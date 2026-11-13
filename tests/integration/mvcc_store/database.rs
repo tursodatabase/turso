@@ -1,44 +1,64 @@
-use crate::namespace::NamespaceId;
-use crate::EngineDialect;
 use rustc_hash::FxHashSet as HashSet;
+use std::fmt::Debug;
+use turso_core::alloc::TursoVecInExt;
+use turso_core::mvcc::database::checkpoint_state_machine::CheckpointState;
+use turso_core::mvcc::database::checkpoint_state_machine::CheckpointStateMachine;
+use turso_core::namespace::NamespaceId;
+use turso_core::schema::Table;
+use turso_core::skiplist::SkipMap;
+use turso_core::storage::btree::BTreeCursor;
+use turso_core::storage::btree::BTreeKey;
+use turso_core::storage::btree::CursorTrait;
+use turso_core::types::IOResult;
+use turso_core::types::IOResultOr;
+use turso_core::types::ImmutableRecord;
+use turso_core::types::IndexInfo;
+use turso_core::types::SeekResult;
+use turso_core::CheckpointMode;
+use turso_core::Connection;
+use turso_core::IOExt;
+use turso_core::Numeric;
+use turso_core::Pager;
+use turso_core::Result;
+use turso_sqlite::SqliteDialect;
 
-use super::*;
-use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::database::remove_file_from_database_registry;
-use crate::io::{PlatformIO, IO};
-use crate::mvcc::clock::MvccClock;
-use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
-use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
-use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
-use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
-};
-#[cfg(feature = "conn_raw_api")]
-use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
-#[cfg(feature = "conn_raw_api")]
-use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
-use crate::state_machine::{StateTransition, TransitionResult};
-use crate::storage::sqlite3_ondisk::{
-    checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
-    WAL_HEADER_SIZE,
-};
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::sync::Mutex;
-use crate::sync::RwLock;
-use crate::translate::emitter::TransactionMode;
-use crate::types::ImmutableRecordRef;
-use crate::vdbe::execute::TransactionYieldPoint;
-use crate::{
-    Buffer, Completion, ConnectOpts, DatabaseOpts, EncryptionKey, LimboError, OpenFlags,
-    StatementStatusCounter,
-};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::sync::Arc;
+use turso_core::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
+use turso_core::database::remove_file_from_database_registry;
+use turso_core::io::{PlatformIO, IO};
+use turso_core::mvcc::clock::MvccClock;
+use turso_core::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
+use turso_core::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
+use turso_core::mvcc::database::*;
+use turso_core::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
+use turso_core::mvcc::persistent_storage::logical_log::{
+    LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
+};
+#[cfg(feature = "conn_raw_api")]
+use turso_core::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
+#[cfg(feature = "conn_raw_api")]
+use turso_core::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
+use turso_core::state_machine::{StateTransition, TransitionResult};
+use turso_core::storage::sqlite3_ondisk::{
+    checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
+    WAL_HEADER_SIZE,
+};
+use turso_core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use turso_core::sync::Mutex;
+use turso_core::sync::RwLock;
+use turso_core::translate::emitter::TransactionMode;
+use turso_core::types::ImmutableRecordRef;
+use turso_core::vdbe::execute::TransactionYieldPoint;
+use turso_core::{
+    Buffer, Completion, ConnectOpts, DatabaseOpts, EncryptionKey, LimboError, OpenFlags,
+    StatementStatusCounter,
+};
 
 const TX_BASE_HEADER_SIZE: usize = 24;
 const TX_EXT_HEADER_SIZE: usize = 40;
@@ -48,12 +68,12 @@ pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
     opts: DatabaseOpts,
-    enc_opts: Option<crate::EncryptionOpts>,
+    enc_opts: Option<turso_core::EncryptionOpts>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
 pub(crate) struct MvccTestDb {
-    pub(crate) mvcc_store: Arc<crate::MvStore>,
+    pub(crate) mvcc_store: Arc<turso_core::MvStore>,
     pub(crate) db: Arc<Database>,
     pub(crate) conn: Arc<Connection>,
 }
@@ -86,11 +106,11 @@ impl YieldInjector for FixedYieldInjector {
 }
 
 fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
-    let mut state = crate::attach::AttachDatabaseState::default();
+    let mut state = turso_core::attach::AttachDatabaseState::default();
     loop {
         match conn.attach_database(path, alias, &mut state).unwrap() {
-            crate::IOResult::Done(()) => return,
-            crate::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+            turso_core::IOResult::Done(()) => return,
+            turso_core::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
         }
     }
 }
@@ -101,7 +121,7 @@ struct CommitWriterOnExclusiveAcquireInjector {
     point: YieldPoint,
     selection_key: u64,
     writer: Arc<Connection>,
-    writer_commit: Mutex<Option<crate::Statement>>,
+    writer_commit: Mutex<Option<turso_core::Statement>>,
     fired: AtomicBool,
 }
 
@@ -120,7 +140,7 @@ impl CommitWriterOnExclusiveAcquireInjector {
         self.fired.load(Ordering::Acquire)
     }
 
-    fn take_writer_commit(&self) -> Option<crate::Statement> {
+    fn take_writer_commit(&self) -> Option<turso_core::Statement> {
         self.writer_commit.lock().take()
     }
 }
@@ -187,7 +207,7 @@ impl std::fmt::Debug for CheckpointingDeleteAtMvccBeginInjector {
 impl YieldInjector for CheckpointingDeleteAtMvccBeginInjector {
     fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
         if point != TransactionYieldPoint::BeforeMvccBegin.point()
-            || selection_key != crate::MAIN_DB_ID as u64
+            || selection_key != turso_core::MAIN_DB_ID as u64
             || self.fired.swap(true, Ordering::AcqRel)
         {
             return false;
@@ -232,7 +252,7 @@ impl std::fmt::Debug for CheckpointingInsertAtMvccBeginInjector {
 impl YieldInjector for CheckpointingInsertAtMvccBeginInjector {
     fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
         if point != TransactionYieldPoint::BeforeMvccBegin.point()
-            || selection_key != crate::MAIN_DB_ID as u64
+            || selection_key != turso_core::MAIN_DB_ID as u64
             || self.fired.swap(true, Ordering::AcqRel)
         {
             return false;
@@ -369,24 +389,24 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
     assert!(!rollback_restores_rowid(tx_id, &inserted_then_deleted));
 }
 
-unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
+unsafe impl turso_core::alloc::ApiAllocator for FailOnDemandAlloc {
     fn allocate(
         &self,
-        layout: crate::alloc::Layout,
-    ) -> std::result::Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        layout: turso_core::alloc::Layout,
+    ) -> std::result::Result<std::ptr::NonNull<[u8]>, turso_core::alloc::AllocError> {
         if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(crate::alloc::AllocError);
+            return Err(turso_core::alloc::AllocError);
         }
-        <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::allocate(
-            &crate::alloc::TursoAllocator,
+        <turso_core::alloc::TursoAllocator as turso_core::alloc::ApiAllocator>::allocate(
+            &turso_core::alloc::TursoAllocator,
             layout,
         )
     }
 
-    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: turso_core::alloc::Layout) {
         unsafe {
-            <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::deallocate(
-                &crate::alloc::TursoAllocator,
+            <turso_core::alloc::TursoAllocator as turso_core::alloc::ApiAllocator>::deallocate(
+                &turso_core::alloc::TursoAllocator,
                 ptr,
                 layout,
             )
@@ -394,10 +414,10 @@ unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
     }
 }
 
-fn test_mvcc_storage(name: &str) -> Arc<dyn crate::mvcc::persistent_storage::DurableStorage> {
+fn test_mvcc_storage(name: &str) -> Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> {
     let io = Arc::new(MemoryIO::new());
     let file = io.open_file(name, OpenFlags::Create, false).unwrap();
-    Arc::new(crate::mvcc::persistent_storage::Storage::new(
+    Arc::new(turso_core::mvcc::persistent_storage::Storage::new(
         file, io, None,
     ))
 }
@@ -431,10 +451,10 @@ fn mv_store_skiplist_allocations_are_fallible() {
         end: PackedTs::pack(None),
         data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
     let result = store.insert_version(row_id, row_version);
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(turso_core::alloc::TryReserveError)));
     assert!(store.rows.is_empty());
 }
 
@@ -446,7 +466,7 @@ fn row_payload_allocation_uses_passed_allocator() {
 
     alloc.fail_allocations(true);
     let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], alloc.clone());
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(turso_core::alloc::TryReserveError)));
 
     alloc.fail_allocations(false);
     let row = Row::new_table_row_in(row_id, &[1, 2, 3], alloc).unwrap();
@@ -461,9 +481,9 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     let record_ref = ImmutableRecordRef::from_bin_record(record.get_payload());
     let index_info = Arc::new(
         IndexInfo::new(
-            [crate::types::KeyInfo {
+            [turso_core::types::KeyInfo {
                 sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::BINARY,
+                collation: turso_core::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
             false,
@@ -475,7 +495,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
 
     alloc.fail_allocations(true);
     let result = SortableIndexKey::new_from_payload_in(&record, index_info.clone(), alloc.clone());
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(turso_core::alloc::TryReserveError)));
 
     alloc.fail_allocations(false);
     let key = SortableIndexKey::new_from_payload_in(record_ref, index_info, alloc).unwrap();
@@ -544,7 +564,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -597,7 +617,7 @@ fn mvcc_active_write_tx_blocks_vacuum_gate() {
     ));
 
     db.mvcc_store
-        .rollback_tx(tx_id, pager, &db.conn, crate::MAIN_DB_ID);
+        .rollback_tx(tx_id, pager, &db.conn, turso_core::MAIN_DB_ID);
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -636,7 +656,7 @@ fn mvcc_pragma_page_size_propagates_to_global_header() {
         .unwrap();
     assert_eq!(
         initial,
-        crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE as u32,
+        turso_core::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE as u32,
         "global_header should start at the default page size"
     );
 
@@ -725,7 +745,7 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
 
 #[test]
 fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
-    use crate::mvcc::database::WalPos;
+    use turso_core::mvcc::database::WalPos;
     let frame = |f: u64| WalPos {
         checkpoint_seq: 1,
         frame: f,
@@ -735,13 +755,13 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     let stamped_insert = || -> RowVersionChain {
         let mut rv = make_rv(ts(5), None);
         rv.set_materialized_at(frame(100));
-        crate::alloc::vec![rv].into()
+        turso_core::alloc::vec![rv].into()
     };
     // Superseded delete (begin=Ts(3), end=Ts(5)<=lwm), materialized at frame 100.
     let stamped_delete = || -> RowVersionChain {
         let mut rv = make_rv(ts(3), ts(5));
         rv.set_materialized_at(frame(100));
-        crate::alloc::vec![rv].into()
+        turso_core::alloc::vec![rv].into()
     };
 
     // Reader pinned below the materialization frame: keep both current and delete.
@@ -795,7 +815,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     // Unmaterialized versions are never reclaimed on the Passive path.
     for drop_current_if_in_btree in [false, true] {
-        let mut v: RowVersionChain = crate::alloc::vec![make_rv(ts(5), None)].into();
+        let mut v: RowVersionChain = turso_core::alloc::vec![make_rv(ts(5), None)].into();
         let dropped = MvStore::<MvccClock>::gc_version_chain(
             &mut v,
             10,
@@ -814,8 +834,8 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
 #[test]
 fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
-    use crate::alloc::{DynAllocator, TursoVecInExt};
-    use crate::mvcc::database::WalPos;
+    use turso_core::alloc::{DynAllocator, TursoVecInExt};
+    use turso_core::mvcc::database::WalPos;
 
     let db = MvccTestDb::new();
     let store = &db.mvcc_store;
@@ -866,7 +886,7 @@ fn debug_gc_metrics_truncate_vs_passive() {
         mode: &str,
         step: usize,
         updates: usize,
-        snap: &crate::mvcc::database::GcDebugSnapshot,
+        snap: &turso_core::mvcc::database::GcDebugSnapshot,
     ) {
         println!(
             "{mode},step={step},updates={updates},\
@@ -1158,7 +1178,7 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Passive {
             upper_bound_inclusive: None,
         },
@@ -1374,7 +1394,7 @@ fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
         "auto passive checkpoint should publish durable boundary despite pinned reader (before={durable_before}, after={durable_after})",
     );
 
-    if reader.get_tx_state() != crate::connection::TransactionState::None {
+    if reader.get_tx_state() != turso_core::connection::TransactionState::None {
         reader.execute("COMMIT").unwrap();
     }
     assert_eq!(
@@ -1455,7 +1475,7 @@ fn mvcc_passive_drop_index_then_reuse_page_integrity() {
 
 #[test]
 fn mvcc_btree_read_dual_gate() {
-    use crate::mvcc::database::WalPos;
+    use turso_core::mvcc::database::WalPos;
     let db = MvccTestDb::new();
     let store = &db.mvcc_store;
 
@@ -1522,7 +1542,7 @@ fn mvcc_try_get_table_id_stale_schema_read_returns_none() {
     // compiled cursor then references a positive root page the reader's snapshot already sees
     // dropped. The fallible lookup must report this (None -> SchemaUpdated reprepare) instead of
     // the panicking variant firing. See `try_get_table_id_from_root_page_at`.
-    use crate::mvcc::database::WalPos;
+    use turso_core::mvcc::database::WalPos;
     let db = MvccTestDb::new();
     let store = &db.mvcc_store;
 
@@ -1653,7 +1673,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -1699,7 +1719,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -1720,7 +1740,7 @@ impl MvccTestDbNoConn {
     /// Opens a file-backed encrypted database with the given hex key.
     pub fn new_encrypted(hex_key: &str) -> Self {
         let opts = DatabaseOpts::new().with_encryption(true);
-        let enc_opts = crate::EncryptionOpts {
+        let enc_opts = turso_core::EncryptionOpts {
             cipher: "aes256gcm".to_string(),
             hexkey: hex_key.to_string(),
         };
@@ -1733,7 +1753,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             Some(enc_opts.clone()),
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
@@ -1782,7 +1802,7 @@ impl MvccTestDbNoConn {
 
     fn new_encrypted_with_cipher(hex_key: &str, cipher: &str) -> Self {
         let opts = DatabaseOpts::new().with_encryption(true);
-        let enc_opts = crate::EncryptionOpts {
+        let enc_opts = turso_core::EncryptionOpts {
             cipher: cipher.to_string(),
             hexkey: hex_key.to_string(),
         };
@@ -1795,7 +1815,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             Some(enc_opts.clone()),
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
@@ -1817,7 +1837,7 @@ impl MvccTestDbNoConn {
 
     /// Like `restart`, but returns the error instead of panicking.
     /// Useful for testing wrong-key scenarios.
-    pub fn restart_result(&mut self) -> crate::Result<()> {
+    pub fn restart_result(&mut self) -> turso_core::Result<()> {
         // Remove this database from the database manager in order to force restart.
         // If not, we will load the same database instance again.
         let path = self.path.as_ref().unwrap();
@@ -1830,7 +1850,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             self.opts,
             self.enc_opts.clone(),
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         self.db.replace(db);
         Ok(())
@@ -1851,7 +1871,7 @@ impl MvccTestDbNoConn {
             .unwrap()
     }
 
-    pub fn get_mvcc_store(&self) -> Arc<crate::MvStore> {
+    pub fn get_mvcc_store(&self) -> Arc<turso_core::MvStore> {
         self.get_db().get_mv_store().clone().unwrap()
     }
 }
@@ -1867,7 +1887,7 @@ pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
 }
 
 fn advance_checkpoint_until_wal_has_commit_frame(
-    mvcc_store: Arc<crate::MvStore>,
+    mvcc_store: Arc<turso_core::MvStore>,
     conn: &Arc<Connection>,
 ) {
     let pager = conn.pager.load().clone();
@@ -1882,7 +1902,7 @@ fn advance_checkpoint_until_wal_has_commit_frame(
         conn.clone(),
         true,
         conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -2440,7 +2460,7 @@ fn test_recover_logical_log_short_file_ignored() {
     conn.db.io.wait_for_completion(c).unwrap();
     assert_eq!(file.size().unwrap(), 1);
 
-    use crate::util::IOExt as _;
+    use turso_core::util::IOExt as _;
     let io = conn.db.io.clone();
     let mut st = RecoverLogicalLogState::default();
     let recovered = io
@@ -2480,11 +2500,13 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
     let commit_ts = 1u64 << 40;
     let data_version = RowVersion {
         id: 1,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
-        end: crate::mvcc::database::PackedTs::pack(None),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(
+            commit_ts,
+        ))),
+        end: turso_core::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row(table_id, 1, "data").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
     let schema_record = ImmutableRecord::from_values(
         &[
@@ -2499,8 +2521,10 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
     .unwrap();
     let schema_version = RowVersion {
         id: 2,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
-        end: crate::mvcc::database::PackedTs::pack(None),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(
+            commit_ts,
+        ))),
+        end: turso_core::mvcc::database::PackedTs::pack(None),
         data: Row::new_table_row(
             RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
             schema_record.as_blob(),
@@ -2508,7 +2532,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         .unwrap()
         .data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
     let tx = LogRecord::for_test(
         commit_ts,
@@ -2559,9 +2583,9 @@ fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
     let mut stmt = conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
     for _ in 0..10_000 {
         match stmt.step().unwrap() {
-            crate::StepResult::Yield if injector.is_empty() => break,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield if injector.is_empty() => break,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Yield => {}
             other => {
                 panic!("journal-mode checkpoint completed before pager-commit yield: {other:?}")
             }
@@ -2578,7 +2602,7 @@ fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
         mvcc_store.blocking_checkpoint_lock.unlock();
     }
     assert!(
-        tx_state == crate::connection::TransactionState::None && checkpoint_lock_released,
+        tx_state == turso_core::connection::TransactionState::None && checkpoint_lock_released,
         "reset left journal-mode checkpoint resources owned: \
          transaction_state={tx_state:?}, checkpoint_lock_released={checkpoint_lock_released}"
     );
@@ -2851,7 +2875,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
 
     {
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path_str, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -2866,7 +2890,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     remove_file_from_database_registry(&db_path_str);
     {
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path_str, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -2876,7 +2900,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
 
     remove_file_from_database_registry(&db_path_str);
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, &db_path_str, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -2963,7 +2987,7 @@ fn test_checkpoint_truncates_wal_last() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -3017,7 +3041,7 @@ fn test_checkpoint_truncates_wal_last() {
 /// Truncate checkpoint must collect commits that land while waiting for `AcquireLock`, and zero the logical log.
 #[test]
 fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -3149,7 +3173,7 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -3262,7 +3286,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
         OpenFlags::default(),
         DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .expect("open should recover, not fail closed");
     let conn = db
@@ -3293,7 +3317,7 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
     remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, &db_path, Arc::new(EngineDialect))
+    let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
         .expect("FULL checkpoint reopen should recover");
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
@@ -3393,7 +3417,7 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
     remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -3431,7 +3455,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
     remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -3499,7 +3523,7 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 =
-        Database::open_file(io, &db_path, Arc::new(EngineDialect)).expect("open should succeed");
+        Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
     let conn2 = db2
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .expect("connect should succeed");
@@ -3963,7 +3987,7 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     {
@@ -3985,7 +4009,7 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
         OpenFlags::default() | OpenFlags::ReadOnly,
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -4009,10 +4033,10 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
 
 #[test]
 fn test_begin_concurrent_first_statement_retry_after_busy_exclusive_upgrade() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     fn step_until_not_io(
-        stmt: &mut crate::Statement,
+        stmt: &mut turso_core::Statement,
         io: &Arc<dyn IO>,
     ) -> Result<StepResult, LimboError> {
         loop {
@@ -4172,7 +4196,7 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(
@@ -4254,7 +4278,7 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
 
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail closed"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -4290,7 +4314,7 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io, &db_path, Arc::new(EngineDialect)).is_ok_and(|db2| {
+    if Database::open_file(io, &db_path, Arc::new(SqliteDialect)).is_ok_and(|db2| {
         db2.connect(ConnectOpts::new(SessionRole::Superuser))
             .is_ok()
     }) {
@@ -4321,7 +4345,7 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io, &db_path, Arc::new(EngineDialect)).is_ok_and(|db2| {
+    if Database::open_file(io, &db_path, Arc::new(SqliteDialect)).is_ok_and(|db2| {
         db2.connect(ConnectOpts::new(SessionRole::Superuser))
             .is_ok()
     }) {
@@ -4356,7 +4380,7 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
 
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(_) => panic!("expected connect to fail closed"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -4386,7 +4410,7 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             conn.clone(),
             true,
             conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
+            turso_core::MAIN_DB_ID,
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             },
@@ -4531,12 +4555,12 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
     let mut yielded_before_checkpoint_lock = false;
     for _ in 0..10_000 {
         match insert_stmt.step().unwrap() {
-            crate::StepResult::Yield if injector.is_empty() => {
+            turso_core::StepResult::Yield if injector.is_empty() => {
                 yielded_before_checkpoint_lock = true;
                 break;
             }
-            crate::StepResult::IO | crate::StepResult::Yield => {}
-            crate::StepResult::Done => {
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => {}
+            turso_core::StepResult::Done => {
                 panic!("INSERT completed before checkpoint acquire-lock yield fired")
             }
             other => panic!("unexpected INSERT step result before yield: {other:?}"),
@@ -4550,15 +4574,15 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
     let mut completed_after_durable_boundary_failure = false;
     for _ in 0..10_000 {
         match insert_stmt.step() {
-            Ok(crate::StepResult::Done) if failure_injector.is_empty() => {
+            Ok(turso_core::StepResult::Done) if failure_injector.is_empty() => {
                 completed_after_durable_boundary_failure = true;
                 break;
             }
-            Ok(crate::StepResult::Done) => {
+            Ok(turso_core::StepResult::Done) => {
                 panic!("INSERT completed before checkpoint durable-boundary failure fired")
             }
             Err(err) => panic!("unexpected INSERT error after yield: {err:?}"),
-            Ok(crate::StepResult::IO | crate::StepResult::Yield) => {}
+            Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => {}
             Ok(other) => panic!("unexpected INSERT step result after yield: {other:?}"),
         }
     }
@@ -4620,7 +4644,7 @@ fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
     assert!(
         matches!(
             stale_integrity_check.step().unwrap(),
-            crate::StepResult::Yield
+            turso_core::StepResult::Yield
         ) && injector.is_empty(),
         "integrity_check should yield before opening its read transaction"
     );
@@ -4668,7 +4692,7 @@ fn test_deferred_begin_integrity_check_reprepares_after_checkpoint_root_publish(
     assert!(
         matches!(
             stale_integrity_check.step().unwrap(),
-            crate::StepResult::Yield
+            turso_core::StepResult::Yield
         ) && injector.is_empty(),
         "integrity_check should yield before opening its read transaction"
     );
@@ -4720,7 +4744,7 @@ fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
     assert!(
         matches!(
             stale_integrity_check.step().unwrap(),
-            crate::StepResult::Yield
+            turso_core::StepResult::Yield
         ) && injector.is_empty(),
         "integrity_check should yield before opening its read transaction"
     );
@@ -4749,7 +4773,7 @@ fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
 
 #[test]
 fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
@@ -4808,7 +4832,7 @@ fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
 
 #[test]
 fn integrity_check_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
@@ -4974,17 +4998,17 @@ fn integrity_check_does_not_report_page_never_used_after_checkpoint_begin_race()
 }
 
 fn step_until_checkpoint_before_pager_commit_yield(
-    stmt: &mut crate::Statement,
+    stmt: &mut turso_core::Statement,
     injector: &FixedYieldInjector,
     io: &Arc<dyn IO>,
     context: &str,
 ) {
     for _ in 0..100_000 {
         match stmt.step().unwrap() {
-            crate::StepResult::Yield if injector.is_empty() => return,
-            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
-            crate::StepResult::Row => {}
-            crate::StepResult::Done => {
+            turso_core::StepResult::Yield if injector.is_empty() => return,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => io.step().unwrap(),
+            turso_core::StepResult::Row => {}
+            turso_core::StepResult::Done => {
                 panic!("{context} completed before BeforePagerCommit yield")
             }
             other => panic!("unexpected {context} step before yield: {other:?}"),
@@ -4993,12 +5017,12 @@ fn step_until_checkpoint_before_pager_commit_yield(
     panic!("checkpoint did not reach its guarded write phase");
 }
 
-fn step_until_done(stmt: &mut crate::Statement, io: &Arc<dyn IO>, context: &str) {
+fn step_until_done(stmt: &mut turso_core::Statement, io: &Arc<dyn IO>, context: &str) {
     for _ in 0..100_000 {
         match stmt.step().unwrap() {
-            crate::StepResult::Done => return,
-            crate::StepResult::Row => {}
-            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
+            turso_core::StepResult::Done => return,
+            turso_core::StepResult::Row => {}
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => io.step().unwrap(),
             other => panic!("unexpected {context} step after yield: {other:?}"),
         }
     }
@@ -5007,7 +5031,7 @@ fn step_until_done(stmt: &mut crate::Statement, io: &Arc<dyn IO>, context: &str)
 
 #[test]
 fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
     let aux_dir = tempfile::TempDir::new().unwrap();
@@ -5191,7 +5215,7 @@ fn drop_attached_statement_paused_at_checkpoint_before_pager_commit(
 
 #[test]
 fn savepoint_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
@@ -5277,7 +5301,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         conn.clone(),
         true,
         conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -5316,7 +5340,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         conn,
         true,
         sync_mode,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -5388,7 +5412,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         delayed_conn.clone(),
         true,
         delayed_conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -5404,7 +5428,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         interrupted_conn.clone(),
         true,
         interrupted_conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
         CheckpointMode::Truncate {
             upper_bound_inclusive: None,
         },
@@ -5466,7 +5490,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
 
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
-    use crate::StepResult;
+    use turso_core::StepResult;
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let c1 = db.connect();
     c1.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
@@ -5535,7 +5559,7 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
 
 #[test]
 fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
-    use crate::StepResult;
+    use turso_core::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
 
@@ -5565,7 +5589,7 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
 
     // Helper: step the auto-checkpoint until the NEXT injected yield fires (the
     // injector's remaining-set shrinks). Returns when a fresh yield is observed.
-    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+    let step_to_next_yield = |checkpoint: &mut turso_core::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
                 StepResult::IO | StepResult::Yield => {
@@ -5632,7 +5656,7 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
 
 #[test]
 fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
-    use crate::StepResult;
+    use turso_core::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
 
@@ -5651,7 +5675,7 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
     let mut checkpoint = conn_c.prepare("INSERT INTO t VALUES (2, 999)").unwrap();
     let pager_io = conn_c.pager.load().io.clone();
 
-    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+    let step_to_next_yield = |checkpoint: &mut turso_core::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
                 StepResult::IO | StepResult::Yield => {
@@ -6901,7 +6925,7 @@ fn test_rollback() {
         tx1,
         db.conn.pager.load().clone(),
         &db.conn,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
     );
     let tx2 = db
         .mvcc_store
@@ -7179,8 +7203,12 @@ fn test_lost_update() {
         Err(LimboError::WriteWriteConflict)
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
-    db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.load().clone(), &conn3, crate::MAIN_DB_ID);
+    db.mvcc_store.rollback_tx(
+        tx3,
+        conn3.pager.load().clone(),
+        &conn3,
+        turso_core::MAIN_DB_ID,
+    );
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -7309,16 +7337,16 @@ fn test_future_row() {
     assert_eq!(row, None);
 }
 
-use crate::mvcc::cursor::MvccLazyCursor;
-use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
-use crate::mvcc::database::{MvStore, Row, RowID};
-use crate::schema::IndexColumn;
-use crate::security::roles::SessionRole;
-use crate::types::Text;
-use crate::Value;
-use crate::ValueRef;
-use crate::{Database, StepResult};
-use crate::{MemoryIO, Statement};
+use turso_core::mvcc::cursor::MvccLazyCursor;
+use turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared;
+use turso_core::mvcc::database::{MvStore, Row, RowID};
+use turso_core::schema::IndexColumn;
+use turso_core::security::roles::SessionRole;
+use turso_core::types::Text;
+use turso_core::Value;
+use turso_core::ValueRef;
+use turso_core::{Database, StepResult};
+use turso_core::{MemoryIO, Statement};
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -7450,11 +7478,13 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
 }
 
 pub(crate) fn commit_tx(
-    mv_store: Arc<crate::MvStore>,
+    mv_store: Arc<turso_core::MvStore>,
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
+    let mut sm = mv_store
+        .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+        .unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -7475,7 +7505,9 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
+    let mut sm = mv_store
+        .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+        .unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -7521,7 +7553,7 @@ fn test_sequence_watermark_tracks_lowest_active_allocation() {
         Some(12)
     );
 
-    mv_store.rollback_tx(tx2, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    mv_store.rollback_tx(tx2, pager, conn.as_ref(), turso_core::MAIN_DB_ID);
     assert_eq!(
         mv_store.sequence_watermark("turso_cdc_pk_autoincrement"),
         Some(13)
@@ -7550,7 +7582,7 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
 
     assert_eq!(rows[0][0].as_int().unwrap(), 10);
 
-    mv_store.rollback_tx(tx_id, pager, conn.as_ref(), crate::MAIN_DB_ID);
+    mv_store.rollback_tx(tx_id, pager, conn.as_ref(), turso_core::MAIN_DB_ID);
     let rows = get_rows(&conn, "SELECT sequence_watermark_experimental('s')");
 
     assert_eq!(rows[0][0].as_int().unwrap(), 42);
@@ -7644,7 +7676,7 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
             let mut rng = ChaCha8Rng::seed_from_u64(0x5EED_0000 + who);
             for _ in 0..INSERTS_PER_WRITER {
                 for _ in 0..COMMIT_ATTEMPTS {
-                    let txn = (|| -> crate::Result<bool> {
+                    let txn = (|| -> turso_core::Result<bool> {
                         conn.execute("BEGIN CONCURRENT")?;
                         conn.execute(format!(
                             "INSERT INTO t(id, who) VALUES (nextval('s'), {who})"
@@ -8089,7 +8121,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
     new_tx_in(tx_id, begin_ts, state)
 }
 
-fn new_tx_in<A: super::RowVersionAllocator>(
+fn new_tx_in<A: turso_core::mvcc::database::RowVersionAllocator>(
     tx_id: TxID,
     begin_ts: u64,
     state: TransactionState,
@@ -8110,7 +8142,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
-        read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        read_mark: turso_core::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
     }
@@ -8137,11 +8169,11 @@ fn test_snapshot_isolation_tx_visible1() {
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
             id: 0, // Dummy ID for visibility tests
-            begin: crate::mvcc::database::PackedTs::pack(begin),
-            end: crate::mvcc::database::PackedTs::pack(end),
+            begin: turso_core::mvcc::database::PackedTs::pack(begin),
+            end: turso_core::mvcc::database::PackedTs::pack(end),
             data: generate_simple_string_row((-2).into(), 1, "testme").data,
             btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
         };
         tracing::debug!("Testing visibility of {row_version:?}");
         row_version.is_visible_to(&current_tx, &txs, &finalized_tx_states)
@@ -8238,11 +8270,11 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
     let inserted_row = RowVersion {
         id: 1,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
-        end: crate::mvcc::database::PackedTs::pack(None),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
+        end: turso_core::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), 1, "x").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
     assert!(
         inserted_row.is_visible_to(&reader, &txs, &finalized_tx_states),
@@ -8251,11 +8283,11 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
     let deleted_row = RowVersion {
         id: 2,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
-        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
+        end: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
         data: generate_simple_string_row((-2).into(), 2, "y").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
     assert!(
         !deleted_row.is_visible_to(&reader, &txs, &finalized_tx_states),
@@ -8359,11 +8391,11 @@ fn test_commit_dependency_speculative_read() {
 
     let rv = RowVersion {
         id: 0,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
-        end: crate::mvcc::database::PackedTs::pack(None),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: turso_core::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
 
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
@@ -8392,11 +8424,11 @@ fn test_commit_dependency_cascade_abort() {
 
     let rv = RowVersion {
         id: 0,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
-        end: crate::mvcc::database::PackedTs::pack(None),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: turso_core::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
 
     // Speculative read registers dependency
@@ -8468,11 +8500,11 @@ fn test_commit_dependency_speculative_ignore() {
 
     let rv = RowVersion {
         id: 0,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
-        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(3))),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
+        end: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(3))),
         data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
 
     // is_end_visible: Preparing(5), begin_ts(10) < 5 = false → deletion visible
@@ -8503,7 +8535,7 @@ fn test_commit_dependency_speculative_ignore() {
 /// so no dependency may be registered.
 #[test]
 fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
-    use crate::mvcc::cursor::IndexShadowScan;
+    use turso_core::mvcc::cursor::IndexShadowScan;
 
     let db = MvccTestDb::new();
     let store = &db.mvcc_store;
@@ -8511,10 +8543,10 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
 
     // Single-column ascending integer index key.
     let info = std::sync::Arc::new(
-        crate::types::IndexInfo::new(
-            crate::alloc::vec![crate::types::KeyInfo {
+        turso_core::types::IndexInfo::new(
+            turso_core::alloc::vec![turso_core::types::KeyInfo {
                 sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::BINARY,
+                collation: turso_core::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
             false,
@@ -8524,10 +8556,15 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         .unwrap(),
     );
     let idx_key = |v: i64| {
-        let rec = crate::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
+        let rec =
+            turso_core::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
         std::sync::Arc::new(
-            SortableIndexKey::new_from_payload_in(&rec, info.clone(), crate::alloc::TursoAllocator)
-                .unwrap(),
+            SortableIndexKey::new_from_payload_in(
+                &rec,
+                info.clone(),
+                turso_core::alloc::TursoAllocator,
+            )
+            .unwrap(),
         )
     };
 
@@ -8537,11 +8574,11 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let writer_id: TxID = 9_000_050;
     store.txs.insert(
         writer_id,
-        new_tx_in::<crate::alloc::DynAllocator>(writer_id, 1, TransactionState::Preparing(40)),
+        new_tx_in::<turso_core::alloc::DynAllocator>(writer_id, 1, TransactionState::Preparing(40)),
     );
     store.txs.insert(
         reader_id,
-        new_tx_in::<crate::alloc::DynAllocator>(reader_id, 100, TransactionState::Active),
+        new_tx_in::<turso_core::alloc::DynAllocator>(reader_id, 100, TransactionState::Active),
     );
 
     // MVCC-only tombstone at key 20: committed insert (begin Timestamp) deleted
@@ -8550,17 +8587,17 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let row_id = RowID::new(table_id, RowKey::Record(key20.clone()));
     let tombstone = RowVersion {
         id: 20,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
-        end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
+        end: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
         data: Row::new_index_row(row_id).data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
     let mut tombstone_versions =
-        <RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+        <RowVersionChain<turso_core::alloc::DynAllocator> as turso_core::alloc::TursoVecInExt<
             RowVersion,
-            crate::alloc::DynAllocator,
-        >>::new_in(crate::alloc::DynAllocator::default());
+            turso_core::alloc::DynAllocator,
+        >>::new_in(turso_core::alloc::DynAllocator::default());
     tombstone_versions.push(tombstone);
     store
         .get_or_create_index_rows(table_id)
@@ -8605,11 +8642,11 @@ fn test_commit_dependency_multiple_reads_dedup() {
 
     let make_rv = |row_id: i64| RowVersion {
         id: row_id as u64,
-        begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
-        end: crate::mvcc::database::PackedTs::pack(None),
+        begin: turso_core::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
+        end: turso_core::mvcc::database::PackedTs::pack(None),
         data: generate_simple_string_row((-2).into(), row_id, "test").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
 
     // Read 3 rows from the same preparing tx — dependency is deduplicated
@@ -8710,7 +8747,7 @@ fn test_commit_dep_threaded_abort_cascades() {
         writer_tx_id,
         writer_conn.pager.load().clone(),
         &writer_conn,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
     );
 
     let (rows, commit_result) = reader_handle.join().unwrap();
@@ -8821,7 +8858,7 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
         writer_tx_id,
         writer_conn.pager.load().clone(),
         &writer_conn,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
     );
 
     for handle in handles {
@@ -9026,7 +9063,7 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
         writer_tx_id,
         writer_conn.pager.load().clone(),
         &writer_conn,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
     );
 
     let (rows, commit_result) = reader_handle.join().unwrap();
@@ -9913,7 +9950,7 @@ fn transaction_display() {
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
-        read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        read_mark: turso_core::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
         portable_logical_changes: false,
     };
@@ -9977,7 +10014,7 @@ fn test_insert_with_checkpoint() {
     assert_eq!(row.len(), 1);
     let value = row.first().unwrap();
     match value {
-        Value::Numeric(crate::numeric::Numeric::Integer(i)) => assert_eq!(*i, 1),
+        Value::Numeric(turso_core::numeric::Numeric::Integer(i)) => assert_eq!(*i, 1),
         _ => unreachable!(),
     }
 }
@@ -10012,7 +10049,7 @@ fn test_auto_checkpoint_busy_is_ignored() {
         tx2,
         db.conn.pager.load().clone(),
         &db.conn,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
     );
 }
 
@@ -10575,7 +10612,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
 
     let db = MvccTestDb::new();
     let pager = db.conn.pager.load().clone();
-    let index = crate::schema::Index {
+    let index = turso_core::schema::Index {
         name: "testindex".to_string(),
         table_name: "test".to_string(),
         root_page: 0,
@@ -10591,13 +10628,13 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
 
     pager.begin_read_tx().unwrap();
     run_pager_until_done(
-        || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
+        || pager.begin_write_tx(turso_core::storage::wal::WalAutoActions::all_enabled()),
         pager.as_ref(),
     )
     .unwrap();
     let root_page = pager
         .io
-        .block(|| pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()))
+        .block(|| pager.btree_create(&turso_core::storage::pager::CreateBTreeFlags::new_index()))
         .unwrap() as i64;
     let cursor = Arc::new(RwLock::new(
         BTreeCursor::new_index(pager.clone(), root_page, &index, index.columns.len()).unwrap(),
@@ -10609,8 +10646,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         let seek_result = run_pager_until_done(
             || {
                 cursor.write().seek(
-                    crate::types::SeekKey::IndexKey(record.as_record_ref()),
-                    crate::types::SeekOp::GE { eq_only: true },
+                    turso_core::types::SeekKey::IndexKey(record.as_record_ref()),
+                    turso_core::types::SeekOp::GE { eq_only: true },
                 )
             },
             pager.as_ref(),
@@ -10643,8 +10680,8 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         let seek_result = run_pager_until_done(
             || {
                 cursor.write().seek(
-                    crate::types::SeekKey::IndexKey(record.as_record_ref()),
-                    crate::types::SeekOp::GE { eq_only: true },
+                    turso_core::types::SeekKey::IndexKey(record.as_record_ref()),
+                    turso_core::types::SeekOp::GE { eq_only: true },
                 )
             },
             pager.as_ref(),
@@ -10659,7 +10696,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     let count_before = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
 
     run_pager_until_done(
-        || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
+        || pager.begin_write_tx(turso_core::storage::wal::WalAutoActions::all_enabled()),
         pager.as_ref(),
     )
     .unwrap();
@@ -10669,9 +10706,12 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         2,
     )
     .unwrap();
-    let row_key =
-        SortableIndexKey::new_from_payload_in(&record, index_info, crate::alloc::TursoAllocator)
-            .unwrap();
+    let row_key = SortableIndexKey::new_from_payload_in(
+        &record,
+        index_info,
+        turso_core::alloc::TursoAllocator,
+    )
+    .unwrap();
     let row = Row::new_index_row(RowID::new(
         MVTableId::new(-42),
         RowKey::Record(Arc::new(row_key)),
@@ -11113,7 +11153,7 @@ fn test_integrity_check_after_drop_autoincrement_table_before_checkpoint() {
 fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:interrupted-drop-table-schema-rollback";
-    let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -11146,7 +11186,7 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 
     let mut drop_stmt = conn.prepare("DROP TABLE repro_target").unwrap();
     match drop_stmt.step().unwrap() {
-        crate::StepResult::Yield => {}
+        turso_core::StepResult::Yield => {}
         other => panic!("expected injected yield while dropping repro_target; got {other:?}"),
     }
     conn.set_yield_injector(None);
@@ -11161,7 +11201,7 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 
     // Reopening used to fail here because the same-connection SELECT could
     // commit the interrupted DROP TABLE's partial sqlite_schema delete.
-    let db = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -11362,7 +11402,7 @@ fn test_update_multiple_unique_columns_partial_rollback() {
 
 // ─── GC helpers ───────────────────────────────────────────────────────────
 
-fn unique_index_btree_is_allocated(mv: &crate::MvStore) -> bool {
+fn unique_index_btree_is_allocated(mv: &turso_core::MvStore) -> bool {
     mv.index_rows
         .iter()
         .any(|idx| mv.is_btree_allocated(idx.key()))
@@ -11370,28 +11410,29 @@ fn unique_index_btree_is_allocated(mv: &crate::MvStore) -> bool {
 
 /// An index current that no checkpoint has written to the B-tree yet. GC must
 /// keep it: the SkipMap is the only copy of that key.
-fn skipmap_has_unmaterialized_index_current(mv: &crate::MvStore) -> bool {
+fn skipmap_has_unmaterialized_index_current(mv: &turso_core::MvStore) -> bool {
     mv.index_rows.iter().any(|idx| {
         idx.value().iter().any(|e| {
             e.value().read().iter().any(|rv| {
-                rv.end().is_none() && rv.materialized_at() == crate::mvcc::database::WalPos::ORIGIN
+                rv.end().is_none()
+                    && rv.materialized_at() == turso_core::mvcc::database::WalPos::ORIGIN
             })
         })
     })
 }
 
-fn skipmap_version_count(mv: &crate::MvStore) -> usize {
+fn skipmap_version_count(mv: &turso_core::MvStore) -> usize {
     mv.rows.iter().map(|e| e.value().read().len()).sum()
 }
 
 fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowVersion {
     RowVersion {
         id: 0,
-        begin: crate::mvcc::database::PackedTs::pack(begin),
-        end: crate::mvcc::database::PackedTs::pack(end),
+        begin: turso_core::mvcc::database::PackedTs::pack(begin),
+        end: turso_core::mvcc::database::PackedTs::pack(end),
         data: generate_simple_string_row((-2).into(), 1, "gc_test").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     }
 }
 
@@ -11402,7 +11443,7 @@ fn make_materialized_rv(
     end: Option<TxTimestampOrID>,
 ) -> RowVersion {
     let mut rv = make_rv(begin, end);
-    rv.set_materialized_at(crate::mvcc::database::WalPos {
+    rv.set_materialized_at(turso_core::mvcc::database::WalPos {
         checkpoint_seq: 1,
         frame: 1,
     });
@@ -11423,13 +11464,13 @@ fn txid(v: u64) -> Option<TxTimestampOrID> {
 /// Rolled-back transactions leave versions with begin=None, end=None. These are
 /// invisible to every transaction and must be removed unconditionally by Rule 1.
 fn test_gc_rule1_aborted_garbage_removed() {
-    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(None, None)].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![make_rv(None, None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1);
@@ -11440,7 +11481,7 @@ fn test_gc_rule1_aborted_garbage_removed() {
 #[test]
 /// Rule 1 removes only aborted garbage, leaving live and superseded versions intact.
 fn test_gc_rule1_aborted_among_live_versions() {
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(ts(5), None),  // current
         make_rv(None, None),   // aborted
         make_rv(ts(3), ts(5)), // superseded
@@ -11451,7 +11492,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
         2,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // Only aborted removed; superseded has e=5 > lwm=2 so retained
@@ -11469,7 +11510,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
 /// take over B-tree invalidation, the superseded version is safely removable.
 fn test_gc_rule2_superseded_below_lwm_with_current() {
     // Superseded version (end=Timestamp(3)) below LWM=10, and there's a current version.
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // current
     ]
@@ -11479,7 +11520,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
         10,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1);
@@ -11494,13 +11535,13 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
 fn test_gc_rule2_superseded_above_lwm_retained() {
     // Superseded version (end=Timestamp(15)) above LWM=10 — must be retained.
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_rv(ts(3), ts(15)), make_rv(ts(15), None)].into();
+        turso_core::alloc::vec![make_rv(ts(3), ts(15)), make_rv(ts(15), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11515,7 +11556,7 @@ fn test_gc_rule2_superseded_above_lwm_retained() {
 fn test_gc_rule2_tombstone_guard_uncheckpointed() {
     // Tombstone: end is set, no current version, and e > ckpt_max.
     // Must be retained to prevent row resurrection via dual cursor.
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(ts(3), ts(5)), // tombstone (sole version, no current)
     ]
     .into();
@@ -11524,7 +11565,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
         10,
         2,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // e=5 > ckpt_max=2, no current → tombstone guard retains it
@@ -11538,13 +11579,13 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
 /// contains the row, so the tombstone is safe to remove.
 fn test_gc_rule2_tombstone_guard_checkpointed() {
     // Tombstone with e <= ckpt_max — deletion is checkpointed, safe to remove.
-    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(ts(3), ts(5))].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![make_rv(ts(3), ts(5))].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // e=5 <= ckpt_max=5, e=5 <= lwm=10 → removable
@@ -11561,13 +11602,13 @@ fn test_gc_rule3_drop_current_when_in_btree() {
     // Single stamped current with b <= ckpt_max, and no transaction open
     // (lwm == u64::MAX).
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
+        turso_core::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1);
@@ -11578,13 +11619,13 @@ fn test_gc_rule3_drop_current_when_in_btree() {
 #[test]
 fn test_gc_rule3_truncate_idle_only() {
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
+        turso_core::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0, "open snapshot must block Truncate Rule 3 clear");
@@ -11595,7 +11636,7 @@ fn test_gc_rule3_truncate_idle_only() {
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1);
@@ -11611,13 +11652,13 @@ fn test_gc_rule3_not_checkpointed_retained() {
     // Nothing is open (lwm == u64::MAX), so ckpt_max is the only thing holding
     // this version back.
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
+        turso_core::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         3,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11632,13 +11673,13 @@ fn test_gc_rule3_not_checkpointed_retained() {
 fn test_gc_rule3_visible_to_active_tx_retained() {
     // Single stamped current, already inside ckpt_max, but a transaction is open.
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
+        turso_core::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         5,
         10,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // lwm=5 != u64::MAX, so a transaction is open and Rule 3 must not fire.
@@ -11651,13 +11692,13 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
 /// A current version cannot be removed before checkpoint has persisted it.
 fn test_gc_rule3_current_retained_before_first_checkpoint() {
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_materialized_rv(ts(1), None)].into();
+        turso_core::alloc::vec![make_materialized_rv(ts(1), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11669,13 +11710,13 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
 /// Once checkpoint has persisted a sole current version, it becomes GC-eligible.
 fn test_gc_rule3_current_collected_after_checkpoint() {
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_materialized_rv(ts(1), None)].into();
+        turso_core::alloc::vec![make_materialized_rv(ts(1), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1);
@@ -11689,7 +11730,7 @@ fn test_gc_rule3_current_collected_after_checkpoint() {
 fn test_gc_rule3_after_history_reclaimed() {
     // Rule 3 only fires when exactly one version remains after rules 1 & 2.
     let mut versions: RowVersionChain =
-        crate::alloc::vec![make_rv(ts(3), ts(5)), make_materialized_rv(ts(5), None)].into();
+        turso_core::alloc::vec![make_rv(ts(3), ts(5)), make_materialized_rv(ts(5), None)].into();
     // Both versions are inside ckpt_max and nothing is open, but the chain
     // starts with 2 entries. Rule 2 removes the superseded one
     // (has_current=true), then Rule 3 drops the remaining current.
@@ -11698,7 +11739,7 @@ fn test_gc_rule3_after_history_reclaimed() {
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 2);
@@ -11709,19 +11750,19 @@ fn test_gc_rule3_after_history_reclaimed() {
 /// `ckpt_max` says a checkpoint ran, not that this row reached a B-tree leaf.
 #[test]
 fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
-    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(ts(5), None)].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![make_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
         10,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
 
-    versions[0].set_materialized_at(crate::mvcc::database::WalPos {
+    versions[0].set_materialized_at(turso_core::mvcc::database::WalPos {
         checkpoint_seq: 1,
         frame: 7,
     });
@@ -11730,7 +11771,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
         u64::MAX,
         10,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1);
@@ -11743,13 +11784,13 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
 /// inserts. They don't match any removal rule and must always be retained.
 fn test_gc_txid_refs_retained() {
     // Versions with TxID (uncommitted) references are never collected.
-    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(txid(99), None)].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![make_rv(txid(99), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         u64::MAX,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11762,13 +11803,13 @@ fn test_gc_txid_refs_retained() {
 /// end=Timestamp, so these are never collected until the deleting tx resolves.
 fn test_gc_txid_end_retained() {
     // end=TxID means the deletion is uncommitted; rule 2 only matches Timestamp.
-    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(ts(3), txid(50))].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![make_rv(ts(3), txid(50))].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         u64::MAX,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11784,7 +11825,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
     // A pending insert (begin=TxID, end=None) coexists with a tombstone.
     // has_current must NOT count the pending insert — if it rolls back,
     // the tombstone is the only thing hiding the B-tree row.
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(ts(3), ts(5)), // tombstone: deletion at e=5, not checkpointed (ckpt_max=2)
         make_rv(txid(99), None), // pending insert (uncommitted)
     ]
@@ -11794,7 +11835,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
         10,
         2,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // Tombstone must be retained: e=5 > ckpt_max=2, and pending insert doesn't count.
@@ -11811,7 +11852,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
 fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
     // A committed current version (begin=Timestamp, end=None) means the row
     // has a live successor — the tombstone can safely be removed.
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // committed current
     ]
@@ -11821,7 +11862,7 @@ fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
         10,
         2,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // Superseded removed (has_current=true for committed version), current remains.
@@ -11839,14 +11880,14 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     let mut tombstone = make_rv(None, ts(5));
     tombstone.btree_resident = true;
     let current = make_materialized_rv(ts(5), None);
-    let mut versions: RowVersionChain = crate::alloc::vec![tombstone, current.clone()].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![tombstone, current.clone()].into();
 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         2,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11858,7 +11899,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 2);
@@ -11866,14 +11907,15 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
 
     let mut rewritten_btree_row = make_rv(ts(3), ts(5));
     rewritten_btree_row.btree_resident = true;
-    let mut versions: RowVersionChain = crate::alloc::vec![rewritten_btree_row, current].into();
+    let mut versions: RowVersionChain =
+        turso_core::alloc::vec![rewritten_btree_row, current].into();
 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         2,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11885,7 +11927,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 2);
@@ -11905,14 +11947,15 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
     // begin=2 <= ckpt_max=2 (insert checkpointed), end=5 > ckpt_max (overwrite not).
     let checkpointed_btree_row = make_rv(ts(2), ts(5));
     let current = make_materialized_rv(ts(5), None);
-    let mut versions: RowVersionChain = crate::alloc::vec![checkpointed_btree_row, current].into();
+    let mut versions: RowVersionChain =
+        turso_core::alloc::vec![checkpointed_btree_row, current].into();
 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         2,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -11925,7 +11968,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 2);
@@ -11942,13 +11985,13 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
     // B-tree tombstone: begin=None, end=Timestamp(e) where e > 0.
     // Represents a row deleted in MVCC that existed in B-tree before MVCC.
     // Before checkpoint (ckpt_max < e): tombstone must be retained.
-    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(None, ts(5))].into();
+    let mut versions: RowVersionChain = turso_core::alloc::vec![make_rv(None, ts(5))].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
         3,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0, "tombstone retained: e=5 > ckpt_max=3");
@@ -11960,7 +12003,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1, "tombstone collected: e=5 <= ckpt_max=5");
@@ -11976,7 +12019,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
     // Two versions: superseded with e > lwm (can't remove), and current.
     // Rule 2 can't remove the superseded one, so 2 versions remain.
     // Rule 3 needs a single remaining current, so it must NOT fire.
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(ts(3), ts(15)),             // e=15 > lwm=10 — retained
         make_materialized_rv(ts(15), None), // current
     ]
@@ -11986,7 +12029,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
         10,
         20,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -12003,7 +12046,7 @@ fn test_gc_noop_on_empty() {
         10,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 0);
@@ -12015,7 +12058,7 @@ fn test_gc_noop_on_empty() {
 /// checkpointed superseded versions with a committed current (Rule 2), and the sole
 /// surviving stamped current inside `ckpt_max` (Rule 3). The chain is fully reclaimed.
 fn test_gc_combined_rules() {
-    let mut versions: RowVersionChain = crate::alloc::vec![
+    let mut versions: RowVersionChain = turso_core::alloc::vec![
         make_rv(None, None),   // aborted → rule 1
         make_rv(ts(1), ts(3)), // superseded, e=3 <= ckpt_max=5 → rule 2 (has_current=true)
         make_rv(ts(3), ts(5)), // superseded, e=5 <= ckpt_max=5 → rule 2
@@ -12028,7 +12071,7 @@ fn test_gc_combined_rules() {
         u64::MAX,
         5,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 4);
@@ -12078,7 +12121,7 @@ fn transaction_rollback_removes_created_versions_immediately() {
             tx,
             db.conn.pager.load().clone(),
             &db.conn,
-            crate::MAIN_DB_ID,
+            turso_core::MAIN_DB_ID,
         );
     }
 
@@ -12277,11 +12320,11 @@ fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
 fn test_gc_shrinks_version_chain_capacity() {
     let make_version = |begin, end| RowVersion {
         id: 0,
-        begin: crate::mvcc::database::PackedTs::pack(begin),
-        end: crate::mvcc::database::PackedTs::pack(end),
+        begin: turso_core::mvcc::database::PackedTs::pack(begin),
+        end: turso_core::mvcc::database::PackedTs::pack(end),
         data: generate_simple_string_row((-2).into(), 1, "shrink").data,
         btree_resident: false,
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     };
 
     // One committed current version that survives GC (b=1 > ckpt_max=0, so
@@ -12299,7 +12342,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         0,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1023);
@@ -12321,7 +12364,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         0,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert_eq!(dropped, 1024);
@@ -12344,7 +12387,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         0,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     assert!(small.is_empty());
@@ -12589,7 +12632,7 @@ fn test_savepoint_rollback_removes_only_the_chains_that_the_savepoint_added() {
 }
 
 fn write_set_len_and_distinct_chains(
-    mvcc_store: &Arc<crate::MvStore>,
+    mvcc_store: &Arc<turso_core::MvStore>,
     tx_id: TxID,
 ) -> (usize, usize) {
     let tx = mvcc_store.txs.get(&tx_id).unwrap();
@@ -12616,7 +12659,7 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         tx1,
         db.conn.pager.load().clone(),
         &db.conn,
-        crate::MAIN_DB_ID,
+        turso_core::MAIN_DB_ID,
     );
 
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
@@ -13196,7 +13239,7 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
         .unwrap();
-    mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
+    mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, turso_core::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
     let entry = mvcc_store.rows.get(&row_id).unwrap();
@@ -13583,7 +13626,7 @@ fn test_passive_finalize_reclaim_text_pk_unique_lookup_still_sees_key() {
 
 #[test]
 fn test_unique_lookup_survives_passive_checkpoint_mid_seek() {
-    use crate::StepResult;
+    use turso_core::StepResult;
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let setup = db.connect();
     setup
@@ -13652,7 +13695,7 @@ fn test_unique_lookup_survives_passive_checkpoint_mid_seek() {
 
 #[test]
 fn test_same_txn_unique_lookup_stable_across_passive_checkpoint() {
-    use crate::StepResult;
+    use turso_core::StepResult;
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let setup = db.connect();
     setup
@@ -13900,7 +13943,7 @@ fn test_gc_incremental_keeps_held_reader_row() {
     assert_eq!(versions.len(), 1);
     assert_eq!(
         versions[0].materialized_at(),
-        crate::mvcc::database::WalPos::ORIGIN
+        turso_core::mvcc::database::WalPos::ORIGIN
     );
     assert_eq!(versions[0].end(), None);
 }
@@ -14066,11 +14109,11 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
 
     RowVersion {
         id: 0,
-        begin: crate::mvcc::database::PackedTs::pack(begin),
-        end: crate::mvcc::database::PackedTs::pack(end),
+        begin: turso_core::mvcc::database::PackedTs::pack(begin),
+        end: turso_core::mvcc::database::PackedTs::pack(end),
         data: generate_simple_string_row((-2).into(), 1, "qc").data,
         btree_resident: bool::arbitrary(g),
-        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        materialized_at: turso_core::mvcc::database::WalPos::ORIGIN,
     }
 }
 
@@ -14112,7 +14155,7 @@ fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     versions.len() <= before
@@ -14130,7 +14173,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     let snapshot = v1.clone();
@@ -14139,7 +14182,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     // Compare content, not just length — a swap bug would pass a length-only check.
@@ -14161,7 +14204,7 @@ fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     versions
@@ -14185,7 +14228,7 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     let txid_begins_after: usize = versions
@@ -14214,7 +14257,7 @@ fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     let txid_ends_after: usize = versions.iter().filter(filter).count();
@@ -14242,7 +14285,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         chain.lwm,
         0,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
     let current_after: usize = versions
@@ -14273,7 +14316,7 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
 
@@ -14317,7 +14360,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
         chain.lwm,
         chain.ckpt_max,
         false,
-        crate::mvcc::database::WalPos::STAGED,
+        turso_core::mvcc::database::WalPos::STAGED,
         true,
     );
 
@@ -15752,7 +15795,7 @@ fn test_concurrent_commit_yield_spin() {
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        matches!(stmt.step().unwrap(), turso_core::StepResult::IO),
         "step() should park when pager_commit_lock is contended"
     );
     assert_eq!(coordinator.parked_tickets().len(), 1);
@@ -15760,8 +15803,8 @@ fn test_concurrent_commit_yield_spin() {
     coordinator.unlock_pager_commit_lock();
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Done => break,
-            crate::StepResult::IO => {}
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO => {}
             _ => {}
         }
     }
@@ -15771,7 +15814,7 @@ fn test_concurrent_commit_yield_spin() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
-fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::MvStore>) {
+fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<turso_core::MvStore>) {
     let coordinator = &mv_store.commit_coordinator;
     assert!(
         coordinator.pager_commit_lock.write(),
@@ -15780,7 +15823,7 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::M
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
+        matches!(stmt.step().unwrap(), turso_core::StepResult::IO),
         "COMMIT should park while the commit lock is held",
     );
     assert_eq!(coordinator.parked_tickets().len(), 1);
@@ -15809,7 +15852,7 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
 
     let mut stmt = conn.prepare("COMMIT").unwrap();
     assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::Yield),
+        matches!(stmt.step().unwrap(), turso_core::StepResult::Yield),
         "MVCC commit should yield before completion",
     );
 
@@ -15834,7 +15877,7 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
 /// bypassing MVCC) and other connections on the same `Database` could trip an
 /// assertion on the un-bootstrapped store (`global_header = None`) at commit.
 ///
-/// Gated on `io_memory_yield`: the test needs [`crate::MemoryYieldIO`] to defer
+/// Gated on `io_memory_yield`: the test needs [`turso_core::MemoryYieldIO`] to defer
 /// completions so the bootstrap yields are observable. CI exercises it via the
 /// `--all-features` test job.
 #[cfg(feature = "io_memory_yield")]
@@ -15850,14 +15893,14 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
     // `stmt.step()` calls and we can abandon the statement precisely while it
     // is parked at a bootstrap yield (with `PlatformIO` the completions finish
     // synchronously and the whole PRAGMA runs in a single step).
-    let io = Arc::new(crate::MemoryYieldIO::new());
+    let io = Arc::new(turso_core::MemoryYieldIO::new());
     let db = Database::open_file_with_flags(
         io,
         path.as_os_str().to_str().unwrap(),
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -15930,7 +15973,7 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
 /// final yield. Expected: 4 chunked yields between Start and Prepared.
 #[test]
 fn test_build_log_record_yields_for_large_write_set() {
-    use super::MVCC_COMMIT_BATCH_SIZE;
+    use turso_core::mvcc::database::MVCC_COMMIT_BATCH_SIZE;
 
     /// Yields once at each of the bracketing points and toggles the
     /// corresponding flag so the test can detect when the bracket opens
@@ -15982,7 +16025,7 @@ fn test_build_log_record_yields_for_large_write_set() {
     let mut saw_start = false;
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Yield => {
+            turso_core::StepResult::Yield => {
                 if !saw_start {
                     // Wait for the BuildLogRecordStart yield to open the bracket.
                     // IOs before this came from earlier states (Initial → Commit
@@ -16001,8 +16044,8 @@ fn test_build_log_record_yields_for_large_write_set() {
                 // `Completion::new_yield()` in step_build_log_record's loop.
                 chunked_io_yields += 1;
             }
-            crate::StepResult::IO => continue,
-            crate::StepResult::Done => break,
+            turso_core::StepResult::IO => continue,
+            turso_core::StepResult::Done => break,
             other => panic!("unexpected step result: {other:?}"),
         }
     }
@@ -16997,7 +17040,7 @@ fn test_abandoned_drop() {
     let _ = tracing_subscriber::fmt::try_init();
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:";
-    let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -17020,7 +17063,7 @@ fn test_abandoned_drop() {
     conn.execute("BEGIN").unwrap();
     let mut drop_stmt = conn.prepare("DROP TABLE t").unwrap();
     match drop_stmt.step().unwrap() {
-        crate::StepResult::Yield => {}
+        turso_core::StepResult::Yield => {}
         other => panic!("expected injected yield mid-DROP TABLE; got {other:?}"),
     }
     conn.set_yield_injector(None);
@@ -17033,7 +17076,7 @@ fn test_abandoned_drop() {
     drop(conn);
     drop(db);
 
-    let db = Database::open_file(io, path, Arc::new(EngineDialect)).expect(
+    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
         "reopen should not fail; abandoned DROP must not have committed its partial Delete",
     );
     let conn = db
@@ -17089,11 +17132,11 @@ fn test_close_persists_drop_index() {
 
 #[test]
 fn test_partial_commit_visibility_bug() {
-    use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use crate::sync::Arc;
     use std::collections::HashMap;
     use std::thread;
     use std::time::Duration;
+    use turso_core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use turso_core::sync::Arc;
     for _ in 0..10 {
         // Setup: Create a table with batch_id and row_num columns
         let db = Arc::new(MvccTestDbNoConn::new_with_random_db());
@@ -17370,13 +17413,13 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
 
     // Phase 1: Open in WAL mode, create AUTOINCREMENT table
     {
-        let db = crate::Database::open_file_with_flags(
+        let db = turso_core::Database::open_file_with_flags(
             io.clone(),
             path_str,
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -17394,13 +17437,13 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
 
     // Phase 2: Reopen in MVCC mode — INSERT should work
     {
-        let db = crate::Database::open_file_with_flags(
+        let db = turso_core::Database::open_file_with_flags(
             io,
             path_str,
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -18169,7 +18212,7 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
 
     // --- Restart with wrong key: should fail ---
     let wrong_key = "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    db.enc_opts = Some(crate::EncryptionOpts {
+    db.enc_opts = Some(turso_core::EncryptionOpts {
         cipher: "aes256gcm".to_string(),
         hexkey: wrong_key.to_string(),
     });
@@ -18193,7 +18236,7 @@ fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
         OpenFlags::default(),
         opts,
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -18267,7 +18310,7 @@ fn test_encrypted_recovery_large_payload_multi_chunk() {
     assert_log_payloads_decrypt(
         &log_path,
         hex_key,
-        crate::storage::encryption::CipherMode::Aes256Gcm,
+        turso_core::storage::encryption::CipherMode::Aes256Gcm,
     );
 
     db.restart();
@@ -18313,8 +18356,8 @@ fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
         "expected multi-chunk encrypted recovery tail"
     );
 
-    let enc_ctx = crate::storage::encryption::EncryptionContext::new(
-        crate::storage::encryption::CipherMode::Aes256Gcm,
+    let enc_ctx = turso_core::storage::encryption::EncryptionContext::new(
+        turso_core::storage::encryption::CipherMode::Aes256Gcm,
         &EncryptionKey::from_hex_string(hex_key).unwrap(),
         4096,
     )
@@ -18338,9 +18381,9 @@ fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
 fn assert_log_payloads_decrypt(
     log_path: &std::path::Path,
     hex_key: &str,
-    cipher: crate::storage::encryption::CipherMode,
+    cipher: turso_core::storage::encryption::CipherMode,
 ) {
-    use crate::storage::encryption::EncryptionContext;
+    use turso_core::storage::encryption::EncryptionContext;
 
     let log_bytes = std::fs::read(log_path).expect("db-log file should exist");
     assert!(
@@ -18459,7 +18502,7 @@ fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
 #[cfg(feature = "conn_raw_api")]
 fn collect_mvcc_portable_change_bytes_with_encryption(
     conn: &Arc<Connection>,
-    encryption_ctx: crate::storage::encryption::EncryptionContext,
+    encryption_ctx: turso_core::storage::encryption::EncryptionContext,
 ) -> Vec<u8> {
     let mv_store = conn
         .mv_store()
@@ -18690,7 +18733,7 @@ fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
 #[test]
 fn test_mvcc_portable_changes_disabled_by_default() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -18830,7 +18873,7 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
 #[test]
 fn test_mvcc_mode_supports_cdc_for_client_push() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -19030,7 +19073,7 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
 #[test]
 fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let creator = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -19191,7 +19234,8 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
     });
     let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
     let pk_values = ImmutableRecord::from_bin_record(
-        crate::types::value_blob_from_slice(&delete_pk_record).expect(crate::alloc::ALLOC_ERR_MSG),
+        turso_core::types::value_blob_from_slice(&delete_pk_record)
+            .expect(turso_core::alloc::ALLOC_ERR_MSG),
     )
     .get_values_owned()
     .unwrap();
@@ -19228,7 +19272,8 @@ fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection()
         })
         .expect("expected data DELETE op");
     let pk_values = ImmutableRecord::from_bin_record(
-        crate::types::value_blob_from_slice(&delete_pk_record).expect(crate::alloc::ALLOC_ERR_MSG),
+        turso_core::types::value_blob_from_slice(&delete_pk_record)
+            .expect(turso_core::alloc::ALLOC_ERR_MSG),
     )
     .get_values_owned()
     .unwrap();
@@ -19324,7 +19369,7 @@ fn test_mvcc_portable_changes_mark_internal_only_commits_explicitly() {
 #[test]
 fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -19359,7 +19404,7 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
-    use crate::storage::encryption::{CipherMode, EncryptionContext};
+    use turso_core::storage::encryption::{CipherMode, EncryptionContext};
 
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let db = MvccTestDbNoConn::new_encrypted(hex_key);
@@ -19463,7 +19508,7 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
     assert_log_payloads_decrypt(
         &log_path,
         hex_key,
-        crate::storage::encryption::CipherMode::Aes256Gcm,
+        turso_core::storage::encryption::CipherMode::Aes256Gcm,
     );
 
     db.restart();
@@ -19497,7 +19542,7 @@ fn test_encrypted_recovery_multiple_restart_cycles() {
     assert_log_payloads_decrypt(
         &log_path,
         hex_key,
-        crate::storage::encryption::CipherMode::Aes256Gcm,
+        turso_core::storage::encryption::CipherMode::Aes256Gcm,
     );
     db.restart();
 
@@ -19546,7 +19591,7 @@ fn test_encrypted_recovery_corrupted_ciphertext() {
     assert_log_payloads_decrypt(
         &log_path,
         hex_key,
-        crate::storage::encryption::CipherMode::Aes256Gcm,
+        turso_core::storage::encryption::CipherMode::Aes256Gcm,
     );
 
     // Corrupt the portable_changes of the second (non-checkpointed) frame in the log file.
@@ -20458,7 +20503,7 @@ fn test_begin_tx_schema_generation_gate() {
         .begin_tx_with_schema_generation(pager.clone(), Some(generation))
         .unwrap();
     db.mvcc_store
-        .rollback_tx(tx, pager.clone(), &db.conn, crate::MAIN_DB_ID);
+        .rollback_tx(tx, pager.clone(), &db.conn, turso_core::MAIN_DB_ID);
 
     // Stale (mismatched) generation: forced reprepare.
     let err = db
@@ -20476,7 +20521,7 @@ fn test_begin_tx_schema_generation_gate() {
         .begin_tx_with_schema_generation(pager.clone(), None)
         .unwrap();
     db.mvcc_store
-        .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
+        .rollback_tx(tx, pager, &db.conn, turso_core::MAIN_DB_ID);
 }
 
 /// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
@@ -20567,8 +20612,8 @@ fn test_mvcc_passive_replace_then_delete_keeps_table_and_index_consistent() {
 ///   REPRO_READER_OPS=N     count samples per reader transaction (default 8)
 #[test]
 fn test_snapshot_stability_full() {
-    use crate::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+    use turso_core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
     // Honor RUST_LOG when set; ignored if a subscriber is already installed.
     // NOTE: deliberately NOT using `with_test_writer()` — that routes through
@@ -20940,7 +20985,7 @@ fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
     let rows = get_rows(&verify, "SELECT id, c, extra FROM t");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][1].to_string(), "a");
-    assert!(matches!(&rows[0][2], crate::types::Value::Null));
+    assert!(matches!(&rows[0][2], turso_core::types::Value::Null));
 }
 
 #[test]
@@ -21022,7 +21067,7 @@ fn test_open_with_mvcc_option_converts_fresh_database() {
         OpenFlags::default(),
         DatabaseOpts::new().with_mvcc(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     assert!(
@@ -21050,7 +21095,7 @@ fn test_open_with_mvcc_option_converts_fresh_database() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     assert!(db.mvcc_enabled());
@@ -21072,7 +21117,7 @@ fn test_open_with_mvcc_option_converts_existing_wal_database() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     assert!(!db.mvcc_enabled());
@@ -21093,7 +21138,7 @@ fn test_open_with_mvcc_option_converts_existing_wal_database() {
         OpenFlags::default(),
         DatabaseOpts::new().with_mvcc(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     assert!(db.mvcc_enabled(), "open must convert the WAL database");
@@ -21122,7 +21167,7 @@ fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     {
@@ -21141,7 +21186,7 @@ fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
         OpenFlags::default() | OpenFlags::ReadOnly,
         DatabaseOpts::new().with_mvcc(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     assert!(
@@ -21346,7 +21391,7 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
         .prepare("INSERT INTO t VALUES (NULL, 'leaker')")
         .unwrap();
     match leak_stmt.step().unwrap() {
-        crate::StepResult::Yield => {}
+        turso_core::StepResult::Yield => {}
         other => panic!("expected yield from injected seek_start; got {other:?}"),
     }
 
@@ -21366,8 +21411,8 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
             panic!("victim INSERT did not complete within 5s — rowid allocator lock leaked");
         }
         match victim_stmt.step().unwrap() {
-            crate::StepResult::Done => break,
-            crate::StepResult::IO | crate::StepResult::Yield => continue,
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => continue,
             other => panic!("unexpected step result on victim INSERT: {other:?}"),
         }
     }
@@ -21444,7 +21489,7 @@ fn dropped_concurrent_commit_does_not_strand_connection() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield => {}
             other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
@@ -21464,7 +21509,7 @@ fn dropped_concurrent_commit_does_not_strand_connection() {
     );
     assert_eq!(
         conn.get_tx_state(),
-        crate::connection::TransactionState::None,
+        turso_core::connection::TransactionState::None,
         "transaction_state must be reset after abort-side rollback"
     );
 
@@ -21511,7 +21556,7 @@ fn dropped_exclusive_commit_releases_locks() {
     {
         let mut commit = conn_a.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield => {}
             other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
@@ -21568,7 +21613,7 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield => {}
             other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
@@ -21614,7 +21659,7 @@ fn dropped_main_commit_rolls_back_temp_schema_changes() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield => {}
             other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
         }
     }
@@ -21671,7 +21716,7 @@ fn dropped_attached_commit_releases_attached_read_lock() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield => {}
             other => panic!("expected yield at attached LogRecordPrepared; got {other:?}"),
         }
     }
@@ -21737,7 +21782,7 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
     {
         let mut commit = conn.prepare("COMMIT").unwrap();
         match commit.step().unwrap() {
-            crate::StepResult::Yield => {}
+            turso_core::StepResult::Yield => {}
             other => panic!("expected yield at attached LogRecordPrepared; got {other:?}"),
         }
     }
@@ -21782,15 +21827,15 @@ fn busy_from_log_tx_does_not_block_subsequent_commit_without_group_commit() {
 }
 
 fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
-    use crate::io::FileSyncType;
-    use crate::mvcc;
-    use crate::mvcc::database::{LogRecord, RowVersion};
-    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
-    use crate::mvcc::persistent_storage::DurableStorage;
-    use crate::storage::encryption::EncryptionContext;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::{CheckpointResult, File, Result, IO};
     use std::time::Duration;
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::encryption::EncryptionContext;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::{CheckpointResult, File, Result, IO};
 
     /// BusyOnLogTxStorage is a test double that can be stubbed to return [LimboError::Busy] from log_tx.
     #[derive(Debug)]
@@ -21851,7 +21896,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
             checkpointed_through_ts: u64,
         ) -> Result<(
             Completion,
-            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
@@ -21924,7 +21969,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -21950,7 +21995,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     let db = Database::open(
         io,
         &path_str,
-        crate::OpenOptions::new(Arc::new(EngineDialect))
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
             .durable_storage(busy_storage.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
@@ -21971,7 +22016,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
 
-    let mv_store: Arc<crate::MvStore> = db.get_mv_store().clone().unwrap();
+    let mv_store: Arc<turso_core::MvStore> = db.get_mv_store().clone().unwrap();
 
     // Step 3: open a CONCURRENT tx, do an INSERT, then arm log_tx Busy.
     conn_a.execute("BEGIN CONCURRENT").unwrap();
@@ -22002,14 +22047,14 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
 /// finishes.
 #[test]
 fn logical_log_offset_advances_only_after_on_log_write_complete() {
-    use crate::io::FileSyncType;
-    use crate::mvcc;
-    use crate::mvcc::database::{LogRecord, RowVersion};
-    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
-    use crate::mvcc::persistent_storage::DurableStorage;
-    use crate::storage::encryption::EncryptionContext;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::{CheckpointResult, File, Result, IO};
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::encryption::EncryptionContext;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::{CheckpointResult, File, Result, IO};
 
     #[derive(Debug)]
     struct DeferredOnLogWriteCompleteStorage {
@@ -22084,7 +22129,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             checkpointed_through_ts: u64,
         ) -> Result<(
             Completion,
-            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
@@ -22141,7 +22186,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         Database::open(
             io,
             path,
-            crate::OpenOptions::new(Arc::new(EngineDialect))
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
                 .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
         )
         .unwrap()
@@ -22191,7 +22236,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -23507,7 +23552,7 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
         "writer should commit in the exclusive-acquire CAS window"
     );
     assert!(
-        matches!(result, Err(crate::LimboError::Busy)),
+        matches!(result, Err(turso_core::LimboError::Busy)),
         "stale DDL transaction should release exclusive and return Busy after post-CAS recheck: {result:?}"
     );
     assert!(
@@ -23571,7 +23616,7 @@ fn test_create_index_exclusive_acquire_rechecks_committed_tx_after_cas() {
         .take_writer_commit()
         .expect("writer COMMIT should pause before publishing last_committed_tx_ts");
     assert!(
-        matches!(result, Err(crate::LimboError::Busy)),
+        matches!(result, Err(turso_core::LimboError::Busy)),
         "DDL transaction older than an already-committed writer should return Busy: {result:?}"
     );
     assert!(!mvcc_store.is_exclusive_tx(&ddl_tx_id));
@@ -23621,7 +23666,7 @@ fn test_create_index_exclusive_acquire_rechecks_committed_tx_before_watermark_pu
 
     let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
     assert!(
-        matches!(result, Err(crate::LimboError::Busy)),
+        matches!(result, Err(turso_core::LimboError::Busy)),
         "DDL transaction older than an already-committed writer should return Busy: {result:?}"
     );
     ddl.execute("ROLLBACK").unwrap();
@@ -23673,7 +23718,7 @@ fn test_create_index_exclusive_acquire_after_dropped_commit_returns_busy() {
 
     let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
     assert!(
-        matches!(result, Err(crate::LimboError::Busy)),
+        matches!(result, Err(turso_core::LimboError::Busy)),
         "DDL transaction older than a committed writer should return Busy: {result:?}"
     );
     ddl.execute("ROLLBACK").unwrap();
@@ -23683,7 +23728,7 @@ fn test_create_index_exclusive_acquire_after_dropped_commit_returns_busy() {
     assert_eq!(rows.len(), 1);
 }
 
-/// Contract test for [`crate::StepResult::Yield`]: an explicit yield (here an
+/// Contract test for [`turso_core::StepResult::Yield`]: an explicit yield (here an
 /// injected one) must surface as `Yield`, not as `IO` — there are no pending
 /// completions to drive, so the caller can simply step the statement again,
 /// possibly after doing other work first.
@@ -23703,7 +23748,7 @@ fn injected_yield_surfaces_as_step_result_yield() {
     let mut commit = conn.prepare("COMMIT").unwrap();
     let first = commit.step().unwrap();
     assert!(
-        matches!(first, crate::StepResult::Yield),
+        matches!(first, turso_core::StepResult::Yield),
         "injected yield must surface as StepResult::Yield, got {first:?}"
     );
     conn.set_yield_injector(None);
@@ -23850,7 +23895,7 @@ fn prepare_recycled_root_pages_for_failed_checkpoint(conn: &Arc<Connection>) {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
 
-fn expect_database_full_checkpoint(result: crate::Result<()>) {
+fn expect_database_full_checkpoint(result: turso_core::Result<()>) {
     let error = result.expect_err("checkpoint must fail when max_page_count is exhausted");
     assert!(
         error.to_string().contains("database or disk is full"),
@@ -24104,7 +24149,7 @@ fn test_failed_checkpoint_preserves_secondary_index_consistency() {
 /// Concurrent DROP of a checkpointed table during a parked passive checkpoint must not panic.
 #[test]
 fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointed_table() {
-    use crate::StepResult;
+    use turso_core::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn_keep = db.connect();
@@ -24137,7 +24182,7 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
     conn_c.set_yield_injector(Some(injector.clone()));
     let mut checkpoint = conn_c.prepare("INSERT INTO other VALUES (1)").unwrap();
     let pager_io = conn_c.pager.load().io.clone();
-    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+    let step_to_next_yield = |checkpoint: &mut turso_core::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
                 StepResult::IO | StepResult::Yield => {
@@ -24188,7 +24233,7 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
 /// schema version (which would resurrect the table).
 #[test]
 fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -24228,7 +24273,7 @@ fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
         .unwrap();
     let pager_io = checkpoint_conn.pager.load().io.clone();
 
-    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+    let step_to_next_yield = |checkpoint: &mut turso_core::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
                 StepResult::IO | StepResult::Yield => {
@@ -24313,7 +24358,7 @@ fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
 /// until a later checkpoint actually frees that btree.
 #[test]
 fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -24363,7 +24408,7 @@ fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
         .unwrap();
     let pager_io = checkpoint_conn.pager.load().io.clone();
 
-    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+    let step_to_next_yield = |checkpoint: &mut turso_core::Statement, expect_remaining: usize| {
         for _ in 0..200_000 {
             match checkpoint.step().unwrap() {
                 StepResult::IO | StepResult::Yield => {
@@ -24439,15 +24484,15 @@ fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
 /// Unlocking before `on_checkpoint_end` races writers and the next checkpoint.
 #[test]
 fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
-    use crate::io::FileSyncType;
-    use crate::mvcc;
-    use crate::mvcc::database::{LogRecord, RowVersion};
-    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
-    use crate::mvcc::persistent_storage::DurableStorage;
-    use crate::storage::encryption::EncryptionContext;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::storage::wal::{CheckpointMode, TursoRwLock};
-    use crate::{CheckpointResult, File, Result, IO};
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::encryption::EncryptionContext;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::storage::wal::{CheckpointMode, TursoRwLock};
+    use turso_core::{CheckpointResult, File, Result, IO};
 
     #[derive(Debug)]
     struct ObserveCheckpointEndStorage {
@@ -24512,7 +24557,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             checkpointed_through_ts: u64,
         ) -> Result<(
             Completion,
-            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
@@ -24584,7 +24629,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -24609,7 +24654,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let db = Database::open(
         io,
         &path_str,
-        crate::OpenOptions::new(Arc::new(EngineDialect))
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
             .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
@@ -24755,13 +24800,13 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
 }
 
 struct ResumeCheckpointAtSeekStartInjector {
-    checkpoint: Mutex<Option<crate::Statement>>,
+    checkpoint: Mutex<Option<turso_core::Statement>>,
     io: Arc<dyn IO>,
     fired: AtomicBool,
 }
 
 impl ResumeCheckpointAtSeekStartInjector {
-    fn new(checkpoint: crate::Statement, io: Arc<dyn IO>) -> Arc<Self> {
+    fn new(checkpoint: turso_core::Statement, io: Arc<dyn IO>) -> Arc<Self> {
         Arc::new(Self {
             checkpoint: Mutex::new(Some(checkpoint)),
             io,
@@ -24823,14 +24868,14 @@ fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
     let mut parked = false;
     for _ in 0..200_000 {
         match delayed.step().unwrap() {
-            crate::StepResult::Yield | crate::StepResult::IO => {
+            turso_core::StepResult::Yield | turso_core::StepResult::IO => {
                 if park.is_empty() {
                     parked = true;
                     break;
                 }
                 io.step().unwrap();
             }
-            crate::StepResult::Done => break,
+            turso_core::StepResult::Done => break,
             other => panic!("unexpected checkpoint step: {other:?}"),
         }
     }
@@ -24876,14 +24921,14 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
     let mut parked = false;
     for _ in 0..200_000 {
         match delayed.step().unwrap() {
-            crate::StepResult::Yield | crate::StepResult::IO => {
+            turso_core::StepResult::Yield | turso_core::StepResult::IO => {
                 if park.is_empty() {
                     parked = true;
                     break;
                 }
                 io.step().unwrap();
             }
-            crate::StepResult::Done => break,
+            turso_core::StepResult::Done => break,
             other => panic!("unexpected checkpoint step: {other:?}"),
         }
     }
@@ -24912,12 +24957,12 @@ mod group_commit_sync_mode_tests;
 /// Drive a statement until it yields or finishes; IO is pumped, an explicit
 /// yield is handed back so the test can observe it.
 fn step_until_yield_or_done_pumping_io(
-    stmt: &mut crate::Statement,
+    stmt: &mut turso_core::Statement,
     io: &dyn IO,
-) -> crate::StepResult {
+) -> turso_core::StepResult {
     for _ in 0..100_000 {
         match stmt.step().unwrap() {
-            crate::StepResult::IO => {
+            turso_core::StepResult::IO => {
                 if let Some(pending) = stmt.take_io_completions() {
                     pending.wait(io).unwrap();
                 }
@@ -24965,7 +25010,7 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     assert!(
         matches!(
             step_until_yield_or_done_pumping_io(&mut parked, database.io.as_ref()),
-            crate::StepResult::Yield
+            turso_core::StepResult::Yield
         ),
         "ANALYZE t2 should park inside its commit"
     );
@@ -24973,17 +25018,17 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
 
     // While the writer is parked, connect_async must keep handing the wait
     // back instead of completing or spinning. (`connect()` never returns here.)
-    let mut state = crate::ConnectAsyncState::new();
+    let mut state = turso_core::ConnectAsyncState::new();
     let mut yielded = false;
     for _ in 0..1_000 {
         match database
             .connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state)
             .unwrap()
         {
-            crate::IOResult::Done(_) => panic!(
+            turso_core::IOResult::Done(_) => panic!(
                 "connect must not complete while the commit its stats scan depends on is parked"
             ),
-            crate::IOResult::IO(io) => {
+            turso_core::IOResult::IO(io) => {
                 yielded |= io.is_explicit_yield();
                 io.wait(database.io.as_ref()).unwrap();
             }
@@ -24998,8 +25043,8 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     // connect state runs to completion with fresh stats.
     loop {
         match parked.step().unwrap() {
-            crate::StepResult::Done => break,
-            crate::StepResult::IO | crate::StepResult::Yield => {
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                 if let Some(io) = parked.take_io_completions() {
                     io.wait(database.io.as_ref()).unwrap();
                 }
@@ -25012,8 +25057,8 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
             .connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state)
             .unwrap()
         {
-            crate::IOResult::Done(conn) => break conn,
-            crate::IOResult::IO(io) => io.wait(database.io.as_ref()).unwrap(),
+            turso_core::IOResult::Done(conn) => break conn,
+            turso_core::IOResult::IO(io) => io.wait(database.io.as_ref()).unwrap(),
         }
     };
     let schema = conn.schema.read();
@@ -25053,19 +25098,19 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     let mut parked = writer.prepare("ANALYZE t1").unwrap();
     assert!(matches!(
         step_until_yield_or_done_pumping_io(&mut parked, database.io.as_ref()),
-        crate::StepResult::Yield
+        turso_core::StepResult::Yield
     ));
     writer.set_yield_injector(None);
 
-    let mut state = crate::ConnectAsyncState::new();
+    let mut state = turso_core::ConnectAsyncState::new();
     let mut yielded = false;
     for _ in 0..100 {
         match database
             .connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state)
             .unwrap()
         {
-            crate::IOResult::Done(_) => panic!("connect must wait for the parked commit"),
-            crate::IOResult::IO(io) => {
+            turso_core::IOResult::Done(_) => panic!("connect must wait for the parked commit"),
+            turso_core::IOResult::IO(io) => {
                 yielded |= io.is_explicit_yield();
                 io.wait(database.io.as_ref()).unwrap();
             }
@@ -25077,8 +25122,8 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
 
     loop {
         match parked.step().unwrap() {
-            crate::StepResult::Done => break,
-            crate::StepResult::IO | crate::StepResult::Yield => {
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                 if let Some(io) = parked.take_io_completions() {
                     io.wait(database.io.as_ref()).unwrap();
                 }
@@ -25098,8 +25143,11 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
         .is_some());
 }
 
-fn drive_statement_to_done(statement: &mut crate::Statement, pager_io: &Arc<dyn crate::IO>) {
-    use crate::StepResult;
+fn drive_statement_to_done(
+    statement: &mut turso_core::Statement,
+    pager_io: &Arc<dyn turso_core::IO>,
+) {
+    use turso_core::StepResult;
     for _ in 0..200_000 {
         match statement.step().unwrap() {
             StepResult::Done => return,
@@ -25112,7 +25160,7 @@ fn drive_statement_to_done(statement: &mut crate::Statement, pager_io: &Arc<dyn 
 
 #[test]
 fn commit_between_checkpoint_snapshot_and_collection_survives_restart() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
     {
@@ -25294,7 +25342,7 @@ fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
 
 #[test]
 fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
-    use crate::StepResult;
+    use turso_core::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -25311,11 +25359,13 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
         let db = Database::open(
             io,
             &path,
-            crate::OpenOptions::new(Arc::new(EngineDialect))
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
                 .db_opts(opts)
-                .allocators(crate::DatabaseAllocators {
-                    mv_store: crate::alloc::DynAllocator::new(OneShotFaultAlloc(fault.clone())),
-                    fts: crate::alloc::DynAllocator::default(),
+                .allocators(turso_core::DatabaseAllocators {
+                    mv_store: turso_core::alloc::DynAllocator::new(OneShotFaultAlloc(
+                        fault.clone(),
+                    )),
+                    fts: turso_core::alloc::DynAllocator::default(),
                 }),
         )
         .unwrap();
@@ -25450,7 +25500,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
         OpenFlags::default(),
         opts,
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let rows = get_rows(
@@ -25493,27 +25543,27 @@ struct OneShotAllocFault {
 #[derive(Clone, Debug)]
 struct OneShotFaultAlloc(Arc<OneShotAllocFault>);
 
-unsafe impl crate::alloc::ApiAllocator for OneShotFaultAlloc {
+unsafe impl turso_core::alloc::ApiAllocator for OneShotFaultAlloc {
     fn allocate(
         &self,
-        layout: crate::alloc::Layout,
-    ) -> std::result::Result<std::ptr::NonNull<[u8]>, crate::alloc::AllocError> {
+        layout: turso_core::alloc::Layout,
+    ) -> std::result::Result<std::ptr::NonNull<[u8]>, turso_core::alloc::AllocError> {
         if self.0.armed.swap(false, Ordering::SeqCst) {
             self.0.fired.fetch_add(1, Ordering::SeqCst);
             *self.0.failed_allocation.lock() =
                 Some(std::backtrace::Backtrace::force_capture().to_string());
-            return Err(crate::alloc::AllocError);
+            return Err(turso_core::alloc::AllocError);
         }
-        <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::allocate(
-            &crate::alloc::TursoAllocator,
+        <turso_core::alloc::TursoAllocator as turso_core::alloc::ApiAllocator>::allocate(
+            &turso_core::alloc::TursoAllocator,
             layout,
         )
     }
 
-    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: crate::alloc::Layout) {
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: turso_core::alloc::Layout) {
         unsafe {
-            <crate::alloc::TursoAllocator as crate::alloc::ApiAllocator>::deallocate(
-                &crate::alloc::TursoAllocator,
+            <turso_core::alloc::TursoAllocator as turso_core::alloc::ApiAllocator>::deallocate(
+                &turso_core::alloc::TursoAllocator,
                 ptr,
                 layout,
             )
@@ -25572,7 +25622,7 @@ fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
 }
 
 fn step_until_busy_then_release(
-    stmt: &mut crate::Statement,
+    stmt: &mut turso_core::Statement,
     lock_holder: &Arc<Connection>,
 ) -> Result<()> {
     let mut released = false;

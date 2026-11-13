@@ -2095,7 +2095,7 @@ mod immutable_record {
             }
         }
 
-        pub(crate) fn from_shared_record(
+        pub fn from_shared_record(
             payload: crate::alloc::ArcSlice<u8>,
         ) -> ImmutableRecordRef<'static> {
             ImmutableRecordRef {

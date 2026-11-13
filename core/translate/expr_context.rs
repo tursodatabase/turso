@@ -29,7 +29,7 @@ pub(crate) trait ExprProperties<
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ExprContext<'a, 'schema> {
+pub struct ExprContext<'a, 'schema> {
     tables: TableMetadata<'a>,
     resolver: &'a Resolver<'schema>,
 }

@@ -11,7 +11,7 @@ use super::{
     sqlite3_ondisk::{IndexInteriorCell, OverflowCell, MINIMUM_CELL_SIZE},
 };
 use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoVecExt};
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::{
@@ -380,17 +380,17 @@ enum WriteState {
     Finish,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub(crate) enum BTreeWriteYieldPoint {
     AfterInsertOverflowCellBeforeBalance,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 pub(crate) const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl YieldPointMarker for BTreeWriteYieldPoint {
     const POINT_COUNT: u8 = 1;
 
@@ -987,9 +987,9 @@ pub struct BTreeCursor {
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
     did_register: crate::sync::atomic::AtomicBool,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     yield_instance_id: u64,
 }
 
@@ -1338,14 +1338,14 @@ impl BTreeCursor {
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
             did_register: crate::sync::atomic::AtomicBool::new(false),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_injector: None,
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_instance_id: 0,
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub(crate) fn install_yield_context(&mut self, connection: &crate::Connection) {
         self.yield_injector = connection.yield_injector();
         self.yield_instance_id = connection.next_yield_instance_id();
@@ -6640,7 +6640,7 @@ impl BTreeCursor {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl ProvidesYieldContext for BTreeCursor {
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(

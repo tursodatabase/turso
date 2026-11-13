@@ -420,7 +420,7 @@ impl Connection {
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
     #[cfg(feature = "fs")]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "test_helper")), allow(dead_code))]
     pub(crate) fn attach_database_with_config(
         &self,
         path: &str,

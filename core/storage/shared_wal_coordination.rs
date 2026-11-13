@@ -84,7 +84,7 @@ static NEXT_SHARED_OWNER_INSTANCE_ID: AtomicU32 = AtomicU32::new(1);
 /// This registry enforces that invariant for callers that bypass the manager.
 ///
 /// Unit tests still use it as a shim to share same-process bookkeeping across
-/// duplicate opens, but only under `cfg(test)`. That test-only convenience must
+/// duplicate opens, but only under `cfg(any(test, feature = "test_helper"))`. That test-only convenience must
 /// not change the durable cross-process meaning of `open_mode`.
 static PROCESS_LOCAL_COORDINATION_OPENS: LazyLock<
     Mutex<HashMap<PathBuf, ProcessLocalCoordinationEntry>>,
@@ -95,11 +95,11 @@ struct ProcessLocalCoordinationEntry {
     /// Number of live mappings in this process for the same canonical tshm path.
     open_count: usize,
     /// Shared publish mutex reused only by tests that bypass `DATABASE_MANAGER`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     frame_index_publish_lock: Arc<Mutex<()>>,
     /// Same-process ownership registry shared only by tests that bypass
     /// `DATABASE_MANAGER`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
 }
 
@@ -514,7 +514,7 @@ impl SharedWalBackfillProof {
     }
 
     /// Compute the checksum covering the serialized proof payload.
-    fn crc32c(self) -> u32 {
+    pub fn crc32c(self) -> u32 {
         let mut bytes = [0u8; Self::CRC_INPUT_LEN];
         bytes[0..4].copy_from_slice(&SHARED_WAL_BACKFILL_PROOF_VERSION.to_le_bytes());
         bytes[4..12].copy_from_slice(&self.nbackfills.to_le_bytes());
@@ -686,7 +686,7 @@ pub(crate) struct MappedSharedWalCoordination {
     sanitized_backfill_proof_on_open: bool,
     /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     frame_index_blocks_scanned: AtomicU64,
 }
 
@@ -807,7 +807,7 @@ impl MappedSharedWalCoordination {
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             frame_index_blocks_scanned: AtomicU64::new(0),
         }
     }
@@ -826,10 +826,10 @@ impl MappedSharedWalCoordination {
     ) -> Result<ProcessMappingResult> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test_helper")))]
         let _ = reader_slot_count;
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         if let Some(entry) = opens.get_mut(&canonical_path) {
             turso_assert!(
                 entry.ownership.lock().reader_owners.len() == reader_slot_count as usize,
@@ -843,7 +843,7 @@ impl MappedSharedWalCoordination {
             ));
         }
 
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test_helper")))]
         if opens.contains_key(&canonical_path) {
             return Err(LimboError::InternalError(format!(
                 "duplicate same-process shared WAL coordination open for '{}' is unsupported; callers must reuse the existing Database/authority",
@@ -855,9 +855,9 @@ impl MappedSharedWalCoordination {
             canonical_path.clone(),
             ProcessLocalCoordinationEntry {
                 open_count: 1,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 frame_index_publish_lock: frame_index_publish_lock.clone(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 ownership: process_local_ownership.clone(),
             },
         );
@@ -894,7 +894,7 @@ impl MappedSharedWalCoordination {
         Self::open_existing_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn create_or_open_process_scoped_for_tests(
         io: &Arc<dyn IO>,
         path: &Path,
@@ -908,7 +908,7 @@ impl MappedSharedWalCoordination {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     /// Force the overflow bit for tests that need to exercise fallback WAL scans.
     pub(crate) fn mark_frame_index_overflowed_for_tests(&self) {
         self.header()
@@ -916,7 +916,7 @@ impl MappedSharedWalCoordination {
             .store(1, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
         self.frame_index_blocks_scanned.swap(0, Ordering::Relaxed)
     }
@@ -2482,7 +2482,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
@@ -2539,7 +2539,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;

@@ -1061,6 +1061,7 @@ impl From<&str> for CacheMode {
 }
 
 impl OpenMode {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         let s_bytes = s.trim().as_bytes();
         match_ignore_ascii_case!(match s_bytes {
@@ -1287,6 +1288,7 @@ pub fn trim_ascii_whitespace(s: &str) -> &str {
 /// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
 ///
 /// `lossless`: If `true`, rejects the input if any characters remain after the numeric prefix (strict / exact conversion).
+#[allow(clippy::result_unit_err)]
 pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::Result<Value, ()> {
     // sqlite will parse the first N digits of a string to numeric value, then determine
     // whether _that_ value is more likely a real or integer value. e.g.
@@ -1412,6 +1414,7 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
 // 2. The integer must be strictly between i64::MIN and i64::MAX (exclusive)
 //
 // This matches SQLite's check: ix > SMALLEST_INT64 && ix < LARGEST_INT64
+#[allow(clippy::result_unit_err)]
 pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
     // Must be finite and a whole number (no fractional part)
     if !float.is_finite() || float.trunc() != float {

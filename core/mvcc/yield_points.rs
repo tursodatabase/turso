@@ -35,13 +35,14 @@ pub trait FailureInjector: Debug + Send + Sync {
 
 // At a safe resumable boundary, ask the active yield injector whether this
 // state machine should return a synthetic TransitionResult::Io yield here.
+#[macro_export]
 macro_rules! inject_transition_yield {
     ($state_machine:expr, $point:expr) => {{
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
             let yield_context = $state_machine.yield_context();
-            if let Some(result) = crate::mvcc::yield_hooks::maybe_inject_transition_yield(
+            if let Some(result) = $crate::mvcc::yield_hooks::maybe_inject_transition_yield(
                 yield_context.injector.as_ref(),
                 yield_context.instance_id,
                 yield_context.selection_key,
@@ -53,13 +54,13 @@ macro_rules! inject_transition_yield {
     }};
 }
 
-pub(crate) use inject_transition_yield;
+pub use inject_transition_yield;
 
 // At a safe resumable boundary, ask the active yield injector whether this
 // state machine should return a synthetic IOResult::IO yield here.
 macro_rules! inject_io_yield {
     ($state_machine:expr, $point:expr) => {{
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
             let yield_context = $state_machine.yield_context();
@@ -80,13 +81,14 @@ pub(crate) use inject_io_yield;
 // At a safe resumable boundary, ask the active failure injector whether this
 // state machine should return Err here. Used to reproduce mid-commit failures
 // in tests without requiring a real I/O fault.
+#[macro_export]
 macro_rules! inject_transition_failure {
     ($state_machine:expr, $point:expr) => {{
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
         {
             use $crate::mvcc::yield_hooks::ProvidesYieldContext;
             let yield_context = $state_machine.yield_context();
-            if let Some(err) = crate::mvcc::yield_hooks::maybe_inject_transition_failure(
+            if let Some(err) = $crate::mvcc::yield_hooks::maybe_inject_transition_failure(
                 yield_context.failure_injector.as_ref(),
                 yield_context.instance_id,
                 yield_context.selection_key,
@@ -98,4 +100,4 @@ macro_rules! inject_transition_failure {
     }};
 }
 
-pub(crate) use inject_transition_failure;
+pub use inject_transition_failure;

@@ -4,7 +4,7 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::NamespaceId;
@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
@@ -67,8 +67,8 @@ pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
-mod group_commit;
-pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
+pub mod group_commit;
+pub use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
@@ -83,11 +83,6 @@ use super::portable_logical::{
     is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
     portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
 };
-
-#[cfg(test)]
-pub mod hermitage_tests;
-#[cfg(test)]
-pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
@@ -119,8 +114,8 @@ pub(crate) fn first_unsafe_sequence_watermark(seq: &Sequence, value: i64, is_cal
     }
 }
 
-#[cfg(not(any(test, injected_yields)))]
-struct YieldContext;
+#[cfg(not(any(any(test, feature = "test_helper"), injected_yields)))]
+pub struct YieldContext;
 
 /// A table ID for MVCC.
 /// MVCC table IDs are always negative. Their corresponding rootpage entry in sqlite_schema
@@ -158,7 +153,7 @@ type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions<A>, Ba
 type TxEntry<'a, A = TursoAllocator> = Entry<'a, TxID, Transaction<A>, BasicComparator, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
     Entry<'a, Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
-type IndexRowsEntry<'a, A = TursoAllocator> =
+pub type IndexRowsEntry<'a, A = TursoAllocator> =
     Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
 type TableRowIterator<'a, A = TursoAllocator> =
     Box<dyn Iterator<Item = TableRowEntry<'a, A>> + Send + Sync + 'a>;
@@ -414,7 +409,7 @@ impl Row {
 /// than a zero sentinel) are required because `Timestamp(0)` is a real value —
 /// the logical clock hands out timestamp 0 to the first transaction.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PackedTs(u64);
+pub struct PackedTs(u64);
 
 impl PackedTs {
     const TIMESTAMP_TAG: u64 = 1 << 62;
@@ -423,7 +418,7 @@ impl PackedTs {
     const NONE: PackedTs = PackedTs(0);
 
     #[inline]
-    pub(crate) fn pack(value: Option<TxTimestampOrID>) -> Self {
+    pub fn pack(value: Option<TxTimestampOrID>) -> Self {
         match value {
             None => Self::NONE,
             Some(TxTimestampOrID::Timestamp(ts)) => {
@@ -466,8 +461,8 @@ pub struct RowVersion {
     /// [`RowVersion::set_begin`]/[`RowVersion::set_end`]; the raw `PackedTs`
     /// fields are `pub(crate)` only so they can be set in struct literals (via
     /// `PackedTs::pack`).
-    pub(crate) begin: PackedTs,
-    pub(crate) end: PackedTs,
+    pub begin: PackedTs,
+    pub end: PackedTs,
     /// The record of a table row. `None` for an index row, because the key of
     /// its chain is the record. A version does not store its `RowID`: every
     /// version in a chain has the `RowID` of the chain.
@@ -485,7 +480,7 @@ pub struct RowVersion {
     /// read mark has reached that position — otherwise a reader pinned below it reads the stale
     /// B-tree and the version it needed is gone. Set by the checkpoint at materialization
     /// ([`MvStore::stamp_materialized`]); reset to ORIGIN when a delete supersedes the row.
-    pub(crate) materialized_at: WalPos,
+    pub materialized_at: WalPos,
 }
 
 #[derive(Debug)]
@@ -502,7 +497,7 @@ pub type TxID = u64;
 /// chunk-encrypts the payload) and writes to disk.
 #[derive(Debug)]
 pub struct LogRecord {
-    pub(crate) tx_timestamp: TxID,
+    pub tx_timestamp: TxID,
     /// Frame buffer that grows in place into the on-disk representation.
     /// The first `LOG_HDR_SIZE + TX_HEADER_SIZE` bytes are pre-reserved
     /// (zeros) so that op-entry appends land at the correct on-disk
@@ -535,7 +530,7 @@ impl LogRecord {
         feature = "aristo-instr",
         aristo::instrument::expose_pub(as = "new_for_test")
     )]
-    pub(crate) fn new(tx_timestamp: TxID, alloc: DynAllocator) -> Result<Self> {
+    pub fn new(tx_timestamp: TxID, alloc: DynAllocator) -> Result<Self> {
         let buf: DynVec<u8> = crate::alloc::try_vec![
             0;
             crate::mvcc::persistent_storage::logical_log::LOG_RECORD_PREFIX_SIZE;
@@ -561,7 +556,7 @@ impl LogRecord {
         })
     }
 
-    fn empty(tx_timestamp: TxID, alloc: DynAllocator) -> Self {
+    pub fn empty(tx_timestamp: TxID, alloc: DynAllocator) -> Self {
         Self {
             tx_timestamp,
             buf: <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(alloc),
@@ -592,8 +587,8 @@ impl LogRecord {
     /// [`DurableStorage::serialize_row_version`] and
     /// [`DurableStorage::serialize_database_header`] instead so the bytes are
     /// appended one op at a time.
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn for_test(
         tx_timestamp: TxID,
         row_versions: &[(RowID, RowVersion)],
         header: Option<DatabaseHeader>,
@@ -610,8 +605,8 @@ impl LogRecord {
     }
 
     /// Test-only: append one row-version op to the payload buffer.
-    #[cfg(test)]
-    pub(crate) fn push_row_version_for_test(&mut self, row_id: &RowID, row_version: &RowVersion) {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn push_row_version_for_test(&mut self, row_id: &RowID, row_version: &RowVersion) {
         crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
             .serialize_op_entry(row_id, row_version, None)
             .expect("failed to serialize row version in test");
@@ -619,7 +614,7 @@ impl LogRecord {
     }
 
     /// Test-only: append a `DatabaseHeader` op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
         assert!(!self.has_header, "header op appended twice in test");
         crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
@@ -856,7 +851,7 @@ pub struct Savepoint {
     header_dirty: bool,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
-    created_table_versions: Vec<(RowID, u64)>,
+    pub created_table_versions: Vec<(RowID, u64)>,
     created_index_versions: Vec<((MVTableId, Arc<SortableIndexKey>), u64)>,
     /// Versions DELETED during this savepoint (end timestamp set).
     /// On rollback: clear end timestamp to restore visibility.
@@ -932,8 +927,8 @@ struct SavepointRollbackResult {
 /// the transaction created or deleted, so a writer adds a chain only when the
 /// chain had no such version before the write. Thus each chain appears once.
 #[derive(Debug)]
-struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
-    entries: Vec<(RowID, RowVersions<A>)>,
+pub struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
+    pub entries: Vec<(RowID, RowVersions<A>)>,
 }
 
 impl<A: RowVersionAllocator> Default for WriteSet<A> {
@@ -945,27 +940,27 @@ impl<A: RowVersionAllocator> Default for WriteSet<A> {
 }
 
 impl<A: RowVersionAllocator> WriteSet<A> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    fn push(&mut self, id: RowID, row_versions: RowVersions<A>) {
+    pub fn push(&mut self, id: RowID, row_versions: RowVersions<A>) {
         self.entries.push((id, row_versions));
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    fn iter(&self) -> std::slice::Iter<'_, (RowID, RowVersions<A>)> {
+    pub fn iter(&self) -> std::slice::Iter<'_, (RowID, RowVersions<A>)> {
         self.entries.iter()
     }
 
-    fn take(&mut self) -> Self {
+    pub fn take(&mut self) -> Self {
         std::mem::take(self)
     }
 }
@@ -974,56 +969,56 @@ impl<A: RowVersionAllocator> WriteSet<A> {
 #[derive(Debug)]
 pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// The state of the transaction.
-    state: AtomicTransactionState,
+    pub state: AtomicTransactionState,
     /// The transaction ID.
-    tx_id: u64,
+    pub tx_id: u64,
     /// The transaction begin timestamp.
-    begin_ts: u64,
+    pub begin_ts: u64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
-    write_set: Mutex<WriteSet<A>>,
+    pub write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
-    header: RwLock<DatabaseHeader>,
+    pub header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
-    header_dirty: AtomicBool,
+    pub header_dirty: AtomicBool,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
-    savepoint_stack: RwLock<Vec<Savepoint>>,
+    pub savepoint_stack: RwLock<Vec<Savepoint>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
-    pager_commit_lock_held: AtomicBool,
+    pub pager_commit_lock_held: AtomicBool,
     /// True once this transaction's commit record is in the logical log.
     /// From then on the transaction commits whatever happens to the
     /// statement driving it: later records are chained after its record
     /// and recovery replays it.
-    log_appended: AtomicBool,
+    pub log_appended: AtomicBool,
     /// Number of unresolved commit dependencies (must reach 0 before commit).
     /// i.e the number of transactions this transaction is dependent on and waiting for
     /// commit or abort.
     /// Hekaton Section 2.7: "A transaction cannot commit until this counter is zero."
-    commit_dep_counter: AtomicU64,
+    pub commit_dep_counter: AtomicU64,
     /// Flag: a depended-on transaction aborted; this transaction must abort too.
     /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
-    abort_now: AtomicBool,
+    pub abort_now: AtomicBool,
     /// Transaction IDs that depend on this transaction (notified on commit/abort).
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
-    commit_dep_set: Mutex<HashSet<TxID>>,
+    pub commit_dep_set: Mutex<HashSet<TxID>>,
     /// True when this transaction holds `blocking_checkpoint_lock` in read mode
     /// (truncate / flag-off path only). Passive `begin_tx` does not pin the lock.
-    holds_blocking_checkpoint_read: AtomicBool,
+    pub holds_blocking_checkpoint_read: AtomicBool,
     /// `MvStore::schema_generation` captured at `begin_tx` (passive root publication gate).
-    schema_generation_at_begin: u64,
+    pub schema_generation_at_begin: u64,
     /// This transaction's frozen WAL read mark `(checkpoint_seq, max_frame)`, captured when it
     /// pinned its read transaction at begin. A checkpoint-materialized B-tree is physically
     /// reachable by this transaction only if `materialized_at <= read_mark` — i.e. the
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
-    read_mark: WalPos,
+    pub read_mark: WalPos,
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
-    created_table_ids: Mutex<Vec<MVTableId>>,
+    pub created_table_ids: Mutex<Vec<MVTableId>>,
     /// The portable logical-change setting of the connection when this transaction
     /// began.
-    portable_logical_changes: bool,
+    pub portable_logical_changes: bool,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1059,7 +1054,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
     /// Adds a chain that this transaction just wrote for the first time. The caller
     /// must make sure that the chain had no version of this transaction before the
     /// write, because the write set does not check for duplicates.
-    fn add_to_write_set(&self, id: RowID, row_versions: RowVersions<A>) {
+    pub fn add_to_write_set(&self, id: RowID, row_versions: RowVersions<A>) {
         turso_assert_eq!(
             self.state,
             TransactionState::Active,
@@ -1069,7 +1064,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
     }
 
     /// Begin a new savepoint for statement-level tracking.
-    fn begin_savepoint(&self) {
+    pub fn begin_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
         let header = *self.header.read();
@@ -1323,7 +1318,7 @@ impl<A: RowVersionAllocator> std::fmt::Display for Transaction<A> {
 
 /// Transaction state.
 #[derive(Debug, Clone, PartialEq, Copy)]
-enum TransactionState {
+pub enum TransactionState {
     Active,
     /// Preparing state includes the end_ts so other transactions can compare
     /// timestamps during validation to resolve races (first-committer-wins).
@@ -1375,7 +1370,7 @@ impl TransactionState {
 
 // Transaction state encoded into a single 64-bit atomic.
 #[derive(Debug)]
-pub(crate) struct AtomicTransactionState {
+pub struct AtomicTransactionState {
     pub(crate) state: AtomicU64,
 }
 
@@ -1413,11 +1408,11 @@ impl std::fmt::Display for TransactionState {
 }
 
 impl AtomicTransactionState {
-    fn store(&self, state: TransactionState) {
+    pub fn store(&self, state: TransactionState) {
         self.state.store(state.encode(), Ordering::Release);
     }
 
-    fn load(&self) -> TransactionState {
+    pub fn load(&self) -> TransactionState {
         TransactionState::decode(self.state.load(Ordering::Acquire))
     }
 }
@@ -1538,7 +1533,7 @@ pub struct RewriteLiveVersionsCtx {
 /// How many rowids `BuildLogRecord` / `RewriteLiveVersions` process before
 /// yielding to the executor. Picked to amortize state-machine overhead
 /// while keeping a CREATE INDEX on a 2M-row table responsive.
-const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
+pub const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub enum WriteRowState {
@@ -1552,10 +1547,10 @@ pub enum WriteRowState {
     Next,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CommitYieldPoint {
+pub enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     /// Fires once on the first entry into `step_build_log_record` (cursor=0,
@@ -1582,14 +1577,14 @@ pub(crate) enum CommitYieldPoint {
     LogicalLogWriteIssued,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum ExclusiveTxYieldPoint {
+pub enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl YieldPointMarker for ExclusiveTxYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -1598,7 +1593,7 @@ impl YieldPointMarker for ExclusiveTxYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl YieldPointMarker for CommitYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -1607,14 +1602,14 @@ impl YieldPointMarker for CommitYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 fn commit_yield_key(tx_id: u64) -> u64 {
     // any large number will do
     const COMMIT_SELECTION_TAG: u64 = 0xC011_C011_C011_C011;
     tx_id ^ COMMIT_SELECTION_TAG
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
     for CommitStateMachine<Clock, A>
 {
@@ -1631,7 +1626,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
 pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     state: CommitState<Clock, A>,
     is_finalized: bool,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
@@ -1756,7 +1751,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         Ok(Self {
             state,
             is_finalized: false,
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
@@ -4016,11 +4011,11 @@ impl DeleteRowStateMachine {
 }
 
 pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
-pub(crate) const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
+pub const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
 /// Indicates the maximum transaction timestamp that has been made durable in the WAL.
 /// Used to determine the replay boundary for recovery; only records with a higher timestamp
 /// are replayed.
-pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
+pub const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
 
 #[derive(Debug)]
 pub struct RowidAllocator {
@@ -4030,7 +4025,7 @@ pub struct RowidAllocator {
     lock: TursoRwLock,
     /// Monotonically increasing counter. 0 = empty table (rowids start at 1).
     /// Updated via atomic CAS — no RwLock needed on the fast path.
-    max_rowid: AtomicI64,
+    pub max_rowid: AtomicI64,
     /// True after the first btree-max scan. Never reset to false.
     initialized: AtomicBool,
 }
@@ -4345,9 +4340,9 @@ impl RootEntry {
 
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
 /// Test-only harness data, not part of the public MVCC API.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GcDebugSnapshot {
+pub struct GcDebugSnapshot {
     pub rows_slots: usize,
     pub rows_empty_slots: usize,
     pub rows_versions: usize,
@@ -4399,10 +4394,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// their next MVCC row again on a mismatch, like index cursors do with
     /// [`Self::index_rows_epoch`].
     table_rows_epoch: AtomicU64,
-    txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    pub txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
-    finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
+    pub finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
     /// Allocator backing every skiplist in this store, including lazily
     /// created per-index maps in `index_rows`.
     alloc: A,
@@ -4419,7 +4414,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// Stored behind a trait object so callers can inject their own implementation
     /// per database (via `Database::durable_storage`) for testing or custom durability.
-    storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
+    pub storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
 
     /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
     ///
@@ -4429,14 +4424,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// If there is no exclusive transaction, the field is set to `NO_EXCLUSIVE_TX`.
     exclusive_tx: AtomicU64,
-    commit_coordinator: Arc<CommitCoordinator>,
-    global_header: Arc<RwLock<Option<DatabaseHeader>>>,
+    pub commit_coordinator: Arc<CommitCoordinator>,
+    pub global_header: Arc<RwLock<Option<DatabaseHeader>>>,
     /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
     /// MvStore → WAL write-out runs unlocked, so concurrent `BEGIN CONCURRENT`s aren't
     /// blocked. Phases: (unlocked) snapshot + collect + write + commit pager txn;
     /// (locked) publish durable_txid_max / global_header / schema roots; (unlocked) GC,
     /// CheckpointWal, truncate logical log, TruncateWal.
-    blocking_checkpoint_lock: Arc<TursoRwLock>,
+    pub blocking_checkpoint_lock: Arc<TursoRwLock>,
     /// Passive publish drain: set for the brief in-memory publish window so new `begin_tx`
     /// calls contend out instead of pinning a lifetime checkpoint read guard.
     checkpoint_publish_in_progress: AtomicBool,
@@ -4457,21 +4452,21 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     checkpoint_full_scan_min_snapshot_ts: AtomicU64,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
-    durable_txid_max: AtomicU64,
+    pub durable_txid_max: AtomicU64,
     /// The WAL backfill boundary published by the most recent checkpoint: a version materialized at
     /// or below this `WalPos` is durably in the DB file, so reachable by EVERY snapshot (including
     /// a db-file reader pinned at the boundary). The passive checkpoint GC reclaims a materialized version
     /// only once its `materialized_at <= backfill_floor` — otherwise a low-frame reader that
     /// cannot reach the un-backfilled WAL frame still needs the version-store copy. See
     /// `gc_version_chain` / `gc_floor_reader_mark`. `RwLock<WalPos>` mirrors `global_header`.
-    backfill_floor: Arc<RwLock<WalPos>>,
+    pub backfill_floor: Arc<RwLock<WalPos>>,
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
     /// The timestamp of the last committed transaction.
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
-    last_committed_tx_ts: AtomicU64,
+    pub last_committed_tx_ts: AtomicU64,
     /// `end_ts` of the most recent tx whose header was written into
     /// `global_header`. Used to gate header writes at both
     /// `EndCommitLogicalLog` and `FinalizeCommit` so an older commit
@@ -4514,13 +4509,13 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// processed by the previous `gc_incremental` pass. `None` restarts the
     /// sweep from the beginning of `rows` (and marks the point where index
     /// chains are swept — see `gc_incremental`).
-    gc_table_cursor: Mutex<Option<RowID>>,
+    pub gc_table_cursor: Mutex<Option<RowID>>,
     /// Resume cursor for the incremental index-row GC sweep: the last
     /// `(index id, key)` processed by the previous `gc_incremental` pass.
     /// `None` restarts from the beginning of `index_rows`. Mirrors
     /// `gc_table_cursor` but over the nested `index_rows` maps, so a single
     /// huge index can't force an unbounded pass.
-    gc_index_cursor: Mutex<Option<(MVTableId, Arc<SortableIndexKey>)>>,
+    pub gc_index_cursor: Mutex<Option<(MVTableId, Arc<SortableIndexKey>)>>,
     /// Single-flight gate for inline GC. Many connections commit concurrently
     /// (each shares this `MvStore`), and the commit path calls
     /// `gc_incremental` without holding any global lock — so without this gate
@@ -4890,7 +4885,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// hold it in read mode for their whole lifetime, so acquiring it in write
     /// mode proves there are no active MVCC transactions and prevents new ones
     /// from starting until VACUUM releases it.
-    pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
+    pub fn try_begin_vacuum_gate(&self) -> Result<()> {
         if !self.blocking_checkpoint_lock.write() {
             return Err(LimboError::Busy);
         }
@@ -4902,7 +4897,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
-    pub(crate) fn release_vacuum_gate(&self) {
+    pub fn release_vacuum_gate(&self) {
         self.blocking_checkpoint_lock.unlock();
     }
 
@@ -4923,7 +4918,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// The caller must hold the MVCC vacuum gate and pass both the committed
     /// page-1 header and the schema parsed from the post-VACUUM physical
     /// database image.
-    pub(crate) fn reset_after_vacuum(&self, header: DatabaseHeader, schema: &Schema) {
+    pub fn reset_after_vacuum(&self, header: DatabaseHeader, schema: &Schema) {
         turso_assert!(
             self.txs.is_empty(),
             "MVCC VACUUM reset requires no active transactions"
@@ -6557,16 +6552,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             begin_ts
         };
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
         let exclusive_yield_context = YieldContext::new(
             connection.yield_injector(),
             None,
             connection.next_yield_instance_id(),
             tx_id,
         );
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
         let exclusive_yield_context = Some(&exclusive_yield_context);
-        #[cfg(not(any(test, injected_yields)))]
+        #[cfg(not(any(any(test, feature = "test_helper"), injected_yields)))]
         let exclusive_yield_context: Option<&YieldContext> = None;
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
@@ -6677,7 +6672,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(any(any(test, feature = "test_helper"), feature = "bench"))]
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
         self.begin_tx_with_schema_generation(pager, None)
     }
@@ -6686,7 +6681,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `Connection::mvcc_begin_schema_generation`). Used by the statement begin path so a passive
     /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
     /// of a transaction beginning against stale roots.
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(any(any(test, feature = "test_helper"), feature = "bench"))]
     pub fn begin_tx_with_schema_generation(
         &self,
         pager: Arc<Pager>,
@@ -6868,7 +6863,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
-    fn insert_finalized_tx_state(
+    pub fn insert_finalized_tx_state(
         &self,
         tx_id: TxID,
         commit_ts: u64,
@@ -7710,12 +7705,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
-    fn acquire_exclusive_tx(
+    pub fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
-        #[cfg(not(any(test, injected_yields)))]
+        #[cfg(not(any(any(test, feature = "test_helper"), injected_yields)))]
         let _ = yield_context;
         if self.exclusive_tx.load(Ordering::Acquire) == *tx_id {
             // Re-entrant upgrade attempt for the same transaction.
@@ -7739,7 +7734,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return Err(LimboError::Busy);
             }
         }
-        #[cfg(any(test, injected_yields))]
+        #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
         if let Some(yield_context) = yield_context {
             if yield_context.injector.as_ref().is_some_and(|injector| {
                 injector.should_yield(
@@ -7799,7 +7794,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Release the exclusive transaction lock if held by the this transaction.
-    fn release_exclusive_tx(&self, tx_id: &TxID) {
+    pub fn release_exclusive_tx(&self, tx_id: &TxID) {
         tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
         let prev = self.exclusive_tx.swap(NO_EXCLUSIVE_TX, Ordering::Release);
         turso_assert_eq!(prev, *tx_id, "exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
@@ -7858,7 +7853,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot_ts
     }
 
-    pub(crate) fn mark_checkpoint_dirty_key(
+    pub fn mark_checkpoint_dirty_key(
         &self,
         key: &RowID,
         stamp: u64,
@@ -7967,7 +7962,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .store(false, Ordering::Release);
     }
 
-    pub(crate) fn schema_generation(&self) -> u64 {
+    pub fn schema_generation(&self) -> u64 {
         self.schema_generation.load(Ordering::Acquire)
     }
 
@@ -8025,8 +8020,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Debug SkipMap / GC counters. Walks every chain; not for hot paths.
-    #[cfg(test)]
-    pub(crate) fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
         let mut rows_empty_slots = 0;
         let mut rows_versions = 0;
         for entry in self.rows.iter() {
@@ -8112,7 +8107,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.group_commit_enabled()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn last_group_commit_size(&self) -> usize {
         self.commit_coordinator.last_group_size()
     }
@@ -8136,7 +8131,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// here cannot miss a transaction mid-publish. Call this *before* taking
     /// any version-chain write lock. Taking the clock while holding a chain
     /// lock deadlocks against Passive publish (`clock` then `versions.write()`).
-    pub(crate) fn sample_gc_lwm(&self) -> u64 {
+    pub fn sample_gc_lwm(&self) -> u64 {
         let mut lwm = u64::MAX;
         self.clock.get_timestamp(|_| {
             lwm = self.compute_lwm();
@@ -8151,7 +8146,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// without holding that lock. An `lwm` of `u64::MAX` is checked again
     /// against the open transactions, because a reader may have begun after
     /// the sample.
-    pub(crate) fn gc_chain_now(
+    pub fn gc_chain_now(
         &self,
         versions: &mut RowVersionChain<A>,
         lwm: u64,
@@ -8578,7 +8573,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Truncate uses `ckpt_max` instead. Both require `materialized_at` before
     /// dropping a live copy: a `ckpt_max` above this version's begin says a
     /// checkpoint ran, not that this row reached a B-tree leaf.
-    fn gc_version_chain(
+    pub fn gc_version_chain(
         versions: &mut RowVersionChain<A>,
         lwm: u64,
         ckpt_max: u64,
@@ -8724,7 +8719,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is inserted in the correct order. Returns a reference to the modified version chain,
     /// and whether the chain was already in the write set of the transaction that created
     /// `row_version`.
-    fn insert_version(
+    pub fn insert_version(
         &self,
         id: RowID,
         row_version: RowVersion,
@@ -8843,7 +8838,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
-    pub(crate) fn get_or_create_index_rows(
+    pub fn get_or_create_index_rows(
         &self,
         index_id: MVTableId,
     ) -> Result<IndexRowsEntry<'_, A>, TryReserveError> {
@@ -10749,7 +10744,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 }
 
 /// The root page of the types table, if `record` is its sqlite_schema row.
-pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> {
+pub fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> {
     let is_types_table = matches!(record.get_value_opt(0), Some(ValueRef::Text(ty)) if ty.as_str() == "table")
         && matches!(record.get_value_opt(1), Some(ValueRef::Text(name)) if name.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME);
     match record.get_value_opt(3) {
@@ -10758,7 +10753,7 @@ pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> 
     }
 }
 
-fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
+pub fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
     let created_by_tx = rv.begin() == Some(TxTimestampOrID::TxID(tx_id));
     let deleted_by_tx = rv.end() == Some(TxTimestampOrID::TxID(tx_id));
     // An inserted row already advanced the allocator. If this transaction both created and
@@ -10964,12 +10959,12 @@ impl RowVersion {
     /// WAL position at which this version's current state is materialized in the B-tree
     /// ([`WalPos::ORIGIN`] = not materialized). See the field doc.
     #[inline]
-    pub(crate) fn materialized_at(&self) -> WalPos {
+    pub fn materialized_at(&self) -> WalPos {
         self.materialized_at
     }
 
     #[inline]
-    pub(crate) fn set_materialized_at(&mut self, pos: WalPos) {
+    pub fn set_materialized_at(&mut self, pos: WalPos) {
         self.materialized_at = pos;
     }
 
@@ -11022,7 +11017,7 @@ impl RowVersion {
     /// A row is visible to a transaction if:
     /// * Begin is visible to the transaction
     /// * End timestamp is not applicable yet, meaning deletion of row is not visible to this transaction
-    fn is_visible_to<A: ConcurrentAllocator>(
+    pub fn is_visible_to<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
         txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
@@ -11126,7 +11121,7 @@ impl RowVersion {
 ///
 /// The lock on `commit_dep_set` serializes with the drain in commit/abort
 /// resolution, preventing the race where we push an entry after the drain.
-fn register_commit_dependency<A: ConcurrentAllocator>(
+pub fn register_commit_dependency<A: ConcurrentAllocator>(
     txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     dependent_tx: &Transaction<A>,
     depended_on_tx_id: TxID,
@@ -11184,7 +11179,7 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
     }
 }
 
-fn lookup_tx_state<A: ConcurrentAllocator>(
+pub fn lookup_tx_state<A: ConcurrentAllocator>(
     txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
@@ -11194,7 +11189,7 @@ fn lookup_tx_state<A: ConcurrentAllocator>(
         .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
 }
 
-fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
+pub fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {

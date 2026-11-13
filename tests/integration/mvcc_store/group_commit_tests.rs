@@ -1,17 +1,17 @@
 use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
-use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::security::roles::SessionRole;
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::{ConnectOpts, Connection, Database, LimboError, StepResult, SyncMode, Value};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+use turso_core::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::security::roles::SessionRole;
+use turso_core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use turso_core::{ConnectOpts, Connection, Database, LimboError, StepResult, SyncMode, Value};
 
 fn pragma_int(conn: &Arc<Connection>, query: &str) -> i64 {
     let rows = get_rows(conn, query);
     assert_eq!(rows.len(), 1, "{query} returned {rows:?}");
     match rows[0][0] {
-        Value::Numeric(crate::Numeric::Integer(n)) => n,
+        Value::Numeric(turso_core::Numeric::Integer(n)) => n,
         ref other => panic!("{query} returned {other:?}"),
     }
 }
@@ -59,8 +59,8 @@ fn group_commit_pragma_is_store_wide() {
 
 #[test]
 fn group_commit_pragma_needs_mvcc() {
-    let io = Arc::new(crate::io::MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
+    let io = Arc::new(turso_core::io::MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(turso_sqlite::SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -256,7 +256,7 @@ fn batched_records_survive_a_restart() {
 }
 
 fn empty_record(end_ts: u64) -> LogRecord {
-    LogRecord::empty(end_ts, crate::alloc::DynAllocator::default())
+    LogRecord::empty(end_ts, turso_core::alloc::DynAllocator::default())
 }
 
 #[test]
@@ -369,7 +369,7 @@ fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     );
 }
 
-fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
+fn step_until_yield_or_done(stmt: &mut turso_core::Statement) -> StepResult {
     for _ in 0..10_000 {
         match stmt.step().unwrap() {
             StepResult::IO => continue,
@@ -421,7 +421,7 @@ fn dropped_after_log_record_written_still_commits(group_commit: bool) {
     assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
 }
 
-fn step_until_done(stmt: &mut crate::Statement) {
+fn step_until_done(stmt: &mut turso_core::Statement) {
     for _ in 0..10_000 {
         match stmt.step().unwrap() {
             StepResult::Done => return,

@@ -6,7 +6,7 @@ use super::*;
 /// serializer reserve for the complete stream once, then bulk-copy each slice.
 /// Flattening the same chain to `Iterator<Item = u8>` loses those slice
 /// boundaries and makes `Vec::extend` copy the payload one byte at a time.
-pub(crate) trait LogChunkStream: Sized {
+pub trait LogChunkStream: Sized {
     fn encoded_len(&self) -> Option<usize>;
 
     fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()>;
@@ -17,7 +17,7 @@ pub(crate) trait LogChunkStream: Sized {
     }
 }
 
-pub(crate) struct ChainedLogChunks<L, R> {
+pub struct ChainedLogChunks<L, R> {
     left: L,
     right: R,
 }
@@ -84,11 +84,11 @@ impl LogChunkStream for BorrowedLogChunk<'_> {
     }
 }
 
-pub(crate) trait LogBufferWrite {
+pub trait LogBufferWrite {
     fn into_chunks(self) -> impl LogChunkStream;
 }
 
-pub(crate) struct LogChunkWriter {
+pub struct LogChunkWriter {
     output: *mut u8,
     capacity: usize,
     written: usize,
@@ -116,7 +116,7 @@ impl LogChunkWriter {
     }
 }
 
-pub(crate) trait LogBufferExt: std::ops::DerefMut<Target = [u8]> {
+pub trait LogBufferExt: std::ops::DerefMut<Target = [u8]> {
     fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()>;
     fn try_resize_zeroed(&mut self, new_len: usize) -> Result<()>;
 }
@@ -175,6 +175,7 @@ impl<A: crate::alloc::ApiAllocator> LogBufferExt for std::vec::Vec<u8, A> {
     impl_try_extend_chunks!();
 }
 
+#[macro_export]
 macro_rules! log_write {
     ($serializer:expr, [$first:expr $(, $rest:expr)* $(,)?], $extension:expr) => {{
         if let Some(extension) = $extension {
@@ -203,15 +204,15 @@ macro_rules! log_write {
         )
     }};
 }
-pub(crate) use log_write;
+pub use log_write;
 
-pub(crate) struct LogSerializer<'a, B: ?Sized = Vec<u8>> {
+pub struct LogSerializer<'a, B: ?Sized = Vec<u8>> {
     buffer: &'a mut B,
 }
 
 impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     #[inline(always)]
-    pub(crate) fn new(buffer: &'a mut B) -> Self {
+    pub fn new(buffer: &'a mut B) -> Self {
         Self { buffer }
     }
 
@@ -289,7 +290,7 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     ///
     /// Layout: tag(1) | flags(1) | table_id(4) | payload_len(varint) | payload.
     #[inline(always)]
-    pub(crate) fn serialize_op_entry(
+    pub fn serialize_op_entry(
         &mut self,
         row_id: &RowID,
         row_version: &RowVersion,
@@ -375,7 +376,7 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     }
 
     #[inline(always)]
-    pub(crate) fn serialize_header_entry(&mut self, header: &DatabaseHeader) -> Result<()> {
+    pub fn serialize_header_entry(&mut self, header: &DatabaseHeader) -> Result<()> {
         // Header operations use tag-only addressing (table_id=0, flags=0).
         log_write!(
             self,
@@ -530,7 +531,7 @@ impl LogBufferWrite for SqliteVarint {
     }
 }
 
-pub(crate) struct ProtoVarint(pub(crate) u64);
+pub struct ProtoVarint(pub(crate) u64);
 
 impl LogBufferWrite for ProtoVarint {
     #[inline(always)]
@@ -551,10 +552,10 @@ impl LogBufferWrite for ProtoVarint {
     }
 }
 
-pub(crate) const PROTO_WIRE_VARINT: u64 = 0;
-pub(crate) const PROTO_WIRE_LENGTH_DELIMITED: u64 = 2;
+pub const PROTO_WIRE_VARINT: u64 = 0;
+pub const PROTO_WIRE_LENGTH_DELIMITED: u64 = 2;
 
-pub(crate) struct ProtoKey {
+pub struct ProtoKey {
     field: u64,
     wire_type: u64,
 }
@@ -571,7 +572,7 @@ impl LogBufferWrite for ProtoKey {
     }
 }
 
-pub(crate) struct ProtoSint64 {
+pub struct ProtoSint64 {
     field: u64,
     value: i64,
 }
@@ -631,7 +632,7 @@ fn proto_varint_len(mut value: u64) -> usize {
 }
 
 /// Context needed to find the stable raw-log cursor encoded in a portable payload.
-pub(super) struct PortableEndOffsetCtx {
+pub struct PortableEndOffsetCtx {
     pub(super) write_offset: u64,
     pub(super) includes_log_header: bool,
     pub(super) tx_header_size: usize,
@@ -641,7 +642,7 @@ pub(super) struct PortableEndOffsetCtx {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct PortableChangePayload<'a> {
+pub struct PortableChangePayload<'a> {
     end_offset: u64,
     commit_ts: u64,
     encoded_metadata: &'a [u8],
@@ -752,7 +753,7 @@ impl<'payload> LogBufferWrite for PortableChangePayload<'payload> {
     }
 }
 
-pub(super) struct ExtensionRecord<P> {
+pub struct ExtensionRecord<P> {
     extension_type: u16,
     extension_flags: u16,
     payload: P,
@@ -768,9 +769,7 @@ impl<P> ExtensionRecord<P> {
     }
 }
 
-pub(super) fn extension_record_len(
-    record: &ExtensionRecord<PortableChangePayload<'_>>,
-) -> Result<usize> {
+pub fn extension_record_len(record: &ExtensionRecord<PortableChangePayload<'_>>) -> Result<usize> {
     let payload_len = record
         .payload
         .encoded_len()
@@ -783,7 +782,7 @@ pub(super) fn extension_record_len(
         .ok_or_else(log_buffer_len_overflow)
 }
 
-pub(crate) struct EncryptedPayload<'a> {
+pub struct EncryptedPayload<'a> {
     pub(super) enc_ctx: &'a EncryptionContext,
     pub(super) payload_start: usize,
     pub(super) plaintext_size: usize,

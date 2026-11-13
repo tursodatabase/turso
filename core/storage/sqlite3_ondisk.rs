@@ -306,7 +306,7 @@ impl Default for TextEncoding {
 }
 
 #[derive(Pod, Zeroable, Clone, Copy, Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[cfg_attr(any(test, feature = "test_helper"), derive(PartialEq, Eq))]
 #[repr(C, packed)]
 /// Database Header Format
 pub struct DatabaseHeader {
@@ -1583,7 +1583,7 @@ impl BuildSharedWal {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 frames_compared: AtomicU64::new(0),
             },
         }));

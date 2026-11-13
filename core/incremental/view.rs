@@ -131,7 +131,7 @@ pub fn create_dbsp_state_index(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TableChangeId {
     RootPage(i64),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     Name(String),
 }
 
@@ -182,7 +182,7 @@ impl CapturedDelta {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn contains_table(&self, table_id: &TableChangeId) -> bool {
         self.spilled
             .iter()
@@ -455,7 +455,7 @@ fn serialize_change_events(events: &[ChangeEvent]) -> Result<std::vec::Vec<u8>> 
 fn table_id_value(table_id: &TableChangeId) -> Value {
     match table_id {
         TableChangeId::RootPage(root_page) => Value::from_i64(*root_page),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         TableChangeId::Name(name) => Value::Text(crate::types::Text::new(name.clone())),
     }
 }
@@ -510,7 +510,7 @@ impl ViewChangeSubscription {
     pub(crate) fn table_delta(&self, table: &BTreeTable) -> CapturedDelta {
         let root_id = TableChangeId::RootPage(table.root_page);
         let captured = self.change_log.snapshot(&root_id);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         {
             if !captured.contains_table(&root_id) {
                 return self

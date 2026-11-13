@@ -57,7 +57,7 @@ pub(crate) struct JoinPlanningContext<'a> {
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "test_helper")), allow(dead_code))]
     fn default_with_order_target(
         maybe_order_target: Option<&'a OrderTarget>,
         resolver: &'a Resolver<'a>,

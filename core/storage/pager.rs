@@ -81,6 +81,7 @@ impl HeaderRef {
         Ok(IOResult::Done(Self(page)))
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn borrow(&self) -> &DatabaseHeader {
         // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
         let content = self.0.get_contents();
@@ -1612,7 +1613,7 @@ pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
-    pub(crate) wal: Option<Arc<dyn Wal>>,
+    pub wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.

@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use strum::EnumCount;
 use turso_parser::ast;
 
@@ -175,7 +175,7 @@ pub enum IndexMethodSnapshotIdentity {
 ///
 /// Ordinals are consumed by deterministic simulator plans; never reorder or
 /// reuse an existing value.
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub enum IndexMethodYieldPoint {
@@ -195,7 +195,7 @@ pub enum IndexMethodYieldPoint {
     FtsAutoMergeStaged = 7,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for IndexMethodYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -266,7 +266,7 @@ pub struct IndexMethodContext {
     snapshot: IndexMethodSnapshotIdentity,
     schema_generation: u64,
     index: IndexMethodIdentity,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     yield_instance_id: u64,
 }
 
@@ -372,7 +372,7 @@ impl IndexMethodContext {
                 runtime_id,
                 schema_root,
             },
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
         })
     }
@@ -435,7 +435,7 @@ impl IndexMethodContext {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl crate::mvcc::yield_hooks::ProvidesYieldContext for IndexMethodContext {
     fn yield_context(&self) -> crate::mvcc::yield_hooks::YieldContext {
         let mut selection_key = 0x494e_4458_4d45_5448u64;

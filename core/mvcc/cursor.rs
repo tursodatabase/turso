@@ -8,7 +8,7 @@ use crate::mvcc::database::{
     create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
     SortableIndexKey,
 };
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
@@ -23,7 +23,7 @@ use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use strum::EnumCount;
 
 #[derive(Clone)]
@@ -128,7 +128,7 @@ enum MvccLazyCursorState {
     Seek(SeekState, IterationDirection),
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
 pub enum CursorYieldPoint {
@@ -143,7 +143,7 @@ pub enum CursorYieldPoint {
     AdvanceBtreeBackwardProgress,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl YieldPointMarker for CursorYieldPoint {
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
@@ -152,7 +152,7 @@ impl YieldPointMarker for CursorYieldPoint {
     }
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
     for MvccLazyCursor<Clock, A>
 {
@@ -208,7 +208,7 @@ fn index_key_matches_at_most_one_row(key: &[ValueRef<'_>], index_info: &IndexInf
         && !key.iter().any(|value| matches!(value, ValueRef::Null))
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
     // ASCII-ish "CURSORCR"
     // any large number will do
@@ -356,7 +356,7 @@ pub enum MvccCursorType {
 pub(crate) type MvccEntry<'l, T, A = TursoAllocator> =
     Entry<'l, T, RowVersions<A>, BasicComparator, A>;
 
-pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
+pub type MvccIterator<'l, T, A = TursoAllocator> =
     Box<dyn Iterator<Item = MvccEntry<'l, T, A>> + Send + Sync>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
@@ -379,21 +379,23 @@ pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
 ///   outlives the cursor.
 /// - For index iterators: The `MvStore.index_rows` SkipMap is held in an `Arc<MvStore>`
 ///   that outlives the cursor.
+#[macro_export]
 macro_rules! static_iterator_hack {
     ($iter:expr, $key_type:ty) => {
-        static_iterator_hack!($iter, $key_type, crate::alloc::TursoAllocator)
+        static_iterator_hack!($iter, $key_type, $crate::alloc::TursoAllocator)
     };
     ($iter:expr, $key_type:ty, $alloc:ty) => {
         // SAFETY: See macro documentation above.
+        #[allow(clippy::macro_metavars_in_unsafe)]
         unsafe {
             std::mem::transmute::<
                 Box<
-                    dyn Iterator<Item = crate::mvcc::cursor::MvccEntry<'_, $key_type, $alloc>>
+                    dyn Iterator<Item = $crate::mvcc::cursor::MvccEntry<'_, $key_type, $alloc>>
                         + Send
                         + Sync,
                 >,
                 Box<
-                    dyn Iterator<Item = crate::mvcc::cursor::MvccEntry<'static, $key_type, $alloc>>
+                    dyn Iterator<Item = $crate::mvcc::cursor::MvccEntry<'static, $key_type, $alloc>>
                         + Send
                         + Sync,
                 >,
@@ -402,7 +404,7 @@ macro_rules! static_iterator_hack {
     };
 }
 
-pub(crate) use static_iterator_hack;
+pub use static_iterator_hack;
 
 /// Forward scan over `index_rows`, co-advanced with the B-tree cursor so the
 /// per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
@@ -412,7 +414,7 @@ pub(crate) use static_iterator_hack;
 ///
 /// Owns the [`MvStore::index_rows_epoch`] snapshot used to detect keys created
 /// mid-scan (#7578). A mismatch reseeds from the current B-tree key.
-pub(crate) struct IndexShadowScan<A: ConcurrentAllocator = TursoAllocator> {
+pub struct IndexShadowScan<A: ConcurrentAllocator = TursoAllocator> {
     state: IndexShadowScanState<A>,
     epoch: u64,
 }
@@ -469,7 +471,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
     /// Whether the B-tree row `key` is visible (not shadowed by an MVCC version),
     /// served from this co-positioned scan. Forward equivalent of
     /// [`MvStore::query_btree_version_is_valid`] for index keys.
-    pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
+    pub fn btree_row_is_valid<Clock: LogicalClock>(
         &mut self,
         db: &MvStore<Clock, A>,
         table_id: MVTableId,
@@ -542,9 +544,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     pub db: Arc<MvStore<Clock, A>>,
     /// Weak so a cursor retained past its statement (an index-method cursor
     /// parked on its connection) cannot keep the connection alive.
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     connection: crate::sync::Weak<Connection>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     yield_instance_id: u64,
     current_pos: CursorPosition<A>,
     /// Stateful MVCC table iterator if this is a table cursor.
@@ -624,9 +626,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         };
         Ok(Self {
             db,
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             connection: Arc::downgrade(connection),
             tx_id,
             snapshot,

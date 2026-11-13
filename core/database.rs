@@ -669,8 +669,8 @@ pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
 
-#[cfg(test)]
-pub(crate) fn remove_file_from_database_registry(path: &str) {
+#[cfg(any(test, feature = "test_helper"))]
+pub fn remove_file_from_database_registry(path: &str) {
     let file_id = io::get_file_id(path).unwrap();
     DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
 }
@@ -686,7 +686,7 @@ pub struct Database<
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
     pub(crate) allocators: DatabaseAllocators<A, F>,
-    pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
+    pub schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
     wal_path: String,
@@ -701,7 +701,7 @@ pub struct Database<
     /// When set, MVCC will use this implementation for logical-log durability
     /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
     pub(crate) durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-    pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
+    pub shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
@@ -2798,11 +2798,11 @@ impl Database {
             test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_injector: RwLock::new(None),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             failure_injector: RwLock::new(None),
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             transaction_changes: TransactionChanges::with_io(self.io.clone()),
             maintenance_program_cache:

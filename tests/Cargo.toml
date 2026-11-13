@@ -55,6 +55,16 @@ turso-dbhash.workspace = true
 
 [dev-dependencies]
 branches = { version = "0.4.3", default-features = false }
+bytemuck = "1.23.1"
+crc32c = "0.6.8"
+memory-stats = "1.2.0"
+pack1 = { version = "1.0.0", features = ["bytemuck"] }
+parking_lot = { workspace = true, features = ["arc_lock"] }
+quickcheck = { version = "1.0", default-features = false }
+quickcheck_macros = { version = "1.0", default-features = false }
+rstest = "0.18.2"
+rustc-hash = "2.0"
+sorted-vec = "0.8.6"
 similar-asserts.workspace = true
 asserting.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
@@ -93,3 +103,7 @@ io_memory_yield = ["turso_core/io_memory_yield"]
 io_uring = ["turso_core/io_uring"]
 win_iocp = ["turso_core/experimental_win_iocp"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+unstable_name_collisions = "allow"

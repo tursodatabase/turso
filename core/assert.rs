@@ -3,7 +3,7 @@
 /// Usage: assert_send!(Type1, Type2, Type3);
 macro_rules! assert_send {
     ($($t:ty),+ $(,)?) => {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         $(const _: () = {
             const fn _assert_send<T: ?Sized + Send>() {}
             _assert_send::<$t>();
@@ -18,7 +18,7 @@ pub(crate) use assert_send;
 /// Usage: assert_sync!(Type1, Type2, Type3);
 macro_rules! assert_sync {
     ($($t:ty),+ $(,)?) => {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         $(const _: () = {
             const fn _assert_sync<T: ?Sized + Sync>() {}
             _assert_sync::<$t>();
@@ -32,7 +32,7 @@ pub(crate) use assert_sync;
 /// Usage: assert_send_sync!(Type1, Type2, Type3);
 macro_rules! assert_send_sync {
     ($($t:ty),+ $(,)?) => {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         $(const _: () = {
             const fn _assert_send<T: ?Sized + Send>() {}
             const fn _assert_sync<T: ?Sized + Sync>() {}

@@ -109,13 +109,13 @@ fn btree_cursor_with_yield_context(
     cursor: Box<BTreeCursor>,
     connection: &Arc<Connection>,
 ) -> Box<BTreeCursor> {
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     {
         let mut cursor = cursor;
         cursor.install_yield_context(connection);
         cursor
     }
-    #[cfg(not(any(test, injected_yields)))]
+    #[cfg(not(any(any(test, feature = "test_helper"), injected_yields)))]
     {
         let _ = connection;
         cursor
@@ -1840,7 +1840,7 @@ pub enum OpColumnState {
     GetColumn,
 }
 
-#[cfg_attr(not(test), inline(always))]
+#[cfg_attr(not(any(test, feature = "test_helper")), inline(always))]
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1878,7 +1878,7 @@ pub fn op_column(
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
-#[cfg_attr(not(test), inline(always))]
+#[cfg_attr(not(any(test, feature = "test_helper")), inline(always))]
 pub fn op_column_range(
     program: &Program,
     state: &mut ProgramState,
@@ -3464,7 +3464,7 @@ pub fn op_blob_write(
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
-#[cfg_attr(not(test), inline(always))]
+#[cfg_attr(not(any(test, feature = "test_helper")), inline(always))]
 pub fn op_result_row(
     _program: &Program,
     state: &mut ProgramState,
@@ -3484,7 +3484,7 @@ pub fn op_result_row(
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
-#[cfg_attr(not(test), inline(always))]
+#[cfg_attr(not(any(test, feature = "test_helper")), inline(always))]
 pub fn op_next(
     _program: &Program,
     state: &mut ProgramState,
@@ -4247,14 +4247,14 @@ pub enum OpTransactionState {
     BeginStatement,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum TransactionYieldPoint {
+pub enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
 }
 
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
     const POINT_COUNT: u8 = 2;
 
@@ -4645,7 +4645,7 @@ pub fn op_transaction_inner(
                     );
                     return Err(LimboError::SchemaUpdated.into());
                 }
-                #[cfg(any(test, injected_yields))]
+                #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
                 {
                     if let Some(IOResult::IO(io)) =
                         crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
@@ -4733,7 +4733,7 @@ pub fn op_transaction_inner(
                                         *tx_mode
                                     }
                                 });
-                            #[cfg(any(test, injected_yields))]
+                            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
                                     crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
@@ -4821,7 +4821,7 @@ pub fn op_transaction_inner(
                                         return Err(err.into());
                                     }
                                 };
-                            #[cfg(any(test, injected_yields))]
+                            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
                                     crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
@@ -5497,7 +5497,7 @@ pub fn op_savepoint(
             if let IOResult::IO(io) = load_active_non_main_wal_headers_for_named_savepoint(&conn)? {
                 return Ok(state.suspend_on_io(io));
             }
-            #[cfg(any(test, injected_yields))]
+            #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
             {
                 if mv_store.is_some() && conn.get_mv_tx_id().is_none() {
                     if let Some(IOResult::IO(io)) =
@@ -5832,7 +5832,7 @@ fn return_register_not_an_integer() -> Box<LimboError> {
     LimboError::InternalError("Return register is not an integer".to_string()).into()
 }
 
-#[cfg_attr(not(test), inline(always))]
+#[cfg_attr(not(any(test, feature = "test_helper")), inline(always))]
 pub fn op_integer(
     _program: &Program,
     state: &mut ProgramState,
@@ -6249,7 +6249,7 @@ pub fn op_row_data(
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
-#[cfg_attr(not(test), inline(always))]
+#[cfg_attr(not(any(test, feature = "test_helper")), inline(always))]
 pub fn op_row_id(
     _program: &Program,
     state: &mut ProgramState,

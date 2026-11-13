@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 use std::{cell::RefCell, collections::VecDeque};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED, FALSE, GENERIC_READ,
@@ -99,7 +99,7 @@ fn open_lock_handle(path: &Path) -> Result<HANDLE> {
 }
 
 fn lock_range(handle: HANDLE, offset: u64, exclusive: bool, fail_immediately: bool) -> Result<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     if take_injected_lock_failure(offset, exclusive, fail_immediately) {
         return Err(LimboError::LockingError(
             "injected Windows file lock acquisition failure".into(),
@@ -130,7 +130,7 @@ fn lock_range(handle: HANDLE, offset: u64, exclusive: bool, fail_immediately: bo
 }
 
 fn unlock_range(handle: HANDLE, offset: u64) -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     if take_injected_unlock_failure(offset) {
         return Err(LimboError::LockingError(
             "injected Windows file lock release failure".into(),
@@ -148,7 +148,7 @@ fn unlock_range(handle: HANDLE, offset: u64) -> Result<()> {
     )))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InjectedLockFailure {
     Lock {
@@ -161,12 +161,12 @@ enum InjectedLockFailure {
     },
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 thread_local! {
     static LOCK_FAILURES: RefCell<VecDeque<InjectedLockFailure>> = const { RefCell::new(VecDeque::new()) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 fn inject_lock_failures(failures: impl IntoIterator<Item = InjectedLockFailure>) {
     LOCK_FAILURES.with(|injected| {
         let mut injected = injected.borrow_mut();
@@ -175,7 +175,7 @@ fn inject_lock_failures(failures: impl IntoIterator<Item = InjectedLockFailure>)
     });
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 fn take_injected_lock_failure(offset: u64, exclusive: bool, fail_immediately: bool) -> bool {
     LOCK_FAILURES.with(|injected| {
         let mut injected = injected.borrow_mut();
@@ -197,7 +197,7 @@ fn take_injected_lock_failure(offset: u64, exclusive: bool, fail_immediately: bo
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 fn take_injected_unlock_failure(offset: u64) -> bool {
     LOCK_FAILURES.with(|injected| {
         let mut injected = injected.borrow_mut();

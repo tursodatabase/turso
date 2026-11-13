@@ -941,7 +941,7 @@ impl LimitCtx {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HashLabels {
+pub struct HashLabels {
     /// Label for hash join match processing (points to just after HashProbe instruction)
     /// Used by HashNext to jump back to process additional matches without re-probing
     pub match_found: BranchOffset,

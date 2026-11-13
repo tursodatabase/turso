@@ -1,11 +1,12 @@
-use crate::io::{File, FileId, FileSyncType};
-use crate::security::roles::SessionRole;
-use crate::sync::atomic::{AtomicUsize, Ordering};
-use crate::{
-    Buffer, Clock, Completion, ConnectOpts, Database, EngineDialect, MemoryIO, MonotonicInstant,
-    OpenFlags, Result, Statement, StepResult, SyncMode, WallClockInstant, IO,
-};
 use std::sync::Arc;
+use turso_core::io::{File, FileId, FileSyncType};
+use turso_core::security::roles::SessionRole;
+use turso_core::sync::atomic::{AtomicUsize, Ordering};
+use turso_core::{
+    Buffer, Clock, Completion, ConnectOpts, Database, MemoryIO, MonotonicInstant, OpenFlags,
+    Result, Statement, StepResult, SyncMode, WallClockInstant, IO,
+};
+use turso_sqlite::SqliteDialect;
 
 #[test]
 fn full_waiter_is_synced_when_group_leader_uses_sync_off() {
@@ -25,7 +26,7 @@ fn prepare_group_commit(
     leader_sync: SyncMode,
 ) -> (Arc<Database>, Arc<SyncCountingIo>, [Statement; 2]) {
     let io = Arc::new(SyncCountingIo::default());
-    let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
     let leader = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();

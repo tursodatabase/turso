@@ -1,7 +1,7 @@
 use crate::alloc::TryClone;
 use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
-#[cfg(any(test, injected_yields))]
+#[cfg(any(any(test, feature = "test_helper"), injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::security::roles::RoleId;
@@ -401,8 +401,8 @@ pub struct Connection {
     pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
-    pub(crate) pager: ArcSwap<Pager>,
-    pub(crate) schema: RwLock<Arc<Schema>>,
+    pub pager: ArcSwap<Pager>,
+    pub schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
@@ -507,11 +507,11 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub(super) failure_injector: RwLock<Option<Arc<dyn FailureInjector>>>,
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
     /// Ordered row changes captured once per connection transaction, with
@@ -1438,7 +1438,7 @@ impl Connection {
     /// Retained for the many synchronous callers (statement reprepare, attach,
     /// extension load, vacuum). The genuinely non-blocking callers (MVCC
     /// bootstrap, the open-db state machine) drive `*_nonblock` directly.
-    pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
+    pub fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let io = self.pager.load().io.clone();
         let mut state = ReparseSchemaState::default();
         io.block(|| self.reparse_schema_nonblock(&mut state))
@@ -3243,7 +3243,7 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
         let mut slot = self.yield_injector.write();
         match injector {
@@ -3264,12 +3264,12 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub fn set_failure_injector(&self, injector: Option<Arc<dyn FailureInjector>>) {
         let mut slot = self.failure_injector.write();
         match injector {
@@ -3290,12 +3290,12 @@ impl Connection {
         }
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     pub(crate) fn failure_injector(&self) -> Option<Arc<dyn FailureInjector>> {
         self.failure_injector.read().clone()
     }
 
-    #[cfg(any(test, injected_yields))]
+    #[cfg(any(any(test, feature = "test_helper"), injected_yields))]
     #[inline(always)]
     pub(crate) fn next_yield_instance_id(&self) -> u64 {
         self.yield_instance_id_counter
@@ -3376,7 +3376,7 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
+    pub fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
             crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
@@ -4851,7 +4851,7 @@ impl Connection {
         matches!(self.get_tx_state(), TransactionState::Write { .. })
     }
 
-    pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
+    pub fn get_mv_tx_id(&self) -> Option<u64> {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
 
@@ -4876,7 +4876,7 @@ impl Connection {
 
     /// Get MVCC transaction ID for a specific database.
     /// Uses fast path for main DB, O(1) HashMap lookup for attached DBs.
-    pub(crate) fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
+    pub fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx_id()
         } else {
@@ -4888,7 +4888,7 @@ impl Connection {
     }
 
     /// Get MVCC transaction ID and mode for a specific database.
-    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
@@ -5239,7 +5239,7 @@ impl Connection {
 
     /// Get the MvStore for a specific database.
     /// Returns None for databases without MVCC or for bootstrap connections.
-    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+    pub fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }

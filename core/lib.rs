@@ -55,7 +55,7 @@ mod assert;
 pub mod attach;
 pub mod connection;
 mod connection_hooks;
-mod database;
+pub mod database;
 pub mod dialect;
 mod error;
 mod ext;
@@ -86,8 +86,8 @@ mod stats;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
-mod translate;
-mod util;
+pub mod translate;
+pub mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
@@ -114,7 +114,7 @@ use crate::{
 pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 use std::time::Duration;
-use storage::sqlite3_ondisk::PageSize;
+pub use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
@@ -128,7 +128,7 @@ pub use connection::SubqueryUnnestingMode;
 pub use connection::{
     resolve_ext_path, Connection, ReparseSchemaState, Row, StepResult, SymbolTable,
 };
-pub(crate) use connection::{AtomicTransactionState, TransactionState};
+pub use connection::{AtomicTransactionState, TransactionState};
 pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 pub use database::is_memory_like;
 #[cfg(feature = "simulator")]
@@ -261,6 +261,6 @@ pub enum TempStore {
     Memory = 2,
 }
 
-pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
+pub type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock, alloc::DynAllocator>;

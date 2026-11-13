@@ -20,6 +20,7 @@ mod index_method;
 mod integrity_check;
 mod lossy_index_keys;
 mod mvcc;
+mod mvcc_store;
 mod native_extension;
 mod pragma;
 mod query_processing;

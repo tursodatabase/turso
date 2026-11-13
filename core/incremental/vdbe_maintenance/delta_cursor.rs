@@ -258,7 +258,7 @@ fn parse_spilled_delta(
             Value::Numeric(crate::numeric::Numeric::Integer(root_page)) => {
                 TableChangeId::RootPage(root_page)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             Value::Text(name) => TableChangeId::Name(name.as_str().to_string()),
             _ => {
                 return Err(LimboError::Corrupt(

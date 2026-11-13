@@ -864,7 +864,7 @@ impl PageCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn keys(&mut self) -> Vec<PageCacheKey> {
         self.map.keys().copied().collect()
     }

@@ -868,7 +868,7 @@ pub trait Wal: Debug + Send + Sync {
     /// readers and writers may proceed again.
     fn release_vacuum_lock(&self);
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(any(test, feature = "test_helper"), debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -3017,7 +3017,7 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) frames_compared: AtomicU64,
 }
 
@@ -3028,7 +3028,7 @@ impl WalSharedRuntime {
         range: &std::ops::RangeInclusive<u64>,
     ) -> Option<u64> {
         let end = frames.partition_point(|&frame| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frames_compared.fetch_add(1, Ordering::Relaxed);
             frame <= *range.end()
         });
@@ -4840,7 +4840,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(any(test, feature = "test_helper"), debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -5955,7 +5955,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 frames_compared: AtomicU64::new(0),
             },
         };
@@ -6033,7 +6033,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 frames_compared: AtomicU64::new(0),
             },
         };
@@ -6077,7 +6077,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 frames_compared: AtomicU64::new(0),
             },
         };
@@ -7606,7 +7606,7 @@ pub mod test {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn read_slots_with_readers(shared: &WalFileShared) -> Vec<usize> {
         shared
             .runtime

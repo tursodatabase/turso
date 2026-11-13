@@ -22,7 +22,7 @@ const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
 const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 const TURSO_SYNC_PREFIX: &str = "turso_sync_";
 
-pub(crate) fn is_portable_logical_name(name: &str) -> bool {
+pub fn is_portable_logical_name(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_SYNC_PREFIX)
@@ -33,13 +33,13 @@ pub(crate) fn is_portable_logical_name(name: &str) -> bool {
 /// Decoded subset of a `sqlite_schema` record needed to materialize stable
 /// portable object-map entries at MVCC commit time.
 #[derive(Clone, Debug)]
-pub(crate) struct PortableSchemaRow {
+pub struct PortableSchemaRow {
     pub(crate) row_type: String,
     pub(crate) name: String,
     pub(crate) rootpage: i64,
 }
 
-pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
+pub fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
     let record = ImmutableRecordRef::from_bin_record(record_bytes);
     let column_count = record.column_count();
     if column_count < 5 {
@@ -77,11 +77,11 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
     })
 }
 
-pub(crate) fn is_portable_table_schema_row(row: &PortableSchemaRow) -> bool {
+pub fn is_portable_table_schema_row(row: &PortableSchemaRow) -> bool {
     row.rootpage != 0 && row.row_type.eq_ignore_ascii_case("table") && is_portable_schema_row(row)
 }
 
-pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
+pub fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
     is_portable_logical_name(&row.name)
         && (row.row_type.eq_ignore_ascii_case("table")
             || row.row_type.eq_ignore_ascii_case("index")
@@ -89,7 +89,7 @@ pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
             || row.row_type.eq_ignore_ascii_case("view"))
 }
 
-pub(crate) struct PortableLogicalBuilder<'a> {
+pub struct PortableLogicalBuilder<'a> {
     strings: Vec<&'a str>,
     string_refs: HashMap<&'a str, u64>,
     object_maps: Vec<Vec<u8>>,
@@ -109,13 +109,13 @@ impl Default for PortableLogicalBuilder<'_> {
     }
 }
 
-pub(crate) struct PortableObjectMapEntry<'a> {
-    pub(crate) mv_table_id: i64,
-    pub(crate) name: &'a str,
+pub struct PortableObjectMapEntry<'a> {
+    pub mv_table_id: i64,
+    pub name: &'a str,
 }
 
 impl<'a> PortableLogicalBuilder<'a> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -129,7 +129,7 @@ impl<'a> PortableLogicalBuilder<'a> {
         Ok(idx)
     }
 
-    pub(crate) fn add_object_map(&mut self, entry: PortableObjectMapEntry<'a>) -> Result<bool> {
+    pub fn add_object_map(&mut self, entry: PortableObjectMapEntry<'a>) -> Result<bool> {
         if !is_portable_logical_name(entry.name) || self.object_map_ids.contains(&entry.mv_table_id)
         {
             return Ok(false);
@@ -155,7 +155,7 @@ impl<'a> PortableLogicalBuilder<'a> {
         Ok(true)
     }
 
-    pub(crate) fn add_metadata(&mut self, key: &'a str, value: &'a str) -> Result<()> {
+    pub fn add_metadata(&mut self, key: &'a str, value: &'a str) -> Result<()> {
         let key_ref = self.intern_string(key)?;
         let value_ref = self.intern_string(value)?;
         let mut meta = crate::alloc::vec![];
@@ -173,7 +173,7 @@ impl<'a> PortableLogicalBuilder<'a> {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Result<Vec<u8>> {
+    pub fn finish(self) -> Result<Vec<u8>> {
         let mut txn_fields = crate::alloc::vec![];
         let mut serializer = LogSerializer::new(&mut txn_fields);
         for value in &self.strings {
