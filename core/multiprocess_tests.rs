@@ -513,7 +513,9 @@ fn multiprocess_open_reinitializes_unpublished_coordination_file() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table test(id integer primary key)")
         .unwrap();
 }
@@ -613,7 +615,9 @@ fn open_while_creator_paused(
 
     {
         let db = Database::open_file(io.clone(), &db_path_str, Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         conn.execute("insert into test(value) values ('seed')")
@@ -625,7 +629,7 @@ fn open_while_creator_paused(
     let opener = std::thread::spawn(move || -> Result<(bool, i64)> {
         let db = open_multiprocess_db_with_flags(io, &db_path_str, flags)?;
         let attached = db.shared_wal_coordination()?.is_some();
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         Ok((attached, count_test_rows(&conn)))
     });
     std::thread::sleep(Duration::from_millis(200));
@@ -876,7 +880,9 @@ fn process_holding_an_empty_database_adopts_one_created_by_another_process() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     let child_output = Command::new(std::env::current_exe().unwrap())
         .arg(MULTIPROCESS_NEW_DB_CREATOR_CHILD_TEST)
@@ -904,7 +910,9 @@ fn process_holding_an_empty_database_adopts_one_created_by_another_process() {
     };
     let expected = vec![Value::from_i64(1), Value::from_i64(2)];
     assert_eq!(xs(&conn), expected);
-    let fresh = db.connect(ConnectOpts::new()).unwrap();
+    let fresh = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     assert_eq!(xs(&fresh), expected);
 }
 
@@ -916,7 +924,9 @@ fn multiprocess_new_db_creator_child_process() {
     };
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("create table t(x)").unwrap();
     conn.execute("insert into t values (1)").unwrap();
     conn.close().unwrap();
