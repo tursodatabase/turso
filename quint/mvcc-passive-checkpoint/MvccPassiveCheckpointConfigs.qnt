@@ -6,7 +6,7 @@
 // The main configuration has one key, so that TLC finishes in about 4
 // minutes. DESIGN.md gives the result for two keys.
 // Expect no error: every rule of the design is on, as in the code today.
-// Invariants: TypeOK ReadsCorrect RecoveryCorrect BackfillBelowReaders BackfillFloorBelowReaders
+// Invariants: TypeOK ReadsCorrect RecoveryCorrect BackfillBelowReaders BackfillFloorBelowReaders GcKeepsVersionsAboveReaders
 module main {
   import MvccPassiveCheckpoint(
     Keys = Set("k1"),
@@ -18,6 +18,7 @@ module main {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -52,6 +53,7 @@ module mbt {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -84,6 +86,7 @@ module abortsKeepMaterialized {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = true,
     GuardReadersAbortOnDependency = true,
@@ -116,6 +119,7 @@ module abortsNoDependency {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = true,
     GuardReadersAbortOnDependency = false,
@@ -148,6 +152,7 @@ module aborts {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = true,
     GuardReadersAbortOnDependency = true,
@@ -180,6 +185,7 @@ module dirtyClearFullScanEarly {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -212,6 +218,7 @@ module dirtyKeys {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = true,
     GuardReadersAbortOnDependency = true,
@@ -244,6 +251,7 @@ module dirtyMarkAfterCommit {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -276,6 +284,7 @@ module dirtyNoGenerationCas {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = true,
     GuardReadersAbortOnDependency = true,
@@ -307,6 +316,7 @@ module floorBackfill {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "backfill",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -338,6 +348,7 @@ module floorPinned {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "pinned",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -370,6 +381,7 @@ module floorRegistered {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "registered",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -402,6 +414,7 @@ module gcSampleNoRecheck {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -434,6 +447,7 @@ module gcSample {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -465,6 +479,7 @@ module noBackfillStop {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = false,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -496,6 +511,7 @@ module noGcWait {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -527,6 +543,7 @@ module noSnapshotClamp {
     GuardDropCurrentOnlyWhenIdle = true,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -559,6 +576,7 @@ module rule3UnderLoadOneLook {
     GuardDropCurrentOnlyWhenIdle = false,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "pinned",
+    CheckpointOnReaderConnection = "none",
     ReadLooksAtChainTwice = false,
     Aborts = false,
     GuardReadersAbortOnDependency = true,
@@ -591,6 +609,307 @@ module rule3UnderLoad {
     GuardDropCurrentOnlyWhenIdle = false,
     GuardBackfillStopsAtReaders = true,
     GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect ReadsCorrect to fail: Connection::checkpoint runs on the connection
+// of an open reader, the backfill passes the reader and its read mark moves.
+// The reader reads a value that commits after it began. GC drops nothing.
+// Invariants: ReadsCorrect
+module ownCheckpoint {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "code",
+    CheckpointOnReaderConnection = "movesMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect ReadsCorrect to fail: the same as ownCheckpoint with backfill_floor
+// as the only GC floor.
+// Invariants: ReadsCorrect
+module ownCheckpointBackfillFloor {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "backfill",
+    CheckpointOnReaderConnection = "movesMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect ReadsCorrect to fail: the same as ownCheckpoint, but the reader keeps
+// its read mark. A read of the database file finds a newer value.
+// Invariants: ReadsCorrect
+module ownCheckpointKeepsMark {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "code",
+    CheckpointOnReaderConnection = "keepsMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect ReadsCorrect to fail: the same as ownCheckpointKeepsMark with
+// backfill_floor as the only GC floor.
+// Invariants: ReadsCorrect
+module ownCheckpointKeepsMarkBackfillFloor {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "backfill",
+    CheckpointOnReaderConnection = "keepsMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect GcKeepsVersionsAboveReaders to fail: with Connection::checkpoint on
+// a reader's connection, the floor of gc_incremental counts only registered
+// readers, so GC drops a version above the kept read mark of a pinned reader.
+// Invariants: GcKeepsVersionsAboveReaders
+module ownCheckpointGc {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "code",
+    CheckpointOnReaderConnection = "keepsMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect GcKeepsVersionsAboveReaders to fail: the same path with
+// backfill_floor as the only GC floor.
+// Invariants: GcKeepsVersionsAboveReaders
+module ownCheckpointGcBackfillFloor {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "backfill",
+    CheckpointOnReaderConnection = "keepsMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect no error: the lowest pinned read mark, the WAL-slot term of the
+// checkpoint GC floor, keeps the versions above the kept read mark in the same
+// path.
+// Invariants: GcKeepsVersionsAboveReaders
+module ownCheckpointGcPinnedFloor {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "pinned",
+    CheckpointOnReaderConnection = "keepsMark",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect NeverStampedAboveReader to fail: a pinned reader has a read mark
+// below the stamp of a version.
+// Invariants: NeverStampedAboveReader
+module reachStampedAboveReader {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "code",
+    CheckpointOnReaderConnection = "none",
+    ReadLooksAtChainTwice = true,
+    Aborts = false,
+    GuardReadersAbortOnDependency = true,
+    AbortKeepsMaterialized = false,
+    DirtyKeys = false,
+    GuardMarkBeforeCommitEnd = true,
+    MaxMarkFailures = 0,
+    GuardFullScanUntilStampCovered = true,
+    GuardFullScanGenerationCas = true,
+    GcSamplesFirst = false,
+    GuardGcRechecksIdleLwm = true,
+    BackfillToLimit = false,
+    LogAppendOneAtATime = false,
+    WriterBeginTicks = false,
+    WritersPinMarks = false
+  ).* from "./MvccPassiveCheckpoint"
+}
+
+// Expect NeverReaderMarkBelowBackfillFloor to fail: with Connection::checkpoint
+// on a reader's connection, a reader mark falls below backfill_floor.
+// Invariants: NeverReaderMarkBelowBackfillFloor
+module reachReaderMarkBelowFloor {
+  import MvccPassiveCheckpoint(
+    Keys = Set("k1"),
+    Readers = Set("r1", "r2"),
+    MaxTs = 5,
+    MaxCheckpoints = 2,
+    GuardSnapshotBelowPreparing = true,
+    GuardGcWaitsForReaders = true,
+    GuardDropCurrentOnlyWhenIdle = true,
+    GuardBackfillStopsAtReaders = true,
+    GcFloorRule = "code",
+    CheckpointOnReaderConnection = "keepsMark",
     ReadLooksAtChainTwice = true,
     Aborts = false,
     GuardReadersAbortOnDependency = true,

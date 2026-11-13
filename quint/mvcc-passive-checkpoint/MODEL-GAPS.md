@@ -224,6 +224,7 @@ mark), not the lock.
 12. The sync object map and stable table ids are not modeled (SYNC.md).
 13. The rowid allocator cache is dropped with retired bindings (mod.rs:4880). Not modeled. A wrong cache can reuse a rowid.
 14. If the B stamp after `TruncateWal` (csm.rs:2257) is `ORIGIN`, Rule 3 never drops those versions in B. Memory only. Not verified.
+15. A checkpoint on the connection of an open MVCC transaction (`Connection::checkpoint`, or the auto-checkpoint after the inner commit of `nextval` inside `BEGIN CONCURRENT`) is in the row spec only as `CheckpointOnReaderConnection`: the backfill ignores that reader's mark. The spec does not model the reset of the connection's transaction state. The schema and sequence specs do not have this path.
 
 ## 4. Optimizations the design does not need, and the rule each one stands in for
 

@@ -165,7 +165,11 @@ change needs its own test in the Rust code before it goes in.
    `BackfillFloorBelowReaders`. So the reader marks in the floor never lower
    it, and `compute_min_reader_mark` adds nothing to row GC. A floor of "lowest
    pinned read mark" is also safe and lets GC drop versions sooner. A floor of
-   "registered readers only" is not safe (rule R5).
+   "registered readers only" is not safe (rule R5). A checkpoint on the
+   connection of an open transaction breaks this result. Its backfill ignores
+   that reader's mark, so `backfill_floor` moves above the mark
+   (`reachReaderMarkBelowFloor`). Until that path refuses the checkpoint, the
+   reader marks stay in the floor.
 2. Rule 3 needs "no reader open" only because the dual cursor looks at the
    chain twice. When one look decides both sides of a read, TLC finds no error
    with Rule 3 under load. The variant `rule3UnderLoadOneLook` checks this

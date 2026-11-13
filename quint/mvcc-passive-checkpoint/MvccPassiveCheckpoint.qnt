@@ -79,6 +79,13 @@ module MvccPassiveCheckpoint {
   //   "backfill"   only backfillFloor
   const GcFloorRule: str
 
+  // Whether Connection::checkpoint can run on the connection of an open
+  // reader. The backfill then ignores that reader's pin. One of:
+  //   "none"      it cannot (PRAGMA wal_checkpoint refuses)
+  //   "movesMark" the reader's read mark moves to the end of the WAL
+  //   "keepsMark" the reader keeps its read mark
+  const CheckpointOnReaderConnection: str
+
   // true: a read looks at the chain twice, once for each side of the dual
   // cursor (what MvccLazyCursor does). false: one look decides both sides.
   const ReadLooksAtChainTwice: bool
@@ -598,7 +605,8 @@ module MvccPassiveCheckpoint {
   // PASSIVE WAL checkpoint: copy frames into the database file, but never past
   // a frame that a pinned reader does not see. Busy is the case upTo = nBackfill.
   action CheckpointBackfill: bool = {
-    val marks = Pinned.map(r => rd.get(r).mark)
+    nondet own = (if (CheckpointOnReaderConnection != "none") Pinned.union(Set("")) else Set("")).oneOf()
+    val marks = Pinned.exclude(Set(own)).map(r => rd.get(r).mark)
                   .union(if (WritersPinMarks) inflight.map(i => i.mark) else Set())
     val limit = if (GuardBackfillStopsAtReaders) Min(marks.union(Set(wal.length())))
                 else wal.length()
@@ -618,7 +626,10 @@ module MvccPassiveCheckpoint {
       ck' = { ...ck, pc: "backfilled" },
       chain' = chain, llog' = llog, wal' = wal, durable' = durable,
       backfillFloor' = backfillFloor, nCk' = nCk,
-      UnchangedForCheckpoint,
+      clock' = clock, inflight' = inflight, lastCommitted' = lastCommitted,
+      rd' = if (own == "" or CheckpointOnReaderConnection == "keepsMark") rd
+            else rd.setBy(own, x => { ...x, mark: wal.length() }),
+      writes' = writes, logged' = logged, err' = err,
       UnchangedRowVars,
     }
   }
@@ -879,6 +890,11 @@ module MvccPassiveCheckpoint {
     Pinned.forall(r => backfillFloor <= rd.get(r).mark),
   }
 
+  // GC never drops a version stamped above the read mark of a pinned reader.
+  val GcKeepsVersionsAboveReaders: bool =
+    Keys.forall(k => Pinned.forall(r =>
+      chain.get(k).exclude(GcChain(k, Lwm, GcFloor)).forall(v => v.mat <= rd.get(r).mark)))
+
   val TypeOK: bool = and {
     clock.in(0.to(MaxTs)),
     nBackfill.in(0.to(wal.length())),
@@ -903,6 +919,13 @@ module MvccPassiveCheckpoint {
       rd.get(r).pc == "reading", rd.get(r).mark < wal.length(), rd.get(r).mark > 0,
     }))
   val NeverBackfills: bool = nBackfill == 0
+  // A pinned reader has a read mark below the stamp of a version.
+  val NeverStampedAboveReader: bool =
+    not(Pinned.exists(r => Keys.exists(k => chain.get(k).exists(v => v.mat > rd.get(r).mark))))
+  // A pinned reader has a read mark below backfillFloor, so the reader marks
+  // in the "code" floor lower it.
+  val NeverReaderMarkBelowBackfillFloor: bool =
+    not(Pinned.exists(r => rd.get(r).mark < backfillFloor))
   // After a rollback, a current version that the B-tree already has is left
   // with materialized_at = ORIGIN, and no later checkpoint stamps it again.
   val NeverLeavesUnstampedCurrent: bool =
