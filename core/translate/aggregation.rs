@@ -39,6 +39,8 @@ pub fn emit_ungrouped_aggregation<'a>(
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
 
+    emit_saved_distinct_aggregate_steps(program, &plan.aggregates, agg_start_reg);
+
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
         emit_aggregate_final(
@@ -218,13 +220,48 @@ pub fn emit_ungrouped_aggregation<'a>(
     Ok(())
 }
 
-/// Emits the bytecode for handling duplicates in a distinct aggregate.
-/// This is used in both GROUP BY and non-GROUP BY aggregations to jump over
-/// the AggStep that would otherwise accumulate the same value multiple times.
+/// Send the values saved after a spill to COUNT(DISTINCT).
+///
+/// Only COUNT saves values after a spill, and it gets them as one total. Every
+/// other DISTINCT aggregate sees each new value at once, because saved values
+/// come back in a different order and without their subtype.
+pub fn emit_saved_distinct_aggregate_steps(
+    program: &mut ProgramBuilder,
+    aggregates: &[Aggregate],
+    first_aggregate_register: usize,
+) {
+    for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
+        // An aggregate with ORDER BY sends its values through a sorter, so
+        // handle_distinct never saves them for it.
+        if aggregate.order_cursor.is_some() || !matches!(aggregate.func, AggFunc::Count) {
+            continue;
+        }
+        let Distinctness::Distinct { ctx } = &aggregate.distinctness else {
+            continue;
+        };
+        let distinct_context = ctx
+            .as_ref()
+            .expect("distinct aggregate context not populated");
+        program.emit_insn(Insn::HashDistinctCount {
+            hash_table_id: distinct_context.hash_table_id,
+            acc_reg: first_aggregate_register + aggregate_index,
+        });
+    }
+}
+
+/// Write the instruction that removes repeated aggregate values.
+///
+/// With `save_after_spill`, values that arrive after the first spill are saved
+/// and counted at the end (see `emit_saved_distinct_aggregate_steps`). Only
+/// COUNT(DISTINCT) does this, and `is_count` lets it use its integer bitmap.
+/// An aggregate whose values go through a sorter must not save them, because
+/// the saved values would skip the sorter.
 pub fn handle_distinct(
     program: &mut ProgramBuilder,
     distinctness: &Distinctness,
     agg_arg_reg: usize,
+    is_count: bool,
+    save_after_spill: bool,
 ) {
     let Distinctness::Distinct { ctx } = distinctness else {
         return;
@@ -240,17 +277,16 @@ pub fn handle_distinct(
             num_keys: num_regs,
             collations: distinct_ctx.collations.clone(),
             target_pc: distinct_ctx.label_on_conflict,
+            save_after_spill,
+            is_count,
         }),
     });
 }
 
-/// Source of aggregate function arguments during bytecode emission.
+/// Says where an aggregate instruction gets its input values.
 ///
-/// * `Register`: arguments were pre-computed into contiguous registers
-///   (used for GROUP BY without a sorter, where the main loop is already sorted).
-/// * `Expression`: arguments are evaluated on-the-fly from the original AST
-///   (used for ungrouped aggregates, window functions, and for the GROUP BY sorter
-///   path where leaf columns are cached in `expr_to_reg_cache` before evaluation).
+/// `Register` reads values that the main query already placed in registers.
+/// `Expression` runs the SQL expression when the aggregate step runs.
 pub enum AggArgumentSource<'a> {
     Register {
         src_reg_start: usize,
@@ -281,6 +317,29 @@ impl<'a> AggArgumentSource<'a> {
             args,
             distinctness,
         }
+    }
+
+    /// Write the DISTINCT check for argument register `reg`, if the aggregate is DISTINCT.
+    ///
+    /// Only COUNT saves values after a spill, and not when it has ORDER BY
+    /// (its values come from a sorter).
+    pub fn emit_distinct(&self, program: &mut ProgramBuilder, reg: usize, is_count: bool) {
+        // Saved values come back in partition order and without their
+        // subtype, which changes the result of order-dependent aggregates (sum
+        // overflow, group_concat order) and of subtype-aware ones
+        // (json_group_array). So only COUNT saves them.
+        let save_after_spill = is_count
+            && match self {
+                AggArgumentSource::Register { aggregate, .. } => aggregate.order_cursor.is_none(),
+                AggArgumentSource::Expression { .. } => true,
+            };
+        handle_distinct(
+            program,
+            self.distinctness(),
+            reg,
+            is_count && save_after_spill,
+            save_after_spill,
+        );
     }
 
     pub fn distinctness(&self) -> &Distinctness {
@@ -380,7 +439,7 @@ pub fn emit_aggregate_step(
         });
     }
     if !aggregate.distinct_uses_order_key() {
-        handle_distinct(program, &aggregate.distinctness, args_start);
+        handle_distinct(program, &aggregate.distinctness, args_start, false, false);
     }
     let record_reg = program.alloc_register();
     super::order_by::sorter_insert(program, start, column_count, cursor_id, record_reg);
@@ -536,7 +595,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("avg bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -551,7 +610,7 @@ pub fn translate_aggregation_step(
         AggFunc::Count0 => {
             let expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
             let expr_reg = translate_const_arg(program, referenced_tables, resolver, &expr)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -568,7 +627,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("count bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, true);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -594,7 +653,7 @@ pub fn translate_aggregation_step(
             };
 
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -613,7 +672,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("max bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation =
                 ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
@@ -633,7 +692,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("min bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation =
                 ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
@@ -654,7 +713,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("max bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
@@ -674,7 +733,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("max bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -712,7 +771,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("sum bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -729,7 +788,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("total bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -747,7 +806,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("array_agg bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct(program, expr_reg, false);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -834,7 +893,7 @@ pub fn translate_aggregation_step(
                 }
                 // invariant: distinct aggregates are only supported for single-argument functions
                 if argc == 1 {
-                    handle_distinct(program, agg_arg_source.distinctness(), expr_reg + i);
+                    agg_arg_source.emit_distinct(program, expr_reg + i, false);
                 }
             }
             program.emit_insn(Insn::AggStep {

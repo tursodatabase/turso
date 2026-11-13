@@ -215,6 +215,151 @@ expect {
     3
 }
 
+# These rows pass the small debug memory limit. The same value can appear in
+# more than one in-memory set before those sets are written to disk.
+@cross-check-integrity
+test distinct-aggregate-spill {
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 20000
+    )
+    SELECT count(DISTINCT x % 4000),
+           sum(DISTINCT x % 4000),
+           avg(DISTINCT x % 4000),
+           count(DISTINCT x % 4000) FILTER (WHERE x % 2 = 0)
+    FROM input;
+}
+expect {
+    4000|7998000|1999.5|2000
+}
+
+@cross-check-integrity
+test distinct-aggregate-spill-grouped {
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 30000
+    )
+    SELECT x % 3, count(DISTINCT x % 4000), sum(DISTINCT x % 4000)
+    FROM input
+    GROUP BY x % 3
+    ORDER BY x % 3;
+}
+expect {
+    0|4000|7998000
+    1|4000|7998000
+    2|4000|7998000
+}
+
+@cross-check-integrity
+test distinct-aggregate-spill-number-types {
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 3000
+    ), mixed(value) AS (
+        SELECT x FROM input
+        UNION ALL
+        SELECT CAST(x AS REAL) FROM input
+    )
+    SELECT count(DISTINCT value), sum(DISTINCT value) FROM mixed;
+}
+expect {
+    3000|4501500
+}
+
+@cross-check-integrity
+test distinct-aggregate-spill-nocase {
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 3000
+    ), mixed(value) AS (
+        SELECT printf('v%04d', x) FROM input
+        UNION ALL
+        SELECT upper(printf('v%04d', x)) FROM input
+    )
+    SELECT count(DISTINCT value COLLATE NOCASE) FROM mixed;
+}
+expect {
+    3000
+}
+
+@cross-check-integrity
+test distinct-aggregate-spill-correlated {
+    CREATE TABLE distinct_spill_values(x INTEGER);
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 6000
+    )
+    INSERT INTO distinct_spill_values SELECT x FROM input;
+    CREATE TABLE distinct_spill_limits(n INTEGER);
+    INSERT INTO distinct_spill_limits VALUES (1000), (3000), (6000);
+    SELECT n,
+           (SELECT count(DISTINCT x % 2000)
+            FROM distinct_spill_values
+            WHERE x <= n)
+    FROM distinct_spill_limits
+    ORDER BY n;
+}
+expect {
+    1000|1000
+    3000|2000
+    6000|2000
+}
+
+# The bitmap in a debug build can hold this whole signed range. Repeated values
+# must not create spill entries.
+@cross-check-integrity
+test distinct-count-integer-bitmap {
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 120000
+    )
+    SELECT count(DISTINCT (x % 60000) - 30000) FROM input;
+}
+expect {
+    60000
+}
+
+# A far-away integer stops the bitmap from growing. Far-away integers and other
+# value types use the normal value set. A value cannot be in both places.
+@cross-check-integrity
+test distinct-count-bitmap-with-spill-parts {
+    WITH RECURSIVE input(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM input WHERE x < 5000
+    ), mixed(value) AS (
+        SELECT x - 2500 FROM input
+        UNION ALL
+        SELECT 1000000 + x * 10000 FROM input
+        UNION ALL
+        SELECT CAST(1000000 + x * 10000 AS REAL) FROM input
+        UNION ALL
+        SELECT 1.5
+        UNION ALL
+        SELECT 1.5
+        UNION ALL
+        SELECT '1'
+        UNION ALL
+        SELECT '1'
+        UNION ALL
+        SELECT x'31'
+        UNION ALL
+        SELECT x'31'
+        UNION ALL
+        SELECT NULL
+    )
+    SELECT count(DISTINCT value) FROM mixed;
+}
+expect {
+    10003
+}
+
 # Regression: EXISTS over DISTINCT+OFFSET must return true when rows remain.
 @cross-check-integrity
 test distinct-exists-with-offset {
@@ -272,4 +417,51 @@ test distinct-spilled-many-duplicates {
 }
 expect {
     5000|12497500
+}
+
+# A group whose rows are all removed by FILTER never inserts a DISTINCT value,
+# after an earlier group has created the hash table.
+test distinct-filter-skips-whole-group {
+    CREATE TABLE distinct_filter (g, x, e);
+    INSERT INTO distinct_filter VALUES ('a', 1, 1), ('a', 2, 0), ('b', 5, 0);
+    SELECT g, count(DISTINCT x) FILTER (WHERE e), ifnull(sum(DISTINCT x) FILTER (WHERE e), 'NULL')
+    FROM distinct_filter GROUP BY g ORDER BY g;
+}
+expect {
+    a|1|1
+    b|0|NULL
+}
+
+# After a spill, SUM/TOTAL/AVG must still add each value as it arrives. Replaying
+# saved values in partition order sums the big values of one sign first and
+# raises a spurious integer overflow.
+test distinct-spilled-sum-does-not-overflow {
+    WITH RECURSIVE s(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<500)
+    SELECT sum(DISTINCT v), total(DISTINCT v), avg(DISTINCT v)
+    FROM (SELECT CASE WHEN i%2=0 THEN 9223372036854770000-i ELSE -9223372036854770000+i END v FROM s);
+}
+expect {
+    -250|-250.0|-0.5
+}
+expect @js {
+    -250|-250|-0.5
+}
+
+# A DISTINCT value must keep its JSON subtype after a spill, so the elements are
+# arrays and not JSON strings.
+test distinct-spilled-json-group-array-keeps-subtype {
+    WITH RECURSIVE s(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM s WHERE i<500)
+    SELECT length(json_group_array(DISTINCT json_array(i))) FROM s;
+}
+expect {
+    2893
+}
+
+# Two large values spill at once: the second element must still be an array.
+test distinct-spilled-json-group-array-large-values {
+    WITH t(x) AS (VALUES(1),(2))
+    SELECT json_type(json_group_array(DISTINCT json_array(printf('%016000d',x))), '$[1]') FROM t;
+}
+expect {
+    array
 }
