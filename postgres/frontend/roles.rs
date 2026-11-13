@@ -2,7 +2,8 @@
 //! table of the main database.
 //!
 //! The table has the `pg_authid` columns that tursopg uses: `rolname`,
-//! `rolsuper` and `rolbypassrls`. Its `id` column is the engine's [`RoleId`] of the role, which
+//! `rolsuper`, `rolinherit` and `rolbypassrls`. Its `id` column is the
+//! engine's [`RoleId`] of the role, which
 //! other catalog rows store, such as `relowner` of the relation catalog.
 //! [`crate::catalog::role_oid`] gives the role's PostgreSQL oid.
 //!
@@ -43,6 +44,7 @@ pub(crate) const CREATE_AUTHID_TABLE_SQL: &str = "CREATE TABLE __turso_internal_
     id INTEGER PRIMARY KEY, \
     rolname TEXT NOT NULL, \
     rolsuper INTEGER NOT NULL, \
+    rolinherit INTEGER NOT NULL, \
     rolbypassrls INTEGER NOT NULL)";
 
 /// Keeps role names unique in the stored table, whatever writes it.
@@ -50,7 +52,7 @@ pub(crate) const CREATE_AUTHID_NAME_INDEX_SQL: &str =
     "CREATE UNIQUE INDEX __turso_internal_authid_rolname ON __turso_internal_authid (rolname)";
 
 /// The number of columns of [`AUTHID_TABLE_NAME`].
-const AUTHID_COLUMN_COUNT: usize = 4;
+const AUTHID_COLUMN_COUNT: usize = 5;
 
 /// The query that reads the roles for the frontend's schema state, or None
 /// when the database has no roles table, as in a read-only open of an empty
@@ -58,7 +60,7 @@ const AUTHID_COLUMN_COUNT: usize = 4;
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME)?;
     Some(format!(
-        "SELECT id, rolname, rolsuper, rolbypassrls FROM {AUTHID_TABLE_NAME}"
+        "SELECT id, rolname, rolsuper, rolinherit, rolbypassrls FROM {AUTHID_TABLE_NAME}"
     ))
 }
 
@@ -88,6 +90,10 @@ pub(crate) struct Role {
     pub(crate) name: String,
     /// A superuser passes every privilege check.
     pub(crate) superuser: bool,
+    /// A role with `inherit` uses the privileges of the roles it is a member
+    /// of without `SET ROLE`. tursopg has no role membership yet, so nothing
+    /// reads it but `pg_roles`.
+    pub(crate) inherit: bool,
     /// Row-level security does not limit a role with `bypassrls`.
     pub(crate) bypassrls: bool,
 }
@@ -102,7 +108,7 @@ pub(crate) struct RoleCatalog {
 
 impl RoleCatalog {
     /// Returns a catalog of the rows read from the roles table. Each row is
-    /// `(id, rolname, rolsuper, rolbypassrls)`.
+    /// `(id, rolname, rolsuper, rolinherit, rolbypassrls)`.
     pub(crate) fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
@@ -170,6 +176,7 @@ impl RoleCatalog {
             id: RoleId::from_stored(*id),
             name: name.to_string(),
             superuser: false,
+            inherit: options.inherit,
             bypassrls: options.bypassrls,
         });
         Ok(())
@@ -190,19 +197,21 @@ impl RoleCatalog {
 }
 
 fn role_from_row(row: &[Value]) -> turso_core::Result<Role> {
-    let [id, name, superuser, bypassrls] = row else {
+    let [id, name, superuser, inherit, bypassrls] = row else {
         return Err(corrupt_row(row));
     };
-    match (id, name, superuser, bypassrls) {
+    match (id, name, superuser, inherit, bypassrls) {
         (
             Value::Numeric(Numeric::Integer(id)),
             Value::Text(name),
             Value::Numeric(Numeric::Integer(superuser @ (0 | 1))),
+            Value::Numeric(Numeric::Integer(inherit @ (0 | 1))),
             Value::Numeric(Numeric::Integer(bypassrls @ (0 | 1))),
         ) if *id > 0 => Ok(Role {
             id: RoleId::from_stored(*id),
             name: name.as_str().to_string(),
             superuser: *superuser == 1,
+            inherit: *inherit == 1,
             bypassrls: *bypassrls == 1,
         }),
         _ => Err(corrupt_row(row)),
@@ -273,8 +282,12 @@ pub(crate) fn translate_create_role(
         dest: first_column_reg + 2,
     });
     program.emit_insn(Insn::Integer {
-        value: options.bypassrls as i64,
+        value: options.inherit as i64,
         dest: first_column_reg + 3,
+    });
+    program.emit_insn(Insn::Integer {
+        value: options.bypassrls as i64,
+        dest: first_column_reg + 4,
     });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -415,6 +428,15 @@ mod tests {
     }
 
     #[test]
+    fn a_role_keeps_the_inherit_value_of_its_row() {
+        let catalog =
+            RoleCatalog::new(&[role_row(1, "alice", 0), noinherit_role_row(2, "bob")]).unwrap();
+
+        assert!(catalog.get_by_name("alice").unwrap().inherit);
+        assert!(!catalog.get_by_name("bob").unwrap().inherit);
+    }
+
+    #[test]
     fn only_a_superuser_may_set_another_role_and_no_one_may_set_public() {
         let catalog = RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "bob", 0)]).unwrap();
         let alice = catalog.get_by_name("alice").unwrap().id;
@@ -432,6 +454,7 @@ mod tests {
             Value::from_i64(id),
             Value::build_text(name.to_string()),
             Value::from_i64(superuser),
+            Value::from_i64(1),
             Value::from_i64(0),
         ]
     }
@@ -442,6 +465,17 @@ mod tests {
             Value::build_text(name.to_string()),
             Value::from_i64(0),
             Value::from_i64(1),
+            Value::from_i64(1),
+        ]
+    }
+
+    fn noinherit_role_row(id: i64, name: &str) -> Vec<Value> {
+        vec![
+            Value::from_i64(id),
+            Value::build_text(name.to_string()),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ]
     }
 }

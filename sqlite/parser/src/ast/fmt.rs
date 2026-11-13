@@ -695,6 +695,9 @@ impl ToTokens for Stmt {
                 s.append(TK_CREATE, None)?;
                 s.append(TK_ID, Some("ROLE"))?;
                 s.append(TK_ID, Some(role_name))?;
+                if !options.inherit {
+                    s.append(TK_ID, Some("NOINHERIT"))?;
+                }
                 if options.bypassrls {
                     s.append(TK_ID, Some("BYPASSRLS"))?;
                 }

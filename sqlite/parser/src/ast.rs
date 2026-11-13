@@ -1554,11 +1554,24 @@ pub enum RoleSpec {
 }
 
 /// The options of `CREATE ROLE`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RoleOptions {
+    /// `INHERIT`: the role uses the privileges of the roles it is a member
+    /// of without `SET ROLE`
+    pub inherit: bool,
     /// `BYPASSRLS`: row-level security does not limit the role
     pub bypassrls: bool,
+}
+
+impl Default for RoleOptions {
+    /// The options of a `CREATE ROLE` that gives none.
+    fn default() -> Self {
+        Self {
+            inherit: true,
+            bypassrls: false,
+        }
+    }
 }
 
 /// `GRANT privileges ON relations TO grantees`, or `REVOKE privileges ON
