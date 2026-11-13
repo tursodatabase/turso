@@ -1411,7 +1411,6 @@ mod tests {
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{Cmd, OneSelect, ResultColumn, Stmt};
-    use turso_parser::parser::Parser;
 
     impl PartialEq for ExprType {
         fn eq(&self, other: &Self) -> bool {
@@ -1636,8 +1635,9 @@ mod tests {
 
     fn parse_expr(sql: &str) -> ast::Expr {
         let select_sql = format!("SELECT {sql}");
-        let mut parser = Parser::new(select_sql.as_bytes());
-        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) = parser.next_cmd() else {
+        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
+            crate::dialect::engine::parse_statement(&select_sql)
+        else {
             panic!("not a SELECT: {sql}");
         };
         let OneSelect::Select { mut columns, .. } = select.body.select else {

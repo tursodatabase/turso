@@ -9,10 +9,7 @@ use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{turso_assert, LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
-use turso_parser::{
-    ast::{Cmd, Stmt},
-    parser::Parser,
-};
+use turso_parser::ast::{Cmd, Stmt};
 
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
@@ -714,8 +711,7 @@ impl IncrementalView {
         main_data_root: i64,
         namespace: NamespaceId,
     ) -> Result<Self> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         let cmd = cmd.expect("View is an empty statement");
         match cmd {
             Cmd::Stmt(Stmt::CreateMaterializedView {

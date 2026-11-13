@@ -8,7 +8,7 @@ use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::{ast, parser::Parser};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
@@ -134,9 +134,8 @@ impl VirtualTable {
     }
 
     pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
-        let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
-            parser.next_cmd()?.ok_or_else(|| {
+            crate::dialect::engine::parse_statement(&schema)?.ok_or_else(|| {
                 LimboError::ParseError(
                     "Failed to parse schema from virtual table module".to_string(),
                 )

@@ -8,10 +8,7 @@ use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use turso_parser::ast::{self, TableInternalId};
 
 use super::{
     index::emit_refill_index,
@@ -1201,8 +1198,7 @@ pub fn translate_alter_table(
                 "#,
             );
 
-            let mut parser = Parser::new(stmt.as_bytes());
-            let cmd = parser.next_cmd().map_err(|e| {
+            let cmd = crate::dialect::engine::parse_statement(&stmt).map_err(|e| {
                 LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
             })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
@@ -1418,8 +1414,7 @@ pub fn translate_alter_table(
                 "#,
             );
 
-            let mut parser = Parser::new(stmt.as_bytes());
-            let cmd = parser.next_cmd().map_err(|e| {
+            let cmd = crate::dialect::engine::parse_statement(&stmt).map_err(|e| {
                 LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
             })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
@@ -1802,8 +1797,7 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
+                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
                     ))
@@ -2383,8 +2377,7 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
+                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
                     ))
@@ -2417,8 +2410,7 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
+                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse view update SQL for {view_name}: {e}"
                     ))
@@ -3304,9 +3296,7 @@ fn rewrite_trigger_sql_for_table_rename(
     new_table_name: &str,
     renamed_db_name: &str,
 ) -> Result<String> {
-    let mut parser = Parser::new(trigger_sql.as_bytes());
-    let cmd = parser
-        .next_cmd()
+    let cmd = crate::dialect::engine::parse_statement(trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
@@ -3384,9 +3374,7 @@ fn rewrite_trigger_sql_for_column_rename(
     resolver: &Resolver,
 ) -> Result<String> {
     // Parse the trigger SQL
-    let mut parser = Parser::new(trigger_sql.as_bytes());
-    let cmd = parser
-        .next_cmd()
+    let cmd = crate::dialect::engine::parse_statement(trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,

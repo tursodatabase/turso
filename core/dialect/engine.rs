@@ -96,6 +96,19 @@ pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)
     Ok((cmd, parser.offset()))
 }
 
+/// Parse the first SQLite statement in `sql`.
+pub fn parse_statement(sql: &str) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+    Ok(parse(sql)?.0)
+}
+
+/// Parse the column definition of an `ALTER TABLE` statement.
+pub fn parse_column_definition(
+    sql: &str,
+    in_alter: bool,
+) -> crate::Result<turso_parser::ast::ColumnDefinition> {
+    Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(in_alter)?)
+}
+
 /// Formats canonical SQLite `CREATE TABLE` text from its AST.
 pub fn format_table_sql(
     tbl_name: &turso_parser::ast::QualifiedName,

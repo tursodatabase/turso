@@ -771,8 +771,10 @@ mod tests {
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
-        let cmd = parser.next().unwrap().unwrap();
+        let cmd = crate::dialect::engine::parse_statement("SELECT 'x' REGEXP 'y'")
+            .transpose()
+            .unwrap()
+            .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -1000,8 +1002,10 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
-        let cmd = parser.next().unwrap().unwrap();
+        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
+            .transpose()
+            .unwrap()
+            .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -1045,8 +1049,10 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
-        let cmd = parser.next().unwrap().unwrap();
+        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
+            .transpose()
+            .unwrap()
+            .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
