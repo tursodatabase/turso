@@ -501,6 +501,25 @@ pub(crate) fn relation_owner(
     )
 }
 
+/// [`turso_core::Dialect::sequences_owned_by_table`] for the PostgreSQL frontend.
+pub(crate) fn sequences_owned_by_table(
+    schema: &Schema,
+    namespace: NamespaceId,
+    name: &str,
+) -> Vec<String> {
+    let Some(catalog) = class_catalog(schema) else {
+        return Vec::new();
+    };
+    let Some(table) = catalog.get_by_name(namespace, name) else {
+        return Vec::new();
+    };
+    catalog
+        .owned_by(table.oid)
+        .filter(|owned| owned.relkind == RelationKind::Sequence)
+        .map(|owned| owned.relname.clone())
+        .collect()
+}
+
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// a role has the privileges the relation's list gives it, by oid or through
 /// PUBLIC. A relation without a list has the default one, which gives the
@@ -677,21 +696,11 @@ pub(crate) fn translate_catalog_changes(
             }
             CatalogChange::Drop { namespace, name } => {
                 // An engine relation has no row and nothing to do.
-                let Some(owned) = class_catalog(schema).and_then(|catalog| {
-                    let class = catalog.get_by_name(*namespace, name)?;
-                    Some(
-                        catalog
-                            .owned_by(class.oid)
-                            .map(|owned| (owned.relnamespace, owned.relname.clone()))
-                            .collect::<Vec<_>>(),
-                    )
-                }) else {
+                if class_catalog(schema)
+                    .and_then(|catalog| catalog.get_by_name(*namespace, name))
+                    .is_none()
+                {
                     continue;
-                };
-                // What the dropped relation owned, such as the sequences of
-                // a table's serial columns, stays and is nobody's now.
-                for (owned_namespace, owned_name) in owned {
-                    emit_class_row_set_owned_by(program, &cursors, owned_namespace, &owned_name, 0);
                 }
                 emit_class_row_delete(program, &cursors, *namespace, name)
             }
