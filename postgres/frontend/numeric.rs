@@ -187,7 +187,7 @@ fn map_parse_int_err_kind(err: ParseIntError, width: IntegerWidth) -> LimboError
 
             sqlstate_error(
                 SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                &format!("invalid input syntax for type {type_name}"),
+                format!("invalid input syntax for type {type_name}"),
             )
         }
         _ => sqlstate_error(

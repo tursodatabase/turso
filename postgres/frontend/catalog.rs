@@ -415,7 +415,7 @@ impl Dialect for PostgresDialect {
         let integer_width =
             IntegerWidth::try_from(*metadata).expect("invalid integer width metadata");
 
-        Ok(cast_value_to_integer(operand, integer_width)?)
+        cast_value_to_integer(operand, integer_width)
     }
 }
 
