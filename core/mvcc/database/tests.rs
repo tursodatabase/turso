@@ -518,7 +518,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let tx_id = 7;
     let tx = new_tx_in::<FailOnDemandAlloc>(tx_id, 1, TransactionState::Active);
     tx.begin_savepoint();
-    store.txs.try_insert(tx_id, tx).unwrap();
+    store.txs.try_insert(tx_id, Arc::new(tx)).unwrap();
 
     let table_id = MVTableId::from(-2);
     let row_id = RowID::new(table_id, RowKey::Int(42));
@@ -825,7 +825,11 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
     let reader_id: TxID = 9_000_100;
     store.txs.insert(
         reader_id,
-        new_tx_in::<DynAllocator>(reader_id, 100, TransactionState::Active),
+        Arc::new(new_tx_in::<DynAllocator>(
+            reader_id,
+            100,
+            TransactionState::Active,
+        )),
     );
 
     let materialized_at = WalPos {
@@ -8120,15 +8124,15 @@ fn new_tx_in<A: super::RowVersionAllocator>(
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
 fn test_snapshot_isolation_tx_visible1() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
-        (1, new_tx(1, 1, TransactionState::Committed(2))),
-        (2, new_tx(2, 2, TransactionState::Committed(5))),
-        (3, new_tx(3, 3, TransactionState::Aborted)),
-        (5, new_tx(5, 5, TransactionState::Preparing(8))),
-        (6, new_tx(6, 6, TransactionState::Committed(10))),
-        (7, new_tx(7, 7, TransactionState::Active)),
+    let txs: TxMap<Arc<Transaction>> = TxMap::from_iter([
+        (1, Arc::new(new_tx(1, 1, TransactionState::Committed(2)))),
+        (2, Arc::new(new_tx(2, 2, TransactionState::Committed(5)))),
+        (3, Arc::new(new_tx(3, 3, TransactionState::Aborted))),
+        (5, Arc::new(new_tx(5, 5, TransactionState::Preparing(8)))),
+        (6, Arc::new(new_tx(6, 6, TransactionState::Committed(10)))),
+        (7, Arc::new(new_tx(7, 7, TransactionState::Active))),
         // tx 8 with Preparing(3): current_tx (begin_ts=4) can speculatively read
-        (8, new_tx(8, 1, TransactionState::Preparing(3))),
+        (8, Arc::new(new_tx(8, 1, TransactionState::Preparing(3)))),
     ]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -8231,7 +8235,7 @@ fn test_snapshot_isolation_tx_visible1() {
 
 #[test]
 fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let txs: TxMap<Arc<Transaction>> = TxMap::new();
     let finalized_tx_states: SkipMap<TxID, TransactionState> =
         SkipMap::from_iter([(42, TransactionState::Committed(5))]);
     let reader = new_tx(7, 10, TransactionState::Active);
@@ -8350,8 +8354,8 @@ fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
 /// and adds to CommitDepSet.
 #[test]
 fn test_commit_dependency_speculative_read() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     // Reader with begin_ts=10 > end_ts=5 → speculative read → dependency
@@ -8384,8 +8388,8 @@ fn test_commit_dependency_speculative_read() {
 /// and decrements their CommitDepCounter.
 #[test]
 fn test_commit_dependency_cascade_abort() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -8410,7 +8414,7 @@ fn test_commit_dependency_cascade_abort() {
     tx1.state.store(TransactionState::Aborted);
 
     // Add reader to txs so cascade can find it
-    txs.insert(2, reader);
+    txs.insert(2, Arc::new(reader));
 
     for dep_tx_id in tx1.commit_dep_set.lock().drain() {
         if let Some(dep_tx_entry) = txs.get(&dep_tx_id) {
@@ -8429,8 +8433,8 @@ fn test_commit_dependency_cascade_abort() {
 /// Test that registering a dependency on an already-committed tx is a no-op.
 #[test]
 fn test_commit_dependency_already_committed() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Committed(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Committed(5))))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -8443,8 +8447,8 @@ fn test_commit_dependency_already_committed() {
 /// Test that registering a dependency on an already-aborted tx sets AbortNow.
 #[test]
 fn test_commit_dependency_already_aborted() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Aborted))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Aborted)))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -8457,9 +8461,9 @@ fn test_commit_dependency_already_aborted() {
 /// Test speculative ignore in is_end_visible registers dependency.
 #[test]
 fn test_commit_dependency_speculative_ignore() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
-        (1, new_tx(1, 1, TransactionState::Committed(2))),
-        (3, new_tx(3, 3, TransactionState::Preparing(5))),
+    let txs: TxMap<Arc<Transaction>> = TxMap::from_iter([
+        (1, Arc::new(new_tx(1, 1, TransactionState::Committed(2)))),
+        (3, Arc::new(new_tx(3, 3, TransactionState::Preparing(5)))),
     ]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -8537,11 +8541,19 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let writer_id: TxID = 9_000_050;
     store.txs.insert(
         writer_id,
-        new_tx_in::<crate::alloc::DynAllocator>(writer_id, 1, TransactionState::Preparing(40)),
+        Arc::new(new_tx_in::<crate::alloc::DynAllocator>(
+            writer_id,
+            1,
+            TransactionState::Preparing(40),
+        )),
     );
     store.txs.insert(
         reader_id,
-        new_tx_in::<crate::alloc::DynAllocator>(reader_id, 100, TransactionState::Active),
+        Arc::new(new_tx_in::<crate::alloc::DynAllocator>(
+            reader_id,
+            100,
+            TransactionState::Active,
+        )),
     );
 
     // MVCC-only tombstone at key 20: committed insert (begin Timestamp) deleted
@@ -8597,8 +8609,8 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
 /// register one commit dependency (dedup).
 #[test]
 fn test_commit_dependency_multiple_reads_dedup() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -9046,8 +9058,8 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
 /// a concurrent drain could fetch_sub(1) on a zero counter, wrapping to MAX.
 #[test]
 fn test_commit_dependency_counter_no_underflow() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let reader = new_tx(2, 10, TransactionState::Active);
 
     // Register dependency: counter should go 0 → 1
@@ -9068,8 +9080,8 @@ fn test_commit_dependency_counter_no_underflow() {
 /// tx from txs, so register_commit_dependency saw None and assumed "committed."
 #[test]
 fn test_commit_dependency_terminated_tx_sets_abort() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Terminated))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Terminated)))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
     register_commit_dependency(&txs, &reader, 1);
@@ -9092,7 +9104,7 @@ fn test_commit_dependency_terminated_tx_sets_abort() {
 /// from the map (Issue #3 fix ensures this).
 #[test]
 fn test_commit_dependency_missing_tx_assumes_committed() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let txs: TxMap<Arc<Transaction>> = TxMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
     register_commit_dependency(&txs, &reader, 99);
@@ -24901,6 +24913,225 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
     let rows = get_rows(&writer, "SELECT id FROM t ORDER BY id");
     let ids: Vec<i64> = rows.iter().map(|row| row[0].as_int().unwrap()).collect();
     assert_eq!(ids, vec![1, 2, 3]);
+}
+
+fn prefix_test_values() -> (Vec<crate::numeric::Numeric>, Vec<String>, Vec<Vec<u8>>) {
+    use crate::numeric::{nonnan::NonNan, Numeric};
+    let mut rng = ChaCha8Rng::seed_from_u64(7);
+    let two_53 = 1i64 << 53;
+    let mut numbers: Vec<Numeric> = [
+        0,
+        1,
+        -1,
+        i64::MIN,
+        i64::MAX,
+        two_53,
+        two_53 + 1,
+        two_53 + 2,
+        -two_53 - 1,
+        -two_53,
+    ]
+    .into_iter()
+    .map(Numeric::Integer)
+    .collect();
+    let floats = [
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        1.0,
+        -1.0,
+        1e300,
+        -1e300,
+        f64::MIN_POSITIVE,
+        5e-324,
+        two_53 as f64,
+        (two_53 + 2) as f64,
+        9.223372036854776e18,
+        -9.223372036854776e18,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    numbers.extend(
+        floats
+            .into_iter()
+            .map(|f| Numeric::Float(NonNan::new(f).expect("not NaN"))),
+    );
+    for _ in 0..40 {
+        numbers.push(Numeric::Integer(rng.random_range(-1000..1000)));
+        numbers.push(Numeric::Integer(rng.random::<i64>()));
+        numbers.push(Numeric::Float(
+            NonNan::new(rng.random_range(-1000.0..1000.0)).expect("not NaN"),
+        ));
+    }
+    let alphabet = ['a', 'b', 'A', 'B', 'z', 'Z', ' ', '\0', '~', 'é'];
+    let mut texts: Vec<String> = [
+        "", "a", "a ", "a\0", "a\0b", "a\0c", "abcdefg", "abcdefgh", "ABCDEFGz", "5", "-1",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for _ in 0..80 {
+        let len = rng.random_range(0..12);
+        texts.push(
+            (0..len)
+                .map(|_| alphabet[rng.random_range(0..alphabet.len())])
+                .collect(),
+        );
+    }
+    let mut blobs: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![0],
+        vec![0, 0],
+        vec![0xff; 9],
+        vec![1; 7],
+        vec![1; 8],
+    ];
+    for _ in 0..40 {
+        let len = rng.random_range(0..12);
+        blobs.push(
+            (0..len)
+                .map(|_| [0u8, 1, 0x7f, 0x80, 0xfe, 0xff][rng.random_range(0..6)])
+                .collect(),
+        );
+    }
+    (numbers, texts, blobs)
+}
+
+fn prefix_test_key_infos() -> Vec<crate::types::KeyInfo> {
+    use crate::translate::collate::CollationSeq;
+    use crate::type_ordering::TypeOrdering;
+    use turso_parser::ast::{NullsOrder, SortOrder};
+    let mut infos = Vec::new();
+    for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+        for collation in [
+            CollationSeq::BINARY,
+            CollationSeq::NOCASE,
+            CollationSeq::RTRIM,
+            CollationSeq::Text(backwards_collation()),
+            CollationSeq::Type(TypeOrdering::Numeric),
+        ] {
+            for nulls_order in [None, Some(NullsOrder::First), Some(NullsOrder::Last)] {
+                infos.push(crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order,
+                });
+            }
+        }
+    }
+    infos
+}
+
+/// A custom collation that orders texts backwards, unlike the bytes of the texts.
+fn backwards_collation() -> crate::translate::collate::TextCollation {
+    unsafe extern "C" fn backwards(
+        _: usize,
+        left_ptr: *const u8,
+        left_len: usize,
+        right_ptr: *const u8,
+        right_len: usize,
+    ) -> i32 {
+        // SAFETY: the collation is called with two valid byte slices.
+        let (left, right) = unsafe {
+            (
+                std::slice::from_raw_parts(left_ptr, left_len),
+                std::slice::from_raw_parts(right_ptr, right_len),
+            )
+        };
+        right.cmp(left) as i32
+    }
+    static BACKWARDS: std::sync::LazyLock<Arc<crate::function::ExternalCollation>> =
+        std::sync::LazyLock::new(|| {
+            crate::function::ExternalCollation::new("backwards".into(), 0, backwards, None)
+        });
+    BACKWARDS.collation
+}
+
+#[test]
+fn index_value_prefix_keeps_the_order_of_cmp_in_column() {
+    use crate::types::{cmp_in_column, TextRef, TextSubtype};
+    let (numbers, texts, blobs) = prefix_test_values();
+    let mut values: Vec<ValueRef<'_>> = vec![ValueRef::Null];
+    values.extend(numbers.iter().map(|n| ValueRef::Numeric(*n)));
+    values.extend(
+        texts
+            .iter()
+            .map(|t| ValueRef::Text(TextRef::new(t, TextSubtype::Text))),
+    );
+    values.extend(blobs.iter().map(|b| ValueRef::Blob(b)));
+    let mut decided = 0u64;
+    for key_info in prefix_test_key_infos() {
+        let prefixes: Vec<Option<u64>> = values
+            .iter()
+            .map(|v| index_value_prefix(v, &key_info))
+            .collect();
+        for (a, pa) in values.iter().zip(&prefixes) {
+            for (b, pb) in values.iter().zip(&prefixes) {
+                let (Some(pa), Some(pb)) = (pa, pb) else {
+                    continue;
+                };
+                if pa == pb {
+                    continue;
+                }
+                decided += 1;
+                let expected = if pa < pb {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+                assert_eq!(
+                    cmp_in_column(a, b, &key_info),
+                    expected,
+                    "prefix order of {a:?} and {b:?} does not match {key_info:?}"
+                );
+            }
+        }
+    }
+    assert!(decided > 1_000_000, "the prefixes decide most pairs");
+}
+
+#[test]
+fn index_key_prefix_keeps_the_order_of_index_keys() {
+    use crate::bplus_tree::KeyPrefix;
+    let (numbers, texts, _) = prefix_test_values();
+    let mut rng = ChaCha8Rng::seed_from_u64(11);
+    for key_info in prefix_test_key_infos() {
+        let second = crate::types::KeyInfo {
+            sort_order: turso_parser::ast::SortOrder::Asc,
+            collation: crate::translate::collate::CollationSeq::BINARY,
+            nulls_order: None,
+        };
+        let info = Arc::new(IndexInfo::new([key_info, second], true, 2, false).unwrap());
+        let keys: Vec<SortableIndexKey> = (0..150)
+            .map(|i| {
+                let first = match rng.random_range(0..3) {
+                    0 => Value::Null,
+                    1 => Value::from(numbers[rng.random_range(0..numbers.len())]),
+                    _ => Value::build_text(texts[rng.random_range(0..texts.len())].clone()),
+                };
+                let record = ImmutableRecord::from_values(&[first, Value::from_i64(i)], 2).unwrap();
+                SortableIndexKey::new_from_payload_in(
+                    record.as_blob(),
+                    info.clone(),
+                    TursoAllocator,
+                )
+                .unwrap()
+            })
+            .collect();
+        for a in &keys {
+            for b in &keys {
+                let (Some(pa), Some(pb)) = (a.prefix(), b.prefix()) else {
+                    continue;
+                };
+                if pa < pb {
+                    assert_eq!(a.cmp(b), std::cmp::Ordering::Less);
+                } else if pa > pb {
+                    assert_eq!(a.cmp(b), std::cmp::Ordering::Greater);
+                }
+            }
+        }
+    }
 }
 
 #[path = "group_commit_tests.rs"]

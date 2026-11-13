@@ -1,0 +1,23 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# The seek key of x = 1 has fewer columns than the index on (x, y, z), so it is
+# equal to every index row with x = 1. Those MVCC index rows fill several leaves
+# of the in-memory B+ tree, and a backward seek must start at the last of them,
+# not at the end of the first leaf that holds them.
+test mvcc-backward-index-seek-starts-at-last-row-of-key {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(x, y, z, PRIMARY KEY (x, y, z));
+    INSERT INTO t SELECT a.value, b.value, 0 FROM generate_series(1, 2) AS a, generate_series(1, 300) AS b;
+    SELECT y FROM t WHERE x = 1 AND y >= 290 ORDER BY x DESC, y DESC LIMIT 3;
+    SELECT y FROM t WHERE x = 1 ORDER BY x DESC, y DESC LIMIT 3;
+}
+expect {
+    mvcc
+    300
+    299
+    298
+    300
+    299
+    298
+}
