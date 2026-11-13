@@ -58,8 +58,27 @@ read the chain registered in `txs` before taking the chain read lock, so the
 recheck sees it. A reader that begins later reads the chain only after GC
 releases the lock. The recheck does not take the clock (see Lock order).
 
-Truncate Finalize still reclaims last currents: the blocking write lock waits
-out open MVCC txs, so LWM is `MAX` for that pass.
+An explicit TRUNCATE with `experimental_mvcc_passive_checkpoint` still reclaims
+last currents in Finalize: the blocking write lock waits out open MVCC txs, so
+LWM is `MAX` for that pass.
+
+## Blocking checkpoint clears the store
+
+Without `experimental_mvcc_passive_checkpoint`, a checkpoint holds
+`blocking_checkpoint_lock` in write mode from before its snapshot until after
+Finalize, and its mode is always TRUNCATE. When it gets to Finalize:
+
+- No MVCC transaction is open. Each transaction holds the lock in read mode
+  from its begin to `remove_tx`.
+- Every committed version is at or below the snapshot, and the B-tree has it.
+  The checkpoint truncates the whole logical log for the same reason.
+- No pager reader is at an older WAL position. Such a reader makes the WAL
+  truncation return `Busy`, and the checkpoint stops before Finalize.
+
+No reader needs the store then, so Finalize does not apply the chain rules. It
+removes every version and every slot with `clear_row_versions`. This includes
+versions that the chain rules never remove: a version stays unstamped when an
+earlier checkpoint stopped after its pager commit and before `GcTableRows`.
 
 ## Materialization stamps
 
@@ -81,8 +100,10 @@ clock while holding a chain lock. Passive publish takes the clock then
 1. **Incremental** (`gc_incremental` on commit): bounded table + index sweeps.
 2. **Checkpoint write-set** (`gc_checkpointed_*`): stamp then GC keys this
    checkpoint wrote.
-3. **Finalize**: Truncate uses `drop_unused_row_versions_and_slots`; Passive
-   uses `drop_unused_row_versions_unlink_empty_at(gc_floor_reader_mark())`.
+3. **Finalize**: without `experimental_mvcc_passive_checkpoint`, the checkpoint
+   clears the store with `clear_row_versions`. With the flag, an explicit
+   TRUNCATE uses `drop_unused_row_versions_and_slots` and Passive uses
+   `drop_unused_row_versions_unlink_empty_at(gc_floor_reader_mark())`.
 
 ## Dual cursor / write buffer
 

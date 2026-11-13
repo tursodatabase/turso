@@ -3529,7 +3529,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::Finalize => {
-                if self.lock_states.blocking_checkpoint_lock_held {
+                if !self.mvstore.uses_passive_checkpoint() {
+                    turso_assert!(
+                        self.lock_states.blocking_checkpoint_lock_held
+                            && self.mode.should_restart_log(),
+                        "blocking checkpoint must hold the checkpoint lock and truncate the WAL"
+                    );
+                    // The lock was held from before the snapshot, so the B-tree has every
+                    // committed row. The WAL truncation found no reader at an older WAL
+                    // position, so every reader can read those rows from the B-tree.
+                    self.mvstore.clear_row_versions();
+                } else if self.lock_states.blocking_checkpoint_lock_held {
                     // Truncate: under the blocking lock, drop last SkipMap copies and empty slots.
                     // That lock waits out open MVCC txs, so no old reader can see a later rewrite.
                     self.mvstore.drop_unused_row_versions_and_slots();

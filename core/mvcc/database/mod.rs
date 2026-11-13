@@ -8196,6 +8196,73 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.drop_unused_row_versions_inner(true, true, reader_mark_floor)
     }
 
+    /// Remove every row version and every row slot of every table and index, and every
+    /// finalized transaction state.
+    ///
+    /// The caller must hold `blocking_checkpoint_lock` in write mode from before the
+    /// checkpoint snapshot. No transaction is open then, and the B-tree holds every
+    /// committed row.
+    pub(crate) fn clear_row_versions(&self) {
+        turso_assert!(
+            self.txs.is_empty(),
+            "MVCC row versions cleared while transactions are still active"
+        );
+        #[cfg(debug_assertions)]
+        self.debug_assert_no_version_is_newer_than_the_last_checkpoint();
+
+        // The skip map frees a removed entry only during later operations, and it frees the
+        // entries of `SkipMap::clear` more slowly. Free the versions now and remove the
+        // entries one at a time.
+        for entry in self.rows.iter() {
+            entry.value().write().clear();
+            entry.remove();
+        }
+        self.bump_index_rows_epoch();
+        for index in self.index_rows.iter() {
+            for entry in index.value().iter() {
+                entry.value().write().clear();
+                entry.remove();
+            }
+        }
+        for entry in self.finalized_tx_states.iter() {
+            entry.remove();
+        }
+        self.live_version_count_approx.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_no_version_is_newer_than_the_last_checkpoint(&self) {
+        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        let commit_ts = |marker: Option<TxTimestampOrID>| match marker {
+            Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+            Some(TxTimestampOrID::TxID(tx_id)) => {
+                match lookup_tx_state(&self.txs, &self.finalized_tx_states, tx_id) {
+                    Some(TransactionState::Committed(ts)) => Some(ts),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        let assert_chain = |versions: &[RowVersion]| {
+            for version in versions {
+                for ts in [commit_ts(version.begin()), commit_ts(version.end())] {
+                    debug_assert!(
+                        ts.is_none_or(|ts| ts <= ckpt_max),
+                        "row version committed at {ts:?} is newer than the last checkpoint at {ckpt_max}"
+                    );
+                }
+            }
+        };
+        for entry in self.rows.iter() {
+            assert_chain(&entry.value().read());
+        }
+        for index in self.index_rows.iter() {
+            for entry in index.value().iter() {
+                assert_chain(&entry.value().read());
+            }
+        }
+    }
+
     /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
     /// (resuming via `gc_table_cursor`). Truncate mode unlinks empty SkipMap slots;
     /// Passive leaves them for Finalize `unlink_empty`. Skips `finalized_tx_states`
