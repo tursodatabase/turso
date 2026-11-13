@@ -924,15 +924,7 @@ pub(crate) fn translate_catalog_changes(
                     using_expr: policy.using_expr.as_deref().cloned(),
                     check_expr: policy.check_expr.as_deref().cloned(),
                 });
-                let stored = policies::stored_text(&relpolicies);
-                // The catalog reads the conditions back from the stored form,
-                // so a condition that does not read back is refused here
-                // rather than leaving a database that cannot be opened.
-                if policies::parse(&stored).is_none() {
-                    return Err(LimboError::ParseError(format!(
-                        "the conditions of policy \"{policy_name}\" cannot be stored"
-                    )));
-                }
+                let stored = stored_policies(&relpolicies, policy_name)?;
                 emit_class_row_set_policies(
                     program,
                     &cursors,
@@ -988,6 +980,20 @@ fn catalog_view_name(name: &str) -> String {
         Some(view) => format!("information_schema.{view}"),
         None => name.to_string(),
     }
+}
+
+/// The stored form of `relpolicies`, after a change to policy
+/// `policy_name`. The catalog reads the conditions back from the stored
+/// form, so a condition that does not read back is refused here rather than
+/// leaving a database that cannot be opened.
+fn stored_policies(relpolicies: &[RowPolicy], policy_name: &str) -> turso_core::Result<String> {
+    let stored = policies::stored_text(relpolicies);
+    if policies::parse(&stored).is_none() {
+        return Err(LimboError::ParseError(format!(
+            "the conditions of policy \"{policy_name}\" cannot be stored"
+        )));
+    }
+    Ok(stored)
 }
 
 /// The class row of table `name` of `namespace`, which row-level security
