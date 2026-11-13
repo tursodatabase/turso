@@ -12,7 +12,7 @@ Line numbers are from main at commit 719fcc411. Short names in this file:
 - `mod.rs` is `core/mvcc/database/mod.rs`.
 - `csm.rs` is `core/mvcc/database/checkpoint_state_machine.rs`.
 - `cursor.rs` is `core/mvcc/cursor.rs`.
-- Row spec is `MvccPassiveCheckpoint.qnt`. Schema spec is `MvccPassiveSchema.qnt`. Sequence spec is `MvccPassiveSequence.qnt`.
+- Row spec is `MvccPassiveCheckpoint.qnt`. Schema spec is `MvccPassiveSchema.qnt`. Sequence spec is `MvccPassiveSequence.qnt`. Recovery spec is `MvccRecovery.qnt` (line numbers of commit 7c607534b, see `DESIGN-recovery.md`).
 
 ## The three modes
 
@@ -27,9 +27,11 @@ The second is the `CheckpointMode` of one checkpoint. Together they give three m
 | T (flag on, TRUNCATE) | on | Truncate | `PRAGMA wal_checkpoint(TRUNCATE)` (vdbe/execute.rs:593, connection.rs:2605), journal mode change (vdbe/execute.rs:18792) |
 
 The code gates some paths on the flag and others on the checkpoint mode or on
-"blocking lock held". Mode T gets a mix of both. The specs model P. The sequence
-spec also has a mode "blocking", which matches B for locks but uses the P GC rules.
-No spec models T.
+"blocking lock held". Mode T gets a mix of both. The row, schema and sequence
+specs model P. The sequence spec also has a mode "blocking", which matches B for
+locks but uses the P GC rules. The recovery spec covers B, P and T in part: the
+checkpoint file steps, crash recovery, and the row GC rules of B and P, with no
+readers, schema or indexes (`DESIGN-recovery.md`).
 
 What the blocking lock gives in each mode:
 
@@ -110,7 +112,7 @@ means that it runs in B but nothing in B needs it.
 | `CompactSequences` | csm.rs:3208-3239, driver csm.rs:705-725, `pending_sequence_compactions` csm.rs:792 (skips CYCLE at csm.rs:817) | P records deletes. B and T delete inline and purge the chain (`purge_row_versions_during_checkpoint` mod.rs:8988). Gate: `CheckpointMode::Passive` (csm.rs:3224), not the flag | Sequence spec `CheckpointCompact` (`Mode` passive or blocking). T not modeled | Design (bounds the backing table) |
 | `CommitPagerTxn`, header stage | csm.rs:3241-3295 | B, P, T. T takes the lock here (csm.rs:3246-3252) | Row spec `CheckpointCommit`, schema spec issue11499 | Design |
 | Publish window | `apply_checkpoint_publish_window` csm.rs:2154-2205 | P: under the clock lock (`apply_passive_publish_window_ordered` csm.rs:2208). B and T: under the blocking lock (csm.rs:3313-3320), no clock lock | Row spec `CheckpointPublish`, schema spec `CheckpointPublish` | Design |
-| Publish drain bit | `checkpoint_publish_in_progress`, mod.rs:7957-7968, csm.rs:3298-3309 | P (gate: mode) | Not modeled | Dead (not verified). Only checkpoints CAS it, and `checkpoint_in_progress` already allows one checkpoint. No `begin_tx` reads it (rg finds only mod.rs:4442, mod.rs:4655, mod.rs:7959, mod.rs:7966), so the comment at csm.rs:2211-2212 is wrong. The busy retry at csm.rs:3300-3309 cannot fire |
+| Publish drain bit | `checkpoint_publish_in_progress`, mod.rs:7957-7968, csm.rs:3298-3309 | P (gate: mode) | Not modeled. The recovery spec `CkPublish` models the publish as its own step, but not this retry | Dead (not verified). Only checkpoints CAS it, and `checkpoint_in_progress` already allows one checkpoint. No `begin_tx` reads it (rg finds only mod.rs:4442, mod.rs:4655, mod.rs:7959, mod.rs:7966), so the comment at csm.rs:2211-2212 is wrong. The busy retry at csm.rs:3300-3309 cannot fire |
 | Sequence deletes at a fresh clock ts | csm.rs:2163-2167, `seqcompact_commit_delete` mod.rs:8998, `seqcompact_stamp_delete` mod.rs:9007 | P only (only csm.rs:2217 passes `Some(ts)`) | Sequence spec `CheckpointPublish`, S3 | Design |
 | Root bindings: retire, alloc, visible | csm.rs:2169-2185, mod.rs:4809, mod.rs:4848, mod.rs:4859 | B, P, T | Schema spec S4, S6 | Design for P |
 | Patch `sqlite_schema` roots, `dropped_root_pages`, generation bump | `publish_checkpointed_schema_roots` csm.rs:2021-2148 | B, P, T | Schema spec S11, S12, S13 | Design |
@@ -149,7 +151,12 @@ means that it runs in B but nothing in B needs it.
 | Mechanism | Code | Modes (gate) | Modeled? | Kind |
 |---|---|---|---|---|
 | Recovery: replay log records above `persistent_tx_ts_max` | `maybe_recover_logical_log` mod.rs:9609, boundary mod.rs:9663-9681 | B, P, T | Row, schema, sequence specs `RecoveryCorrect` | Design |
-| Recovery WAL backfill (TRUNCATE) | mod.rs:9275-9290 | B, P, T | Not modeled | Design |
+| Recovery WAL backfill (TRUNCATE) | mod.rs:9275-9290 | B, P, T | Recovery spec `Open` | Design |
+| Startup case table: refuse or reconcile | `maybe_complete_interrupted_checkpoint_nonblock` mod.rs:9179. Read-only refusal mod.rs:9222. `NoLog` refusal mod.rs:9237 (flag off only). `Invalid` refusal mod.rs:9247 | B, P, T. The `NoLog` refusal has the gate "flag off" | Recovery spec `Open`, `OpenSucceeds` (`issue7480`, `issue9749`, `leadA`, `leadB`) | Design. The `NoLog` refusal is a bug (#7480, #9749, PR #9770) |
+| Log header written with the first frame after a truncate | logical_log.rs:717, header read logical_log.rs:1832-1860 | B, P, T | Recovery spec `CommitWrite`, `Crash` with `torn` | Design. A torn header with WAL frames refuses every open (`leadB`) |
+| Checkpoint error cleanup | `cleanup_after_external_io_error` csm.rs:1039-1075 | B, P, T | Partly. Recovery spec `CkFail` stops a checkpoint at each modeled step from the pager commit to the WAL truncate. It models the effects of a failure before the publish, of a log truncate error, and of an async truncate failure. A failure inside the backfill or between the WAL truncate and its fsync is not modeled (`DESIGN-recovery.md`) | Design. A failure after the publish leaves versions unstamped (`idea2`, `idea2Passive`) |
+| Log truncate error | `truncate_to_zero` logical_log.rs:1058-1078, Unix truncate core/io/unix.rs:500-512 | B, P, T | Recovery spec `LogTruncateErrors` (`logTruncError`) | Bug lead. The salt and running CRC change before the truncate call, and an error keeps the offset. The next frame does not chain, so a crash loses an acknowledged commit. A `LogicalLog` unit test shows the unreadable frame |
+| Replay keeps one timestamp per frame | mod.rs:9936, `insert_version_raw` mod.rs:8880 | B, P, T | Recovery spec `RecoveryOneTs` (`idea1`) | Design. One timestamp for all frames brings back deleted rows |
 | Bootstrap ids from root pages | `bootstrap` mod.rs:5121 | B, P, T | Schema spec `Boot` | Design today |
 | VACUUM reset with `SkipMap::clear` | mod.rs:4958-4983, gate mod.rs:4891 | B, P, T | Not modeled | Design |
 | Rowid allocator cache | `table_id_to_last_rowid` mod.rs:4484, dropped in `gc_rootpage_entries` mod.rs:4880 | B, P, T | Not modeled | Optimization (cache) |
@@ -210,8 +217,8 @@ mark), not the lock.
 
 ## 3. Gaps in the model, ranked by risk
 
-1. Mode T (flag on, explicit TRUNCATE) is not modeled, and the code mixes the B and P paths. `CompactSequences` deletes inline and purges chains (csm.rs:3224, mod.rs:8988) before T takes any lock (csm.rs:3246), while readers and writers are live. That is the `noDeferDeletes` bug of the sequence spec (rule S2), and a `setval` version can be purged too. Not verified with a test.
-2. Mode B GC rules are not modeled. Three B paths change reads: Rule 2 B form (mod.rs:8610-8619), Rule 3 with `b <= ckpt_max` (mod.rs:8633), and the B-tree fall-through read (mod.rs:6070-6087, cursor.rs:1203). B is the default mode. The sequence spec states that both modes use the P rules (MvccPassiveSequence.qnt:51), which is false for flag off.
+1. Mode T (flag on, explicit TRUNCATE) is not modeled with readers, schema or sequences, and the code mixes the B and P paths. The recovery spec covers T in part (kind `truncflag`: file steps, crash recovery and row GC, with no readers). `CompactSequences` deletes inline and purges chains (csm.rs:3224, mod.rs:8988) before T takes any lock (csm.rs:3246), while readers and writers are live. That is the `noDeferDeletes` bug of the sequence spec (rule S2), and a `setval` version can be purged too. Not verified with a test.
+2. Mode B GC rules are not modeled with readers. The recovery spec models Rule 2 B form and Rule 3 with `b <= ckpt_max` for rows, with no readers (`gcChain`), so it cannot see a wrong read. Three B paths change reads: Rule 2 B form (mod.rs:8610-8619), Rule 3 with `b <= ckpt_max` (mod.rs:8633), and the B-tree fall-through read (mod.rs:6070-6087, cursor.rs:1203). B is the default mode. The sequence spec states that both modes use the P rules (MvccPassiveSequence.qnt:51), which is false for flag off.
 3. Mode T publish runs without the clock lock (csm.rs:3313-3320) while `begin_tx` runs with no blocking lock. A begin can read the header, `schema_generation` and the root map half updated. The comment at mod.rs:6751-6756 assumes the clock lock or the read guard. Not verified.
 4. Mode T `Finalize` uses `reader_mark_floor = STAGED` (mod.rs:8188). So it ignores readers that pinned a read mark but are not in `txs` yet (rule R5). If the R5 argument holds after a WAL restart, `backfill_floor` still protects them. Not verified.
 5. Index rows are not in any spec. They have their own GC loop (mod.rs:8348), their own dirty map, the lockstep cursor (cursor.rs:524) and `rootpage_gc_protected` for indexes (mod.rs:8371). A correct table with a wrong index still gives wrong query results.
@@ -223,7 +230,12 @@ mark), not the lock.
 11. Reads of `sqlite_schema` through the dual cursor and GC of its versions (#8093, #8094) are not modeled (DESIGN-schema "Not modeled").
 12. The sync object map and stable table ids are not modeled (SYNC.md).
 13. The rowid allocator cache is dropped with retired bindings (mod.rs:4880). Not modeled. A wrong cache can reuse a rowid.
-14. If the B stamp after `TruncateWal` (csm.rs:2257) is `ORIGIN`, Rule 3 never drops those versions in B. Memory only. Not verified.
+14. If the B stamp after `TruncateWal` (csm.rs:2257) is `ORIGIN`, Rule 3 never drops those versions in B. Memory only. Not verified: no test measured the frame that the stamp gets.
+15. A checkpoint that fails after its publish never stamps its rows. The retry collects from the new boundary (csm.rs:1138) and stamps only its own write set (csm.rs:2271), so GC keeps those versions until the key gets a new write. This is a missing stamp, not an `ORIGIN` stamp. Recovery spec `idea2` and `idea2Passive`, and a Rust test in each mode, show it.
+16. A read-only open refuses a passive database that closed cleanly, because close does not checkpoint in MVCC and the WAL keeps frames (mod.rs:9222). Recovery spec `leadA`, and a Rust test shows it.
+17. The log truncate decides, submits the truncate and resets the writer under the log lock (persistent_storage/mod.rs:230). On an async backend such as io_uring (core/io/io_uring.rs:848), a newer append can run before the truncate completes, and the truncate then erases it (recovery spec `logTruncSplit`). This is a hypothesis: the Unix truncate completes in the submit call, and no Rust test shows the order.
+18. A log truncate error makes the next acknowledged commit unreadable after a crash (recovery spec `logTruncError`, section 1 row "Log truncate error").
+19. The recovery spec has no readers, schema, indexes, I/O errors at open, SyncMode NORMAL or OFF, or explicit FULL and RESTART checkpoints (`DESIGN-recovery.md`).
 
 ## 4. Optimizations the design does not need, and the rule each one stands in for
 
