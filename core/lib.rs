@@ -146,7 +146,7 @@ pub(crate) use dialect::EngineDialect;
 pub use dialect::{CatalogChange, Dialect, NewOwner};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
-    SQLITE_CONSTRAINT_UNIQUE,
+    SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,
 };
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]

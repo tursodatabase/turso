@@ -586,3 +586,204 @@ fn owner_cannot_give_its_table_to_another_role() {
     assert_eq!(error.to_string(), "permission denied to set role \"bob\"");
     conn.execute("ALTER TABLE t OWNER TO CURRENT_USER").unwrap();
 }
+
+/// The memberships of `pg_auth_members` as `(role, member)` names.
+fn memberships(conn: &PgConnection) -> Vec<(String, String)> {
+    let mut stmt = conn
+        .query(
+            "SELECT r.rolname, m.rolname FROM pg_auth_members a \
+             JOIN pg_roles r ON r.oid = a.roleid \
+             JOIN pg_roles m ON m.oid = a.member \
+             ORDER BY r.rolname, m.rolname",
+        )
+        .unwrap()
+        .unwrap();
+    stmt.run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row[0].to_string(), row[1].to_string()))
+        .collect()
+}
+
+fn membership(role: &str, member: &str) -> (String, String) {
+    (role.to_string(), member.to_string())
+}
+
+#[test]
+fn memberships_are_kept_after_reopening_the_database() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE writers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT readers, writers TO alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    assert_eq!(
+        memberships(&conn),
+        vec![
+            membership("readers", "alice"),
+            membership("writers", "alice")
+        ]
+    );
+    conn.execute("REVOKE readers FROM alice").unwrap();
+    assert_eq!(memberships(&conn), vec![membership("writers", "alice")]);
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    assert_eq!(
+        memberships(&db.connect_postgres()),
+        vec![membership("writers", "alice")]
+    );
+}
+
+#[test]
+fn memberships_are_kept_after_reopening_an_mvcc_database() {
+    let db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT readers TO alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    assert_eq!(
+        memberships(&db.connect_postgres()),
+        vec![membership("readers", "alice")]
+    );
+}
+
+#[test]
+fn membership_granted_by_one_connection_is_visible_to_another() {
+    let db = TempDatabase::builder().build();
+    let conn1 = db.connect_postgres();
+    let conn2 = db.connect_postgres();
+    conn1.execute("CREATE ROLE readers").unwrap();
+    conn1.execute("CREATE ROLE alice").unwrap();
+    assert_eq!(memberships(&conn2), vec![]);
+
+    conn1.execute("GRANT readers TO alice").unwrap();
+
+    assert_eq!(memberships(&conn2), vec![membership("readers", "alice")]);
+    conn2.execute("REVOKE readers FROM alice").unwrap();
+    assert_eq!(memberships(&conn1), vec![]);
+}
+
+/// A statement that fails on its last pair stores none of its memberships.
+#[test]
+fn grant_that_fails_grants_none_of_its_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+
+    let error = conn.execute("GRANT readers, alice TO alice").unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "role \"alice\" is a member of role \"alice\""
+    );
+    assert_eq!(memberships(&conn), vec![]);
+    assert_eq!(memberships(&db.connect_postgres()), vec![]);
+}
+
+/// Removes the membership table, as a database made before tursopg stored
+/// memberships has none.
+fn drop_membership_table(db: &TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.inner()
+        .prepare_engine_schema_statement("DROP TABLE __turso_internal_auth_members")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    conn.close().unwrap();
+}
+
+#[test]
+fn database_without_the_membership_table_opens_read_only_without_memberships() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    drop_membership_table(&db);
+    let TempDatabase { path, io, db } = db;
+    drop(db);
+
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+        turso_core::DatabaseOpts::new().with_encryption(true),
+    )
+    .unwrap();
+    let conn = PgConnection::connect(&db).unwrap();
+
+    assert_eq!(memberships(&conn), vec![]);
+    conn.execute("SET ROLE alice").unwrap();
+    let error = conn.query("SELECT x FROM t").err().unwrap();
+    assert_eq!(error.to_string(), "permission denied for table t");
+    conn.execute("RESET ROLE").unwrap();
+    assert!(conn.execute("GRANT readers TO alice").is_err());
+}
+
+#[test]
+fn database_without_the_membership_table_gets_it_when_opened() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    drop_membership_table(&db);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    assert_eq!(memberships(&conn), vec![]);
+    conn.execute("GRANT readers TO alice").unwrap();
+    assert_eq!(memberships(&conn), vec![membership("readers", "alice")]);
+}
+
+/// The in-memory catalog skips a membership it knows, but only the stored
+/// table can keep a membership unique against every writer of the file. A
+/// duplicate would leave the database unable to open.
+#[test]
+fn stored_membership_table_keeps_memberships_unique() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE readers").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT readers TO alice").unwrap();
+
+    let error = conn
+        .inner()
+        .prepare_engine_schema_statement(
+            "INSERT INTO __turso_internal_auth_members \
+             SELECT NULL, roleid, member, grantor, admin_option, inherit_option, set_option \
+             FROM __turso_internal_auth_members",
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap_err();
+    assert!(error.to_string().contains("UNIQUE"), "{error}");
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    assert_eq!(
+        memberships(&db.connect_postgres()),
+        vec![membership("readers", "alice")]
+    );
+}

@@ -254,8 +254,16 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        if let [turso_core::CatalogChange::CreateRole { name, options }] = changes {
-            return crate::roles::translate_create_role(program, schema, name, options);
+        match changes {
+            [turso_core::CatalogChange::CreateRole { name, options }] => {
+                return crate::roles::translate_create_role(program, schema, name, options);
+            }
+            [turso_core::CatalogChange::GrantRole(grant)] => {
+                return crate::auth_members::translate_grant_role(
+                    program, schema, connection, grant,
+                );
+            }
+            _ => {}
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
@@ -1069,6 +1077,48 @@ fn role_row(role: &Role) -> Vec<Value> {
         Value::from_i64(role.bypassrls as i64), // rolbypassrls
         Value::Null,                            // rolconfig
     ]
+}
+
+/// Virtual table implementation for pg_catalog.pg_auth_members: the
+/// memberships that `GRANT role TO role` made.
+#[derive(Debug)]
+struct PgAuthMembersTable;
+
+/// The oids of memberships start where those of PostgreSQL's own objects
+/// end, as the oids of roles do.
+const MEMBERSHIP_OID_START: i64 = USER_ROLE_OID_START;
+
+impl SnapshotRows for PgAuthMembersTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_auth_members (
+            oid INTEGER,
+            roleid INTEGER,
+            member INTEGER,
+            grantor INTEGER,
+            admin_option INTEGER,
+            inherit_option INTEGER,
+            set_option INTEGER
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 2;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        connection_roles(conn)
+            .memberships()
+            .iter()
+            .map(|membership| {
+                vec![
+                    Value::from_i64(MEMBERSHIP_OID_START + membership.id),
+                    Value::from_i64(role_oid(membership.role)),
+                    Value::from_i64(role_oid(membership.member)),
+                    Value::from_i64(role_oid(membership.grantor)),
+                    Value::from_i64(membership.admin_option as i64),
+                    Value::from_i64(membership.inherit_option as i64),
+                    Value::from_i64(membership.set_option as i64),
+                ]
+            })
+            .collect()
+    }
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -2535,6 +2585,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_roles",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgRolesTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_auth_members",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgAuthMembersTable>(PhantomData),
     );
     options = options.native_module(
         "pg_am",
@@ -4353,6 +4408,7 @@ mod tests {
             "pg_namespace",
             "pg_attribute",
             "pg_roles",
+            "pg_auth_members",
             "pg_am",
             "pg_proc",
             "pg_database",
