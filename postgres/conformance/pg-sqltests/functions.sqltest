@@ -1133,6 +1133,19 @@ expect @tursopg error {
     a column of row type emp is not supported
 }
 
+# A column of a column definition list is read as a cast is.
+test json-to-record-column-of-array-type-of-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    SELECT a FROM json_to_record('{"a": ["sad"]}') AS _(a _mood);
+}
+expect {
+    {sad}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a column of array type _mood is not supported
+}
+
 test json-to-record-value-conversion {
     SELECT id + 1, n, j, s FROM json_to_record('{"id":"5","n":{"z":[1]},"j":"q","s":"x"}') AS _(id integer, n text, j json, s text);
     SELECT * FROM json_to_record('{"a b":1,"c.d":2,"$x":3,"q\"r":4}') AS _("a b" integer, "c.d" integer, "$x" integer, "q""r" integer);

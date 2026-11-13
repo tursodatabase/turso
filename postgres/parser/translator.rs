@@ -18,7 +18,10 @@ use crate::sqlstate::{
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
     SQLSTATE_WINDOWING_ERROR,
 };
-use crate::type_names::{schema_and_name, type_kind, type_name_text, PgType, TypeKind, TypeLookup};
+use crate::type_names::{
+    built_in_array_element, schema_and_name, type_kind, type_name_text, BuiltInType, PgType,
+    TypeKind, TypeLookup,
+};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -3056,8 +3059,7 @@ impl PostgreSQLTranslator {
                         .as_str(),
                     "json" | "jsonb"
                 );
-                self.check_type_name(type_name, TypeUse::Column)?;
-                let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
+                let cast_type = Some(self.cast_type(type_name, TypeUse::Column)?);
                 let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'$.\"{}\"'",
                     col_def
@@ -3441,8 +3443,7 @@ impl PostgreSQLTranslator {
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
                     expr = Box::new(int8_cast_operand(arg, *expr));
                 }
-                self.check_type_name(pg_type_name, TypeUse::Cast)?;
-                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let type_name = self.cast_type(pg_type_name, TypeUse::Cast)?;
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -5678,21 +5679,40 @@ impl PostgreSQLTranslator {
         Ok(pg_type)
     }
 
-    /// Checks `type_name`, used as `used_as`, when tursopg has no type of
-    /// its own for it. Core then gets the name as it is written and takes
-    /// it for a custom type, so the name must be one. A type that
-    /// PostgreSQL defines is left to core. Nothing is checked without a
-    /// type lookup, or in a statement that PostgreSQL skips.
+    /// The type of a cast to `type_name`, used as `used_as`. A stored
+    /// statement is translated again without the catalog, so a cast reads a
+    /// name such as `_mood` without the catalog too: as the name of a custom
+    /// type. Only the catalog can tell that `_mood` names the array type of
+    /// `mood`, and then the cast is refused.
+    fn cast_type(
+        &self,
+        type_name: &pg_query::protobuf::TypeName,
+        used_as: TypeUse,
+    ) -> Result<ast::Type, ParseError> {
+        if let Some(TypeKind::CatalogArray(_)) = self.check_type_name(type_name, used_as)? {
+            return Err(ParseError::not_supported(
+                used_as.array_type_feature(&type_name_text(type_name)?),
+            ));
+        }
+        pg_type_name_to_ast_type(type_name)
+    }
+
+    /// Checks `type_name`, used as `used_as`, and gives what it names. When
+    /// tursopg has no type of its own for the name, core gets the name and
+    /// takes it for a custom type, so the name must be one. A type that
+    /// PostgreSQL defines is left to core. Nothing is checked, and None is
+    /// given, without a type lookup, in a statement that PostgreSQL skips,
+    /// and for a type of tursopg.
     fn check_type_name(
         &self,
         type_name: &pg_query::protobuf::TypeName,
         used_as: TypeUse,
-    ) -> Result<(), ParseError> {
+    ) -> Result<Option<TypeKind>, ParseError> {
         let Some(lookup) = &self.type_lookup else {
-            return Ok(());
+            return Ok(None);
         };
         if self.skips_type_checks.get() {
-            return Ok(());
+            return Ok(None);
         }
         let undefined_type = || {
             Err(ParseError::Sqlstate {
@@ -5708,16 +5728,17 @@ impl PostgreSQLTranslator {
             if has_brackets && name.starts_with('_') {
                 return undefined_type();
             }
-            return Ok(());
+            return Ok(None);
         }
-        match type_kind(lookup.as_ref(), schema, name) {
+        let kind = type_kind(lookup.as_ref(), schema, name);
+        match kind {
             Some(TypeKind::BuiltInArray(_) | TypeKind::CatalogArray(_)) if has_brackets => {
                 undefined_type()
             }
             Some(TypeKind::Catalog(PgType::Row) | TypeKind::CatalogArray(PgType::Row)) => Err(
                 ParseError::not_supported(used_as.row_type_feature(&type_name_text(type_name)?)),
             ),
-            Some(_) => Ok(()),
+            Some(_) => Ok(kind),
             None => undefined_type(),
         }
     }
@@ -5740,6 +5761,16 @@ impl TypeUse {
             Self::Column => format!("a column of row type {type_name}"),
             Self::Cast => format!("a cast to row type {type_name}"),
             Self::Domain => format!("a domain over row type {type_name}"),
+        }
+    }
+
+    /// The feature that is not supported when a type name used so names
+    /// the array type of a custom type, such as `_mood`.
+    fn array_type_feature(self, type_name: &str) -> String {
+        match self {
+            Self::Column => format!("a column of array type {type_name}"),
+            Self::Cast => format!("a cast to array type {type_name}"),
+            Self::Domain => format!("a domain over array type {type_name}"),
         }
     }
 }
@@ -7017,14 +7048,20 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types. Other names are kept as
-/// written so that enums and domains resolve to their custom type.
+/// Maps PG types to their base SQLite storage types. A name such as `_int4`
+/// is the array type of a built-in type. Other names are kept as written so
+/// that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
+    let (schema, name) = schema_and_name(type_name)?;
+    let (element, array_dimensions) = match built_in_array_element(schema, name) {
+        Some((element, BuiltInType::Base)) if type_name.array_bounds.is_empty() => (element, 1),
+        _ => (pg_type.as_str(), type_name.array_bounds.len() as u32),
+    };
 
-    let name = match pg_type.to_uppercase().as_str() {
+    let name = match element.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
         | "REGCLASS" | "REGTYPE" => "INTEGER",
         // Casts like INTEGER; the name types the result as int8.
@@ -7044,10 +7081,9 @@ fn pg_type_name_to_ast_type(
             "TEXT"
         }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => &pg_type,
+        _ => element,
     };
 
-    let array_dimensions = type_name.array_bounds.len() as u32;
     check_array_dimensions(array_dimensions)?;
     Ok(ast::Type {
         name: name.to_string(),

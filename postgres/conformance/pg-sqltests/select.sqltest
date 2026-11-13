@@ -518,6 +518,13 @@ expect error {
     type "public\.int4" does not exist
 }
 
+test select-cast-to-array-type-of-built-in-type {
+    SELECT '{1,2}'::_int4, '{x}'::_text, '{1}'::pg_catalog._int4;
+}
+expect {
+    {1,2}|{x}|{1}
+}
+
 # `_int4` is an array type, and PostgreSQL has no array type of an array
 # type.
 test select-cast-to-array-of-array-type {
@@ -526,6 +533,28 @@ test select-cast-to-array-of-array-type {
 @sqlstate 42704
 expect error {
     type "_int4\[\]" does not exist
+}
+
+test select-view-with-cast-to-array-type-of-built-in-type {
+    CREATE VIEW v AS SELECT '{1,2}'::_int4 AS a;
+    SELECT a FROM v;
+}
+expect {
+    {1,2}
+}
+
+# A stored statement is translated again without the catalog, which tells
+# the array type of `mood` from a type named `_mood`.
+test select-cast-to-array-type-of-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    SELECT '{sad}'::_mood;
+}
+expect {
+    {sad}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a cast to array type _mood is not supported
 }
 
 test select-cast-to-array-of-array-type-of-enum {
