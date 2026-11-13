@@ -493,6 +493,159 @@ test select-cast-to-domain-checks-constraint {
 @sqlstate 23514
 expect error {}
 
+test select-cast-to-missing-type {
+    SELECT 1::nosuch;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+test select-cast-to-missing-array-type-in-public-schema {
+    SELECT CAST(NULL AS public.nosuch[]);
+}
+@sqlstate 42704
+expect error {
+    type "public\.nosuch\[\]" does not exist
+}
+
+# The built-in types are in pg_catalog, not in public.
+test select-cast-to-built-in-type-in-public-schema {
+    SELECT 1::public.int4;
+}
+@sqlstate 42704
+expect error {
+    type "public\.int4" does not exist
+}
+
+test select-cast-to-array-type-of-built-in-type {
+    SELECT '{1,2}'::_int4, '{x}'::_text, '{1}'::pg_catalog._int4;
+}
+expect {
+    {1,2}|{x}|{1}
+}
+
+# `_int4` is an array type, and PostgreSQL has no array type of an array
+# type.
+test select-cast-to-array-of-array-type {
+    SELECT '{1}'::_int4[];
+}
+@sqlstate 42704
+expect error {
+    type "_int4\[\]" does not exist
+}
+
+test select-view-with-cast-to-array-type-of-built-in-type {
+    CREATE VIEW v AS SELECT '{1,2}'::_int4 AS a;
+    SELECT a FROM v;
+}
+expect {
+    {1,2}
+}
+
+# A stored statement is translated again without the catalog, which tells
+# the array type of `mood` from a type named `_mood`.
+test select-cast-to-array-type-of-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    SELECT '{sad}'::_mood;
+}
+expect {
+    {sad}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a cast to array type _mood is not supported
+}
+
+test select-cast-to-array-of-array-type-of-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    SELECT '{sad}'::_mood[];
+}
+@sqlstate 42704
+expect error {
+    type "_mood\[\]" does not exist
+}
+
+# `_int4` is the array type of `int4`, but `__int4` is no type.
+test select-cast-to-type-named-with-two-underscores {
+    SELECT 1::__int4;
+}
+@sqlstate 42704
+expect error {
+    type "__int4" does not exist
+}
+
+# PostgreSQL has no array type of a polymorphic type.
+test select-cast-to-array-of-polymorphic-type {
+    SELECT NULL::_anyelement;
+}
+@sqlstate 42704
+expect error {
+    type "_anyelement" does not exist
+}
+
+test select-cast-to-information-schema-domain {
+    SELECT 5::information_schema.cardinal_number;
+}
+expect {
+    5
+}
+
+test select-cast-of-null-to-catalog-row-type {
+    SELECT CASE WHEN NULL::pg_class IS NULL THEN 'null' END;
+}
+expect {
+    null
+}
+
+# An index has no row type.
+test select-cast-to-index-name {
+    CREATE TABLE emp (name text);
+    CREATE INDEX emp_name ON emp (name);
+    SELECT 1::emp_name;
+}
+@sqlstate 42704
+expect error {
+    type "emp_name" does not exist
+}
+
+test select-cast-to-table-row-type {
+    CREATE TABLE emp (name text);
+    SELECT '(ann)'::emp;
+}
+expect {
+    (ann)
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a cast to row type emp is not supported
+}
+
+test select-view-with-cast-to-missing-type {
+    CREATE VIEW v AS SELECT 1::nosuch;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+# `_letter` is not the array type of a type `letter`.
+test select-cast-to-enum-named-with-underscore {
+    CREATE TYPE _letter AS ENUM ('a');
+    SELECT 'a'::_letter;
+}
+expect {
+    a
+}
+
+test select-cast-to-array-of-enum-named-with-underscore {
+    CREATE TYPE _letter AS ENUM ('a');
+    SELECT '{a}'::_letter[];
+}
+expect {
+    {a}
+}
+
 test select-cast-integer-to-domain-over-boolean {
     CREATE DOMAIN db AS boolean;
     CREATE DOMAIN true_db AS db CHECK (VALUE);

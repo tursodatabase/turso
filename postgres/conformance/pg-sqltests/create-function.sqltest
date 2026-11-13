@@ -390,6 +390,16 @@ expect @tursopg error {
     a function parameter of type emp is not supported
 }
 
+test catalog-row-parameter {
+    CREATE FUNCTION f(pg_class) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of type pg_class is not supported
+}
+
 test enum-parameter {
     CREATE TYPE mood AS ENUM ('sad', 'happy');
     CREATE FUNCTION is_happy(mood) RETURNS bool AS $$ SELECT $1 = 'happy' $$ LANGUAGE sql;
@@ -401,6 +411,38 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     a function parameter of type mood is not supported
+}
+
+# `_mood` is the array type of `mood`.
+test enum-array-parameter-named-with-underscore {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(_mood) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of type _mood is not supported
+}
+
+# PostgreSQL looks up the result type after the parameter types.
+test enum-parameter-with-missing-result-type {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(mood) RETURNS nosuch AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+# PostgreSQL parses the body after it looks up the types.
+test enum-parameter-with-body-syntax-error {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(mood) RETURNS int AS $$ SELEC 1 $$ LANGUAGE sql;
+}
+@sqlstate 42601
+expect error {
+    syntax error at or near "SELEC"
 }
 
 test missing-parameter-type {
@@ -469,6 +511,26 @@ test record-array-parameter {
 @sqlstate 42P13
 expect error {
     SQL functions cannot have arguments of type record\[\]
+}
+
+# `_record` is the array type of `record`.
+test record-array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_record) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42P13
+expect error {
+    SQL functions cannot have arguments of type record\[\]
+}
+
+# `_int4` is the array type of `int4`.
+test array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_int4) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of array type _int4 is not supported
 }
 
 test any-parameter {
@@ -579,6 +641,16 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     a function result of array type pg_catalog\.int4\[\] is not supported
+}
+
+test returns-array-named-with-underscore {
+    CREATE FUNCTION pair() RETURNS _int4 AS $$ SELECT ARRAY[1, 2] $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function result of array type _int4 is not supported
 }
 
 test returns-column-type {
@@ -995,6 +1067,25 @@ test index-as-parameter-type {
 @sqlstate 42704
 expect error {
     type t_a does not exist
+}
+
+# A sequence has no row type either.
+test sequence-as-parameter-type {
+    CREATE SEQUENCE s;
+    CREATE FUNCTION f(s) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type s does not exist
+}
+
+# The built-in types are in pg_catalog, not in public.
+test built-in-type-in-public-schema {
+    CREATE FUNCTION f(public.uuid) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type public\.uuid does not exist
 }
 
 test table-row-parameter-in-other-schema {

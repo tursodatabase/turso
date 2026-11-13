@@ -5,10 +5,13 @@
 //! tursopg does not support, so that each feature can be enabled on its own.
 
 use crate::cmdtag::CommandTag;
-use crate::names::{extract_key_columns, is_default_schema, object_name};
+use crate::names::{is_default_schema, object_name};
 use crate::sqlstate::{
     SQLSTATE_INVALID_FUNCTION_DEFINITION, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_OBJECT,
+};
+use crate::type_names::{
+    schema_and_name, type_kind, type_name_text, BuiltInType, TypeKind, TypeLookup,
 };
 use crate::{FunctionTypeUse, ParseError};
 use pg_query::protobuf::{
@@ -19,9 +22,13 @@ use pg_query::NodeEnum;
 use std::collections::HashMap;
 
 /// The error for `stmt`, a CREATE FUNCTION or CREATE PROCEDURE statement of
-/// `sql`.
-pub(crate) fn reject_create_function(sql: &str, stmt: &CreateFunctionStmt) -> ParseError {
-    match check_create_function(sql, stmt) {
+/// `sql`. `type_lookup` finds the types that are not built in.
+pub(crate) fn reject_create_function(
+    sql: &str,
+    stmt: &CreateFunctionStmt,
+    type_lookup: &TypeLookup<'_>,
+) -> ParseError {
+    match check_create_function(sql, stmt, type_lookup) {
         Err(error) => error,
         Ok(()) => ParseError::not_supported("CREATE FUNCTION"),
     }
@@ -29,7 +36,11 @@ pub(crate) fn reject_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Pa
 
 /// Raises the errors of PostgreSQL in the order PostgreSQL raises them, then
 /// the error for the first feature that tursopg does not support.
-fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), ParseError> {
+fn check_create_function(
+    sql: &str,
+    stmt: &CreateFunctionStmt,
+    type_lookup: &TypeLookup<'_>,
+) -> Result<(), ParseError> {
     if stmt.is_procedure {
         return Err(ParseError::not_supported("CREATE PROCEDURE"));
     }
@@ -40,9 +51,9 @@ fn check_create_function(sql: &str, stmt: &CreateFunctionStmt) -> Result<(), Par
     let parameters = function_parameters(stmt)?;
     let parameter_types = parameters
         .iter()
-        .map(|parameter| check_parameter_type(parameter, is_sql))
+        .map(|parameter| check_parameter_type(parameter, is_sql, type_lookup))
         .collect::<Result<Vec<_>, _>>()?;
-    let result_type = check_result_type(stmt, &parameters, &parameter_types, is_sql)?;
+    let result_type = check_result_type(stmt, &parameters, &parameter_types, is_sql, type_lookup)?;
     let returns_set = stmt.return_type.as_ref().is_some_and(|t| t.setof);
     if options.contains_key("rows") && !returns_set {
         return Err(ParseError::Sqlstate {
@@ -204,19 +215,19 @@ fn function_parameters(stmt: &CreateFunctionStmt) -> Result<Vec<&FunctionParamet
 fn check_parameter_type(
     parameter: &FunctionParameter,
     is_sql: bool,
+    type_lookup: &TypeLookup<'_>,
 ) -> Result<TypeClass, ParseError> {
     let type_name = parameter
         .arg_type
         .as_ref()
         .ok_or_else(|| ParseError::ParseError("function parameter without a type".to_string()))?;
-    match classify_type(type_name)? {
+    match classify_type(type_name, type_lookup)? {
         TypeClass::Pseudo(name) if is_sql => Err(ParseError::Sqlstate {
             sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
             message: format!("SQL functions cannot have arguments of type {name}"),
         }),
-        TypeClass::NotBuiltIn { schema, name } => Err(ParseError::UnresolvedFunctionType {
+        TypeClass::Missing { schema } => Err(ParseError::MissingFunctionType {
             schema,
-            name,
             full_name: type_name_text(type_name)?,
             used_as: FunctionTypeUse::Parameter,
         }),
@@ -232,6 +243,7 @@ fn check_result_type(
     parameters: &[&FunctionParameter],
     parameter_types: &[TypeClass],
     is_sql: bool,
+    type_lookup: &TypeLookup<'_>,
 ) -> Result<Option<TypeClass>, ParseError> {
     let invalid = |message: String| ParseError::Sqlstate {
         sqlstate: SQLSTATE_INVALID_FUNCTION_DEFINITION,
@@ -248,7 +260,7 @@ fn check_result_type(
             "function result type must be specified".to_string(),
         ));
     };
-    match classify_type(type_name)? {
+    match classify_type(type_name, type_lookup)? {
         // PostgreSQL finds the result type from the types of the arguments.
         // Which polymorphic parameter types determine which result types is
         // left to the rejection of polymorphic parameters.
@@ -266,17 +278,20 @@ fn check_result_type(
         TypeClass::Pseudo(name) if is_sql && !matches!(name.as_str(), "record" | "void") => {
             Err(invalid(format!("SQL functions cannot return type {name}")))
         }
-        TypeClass::NotBuiltIn { schema, name } => Err(ParseError::UnresolvedFunctionType {
+        TypeClass::Missing { schema } => Err(ParseError::MissingFunctionType {
             schema,
-            name,
             full_name: type_name_text(type_name)?,
-            used_as: if type_name.setof {
-                FunctionTypeUse::SetofResult
-            } else {
-                FunctionTypeUse::Result
-            },
+            used_as: result_type_use(type_name),
         }),
         class => Ok(Some(class)),
+    }
+}
+
+fn result_type_use(type_name: &TypeName) -> FunctionTypeUse {
+    if type_name.setof {
+        FunctionTypeUse::SetofResult
+    } else {
+        FunctionTypeUse::Result
     }
 }
 
@@ -422,17 +437,25 @@ fn check_parameter_features(
         TypeClass::ColumnType => Err(ParseError::not_supported(
             "%TYPE in a function parameter type",
         )),
-        TypeClass::Pseudo(_) | TypeClass::NotBuiltIn { .. } => {
+        TypeClass::Catalog(name) => Err(ParseError::not_supported(
+            FunctionTypeUse::Parameter.unsupported_feature(name),
+        )),
+        TypeClass::Pseudo(_) | TypeClass::Missing { .. } => {
             unreachable!("{class:?} is rejected with the error of PostgreSQL")
         }
     }
 }
 
 fn check_result_features(stmt: &CreateFunctionStmt, class: &TypeClass) -> Result<(), ParseError> {
-    if stmt.return_type.as_ref().is_some_and(|t| t.setof) {
-        return Err(ParseError::not_supported("RETURNS SETOF"));
-    }
+    let type_name = stmt
+        .return_type
+        .as_ref()
+        .expect("a function with a result class has a result type");
     match class {
+        TypeClass::Catalog(name) => Err(ParseError::not_supported(
+            result_type_use(type_name).unsupported_feature(name),
+        )),
+        _ if type_name.setof => Err(ParseError::not_supported("RETURNS SETOF")),
         TypeClass::Base => Ok(()),
         TypeClass::Pseudo(name) => Err(ParseError::not_supported(format!("RETURNS {name}"))),
         TypeClass::Array(name) => Err(ParseError::not_supported(format!(
@@ -441,7 +464,7 @@ fn check_result_features(stmt: &CreateFunctionStmt, class: &TypeClass) -> Result
         TypeClass::ColumnType => Err(ParseError::not_supported("%TYPE in a function result type")),
         // A polymorphic result needs a polymorphic parameter, which is
         // rejected first.
-        TypeClass::Polymorphic(_) | TypeClass::NotBuiltIn { .. } => {
+        TypeClass::Polymorphic(_) | TypeClass::Missing { .. } => {
             unreachable!("{class:?} is rejected before the function's result")
         }
     }
@@ -504,190 +527,61 @@ enum TypeClass {
     Array(String),
     /// `table.column%TYPE`.
     ColumnType,
-    /// A relation, a custom type such as a domain or an enum, or no type at
-    /// all. Only a caller with a connection can tell which.
-    NotBuiltIn {
-        schema: Option<String>,
-        name: String,
-    },
+    /// A type that is not built in: a custom type, such as a domain or an
+    /// enum, the row type of a table or view, or a type that PostgreSQL
+    /// defines outside the built-in lists, as PostgreSQL writes it in errors.
+    Catalog(String),
+    /// A type that does not exist. If `schema` does not exist either,
+    /// PostgreSQL reports the schema.
+    Missing { schema: Option<String> },
 }
 
-fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
+fn classify_type(
+    type_name: &TypeName,
+    type_lookup: &TypeLookup<'_>,
+) -> Result<TypeClass, ParseError> {
     if type_name.pct_type {
         return Ok(TypeClass::ColumnType);
     }
-    let names = extract_key_columns(&type_name.names)?;
-    let (schema, name) = match names.as_slice() {
-        [name] => (None, name),
-        [schema, name] => (Some(schema), name),
-        _ => return Err(ParseError::not_supported("a cross-database reference")),
-    };
-    let is_built_in_schema = schema.is_none_or(|schema| schema == "pg_catalog");
-    let class = if !is_built_in_schema {
-        None
-    } else if POLYMORPHIC_TYPES.contains(&name.as_str()) {
-        Some(TypeClass::Polymorphic(name.clone()))
-    } else if name == "any" {
-        // "any" is a keyword, so PostgreSQL quotes it.
-        Some(TypeClass::Pseudo("\"any\"".to_string()))
-    } else if PSEUDO_TYPES.contains(&name.as_str()) {
-        Some(TypeClass::Pseudo(name.clone()))
-    } else if BASE_TYPES.contains(&name.as_str()) {
-        Some(TypeClass::Base)
-    } else {
-        None
-    };
-    let not_built_in = TypeClass::NotBuiltIn {
-        schema: schema.cloned(),
-        name: name.clone(),
-    };
-    if type_name.array_bounds.is_empty() {
-        return Ok(class.unwrap_or(not_built_in));
-    }
+    let (schema, name) = schema_and_name(type_name)?;
+    let brackets = "[]".repeat(type_name.array_bounds.len());
     // PostgreSQL has arrays of base types and of some pseudo-types, such as
     // record[], but not of polymorphic types.
-    Ok(match class {
-        Some(TypeClass::Base) => TypeClass::Array(type_name_text(type_name)?),
-        Some(TypeClass::Pseudo(name)) => {
-            TypeClass::Pseudo(name + &"[]".repeat(type_name.array_bounds.len()))
+    Ok(match type_kind(type_lookup, schema, name) {
+        Some(TypeKind::BuiltIn(BuiltInType::Base)) if brackets.is_empty() => TypeClass::Base,
+        Some(TypeKind::BuiltIn(BuiltInType::Base) | TypeKind::BuiltInArray(BuiltInType::Base)) => {
+            TypeClass::Array(type_name_text(type_name)?)
         }
-        _ => not_built_in,
+        Some(TypeKind::BuiltIn(BuiltInType::Pseudo)) => {
+            TypeClass::Pseudo(pseudo_type_text(name) + &brackets)
+        }
+        Some(TypeKind::BuiltInArray(BuiltInType::Pseudo)) => {
+            let element = name
+                .strip_prefix('_')
+                .expect("the name of an array type starts with an underscore");
+            TypeClass::Pseudo(pseudo_type_text(element) + "[]" + &brackets)
+        }
+        Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) if brackets.is_empty() => {
+            TypeClass::Polymorphic(name.to_string())
+        }
+        Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) | None => TypeClass::Missing {
+            schema: schema.map(str::to_string),
+        },
+        Some(TypeKind::BuiltInArray(BuiltInType::Polymorphic)) => {
+            unreachable!("type_kind gives no array type of a polymorphic type")
+        }
+        Some(TypeKind::System | TypeKind::Catalog(_) | TypeKind::CatalogArray(_)) => {
+            TypeClass::Catalog(type_name_text(type_name)?)
+        }
     })
 }
 
-/// The type name as PostgreSQL writes it in an error about a type that does
-/// not exist, such as `public.nosuch[]`.
-fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
-    let mut text = extract_key_columns(&type_name.names)?.join(".");
-    for _ in &type_name.array_bounds {
-        text.push_str("[]");
+/// A pseudo-type as PostgreSQL writes it in errors. "any" is a keyword, so
+/// PostgreSQL quotes it.
+fn pseudo_type_text(name: &str) -> String {
+    if name == "any" {
+        "\"any\"".to_string()
+    } else {
+        name.to_string()
     }
-    Ok(text)
 }
-
-// FIXME: the three lists that follow are written by hand, and they must
-// follow the PostgreSQL version of pg_query. They are also one of three
-// places that say what a type name is. The FIXME in
-// postgres/frontend/pg_type.rs gives the plan for one type lookup.
-
-/// The types that stand for the types of a function's arguments.
-const POLYMORPHIC_TYPES: &[&str] = &[
-    "anyelement",
-    "anyarray",
-    "anynonarray",
-    "anyenum",
-    "anyrange",
-    "anymultirange",
-    "anycompatible",
-    "anycompatiblearray",
-    "anycompatiblenonarray",
-    "anycompatiblerange",
-    "anycompatiblemultirange",
-];
-
-/// The pseudo-types that are not polymorphic.
-const PSEUDO_TYPES: &[&str] = &[
-    "any",
-    "cstring",
-    "internal",
-    "language_handler",
-    "fdw_handler",
-    "table_am_handler",
-    "index_am_handler",
-    "tsm_handler",
-    "record",
-    "trigger",
-    "event_trigger",
-    "pg_ddl_command",
-    "void",
-    "unknown",
-];
-
-/// The built-in base, range and multirange types, by the names pg_query
-/// gives them: `int` is `int4` and `double precision` is `float8`, for
-/// example.
-const BASE_TYPES: &[&str] = &[
-    "bool",
-    "int2",
-    "int4",
-    "int8",
-    "float4",
-    "float8",
-    "numeric",
-    "money",
-    "text",
-    "varchar",
-    "bpchar",
-    "char",
-    "name",
-    "bytea",
-    "uuid",
-    "date",
-    "time",
-    "timetz",
-    "timestamp",
-    "timestamptz",
-    "interval",
-    "json",
-    "jsonb",
-    "xml",
-    "inet",
-    "cidr",
-    "macaddr",
-    "macaddr8",
-    "bit",
-    "varbit",
-    "oid",
-    "regclass",
-    "regtype",
-    "regproc",
-    "regprocedure",
-    "regnamespace",
-    "regrole",
-    "point",
-    "line",
-    "lseg",
-    "box",
-    "path",
-    "polygon",
-    "circle",
-    "tsvector",
-    "tsquery",
-    "gtsvector",
-    "jsonpath",
-    "refcursor",
-    "aclitem",
-    "int2vector",
-    "oidvector",
-    "tid",
-    "xid",
-    "xid8",
-    "cid",
-    "pg_lsn",
-    "pg_snapshot",
-    "txid_snapshot",
-    "regoper",
-    "regoperator",
-    "regconfig",
-    "regdictionary",
-    "regcollation",
-    "regdatabase",
-    "pg_node_tree",
-    "pg_ndistinct",
-    "pg_dependencies",
-    "pg_mcv_list",
-    "pg_brin_bloom_summary",
-    "pg_brin_minmax_multi_summary",
-    "int4range",
-    "int8range",
-    "numrange",
-    "daterange",
-    "tsrange",
-    "tstzrange",
-    "int4multirange",
-    "int8multirange",
-    "nummultirange",
-    "datemultirange",
-    "tsmultirange",
-    "tstzmultirange",
-];

@@ -7,7 +7,7 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
-use crate::pg_type::type_exists;
+use crate::pg_type::lookup_type;
 use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
@@ -471,10 +471,12 @@ fn prepare_statement_inner(
         }
     }
     let conn_for_names = Arc::clone(&pg_conn.conn);
+    let conn_for_types = Arc::clone(&pg_conn.conn);
     let translator = PostgreSQLTranslator::new()
         .with_relation_name_check(move |schema, name| {
             schema_has_relation(&conn_for_names, schema, name)
         })
+        .with_type_lookup(move |schema, name| lookup_type(&conn_for_types, schema, name))
         .with_existing_generated_columns(existing_generated);
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -1740,8 +1742,9 @@ fn try_prepare_special(
     parse_result: &turso_pg_parser::ParseResult,
     mut result_kind: StatementResultKind,
 ) -> Result<Option<crate::Statement>> {
-    let Some(stmt) =
-        frontend_stmt(sql, parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+    let type_lookup = |schema: Option<&str>, name: &str| lookup_type(&pg_conn.conn, schema, name);
+    let Some(stmt) = frontend_stmt(sql, parse_result, &type_lookup)
+        .map_err(|e| translation_error(&pg_conn.conn, e))?
     else {
         return Ok(None);
     };
@@ -1781,25 +1784,13 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
                 Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
             }
         }
-        ParseError::UnresolvedFunctionType {
-            ref schema,
-            ref name,
-            ref full_name,
-            used_as,
-        } => {
+        ParseError::MissingFunctionType { ref schema, .. } => {
             if let Some(schema) = schema {
                 if let Err(missing_schema) = check_schema_exists(conn, schema) {
                     return missing_schema;
                 }
             }
-            if type_exists(conn, schema.as_deref(), name) {
-                sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
-            } else {
-                sqlstate_error(
-                    SQLSTATE_UNDEFINED_OBJECT,
-                    used_as.missing_message(full_name),
-                )
-            }
+            sqlstate_error(SQLSTATE_UNDEFINED_OBJECT, error.to_string())
         }
     }
 }
