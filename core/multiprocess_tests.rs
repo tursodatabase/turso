@@ -1173,7 +1173,9 @@ fn attached_multiprocess_reader_sees_other_process_commits(main_read_only: bool)
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let aux_db = open_multiprocess_db(io.clone(), aux_path_str).unwrap();
-    let aux_conn = aux_db.connect(ConnectOpts::new()).unwrap();
+    let aux_conn = aux_db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     aux_conn
         .execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1182,7 +1184,7 @@ fn attached_multiprocess_reader_sees_other_process_commits(main_read_only: bool)
         .unwrap();
     let main_db = open_multiprocess_db(io.clone(), main_path_str).unwrap();
     main_db
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap()
         .execute("create table main_t(id integer primary key)")
         .unwrap();
@@ -1204,7 +1206,9 @@ fn attached_multiprocess_reader_sees_other_process_commits(main_read_only: bool)
         Arc::new(EngineDialect),
     )
     .unwrap();
-    let conn = main_db.connect(ConnectOpts::new()).unwrap();
+    let conn = main_db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute(format!("attach '{aux_path_str}' as aux"))
         .unwrap();
     assert_eq!(attached_count(&conn), "1");
@@ -1253,7 +1257,9 @@ fn in_memory_attach_works_with_multiprocess_wal() {
         Arc::new(EngineDialect),
     )
     .unwrap();
-    let conn = main_db.connect(ConnectOpts::new()).unwrap();
+    let conn = main_db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     for (alias, path) in [("mem", ":memory:"), ("tmp", "")] {
         conn.execute(format!("attach '{path}' as {alias}")).unwrap();
         conn.execute(format!("create table {alias}.u(x)")).unwrap();
