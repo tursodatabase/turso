@@ -368,6 +368,72 @@ fn role_without_privileges_cannot_call_pragma_functions() {
     }
 }
 
+/// An embedder, such as a server measuring the database after each write,
+/// runs its own PRAGMAs on the connection of a user who switched to a role
+/// that may not run them.
+#[test]
+fn embedder_pragmas_run_after_set_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("GRANT ALL ON t TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    let pragmas = [
+        "PRAGMA page_size",
+        "PRAGMA page_count",
+        "PRAGMA freelist_count",
+        "PRAGMA mvcc_checkpoint_threshold(-1)",
+    ];
+
+    for value in [1, 2] {
+        for sql in pragmas {
+            conn.inner()
+                .prepare_embedder_pragma(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+        }
+        conn.execute(format!("INSERT INTO t VALUES ({value})"))
+            .unwrap();
+    }
+    for sql in pragmas {
+        conn.inner()
+            .prepare_embedder_pragma(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+    }
+
+    let mut stmt = db
+        .connect_postgres()
+        .query("SELECT x FROM t ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .run_collect_rows()
+        .unwrap()
+        .iter()
+        .map(|row| row[0].to_string())
+        .collect();
+    assert_eq!(rows, ["1", "2"]);
+    for sql in pragmas {
+        let error = conn.inner().prepare(sql).unwrap_err();
+        assert!(
+            matches!(error, turso_core::LimboError::PermissionDenied(_)),
+            "{sql}: {error}"
+        );
+    }
+    let error = conn
+        .inner()
+        .prepare_embedder_pragma("CREATE TABLE u (x int)")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "not a PRAGMA statement: CREATE TABLE u (x int)"
+    );
+}
+
 /// With SELECT on the views granted, the sequences the views change are
 /// what is denied, as in PostgreSQL, where nextval runs as the reader and
 /// not as the view's owner.

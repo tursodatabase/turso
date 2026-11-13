@@ -69,6 +69,11 @@ pub(crate) enum StatementOrigin {
     /// internal tables at open: engine SQL semantics like
     /// [`StatementOrigin::EngineMetadataRead`], run as a top-level statement.
     EngineSchemaWrite,
+    /// A PRAGMA of the embedder's own, such as a server measuring the
+    /// database's size, run on a user's connection. It runs like a root
+    /// statement, in its own autocommit transaction, but the role the
+    /// connection's user set does not limit it.
+    EmbedderPragma,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +97,7 @@ impl StatementOrigin {
     pub(crate) const fn is_top_level(self) -> bool {
         matches!(
             self,
-            Self::Root | Self::EngineMetadataRead | Self::EngineSchemaWrite
+            Self::Root | Self::EngineMetadataRead | Self::EngineSchemaWrite | Self::EmbedderPragma
         )
     }
 }

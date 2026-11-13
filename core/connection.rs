@@ -1130,6 +1130,24 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
+    /// Prepares a PRAGMA statement of the embedder's own, such as
+    /// `PRAGMA page_count`, on a connection whose user may have switched to
+    /// a role that is not a superuser. The statement is not limited by that
+    /// role's privileges; otherwise it runs like a statement from
+    /// [`Self::prepare`], as a top-level statement in its own autocommit
+    /// transaction when no transaction is open. Never pass SQL that comes
+    /// from the connection's user. Fails for any statement but a PRAGMA.
+    pub fn prepare_embedder_pragma(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+        let Some(cmd @ Cmd::Stmt(ast::Stmt::Pragma { .. })) = cmd else {
+            return Err(LimboError::InvalidArgument(format!(
+                "not a PRAGMA statement: {sql}"
+            )));
+        };
+        let input = sql[..byte_offset_end].trim();
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::EmbedderPragma)
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)
