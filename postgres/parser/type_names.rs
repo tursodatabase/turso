@@ -127,10 +127,11 @@ fn is_system_type(schema: Option<&str>, name: &str) -> bool {
 }
 
 /// The type name as PostgreSQL writes it in an error about a type that does
-/// not exist, such as `public.nosuch[]`.
+/// not exist, such as `public.nosuch[]`. PostgreSQL writes `[]` one time
+/// also for more brackets, such as those of `nosuch[][]`.
 pub(crate) fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
     let mut text = extract_key_columns(&type_name.names)?.join(".");
-    for _ in &type_name.array_bounds {
+    if !type_name.array_bounds.is_empty() {
         text.push_str("[]");
     }
     Ok(text)

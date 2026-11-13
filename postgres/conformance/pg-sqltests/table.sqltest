@@ -969,6 +969,15 @@ expect error {
     type "public\.nosuch\[\]" does not exist
 }
 
+# PostgreSQL writes one `[]` for more brackets.
+test table-column-of-missing-type-with-two-array-brackets {
+    CREATE TABLE t (a nosuch[][]);
+}
+@sqlstate 42704
+expect error {
+    type "nosuch\[\]" does not exist
+}
+
 # The built-in types are in pg_catalog, not in public.
 test table-column-of-built-in-type-in-public-schema {
     CREATE TABLE t (a public.int4);
