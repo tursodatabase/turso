@@ -95,7 +95,6 @@ module MvccPassiveSchema {
   const GuardPatchKeepsEnd: bool     // publish patches the schema row payload, keeps end (#7956)
   const GuardEndedCreated: bool      // publish adds ended created roots to dropped roots (#7956)
   const GuardFreedOnly: bool         // publish clears only freed roots from dropped roots (#7957)
-  const GuardRootGcProtect: bool     // rootpage_gc_protected in GC
   const GuardRefreshRoot: bool       // is_btree_allocated: a negative root takes the binding's page (#8537)
   const GuardFrozenMark: bool        // every statement of a transaction reads pages at the
                                      // WAL mark that its begin pinned
@@ -939,7 +938,6 @@ module MvccPassiveSchema {
     chain.get(o) != Set(),
     chain.get(o).forall(v => v.mat != 0 and v.mat <= GcFloor),
     Lwm == Inf,
-    GuardRootGcProtect implies not(bind.get(o).in and bind.get(o).mat > GcFloor),
     chain' = chain.set(o, Set()),
     clock' = clock, lastCommitted' = lastCommitted, UnchangedSchemaVars, ins' = ins,
     UnchangedStoreVars, rd' = rd, seen' = seen, err' = err,
@@ -1097,6 +1095,24 @@ module MvccPassiveSchema {
   // snapshot (#8077).
   val NoLiveDestroy: bool = not(err.exists(e => e.kind == "destroy-live"))
 
+  // Every stamped version of an object has a stamp at or after the frame of
+  // the object's B-tree binding. GC drops only versions stamped at or below
+  // the floor, so a binding above the floor keeps every version of its object
+  // without a separate guard (rootpage_gc_protected).
+  val StampsAtOrAfterBinding: bool =
+    Objs.forall(o => (bind.get(o).in and bind.get(o).root > 0) implies
+                     chain.get(o).forall(v => v.mat == 0 or v.mat >= bind.get(o).mat))
+
+  // GC is never enabled on an object whose binding is above the floor. The
+  // guard rootpage_gc_protected blocked GC in that state.
+  val GcNeverRunsUnderNewerBinding: bool =
+    not(Objs.exists(o => and {
+      chain.get(o) != Set(),
+      chain.get(o).forall(v => v.mat != 0 and v.mat <= GcFloor),
+      Lwm == Inf,
+      bind.get(o).in, bind.get(o).mat > GcFloor,
+    }))
+
   // The current sqlite_schema row of a live table points at its live B-tree.
   // A negative rootpage is right only while the table has no page.
   def NewestRoot(o: str): int =
@@ -1135,6 +1151,11 @@ module MvccPassiveSchema {
 
   // ---------------------------------------------------------------------------
   // Reachability checks. Each one must be violated.
+
+  // An object with versions has a binding above the floor, so
+  // rootpage_gc_protected would skip it.
+  val NeverRootGuardFires: bool =
+    not(Objs.exists(o => chain.get(o) != Set() and bind.get(o).in and bind.get(o).mat > GcFloor))
 
   val NeverReusesPage: bool =
     not(tuples(1.to(wal.length()), 1.to(wal.length())).exists(((i, j)) =>

@@ -5,7 +5,7 @@
 
 // Expect no error: the design. Every special case of the code is on, and every
 // Fix* constant applies the fix for one open issue.
-// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind KindsMatch NoLiveDestroy SchemaRowCurrent
+// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind KindsMatch NoLiveDestroy SchemaRowCurrent StampsAtOrAfterBinding GcNeverRunsUnderNewerBinding
 module main {
   import MvccPassiveSchema(
     Objs = Set("t1", "t2"),
@@ -29,7 +29,6 @@ module main {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -43,7 +42,7 @@ module main {
 }
 
 // Expect no error: the design with ALTER TABLE ADD COLUMN.
-// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind KindsMatch NoLiveDestroy SchemaRowCurrent
+// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind KindsMatch NoLiveDestroy SchemaRowCurrent StampsAtOrAfterBinding GcNeverRunsUnderNewerBinding
 module alter {
   import MvccPassiveSchema(
     Objs = Set("t1", "t2"),
@@ -67,7 +66,6 @@ module alter {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -106,7 +104,6 @@ module codeToday {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = false,
@@ -120,7 +117,7 @@ module codeToday {
 }
 
 // Expect no error: the design with one table and one index on it.
-// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind KindsMatch NoLiveDestroy SchemaRowCurrent
+// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind KindsMatch NoLiveDestroy SchemaRowCurrent StampsAtOrAfterBinding GcNeverRunsUnderNewerBinding
 module indexes {
   import MvccPassiveSchema(
     Objs = Set("t1", "i1"),
@@ -144,7 +141,6 @@ module indexes {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -183,7 +179,6 @@ module issue11499 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -223,7 +218,6 @@ module issue11500 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -262,7 +256,6 @@ module issue11501 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = false,
@@ -302,7 +295,6 @@ module issue11502 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -341,7 +333,6 @@ module issue7960 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = false,
@@ -380,7 +371,6 @@ module issue8004 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -419,7 +409,6 @@ module issue8077Row {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -459,7 +448,6 @@ module issue8077 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -498,7 +486,6 @@ module issue8537 {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = false,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -537,7 +524,6 @@ module noAllocRetiresStale {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -576,7 +562,6 @@ module noAlterRecovery {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -615,7 +600,6 @@ module noBindingGcLwm {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -654,7 +638,6 @@ module noBusy {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -693,7 +676,6 @@ module noCookieCheck {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -732,7 +714,6 @@ module noCoversBegin {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -771,7 +752,6 @@ module noCoversEnd {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -810,7 +790,6 @@ module noEndedCreated {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = false,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -849,7 +828,6 @@ module noFreedOnly {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = false,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -888,7 +866,6 @@ module noFrozenMark {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = false,
     FixDisjointIds = true,
@@ -927,7 +904,6 @@ module noGenerationGate {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -965,7 +941,6 @@ module noMatCheck {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1004,7 +979,6 @@ module noOpenFallback {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1043,7 +1017,6 @@ module noPatchKeepsEnd {
     GuardPatchKeepsEnd = false,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1082,46 +1055,6 @@ module noRetire {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
-    GuardRefreshRoot = true,
-    GuardFrozenMark = true,
-    FixDisjointIds = true,
-    FixPersistIds = true,
-    FixHeaderCookieMax = true,
-    FixInnerTxChecks = true,
-    FixDdlRebases = true,
-    FixAlterPatch = true,
-    FixAlterRecovery = true
-  ).* from "./MvccPassiveSchema"
-}
-
-// Expect no error: GC ignores rootpage_gc_protected. The per-version
-// materialized_at check already keeps the rows.
-// Invariants: TypeOK ReadsCorrect OpenCorrect NoSharedOwner RecoveryCorrect PagesAccounted CookieNotBehind
-module noRootGcProtect {
-  import MvccPassiveSchema(
-    Objs = Set("t1", "t2"),
-    Pages = Set(2, 3),
-    Readers = Set("r1"),
-    MaxTs = 4,
-    MaxCheckpoints = 2,
-    Indexes = Set(),
-    IdxTable = "t1",
-    Alters = false,
-    GuardMatCheck = true,
-    GuardCoversBegin = true,
-    GuardCoversEnd = true,
-    GuardRetireOnDestroy = true,
-    GuardBindingGcLwm = true,
-    GuardAllocRetiresStale = true,
-    GuardOpenFallback = true,
-    GuardBusyOnUnpublished = true,
-    GuardGenerationGate = true,
-    GuardCookieCheck = true,
-    GuardPatchKeepsEnd = true,
-    GuardEndedCreated = true,
-    GuardFreedOnly = true,
-    GuardRootGcProtect = false,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1159,7 +1092,6 @@ module reachBusy {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1198,7 +1130,6 @@ module reachOldOwner {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1238,7 +1169,6 @@ module reachOwnedNegative {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1277,7 +1207,6 @@ module reachReplaysRow {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1316,7 +1245,6 @@ module reachReuse {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1355,7 +1283,6 @@ module reachSchemaUpdatedCookie {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,
@@ -1394,7 +1321,44 @@ module reachSchemaUpdatedGen {
     GuardPatchKeepsEnd = true,
     GuardEndedCreated = true,
     GuardFreedOnly = true,
-    GuardRootGcProtect = true,
+    GuardRefreshRoot = true,
+    GuardFrozenMark = true,
+    FixDisjointIds = true,
+    FixPersistIds = true,
+    FixHeaderCookieMax = true,
+    FixInnerTxChecks = true,
+    FixDdlRebases = true,
+    FixAlterPatch = true,
+    FixAlterRecovery = true
+  ).* from "./MvccPassiveSchema"
+}
+
+// Expect NeverRootGuardFires to fail: an object with versions has a binding
+// above the GC floor.
+// Invariants: NeverRootGuardFires
+module reachRootGuardFires {
+  import MvccPassiveSchema(
+    Objs = Set("t1", "t2"),
+    Pages = Set(2, 3),
+    Readers = Set("r1"),
+    MaxTs = 4,
+    MaxCheckpoints = 2,
+    Indexes = Set(),
+    IdxTable = "t1",
+    Alters = false,
+    GuardMatCheck = true,
+    GuardCoversBegin = true,
+    GuardCoversEnd = true,
+    GuardRetireOnDestroy = true,
+    GuardBindingGcLwm = true,
+    GuardAllocRetiresStale = true,
+    GuardOpenFallback = true,
+    GuardBusyOnUnpublished = true,
+    GuardGenerationGate = true,
+    GuardCookieCheck = true,
+    GuardPatchKeepsEnd = true,
+    GuardEndedCreated = true,
+    GuardFreedOnly = true,
     GuardRefreshRoot = true,
     GuardFrozenMark = true,
     FixDisjointIds = true,

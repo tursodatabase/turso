@@ -139,7 +139,6 @@ means that it runs in B but nothing in B needs it.
 | `gc_chain_now` checks `lwm == MAX` again | mod.rs:8154-8170 | B, P, T | Row spec `GuardGcRechecksIdleLwm` | Design |
 | `compute_min_reader_mark` in the floor | mod.rs:10718, used mod.rs:8251, mod.rs:8376-8378, mod.rs:8454-8457, mod.rs:8494-8497 | B, P, T | Row spec `GcFloorRule` | Optimization at most. DESIGN.md finding 1: it never lowers the floor |
 | Pinned pager read marks in the floor | `gc_floor_reader_mark` csm.rs:2237-2250 | Checkpoint GC in B, P, T. Not in `gc_incremental` | Row spec `floorPinned` | Design option |
-| `rootpage_gc_protected` | mod.rs:10736 | B, P, T | Schema spec S14 (`noRootGcProtect`: not needed) | Not needed in the model |
 | `prune_finalized_tx_states` | mod.rs:8542, only from `drop_unused_row_versions_inner` mod.rs:8434 | B, P, T (only in a full sweep) | Not modeled | Design |
 | Empty slot unlink, writer retry | mod.rs:8296, mod.rs:8380, mod.rs:8478, mod.rs:8517. Retry in `insert_version` mod.rs:8727-8752 | B, P, T (P keeps slots until `Finalize`) | Not modeled | Optimization (memory) |
 | Chain shrink | `shrink_version_chain_allocation` mod.rs:8691 | B, P, T | Not modeled | Optimization (memory) |
@@ -183,7 +182,7 @@ have. Each item below exists only to protect a concurrent reader or a concurrent
 | 4 | Snapshot clamp below `Preparing` commits | mod.rs:7843-7858 | Use `last_committed_tx_ts`. Keep an assert that no tx is `Preparing` | `txs` empty |
 | 5 | `materialized_at` stamp in `GcTableRows`, `GcIndexRows` | csm.rs:2286-2293, csm.rs:2380-2386, mod.rs:8651 | Nothing. In B the stamp is the WAL position after `TruncateWal` (csm.rs:2257 runs after csm.rs:3440-3470), so it does not name the frame of the write. Not verified: whether that position can equal `WalPos::ORIGIN` (seq 0, frame 0). If it can, Rule 3 never drops that version in B (mod.rs:8597-8599) | None |
 | 6 | GC rules at the end: `GcTableRows`, `GcIndexRows`, then `drop_unused_row_versions_and_slots` | csm.rs:3492-3516, csm.rs:3531-3535, mod.rs:8188, mod.rs:8408 | Remove every entry of `rows` and of each `index_rows` inner map, one by one. Do not call `SkipMap::clear` (core/skiplist/base.rs:1515): it only marks towers in batches of 100 and leaves the unlink to later searches. Then empty `finalized_tx_states`, because no tx exists and no version is left that names a TxID | `txs` empty. Every committed version is in the B-tree. No pager-level reader without an MVCC tx. In B a reader takes the gate before its read mark (mod.rs:6410-6420), so this holds for MVCC readers. Not verified for other pager readers (for example schema reads or attached databases) |
-| 7 | `backfill_floor`, `compute_min_reader_mark`, `rootpage_gc_protected`, `gc_floor_reader_mark` in GC | csm.rs:3484-3489, mod.rs:10718, mod.rs:10736, csm.rs:2237 | Nothing in the checkpoint GC. `gc_incremental` between checkpoints only needs Rule 2 B form, which uses `ckpt_max`, not the floor. Rule 3 in B also reads the floor (mod.rs:8631), but item 6 already drops those versions | Same as item 6 |
+| 7 | `backfill_floor`, `compute_min_reader_mark`, `gc_floor_reader_mark` in GC | csm.rs:3484-3489, mod.rs:10718, csm.rs:2237 | Nothing in the checkpoint GC. `gc_incremental` between checkpoints only needs Rule 2 B form, which uses `ckpt_max`, not the floor. Rule 3 in B also reads the floor (mod.rs:8631), but item 6 already drops those versions | Same as item 6 |
 | 8 | Rule 3 tests `lwm == MAX` | mod.rs:8635 | Always true in a B checkpoint | `txs` empty |
 | 9 | Versioned root bindings: retire with `end_ts`, `gc_rootpage_entries(lwm)`, `materialized_at` on bindings, `STAGED` | csm.rs:2169-2185, mod.rs:4859, mod.rs:4870, mod.rs:10695 | Replace the binding at publish and delete retired bindings at once. No reader can see the old binding | Not verified: statements prepared before the checkpoint must get `SchemaUpdated` or must map their root again. The cookie check and the generation check (mod.rs:6768) give this today |
 | 10 | `schema_generation` bump | csm.rs:2147 | Not verified that B needs it. The bump makes every statement prepared before it fail with `SchemaUpdated` at the next begin (mod.rs:6768). In B the cursor maps roots with `get_table_id_from_root_page_at` (cursor.rs:621-622) | Prepared statements must not use a stale root |
@@ -214,7 +213,7 @@ mark), not the lock.
 2. Mode B GC rules are not modeled. Three B paths change reads: Rule 2 B form (mod.rs:8610-8619), Rule 3 with `b <= ckpt_max` (mod.rs:8633), and the B-tree fall-through read (mod.rs:6070-6087, cursor.rs:1203). B is the default mode. The sequence spec states that both modes use the P rules (MvccPassiveSequence.qnt:51), which is false for flag off.
 3. Mode T publish runs without the clock lock (csm.rs:3313-3320) while `begin_tx` runs with no blocking lock. A begin can read the header, `schema_generation` and the root map half updated. The comment at mod.rs:6751-6756 assumes the clock lock or the read guard. Not verified.
 4. Mode T `Finalize` uses `reader_mark_floor = STAGED` (mod.rs:8188). So it ignores readers that pinned a read mark but are not in `txs` yet (rule R5). If the R5 argument holds after a WAL restart, `backfill_floor` still protects them. Not verified.
-5. Index rows are not in any spec. They have their own GC loop (mod.rs:8348), their own dirty map, the lockstep cursor (cursor.rs:524) and `rootpage_gc_protected` for indexes (mod.rs:8371). A correct table with a wrong index still gives wrong query results.
+5. Index rows are not in any spec. They have their own GC loop (mod.rs:8348), their own dirty map and the lockstep cursor (cursor.rs:524). A correct table with a wrong index still gives wrong query results.
 6. `finalized_tx_states` pruning (mod.rs:8542) is not modeled. Assume that GC prunes a TxID and a version still names it. Then visibility and conflict checks treat it as "visible" or "no conflict" (comment at mod.rs:6846-6853).
 7. Write-write validation (mod.rs:2071) against a GC that drops versions is not modeled. If GC drops a version, a conflict can stay hidden and an update can get lost.
 8. Group commit and the order of log fsync and `CommitEnd` (mod.rs:3448-3586) are not modeled. This is the durability promise of a commit.
@@ -225,6 +224,7 @@ mark), not the lock.
 13. The rowid allocator cache is dropped with retired bindings (mod.rs:4880). Not modeled. A wrong cache can reuse a rowid.
 14. If the B stamp after `TruncateWal` (csm.rs:2257) is `ORIGIN`, Rule 3 never drops those versions in B. Memory only. Not verified.
 15. A checkpoint on the connection of an open MVCC transaction (`Connection::checkpoint`, or the auto-checkpoint after the inner commit of `nextval` inside `BEGIN CONCURRENT`) is in the row spec only as `CheckpointOnReaderConnection`: the backfill ignores that reader's mark. The spec does not model the reset of the connection's transaction state. The schema and sequence specs do not have this path.
+16. The schema spec has one GC action (`GcDrop`). It drops a whole chain in one step under Rule 3 alone. It has no GC sample before the chain lock, no Rules 1 and 2, and no chain budget (`gc_index_incremental`).
 
 ## 4. Optimizations the design does not need, and the rule each one stands in for
 
@@ -239,7 +239,6 @@ mark), not the lock.
 | Index lockstep merge | mod.rs:6099, cursor.rs:524 | `query_btree_version_is_valid` per key (mod.rs:6126) | Same answer. The debug compare at cursor.rs:667-672 checks this |
 | Row map epochs | cursor.rs:907-948 | Seek the skip list again on every step | After an insert, do not reuse a cached position |
 | `compute_min_reader_mark` in the floor | mod.rs:10718 | Floor = `backfill_floor` (`floorBackfill`) or the lowest pinned read mark (`floorPinned`) | A smaller floor is always safe. It keeps more versions |
-| `rootpage_gc_protected` | mod.rs:10736 | Nothing. Per-version `materialized_at` covers it (schema S14) | None |
 | CYCLE skip in compaction | csm.rs:817 | Compact every sequence (sequence S4) | The skip only saves the scan |
 | TxID to timestamp rewrite | mod.rs:7383 | A version's begin is the commit ts of its writer | Resolution through `txs`, then `finalized_tx_states`, gives the same ts |
 | `finalized_tx_states` | mod.rs:6871, mod.rs:8542 | A finished tx keeps its state forever | Prune a TxID only after no version names it (`collect_referenced_txids` mod.rs:8530) |

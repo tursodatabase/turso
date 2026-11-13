@@ -103,8 +103,26 @@ mark of every open reader (`CheckpointBackfill`). A Rust run of
 `backfill_floor` above that reader's mark. This step must check that path
 first.
 
-- Removes: `compute_min_reader_mark` from GC, the merge of two values in
-  `gc_floor_reader_mark`, and `rootpage_gc_protected` (`noRootGcProtect`).
+The check found a bug on that path. A checkpoint on the connection of an
+open MVCC transaction ignores that transaction's read mark. SQL reaches it:
+`nextval` inside `BEGIN CONCURRENT` commits an inner transaction, and that
+commit runs the auto-checkpoint. The transaction then reads rows that
+committed after it began, with either floor (`ownCheckpoint`,
+`ownCheckpointBackfillFloor`). On the same path, GC with `backfill_floor`
+alone drops versions above the reader's mark
+(`ownCheckpointGcBackfillFloor` fails), and the lowest pinned read mark keeps
+them (`ownCheckpointGcPinnedFloor` passes). In the concurrent simulator, an
+assertion that `backfill_floor` is not above the read mark of an open
+transaction fails in 46 of 200 seeds.
+
+So the reader marks stay in the floor until the fix for this path merges.
+GC asserts that its floor is not above the read mark of an open transaction.
+
+- Removed: `rootpage_gc_protected`. The invariant `StampsAtOrAfterBinding`
+  holds, and GC asserts it on each chain (`reachRootGuardFires` shows that
+  the model reaches the state where the guard fired).
+- Removes after the fix: `compute_min_reader_mark` from GC and the merge of
+  two values in `gc_floor_reader_mark`.
 - Size: medium.
 
 ### 5. Delete guards that the model does not need
