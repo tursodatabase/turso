@@ -422,9 +422,6 @@ impl RowDriver {
             .mv
             .compute_min_reader_mark()
             .min(*self.mv.backfill_floor.read());
-        if self.mv.rootpage_gc_protected(&row_id.table_id, floor) {
-            return Ok(());
-        }
         if let Some(entry) = self.mv.rows.get(&row_id) {
             let mut versions = entry.value().write();
             self.mv
