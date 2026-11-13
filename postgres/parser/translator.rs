@@ -5679,7 +5679,7 @@ impl PostgreSQLTranslator {
         let (schema, name) = schema_and_name(type_name)?;
         // `_mood` is the array type of `mood`.
         let element = name.strip_prefix('_');
-        if has_turso_type(name)
+        if has_turso_type(schema, name)
             || built_in_type(schema, name).is_some()
             || element.is_some_and(|element| built_in_type(schema, element).is_some())
         {
@@ -5721,11 +5721,12 @@ impl TypeUse {
     }
 }
 
-/// Whether tursopg has a type of its own for `name`, a type name without
-/// its schema. As map_pg_type does, each leading underscore is read as an
-/// array.
-fn has_turso_type(name: &str) -> bool {
-    turso_type(name.trim_start_matches('_'), &[]).is_some()
+/// Whether tursopg has a type of its own for `name` of `schema`. Its own
+/// types are in pg_catalog, as the built-in types are, and `_int4` is the
+/// array type of `int4`.
+fn has_turso_type(schema: Option<&str>, name: &str) -> bool {
+    schema.is_none_or(|schema| schema == "pg_catalog")
+        && turso_type(name.strip_prefix('_').unwrap_or(name), &[]).is_some()
 }
 
 #[allow(clippy::vec_box)]

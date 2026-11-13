@@ -509,6 +509,24 @@ expect error {
     type "public\.nosuch\[\]" does not exist
 }
 
+# The built-in types are in pg_catalog, not in public.
+test select-cast-to-built-in-type-in-public-schema {
+    SELECT 1::public.int4;
+}
+@sqlstate 42704
+expect error {
+    type "public\.int4" does not exist
+}
+
+# `_int4` is the array type of `int4`, but `__int4` is no type.
+test select-cast-to-type-named-with-two-underscores {
+    SELECT 1::__int4;
+}
+@sqlstate 42704
+expect error {
+    type "__int4" does not exist
+}
+
 # An index has no row type.
 test select-cast-to-index-name {
     CREATE TABLE emp (name text);

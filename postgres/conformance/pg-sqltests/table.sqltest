@@ -969,6 +969,15 @@ expect error {
     type "public\.nosuch\[\]" does not exist
 }
 
+# The built-in types are in pg_catalog, not in public.
+test table-column-of-built-in-type-in-public-schema {
+    CREATE TABLE t (a public.int4);
+}
+@sqlstate 42704
+expect error {
+    type "public\.int4" does not exist
+}
+
 # An index and a sequence have no row type.
 test table-column-of-index-name {
     CREATE TABLE emp (name text);
