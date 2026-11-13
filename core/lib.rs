@@ -202,7 +202,7 @@ pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, Reg
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,
-    Program, Register,
+    Program, ProgramState, Register,
 };
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 

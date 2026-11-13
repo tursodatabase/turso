@@ -3405,14 +3405,11 @@ impl PostgreSQLTranslator {
                 }
                 let type_name = extract_type_name_from_typename(pg_type_name)?;
                 if type_name.eq_ignore_ascii_case("int2") {
-                    let operand = int_cast_operand(arg, (*expr).clone(), IntegerType::Int2);
-                    return Ok(function_call("pg_cast_int2", vec![operand]));
+                    expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int2));
                 } else if type_name.eq_ignore_ascii_case("int4") {
-                    let operand = int_cast_operand(arg, (*expr).clone(), IntegerType::Int4);
-                    return Ok(function_call("pg_cast_int4", vec![operand]));
+                    expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int4));
                 } else if type_name.eq_ignore_ascii_case("int8") {
-                    let operand = int_cast_operand(arg, (*expr).clone(), IntegerType::Int8);
-                    return Ok(function_call("pg_cast_int8", vec![operand]));
+                    expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int8));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -4397,7 +4394,8 @@ impl PostgreSQLTranslator {
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" => Some("INTEGER"),
+            "INT2" => Some("SMALLINT"),
+            "INT4" => Some("INTEGER"),
             "INT8" => Some("BIGINT"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
@@ -4414,19 +4412,25 @@ impl PostgreSQLTranslator {
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
                 }
-                let operand = args.into_iter().next().unwrap();
+                let mut operand = args.into_iter().next().unwrap();
                 if func_name.eq_ignore_ascii_case("int2") {
-                    let operand =
-                        int_cast_operand(&func_call.args[0], (*operand).clone(), IntegerType::Int2);
-                    return Ok(function_call("pg_cast_int2", vec![operand]));
+                    operand = Box::new(int_cast_operand(
+                        &func_call.args[0],
+                        (*operand).clone(),
+                        IntegerType::Int2,
+                    ));
                 } else if func_name.eq_ignore_ascii_case("int4") {
-                    let operand =
-                        int_cast_operand(&func_call.args[0], (*operand).clone(), IntegerType::Int4);
-                    return Ok(function_call("pg_cast_int4", vec![operand]));
+                    operand = Box::new(int_cast_operand(
+                        &func_call.args[0],
+                        (*operand).clone(),
+                        IntegerType::Int4,
+                    ));
                 } else if func_name.eq_ignore_ascii_case("int8") {
-                    let operand =
-                        int_cast_operand(&func_call.args[0], (*operand).clone(), IntegerType::Int8);
-                    return Ok(function_call("pg_cast_int8", vec![operand]));
+                    operand = Box::new(int_cast_operand(
+                        &func_call.args[0],
+                        (*operand).clone(),
+                        IntegerType::Int8,
+                    ));
                 }
                 return Ok(ast::Expr::Cast {
                     expr: operand,
@@ -6955,10 +6959,10 @@ fn pg_type_name_to_ast_type(
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
-        | "REGCLASS" | "REGTYPE" => "INTEGER",
-        // Casts like INTEGER; the name types the result as int8.
+        "SMALLINT" | "INT2" | "SMALLSERIAL" => "SMALLINT",
+        "INTEGER" | "INT" | "INT4" | "SERIAL" => "INTEGER",
         "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
+        "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
