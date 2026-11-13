@@ -10,10 +10,24 @@ use crate::error::sqlstate_error;
 const VERTICAL_TAB: char = '\u{b}';
 
 #[derive(Debug, Copy, Clone)]
+#[repr(i64)]
 pub enum IntegerWidth {
-    Int16,
-    Int32,
-    Int64,
+    Int16 = 16,
+    Int32 = 32,
+    Int64 = 64,
+}
+
+impl TryFrom<i64> for IntegerWidth {
+    type Error = &'static str;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            16 => Ok(IntegerWidth::Int16),
+            32 => Ok(IntegerWidth::Int32),
+            64 => Ok(IntegerWidth::Int64),
+            _ => Err("Invalid integer width"),
+        }
+    }
 }
 
 pub fn cast_value_to_integer(value: &Value, width: IntegerWidth) -> Result<Value> {
@@ -173,52 +187,5 @@ fn map_parse_int_err_kind(err: ParseIntError, width: IntegerWidth) -> LimboError
             SQLSTATE_INVALID_TEXT_REPRESENTATION,
             "invalid input syntax for integer",
         ),
-    }
-}
-
-pub fn str_to_i64_checked(input: impl AsRef<str>) -> Result<i64, ParseIntError> {
-    let mut input = input
-        .as_ref()
-        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB);
-
-    let sign = match input.chars().next() {
-        Some(s @ ('+' | '-')) => {
-            input = &input[1..];
-            Some(s)
-        }
-        _ => None,
-    };
-
-    let (radix, clean) = match input.get(..2) {
-        Some("0x" | "0X") => (16, &input[2..]),
-        Some("0o" | "0O") => (8, &input[2..]),
-        Some("0b" | "0B") => (2, &input[2..]),
-        _ => (10, input),
-    };
-
-    let invalid_underscore = clean.char_indices().any(|(i, ch)| {
-        if ch != '_' {
-            return false;
-        }
-
-        let before = clean[..i].chars().next_back();
-        let after = clean[i + 1..].chars().next();
-
-        !matches!(before, Some(c) if c.is_digit(radix))
-            || !matches!(after, Some(c) if c.is_digit(radix))
-    });
-
-    if invalid_underscore {
-        return Err(i64::from_str_radix("_", radix).unwrap_err());
-    }
-
-    let clean = clean.replace('_', "");
-
-    match sign {
-        Some(s) => {
-            let signed = format!("{s}{clean}");
-            i64::from_str_radix(&signed, radix)
-        }
-        None => i64::from_str_radix(&clean, radix),
     }
 }

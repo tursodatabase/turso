@@ -1,11 +1,12 @@
 use crate::functions::validate_pg_input;
-use crate::numeric::str_to_i64_checked;
+use crate::numeric::{cast_value_to_integer, IntegerWidth};
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
+use turso_core::ProgramState;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     namespace::mangle_name,
@@ -18,10 +19,10 @@ use turso_core::{
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
+use turso_core::{Insn, Numeric, ProgramBuilder};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
-use turso_pg_parser::sqlstate::SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -356,11 +357,65 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn cast_to_integer(&self, value: &Value) -> Result<Value> {
-        let Value::Text(raw_str) = value else {
-            return Ok(value.exec_cast("INTEGER")?);
+    fn inject_cast_metadata(
+        &self,
+        program: &mut ProgramBuilder,
+        type_name: &Option<ast::Type>,
+        target_register: usize,
+    ) -> Result<()> {
+        let integer_width = match type_name
+            .as_ref()
+            .unwrap()
+            .name
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "INT2" | "SMALLINT" => IntegerWidth::Int16,
+            "INT4" | "INTEGER" | "INT" => IntegerWidth::Int32,
+            "INT8" | "BIGINT" => IntegerWidth::Int64,
+            _ => return Ok(()), // we're only going to handle to pg integer type case in the execution layer
         };
-        Ok(Value::from_i64(str_to_i64_checked(raw_str)?))
+
+        let metadata_reg_first = program.alloc_registers(2);
+
+        program.emit_insn(Insn::Copy {
+            src_reg: target_register,
+            dst_reg: metadata_reg_first,
+            extra_amount: 0,
+        });
+
+        program.emit_insn(Insn::Int64 {
+            _p1: 0,
+            out_reg: metadata_reg_first + 1,
+            _p3: 0,
+            value: integer_width as i64,
+        });
+
+        program.emit_insn(Insn::Int64 {
+            _p1: 0,
+            out_reg: target_register,
+            _p3: 0,
+            value: metadata_reg_first as i64,
+        });
+
+        Ok(())
+    }
+
+    // assumes pointer semantics for to integer casting, i.e, passed value contains the register id to two contiguous registers where the first register is operand and the second register is the integer width
+    fn cast_to_integer(&self, value: &Value, program: &ProgramState) -> Result<Value> {
+        let Value::Numeric(Numeric::Integer(pointer)) = value else {
+            unreachable!("pointer semantics contract enforces target register to contain an index to the operand register index for postgres integer casts");
+        };
+
+        let operand = program.get_register(*pointer as usize).get_value();
+        let metadata = match program.get_register((*pointer + 1) as usize).get_value() {
+            Value::Numeric(Numeric::Integer(metadata)) => metadata,
+            _ => unreachable!("PostgreSQL integer cast metadata must be an integer"),
+        };
+        let integer_width =
+            IntegerWidth::try_from(*metadata).expect("invalid integer width metadata");
+
+        Ok(cast_value_to_integer(operand, integer_width)?)
     }
 }
 

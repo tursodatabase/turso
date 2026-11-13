@@ -1059,3 +1059,36 @@ test cast-runtime-text-int8-precision-preservation {
 }
 expect error {
 }
+
+test cast-runtime-text-int2-invalid-input {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('hello');
+    SELECT value::int2 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int4-invalid-input {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('hello');
+    SELECT value::int4 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int8-invalid-input {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('hello');
+    SELECT value::int8 FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
+test cast-runtime-text-int2-function-invalid-input {
+    CREATE TABLE integer_cast_values (value text);
+    INSERT INTO integer_cast_values VALUES ('hello');
+    SELECT int2(value) FROM integer_cast_values;
+    DROP TABLE integer_cast_values;
+}
+expect error {
+}
