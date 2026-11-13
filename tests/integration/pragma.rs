@@ -514,3 +514,31 @@ fn test_storage_stats_returns_io_and_matches_pragmas() -> anyhow::Result<()> {
     conn.execute("INSERT INTO t1 VALUES (1)")?;
     Ok(())
 }
+
+/// A pragma table-valued function must wait for the page reads of the
+/// statement that runs the pragma instead of reporting a row.
+#[test]
+fn test_pragma_vtab_waits_for_io() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io, "pragma-vtab-waits-for-io.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("CREATE TABLE t1(a)")?;
+    conn.execute("INSERT INTO t1 VALUES (1), (2)")?;
+    // A new connection starts with an empty page cache.
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    assert_that!(conn
+        .prepare("SELECT * FROM pragma_integrity_check()")?
+        .run_collect_rows()?)
+    .is_equal_to(vec![vec![Value::from_text("ok")]]);
+    // The pragma scan starts again for each row of t1, the first time on an
+    // empty page cache.
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    assert_that!(conn
+        .prepare("SELECT t1.a, ic.* FROM t1, pragma_integrity_check() AS ic")?
+        .run_collect_rows()?)
+    .is_equal_to(vec![
+        vec![Value::from_i64(1), Value::from_text("ok")],
+        vec![Value::from_i64(2), Value::from_text("ok")],
+    ]);
+    Ok(())
+}
