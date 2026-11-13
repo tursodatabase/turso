@@ -511,7 +511,8 @@ pub(crate) fn owned_sequences(
 
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// a role has the privileges the relation's list gives it, by oid or through
-/// PUBLIC. A relation without a list has the default one, which gives the
+/// PUBLIC, together with those it gives the roles whose privileges the role
+/// inherits. A relation without a list has the default one, which gives the
 /// owner every privilege and no one else any. As in PostgreSQL, an owner
 /// that revoked a privilege from itself no longer has it. A table without a
 /// class row is one of the engine's own, such as `__turso_internal_authid` or
@@ -529,11 +530,12 @@ pub(crate) fn role_has_privilege(
     else {
         return false;
     };
+    let roles = schema_roles(schema);
     let Some(acl) = &class.relacl else {
-        return class.relowner == role;
+        return roles.has_privileges_of(role, class.relowner);
     };
     let wanted = Privileges::named_on(class.relkind, &[privilege]);
-    !wanted.is_empty() && acl.grants(role_oid(role), wanted)
+    !wanted.is_empty() && acl.grants(&roles.oids_of_roles_used_by(role), wanted)
 }
 
 /// The access control list of relation `name` of `namespace`, or None when
@@ -886,14 +888,15 @@ pub(crate) fn translate_catalog_changes(
                     .relacl
                     .clone()
                     .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
-                // Only the owner may grant or revoke, and a superuser does
-                // so as the owner. As in PostgreSQL, anyone else is refused
-                // when the list gives it nothing on the relation, and changes
-                // nothing otherwise, for want of a grant option.
-                let may_grant = connection.current_role_is_superuser()
-                    || class.relowner == connection.current_role();
-                if !may_grant {
-                    if acl.gives_anything_to(role_oid(connection.current_role())) {
+                // Only the owner may grant or revoke, and a superuser or a
+                // role with the owner's privileges does so as the owner. As
+                // in PostgreSQL, anyone else is refused when the list gives
+                // it nothing on the relation, and changes nothing otherwise,
+                // for want of a grant option.
+                let roles = schema_roles(schema);
+                let current = connection.current_role();
+                if !roles.has_privileges_of(current, class.relowner) {
+                    if acl.gives_anything_to(&roles.oids_of_roles_used_by(current)) {
                         continue;
                     }
                     return Err(LimboError::PermissionDenied(Box::new(
