@@ -8888,11 +8888,13 @@ impl PartialOrd for IntegrityCheckCellRange {
 /// MINIMUM_CELL_SIZE bytes, the least space any cell takes on a page (a freed cell must be
 /// able to hold a 4-byte freeblock header).
 ///
-/// Only index cells can be smaller: a one-column record of 0, 1, '' or X'' is 2 bytes, so
-/// its cell is 3. A leaf page stores such a cell padded and cell_get_raw_region reports the
-/// padded size, while a divider in the parent stores the cell's real size after its child
-/// pointer. Padding the cell whenever it is headed for a leaf keeps balancing working with
-/// one size; the record's own length prefix keeps readers from ever looking at the padding.
+/// Only leaf cells can be smaller. An index cell holding a one-column record of NULL, 0, 1, ''
+/// or X'' is 3 bytes (the record is 2), and so is a table cell with a rowid from 0 to 127 and an
+/// empty record (the temporary table of rowids an upsert wrote). A leaf page stores such a cell in
+/// a MINIMUM_CELL_SIZE slot and cell_get_raw_region reports the padded size, while an index
+/// divider in the parent stores the cell's real size after its child pointer. Padding the cell
+/// whenever it is headed for a leaf keeps balancing working with one size; the cell's own length
+/// prefix keeps readers from ever looking at the padding.
 fn ensure_min_cell_size(buf: &mut crate::alloc::Vec<u8>, cell_start: usize) {
     const ZEROS: [u8; MINIMUM_CELL_SIZE] = [0; MINIMUM_CELL_SIZE];
     let padding = (cell_start + MINIMUM_CELL_SIZE).saturating_sub(buf.len());
@@ -10353,7 +10355,7 @@ fn _insert_into_cell(
             }
         }
         let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
-        if page.page_type()? == PageType::IndexLeaf {
+        if matches!(page.page_type()?, PageType::IndexLeaf | PageType::TableLeaf) {
             // Balancing must see one size for every leaf cell, whether it sits on the page
             // (where cell_get_raw_region reports at least the minimum size) or overflowed.
             ensure_min_cell_size(&mut payload, 0);
@@ -14206,6 +14208,51 @@ mod tests {
             contents.cell_content_area(),
             pointer_array_end
         );
+    }
+
+    /// A table leaf cell can be 3 bytes too: a rowid from 0 to 127 and an empty record, as in the
+    /// temporary table of rowids an upsert wrote. When such a cell overflows a full leaf it must
+    /// be padded to MINIMUM_CELL_SIZE, as it would be on the page, or balancing counts and checks
+    /// a cell shorter than any cell on a page.
+    #[test]
+    pub fn test_tiny_cell_overflowing_a_leaf_is_padded() {
+        for page_type in [PageType::TableLeaf, PageType::IndexLeaf] {
+            let page = get_page(2);
+            btree_init_page(&page, page_type, 0, 4096);
+            let contents = page.get_contents();
+            let usable_space = 4096;
+
+            // 681 six-byte slots (a four-byte cell and its pointer) fill 4086 of the 4088 free
+            // bytes. insert_into_cell doesn't read the cells, so one cell repeated will do.
+            let four_byte_cell = [0x02, 0x05, 0x01, 0x00];
+            for i in 0..681 {
+                insert_into_cell(contents, &four_byte_cell, i, usable_space).unwrap();
+            }
+            assert_eq!(compute_free_space(contents, usable_space).unwrap(), 2);
+            let three_byte_cell = [0x01, 0x01, 0x01];
+            insert_into_cell(contents, &three_byte_cell, 681, usable_space).unwrap();
+
+            assert_eq!(
+                contents.overflow_cells.len(),
+                1,
+                "{page_type:?}: the cell overflows"
+            );
+            let overflowed = &contents.overflow_cells[0].payload;
+            assert_eq!(
+                overflowed.len(),
+                MINIMUM_CELL_SIZE,
+                "{page_type:?}: the overflowed cell is padded"
+            );
+            assert_eq!(
+                &overflowed[..3],
+                &three_byte_cell,
+                "{page_type:?}: the cell's bytes are kept"
+            );
+            assert_eq!(
+                overflowed[3], 0,
+                "{page_type:?}: the padding is a zero byte"
+            );
+        }
     }
 
     #[test]

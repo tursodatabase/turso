@@ -561,6 +561,15 @@ test table-upsert-middle-row-inserted-again-with-ascending-keys-rejected {
 @sqlstate 21000
 expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
 
+@setup upsert_asc
+test table-upsert-small-key-after-a-full-leaf-of-written-rowids {
+    INSERT INTO upsert_asc SELECT g, 1 FROM generate_series(1000, 1700) g UNION ALL SELECT 1, 1 ON CONFLICT (a) DO UPDATE SET b = 0;
+    SELECT count(*), min(a), max(a) FROM upsert_asc;
+}
+expect {
+    702|1|1700
+}
+
 @setup upsert
 test table-upsert-row-updated-twice-through-unique-column-rejected {
     INSERT INTO upsert_t VALUES (2, 1, 1), (3, 1, 5) ON CONFLICT (k) DO UPDATE SET b = excluded.b;
