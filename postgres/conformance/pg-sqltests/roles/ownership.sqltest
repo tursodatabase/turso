@@ -504,3 +504,32 @@ test owner-may-give-its-table-to-a-role-it-is-a-member-of {
 expect {
     postgres
 }
+
+# The new owner also needs CREATE on the relation's schema, which only a
+# superuser has here and in PostgreSQL's public schema.
+test owner-may-not-give-its-table-to-a-role-without-create-on-the-schema {
+    CREATE ROLE ro_no_create_owner;
+    CREATE ROLE ro_no_create_group;
+    CREATE TABLE ro_no_create_given (x INT);
+    ALTER TABLE ro_no_create_given OWNER TO ro_no_create_owner;
+    GRANT ro_no_create_group TO ro_no_create_owner;
+    SET ROLE ro_no_create_owner;
+    ALTER TABLE ro_no_create_given OWNER TO ro_no_create_group;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test owner-may-give-its-table-to-itself-without-create-on-the-schema {
+    CREATE ROLE ro_same_owner;
+    CREATE TABLE ro_same_owner_kept (x INT);
+    ALTER TABLE ro_same_owner_kept OWNER TO ro_same_owner;
+    SET ROLE ro_same_owner;
+    ALTER TABLE ro_same_owner_kept OWNER TO ro_same_owner;
+    RESET ROLE;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_same_owner_kept';
+}
+expect {
+    ro_same_owner
+}
