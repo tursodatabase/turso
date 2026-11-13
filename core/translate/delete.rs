@@ -113,6 +113,9 @@ pub fn translate_delete(
         program,
         connection,
     )?;
+    if !returning.is_empty() && table.virtual_table().is_some() {
+        crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
+    }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

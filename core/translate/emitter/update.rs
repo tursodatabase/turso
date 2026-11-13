@@ -1203,7 +1203,9 @@ fn emit_update_insns<'a>(
         constraint_rowid_alias_conflict.unwrap_or(ResolveType::Abort)
     };
 
-    let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
+    // NotExists seeks a B-tree, so it cannot run on a virtual table cursor.
+    let not_exists_check_required =
+        !is_virtual_table && (updates_rowid || iteration_cursor_id != target_table_cursor_id);
     let update_namespace = target_table.namespace;
     let update_database_id = update_namespace.database_id;
     let updated_column_indices: ColumnMask = set_clauses
@@ -2786,6 +2788,14 @@ fn emit_update_insns<'a>(
             }
         }
         Table::Virtual(_) => {
+            // The second VUpdate argument is the new rowid.
+            if let Some(new_rowid_reg) = rowid_set_clause_reg {
+                program.emit_insn(Insn::Copy {
+                    src_reg: new_rowid_reg,
+                    dst_reg: beg + 1,
+                    extra_amount: 0,
+                });
+            }
             let arg_count = col_len + 2;
             program.emit_insn(Insn::VUpdate {
                 cursor_id: target_table_cursor_id,

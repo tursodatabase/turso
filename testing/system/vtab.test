@@ -135,6 +135,23 @@ do_execsql_test_on_specific_db {:memory:} update-hidden-column {
     select comment from t where key = 'hidden';
 } {"updated comment"}
 
+do_execsql_test_on_specific_db {:memory:} update-rowid {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k', 'v');
+    update t set rowid = rowid + 1;
+    select key, value from t;
+} {k|v}
+
+do_execsql_test_in_memory_error_content update-returning {
+    create virtual table t using kv_store;
+    update t set value = 'x' returning key;
+} {UPDATE RETURNING is not available on virtual tables}
+
+do_execsql_test_in_memory_error_content delete-returning {
+    create virtual table t using kv_store;
+    delete from t returning key;
+} {DELETE RETURNING is not available on virtual tables}
+
 do_execsql_test_on_specific_db {:memory:} delete-all-rows-without-a-where-clause {
     create virtual table t using kv_store;
     insert into t(key, value) values ('k0', 'v0'), ('k1', 'v1'), ('k2', 'v2');
