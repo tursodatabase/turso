@@ -527,6 +527,20 @@ expect error {
     type "__int4" does not exist
 }
 
+test select-cast-to-information-schema-domain {
+    SELECT 5::information_schema.cardinal_number;
+}
+expect {
+    5
+}
+
+test select-cast-of-null-to-catalog-row-type {
+    SELECT CASE WHEN NULL::pg_class IS NULL THEN 'null' END;
+}
+expect {
+    null
+}
+
 # An index has no row type.
 test select-cast-to-index-name {
     CREATE TABLE emp (name text);

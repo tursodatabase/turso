@@ -19,7 +19,8 @@ use crate::sqlstate::{
     SQLSTATE_WINDOWING_ERROR,
 };
 use crate::type_names::{
-    built_in_type, catalog_type, schema_and_name, type_name_text, PgType, TypeLookup,
+    built_in_type, catalog_type, is_system_type, schema_and_name, type_name_text, PgType,
+    TypeLookup,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -5682,9 +5683,9 @@ impl PostgreSQLTranslator {
 
     /// Checks `type_name`, used as `used_as`, when tursopg has no type of
     /// its own for it. Core then gets the name as it is written and takes
-    /// it for a custom type, so the name must be one. A built-in type of
-    /// PostgreSQL is left to core. Nothing is checked without a type
-    /// lookup, or in a statement that PostgreSQL skips.
+    /// it for a custom type, so the name must be one. A type that
+    /// PostgreSQL defines is left to core. Nothing is checked without a
+    /// type lookup, or in a statement that PostgreSQL skips.
     fn check_type_name(
         &self,
         type_name: &pg_query::protobuf::TypeName,
@@ -5702,6 +5703,7 @@ impl PostgreSQLTranslator {
         if has_turso_type(schema, name)
             || built_in_type(schema, name).is_some()
             || element.is_some_and(|element| built_in_type(schema, element).is_some())
+            || is_system_type(schema, name)
         {
             return Ok(());
         }
