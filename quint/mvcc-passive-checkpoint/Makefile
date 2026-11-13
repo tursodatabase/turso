@@ -124,10 +124,15 @@ bug-traces:
 	  done; \
 	done
 
+# The crash recovery spec (MvccRecovery.qnt) alone: its main configuration,
+# then every variant and reachability check.
+recovery:
+	@$(MAKE) --no-print-directory check variants SPECS=MvccRecovery
+
 typecheck:
 	@set -e; for spec in $(SPECS); do $(QUINT) typecheck $${spec}Configs.qnt; done
 
 clean:
 	rm -rf states/ traces/ _apalache-out/
 
-.PHONY: all check variants simulate traces bug-traces typecheck clean
+.PHONY: all check variants recovery simulate traces bug-traces typecheck clean

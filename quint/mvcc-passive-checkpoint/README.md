@@ -9,6 +9,7 @@ models found.
 | `MvccPassiveCheckpoint.qnt` | `MvccPassiveCheckpointConfigs.qnt` | `DESIGN.md`, `DESIGN-rows.md` |
 | `MvccPassiveSequence.qnt` | `MvccPassiveSequenceConfigs.qnt` | `DESIGN-sequences.md` |
 | `MvccPassiveSchema.qnt` | `MvccPassiveSchemaConfigs.qnt` | `DESIGN-schema.md` |
+| `MvccRecovery.qnt` | `MvccRecoveryConfigs.qnt` | `DESIGN-recovery.md` |
 
 A configurations file has one module for each configuration. The module sets
 the constants of the spec. The module named `main` is the main configuration
@@ -63,6 +64,9 @@ make traces
 
 # Write one failing trace for each variant that must fail to traces/bugs/
 make bug-traces
+
+# Check only the crash recovery spec: main, variants and reachability checks
+make recovery
 ```
 
 These make variables change the runs:
