@@ -5257,6 +5257,16 @@ impl Connection {
         }
     }
 
+    /// Turns off the automatic checkpoint of the MVCC logical log, like
+    /// `PRAGMA mvcc_checkpoint_threshold = -1` but without running SQL, so
+    /// the role the connection's user set does not limit it. The threshold
+    /// belongs to the database, so this applies to all of its connections.
+    /// Explicit checkpoints still run. Fails when the database does not use
+    /// MVCC.
+    pub fn disable_mvcc_auto_checkpoint(&self) -> Result<()> {
+        self.set_mvcc_checkpoint_threshold(-1)
+    }
+
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => {
