@@ -603,6 +603,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    /// Whether INSERT generates a rowid for an `INTEGER PRIMARY KEY` that is
+    /// NULL or not given.
+    ///
+    /// SQLite does. PostgreSQL gives a key that is not given the column
+    /// DEFAULT, and rejects a NULL key.
+    fn generates_integer_primary_keys(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
