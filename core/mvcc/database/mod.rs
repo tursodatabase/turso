@@ -8264,6 +8264,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let min_reader_mark = self
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read());
+        self.assert_floor_below_readers(min_reader_mark);
 
         let mut dropped = 0;
         let mut processed = 0;
@@ -8356,6 +8357,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let min_reader_mark = self
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read());
+        self.assert_floor_below_readers(min_reader_mark);
 
         let cursor = self.gc_index_cursor.lock().clone();
         let outer_start = match &cursor {
@@ -8460,6 +8462,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
+        self.assert_floor_below_readers(min_reader_mark);
 
         for entry in self.rows.iter() {
             // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
@@ -8500,6 +8503,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
+        self.assert_floor_below_readers(min_reader_mark);
 
         for outer_entry in self.index_rows.iter() {
             // GC floor: retain a freshly-materialized index not yet visible to all readers.
@@ -10727,6 +10731,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             })
             .min()
             .unwrap_or(WalPos::STAGED)
+    }
+
+    /// Panics if an open transaction has a read mark below the GC floor, because GC
+    /// could then drop a version that this transaction still reads from the version
+    /// store. A WAL restart puts the floor at `(s + 1, 0)` above a database-file reader
+    /// at `(s, N)`. No frame lies between the two, so that case is allowed.
+    pub(crate) fn assert_floor_below_readers(&self, floor: WalPos) {
+        for entry in self.txs.iter() {
+            let tx = entry.value();
+            if !matches!(
+                tx.state.load(),
+                TransactionState::Active | TransactionState::Preparing(_)
+            ) {
+                continue;
+            }
+            let mark = tx.read_mark;
+            let after_restart = mark.checkpoint_seq.checked_add(1) == Some(floor.checkpoint_seq)
+                && floor.frame == 0;
+            turso_assert!(
+                mark >= floor || after_restart,
+                "GC floor is above the read mark of an open transaction",
+                {
+                    "floor_checkpoint_seq": floor.checkpoint_seq,
+                    "floor_frame": { floor.frame },
+                    "read_mark_checkpoint_seq": mark.checkpoint_seq,
+                    "read_mark_frame": { mark.frame }
+                }
+            );
+        }
     }
 
     /// GC floor for a freshly *created* btree: while a reader's read mark predates the binding's

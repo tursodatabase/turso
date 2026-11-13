@@ -2288,7 +2288,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Bound by the backfill boundary: a version still materialized in un-backfilled WAL
         // frames is unreachable by a db-file reader (present or future), so never reclaim it
         // until backfilled. This is the true floor and subsumes the live-reader marks.
-        readers.min(*self.mvstore.backfill_floor.read())
+        let floor = readers.min(*self.mvstore.backfill_floor.read());
+        self.mvstore.assert_floor_below_readers(floor);
+        floor
     }
 
     fn gc_checkpointed_table_versions(&mut self) -> Option<IOCompletions> {
