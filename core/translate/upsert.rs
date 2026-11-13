@@ -7,6 +7,7 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_generated_columns;
+use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -1790,6 +1791,7 @@ fn emit_generated_column_notnull_checks(
 pub fn collect_set_clauses_for_upsert(
     table: &Table,
     set_items: &mut [ast::Set],
+    resolver: &Resolver,
 ) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
     let lookup: HashMap<String, usize> = table
         .columns()
@@ -1812,12 +1814,15 @@ pub fn collect_set_clauses_for_upsert(
                 values.len()
             );
         }
-        for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
+        for (cn, mut e) in set.col_names.iter().zip(values.into_iter()) {
             let ident = normalize_ident(cn.as_str());
             let idx = match lookup.get(&ident) {
                 Some(idx) => {
-                    // cannot upsert generated column
-                    table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
+                    let col = &table.columns()[*idx];
+                    col.ensure_not_generated("UPDATE", cn.as_str())?;
+                    if matches!(e.as_ref(), ast::Expr::Default) {
+                        e = column_default_expr(col, table.is_strict(), resolver);
+                    }
                     *idx
                 }
                 None => match rowid_name_column_index(table, &ident) {

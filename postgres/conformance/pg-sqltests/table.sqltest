@@ -926,3 +926,25 @@ test alter-table-rename-constraint-is-not-supported {
 expect error {
     ALTER TABLE ... RENAME CONSTRAINT is not supported
 }
+
+test update-set-default-uses-column-default {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int DEFAULT 7, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT a, b FROM defaults_t;
+}
+expect {
+    7|x
+}
+
+test update-set-default-without-column-default-sets-null {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT CASE WHEN a IS NULL THEN 1 ELSE 0 END, b FROM defaults_t;
+}
+expect {
+    1|x
+}

@@ -7,6 +7,7 @@ use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::update::bind_set_expr;
 use crate::translate::{roles, row_security};
 use crate::turso_debug_assert;
 use crate::{
@@ -1762,7 +1763,7 @@ fn resolve_upserts(
         } = upsert.do_clause
         {
             // Normalize SET pairs once
-            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
+            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets, resolver)?;
             let set_column_names: Vec<_> = sets
                 .iter()
                 .flat_map(|set| set.col_names.iter().cloned())
@@ -2179,17 +2180,26 @@ fn resolve_defaults_in_row(
             })
         };
         *expr = match col {
-            Some(col) => col.default.clone().unwrap_or_else(|| {
-                if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                    if let Some(default_expr) = resolved.default_expr() {
-                        return Box::new(default_expr.clone());
-                    }
-                }
-                Box::new(ast::Expr::Literal(ast::Literal::Null))
-            }),
+            Some(col) => column_default_expr(col, is_strict, resolver),
             None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
         };
     }
+}
+
+/// The value a column takes when a statement writes DEFAULT to it.
+pub(crate) fn column_default_expr(
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Box<Expr> {
+    column.default.clone().unwrap_or_else(|| {
+        if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+            if let Some(default_expr) = resolved.default_expr() {
+                return Box::new(default_expr.clone());
+            }
+        }
+        Box::new(ast::Expr::Literal(ast::Literal::Null))
+    })
 }
 
 #[turso_macros::trace_stack]
@@ -2314,12 +2324,11 @@ fn bind_insert(
         } = &mut upsert_opt.do_clause
         {
             for set in sets.iter_mut() {
-                bind_and_rewrite_expr(
+                bind_set_expr(
                     &mut set.expr,
                     None,
-                    None,
-                    resolver,
                     BindingBehavior::AllowUnboundIdentifiers,
+                    resolver,
                 )?;
             }
             if let Some(ref mut where_expr) = where_clause {
