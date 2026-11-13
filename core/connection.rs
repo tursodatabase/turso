@@ -2750,6 +2750,7 @@ impl Connection {
         };
 
         let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+        state_machine.inner_mut().skip_auto_checkpoint();
         while let crate::types::IOResult::IO(io) = state_machine.step(mv_store)? {
             io.wait(self.db.io.as_ref())?;
         }

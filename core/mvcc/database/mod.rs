@@ -1655,7 +1655,8 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     group_batch: Option<GroupBatch>,
     /// This state machine issued at least one `log_tx` (leader or exclusive).
     wrote_logical_log: bool,
-    /// False for a nested commit inside an open transaction on the same connection.
+    /// False for a commit that leaves a transaction or a raw WAL-insert session
+    /// open on its connection.
     run_auto_checkpoint: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
@@ -1778,8 +1779,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         })
     }
 
-    /// The checkpoint runs on this connection and would end the open outer
-    /// transaction's WAL read lock, so it waits for a later commit.
+    /// The checkpoint runs on this connection and would release the WAL locks that
+    /// the surrounding transaction or WAL session still holds, so it waits for a
+    /// later commit.
     pub(crate) fn skip_auto_checkpoint(&mut self) {
         self.run_auto_checkpoint = false;
     }
