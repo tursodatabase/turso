@@ -639,7 +639,7 @@ pub trait Dialect: Send + Sync + 'static {
         true
     }
 
-    fn cast_to_integer(&self, value: &Value, _: &ProgramState) -> Result<Value> {
+    fn cast_to_integer(&self, value: &Value, _: &ProgramState, _: &Schema) -> Result<Value> {
         Ok(value.exec_cast("INTEGER")?)
     }
 
@@ -648,6 +648,7 @@ pub trait Dialect: Send + Sync + 'static {
         _: &mut ProgramBuilder,
         _: &Option<ast::Type>,
         _: usize,
+        _: &Schema,
     ) -> Result<()> {
         Ok(())
     }

@@ -16386,10 +16386,11 @@ pub fn op_cast(
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB")?,
         Affinity::Text => value.exec_cast("TEXT")?,
         Affinity::Numeric => value.exec_cast("NUMERIC")?,
-        Affinity::Integer => program
-            .connection
-            .dialect()
-            .cast_to_integer(&value, state)?,
+        Affinity::Integer => program.connection.dialect().cast_to_integer(
+            &value,
+            state,
+            &program.connection.schema.read(),
+        )?,
         Affinity::Real => value.exec_cast("REAL")?,
     };
 
