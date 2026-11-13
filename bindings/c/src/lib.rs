@@ -3458,13 +3458,9 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
             }
             SQLITE_OK
         }
-        Err(e) => {
-            if matches!(e, turso_core::LimboError::Busy) {
-                SQLITE_BUSY
-            } else {
-                SQLITE_ERROR
-            }
-        }
+        Err(turso_core::LimboError::Busy) => SQLITE_BUSY,
+        Err(turso_core::LimboError::TableLocked) => SQLITE_LOCKED,
+        Err(_) => SQLITE_ERROR,
     }
 }
 

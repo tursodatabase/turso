@@ -2547,6 +2547,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        self.refuse_checkpoint_in_open_transaction(&self.pager.load(), MAIN_DB_ID)?;
         // Checkpointing invalidates this connection's cursors and page cache,
         // which breaks any statement suspended mid-execution, so refuse to run
         // while statements are active — same rule as PRAGMA wal_checkpoint.
@@ -4786,6 +4787,24 @@ impl Connection {
             ));
         }
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Like SQLite, refuse a checkpoint once this connection's open transaction has
+    /// read or written the database. After a plain BEGIN nothing is held yet, so the
+    /// checkpoint runs. The error does not end the transaction.
+    pub(crate) fn refuse_checkpoint_in_open_transaction(
+        &self,
+        pager: &Pager,
+        db_id: usize,
+    ) -> Result<()> {
+        if !self.auto_commit.load(Ordering::SeqCst)
+            && (pager.holds_read_lock()
+                || pager.holds_write_lock()
+                || self.get_mv_tx_for_db(db_id).is_some())
+        {
+            return Err(LimboError::TableLocked);
+        }
         Ok(())
     }
 
