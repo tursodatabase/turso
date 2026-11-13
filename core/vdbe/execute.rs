@@ -14473,7 +14473,11 @@ pub fn op_sequence_commit_inner_tx(
                 .into());
             }
         };
-        state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
+        let mut commit_sm = mv_store.commit_tx(inner_tx_id, &conn, *db)?;
+        if saved_outer.is_some() {
+            commit_sm.inner_mut().skip_auto_checkpoint();
+        }
+        state.sequence_inner_commit = Some(commit_sm);
     }
 
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
