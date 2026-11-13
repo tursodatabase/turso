@@ -1043,3 +1043,377 @@ test cast-runtime-text-int2-function-invalid-input {
 }
 expect error {
 }
+
+test domain-cast-literal-all-widths {
+    CREATE DOMAIN domain_cast_small AS int2;
+    CREATE DOMAIN domain_cast_integer AS int4;
+    CREATE DOMAIN domain_cast_big AS int8;
+
+    SELECT '42'::domain_cast_small;
+    SELECT '-42000'::domain_cast_integer;
+    SELECT '4200000000'::domain_cast_big;
+
+    SELECT CAST('123' AS domain_cast_small);
+    SELECT CAST('456789' AS domain_cast_integer);
+    SELECT CAST('12345678901' AS domain_cast_big);
+
+    DROP DOMAIN domain_cast_small;
+    DROP DOMAIN domain_cast_integer;
+    DROP DOMAIN domain_cast_big;
+}
+expect {
+    42
+    -42000
+    4200000000
+    123
+    456789
+    12345678901
+}
+
+test domain-cast-decimal-boundaries {
+    CREATE DOMAIN domain_boundary_small AS int2;
+    CREATE DOMAIN domain_boundary_integer AS int4;
+    CREATE DOMAIN domain_boundary_big AS int8;
+
+    SELECT '32767'::domain_boundary_small;
+    SELECT '-32768'::domain_boundary_small;
+
+    SELECT '2147483647'::domain_boundary_integer;
+    SELECT '-2147483648'::domain_boundary_integer;
+
+    SELECT '9223372036854775807'::domain_boundary_big;
+    SELECT '-9223372036854775808'::domain_boundary_big;
+
+    DROP DOMAIN domain_boundary_small;
+    DROP DOMAIN domain_boundary_integer;
+    DROP DOMAIN domain_boundary_big;
+}
+expect {
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
+}
+
+test domain-cast-radix-prefixed-values {
+    CREATE DOMAIN domain_radix_small AS int2;
+    CREATE DOMAIN domain_radix_integer AS int4;
+    CREATE DOMAIN domain_radix_big AS int8;
+
+    SELECT '0x7fff'::domain_radix_small;
+    SELECT '-0x8000'::domain_radix_small;
+
+    SELECT '0o17777777777'::domain_radix_integer;
+    SELECT '-0x80000000'::domain_radix_integer;
+
+    SELECT '0x7fffffffffffffff'::domain_radix_big;
+    SELECT '-0x8000000000000000'::domain_radix_big;
+
+    DROP DOMAIN domain_radix_small;
+    DROP DOMAIN domain_radix_integer;
+    DROP DOMAIN domain_radix_big;
+}
+expect {
+    32767
+    -32768
+    2147483647
+    -2147483648
+    9223372036854775807
+    -9223372036854775808
+}
+
+test domain-cast-runtime-text-columns {
+    CREATE DOMAIN domain_runtime_small AS int2;
+    CREATE DOMAIN domain_runtime_integer AS int4;
+    CREATE DOMAIN domain_runtime_big AS int8;
+
+    CREATE TABLE domain_cast_runtime_values (
+        position integer,
+        small_value text,
+        integer_value text,
+        big_value text
+    );
+
+    INSERT INTO domain_cast_runtime_values VALUES
+        (1, '123', '123456', '12345678901'),
+        (2, '-456', '-456789', '-12345678901');
+
+    SELECT small_value::domain_runtime_small
+        FROM domain_cast_runtime_values ORDER BY position;
+
+    SELECT integer_value::domain_runtime_integer
+        FROM domain_cast_runtime_values ORDER BY position;
+
+    SELECT big_value::domain_runtime_big
+        FROM domain_cast_runtime_values ORDER BY position;
+
+    DROP TABLE domain_cast_runtime_values;
+    DROP DOMAIN domain_runtime_small;
+    DROP DOMAIN domain_runtime_integer;
+    DROP DOMAIN domain_runtime_big;
+}
+expect {
+    123
+    -456
+    123456
+    -456789
+    12345678901
+    -12345678901
+}
+
+test domain-cast-runtime-radix-prefixed-text {
+    CREATE DOMAIN domain_runtime_radix_small AS int2;
+    CREATE DOMAIN domain_runtime_radix_integer AS int4;
+    CREATE DOMAIN domain_runtime_radix_big AS int8;
+
+    CREATE TABLE domain_radix_runtime_values (
+        position integer,
+        value text
+    );
+
+    INSERT INTO domain_radix_runtime_values VALUES
+        (1, '0x10'),
+        (2, '0o17'),
+        (3, '0b1010'),
+        (4, '-0x10');
+
+    SELECT value::domain_runtime_radix_small
+        FROM domain_radix_runtime_values ORDER BY position;
+
+    SELECT value::domain_runtime_radix_integer
+        FROM domain_radix_runtime_values ORDER BY position;
+
+    SELECT value::domain_runtime_radix_big
+        FROM domain_radix_runtime_values ORDER BY position;
+
+    DROP TABLE domain_radix_runtime_values;
+    DROP DOMAIN domain_runtime_radix_small;
+    DROP DOMAIN domain_runtime_radix_integer;
+    DROP DOMAIN domain_runtime_radix_big;
+}
+expect {
+    16
+    15
+    10
+    -16
+    16
+    15
+    10
+    -16
+    16
+    15
+    10
+    -16
+}
+
+test domain-cast-null-values {
+    CREATE DOMAIN domain_null_small AS int2;
+    CREATE DOMAIN domain_null_integer AS int4;
+    CREATE DOMAIN domain_null_big AS int8;
+
+    SELECT
+        NULL::domain_null_small IS NULL,
+        NULL::domain_null_integer IS NULL,
+        NULL::domain_null_big IS NULL;
+
+    CREATE TABLE domain_null_values (value text);
+    INSERT INTO domain_null_values VALUES (NULL);
+
+    SELECT
+        value::domain_null_small IS NULL,
+        value::domain_null_integer IS NULL,
+        value::domain_null_big IS NULL
+    FROM domain_null_values;
+
+    DROP TABLE domain_null_values;
+    DROP DOMAIN domain_null_small;
+    DROP DOMAIN domain_null_integer;
+    DROP DOMAIN domain_null_big;
+}
+expect {
+    1|1|1
+    1|1|1
+}
+
+test domain-cast-nested-domains {
+    CREATE DOMAIN domain_inner_integer AS int4;
+    CREATE DOMAIN domain_outer_integer AS domain_inner_integer;
+
+    SELECT '42000'::domain_outer_integer;
+    SELECT '-42000'::domain_outer_integer;
+    SELECT '2147483647'::domain_outer_integer;
+
+    DROP DOMAIN domain_outer_integer;
+    DROP DOMAIN domain_inner_integer;
+}
+expect {
+    42000
+    -42000
+    2147483647
+}
+
+test domain-cast-recreated-with-different-base-types {
+    CREATE DOMAIN domain_recreated_integer AS int2;
+
+    SELECT '123'::domain_recreated_integer;
+
+    DROP DOMAIN domain_recreated_integer;
+    CREATE DOMAIN domain_recreated_integer AS int4;
+
+    SELECT '40000'::domain_recreated_integer;
+
+    DROP DOMAIN domain_recreated_integer;
+    CREATE DOMAIN domain_recreated_integer AS int8;
+
+    SELECT '2147483648'::domain_recreated_integer;
+
+    DROP DOMAIN domain_recreated_integer;
+}
+expect {
+    123
+    40000
+    2147483648
+}
+
+test domain-cast-recreated-from-wide-to-narrow {
+    CREATE DOMAIN domain_recreated_narrow AS int8;
+
+    SELECT '40000'::domain_recreated_narrow;
+
+    DROP DOMAIN domain_recreated_narrow;
+    CREATE DOMAIN domain_recreated_narrow AS int2;
+
+    SELECT '123'::domain_recreated_narrow;
+
+    DROP DOMAIN domain_recreated_narrow;
+}
+expect {
+    40000
+    123
+}
+
+test domain-cast-int2-positive-overflow {
+    CREATE DOMAIN domain_overflow_small AS int2;
+    SELECT '32768'::domain_overflow_small;
+}
+expect error {
+}
+
+test domain-cast-int2-negative-overflow {
+    CREATE DOMAIN domain_overflow_small_negative AS int2;
+    SELECT '-32769'::domain_overflow_small_negative;
+}
+expect error {
+}
+
+test domain-cast-int4-positive-overflow {
+    CREATE DOMAIN domain_overflow_integer AS int4;
+    SELECT '2147483648'::domain_overflow_integer;
+}
+expect error {
+}
+
+test domain-cast-int4-negative-overflow {
+    CREATE DOMAIN domain_overflow_integer_negative AS int4;
+    SELECT '-2147483649'::domain_overflow_integer_negative;
+}
+expect error {
+}
+
+test domain-cast-int8-positive-overflow {
+    CREATE DOMAIN domain_overflow_big AS int8;
+    SELECT '9223372036854775808'::domain_overflow_big;
+}
+expect error {
+}
+
+test domain-cast-int8-negative-overflow {
+    CREATE DOMAIN domain_overflow_big_negative AS int8;
+    SELECT '-9223372036854775809'::domain_overflow_big_negative;
+}
+expect error {
+}
+
+test domain-cast-runtime-int2-overflow {
+    CREATE DOMAIN domain_runtime_overflow_small AS int2;
+
+    CREATE TABLE domain_overflow_values (value text);
+    INSERT INTO domain_overflow_values VALUES ('32768');
+
+    SELECT value::domain_runtime_overflow_small
+        FROM domain_overflow_values;
+}
+expect error {
+}
+
+test domain-cast-runtime-int4-overflow {
+    CREATE DOMAIN domain_runtime_overflow_integer AS int4;
+
+    CREATE TABLE domain_overflow_values (value text);
+    INSERT INTO domain_overflow_values VALUES ('2147483648');
+
+    SELECT value::domain_runtime_overflow_integer
+        FROM domain_overflow_values;
+}
+expect error {
+}
+
+test domain-cast-runtime-int8-overflow {
+    CREATE DOMAIN domain_runtime_overflow_big AS int8;
+
+    CREATE TABLE domain_overflow_values (value text);
+    INSERT INTO domain_overflow_values VALUES ('9223372036854775808');
+
+    SELECT value::domain_runtime_overflow_big
+        FROM domain_overflow_values;
+}
+expect error {
+}
+
+test domain-cast-invalid-text {
+    CREATE DOMAIN domain_invalid_text AS int4;
+    SELECT 'not-an-integer'::domain_invalid_text;
+}
+expect error {
+}
+
+test domain-cast-invalid-radix-text {
+    CREATE DOMAIN domain_invalid_radix AS int4;
+    SELECT '0b102'::domain_invalid_radix;
+}
+expect error {
+}
+
+test domain-cast-text-domain-does-not-use-integer-metadata {
+    CREATE DOMAIN domain_plain_text AS text;
+
+    SELECT 'hello'::domain_plain_text;
+    SELECT '0x10'::domain_plain_text;
+
+    DROP DOMAIN domain_plain_text;
+}
+expect {
+    hello
+    0x10
+}
+
+test domain-cast-integer-aliases {
+    CREATE DOMAIN domain_alias_small AS smallint;
+    CREATE DOMAIN domain_alias_integer AS integer;
+    CREATE DOMAIN domain_alias_big AS bigint;
+
+    SELECT '123'::domain_alias_small;
+    SELECT '123456'::domain_alias_integer;
+    SELECT '12345678901'::domain_alias_big;
+
+    DROP DOMAIN domain_alias_small;
+    DROP DOMAIN domain_alias_integer;
+    DROP DOMAIN domain_alias_big;
+}
+expect {
+    123
+    123456
+    12345678901
+}
