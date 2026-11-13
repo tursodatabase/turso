@@ -125,10 +125,26 @@ pub fn check_statement_privileges(
                 // itself, such as a role it is a member of, as in
                 // PostgreSQL. Anyone else must be the owner.
                 ast::AlterTableBody::OwnerTo { role, .. } if owner => {
-                    if may_set_role(resolver, connection, role) {
-                        return Ok(());
+                    match settable_role(resolver, connection, role) {
+                        // As in PostgreSQL, a new owner also needs CREATE on
+                        // the relation's schema, which only a superuser has
+                        // until GRANT on schemas exists. Giving the relation
+                        // to the role that owns it changes nothing.
+                        Some(new_owner)
+                            if resolver
+                                .catalog
+                                .dialect
+                                .role_is_superuser(resolver.schema(), new_owner)
+                                || table_owner(resolver, &alter.name) == Some(new_owner) =>
+                        {
+                            return Ok(())
+                        }
+                        Some(_) => create_in_schema_denial(&alter.name),
+                        None => PermissionDenied::privilege(
+                            Action::SetRole,
+                            Object::Role(role_spec_name(role)),
+                        ),
                     }
-                    PermissionDenied::privilege(Action::SetRole, Object::Role(role_spec_name(role)))
                 }
                 ast::AlterTableBody::OwnerTo { .. } => owner_denial(),
                 // Renaming also needs CREATE on the schema, as in
@@ -274,17 +290,38 @@ fn may_act_as_owner(
     })
 }
 
-/// Whether the session may `SET ROLE` to `role`, which is what giving a
-/// relation to `role` takes.
-fn may_set_role(resolver: &Resolver, connection: &Arc<Connection>, role: &ast::RoleSpec) -> bool {
+/// The role `role` names, if the current role may `SET ROLE` to it, which
+/// is what giving a relation to `role` takes.
+fn settable_role(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    role: &ast::RoleSpec,
+) -> Option<RoleId> {
     let dialect = &resolver.catalog.dialect;
     let schema = resolver.schema();
     let target = match role {
         ast::RoleSpec::CurrentRole => Some(connection.current_role()),
         ast::RoleSpec::SessionUser => Some(connection.session_role()),
         ast::RoleSpec::Name(name) => dialect.role_by_name(schema, name),
-    };
-    target.is_some_and(|target| dialect.can_set_role(schema, connection.current_role(), target))
+    }?;
+    dialect
+        .can_set_role(schema, connection.current_role(), target)
+        .then_some(target)
+}
+
+/// The role that owns the table or view `name` of the main database names.
+fn table_owner(resolver: &Resolver, name: &ast::QualifiedName) -> Option<RoleId> {
+    let namespace = resolver.find_existing_table(name).ok().flatten()?;
+    if namespace.database_id != MAIN_DB_ID {
+        return None;
+    }
+    let normalized = crate::util::normalize_ident(name.name.as_str());
+    resolver.with_schema(MAIN_DB_ID, |schema| {
+        resolver
+            .catalog
+            .dialect
+            .relation_owner(schema, namespace.id, &normalized)
+    })
 }
 
 /// The name a denial calls `role` by.
