@@ -3829,6 +3829,43 @@ mod tests {
     use super::*;
     use std::ptr;
 
+    #[test]
+    fn test_wal_checkpoint_in_open_transaction_returns_locked() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = CString::new(dir.path().join("checkpoint.db").to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            for sql in [
+                c"CREATE TABLE t(x)",
+                c"INSERT INTO t VALUES (1)",
+                c"BEGIN",
+                c"SELECT * FROM t",
+            ] {
+                assert_eq!(
+                    sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                    SQLITE_OK
+                );
+            }
+            let rc = sqlite3_wal_checkpoint_v2(
+                db,
+                ptr::null(),
+                SQLITE_CHECKPOINT_PASSIVE,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_LOCKED);
+            sqlite3_exec(
+                db,
+                c"ROLLBACK".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            sqlite3_close(db);
+        }
+    }
+
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
     /// shell decoration, not part of the message.
