@@ -1214,17 +1214,17 @@ test domain-cast-null-values {
     CREATE DOMAIN domain_null_big AS int8;
 
     SELECT
-        NULL::domain_null_small IS NULL,
-        NULL::domain_null_integer IS NULL,
-        NULL::domain_null_big IS NULL;
+        CASE WHEN NULL::domain_null_small IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN NULL::domain_null_integer IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN NULL::domain_null_big IS NULL THEN 1 ELSE 0 END;
 
     CREATE TABLE domain_null_values (value text);
     INSERT INTO domain_null_values VALUES (NULL);
 
     SELECT
-        value::domain_null_small IS NULL,
-        value::domain_null_integer IS NULL,
-        value::domain_null_big IS NULL
+        CASE WHEN value::domain_null_small IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN value::domain_null_integer IS NULL THEN 1 ELSE 0 END,
+        CASE WHEN value::domain_null_big IS NULL THEN 1 ELSE 0 END
     FROM domain_null_values;
 
     DROP TABLE domain_null_values;
