@@ -107,6 +107,52 @@ fn policy_is_dropped_when_its_statement_rolls_back() {
 }
 
 #[test]
+fn altered_policies_are_visible_to_another_connection_and_kept_after_reopening() {
+    let db = TempDatabase::builder().build();
+    let conn = connect_with_documents(&db);
+    let alice = db.connect_postgres();
+    alice.execute("SET ROLE alice").unwrap();
+    conn.execute("CREATE POLICY first ON documents USING (id = 1)")
+        .unwrap();
+    assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["1"]]);
+
+    conn.execute("ALTER POLICY first ON documents USING (id = 2)")
+        .unwrap();
+    conn.execute("ALTER POLICY first ON documents RENAME TO second")
+        .unwrap();
+
+    assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["2"]]);
+    conn.close().unwrap();
+    alice.close().unwrap();
+    drop(conn);
+    drop(alice);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    let alice = db.connect_postgres();
+    alice.execute("SET ROLE alice").unwrap();
+    assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["2"]]);
+    conn.execute("DROP POLICY second ON documents").unwrap();
+    assert!(rows(&alice, "SELECT id FROM documents").is_empty());
+}
+
+#[test]
+fn altered_policy_is_restored_when_its_statement_rolls_back() {
+    let db = TempDatabase::builder().build();
+    let conn = connect_with_documents(&db);
+    conn.execute("CREATE POLICY first ON documents USING (id = 1)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("ALTER POLICY first ON documents USING (id = 2)")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    assert_eq!(rows(&conn, "SELECT id FROM documents"), vec![vec!["1"]]);
+}
+
+#[test]
 fn schema_is_read_again_after_enabling_row_security() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
