@@ -34,6 +34,7 @@ use crate::pragma::PragmaVirtualTable;
 use crate::schema::{Schema, Table};
 use crate::stats::StatAccum;
 use crate::sync::Arc;
+use crate::translate::roles;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{
     compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
@@ -93,6 +94,19 @@ pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     let cmd = parser.next_cmd()?;
     Ok((cmd, parser.offset()))
+}
+
+/// Parse the first SQLite statement in `sql`.
+pub fn parse_statement(sql: &str) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+    Ok(parse(sql)?.0)
+}
+
+/// Parse the column definition of an `ALTER TABLE` statement.
+pub fn parse_column_definition(
+    sql: &str,
+    in_alter: bool,
+) -> crate::Result<turso_parser::ast::ColumnDefinition> {
+    Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(in_alter)?)
 }
 
 /// Formats canonical SQLite `CREATE TABLE` text from its AST.
@@ -714,6 +728,7 @@ pub fn call_builtin_scalar(
                 }
             };
             let (namespace, sequence) = connection.find_sequence(&seq_name)?;
+            roles::check_sequence_read(connection, namespace, &sequence.name)?;
             match connection.get_sequence_currval(
                 namespace.database_id,
                 &mangle_name(namespace.id, &sequence.name),

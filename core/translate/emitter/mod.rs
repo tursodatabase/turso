@@ -173,6 +173,7 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Foreign-key action programs currently being compiled by this resolver.
@@ -189,7 +190,7 @@ pub struct Resolver<'a> {
     /// compiled. Every caller of [`Resolver::new`] says which role it is, so
     /// that compiling a statement as the superuser is a visible choice: the
     /// engine makes it for the statements it runs on its own behalf and
-    /// inside [`Resolver::without_row_security`].
+    /// inside [`Resolver::as_superuser`].
     pub(crate) row_security_role: RoleId,
 }
 
@@ -394,12 +395,14 @@ impl Resolver<'static> {
 }
 
 impl<'a> Resolver<'a> {
-    /// Compiles `f` as for the superuser, so row-level security limits
-    /// nothing, and then restores the role.
-    pub(crate) fn without_row_security<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+    /// Compiles `f` as for the superuser, so neither privileges nor
+    /// row-level security limit anything, and then restores the role.
+    pub(crate) fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
+        let role_is_not_superuser = std::mem::replace(&mut self.role_is_not_superuser, false);
         let result = f(self);
         self.row_security_role = role;
+        self.role_is_not_superuser = role_is_not_superuser;
         result
     }
 
@@ -437,6 +440,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
+            automatic_index: true,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -474,6 +478,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -493,6 +498,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -2440,40 +2446,78 @@ pub(crate) fn emit_check_constraints<'a>(
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
     }
+    with_columns_in_registers(
+        program,
+        resolver,
+        table,
+        rowid_reg,
+        stored_columns,
+        referenced_tables,
+        |col_name| {
+            let normalized_name = normalize_ident(col_name);
+            check_constraints
+                .iter()
+                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
+        },
+        |program, resolver, stored_column_mappings| {
+            emit_check_constraint_bytecode(
+                program,
+                check_constraints,
+                resolver,
+                or_conflict,
+                halt_on_error,
+                skip_row_label,
+                referenced_tables,
+                table.name.as_str(),
+                stored_column_mappings,
+            )
+        },
+    )
+}
 
+/// Runs `emit` with the resolver reading the columns of a row of `table`
+/// from registers instead of a cursor: the rowid from `rowid_reg`, and each
+/// column from the register `stored_columns` gives, which holds its stored
+/// value, after ENCODE. A custom-type column that `is_read` names is DECODEd
+/// into a new register first, so that expressions see the value a SELECT
+/// reads. `emit` gets each column's name and stored register.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn with_columns_in_registers<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table: &BTreeTable,
+    rowid_reg: usize,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
+    referenced_tables: Option<&TableReferences>,
+    is_read: impl Fn(&str) -> bool,
+    emit: impl FnOnce(&mut ProgramBuilder, &mut Resolver, &[(&'a str, usize)]) -> Result<()>,
+) -> Result<()> {
     let table_name = table.name.as_str();
     let mut stored_column_mappings = Vec::new();
-    // A CHECK sees the values a SELECT reads, so it reads a custom-type column
-    // after DECODE, as `ceil(n)` on a numeric must compute from 4.50, not
-    // from the stored blob. Only the columns the CHECKs name are decoded.
+    // An expression sees the values a SELECT reads, so it reads a custom-type
+    // column after DECODE, as `ceil(n)` on a numeric must compute from 4.50,
+    // not from the stored blob. Only the columns it reads are decoded.
     let mut column_mappings = Vec::new();
     for (column, stored_reg) in stored_columns {
         let Some(col_name) = column.name.as_deref() else {
             continue;
         };
         stored_column_mappings.push((col_name, stored_reg));
-        let is_named_by_a_check = || {
-            let normalized_name = normalize_ident(col_name);
-            check_constraints
-                .iter()
-                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
-        };
-        let register = if resolver.schema().column_has_decode(column, table.is_strict)
-            && is_named_by_a_check()
-        {
-            let decoded_reg = program.alloc_register();
-            emit_user_facing_column_value(
-                program,
-                stored_reg,
-                decoded_reg,
-                column,
-                table.is_strict,
-                resolver,
-            )?;
-            decoded_reg
-        } else {
-            stored_reg
-        };
+        let register =
+            if resolver.schema().column_has_decode(column, table.is_strict) && is_read(col_name) {
+                let decoded_reg = program.alloc_register();
+                emit_user_facing_column_value(
+                    program,
+                    stored_reg,
+                    decoded_reg,
+                    column,
+                    table.is_strict,
+                    resolver,
+                )?;
+                decoded_reg
+            } else {
+                stored_reg
+            };
         column_mappings.push((col_name, register));
     }
     let initial_cache_size = resolver.expr_to_reg_cache.len();
@@ -2535,17 +2579,7 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        halt_on_error,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-        &stored_column_mappings,
-    );
+    let result = emit(program, resolver, &stored_column_mappings);
 
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);

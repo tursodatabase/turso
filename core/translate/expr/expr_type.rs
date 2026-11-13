@@ -1352,6 +1352,18 @@ fn is_domain(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if type_def.is_domain)
 }
 
+/// The type's name with each domain replaced by its base type: `boolean[]`
+/// for an array of a domain over boolean.
+pub(crate) fn name_without_domains(ty: ExprType, schema: &Schema) -> String {
+    match ty {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => ExprType::array(without_domain(*element, schema), dimensions).to_string(),
+        scalar => without_domain(scalar, schema).to_string(),
+    }
+}
+
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it reads as. Other types are
 /// returned unchanged.
@@ -1399,7 +1411,6 @@ mod tests {
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{Cmd, OneSelect, ResultColumn, Stmt};
-    use turso_parser::parser::Parser;
 
     impl PartialEq for ExprType {
         fn eq(&self, other: &Self) -> bool {
@@ -1624,8 +1635,9 @@ mod tests {
 
     fn parse_expr(sql: &str) -> ast::Expr {
         let select_sql = format!("SELECT {sql}");
-        let mut parser = Parser::new(select_sql.as_bytes());
-        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) = parser.next_cmd() else {
+        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
+            crate::dialect::engine::parse_statement(&select_sql)
+        else {
             panic!("not a SELECT: {sql}");
         };
         let OneSelect::Select { mut columns, .. } = select.body.select else {

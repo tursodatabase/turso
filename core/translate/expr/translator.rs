@@ -1109,13 +1109,33 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
-            let regs = program.alloc_registers(args_count);
+            let argument_types: Vec<String> = match &func_ctx.func {
+                Func::External(external) if external.func.receives_argument_types() => {
+                    let env = TypeEnv::new(referenced_tables, resolver);
+                    args.iter()
+                        .map(|arg| name_without_domains(type_of(arg, &env), resolver.schema()))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let total_count = args_count + argument_types.len();
+            let regs = program.alloc_registers(total_count);
             for (i, arg_expr) in args.iter().enumerate() {
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
             }
+            for (i, type_name) in argument_types.into_iter().enumerate() {
+                program.emit_insn(Insn::String8 {
+                    value: type_name,
+                    dest: regs + args_count + i,
+                });
+            }
 
             // Use shared function call helper
-            let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
+            let arg_registers: Vec<usize> = (regs..regs + total_count).collect();
+            let func_ctx = FuncCtx {
+                arg_count: total_count,
+                ..func_ctx
+            };
             emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 
             Ok(target_register)

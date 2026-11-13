@@ -124,6 +124,9 @@ pub enum ExtFunc {
         arity: crate::native_ext::FunctionArity,
         deterministic: bool,
         return_type: Option<crate::native_ext::ReturnType>,
+        /// Whether a call also gets the type name of each argument, such as
+        /// `boolean[]`, as one more text argument per argument, after them.
+        receives_argument_types: bool,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -179,6 +182,16 @@ impl ExtFunc {
             | Self::Aggregate { argc, .. }
             | Self::NativeAggregate { argc, .. } => vec![*argc],
         }
+    }
+
+    pub fn receives_argument_types(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeScalar {
+                receives_argument_types: true,
+                ..
+            }
+        )
     }
 
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {

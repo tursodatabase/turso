@@ -12,16 +12,16 @@ use crate::translate::plan::{
 use crate::translate::planner::{
     collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
 };
-use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
+use crate::translate::{roles, row_security};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{self, Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -93,9 +93,15 @@ pub fn translate_delete(
     returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
+    truncate: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    let (privilege, command) = if truncate {
+        (ast::Privilege::Truncate, Command::Truncate)
+    } else {
+        (ast::Privilege::Delete, Command::Delete)
+    };
     let namespace = resolver.resolve_queried_table(tbl_name)?;
     let database_id = namespace.database_id;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
@@ -139,6 +145,30 @@ pub fn translate_delete(
                 connection,
             )?;
         }
+        let reads_target_columns = delete_reads_target_columns(delete_plan_inner)?;
+        let target = &delete_plan_inner.table_references.joined_tables()[0];
+        roles::check_write_privileges(
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+            privilege,
+            reads_target_columns,
+        )?;
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+        );
+        filter_deleted_rows(
+            delete_plan_inner,
+            command,
+            reads_target_columns,
+            resolver,
+            program,
+        )?;
     }
 
     optimize_plan(program, &mut delete_plan, resolver, connection)?;
@@ -185,6 +215,65 @@ pub fn translate_delete(
     Ok(())
 }
 
+/// Whether WHERE or RETURNING reads the columns of the target table, which
+/// makes the DELETE need SELECT on it and its SELECT policies apply, as in
+/// PostgreSQL. Subqueries must be planned first, so that only a subquery
+/// that refers to the target table counts as reading it.
+fn delete_reads_target_columns(plan: &DeletePlan) -> Result<bool> {
+    let target = &plan.table_references.joined_tables()[0];
+    let reads_in_where = match &plan.rowset_plan {
+        Some(rowset_plan) => roles::reads_columns_of(
+            target.internal_id,
+            rowset_plan.where_clause.iter().map(|term| &term.expr),
+            &rowset_plan.non_from_clause_subqueries,
+        )?,
+        None => roles::reads_columns_of(
+            target.internal_id,
+            plan.where_clause.iter().map(|term| &term.expr),
+            &plan.non_from_clause_subqueries,
+        )?,
+    };
+    let reads_in_returning = roles::reads_columns_of(
+        target.internal_id,
+        plan.result_columns.iter().map(|column| &column.expr),
+        &plan.non_from_clause_subqueries,
+    )?;
+    Ok(reads_in_where || reads_in_returning)
+}
+
+/// Limits the rows that `command`, DELETE or TRUNCATE, removes to those
+/// its row-level security policies allow, and to those the SELECT policies
+/// allow too when `reads_target_columns`. The filter goes where the WHERE
+/// clause is, in the plan that collects the rowids when there is one.
+fn filter_deleted_rows(
+    plan: &mut DeletePlan,
+    command: Command,
+    reads_target_columns: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let mut commands = vec![command];
+    if reads_target_columns {
+        commands.push(Command::Select);
+    }
+    match &mut plan.rowset_plan {
+        Some(rowset_plan) => row_security::filter_rows(
+            &commands,
+            &mut rowset_plan.table_references,
+            &mut rowset_plan.where_clause,
+            resolver,
+            program,
+        ),
+        None => row_security::filter_rows(
+            &commands,
+            &mut plan.table_references,
+            &mut plan.where_clause,
+            resolver,
+            program,
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
@@ -228,6 +317,7 @@ pub fn prepare_delete_plan(
         namespace,
         indexed,
         plan_estimate: None,
+        row_filter: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -260,13 +350,6 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         resolver,
     )?;
-    row_security::filter_rows(
-        Command::Delete,
-        &table_references,
-        &mut where_predicates,
-        resolver,
-    )?;
-
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut non_from_clause_subqueries = vec![];

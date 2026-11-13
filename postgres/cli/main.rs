@@ -43,7 +43,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso_core::{DatabaseOpts, OpenFlags, Value};
+use turso_core::{DatabaseOpts, OpenFlags, SessionRole, Value};
 use turso_pg::{Connection, Error, Statement};
 use turso_pg_server::TursoPgServer;
 
@@ -1016,7 +1016,7 @@ fn main() -> anyhow::Result<()> {
             address.clone(),
             db_file,
             db,
-            turso_core::ConnectOpts::new(),
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
             interrupt_count,
         );
         return server.run();

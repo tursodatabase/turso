@@ -3,6 +3,7 @@ use std::sync::Arc;
 use turso_core::ConnectOpts;
 
 use super::common::{ExecRows, TempDatabase};
+use turso_core::SessionRole;
 
 #[test]
 fn concurrent_view_expansion_is_not_spuriously_circular() {
@@ -25,7 +26,9 @@ fn concurrent_view_expansion_is_not_spuriously_circular() {
             let db = db.clone();
             let failed = failed.clone();
             std::thread::spawn(move || {
-                let conn = db.connect(ConnectOpts::new()).unwrap();
+                let conn = db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
                 for _ in 0..5000 {
                     if let Err(e) = conn.prepare("SELECT id FROM v") {
                         assert!(
