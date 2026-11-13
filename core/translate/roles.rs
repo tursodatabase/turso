@@ -88,6 +88,10 @@ pub fn check_statement_privileges(
         // The dialect decides who may grant or revoke on each relation, from
         // the privileges it stores.
         ast::Stmt::Grant(_) => return Ok(()),
+        // The dialect checks who may grant or revoke role membership after
+        // it looks up the roles, so that a role that does not exist is
+        // reported as such.
+        ast::Stmt::GrantRole(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
         // exists, as for CREATE TABLE.
@@ -598,6 +602,22 @@ pub fn translate_create_role(
         options,
     };
     translate_change(change, resolver, program, connection)
+}
+
+/// `GRANT role TO role` and `REVOKE role FROM role`: the dialect stores the
+/// membership, through the same hook as its other catalog changes.
+pub fn translate_grant_role(
+    grant: ast::GrantRole,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    translate_change(
+        CatalogChange::GrantRole(grant),
+        resolver,
+        program,
+        connection,
+    )
 }
 
 #[cfg(test)]

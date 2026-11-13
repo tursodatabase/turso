@@ -100,6 +100,8 @@ pub enum CatalogChange {
         name: String,
         options: ast::RoleOptions,
     },
+    /// `GRANT role TO role` or `REVOKE role FROM role`.
+    GrantRole(ast::GrantRole),
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
@@ -366,7 +368,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
     /// has no roles, ownership, privileges or row-level security and refuses
-    /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
+    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
     /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
     /// `CREATE POLICY` and `DROP POLICY`.
     fn translate_catalog_changes(
@@ -412,6 +414,12 @@ pub trait Dialect: Send + Sync + 'static {
                     return Err(LimboError::ParseError(
                         "CREATE ROLE is not supported".to_string(),
                     ));
+                }
+                CatalogChange::GrantRole(grant) => {
+                    let statement = if grant.revoke { "REVOKE" } else { "GRANT" };
+                    return Err(LimboError::ParseError(format!(
+                        "{statement} of role membership is not supported"
+                    )));
                 }
                 _ => {}
             }
