@@ -88,6 +88,13 @@ pub enum CatalogChange {
         name: String,
         policy: Box<ast::CreatePolicy>,
     },
+    /// `ALTER POLICY` on table `name`. Its expressions refer to the
+    /// table's columns by their unqualified names.
+    AlterPolicy {
+        namespace: NamespaceId,
+        name: String,
+        policy: Box<ast::AlterPolicy>,
+    },
     /// `DROP POLICY policy_name ON name`.
     DropPolicy {
         namespace: NamespaceId,
@@ -368,7 +375,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// has no roles, ownership, privileges or row-level security and refuses
     /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
     /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
+    /// `CREATE POLICY`, `ALTER POLICY` and `DROP POLICY`.
     fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -403,6 +410,7 @@ pub trait Dialect: Send + Sync + 'static {
                 }
                 CatalogChange::SetRowSecurity { .. }
                 | CatalogChange::CreatePolicy { .. }
+                | CatalogChange::AlterPolicy { .. }
                 | CatalogChange::DropPolicy { .. } => {
                     return Err(LimboError::ParseError(
                         "row-level security is not supported".to_string(),

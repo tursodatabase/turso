@@ -261,6 +261,7 @@ fn translate_statement(
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
             | ast::Stmt::CreatePolicy(_)
+            | ast::Stmt::AlterPolicy(_)
             | ast::Stmt::DropPolicy { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
@@ -593,6 +594,9 @@ fn translate_statement(
         ast::Stmt::CreatePolicy(policy) => {
             row_security::translate_create_policy(&policy, resolver, program, connection)?;
         }
+        ast::Stmt::AlterPolicy(policy) => {
+            row_security::translate_alter_policy(&policy, resolver, program, connection)?;
+        }
         ast::Stmt::DropPolicy {
             if_exists,
             policy_name,
@@ -699,6 +703,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
         ast::Stmt::CreatePolicy(_) => "create_policy",
+        ast::Stmt::AlterPolicy(_) => "alter_policy",
         ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
