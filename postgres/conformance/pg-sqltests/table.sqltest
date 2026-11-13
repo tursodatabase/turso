@@ -926,3 +926,124 @@ test alter-table-rename-constraint-is-not-supported {
 expect error {
     ALTER TABLE ... RENAME CONSTRAINT is not supported
 }
+
+test serial-primary-key-counts-apart-from-explicit-keys {
+    DROP TABLE IF EXISTS sk_a;
+    CREATE TABLE sk_a (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_a (v) VALUES ('a');
+    INSERT INTO sk_a (id, v) VALUES (100, 'b');
+    INSERT INTO sk_a (v) VALUES ('c');
+    SELECT id, v FROM sk_a ORDER BY v;
+}
+expect {
+    1|a
+    100|b
+    2|c
+}
+
+test serial-primary-key-rejects-null {
+    DROP TABLE IF EXISTS sk_n;
+    CREATE TABLE sk_n (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_n (id, v) VALUES (NULL, 'x');
+}
+@sqlstate 23502
+expect error {}
+
+test serial-primary-key-default-collides-with-explicit-key {
+    DROP TABLE IF EXISTS sk_c;
+    CREATE TABLE sk_c (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_c (id, v) VALUES (1, 'x');
+    INSERT INTO sk_c (v) VALUES ('y');
+}
+@sqlstate 23505
+expect error {}
+
+test bigserial-and-smallserial-primary-keys-use-sequence {
+    DROP TABLE IF EXISTS sk_b;
+    DROP TABLE IF EXISTS sk_s;
+    CREATE TABLE sk_b (id bigserial PRIMARY KEY, v text);
+    CREATE TABLE sk_s (id smallserial PRIMARY KEY, v text);
+    INSERT INTO sk_b (v) VALUES ('a');
+    INSERT INTO sk_b (id, v) VALUES (50, 'b');
+    INSERT INTO sk_b (v) VALUES ('c');
+    INSERT INTO sk_s (v) VALUES ('a');
+    INSERT INTO sk_s (id, v) VALUES (50, 'b');
+    INSERT INTO sk_s (v) VALUES ('c');
+    SELECT id FROM sk_b UNION ALL SELECT id + 1000 FROM sk_s ORDER BY 1;
+}
+expect {
+    1
+    2
+    50
+    1001
+    1002
+    1050
+}
+
+test integer-primary-key-rejects-null {
+    DROP TABLE IF EXISTS sk_i;
+    CREATE TABLE sk_i (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_i (id, v) VALUES (NULL, 'x');
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-uses-column-default {
+    DROP TABLE IF EXISTS sk_d;
+    CREATE TABLE sk_d (id integer PRIMARY KEY DEFAULT 7, v text);
+    INSERT INTO sk_d (v) VALUES ('x');
+    SELECT id, v FROM sk_d;
+}
+expect {
+    7|x
+}
+
+test integer-table-level-primary-key-uses-column-default {
+    DROP TABLE IF EXISTS sk_t;
+    CREATE TABLE sk_t (id int DEFAULT 9, v text, PRIMARY KEY (id));
+    INSERT INTO sk_t (v) VALUES ('x');
+    SELECT id, v FROM sk_t;
+}
+expect {
+    9|x
+}
+
+test integer-primary-key-without-default-rejects-insert-that-omits-it {
+    DROP TABLE IF EXISTS sk_o;
+    CREATE TABLE sk_o (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_o (v) VALUES ('x');
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-rejects-null-from-select {
+    DROP TABLE IF EXISTS sk_q;
+    CREATE TABLE sk_q (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_q (id, v) SELECT NULL, 'x';
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-default-keyword-uses-column-default {
+    DROP TABLE IF EXISTS sk_k;
+    CREATE TABLE sk_k (id integer PRIMARY KEY DEFAULT 7, v text);
+    INSERT INTO sk_k VALUES (DEFAULT, 'x'), (8, 'y');
+    SELECT id, v FROM sk_k ORDER BY id;
+}
+expect {
+    7|x
+    8|y
+}
+
+test serial-primary-key-on-conflict-do-update {
+    DROP TABLE IF EXISTS sk_u;
+    CREATE TABLE sk_u (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_u (v) VALUES ('a');
+    INSERT INTO sk_u (id, v) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+    INSERT INTO sk_u (v) VALUES ('c');
+    SELECT id, v FROM sk_u ORDER BY id;
+}
+expect {
+    1|b
+    2|c
+}
