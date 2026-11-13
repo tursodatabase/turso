@@ -277,8 +277,11 @@ impl Dialect for PostgresDialect {
         crate::schema_state::apply_catalog_change(schema, change, values)
     }
 
+    /// The built-in superuser is found by its name, `postgres`, too.
     fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
-        schema_roles(schema).get_by_name(name).map(|role| role.id)
+        postgres_roles(schema_roles(schema))
+            .find(|role| role.name == name)
+            .map(|role| role.id)
     }
 
     fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {

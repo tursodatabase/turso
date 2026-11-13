@@ -122,9 +122,8 @@ pub fn check_statement_privileges(
             };
             match &alter.body {
                 // The owner may give its relation to a role it may set
-                // itself, as in PostgreSQL; without role membership that is
-                // itself, which changes nothing. Anyone else must be the
-                // owner.
+                // itself, such as a role it is a member of, as in
+                // PostgreSQL. Anyone else must be the owner.
                 ast::AlterTableBody::OwnerTo { role, .. } if owner => {
                     if may_set_role(resolver, connection, role) {
                         return Ok(());

@@ -167,10 +167,18 @@ impl RoleCatalog {
     }
 
     /// Whether a session whose current role is `member` may switch to `role`
-    /// with `SET ROLE`. Only a superuser may switch to another role. No
-    /// session may switch to `public`.
+    /// with `SET ROLE`: a superuser may switch to any role, and any other
+    /// role to the roles it is a member of, directly or through other roles,
+    /// whether or not it inherits their privileges. No session may switch to
+    /// `public`.
     pub(crate) fn can_set_role(&self, member: RoleId, role: RoleId) -> bool {
-        role != RoleId::PUBLIC && (member == role || self.is_superuser(member))
+        role != RoleId::PUBLIC
+            && (member == role
+                || self.is_superuser(member)
+                || self
+                    .memberships
+                    .reached_from(member, |membership| membership.set_option)
+                    .contains(&role))
     }
 
     /// The memberships of the roles.
@@ -476,6 +484,29 @@ mod tests {
     }
 
     #[test]
+    fn a_member_may_set_the_roles_it_reaches_through_memberships() {
+        // carol is a member of bob without inheriting, and bob of alice.
+        let catalog = RoleCatalog::new(
+            &[
+                role_row(1, "alice", 0),
+                role_row(2, "bob", 0),
+                noinherit_role_row(3, "carol"),
+                role_row(4, "dave", 0),
+            ],
+            &[membership_row(1, 1, 2, 1), membership_row(2, 2, 3, 0)],
+        )
+        .unwrap();
+        let id = |name| catalog.get_by_name(name).unwrap().id;
+
+        assert!(catalog.can_set_role(id("bob"), id("alice")));
+        assert!(catalog.can_set_role(id("carol"), id("bob")));
+        assert!(catalog.can_set_role(id("carol"), id("alice")));
+        assert!(!catalog.can_set_role(id("alice"), id("bob")));
+        assert!(!catalog.can_set_role(id("dave"), id("alice")));
+        assert!(!catalog.can_set_role(id("carol"), RoleId::PUBLIC));
+    }
+
+    #[test]
     fn only_a_superuser_may_set_another_role_and_no_one_may_set_public() {
         let catalog =
             RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "bob", 0)], &[]).unwrap();
@@ -505,6 +536,19 @@ mod tests {
             Value::build_text(name.to_string()),
             Value::from_i64(0),
             Value::from_i64(1),
+            Value::from_i64(1),
+        ]
+    }
+
+    /// A membership row of `member` in `role`, granted by the superuser.
+    fn membership_row(id: i64, role: i64, member: i64, inherit: i64) -> Vec<Value> {
+        vec![
+            Value::from_i64(id),
+            Value::from_i64(role),
+            Value::from_i64(member),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(inherit),
             Value::from_i64(1),
         ]
     }

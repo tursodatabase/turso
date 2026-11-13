@@ -2545,8 +2545,7 @@ pub fn translate_alter_table(
 /// relation of another kind.
 ///
 /// [`crate::translate::roles::check_statement_privileges`] lets a superuser
-/// run it, and the owner when it names a role it may set, which without
-/// role membership is itself.
+/// run it, and the owner when it names a role it may set.
 fn translate_alter_owner(
     qualified_name: &ast::QualifiedName,
     kind: RelationKind,

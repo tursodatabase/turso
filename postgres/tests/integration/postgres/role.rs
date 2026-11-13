@@ -570,10 +570,10 @@ fn role_names(conn: &PgConnection) -> Vec<String> {
         .collect()
 }
 
-/// Without role membership, an owner may give its relation to nobody but
-/// itself; PostgreSQL asks for the ability to SET ROLE to the new owner.
+/// An owner may give its relation only to a role it may SET ROLE to, as in
+/// PostgreSQL, and alice is not a member of bob.
 #[test]
-fn owner_cannot_give_its_table_to_another_role() {
+fn owner_cannot_give_its_table_to_a_role_it_is_not_a_member_of() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
     conn.execute("CREATE ROLE alice").unwrap();
@@ -785,5 +785,80 @@ fn stored_membership_table_keeps_memberships_unique() {
     assert_eq!(
         memberships(&db.connect_postgres()),
         vec![membership("readers", "alice")]
+    );
+}
+
+/// A session that logs in as `name`.
+fn connect_as(db: &TempDatabase, name: &str) -> PgConnection {
+    PgConnection::connect_with(
+        &db.db,
+        ConnectOpts::new(SessionRole::Named(name.to_string())),
+    )
+    .unwrap()
+}
+
+/// A session that logs in as a role that is not a superuser may switch to
+/// the roles it is a member of, and to no other.
+#[test]
+fn session_role_may_set_a_role_it_is_a_member_of() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    for role in ["app_login NOINHERIT", "guest", "reader", "other"] {
+        superuser.execute(format!("CREATE ROLE {role}")).unwrap();
+    }
+    superuser
+        .execute("GRANT guest, reader TO app_login")
+        .unwrap();
+
+    let app_login = connect_as(&db, "app_login");
+
+    app_login.execute("SET ROLE reader").unwrap();
+    assert_eq!(current_user(&app_login), "reader");
+    app_login.execute("SET ROLE guest").unwrap();
+    assert_eq!(current_user(&app_login), "guest");
+    let error = app_login.execute("SET ROLE other").unwrap_err();
+    assert_eq!(error.to_string(), "permission denied to set role \"other\"");
+    let error = app_login.execute("SET ROLE postgres").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "permission denied to set role \"postgres\""
+    );
+    app_login.execute("RESET ROLE").unwrap();
+    assert_eq!(current_user(&app_login), "app_login");
+}
+
+#[test]
+fn session_role_may_set_a_role_it_reaches_through_other_roles() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    for role in ["alice", "middle NOINHERIT", "top"] {
+        superuser.execute(format!("CREATE ROLE {role}")).unwrap();
+    }
+    superuser.execute("GRANT top TO middle").unwrap();
+    superuser.execute("GRANT middle TO alice").unwrap();
+
+    let alice = connect_as(&db, "alice");
+
+    alice.execute("SET ROLE top").unwrap();
+    assert_eq!(current_user(&alice), "top");
+}
+
+#[test]
+fn session_role_may_not_set_a_role_after_its_membership_is_revoked() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    superuser.execute("CREATE ROLE alice").unwrap();
+    superuser.execute("CREATE ROLE readers").unwrap();
+    superuser.execute("GRANT readers TO alice").unwrap();
+    let alice = connect_as(&db, "alice");
+    alice.execute("SET ROLE readers").unwrap();
+    alice.execute("RESET ROLE").unwrap();
+
+    superuser.execute("REVOKE readers FROM alice").unwrap();
+
+    let error = alice.execute("SET ROLE readers").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "permission denied to set role \"readers\""
     );
 }
