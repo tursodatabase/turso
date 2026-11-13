@@ -3290,6 +3290,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             self.pager_commit_done = true;
                             self.lock_states.pager_read_tx = false;
                             self.lock_states.pager_write_tx = false;
+                            self.stamp_committed_versions();
                         }
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
@@ -3550,6 +3551,61 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         LimboError::InternalError("checkpoint_result not set".to_string())
                     })?,
                 ))
+            }
+        }
+    }
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, A> {
+    fn stamp_committed_versions(&self) {
+        let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+        for &(table_id, rowid) in &self.written_table_rowids {
+            self.stamp_committed_row(&RowID::new(table_id, RowKey::Int(rowid)), materialized_at);
+        }
+        for rowid in &self.unwritten_table_rows {
+            self.stamp_committed_row(rowid, materialized_at);
+        }
+        for &slot in &self.written_index_slots {
+            self.stamp_committed_row(&self.index_write_set[slot].0, materialized_at);
+        }
+        for (index_id, key) in &self.unwritten_index_rows {
+            self.stamp_committed_row(
+                &RowID::new(*index_id, RowKey::Record(key.clone())),
+                materialized_at,
+            );
+        }
+    }
+
+    fn stamp_committed_row(&self, rowid: &RowID, materialized_at: WalPos) {
+        match &rowid.row_id {
+            RowKey::Int(_) => {
+                if let Some(entry) = self.mvstore.rows.get(rowid) {
+                    self.mvstore.stamp_chain_materialized(
+                        &mut entry.value().write(),
+                        materialized_at,
+                        self.snapshot_ts,
+                    );
+                } else {
+                    assert!(self
+                        .mvcc_meta_table
+                        .is_some_and(|(table_id, _)| table_id == rowid.table_id));
+                }
+            }
+            RowKey::Record(key) => {
+                let index = self
+                    .mvstore
+                    .index_rows
+                    .get(&rowid.table_id)
+                    .expect("committed index must exist in index_rows");
+                let entry = index
+                    .value()
+                    .get(key)
+                    .expect("committed index row must exist in index_rows");
+                self.mvstore.stamp_chain_materialized(
+                    &mut entry.value().write(),
+                    materialized_at,
+                    self.snapshot_ts,
+                );
             }
         }
     }
