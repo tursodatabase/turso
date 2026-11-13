@@ -6,7 +6,7 @@ use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
-use crate::storage::{
+pub use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
     sqlite3_ondisk::{
@@ -122,7 +122,7 @@ pub struct TableLeafCellHeader {
 
 pub use page_inner::PageInner;
 
-mod page_inner {
+pub mod page_inner {
     use super::*;
 
     pub struct PageInner {
@@ -1259,10 +1259,10 @@ enum CommitState {
 }
 
 #[derive(Debug, Default)]
-struct CheckpointState {
-    phase: CheckpointPhase,
+pub struct CheckpointState {
+    pub phase: CheckpointPhase,
     /// The checkpoint result, set after WAL checkpoint completes
-    result: Option<CheckpointResult>,
+    pub result: Option<CheckpointResult>,
     /// The checkpoint mode, used to determine if WAL truncation is needed
     mode: Option<CheckpointMode>,
     /// The checkpoint state machine should acquire the lock or use the one by caller
@@ -1270,7 +1270,7 @@ struct CheckpointState {
 }
 
 #[derive(Clone, Debug)]
-struct PendingCheckpointDbIdentityRead {
+pub struct PendingCheckpointDbIdentityRead {
     max_frame: u64,
     header_buf: Arc<Buffer>,
     bytes_read: Arc<AtomicUsize>,
@@ -1279,7 +1279,7 @@ struct PendingCheckpointDbIdentityRead {
 }
 
 #[derive(Clone, Debug, Default)]
-enum CheckpointPhase {
+pub enum CheckpointPhase {
     #[default]
     NotCheckpointing,
     Checkpoint {
@@ -1437,7 +1437,7 @@ enum PtrMapPutState {
 }
 
 #[derive(Debug, Clone)]
-enum HeaderRefState {
+pub enum HeaderRefState {
     Start,
     CreateHeader {
         page: PageRef,
@@ -1615,7 +1615,7 @@ pub struct Pager {
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
     pub wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
-    page_cache: Arc<RwLock<PageCache>>,
+    pub page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
@@ -1642,8 +1642,8 @@ pub struct Pager {
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
-    checkpoint_state: RwLock<CheckpointState>,
-    syncing: Arc<AtomicBool>,
+    pub checkpoint_state: RwLock<CheckpointState>,
+    pub syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
@@ -1662,13 +1662,13 @@ pub struct Pager {
     /// State machine for async cache spilling.
     spill_state: RwLock<SpillState>,
     /// State machine for async cacheflush operation.
-    cacheflush_state: RwLock<CacheFlushState>,
+    pub cacheflush_state: RwLock<CacheFlushState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
-    header_ref_state: RwLock<HeaderRefState>,
+    pub header_ref_state: RwLock<HeaderRefState>,
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
-    pub(crate) io_ctx: RwLock<IOContext>,
+    pub io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     /// Whether this pager holds an ephemeral table or index, whose file no
@@ -1686,7 +1686,7 @@ pub struct Pager {
     /// Record buffers retired by closed cursors, kept for the next cursor so
     /// each statement execution does not allocate and free a page-sized
     /// buffer per cursor.
-    record_pool: Mutex<Vec<crate::types::RecordBuf>>,
+    pub record_pool: Mutex<Vec<crate::types::RecordBuf>>,
     /// Heap allocations of closed b-tree cursors, kept for the next cursor so
     /// each statement execution does not allocate and free one per cursor.
     /// The boxes are the point: each one is a cursor-sized allocation.
@@ -3212,12 +3212,12 @@ impl Pager {
         PageSize::new(value).expect("invalid page size stored")
     }
 
-    pub(crate) fn has_wal(&self) -> bool {
+    pub fn has_wal(&self) -> bool {
         self.wal.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn wal_shared_ptr(&self) -> Option<usize> {
         self.wal
             .as_ref()
             .and_then(|wal| wal.as_any().downcast_ref::<crate::storage::wal::WalFile>())
@@ -4963,7 +4963,7 @@ impl Pager {
         )
     }
 
-    fn reset_checkpoint_state(&self) {
+    pub fn reset_checkpoint_state(&self) {
         self.clear_checkpoint_state();
         self.commit_info.write().state = CommitState::PrepareWal;
         *self.header_ref_state.write() = HeaderRefState::Start;
@@ -6424,7 +6424,7 @@ impl CreateBTreeFlags {
 **               identifies the parent page in the btree.
 */
 #[cfg(feature = "autovacuum")]
-pub(crate) mod ptrmap {
+pub mod ptrmap {
     #[allow(unused_imports)]
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
     use crate::{turso_assert_greater_than_or_equal, turso_soft_unreachable};
@@ -6568,386 +6568,6 @@ pub(crate) mod ptrmap {
         Ok(entry_index_on_page * PTRMAP_ENTRY_SIZE)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::security::roles::SessionRole;
-    use crate::sync::Arc;
-
-    use crate::sync::RwLock;
-
-    use crate::io::{MemoryIO, OpenFlags, IO};
-    use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::database::DatabaseFile;
-    use crate::storage::page_cache::{PageCache, PageCacheKey};
-    use crate::storage::wal::{Wal, WalFile, WalFileShared};
-    use crate::util::IOExt;
-
-    use super::{
-        default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
-    };
-    use crate::{Buffer, Completion, CompletionError, LimboError};
-
-    #[test]
-    fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
-        let io = Arc::new(MemoryIO::new());
-        let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (2, CAST(zeroblob(5000) AS TEXT), 'small')")
-            .unwrap();
-        conn.execute("SELECT body FROM t WHERE id = 1").unwrap();
-        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 1")
-            .unwrap();
-        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 2")
-            .unwrap();
-
-        let pager = conn.get_pager();
-        let pool = pager.record_pool.lock();
-        assert!(!pool.is_empty());
-        for buf in pool.iter() {
-            assert!(buf.capacity() <= super::PageSize::MAX as usize);
-        }
-    }
-
-    #[test]
-    fn checkpoint_reset_does_not_reuse_failed_header_read() {
-        let pager = pager_with_cache_capacity(10, 2);
-        let completion =
-            Completion::new_read(Arc::new(Buffer::new_temporary(4096)), Box::new(|_| None));
-        completion.abort();
-        *pager.header_ref_state.write() = super::HeaderRefState::CreateHeader {
-            page: default_page1(None),
-            completion: Some(completion),
-        };
-        pager.reset_checkpoint_state();
-        pager.io.block(|| pager.with_header(|_| ())).unwrap();
-    }
-
-    #[test]
-    fn page_id_changes_keep_header_access_at_the_correct_offset() {
-        let mut page = super::PageInner::from_buffer(Buffer::new_temporary(4096));
-        for id in [1, 2, 1, 0, usize::MAX] {
-            page.set_id(id);
-            assert_eq!(page.id(), id);
-            let offset = if id == 1 { 100 } else { 0 };
-            assert_eq!(page.offset(), offset);
-            page.as_ptr().fill(0);
-            page.write_page_type(super::PageType::TableLeaf as u8);
-            assert_eq!(page.as_ptr()[offset], super::PageType::TableLeaf as u8);
-            assert_eq!(page.page_type().unwrap(), super::PageType::TableLeaf);
-
-            let unloaded = super::PageInner::unloaded(id);
-            assert_eq!(unloaded.id(), id);
-            assert_eq!(unloaded.offset(), offset);
-        }
-    }
-
-    #[test]
-    fn unloaded_page_exposes_an_empty_data_slice() {
-        let page = super::PageInner::unloaded(1);
-        assert!(page.as_ptr().is_empty());
-    }
-
-    fn pager_with_cache_capacity(cache_capacity: usize, database_pages: u32) -> Arc<Pager> {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let buffer_pool = BufferPool::begin_init(&io, 4096 * 128);
-
-        let db_file = Arc::new(DatabaseFile::new(
-            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
-        ));
-
-        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
-        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
-        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            last_checksum_and_max_frame,
-            buffer_pool.clone(),
-        ));
-
-        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
-        let pager = Arc::new(
-            Pager::new(
-                db_file,
-                Some(wal),
-                io,
-                PageCache::new(cache_capacity),
-                buffer_pool,
-                shared,
-            )
-            .unwrap(),
-        );
-
-        pager.io.step().unwrap();
-        pager.io.block(|| pager.allocate_page1()).unwrap();
-        for _ in 0..(database_pages - 1) {
-            pager.io.block(|| pager.allocate_page()).unwrap();
-        }
-        pager
-    }
-
-    /// The page cache capacity is a soft limit, as in SQLite: when every
-    /// resident page is unevictable (held by cursors, dirty and unspillable),
-    /// a read must still succeed by admitting the page over capacity instead
-    /// of failing with Busy. The excess drains once pages become evictable.
-    #[test]
-    fn read_page_exceeds_capacity_when_cache_unevictable() {
-        const CAP: usize = 5;
-        let pager = pager_with_cache_capacity(CAP, 6);
-
-        // Allocating 6 pages against a 5-page cache forces a spill and evicts
-        // at least one spilled page; find one that is no longer resident.
-        let missing = (2..=6)
-            .find(|&id| !pager.page_cache.read().contains_key(&PageCacheKey::new(id)))
-            .expect("allocating 6 pages with a 5-page cache must evict at least one page")
-            as i64;
-
-        // Hold strong references to every resident page so none can be
-        // evicted or spilled.
-        let held: Vec<PageRef> = (1..=6)
-            .filter_map(|id| pager.cache_get(id).unwrap())
-            .collect();
-        assert_eq!(held.len(), CAP, "cache should be at capacity");
-
-        let (page, c) = pager.io.block(|| pager.read_page(missing)).unwrap();
-        if let Some(c) = c {
-            pager.io.wait_for_completion(c).unwrap();
-        }
-        while page.is_locked() {
-            pager.io.step().unwrap();
-        }
-        assert_eq!(page.get().id() as i64, missing);
-        assert!(
-            pager.page_cache.read().len() > CAP,
-            "page must have been admitted over capacity"
-        );
-
-        // Once the strong references are gone, the next insert drains the
-        // excess back under capacity.
-        drop(held);
-        drop(page);
-        pager.io.block(|| pager.allocate_page()).unwrap();
-        assert!(
-            pager.page_cache.read().len() <= CAP,
-            "excess over capacity must drain once pages become evictable"
-        );
-    }
-
-    /// Same soft-limit guarantee for the write path: allocating a new page
-    /// while the cache is full of unevictable pages must not fail.
-    #[test]
-    fn allocate_page_exceeds_capacity_when_cache_unevictable() {
-        const CAP: usize = 5;
-        let pager = pager_with_cache_capacity(CAP, 5);
-
-        // Hold strong references to all resident pages: dirty pages with
-        // outstanding references can neither be spilled nor evicted.
-        let held: Vec<PageRef> = (1..=5)
-            .filter_map(|id| pager.cache_get(id).unwrap())
-            .collect();
-        assert_eq!(held.len(), CAP, "cache should be at capacity");
-
-        let page = pager.io.block(|| pager.allocate_page()).unwrap();
-        assert_eq!(page.get().id(), 6);
-        assert!(
-            pager.page_cache.read().len() > CAP,
-            "page must have been admitted over capacity"
-        );
-    }
-
-    /// Verifies that cacheflush returns a codec error when rereading an evicted page fails,
-    /// and resets its state so a later flush can retry.
-    #[test]
-    fn cacheflush_propagates_failed_page_codec_reread() {
-        let pager = pager_with_cache_capacity(5, 2);
-        let page = Arc::new(Page::new(2));
-        page.set_loaded();
-        let completion =
-            Completion::new_read(Arc::new(Buffer::new_temporary(4096)), Box::new(|_| None));
-        completion.error(CompletionError::PageCodecError { page_idx: 2 });
-        *pager.cacheflush_state.write() = CacheFlushState::WaitingForRead {
-            state: CollectingState::default(),
-            page_id: 2,
-            page,
-            completion,
-        };
-
-        let err = pager.cacheflush().unwrap_err();
-        assert!(matches!(
-            *err,
-            LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 2 })
-        ));
-        assert!(matches!(
-            *pager.cacheflush_state.read(),
-            CacheFlushState::Init
-        ));
-    }
-
-    #[test]
-    fn test_shared_cache() {
-        // ensure cache can be shared between threads
-        let cache = Arc::new(RwLock::new(PageCache::new(10)));
-
-        let thread = {
-            let cache = cache.clone();
-            std::thread::spawn(move || {
-                let mut cache = cache.write();
-                let page_key = PageCacheKey::new(1);
-                let page = Page::new(1);
-                // Set loaded so that we avoid eviction, as we evict the page from cache if it is not locked and not loaded
-                page.set_loaded();
-                cache.insert(page_key, Arc::new(page)).unwrap();
-            })
-        };
-        let _ = thread.join();
-        let mut cache = cache.write();
-        let page_key = PageCacheKey::new(1);
-        let page = cache.get(&page_key).unwrap();
-        assert_eq!(page.unwrap().get().id(), 1);
-    }
-
-    #[test]
-    fn rollback_keeps_pages_the_transaction_did_not_change() {
-        let (db, conn) = open_memory_database("rollback-keeps-unchanged-pages.db");
-        conn.execute("CREATE TABLE changed(x)").unwrap();
-        conn.execute("CREATE TABLE unchanged(x)").unwrap();
-        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
-        conn.execute("INSERT INTO unchanged VALUES (1)").unwrap();
-        let changed_root = root_page(&conn, "changed");
-        let unchanged_root = root_page(&conn, "unchanged");
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
-        let pager = conn.pager.load();
-        let cached_unchanged_root = pager.cache_get(unchanged_root).unwrap().unwrap();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO changed VALUES (2)").unwrap();
-        conn.execute("ROLLBACK").unwrap();
-
-        assert!(!pager
-            .page_cache
-            .write()
-            .contains_key(&PageCacheKey::new(changed_root)));
-        let unchanged_root_after_rollback = pager.cache_get(unchanged_root).unwrap().unwrap();
-        assert!(Arc::ptr_eq(
-            &cached_unchanged_root,
-            &unchanged_root_after_rollback
-        ));
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM changed"), 1);
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
-        drop(db);
-    }
-
-    #[test]
-    fn rollback_drops_pages_spilled_to_the_wal() {
-        let (db, conn) = open_memory_database("rollback-drops-spilled-pages.db");
-        conn.execute("PRAGMA cache_size = 200").unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 500)")
-            .unwrap();
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
-        let pager = conn.pager.load();
-        let wal = pager.wal.as_ref().unwrap();
-        let committed_max_frame = wal.get_max_frame();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("UPDATE t SET x = randomblob(1000)").unwrap();
-        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 1000)")
-            .unwrap();
-        assert!(
-            wal.get_max_frame() > committed_max_frame,
-            "the transaction must spill pages to the WAL"
-        );
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 1500);
-        conn.execute("ROLLBACK").unwrap();
-
-        assert_eq!(wal.get_max_frame(), committed_max_frame);
-        let mut cache = pager.page_cache.write();
-        for key in cache.keys() {
-            let page = cache.peek(&key, false).unwrap();
-            assert!(!page.is_dirty());
-            assert!(!page.has_wal_tag() || page.wal_tag_pair().0 <= committed_max_frame);
-        }
-        drop(cache);
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
-        let mut integrity_check = conn.prepare("PRAGMA integrity_check").unwrap();
-        assert_eq!(
-            integrity_check.run_collect_rows().unwrap(),
-            vec![vec![crate::Value::build_text("ok")]]
-        );
-        drop(db);
-    }
-
-    #[test]
-    fn rollback_drops_pinned_pages_that_are_not_loaded() {
-        let (db, conn) = open_memory_database("rollback-drops-pinned-unloaded-pages.db");
-        conn.execute("CREATE TABLE changed(x)").unwrap();
-        conn.execute("CREATE TABLE unloaded(x)").unwrap();
-        conn.execute("INSERT INTO unloaded VALUES (1)").unwrap();
-        let unloaded_root = root_page(&conn, "unloaded");
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
-        let pager = conn.pager.load();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
-        let page = pager.cache_get(unloaded_root).unwrap().unwrap();
-        page.pin();
-        page.clear_loaded();
-        conn.execute("ROLLBACK").unwrap();
-
-        assert!(!pager
-            .page_cache
-            .write()
-            .contains_key(&PageCacheKey::new(unloaded_root)));
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
-        drop(db);
-    }
-
-    #[test]
-    #[should_panic(expected = "rollback must discard pages while holding the WAL write lock")]
-    fn rollback_without_the_write_lock_panics() {
-        let (_db, conn) = open_memory_database("rollback-without-write-lock.db");
-        conn.execute("CREATE TABLE t(x)").unwrap();
-
-        conn.pager.load().rollback(false, &conn, true);
-    }
-
-    fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = crate::Database::open_file(io, path, Arc::new(crate::EngineDialect)).unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        (db, conn)
-    }
-
-    fn root_page(conn: &Arc<crate::Connection>, table: &str) -> usize {
-        query_i64(
-            conn,
-            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{table}'"),
-        ) as usize
-    }
-
-    fn query_i64(conn: &Arc<crate::Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        match rows.as_slice() {
-            [row] => match row.as_slice() {
-                [crate::Value::Numeric(crate::Numeric::Integer(value))] => *value,
-                other => panic!("expected one integer, got {other:?}"),
-            },
-            other => panic!("expected one row, got {other:?}"),
-        }
-    }
-}
-
 #[cfg(test)]
 #[cfg(feature = "autovacuum")]
 mod ptrmap_tests {
@@ -7390,158 +7010,5 @@ mod ptrmap_tests {
             }
             IOResult::IO(_) => panic!("loaded cache hit must not yield"),
         }
-    }
-}
-
-#[cfg(all(test, feature = "fs", host_shared_wal))]
-mod checkpoint_phase_tests {
-    use super::*;
-    use crate::io::{PlatformIO, IO};
-    use crate::security::roles::SessionRole;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::storage::wal::CheckpointMode;
-    use crate::sync::atomic::Ordering;
-    use crate::types::IOResult;
-    use crate::ConnectOpts;
-    use crate::Database;
-    use crate::EngineDialect;
-
-    /// Returns an IO backend that supports shared WAL coordination on the host.
-    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
-    /// and mapping primitives, so the experimental IOCP backend is used when
-    /// the `experimental_win_iocp` feature is enabled.
-    fn shared_wal_test_io() -> Arc<dyn IO> {
-        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-        {
-            Arc::new(crate::WindowsIOCP::new().unwrap())
-        }
-        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
-        {
-            Arc::new(PlatformIO::new().unwrap())
-        }
-    }
-
-    /// The returned `TempDir` deletes the database directory when it drops, so
-    /// callers must hold it for as long as they use the database.
-    fn open_checkpoint_test_database() -> (Arc<Database>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        {
-            let connection = rusqlite::Connection::open(&db_path).unwrap();
-            connection
-                .pragma_update(None, "journal_mode", "wal")
-                .unwrap();
-        }
-        let io = shared_wal_test_io();
-        let db = Database::open_file_with_flags(
-            io,
-            db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_multiprocess_wal(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        (db, dir)
-    }
-
-    fn db_identity(db_path: &std::path::Path) -> (u32, u32) {
-        let bytes = std::fs::read(db_path).unwrap();
-        assert!(bytes.len() >= DatabaseHeader::SIZE);
-        let db_size_pages = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
-        let crc = crc32c::crc32c(&bytes[..DatabaseHeader::SIZE]);
-        (db_size_pages, crc)
-    }
-
-    #[test]
-    fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
-        let (db, dir) = open_checkpoint_test_database();
-        let db_path = dir.path().join("test.db");
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.wal_auto_actions_disable();
-        conn.execute("create table test(id integer primary key, value blob)")
-            .unwrap();
-        conn.execute("begin immediate").unwrap();
-        for _ in 0..32 {
-            conn.execute("insert into test(value) values (randomblob(2048))")
-                .unwrap();
-        }
-        conn.execute("commit").unwrap();
-        assert!(
-            db.shared_wal
-                .read()
-                .metadata
-                .max_frame
-                .load(Ordering::SeqCst)
-                > 1,
-            "checkpoint setup requires more than one WAL frame"
-        );
-
-        let pager = conn.pager.load();
-        let mode = CheckpointMode::Passive {
-            upper_bound_inclusive: Some(1),
-        };
-
-        loop {
-            match pager.checkpoint(mode, crate::SyncMode::Full, true).unwrap() {
-                IOResult::Done(_) => {
-                    panic!("checkpoint should not finish before we observe the post-sync gap")
-                }
-                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
-            }
-
-            let state = pager.checkpoint_state.read();
-            let Some(result) = state.result.as_ref() else {
-                continue;
-            };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
-                && !pager.syncing.load(Ordering::SeqCst)
-            {
-                break;
-            }
-        }
-
-        let authority = db.shared_wal_coordination().unwrap().unwrap();
-        let snapshot_before_publish = authority.snapshot();
-        let (db_size_pages, db_header_crc32c) = db_identity(&db_path);
-        assert_eq!(
-            snapshot_before_publish.nbackfills, 0,
-            "DB sync completion alone must not publish positive nbackfills"
-        );
-        assert!(
-            !authority.validate_backfill_proof(
-                snapshot_before_publish,
-                db_size_pages,
-                db_header_crc32c
-            ),
-            "DB sync completion must still leave the durable backfill proof absent"
-        );
-
-        let result = pager
-            .io
-            .block(|| pager.checkpoint(mode, crate::SyncMode::Full, true))
-            .unwrap();
-        assert!(
-            result.wal_total_backfilled > 0 && !result.everything_backfilled(),
-            "resumed checkpoint should complete the partial checkpoint after proof installation"
-        );
-
-        let snapshot_after_publish = authority.snapshot();
-        let (db_size_pages_after, db_header_crc32c_after) = db_identity(&db_path);
-        assert!(
-            snapshot_after_publish.nbackfills > 0,
-            "proof installation step must publish positive nbackfills"
-        );
-        assert!(
-            authority.validate_backfill_proof(
-                snapshot_after_publish,
-                db_size_pages_after,
-                db_header_crc32c_after
-            ),
-            "resuming after the post-sync gap must install a valid durable backfill proof"
-        );
     }
 }

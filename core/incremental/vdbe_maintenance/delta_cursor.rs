@@ -39,7 +39,7 @@ pub struct DeltaCursor {
 }
 
 impl DeltaCursor {
-    pub(crate) fn new(delta: CapturedDelta, num_columns: usize) -> Self {
+    pub fn new(delta: CapturedDelta, num_columns: usize) -> Self {
         let tail_positions = delta
             .tail
             .iter()
@@ -84,6 +84,7 @@ impl DeltaCursor {
     }
 
     /// Advance to the next row. Returns false when exhausted.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<IOResult<bool>> {
         turso_assert!(self.positioned, "DeltaCursor::next before rewind");
         let batch_len = if self.reading_tail {

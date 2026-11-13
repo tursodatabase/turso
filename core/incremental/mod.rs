@@ -3,8 +3,8 @@ mod dag;
 pub mod vdbe_maintenance;
 pub mod view;
 
-#[cfg(test)]
-pub(crate) mod yield_test_support {
+#[cfg(any(test, feature = "test_helper"))]
+pub mod yield_test_support {
     use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
     use crate::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,14 +12,14 @@ pub(crate) mod yield_test_support {
     /// Fires the requested yield point exactly once, for the btree whose write
     /// selection key matches.
     #[derive(Debug)]
-    pub(crate) struct OneShotYieldInjector {
+    pub struct OneShotYieldInjector {
         point: YieldPoint,
         selection_key: u64,
         fired: AtomicBool,
     }
 
     impl OneShotYieldInjector {
-        pub(crate) fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
+        pub fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
             Arc::new(Self {
                 point,
                 selection_key,
@@ -27,7 +27,7 @@ pub(crate) mod yield_test_support {
             })
         }
 
-        pub(crate) fn fired(&self) -> bool {
+        pub fn fired(&self) -> bool {
             self.fired.load(Ordering::Acquire)
         }
     }

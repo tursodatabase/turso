@@ -8,7 +8,7 @@ use crate::Result;
 /// Extract values from a record-format array blob.
 /// Returns Err if the blob is not a valid record.
 /// Uses zero-copy iteration over the blob bytes — no Vec<u8> allocation.
-pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
+pub fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
     let iter = ValueIterator::new(blob)?;
     let mut values = Vec::with_capacity(iter.size_hint().0);
     for value in iter {

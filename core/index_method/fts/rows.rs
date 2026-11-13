@@ -29,7 +29,7 @@ use tantivy::index::SegmentId;
 
 /// One backing row waiting to be inserted.
 #[derive(Debug, Clone)]
-pub(super) struct PendingRow {
+pub struct PendingRow {
     pub path: String,
     pub chunk_no: i64,
     pub bytes: Vec<u8>,
@@ -217,7 +217,7 @@ impl RowInserter {
 
 /// What rows a [`RowDeleter`] target matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PathTarget {
+pub enum PathTarget {
     /// Every row whose path equals this string (all chunk numbers).
     Exact(String),
     /// Every row whose path starts with this string.
@@ -256,7 +256,7 @@ enum DeletePhase {
 /// done: the cursor's seek state machine is resumed with the same key
 /// after an I/O yield, and every re-seek after a deletion uses it again.
 #[derive(Debug)]
-pub(super) struct RowDeleter {
+pub struct RowDeleter {
     targets: Vec<PathTarget>,
     idx: usize,
     seek_key: Option<ImmutableRecord>,
@@ -273,7 +273,7 @@ impl RowDeleter {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn targets(&self) -> &[PathTarget] {
         &self.targets
     }

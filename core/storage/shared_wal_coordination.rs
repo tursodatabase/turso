@@ -284,7 +284,7 @@ impl ProcessLocalOwnershipState {
 /// processes. Stored in shared memory owner slots for diagnostics and to make
 /// ownership mismatches explicit in assertions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SharedOwnerRecord(u64);
+pub struct SharedOwnerRecord(u64);
 
 impl SharedOwnerRecord {
     pub(crate) const UNOWNED: Self = Self(UNOWNED_LOCK);
@@ -388,7 +388,7 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Serializable snapshot of the authoritative shared WAL coordination state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SharedWalCoordinationHeader {
+pub struct SharedWalCoordinationHeader {
     pub max_frame: u64,
     pub nbackfills: u64,
     pub transaction_count: u64,
@@ -608,7 +608,7 @@ struct SharedWalFrameIndexEntry {
 /// - `MultiProcess`: at least one other process already has the file open.
 ///   The opener must not clobber state that the peer may be relying on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SharedWalCoordinationOpenMode {
+pub enum SharedWalCoordinationOpenMode {
     Exclusive,
     MultiProcess,
 }
@@ -662,7 +662,7 @@ enum SharedWalOwnershipMode {
      one. Registering a reader before rechecking the shared snapshot relies on this \
      ordering; a private copy of the table or a machine boundary would hide the reader."
 )]
-pub(crate) struct MappedSharedWalCoordination {
+pub struct MappedSharedWalCoordination {
     file: Arc<dyn File>,
     /// Mapping containing the fixed header and reader arrays.
     _base_mapping: Box<dyn SharedWalMappedRegion>,
@@ -875,11 +875,7 @@ impl MappedSharedWalCoordination {
     /// file. The open-mode (Exclusive vs MultiProcess) is determined by
     /// attempting an exclusive lock on byte 0: if it succeeds no other
     /// process has the file open, so we are exclusive.
-    pub(crate) fn create_or_open(
-        io: &Arc<dyn IO>,
-        path: &Path,
-        reader_slot_count: u32,
-    ) -> Result<Self> {
+    pub fn create_or_open(io: &Arc<dyn IO>, path: &Path, reader_slot_count: u32) -> Result<Self> {
         Self::create_or_open_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
     }
 
@@ -910,7 +906,7 @@ impl MappedSharedWalCoordination {
 
     #[cfg(any(test, feature = "test_helper"))]
     /// Force the overflow bit for tests that need to exercise fallback WAL scans.
-    pub(crate) fn mark_frame_index_overflowed_for_tests(&self) {
+    pub fn mark_frame_index_overflowed_for_tests(&self) {
         self.header()
             .frame_index_overflowed
             .store(1, Ordering::Release);
@@ -1200,7 +1196,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Read a consistent snapshot of the shared coordination header.
-    pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
+    pub fn snapshot(&self) -> SharedWalCoordinationHeader {
         let header = self.header();
         loop {
             let seq_before = header.snapshot_seq.load(Ordering::Acquire);
@@ -1230,7 +1226,7 @@ impl MappedSharedWalCoordination {
         }
     }
 
-    pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
+    pub const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
         self.open_mode
     }
 
@@ -1240,7 +1236,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Return this mapping's durable owner identity.
-    pub(crate) const fn owner_record(&self) -> SharedOwnerRecord {
+    pub const fn owner_record(&self) -> SharedOwnerRecord {
         self.owner_record
     }
 
@@ -1248,7 +1244,7 @@ impl MappedSharedWalCoordination {
     ///
     /// Any frame-index entries beyond the new tail are discarded first so the
     /// published header and published page-to-frame index stay in sync.
-    pub(crate) fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
+    pub fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
         self.clear_backfill_proof();
         // Snapshots define the authoritative visible WAL range. If the shared
         // frame index still carries entries from an older generation past that
@@ -1434,7 +1430,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Persist a proof that the current positive `nbackfills` state matches the main DB file.
-    pub(crate) fn install_backfill_proof(
+    pub fn install_backfill_proof(
         &self,
         snapshot: SharedWalCoordinationHeader,
         db_size_pages: u32,
@@ -1487,7 +1483,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Validate the persisted backfill proof against the current WAL snapshot and DB header.
-    pub(crate) fn validate_backfill_proof(
+    pub fn validate_backfill_proof(
         &self,
         snapshot: SharedWalCoordinationHeader,
         db_size_pages: u32,
@@ -1727,7 +1723,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Attempt to acquire the writer lock for this mapping.
-    pub(crate) fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
+    pub fn try_acquire_writer(&self, owner: SharedOwnerRecord) -> bool {
         let mut local = self.local_lock_state.lock();
         if local.writer_lock_held {
             return false;
@@ -1763,7 +1759,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Release the writer lock held by this mapping.
-    pub(crate) fn release_writer(&self, owner: SharedOwnerRecord) {
+    pub fn release_writer(&self, owner: SharedOwnerRecord) {
         let mut local = self.local_lock_state.lock();
         turso_assert!(local.writer_lock_held, "writer registry count underflow");
         if self.uses_linux_ofd_locking() {
@@ -2206,7 +2202,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Read the shared owner metadata stored for one reader slot.
-    pub(crate) fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
+    pub fn reader_owner(&self, slot_index: u32) -> Option<SharedOwnerRecord> {
         SharedOwnerRecord::from_raw(
             self.reader_owners()[slot_index as usize].load(Ordering::Acquire),
         )
@@ -2226,7 +2222,7 @@ impl MappedSharedWalCoordination {
         verify = "test",
         id = "reader_slot_frame_zero_means_db_file_reader"
     )]
-    pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
+    pub fn min_active_reader_frame(&self) -> Option<u64> {
         self.live_reader_frames()
             .filter(|frame| *frame != DB_FILE_READER_FRAME)
             .min()
@@ -2234,7 +2230,7 @@ impl MappedSharedWalCoordination {
 
     /// Whether a reader in any process reads only the database file.
     /// Checkpoints must not backfill any new frame while one is active.
-    pub(crate) fn has_active_db_file_reader(&self) -> bool {
+    pub fn has_active_db_file_reader(&self) -> bool {
         self.live_reader_frames()
             .any(|frame| frame == DB_FILE_READER_FRAME)
     }
@@ -2314,7 +2310,7 @@ impl MappedSharedWalCoordination {
     /// When frame_id == 1 and max_frame == 0 (WAL just restarted), the index
     /// is reset to empty before appending.
     #[track_caller]
-    pub(crate) fn record_frame(&self, page_id: u64, frame_id: u64) {
+    pub fn record_frame(&self, page_id: u64, frame_id: u64) {
         let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         if frame_id == 1 && header.max_frame.load(Ordering::Acquire) == 0 {
@@ -2436,7 +2432,7 @@ impl MappedSharedWalCoordination {
     ///
     /// Uses per-block hash tables for O(1) lookup within each block, scanning
     /// blocks in reverse order so the most recent entry wins.
-    pub(crate) fn find_frame(
+    pub fn find_frame(
         &self,
         page_id: u64,
         min_frame: u64,
@@ -2509,7 +2505,7 @@ impl MappedSharedWalCoordination {
     /// Used by checkpoint to determine which pages need to be copied from the
     /// WAL to the DB file. For each page, only the highest-numbered frame is
     /// returned (that frame contains the most recent version of the page).
-    pub(crate) fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+    pub fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
         self.try_iter_latest_frames(min_frame, max_frame)
             .expect("shared WAL enumeration failed")
     }

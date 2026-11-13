@@ -518,7 +518,7 @@ impl LimboError {
         }
     }
 
-    pub(crate) fn is_foreign_key_constraint(&self) -> bool {
+    pub fn is_foreign_key_constraint(&self) -> bool {
         match self {
             Self::ForeignKeyConstraint(_) => true,
             Self::ConstraintViolation(violation) => violation.kind == ConstraintKind::ForeignKey,

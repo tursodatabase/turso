@@ -1217,6 +1217,8 @@ dependencies = [
  "similar-asserts",
  "sorted-vec",
  "sql_generation",
+ "tantivy",
+ "tantivy-common",
  "tempfile",
  "test-log",
  "tokio",
