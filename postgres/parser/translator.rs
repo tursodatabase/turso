@@ -3404,12 +3404,20 @@ impl PostgreSQLTranslator {
                     return Err(ParseError::not_supported("a type modifier in a cast"));
                 }
                 let type_name = extract_type_name_from_typename(pg_type_name)?;
-                if type_name.eq_ignore_ascii_case("int2") {
-                    expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int2));
-                } else if type_name.eq_ignore_ascii_case("int4") {
-                    expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int4));
-                } else if type_name.eq_ignore_ascii_case("int8") {
-                    expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int8));
+                match type_name.to_ascii_lowercase().as_str() {
+                    "int2" => {
+                        expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int2))
+                    }
+                    "int4" => {
+                        expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int4))
+                    }
+                    "int8" => {
+                        expr = Box::new(int_cast_operand(arg, (*expr).clone(), IntegerType::Int8))
+                    }
+                    "oid" => return Ok(function_call("pg_cast_oid", vec![*expr])),
+                    "regtype" => return Ok(function_call("pg_cast_regtype", vec![*expr])),
+                    "regclass" => return Ok(function_call("pg_cast_regclass", vec![*expr])),
+                    _ => (),
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -4397,6 +4405,7 @@ impl PostgreSQLTranslator {
             "INT2" => Some("SMALLINT"),
             "INT4" => Some("INTEGER"),
             "INT8" => Some("BIGINT"),
+            "OID" | "REGCLASS" | "REGTYPE" => Some("INTEGER"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
             _ => None,
@@ -4431,6 +4440,12 @@ impl PostgreSQLTranslator {
                         (*operand).clone(),
                         IntegerType::Int8,
                     ));
+                } else if func_name.eq_ignore_ascii_case("oid") {
+                    return Ok(function_call("pg_cast_oid", vec![*operand]));
+                } else if func_name.eq_ignore_ascii_case("regtype") {
+                    return Ok(function_call("pg_cast_regtype", vec![*operand]));
+                } else if func_name.eq_ignore_ascii_case("regclass") {
+                    return Ok(function_call("pg_cast_regclass", vec![*operand]));
                 }
                 return Ok(ast::Expr::Cast {
                     expr: operand,
@@ -9429,6 +9444,9 @@ const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &[
     "int2_out_of_range",
     "int4_out_of_range",
     "int8_out_of_range",
+    "pg_cast_oid",
+    "pg_cast_regtype",
+    "pg_cast_regclass",
 ];
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {

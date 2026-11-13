@@ -134,6 +134,45 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
                 _ => unreachable!("integer cast must return an integer or NULL"),
             }
         },
+        "pg_cast_oid"(FunctionArity::Exact(1), true) => {
+            match args[0].get_value() {
+                Value::Null => None::<i64>,
+                value => {
+                    let converted = value.exec_cast("INTEGER")?;
+                    Some(
+                        converted
+                            .as_int()
+                            .expect("INTEGER affinity cast must return an integer"),
+                    )
+                }
+            }
+        },
+        "pg_cast_regclass"(FunctionArity::Exact(1), true) => {
+            match args[0].get_value() {
+                Value::Null => None::<i64>,
+                value => {
+                    let converted = value.exec_cast("INTEGER")?;
+                    Some(
+                        converted
+                            .as_int()
+                            .expect("INTEGER affinity cast must return an integer"),
+                    )
+                }
+            }
+        },
+        "pg_cast_regtype"(FunctionArity::Exact(1), true) => {
+            match args[0].get_value() {
+                Value::Null => None::<i64>,
+                value => {
+                    let converted = value.exec_cast("INTEGER")?;
+                    Some(
+                        converted
+                            .as_int()
+                            .expect("INTEGER affinity cast must return an integer"),
+                    )
+                }
+            }
+        },
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
