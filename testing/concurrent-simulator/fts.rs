@@ -12,6 +12,7 @@ use crate::workloads::{
     FTS_SIM_INDEX, FTS_SIM_TABLE, FTS_SIM_WORDS, FtsMatchWorkload, fts_sim_schema,
 };
 use crate::{FiberState, OpResult, Operation, SchemaBias, TxMode, Whopper, WhopperOpts};
+use turso_core::SessionRole;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FtsProfile {
@@ -314,7 +315,7 @@ impl Whopper {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let connection = database.connect(ConnectOpts::new())?;
+        let connection = database.connect(ConnectOpts::new(SessionRole::Superuser))?;
         check_fts_connection(&connection, self.context.enable_mvcc)?;
         let rows = query(
             &connection,

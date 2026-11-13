@@ -49,6 +49,7 @@ mod tests {
         commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,
     };
     use crate::mvcc::database::{RowID, RowKey};
+    use crate::security::roles::SessionRole;
     use crate::sync::atomic::AtomicI64;
     use crate::sync::atomic::Ordering;
     use crate::sync::Arc;
@@ -72,7 +73,10 @@ mod tests {
         let th1 = {
             let db = db.clone();
             std::thread::spawn(move || {
-                let conn = db.get_db().connect(ConnectOpts::new()).unwrap();
+                let conn = db
+                    .get_db()
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
                 let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 for _ in 0..iterations {
                     let tx = loop {
@@ -143,7 +147,10 @@ mod tests {
         };
         let th2 = {
             std::thread::spawn(move || {
-                let conn = db.get_db().connect(ConnectOpts::new()).unwrap();
+                let conn = db
+                    .get_db()
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
                 let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 for _ in 0..iterations {
                     let tx = loop {
@@ -230,7 +237,10 @@ mod tests {
         let work = |prefix: &'static str| {
             let db = db.clone();
             std::thread::spawn(move || {
-                let conn = db.get_db().connect(ConnectOpts::new()).unwrap();
+                let conn = db
+                    .get_db()
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
                 let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 let mut failed_upserts = 0;
                 let mut failed_commits = 0;

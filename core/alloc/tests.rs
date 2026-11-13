@@ -1,4 +1,5 @@
 use super::*;
+use crate::security::roles::SessionRole;
 use crate::ConnectOpts;
 use crate::DatabaseAllocators;
 use std::{
@@ -145,7 +146,9 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
             }),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     allocations.store(0, Ordering::Relaxed);
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();

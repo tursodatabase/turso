@@ -1,5 +1,5 @@
 use crate::alloc::TursoIteratorExt;
-use crate::dialect::{NewOwner, RelationChange};
+use crate::dialect::{CatalogChange, NewOwner};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
@@ -8,10 +8,7 @@ use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, SymbolTable};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use turso_parser::ast::{self, TableInternalId};
 
 use super::{
     index::emit_refill_index,
@@ -760,6 +757,7 @@ fn emit_column_constraints_validation(
                 namespace,
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );
@@ -941,6 +939,12 @@ pub fn translate_alter_table(
         }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
+            row_security::reject_change_of_policy_column(
+                resolver,
+                namespace,
+                table_name,
+                column_name,
+            )?;
 
             // The column must exist before anything else is checked, as in
             // SQLite: a PostgreSQL table can have no columns at all.
@@ -1193,8 +1197,7 @@ pub fn translate_alter_table(
                 "#,
             );
 
-            let mut parser = Parser::new(stmt.as_bytes());
-            let cmd = parser.next_cmd().map_err(|e| {
+            let cmd = crate::dialect::engine::parse_statement(&stmt).map_err(|e| {
                 LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
             })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
@@ -1410,8 +1413,7 @@ pub fn translate_alter_table(
                 "#,
             );
 
-            let mut parser = Parser::new(stmt.as_bytes());
-            let cmd = parser.next_cmd().map_err(|e| {
+            let cmd = crate::dialect::engine::parse_statement(&stmt).map_err(|e| {
                 LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
             })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
@@ -1749,7 +1751,7 @@ pub fn translate_alter_table(
             if schema::dialect_relation_hooks_apply(connection, database_id)? {
                 // Automatic indexes are renamed with the table, because
                 // their names embed it.
-                let mut changes = vec![RelationChange::Rename {
+                let mut changes = vec![CatalogChange::Rename {
                     namespace: namespace.id,
                     old_name: normalized_old_name,
                     new_name: normalized_new_name,
@@ -1762,13 +1764,13 @@ pub fn translate_alter_table(
                     ) else {
                         continue;
                     };
-                    changes.push(RelationChange::Rename {
+                    changes.push(CatalogChange::Rename {
                         namespace: namespace.id,
                         old_name: index.name.clone(),
                         new_name,
                     });
                 }
-                resolver.catalog.dialect.translate_relation_changes(
+                resolver.catalog.dialect.translate_catalog_changes(
                     program,
                     resolver.schema(),
                     connection,
@@ -1794,8 +1796,7 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
+                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
                     ))
@@ -1868,6 +1869,7 @@ pub fn translate_alter_table(
 
             let from = from.as_str();
             let col_name = col_name.as_str();
+            row_security::reject_change_of_policy_column(resolver, namespace, table_name, from)?;
 
             let Some((column_index, _)) = btree.get_column(from) else {
                 return Err(LimboError::ParseError(format!(
@@ -2374,8 +2376,7 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
+                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
                     ))
@@ -2408,8 +2409,7 @@ pub fn translate_alter_table(
                     "#,
                 );
 
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
+                let cmd = crate::dialect::engine::parse_statement(&update_stmt).map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse view update SQL for {view_name}: {e}"
                     ))
@@ -2569,7 +2569,7 @@ fn translate_alter_owner(
     }
     // The dialect decides what goes with the relation, such as a table's
     // indexes, and whose an index's owner is.
-    let changes = [RelationChange::ChangeOwner {
+    let changes = [CatalogChange::ChangeOwner {
         namespace: namespace.id,
         name: normalized_name,
         owner: NewOwner::Role(role.clone()),
@@ -2577,7 +2577,7 @@ fn translate_alter_owner(
 
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_relation_changes(
+    resolver.catalog.dialect.translate_catalog_changes(
         program,
         resolver.schema(),
         connection,
@@ -3295,9 +3295,7 @@ fn rewrite_trigger_sql_for_table_rename(
     new_table_name: &str,
     renamed_db_name: &str,
 ) -> Result<String> {
-    let mut parser = Parser::new(trigger_sql.as_bytes());
-    let cmd = parser
-        .next_cmd()
+    let cmd = crate::dialect::engine::parse_statement(trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
@@ -3375,9 +3373,7 @@ fn rewrite_trigger_sql_for_column_rename(
     resolver: &Resolver,
 ) -> Result<String> {
     // Parse the trigger SQL
-    let mut parser = Parser::new(trigger_sql.as_bytes());
-    let cmd = parser
-        .next_cmd()
+    let cmd = crate::dialect::engine::parse_statement(trigger_sql)
         .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,

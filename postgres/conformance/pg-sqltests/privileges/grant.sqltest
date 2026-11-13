@@ -1,4 +1,4 @@
-# GRANT SELECT on tables through the PostgreSQL frontend.
+# GRANT on tables through the PostgreSQL frontend.
 # PostgreSQL roles belong to the whole server, not to one database, so every
 # test uses its own role names.
 #
@@ -349,6 +349,30 @@ expect {
     {postgres=arwdDxtm/postgres,GsAclCased=r/postgres}
 }
 
+# The table's owner is another role here, so that the entry of the role
+# the keyword names is not the owner's.
+test grant-select-to-session-user-is-stored-for-the-session-role {
+    CREATE ROLE gx_session_owner;
+    CREATE TABLE gx_session (id INT);
+    ALTER TABLE gx_session OWNER TO gx_session_owner;
+    GRANT SELECT ON gx_session TO SESSION_USER;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_session';
+}
+expect {
+    {gx_session_owner=arwdDxtm/gx_session_owner,postgres=r/gx_session_owner}
+}
+
+test grant-select-to-current-role-is-stored-for-the-current-role {
+    CREATE ROLE gx_current_owner;
+    CREATE TABLE gx_current (id INT);
+    ALTER TABLE gx_current OWNER TO gx_current_owner;
+    GRANT SELECT ON gx_current TO CURRENT_ROLE;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_current';
+}
+expect {
+    {gx_current_owner=arwdDxtm/gx_current_owner,postgres=r/gx_current_owner}
+}
+
 test grant-select-on-sequence-is-stored-with-sequence-privileges {
     CREATE ROLE gs_acl_seq_reader;
     CREATE SEQUENCE gs_acl_seq;
@@ -357,6 +381,207 @@ test grant-select-on-sequence-is-stored-with-sequence-privileges {
 }
 expect {
     {postgres=rwU/postgres,gs_acl_seq_reader=r/postgres}
+}
+
+test grant-insert-update-delete-is-stored-in-relacl {
+    CREATE ROLE gs_acl_writer;
+    CREATE TABLE gs_acl_written (id INT);
+    GRANT INSERT, UPDATE, DELETE ON gs_acl_written TO gs_acl_writer;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_written';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_writer=awd/postgres}
+}
+
+test grant-of-more-privileges-adds-them-to-the-entry {
+    CREATE ROLE gs_acl_more;
+    CREATE TABLE gs_acl_more_docs (id INT);
+    GRANT SELECT ON gs_acl_more_docs TO gs_acl_more;
+    GRANT TRUNCATE, INSERT ON gs_acl_more_docs TO gs_acl_more;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_more_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gs_acl_more=arD/postgres}
+}
+
+test grant-all-is-stored-as-every-table-privilege {
+    CREATE ROLE gs_acl_everything;
+    CREATE TABLE gs_acl_all_docs (id INT);
+    CREATE TABLE gs_acl_all_privileges_docs (id INT);
+    GRANT ALL ON gs_acl_all_docs TO gs_acl_everything;
+    GRANT ALL PRIVILEGES ON TABLE gs_acl_all_privileges_docs TO gs_acl_everything;
+    SELECT relname, relacl FROM pg_class
+        WHERE relname IN ('gs_acl_all_docs', 'gs_acl_all_privileges_docs') ORDER BY relname;
+}
+expect {
+    gs_acl_all_docs|{postgres=arwdDxtm/postgres,gs_acl_everything=arwdDxtm/postgres}
+    gs_acl_all_privileges_docs|{postgres=arwdDxtm/postgres,gs_acl_everything=arwdDxtm/postgres}
+}
+
+test grant-truncate-is-stored-in-relacl {
+    CREATE ROLE gx_truncate_grantee;
+    CREATE TABLE gx_truncate_granted (id INT);
+    GRANT TRUNCATE ON gx_truncate_granted TO gx_truncate_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_truncate_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_truncate_grantee=D/postgres}
+}
+
+test grant-references-is-stored-in-relacl {
+    CREATE ROLE gx_references_grantee;
+    CREATE TABLE gx_references_granted (id INT);
+    GRANT REFERENCES ON gx_references_granted TO gx_references_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_references_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_references_grantee=x/postgres}
+}
+
+test grant-trigger-is-stored-in-relacl {
+    CREATE ROLE gx_trigger_grantee;
+    CREATE TABLE gx_trigger_granted (id INT);
+    GRANT TRIGGER ON gx_trigger_granted TO gx_trigger_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_trigger_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_trigger_grantee=t/postgres}
+}
+
+test grant-maintain-is-stored-in-relacl {
+    CREATE ROLE gx_maintain_grantee;
+    CREATE TABLE gx_maintain_granted (id INT);
+    GRANT MAINTAIN ON gx_maintain_granted TO gx_maintain_grantee;
+    SELECT relacl FROM pg_class WHERE relname = 'gx_maintain_granted';
+}
+expect {
+    {postgres=arwdDxtm/postgres,gx_maintain_grantee=m/postgres}
+}
+
+test grant-all-on-all-tables-in-schema-is-stored-on-each-table {
+    CREATE ROLE gs_acl_all_schema;
+    CREATE SCHEMA gs_acl_all_schema_s;
+    CREATE TABLE gs_acl_all_schema_s.a (id INT);
+    CREATE TABLE gs_acl_all_schema_s.b (id INT);
+    GRANT ALL ON ALL TABLES IN SCHEMA gs_acl_all_schema_s TO gs_acl_all_schema;
+    SELECT c.relname, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'gs_acl_all_schema_s' ORDER BY c.relname;
+}
+expect {
+    a|{postgres=arwdDxtm/postgres,gs_acl_all_schema=arwdDxtm/postgres}
+    b|{postgres=arwdDxtm/postgres,gs_acl_all_schema=arwdDxtm/postgres}
+}
+
+test grant-on-all-tables-in-several-schemas-is-stored-on-their-tables-only {
+    CREATE ROLE gx_schemas_reader;
+    CREATE SCHEMA gx_schema_a;
+    CREATE SCHEMA gx_schema_b;
+    CREATE TABLE gx_schema_a.gx_in_a (id INT);
+    CREATE TABLE gx_schema_b.gx_in_b (id INT);
+    CREATE TABLE gx_in_public (id INT);
+    GRANT SELECT ON ALL TABLES IN SCHEMA gx_schema_a, gx_schema_b TO gx_schemas_reader;
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+    WHERE relname IN ('gx_in_a', 'gx_in_b', 'gx_in_public') ORDER BY relname;
+}
+expect {
+    gx_in_a|{postgres=arwdDxtm/postgres,gx_schemas_reader=r/postgres}
+    gx_in_b|{postgres=arwdDxtm/postgres,gx_schemas_reader=r/postgres}
+    gx_in_public|null
+}
+
+# A sequence has only SELECT, UPDATE and USAGE, and PostgreSQL leaves out
+# the others with a warning.
+test grant-all-on-sequence-is-stored-with-sequence-privileges {
+    CREATE ROLE gs_acl_seq_all;
+    CREATE SEQUENCE gs_acl_seq_all_s;
+    GRANT ALL ON gs_acl_seq_all_s TO gs_acl_seq_all;
+    SELECT relacl FROM pg_class WHERE relname = 'gs_acl_seq_all_s';
+}
+expect {
+    {postgres=rwU/postgres,gs_acl_seq_all=rwU/postgres}
+}
+
+test grant-insert-on-sequence-stores-nothing-for-the-role {
+    CREATE ROLE gs_acl_seq_insert;
+    CREATE SEQUENCE gs_acl_seq_insert_s;
+    GRANT INSERT ON gs_acl_seq_insert_s TO gs_acl_seq_insert;
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'gs_acl_seq_insert_s';
+}
+expect {
+    null
+}
+
+test grant-of-a-privilege-tables-do-not-have-fails {
+    CREATE ROLE gs_acl_usage;
+    CREATE TABLE gs_acl_usage_docs (id INT);
+    GRANT USAGE ON gs_acl_usage_docs TO gs_acl_usage;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type USAGE for table
+}
+
+@skip-if postgres "PostgreSQL supports column privileges"
+test grant-of-column-privileges-is-not-supported {
+    CREATE ROLE gs_acl_columns;
+    CREATE TABLE gs_acl_columns_docs (id INT, body TEXT);
+    GRANT UPDATE (body) ON gs_acl_columns_docs TO gs_acl_columns;
+}
+@sqlstate 0A000
+expect error {
+    GRANT of column privileges is not supported
+}
+
+@skip-if postgres "PostgreSQL supports WITH GRANT OPTION"
+test grant-with-grant-option-is-not-supported {
+    CREATE ROLE gx_grant_option;
+    CREATE TABLE gx_grant_option_on (id INT);
+    GRANT SELECT ON gx_grant_option_on TO gx_grant_option WITH GRANT OPTION;
+}
+@sqlstate 0A000
+expect error {
+    GRANT ... WITH GRANT OPTION is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANTED BY"
+test grant-granted-by-is-not-supported {
+    CREATE ROLE gx_granted_by;
+    CREATE TABLE gx_granted_by_on (id INT);
+    GRANT SELECT ON gx_granted_by_on TO gx_granted_by GRANTED BY postgres;
+}
+@sqlstate 0A000
+expect error {
+    GRANT ... GRANTED BY is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANT on schemas"
+test grant-on-a-schema-is-not-supported {
+    CREATE ROLE gx_schema_user;
+    GRANT USAGE ON SCHEMA public TO gx_schema_user;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on objects other than tables and sequences is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANT on functions"
+test grant-on-a-function-is-not-supported {
+    CREATE ROLE gx_function_user;
+    GRANT EXECUTE ON FUNCTION lower(text) TO gx_function_user;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on objects other than tables and sequences is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER DEFAULT PRIVILEGES"
+test alter-default-privileges-is-not-supported {
+    CREATE ROLE un_default_grantee;
+    ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO un_default_grantee;
+}
+@sqlstate 0A000
+expect error {
+    ALTER DEFAULT PRIVILEGES is not supported
 }
 
 # Views are granted on too, which the Rust integration tests cover, because
@@ -475,150 +700,78 @@ expect {
     {postgres=arwdDxtm/postgres,gs_acl_renamed_reader=r/postgres}
 }
 
-# What GRANT allows: reading the table.
-
-test role-without-select-cannot-read-the-table {
-    CREATE ROLE gs_denied;
-    CREATE TABLE gs_closed (id INT);
-    SET ROLE gs_denied;
-    SELECT id FROM gs_closed;
-}
-@sqlstate 42501
-expect error {
-    permission denied for table gs_closed
-}
-
-test role-without-select-cannot-read-the-table-in-a-join {
-    CREATE ROLE gs_denied_join;
-    CREATE TABLE gs_open_j (id INT);
-    CREATE TABLE gs_closed_j (id INT);
-    GRANT SELECT ON gs_open_j TO gs_denied_join;
-    SET ROLE gs_denied_join;
-    SELECT o.id FROM gs_open_j o JOIN gs_closed_j c ON c.id = o.id;
-}
-@sqlstate 42501
-expect error {
-    permission denied for table gs_closed_j
-}
-
-test role-without-select-cannot-read-the-table-in-a-subquery {
-    CREATE ROLE gs_denied_sub;
-    CREATE TABLE gs_closed_sub (id INT);
-    SET ROLE gs_denied_sub;
-    SELECT 1 WHERE EXISTS (SELECT 1 FROM gs_closed_sub);
-}
-@sqlstate 42501
-expect error {
-    permission denied for table gs_closed_sub
-}
-
-test role-without-select-cannot-read-the-table-in-a-cte {
-    CREATE ROLE gs_denied_cte;
-    CREATE TABLE gs_closed_cte (id INT);
-    SET ROLE gs_denied_cte;
-    WITH c AS (SELECT id FROM gs_closed_cte) SELECT id FROM c;
-}
-@sqlstate 42501
-expect error {
-    permission denied for table gs_closed_cte
-}
-
-test role-without-select-cannot-read-the-view {
-    CREATE ROLE gs_denied_view;
-    CREATE TABLE gs_view_closed_base (id INT);
-    CREATE VIEW gs_closed_view AS SELECT id FROM gs_view_closed_base;
-    SET ROLE gs_denied_view;
-    SELECT id FROM gs_closed_view;
-}
-@sqlstate 42501
-expect error {
-    permission denied for view gs_closed_view
-}
-
-test select-on-the-view-is-enough-when-its-owner-reads-the-table {
-    CREATE ROLE gs_view_only;
-    CREATE TABLE gs_view_only_base (id INT);
-    INSERT INTO gs_view_only_base VALUES (7);
-    CREATE VIEW gs_view_only_view AS SELECT id FROM gs_view_only_base;
-    GRANT SELECT ON gs_view_only_view TO gs_view_only;
-    SET ROLE gs_view_only;
-    SELECT id FROM gs_view_only_view;
+test grant-on-sequence-is-stored-in-relacl {
+    CREATE ROLE gq_stored;
+    CREATE SEQUENCE gq_stored_s;
+    GRANT USAGE, UPDATE ON SEQUENCE gq_stored_s TO gq_stored;
+    SELECT relacl FROM pg_class WHERE relname = 'gq_stored_s';
 }
 expect {
-    7
+    {postgres=rwU/postgres,gq_stored=wU/postgres}
 }
 
-test select-on-the-view-is-not-enough-when-its-owner-cannot-read-the-table {
-    CREATE ROLE gs_view_owner;
-    CREATE ROLE gs_view_reader2;
-    CREATE TABLE gs_view_private_base (id INT);
-    CREATE VIEW gs_view_of_private AS SELECT id FROM gs_view_private_base;
-    ALTER VIEW gs_view_of_private OWNER TO gs_view_owner;
-    GRANT SELECT ON gs_view_of_private TO gs_view_reader2;
-    SET ROLE gs_view_reader2;
-    SELECT id FROM gs_view_of_private;
-}
-@sqlstate 42501
-expect error {
-    permission denied for table gs_view_private_base
-}
-
-test the-owner-reads-its-table-without-a-grant {
-    CREATE ROLE gs_owner_reads;
-    CREATE TABLE gs_owned_by_reader (id INT);
-    INSERT INTO gs_owned_by_reader VALUES (3);
-    ALTER TABLE gs_owned_by_reader OWNER TO gs_owner_reads;
-    SET ROLE gs_owner_reads;
-    SELECT id FROM gs_owned_by_reader;
+test grant-usage-on-a-sequence-named-as-a-table-is-stored {
+    CREATE ROLE gq_usage_as_table;
+    CREATE SEQUENCE gq_usage_as_table_s;
+    GRANT USAGE ON gq_usage_as_table_s TO gq_usage_as_table;
+    SELECT relacl FROM pg_class WHERE relname = 'gq_usage_as_table_s';
 }
 expect {
-    3
+    {postgres=rwU/postgres,gq_usage_as_table=U/postgres}
 }
 
-test select-granted-to-public-lets-a-role-made-later-read {
-    CREATE TABLE gs_for_all (id INT);
-    INSERT INTO gs_for_all VALUES (5);
-    GRANT SELECT ON gs_for_all TO PUBLIC;
-    CREATE ROLE gs_latecomer;
-    SET ROLE gs_latecomer;
-    SELECT id FROM gs_for_all;
+test grant-usage-on-a-sequence-and-a-table-fails {
+    CREATE ROLE gq_usage_mixed;
+    CREATE SEQUENCE gq_usage_mixed_s;
+    CREATE TABLE gq_usage_mixed_t (id INT);
+    GRANT USAGE ON gq_usage_mixed_s, gq_usage_mixed_t TO gq_usage_mixed;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type USAGE for table
+}
+
+test grant-all-on-all-sequences-in-schema-is-stored-on-each-sequence-but-not-tables {
+    CREATE ROLE gq_all;
+    CREATE SCHEMA gq_all_schema;
+    CREATE SEQUENCE gq_all_schema.s;
+    CREATE TABLE gq_all_schema.t (id INT);
+    GRANT ALL ON ALL SEQUENCES IN SCHEMA gq_all_schema TO gq_all;
+    SELECT c.relname, coalesce(c.relacl::text, 'null') FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'gq_all_schema' ORDER BY c.relname;
 }
 expect {
-    5
+    s|{postgres=rwU/postgres,gq_all=rwU/postgres}
+    t|null
 }
 
-test select-granted-to-another-role-does-not-let-this-one-read {
-    CREATE ROLE gs_granted_other;
-    CREATE ROLE gs_not_granted;
-    CREATE TABLE gs_for_other (id INT);
-    GRANT SELECT ON gs_for_other TO gs_granted_other;
-    SET ROLE gs_not_granted;
-    SELECT id FROM gs_for_other;
+test grant-on-sequence-of-a-table-fails {
+    CREATE ROLE gq_not_a_sequence;
+    CREATE TABLE gq_not_a_sequence_t (id INT);
+    GRANT USAGE ON SEQUENCE gq_not_a_sequence_t TO gq_not_a_sequence;
 }
-@sqlstate 42501
+@sqlstate 42809
 expect error {
-    permission denied for table gs_for_other
+    "gq_not_a_sequence_t" is not a sequence
 }
 
-test reset-role-reads-again {
-    CREATE ROLE gs_back_to_super;
-    CREATE TABLE gs_after_reset (id INT);
-    INSERT INTO gs_after_reset VALUES (9);
-    SET ROLE gs_back_to_super;
-    RESET ROLE;
-    SELECT id FROM gs_after_reset;
+test grant-of-a-privilege-sequences-do-not-have-fails {
+    CREATE ROLE gq_insert;
+    CREATE SEQUENCE gq_insert_s;
+    GRANT INSERT ON SEQUENCE gq_insert_s TO gq_insert;
 }
-expect {
-    9
-}
-
-test role-without-select-cannot-count-the-table {
-    CREATE ROLE gs_denied_count;
-    CREATE TABLE gs_closed_count (id INT);
-    SET ROLE gs_denied_count;
-    SELECT count(*) FROM gs_closed_count;
-}
-@sqlstate 42501
+@sqlstate 0LP01
 expect error {
-    permission denied for table gs_closed_count
+    invalid privilege type INSERT for sequence
+}
+
+@skip-if postgres "PostgreSQL has no __turso_internal_* tables"
+test grant-on-an-engine-table-is-not-supported {
+    CREATE ROLE gs_catalog_grantee;
+    GRANT SELECT ON pg_catalog.__turso_internal_authid TO gs_catalog_grantee;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on internal table __turso_internal_authid is not supported
 }

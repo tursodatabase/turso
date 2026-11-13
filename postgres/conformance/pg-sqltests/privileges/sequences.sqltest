@@ -1,0 +1,254 @@
+# What the privileges on a sequence let a role do through the PostgreSQL
+# frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+
+@database :memory:
+
+test role-without-privileges-cannot-call-nextval {
+    CREATE SEQUENCE rw_nextval_seq;
+    CREATE ROLE rw_nextval_caller;
+    SET ROLE rw_nextval_caller;
+    SELECT nextval('rw_nextval_seq');
+}
+expect error {
+    permission denied for sequence rw_nextval_seq
+}
+
+test role-without-privileges-cannot-call-setval {
+    CREATE SEQUENCE rw_setval_seq;
+    CREATE ROLE rw_setval_caller;
+    SET ROLE rw_setval_caller;
+    SELECT setval('rw_setval_seq', 5);
+}
+expect error {
+    permission denied for sequence rw_setval_seq
+}
+
+# Sequences. As in PostgreSQL, nextval() needs USAGE or UPDATE on the
+# sequence, and setval() needs UPDATE, so a role that inserts into a table
+# with a serial column needs USAGE on the column's sequence too. Turso does
+# not use the sequence for a serial PRIMARY KEY column, so the tests below
+# use serial columns that are not the primary key.
+
+test role-without-usage-cannot-call-nextval {
+    CREATE ROLE gq_no_usage;
+    CREATE SEQUENCE gq_no_usage_s;
+    SET ROLE gq_no_usage;
+    SELECT nextval('gq_no_usage_s');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_no_usage_s
+}
+
+test grant-usage-lets-a-role-call-nextval {
+    CREATE ROLE gq_usage;
+    CREATE SEQUENCE gq_usage_s;
+    GRANT USAGE ON SEQUENCE gq_usage_s TO gq_usage;
+    SET ROLE gq_usage;
+    SELECT nextval('gq_usage_s');
+    SELECT nextval('gq_usage_s');
+}
+expect {
+    1
+    2
+}
+
+test grant-update-lets-a-role-call-nextval {
+    CREATE ROLE gq_update;
+    CREATE SEQUENCE gq_update_s;
+    GRANT UPDATE ON SEQUENCE gq_update_s TO gq_update;
+    SET ROLE gq_update;
+    SELECT nextval('gq_update_s');
+}
+expect {
+    1
+}
+
+test setval-needs-update {
+    CREATE ROLE gq_setval;
+    CREATE SEQUENCE gq_setval_s;
+    GRANT USAGE ON SEQUENCE gq_setval_s TO gq_setval;
+    SET ROLE gq_setval;
+    SELECT setval('gq_setval_s', 10);
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_setval_s
+}
+
+test grant-update-lets-a-role-call-setval {
+    CREATE ROLE gq_setval_update;
+    CREATE SEQUENCE gq_setval_update_s;
+    GRANT UPDATE ON SEQUENCE gq_setval_update_s TO gq_setval_update;
+    SET ROLE gq_setval_update;
+    SELECT setval('gq_setval_update_s', 10);
+    SELECT nextval('gq_setval_update_s');
+}
+expect {
+    10
+    11
+}
+
+test insert-into-a-serial-column-needs-usage-on-its-sequence {
+    CREATE ROLE gq_serial_no_usage;
+    CREATE TABLE gq_serial_no_usage_t (id SERIAL, body TEXT);
+    GRANT INSERT ON gq_serial_no_usage_t TO gq_serial_no_usage;
+    SET ROLE gq_serial_no_usage;
+    INSERT INTO gq_serial_no_usage_t (body) VALUES ('a');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_serial_no_usage_t_id_seq
+}
+
+test insert-into-a-serial-column-with-usage-on-its-sequence {
+    CREATE ROLE gq_serial;
+    CREATE TABLE gq_serial_t (id SERIAL, body TEXT);
+    GRANT INSERT ON gq_serial_t TO gq_serial;
+    GRANT USAGE ON SEQUENCE gq_serial_t_id_seq TO gq_serial;
+    SET ROLE gq_serial;
+    INSERT INTO gq_serial_t (body) VALUES ('a'), ('b');
+    RESET ROLE;
+    SELECT id, body FROM gq_serial_t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test grant-usage-on-all-sequences-in-schema-lets-a-role-call-nextval {
+    CREATE ROLE sq_all_user;
+    CREATE SEQUENCE sq_all_a;
+    CREATE SEQUENCE sq_all_b;
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO sq_all_user;
+    SET ROLE sq_all_user;
+    SELECT nextval('sq_all_a'), nextval('sq_all_b');
+}
+expect {
+    1|1
+}
+
+test insert-into-a-column-with-a-nextval-default-needs-usage-on-the-sequence {
+    CREATE ROLE sq_default_inserter;
+    CREATE SEQUENCE sq_default_s;
+    CREATE TABLE sq_default_t (id INT DEFAULT nextval('sq_default_s'), n INT);
+    GRANT INSERT ON sq_default_t TO sq_default_inserter;
+    SET ROLE sq_default_inserter;
+    INSERT INTO sq_default_t (n) VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence sq_default_s
+}
+
+test insert-into-a-column-with-a-nextval-default-with-usage-on-the-sequence {
+    CREATE ROLE sq_default_user;
+    CREATE SEQUENCE sq_default_used;
+    CREATE TABLE sq_default_used_t (id INT DEFAULT nextval('sq_default_used'), n INT);
+    GRANT INSERT ON sq_default_used_t TO sq_default_user;
+    GRANT USAGE ON sq_default_used TO sq_default_user;
+    SET ROLE sq_default_user;
+    INSERT INTO sq_default_used_t (n) VALUES (1), (2);
+    RESET ROLE;
+    SELECT id, n FROM sq_default_used_t ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+}
+
+test role-without-privileges-cannot-call-currval {
+    CREATE ROLE gq_no_currval;
+    CREATE SEQUENCE gq_no_currval_seq;
+    SELECT nextval('gq_no_currval_seq');
+    SET ROLE gq_no_currval;
+    SELECT currval('gq_no_currval_seq');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_no_currval_seq
+}
+
+test grant-select-lets-a-role-call-currval {
+    CREATE ROLE gq_currval_select;
+    CREATE SEQUENCE gq_currval_select_seq;
+    SELECT nextval('gq_currval_select_seq');
+    GRANT SELECT ON SEQUENCE gq_currval_select_seq TO gq_currval_select;
+    SET ROLE gq_currval_select;
+    SELECT currval('gq_currval_select_seq');
+}
+expect {
+    1
+    1
+}
+
+test grant-usage-lets-a-role-call-currval {
+    CREATE ROLE gq_currval_usage;
+    CREATE SEQUENCE gq_currval_usage_seq;
+    GRANT USAGE ON SEQUENCE gq_currval_usage_seq TO gq_currval_usage;
+    SET ROLE gq_currval_usage;
+    SELECT nextval('gq_currval_usage_seq');
+    SELECT currval('gq_currval_usage_seq');
+}
+expect {
+    1
+    1
+}
+
+test currval-checks-a-sequence-name-computed-when-the-statement-runs {
+    CREATE ROLE gq_currval_computed;
+    CREATE SEQUENCE gq_currval_computed_seq;
+    CREATE TABLE gq_currval_names (n text);
+    INSERT INTO gq_currval_names VALUES ('gq_currval_computed_seq');
+    GRANT SELECT ON gq_currval_names TO gq_currval_computed;
+    GRANT USAGE ON SEQUENCE gq_currval_computed_seq TO gq_currval_computed;
+    SET ROLE gq_currval_computed;
+    SELECT nextval('gq_currval_computed_seq');
+    SELECT currval(lower('GQ_CURRVAL_COMPUTED_SEQ'));
+    SELECT currval(n) FROM gq_currval_names;
+}
+expect {
+    1
+    1
+    1
+}
+
+test currval-denies-a-sequence-name-computed-when-the-statement-runs {
+    CREATE ROLE gq_currval_computed_denied;
+    CREATE SEQUENCE gq_currval_computed_denied_seq;
+    SELECT nextval('gq_currval_computed_denied_seq');
+    SET ROLE gq_currval_computed_denied;
+    SELECT currval(lower('GQ_CURRVAL_COMPUTED_DENIED_SEQ'));
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence gq_currval_computed_denied_seq
+}
+
+test pg-sequences-hides-last-value-from-a-role-without-privileges {
+    CREATE ROLE gq_seq_view;
+    CREATE SEQUENCE gq_seq_view_seq;
+    SELECT nextval('gq_seq_view_seq');
+    SET ROLE gq_seq_view;
+    SELECT coalesce(last_value::text, 'null') FROM pg_sequences
+        WHERE sequencename = 'gq_seq_view_seq';
+}
+expect {
+    1
+    null
+}
+
+test pg-sequences-shows-last-value-to-a-role-with-usage {
+    CREATE ROLE gq_seq_view_usage;
+    CREATE SEQUENCE gq_seq_view_usage_seq;
+    SELECT nextval('gq_seq_view_usage_seq');
+    GRANT USAGE ON SEQUENCE gq_seq_view_usage_seq TO gq_seq_view_usage;
+    SET ROLE gq_seq_view_usage;
+    SELECT last_value FROM pg_sequences WHERE sequencename = 'gq_seq_view_usage_seq';
+}
+expect {
+    1
+    1
+}

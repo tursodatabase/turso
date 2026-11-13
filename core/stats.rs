@@ -449,6 +449,7 @@ mod tests {
     use super::{parse_stat_numbers, AnalyzeStats, NamespaceId};
     use crate::database::{ConnectOpts, Database, DatabaseOpts};
     use crate::dialect::EngineDialect;
+    use crate::security::roles::SessionRole;
     use crate::sync::Arc;
     use crate::{OpenFlags, PlatformIO, IO};
 
@@ -479,7 +480,9 @@ mod tests {
     /// Create table `t` (2 rows, 2 indexes) and ANALYZE it on a fresh
     /// connection, which is dropped on return.
     fn create_table_and_analyze(db: &Arc<Database>) {
-        let setup = db.connect(ConnectOpts::new()).unwrap();
+        let setup = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         setup
             .execute(
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER);
@@ -513,7 +516,9 @@ mod tests {
         create_table_and_analyze(&db);
         let mut connections = Vec::new();
         for _ in 0..5 {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             assert!(
                 Arc::ptr_eq(&conn.schema.read(), &db.schema.lock()),
                 "new connection must share the database schema instead of deep-cloning it"
@@ -529,7 +534,9 @@ mod tests {
     #[test]
     fn existing_connection_shares_schema_after_analyze() {
         let (_dir, db) = open_db();
-        let setup = db.connect(ConnectOpts::new()).unwrap();
+        let setup = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         setup
             .execute(
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER);
@@ -539,7 +546,9 @@ mod tests {
             )
             .unwrap();
         drop(setup);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("ANALYZE").unwrap();
         assert!(
             Arc::ptr_eq(&conn.schema.read(), &db.schema.lock()),
@@ -555,7 +564,9 @@ mod tests {
     fn analyze_after_more_rows_updates_shared_stats() {
         let (_dir, db) = open_db();
         create_table_and_analyze(&db);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute(
             "INSERT INTO t (a, b, c) VALUES ('p', 'q', 3), ('r', 's', 4), ('u', 'v', 5);
              ANALYZE",
@@ -575,7 +586,9 @@ mod tests {
             Some(5)
         );
         drop(shared);
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         assert!(Arc::ptr_eq(&conn2.schema.read(), &db.schema.lock()));
         assert_eq!(
             conn2
@@ -598,7 +611,9 @@ mod tests {
     fn private_same_version_schema_survives_analyze() {
         let (_dir, db) = open_db();
         create_table_and_analyze(&db);
-        let a = db.connect(ConnectOpts::new()).unwrap();
+        let a = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         a.force_reparse_schema_without_publish().unwrap();
         assert!(
             !Arc::ptr_eq(&a.schema.read(), &db.schema.lock()),
@@ -617,14 +632,18 @@ mod tests {
     #[test]
     fn connections_share_schema_without_stat1() {
         let (_dir, db) = open_db();
-        let setup = db.connect(ConnectOpts::new()).unwrap();
+        let setup = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         setup
             .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             .unwrap();
         drop(setup);
         let mut connections = Vec::new();
         for _ in 0..5 {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             assert!(
                 Arc::ptr_eq(&conn.schema.read(), &db.schema.lock()),
                 "new connection must share the database schema"

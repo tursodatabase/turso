@@ -30,6 +30,15 @@ test error-syntax {
 @sqlstate 42601
 expect error {}
 
+# tursopg does not have LISTEN.
+test error-unsupported-statement {
+    LISTEN channel;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 test error-values-lists-have-different-lengths {
     VALUES (1), (2, 3), (4);
 }

@@ -65,7 +65,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
-            allow_automatic_index: true,
+            allow_automatic_index: resolver.automatic_index,
             resolver,
         }
     }
@@ -833,7 +833,11 @@ fn join_lhs_and_rhs<'a>(
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
-                && !build_is_left_of_right_or_full_join;
+                && !build_is_left_of_right_or_full_join
+                // A hash join computes its keys from rows before the loop
+                // checks their row-level security filter.
+                && build_table.row_filter.is_none()
+                && rhs_table_reference.row_filter.is_none();
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),
@@ -4008,6 +4012,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4110,6 +4115,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4229,6 +4235,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4433,6 +4440,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         }
     }

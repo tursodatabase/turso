@@ -870,3 +870,73 @@ test table-drop-missing-column-from-one-column-table {
 }
 @sqlstate 42703
 expect error {}
+
+test table-insert-values-shorter-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-longer-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3, 4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-shorter-row-without-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u VALUES (1, 2, 3), (4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-different-row-length-with-default {
+    CREATE TABLE u (id int, a int, b int DEFAULT 9);
+    INSERT INTO u VALUES (1, 2, DEFAULT), (3, 4);
+}
+@sqlstate 42601
+expect error {}
+
+@skip-if postgres "PostgreSQL supports ALTER VIEW ... RENAME"
+test alter-view-rename-is-not-supported {
+    CREATE TABLE rn_view_base (id INT);
+    CREATE VIEW rn_view AS SELECT id FROM rn_view_base;
+    ALTER VIEW rn_view RENAME TO rn_view_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER VIEW ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER INDEX ... RENAME"
+test alter-index-rename-is-not-supported {
+    CREATE TABLE rn_index_base (id INT);
+    CREATE INDEX rn_index ON rn_index_base (id);
+    ALTER INDEX rn_index RENAME TO rn_index_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER INDEX ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TYPE ... RENAME"
+test alter-type-rename-is-not-supported {
+    CREATE TYPE rn_type AS ENUM ('a');
+    ALTER TYPE rn_type RENAME TO rn_type_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TYPE ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TABLE ... RENAME CONSTRAINT"
+test alter-table-rename-constraint-is-not-supported {
+    CREATE TABLE rn_constrained (id INT CONSTRAINT rn_positive CHECK (id > 0));
+    ALTER TABLE rn_constrained RENAME CONSTRAINT rn_positive TO rn_still_positive;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TABLE ... RENAME CONSTRAINT is not supported
+}

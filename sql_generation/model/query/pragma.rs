@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Pragma {
     AutoVacuumMode(VacuumMode),
     ForeignKeyList(String),
+    AutomaticIndex(bool),
     WalCheckpoint {
         database: Option<String>,
         mode: CheckpointMode,
@@ -39,6 +40,13 @@ impl Display for Pragma {
 
                 write!(f, "PRAGMA auto_vacuum={mode}")?;
                 Ok(())
+            }
+            Pragma::AutomaticIndex(enabled) => {
+                write!(
+                    f,
+                    "PRAGMA automatic_index={}",
+                    if *enabled { "ON" } else { "OFF" }
+                )
             }
             Pragma::ForeignKeyList(table_name) => {
                 let table_name = table_name.replace('\'', "''");

@@ -34,6 +34,7 @@ use crate::pragma::PragmaVirtualTable;
 use crate::schema::{Schema, Table};
 use crate::stats::StatAccum;
 use crate::sync::Arc;
+use crate::translate::roles;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{
     compute_array_length_at_dim, exec_array_append, exec_array_cat, exec_array_contains,
@@ -51,9 +52,9 @@ use turso_ext::VTabKind;
 
 /// SQLite version reported by compatibility APIs.
 ///
-/// This is the source of truth for the SQLite version Turso tracks. Keep
-/// [`SQLITE_VERSION_NUMBER`], `scripts/install-sqlite3.sh`, README.md, and
-/// COMPAT.md in sync when bumping it.
+/// This must equal `sqlite/version`, which `scripts/install-sqlite3.sh`
+/// reads; a test checks that, and that [`SQLITE_VERSION_NUMBER`] matches.
+/// Keep README.md and COMPAT.md in sync when bumping it.
 pub const SQLITE_VERSION: &str = "3.50.4";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
@@ -93,6 +94,19 @@ pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     let cmd = parser.next_cmd()?;
     Ok((cmd, parser.offset()))
+}
+
+/// Parse the first SQLite statement in `sql`.
+pub fn parse_statement(sql: &str) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+    Ok(parse(sql)?.0)
+}
+
+/// Parse the column definition of an `ALTER TABLE` statement.
+pub fn parse_column_definition(
+    sql: &str,
+    in_alter: bool,
+) -> crate::Result<turso_parser::ast::ColumnDefinition> {
+    Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(in_alter)?)
 }
 
 /// Formats canonical SQLite `CREATE TABLE` text from its AST.
@@ -714,6 +728,7 @@ pub fn call_builtin_scalar(
                 }
             };
             let (namespace, sequence) = connection.find_sequence(&seq_name)?;
+            roles::check_sequence_read(connection, namespace, &sequence.name)?;
             match connection.get_sequence_currval(
                 namespace.database_id,
                 &mangle_name(namespace.id, &sequence.name),
@@ -1521,5 +1536,28 @@ mod tests {
     #[test]
     fn test_execute_sqlite_version() {
         assert_eq!(execute_sqlite_version(), SQLITE_VERSION);
+    }
+
+    /// The constants cannot read `sqlite/version` while building, because the
+    /// file is outside this crate and would be missing from the published
+    /// package. This test fails when they differ from it.
+    #[test]
+    fn sqlite_version_constants_match_sqlite_version_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../sqlite/version");
+        let text = std::fs::read_to_string(path).expect("sqlite/version should exist");
+        let version = text.trim();
+
+        assert_eq!(SQLITE_VERSION, version);
+
+        let [major, minor, patch]: [i32; 3] = version
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("sqlite/version should have three parts, like 3.50.4");
+        assert_eq!(
+            SQLITE_VERSION_NUMBER,
+            major * 1_000_000 + minor * 1_000 + patch
+        );
     }
 }

@@ -4892,6 +4892,7 @@ impl<'a> Parser<'a> {
             indexed,
             where_clause,
             returning,
+            truncate: false,
         })
     }
 
@@ -12909,6 +12910,7 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
+                    truncate: false,
                 })],
             ),
             (
@@ -12956,6 +12958,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    truncate: false,
                 })],
             ),
             // parse drop index

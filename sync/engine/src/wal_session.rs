@@ -71,7 +71,7 @@ mod tests {
     };
     use turso_core::{
         Clock, Completion, ConnectOpts, Database, DatabaseOpts, File, MemoryIO, OpenFlags,
-        Result as CoreResult, IO,
+        Result as CoreResult, SessionRole, IO,
     };
     use turso_sqlite::SqliteDialect;
 
@@ -209,7 +209,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
 
