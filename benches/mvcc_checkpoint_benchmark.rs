@@ -33,6 +33,8 @@ struct UncheckpointedRows {
     _temp_dir: tempfile::TempDir,
     _db: Arc<Database>,
     conn: Arc<Connection>,
+    /// The table has the ids `0..num_rows`.
+    num_rows: u64,
 }
 
 impl UncheckpointedRows {
@@ -51,10 +53,13 @@ impl UncheckpointedRows {
         self
     }
 
-    fn insert_one_row(self, id: u64) -> Self {
+    /// Inserts one row with the id `num_rows`, which is not in the table.
+    fn insert_one_row(mut self) -> Self {
+        let id = self.num_rows;
         self.conn
             .execute(format!("INSERT INTO t(id, v) VALUES ({id}, {id})"))
             .unwrap();
+        self.num_rows += 1;
         self
     }
 }
@@ -104,6 +109,7 @@ fn insert_rows(num_rows: u64, create_table: &str) -> UncheckpointedRows {
         _temp_dir: temp_dir,
         _db: db,
         conn,
+        num_rows,
     }
 }
 
@@ -155,7 +161,7 @@ fn bench_checkpoint(c: &mut Criterion) {
                         )
                         .checkpoint_after_each_commit()
                     },
-                    |rows| black_box(rows.insert_one_row(num_rows)),
+                    |rows| black_box(rows.insert_one_row()),
                     BatchSize::PerIteration,
                 )
             },
