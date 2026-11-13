@@ -559,7 +559,7 @@ pub struct OpenDbAsyncState {
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
     /// Registry key for insertion (computed once at start)
-    pub(crate) registry_key: Option<DatabaseKey>,
+    pub registry_key: Option<DatabaseKey>,
     /// The database being built, held across the ValidatingHeader phase yields
     /// before it is wrapped in an `Arc`.
     building_db: Option<Database>,
@@ -691,7 +691,7 @@ pub struct Database<
     pub path: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
-    pub(crate) buffer_pool: Arc<BufferPool>,
+    pub buffer_pool: Arc<BufferPool>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
@@ -1026,7 +1026,7 @@ impl Database {
 
     #[cfg(feature = "fs")]
     #[cfg(host_shared_wal)]
-    pub(crate) fn reject_live_multiprocess_wal_for_legacy_open(
+    pub fn reject_live_multiprocess_wal_for_legacy_open(
         io: &Arc<dyn IO>,
         path: &str,
         wal_path: Option<&str>,
@@ -3037,7 +3037,7 @@ impl Database {
         target_pointer_width = "64",
         not(any(target_os = "linux", target_os = "android"))
     ))]
-    pub(crate) fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
+    pub fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
@@ -3318,7 +3318,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn build_wal(
+    pub fn build_wal(
         &self,
         last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
