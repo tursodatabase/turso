@@ -2743,3 +2743,42 @@ test expression-index-without-collate-cannot-seek-for-nocase-column {
 expect {
     2
 }
+
+# The planner finds the collation of a comparison with the same rules as the
+# translator. A COLLATE in FILTER, ORDER BY or OVER of an aggregate does not
+# count, and the pattern of LIKE comes before the string. Each query runs
+# before and after the index exists, so the rows are listed twice.
+test collate-planner-uses-leftmost-collate-rules-with-and-without-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO t VALUES (1, 'abc'), (2, 'ABC'), (3, 'xyz');
+    CREATE TABLE u(b TEXT, c TEXT);
+    INSERT INTO u VALUES ('ABC', 'x'), ('XYZ', 'y');
+    SELECT 'filter', max(b) FILTER (WHERE c COLLATE NOCASE = 'X') IN ('abc') FROM u;
+    SELECT 'agg-order-by', group_concat(b ORDER BY c COLLATE NOCASE) IN ('abc,xyz') FROM u;
+    SELECT 'over', max(b) OVER (ORDER BY c COLLATE NOCASE) IN ('abc') FROM u;
+    SELECT 'in-filter', id FROM t WHERE a IN (SELECT max(b) FILTER (WHERE c COLLATE NOCASE = 'X') FROM u) ORDER BY id;
+    SELECT 'eq-filter', id FROM t WHERE a = (SELECT max(b) FILTER (WHERE c COLLATE NOCASE = 'X') FROM u) ORDER BY id;
+    SELECT 'eq-like', id FROM t WHERE a = CASE WHEN 'x' COLLATE BINARY LIKE 'x' COLLATE NOCASE THEN 'ABC' END ORDER BY id;
+    SELECT 'gt-like', id FROM t WHERE a > CASE WHEN 'x' COLLATE BINARY LIKE 'x' COLLATE NOCASE THEN 'ABC' END ORDER BY id;
+    CREATE INDEX t_a ON t(a);
+    SELECT 'in-filter', id FROM t WHERE a IN (SELECT max(b) FILTER (WHERE c COLLATE NOCASE = 'X') FROM u) ORDER BY id;
+    SELECT 'eq-filter', id FROM t WHERE a = (SELECT max(b) FILTER (WHERE c COLLATE NOCASE = 'X') FROM u) ORDER BY id;
+    SELECT 'eq-like', id FROM t WHERE a = CASE WHEN 'x' COLLATE BINARY LIKE 'x' COLLATE NOCASE THEN 'ABC' END ORDER BY id;
+    SELECT 'gt-like', id FROM t WHERE a > CASE WHEN 'x' COLLATE BINARY LIKE 'x' COLLATE NOCASE THEN 'ABC' END ORDER BY id;
+}
+expect {
+    filter|0
+    agg-order-by|0
+    over|0
+    over|0
+    in-filter|2
+    eq-filter|2
+    eq-like|1
+    eq-like|2
+    gt-like|3
+    in-filter|2
+    eq-filter|2
+    eq-like|1
+    eq-like|2
+    gt-like|3
+}
