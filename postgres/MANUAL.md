@@ -132,7 +132,9 @@ role may not read.
 - `FOR`: The command the policy applies to. The default is `ALL`.
 - `TO`: The roles the policy applies to. The default is `PUBLIC`, every role.
   `CURRENT_ROLE`, `CURRENT_USER` and `SESSION_USER` name the role at the time
-  the policy is created.
+  the policy is created. As in PostgreSQL, a policy for a role also applies
+  to every role that has its privileges, such as a member with `INHERIT`
+  (see `GRANT` of roles).
 - `using_expression`: Which existing rows the policy shows. It can use the
   columns of the table, written alone, with the table's name, or with the
   schema and table names, and call scalar functions such as `current_user`.
@@ -143,6 +145,9 @@ role may not read.
 **Notes:**
 
 Only the owner of the table or a superuser may create its policies.
+
+Row-level security does not limit the table's owner, or a role with the
+owner's privileges, such as a member of the owner with `INHERIT`.
 
 A new row is checked against the policies after its `NOT NULL` constraints,
 not before as in PostgreSQL, so a row that breaks both reports the `NOT
@@ -232,9 +237,11 @@ and cannot log in. Roles are listed in the `pg_roles` catalog.
   security, but still needs privileges on the table. The default is
   `NOBYPASSRLS`.
 - `INHERIT`, `NOINHERIT`: Whether the role uses the privileges of the roles it
-  is a member of without `SET ROLE`. The default is `INHERIT`. Turso stores
-  the value and shows it in `pg_roles.rolinherit`. It has no other effect yet,
-  because a role cannot be made a member of another role.
+  is a member of without `SET ROLE`. The default is `INHERIT`. As in
+  PostgreSQL, `GRANT role_name TO` this role stores the value with the
+  membership, in `pg_auth_members.inherit_option`, and the membership keeps
+  it. `pg_roles.rolinherit` shows the value. A role with `NOINHERIT` may
+  still `SET ROLE` to the roles it is a member of.
 - `NOLOGIN`: The role cannot log in. This is the default, and the only choice:
   `LOGIN` is not supported.
 
@@ -382,8 +389,10 @@ already exists`) only to a role with `SELECT` on the table; PostgreSQL also
 shows the values that the statement itself gave. Column
 privileges, `WITH GRANT OPTION`, `GRANTED BY`, and `GRANT` on other kinds of
 objects fail as not supported (SQLSTATE 0A000), so that a script never
-believes it changed what a role may do when it did not. `GRANT role_name TO
-role_name` is not supported either. `REVOKE` takes privileges away again.
+believes it changed what a role may do when it did not. `REVOKE` takes
+privileges away again. A role also has the privileges of the roles it
+inherits from (see `GRANT` of roles), and a role with the owner's privileges
+grants as the owner.
 
 **Examples:**
 
@@ -448,8 +457,8 @@ the owner, so only the entries that the owner gave change. Any other role
 gets `permission denied for table` (SQLSTATE 42501), unless the list gives
 it a privilege on the table, when the statement succeeds and changes
 nothing, as in PostgreSQL, which warns. `REVOKE GRANT OPTION FOR`, `GRANTED
-BY`, column privileges, `REVOKE` on other kinds of objects, and `REVOKE
-role_name FROM role_name` fail as not supported (SQLSTATE 0A000). So does
+BY`, column privileges and `REVOKE` on other kinds of objects fail as not
+supported (SQLSTATE 0A000). So does
 `REVOKE` on a catalog view such as `pg_catalog.pg_roles` or
 `information_schema.schemata`, and `ON ALL TABLES IN SCHEMA` `pg_catalog` or
 `information_schema`: every role reads the catalog views, and they have no
@@ -462,6 +471,82 @@ REVOKE INSERT, UPDATE ON accounts FROM reader;
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
 REVOKE USAGE ON SEQUENCE accounts_id_seq FROM reader;
 ```
+
+### `GRANT` and `REVOKE` of roles — make roles members of other roles
+
+**Synopsis:**
+
+```sql
+GRANT role_name [, ...] TO role_specification [, ...]
+REVOKE role_name [, ...] FROM role_specification [, ...] [ RESTRICT ]
+
+where role_specification can be:
+
+      role_name
+    | CURRENT_ROLE
+    | CURRENT_USER
+    | SESSION_USER
+```
+
+**Description:**
+
+`GRANT role_name TO member` makes `member` a member of `role_name`, and
+`REVOKE role_name FROM member` takes the membership away. As in PostgreSQL:
+
+- A member may `SET ROLE` to the roles it is a member of, directly or
+  through other roles, whether it has `INHERIT` or `NOINHERIT`.
+- A member with `INHERIT` has the privileges of the roles it is a member of,
+  and of the roles those are members of, through members that have
+  `INHERIT` too. It uses their privileges on tables and sequences, acts as
+  the owner of the relations they own, and the row-level security policies
+  for them apply to it. A member with `NOINHERIT` uses them only after `SET
+  ROLE`. Whether a membership inherits privileges is taken from the
+  member's `INHERIT` attribute when the membership is granted.
+- Being a member of the `postgres` role gives its privileges, but does not
+  make a role a superuser.
+
+`pg_auth_members` shows the memberships, with `postgres` as the grantor.
+Memberships are stored in the database file and survive reopening it.
+
+**Parameters:**
+
+- `role_name`: An existing role. `pg_database_owner` cannot have members
+  (SQLSTATE 0A000).
+- `role_specification`: An existing role, or `CURRENT_ROLE`/`CURRENT_USER`
+  for the role the session runs as now, or `SESSION_USER` for the role the
+  session logged in as. `pg_database_owner` cannot be a member of a role
+  (SQLSTATE 0A000).
+
+**Notes:**
+
+Only a superuser may grant or revoke role membership; another role gets
+`permission denied to grant role "name"` (SQLSTATE 42501). PostgreSQL also
+lets roles with the `ADMIN` option or `CREATEROLE` do it. A role that does
+not exist, `PUBLIC` included, fails with SQLSTATE 42704. Granting a
+membership that exists does nothing, as does revoking one that does not
+exist; PostgreSQL prints a NOTICE or a WARNING. A grant that would make a
+role a member of itself, directly or through other roles, fails with `role
+"a" is a member of role "b"` (SQLSTATE 0LP01), and the statement grants
+none of its memberships.
+
+`WITH ADMIN OPTION`, `WITH INHERIT`, `WITH SET`, `ADMIN OPTION FOR`,
+`INHERIT OPTION FOR`, `SET OPTION FOR`, `GRANTED BY` and `CASCADE` fail as
+not supported (SQLSTATE 0A000). There is no `DROP ROLE` yet.
+
+**Examples:**
+
+A login role that has no privileges of its own and switches to the role
+each task needs:
+
+```sql
+CREATE ROLE guest NOINHERIT;
+CREATE ROLE reader NOINHERIT;
+CREATE ROLE app_login NOINHERIT;
+GRANT guest, reader TO app_login;
+```
+
+A session that logged in as `app_login` may then run `SET ROLE reader`, and
+the policies `TO reader` decide what it reads.
 
 ### `SET ROLE` — set the current role
 
@@ -492,8 +577,9 @@ keeps the role, and `DISCARD ALL` resets it.
 **Parameters:**
 
 - `role_name`: The name of an existing role. A superuser session may switch to
-  any role, including roles that cannot log in. Other sessions may only switch
-  to their own login role.
+  any role, including roles that cannot log in. Other sessions may switch to
+  their own login role and to the roles that their login role is a member
+  of, directly or through other roles (see `GRANT` of roles).
 
 **Notes:**
 
@@ -503,7 +589,9 @@ tables it owns or was granted privileges on, and it may alter and drop the
 relations it owns, except that renaming a relation or creating an index on
 it also needs CREATE on the schema, which only a superuser has; it may call
 `nextval` and `setval` on the sequences it owns or was granted privileges
-on; it cannot create objects or roles, or `COPY FROM` a file.
+on; it cannot create objects or roles, or `COPY FROM` a file. A role with
+`INHERIT` may also do all of this with what the roles it is a member of own
+or were granted.
 Creating objects stays superuser-only because PostgreSQL gates it on the
 schema's CREATE privilege, which does not exist yet. Catalog tables and
 sequences read as tables are not checked.
@@ -588,10 +676,13 @@ of another kind, for example `"t" is not a sequence` (SQLSTATE `42809`).
 
 **Notes:**
 
-A superuser may give a relation to any role. The relation's owner may give
-it to itself only, which changes nothing; PostgreSQL also lets the owner give
-it to a role it may `SET ROLE` to, which takes role membership, which Turso
-does not support yet.
+A superuser may give a relation to any role. The relation's owner, or a
+role with the owner's privileges, may give it to a role it may `SET ROLE`
+to, such as a role it is a member of. As in PostgreSQL, the new owner also
+needs `CREATE` on the relation's schema, which only a superuser has, so
+anyone else gets `permission denied for schema public` (SQLSTATE 42501)
+unless it gives the relation to a superuser role or to the role that
+already owns it.
 
 **Examples:**
 
