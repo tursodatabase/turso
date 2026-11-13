@@ -368,6 +368,95 @@ fn role_without_privileges_cannot_call_pragma_functions() {
     }
 }
 
+/// An embedder, such as a server measuring the database after each write,
+/// reads the storage counts and turns off the automatic checkpoint on the
+/// connection of a user who switched to a role that may not run the
+/// PRAGMAs that do the same.
+#[test]
+fn storage_stats_and_checkpoint_setting_work_after_set_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x text)").unwrap();
+    conn.execute("GRANT ALL ON t TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    let superuser = db.connect_postgres();
+    let log_path = format!("{}-log", db.path.display());
+
+    conn.inner().disable_mvcc_auto_checkpoint().unwrap();
+    assert_eq!(pragma(&superuser, "mvcc_checkpoint_threshold"), -1);
+
+    let before = storage_stats(&db, &conn);
+    conn.execute("INSERT INTO t VALUES (repeat('a', 10000))")
+        .unwrap();
+    let after_insert = storage_stats(&db, &conn);
+    assert_eq!(after_insert.logical_log_bytes, file_size(&log_path));
+    let mut stmt = superuser.query("SELECT length(x) FROM t").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0].to_string(), "10000");
+    // The row is only in the logical log until it is checkpointed.
+    assert!(
+        after_insert.logical_log_bytes >= before.logical_log_bytes + 10000,
+        "{before:?} {after_insert:?}"
+    );
+    superuser
+        .inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let after_checkpoint = storage_stats(&db, &conn);
+
+    assert_eq!(after_checkpoint.logical_log_bytes, file_size(&log_path));
+    assert_eq!(
+        after_checkpoint.page_size as i64,
+        pragma(&superuser, "page_size")
+    );
+    assert_eq!(
+        after_checkpoint.page_count as i64,
+        pragma(&superuser, "page_count")
+    );
+    assert_eq!(
+        after_checkpoint.freelist_count as i64,
+        pragma(&superuser, "freelist_count")
+    );
+    assert!(
+        after_checkpoint.page_count > after_insert.page_count,
+        "{after_insert:?} {after_checkpoint:?}"
+    );
+    for sql in [
+        "PRAGMA page_size",
+        "PRAGMA page_count",
+        "PRAGMA freelist_count",
+        "PRAGMA mvcc_checkpoint_threshold = -1",
+    ] {
+        let error = conn.inner().prepare(sql).unwrap_err();
+        assert!(
+            matches!(error, turso_core::LimboError::PermissionDenied(_)),
+            "{sql}: {error}"
+        );
+    }
+}
+
+fn storage_stats(db: &TempDatabase, conn: &PgConnection) -> turso_core::StorageStats {
+    let mut read = conn.inner().storage_stats();
+    loop {
+        match read.read().unwrap() {
+            turso_core::IOResult::Done(stats) => return stats,
+            turso_core::IOResult::IO(io) => io.wait(&*db.io).unwrap(),
+        }
+    }
+}
+
+fn file_size(path: &str) -> u64 {
+    std::fs::metadata(path).map_or(0, |file| file.len())
+}
+
+fn pragma(conn: &PgConnection, name: &str) -> i64 {
+    let rows = conn.inner().pragma_query(name).unwrap();
+    match rows[0][0] {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) => value,
+        ref value => panic!("PRAGMA {name} returned {value:?}"),
+    }
+}
+
 /// With SELECT on the views granted, the sequences the views change are
 /// what is denied, as in PostgreSQL, where nextval runs as the reader and
 /// not as the view's owner.
