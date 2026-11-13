@@ -7538,9 +7538,19 @@ dependencies = [
 name = "turso_sqlite"
 version = "0.9.0-pre.5"
 dependencies = [
+ "branches",
+ "icu_locale",
+ "parking_lot",
+ "quickcheck",
+ "quickcheck_macros",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rstest",
  "rusqlite",
+ "rustc-hash 2.1.1",
  "tempfile",
  "turso_core",
+ "turso_ext",
  "turso_parser",
 ]
 

@@ -2674,8 +2674,8 @@ impl InsnVariants {
 
 impl Insn {
     /// The collations this instruction compares values with.
-    #[cfg(test)]
-    pub(crate) fn collations(&self) -> Vec<CollationSeq> {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn collations(&self) -> Vec<CollationSeq> {
         match self {
             Insn::Eq { collation, .. }
             | Insn::Ne { collation, .. }

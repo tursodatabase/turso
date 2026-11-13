@@ -55,7 +55,7 @@ mod ext;
 mod fast_lock;
 pub mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod functions;
+pub mod functions;
 pub mod incremental;
 mod incremental_blob;
 pub use incremental_blob::Blob;
@@ -63,7 +63,7 @@ mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
+pub mod numeric;
 pub mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
@@ -84,7 +84,7 @@ pub mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod vdbe;
+pub mod vdbe;
 pub mod vtab;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
@@ -95,7 +95,7 @@ pub use function::{ExternalFunc, Func, ScalarFunc};
 /// formatting implementation.
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
 
-use crate::{
+pub use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
     schema::Trigger,
@@ -131,9 +131,7 @@ pub use database::{
     OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
     SharedWalOpenTelemetry,
 };
-pub(crate) use database::{DatabaseCatalog, InitState};
-#[cfg(test)]
-pub(crate) use dialect::EngineDialect;
+pub use database::{DatabaseCatalog, InitState};
 pub use dialect::{CatalogChange, Dialect, NewOwner};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,

@@ -136,7 +136,7 @@ impl CostModelParams {
 /// Compile-time static default parameters (zero runtime overhead).
 #[cfg(any(
     not(feature = "optimizer_params"),
-    all(test, feature = "optimizer_params")
+    all(any(test, feature = "test_helper"), feature = "optimizer_params")
 ))]
 pub static DEFAULT_PARAMS: CostModelParams = CostModelParams::new();
 

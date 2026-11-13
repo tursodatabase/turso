@@ -3111,7 +3111,7 @@ pub(crate) struct InternalTable {
 
 /// Marks the transaction as having changed the schema, so that a rollback restores the connection
 /// schema, and bumps the schema cookie of the main database.
-pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuilder) {
+pub fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuilder) {
     program.emit_insn(Insn::SetCookie {
         db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,

@@ -14,7 +14,7 @@ use crate::{DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 use super::collate::TextCollation;
 use super::plan::BitSet;
 
-pub(crate) struct CatalogContext<'a> {
+pub struct CatalogContext<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,

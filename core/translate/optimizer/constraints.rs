@@ -546,7 +546,7 @@ fn expression_matches_table(
     }
 }
 
-pub(super) fn add_implied_column_equalities(
+pub fn add_implied_column_equalities(
     where_clause: &mut Vec<WhereTerm>,
     table_references: &TableReferences,
     resolver: &Resolver,
