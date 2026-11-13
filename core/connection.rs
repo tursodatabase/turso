@@ -72,7 +72,7 @@ fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
 }
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TransactionState {
+pub enum TransactionState {
     Write {
         schema_did_change: bool,
     },
@@ -398,7 +398,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
-    pub(crate) db: Arc<Database>,
+    pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -416,7 +416,7 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
-    pub(crate) syms: parking_lot::RwLock<SymbolTable>,
+    pub syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// Page size from the last `PRAGMA page_size` on any database of this connection, or 0.
@@ -533,7 +533,7 @@ pub struct Connection {
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
-    pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -954,7 +954,7 @@ impl Connection {
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.
     #[inline]
-    pub(crate) fn bump_prepare_context_generation(&self) {
+    pub fn bump_prepare_context_generation(&self) {
         self.prepare_context_generation
             .fetch_add(1, Ordering::Release);
     }
@@ -4823,7 +4823,7 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
-    pub(crate) fn get_tx_state(&self) -> TransactionState {
+    pub fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
 
@@ -4855,7 +4855,7 @@ impl Connection {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
 
-    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
         *self.mv_tx.read()
     }
 

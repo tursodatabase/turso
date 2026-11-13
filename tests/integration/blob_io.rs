@@ -3,23 +3,24 @@
 //! Programs are hand-assembled with ProgramBuilder and run against a real table so the
 //! whole faithful pager-backed path is exercised, including persistence.
 
-use crate::namespace::NamespaceId;
-use crate::schema::Schema;
-use crate::security::roles::RoleId;
-use crate::Dialect;
 use std::sync::Arc;
+use turso_core::namespace::NamespaceId;
+use turso_core::schema::Schema;
+use turso_core::security::roles::RoleId;
+use turso_core::Dialect;
+use turso_sqlite::SqliteDialect;
 
-use crate::security::roles::SessionRole;
-use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
-use crate::vdbe::insn::{Insn, RegisterOrLiteral};
-use crate::{
-    ConnectOpts, Connection, Database, DatabaseOpts, EngineDialect, LimboError, MemoryIO,
-    OpenFlags, Statement, Value, IO,
+use turso_core::security::roles::SessionRole;
+use turso_core::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use turso_core::vdbe::insn::{Insn, RegisterOrLiteral};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, Statement,
+    Value, IO,
 };
 use turso_parser::ast::Privilege;
 
 fn fresh_db() -> Arc<Connection> {
-    fresh_db_with_dialect(Arc::new(EngineDialect))
+    fresh_db_with_dialect(Arc::new(SqliteDialect))
 }
 
 fn fresh_db_with_dialect(dialect: Arc<dyn Dialect>) -> Arc<Connection> {
@@ -37,7 +38,7 @@ fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
         OpenFlags::Create,
         opts,
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     db.connect(ConnectOpts::new(SessionRole::Superuser))
@@ -160,8 +161,8 @@ fn blob_write_local_persists() {
             dest: r_off,
         });
         b.emit_insn(Insn::Blob {
-            value: crate::types::value_blob_from_slice(&[0xAA, 0xBB, 0xCC])
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+            value: turso_core::types::value_blob_from_slice(&[0xAA, 0xBB, 0xCC])
+                .expect(turso_core::alloc::ALLOC_ERR_MSG),
             dest: r_src,
         });
         let r_ack = b.alloc_register();
@@ -206,7 +207,7 @@ fn blob_read_write_across_overflow() {
     // is well past the ~4KB local cap for a page, and spanning into deeper overflow).
     let pattern: Vec<u8> = (0u16..600).map(|i| (i % 251) as u8).collect();
     let pat_for_move =
-        crate::types::value_blob_from_slice(&pattern).expect(crate::alloc::ALLOC_ERR_MSG);
+        turso_core::types::value_blob_from_slice(&pattern).expect(turso_core::alloc::ALLOC_ERR_MSG);
     let rows = run_blob_program(&conn, root, move |b, cursor| {
         let r_off = b.alloc_register();
         let r_src = b.alloc_register();
@@ -428,7 +429,7 @@ fn blob_write_handle_blocks_other_writers_and_commits_on_close() {
     assert_eq!(blob_bytes(&got[0][0]), vec![0xAA, 0xBB]);
     assert!(matches!(
         got[0][1],
-        Value::Numeric(crate::Numeric::Integer(7))
+        Value::Numeric(turso_core::Numeric::Integer(7))
     ));
 }
 
@@ -623,7 +624,7 @@ fn blob_wide_row_header_spills_into_overflow() {
     // Neighboring columns were untouched.
     assert!(matches!(
         got[0][1],
-        Value::Numeric(crate::Numeric::Integer(1))
+        Value::Numeric(turso_core::Numeric::Integer(1))
     ));
 }
 
@@ -665,7 +666,7 @@ fn blob_open_maps_around_virtual_generated_columns() {
     assert_eq!(blob_bytes(&got[0][0]), vec![0xAA, 0xBB]);
     assert!(matches!(
         got[0][1],
-        Value::Numeric(crate::Numeric::Integer(2))
+        Value::Numeric(turso_core::Numeric::Integer(2))
     ));
     // The generated column itself cannot be opened.
     let err = conn.blob_open("t", "g", 1, false).unwrap_err();
@@ -737,7 +738,7 @@ fn blob_overflow_pin_is_released_on_close() {
     let rows = q.run_collect_rows().unwrap();
     assert!(matches!(
         rows[0][0],
-        Value::Numeric(crate::Numeric::Integer(50000))
+        Value::Numeric(turso_core::Numeric::Integer(50000))
     ));
 }
 

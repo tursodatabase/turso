@@ -131,7 +131,7 @@ enum MvccLazyCursorState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CursorYieldPoint {
+pub enum CursorYieldPoint {
     NextStart,
     NextBtreeAdvance,
     PrevBtreeAdvance,

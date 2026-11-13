@@ -553,7 +553,7 @@ impl From<Text> for String {
 pub type ValueBlob = crate::alloc::Vec<u8>;
 
 #[inline]
-pub(crate) fn value_blob_from_slice(
+pub fn value_blob_from_slice(
     bytes: &[u8],
 ) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
     bytes.try_to_vec()

@@ -24,8 +24,6 @@ use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
-#[cfg(test)]
-mod blob_io_tests;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -34,12 +32,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
-#[cfg(test)]
-mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
-#[cfg(test)]
-mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 #[allow(unused_imports)] // for benchmarks

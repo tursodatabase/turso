@@ -103,7 +103,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub(crate) implementation: ModuleImplementation,
+    pub implementation: ModuleImplementation,
 }
 
 /// Registers a function that core implements through the extension API.

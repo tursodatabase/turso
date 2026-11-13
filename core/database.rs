@@ -232,7 +232,7 @@ pub struct OpenOptions {
     wal_path: Option<String>,
     flags: OpenFlags,
     db_opts: DatabaseOpts,
-    pub(crate) native_extensions: crate::native_ext::NativeExtensions,
+    pub native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
@@ -707,7 +707,7 @@ pub struct Database<
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
-    pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
+    pub builtin_syms: parking_lot::RwLock<SymbolTable>,
     /// SQL dialect this database runs under, interpreting `sqlite_schema`
     /// SQL rows. Passed explicitly by every open path, fixed at open time,
     /// and shared by all connections because the parsed [`Schema`] is
