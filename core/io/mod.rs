@@ -453,6 +453,7 @@ impl File for DiskTempFile {
 #[cfg(all(test, feature = "fs", not(target_family = "wasm")))]
 mod temp_file_tests {
     use super::*;
+    use crate::security::roles::SessionRole;
 
     #[test]
     fn creates_the_file_on_first_write_and_removes_it_on_drop() {
@@ -484,7 +485,9 @@ mod temp_file_tests {
             Arc::new(crate::EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let count_union = |rows: i64| -> i64 {
             let sql = format!(
                 "SELECT count(*) FROM (\

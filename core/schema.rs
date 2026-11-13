@@ -114,7 +114,6 @@ impl Trigger {
     }
 }
 
-use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -139,10 +138,7 @@ use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
     SortOrder, TableInternalId, TypeOperator,
 };
-use turso_parser::{
-    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
-    parser::Parser,
-};
+use turso_parser::ast::{Cmd, CreateTableBody, ResultColumn, Stmt};
 
 pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
@@ -1303,9 +1299,6 @@ pub struct Schema {
     /// loaded, built once they are.
     pending_materialized_views: Option<PendingMaterializedViews>,
 
-    /// The roles of the database. Copies of the schema share them.
-    pub roles: Arc<RoleCatalog>,
-
     /// Schema state of the database's dialect, opaque to core: what the
     /// dialect's [`crate::Dialect::build_schema_state`] built from its own
     /// schema table, such as the PostgreSQL frontend's relation catalog.
@@ -1437,7 +1430,6 @@ pub enum TypeOrigin {
 
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
-    use turso_parser::parser::Parser;
 
     // Whether values of the type take a COLLATE. In PostgreSQL only text
     // types do, so of the types below only varchar does.
@@ -1475,10 +1467,9 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     ];
 
     for &(accepts_collate, range_offsets, sql) in types {
-        let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
-        }))) = parser.next_cmd()
+        }))) = crate::dialect::engine::parse_statement(sql)
         else {
             return Err(crate::LimboError::InternalError(format!(
                 "failed to parse built-in type SQL: {sql}"
@@ -1567,7 +1558,6 @@ impl Schema {
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
-            roles: Arc::default(),
             dialect_schema: None,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
@@ -2423,10 +2413,8 @@ impl Schema {
     /// in-memory registry without working out the kind its DECODE gives.
     fn insert_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
-        use turso_parser::parser::Parser;
 
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd();
+        let cmd = crate::dialect::engine::parse_statement(sql);
         match cmd {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
@@ -3816,7 +3804,7 @@ impl Schema {
         let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
 
         for (view_key, (namespace, sql, _)) in &view_info {
-            let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
+            let cmd = crate::dialect::engine::parse_statement(sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_key} has an empty schema definition"
                 ))
@@ -3951,7 +3939,7 @@ impl Schema {
                 }
             }
 
-            let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
+            let cmd = crate::dialect::engine::parse_statement(&sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_name} has an empty schema definition"
                 ))
@@ -4313,7 +4301,7 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    let create_vtab = match Parser::new(sql.as_bytes()).next_cmd()? {
+                    let create_vtab = match crate::dialect::engine::parse_statement(sql)? {
                         Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
@@ -4469,7 +4457,6 @@ impl Schema {
             "view" => {
                 use crate::schema::View;
                 use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let (namespace, view_name) = self.demangle_name(name);
@@ -4479,8 +4466,7 @@ impl Schema {
                 }
 
                 // Parse the SQL to determine if it's a regular or materialized view
-                let mut parser = Parser::new(sql.as_bytes());
-                let parsed = parser.next_cmd();
+                let parsed = crate::dialect::engine::parse_statement(sql);
                 if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
                     // Tolerate view rows whose stored SQL no longer parses
                     // (e.g. older versions wrote view column lists without
@@ -4527,7 +4513,6 @@ impl Schema {
             }
             "trigger" => {
                 use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let (namespace, trigger_name) = self.demangle_name(name);
@@ -4536,7 +4521,6 @@ impl Schema {
                     self.add_namespace_of_object(namespace);
                 }
 
-                let mut parser = Parser::new(sql.as_bytes());
                 let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
                     temporary,
                     if_not_exists: _,
@@ -4547,7 +4531,7 @@ impl Schema {
                     for_each_row,
                     when_clause,
                     commands,
-                }))) = parser.next_cmd()
+                }))) = crate::dialect::engine::parse_statement(sql)
                 else {
                     return Err(crate::LimboError::ParseError(format!(
                         "invalid trigger sql: {sql}"
@@ -5117,7 +5101,6 @@ impl TryClone for Schema {
             default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
-            roles: self.roles.clone(),
             dialect_schema: self.dialect_schema.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
@@ -6044,8 +6027,7 @@ impl BTreeTable {
         root_page: i64,
         supports_namespaces: bool,
     ) -> Result<BTreeTable> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
                 Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
@@ -6905,12 +6887,8 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+/// Copy of a generated-column expression with column references turned back into names.
+pub fn generated_expr_with_names(expr: &Expr, columns: &[Column]) -> Result<Expr> {
     let mut clone = expr.clone();
     walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
         if let Expr::Column { table, column, .. } = e {
@@ -6924,7 +6902,12 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
         }
         Ok(WalkControl::Continue)
     })?;
-    Ok(clone.to_string())
+    Ok(clone)
+}
+
+/// Re-render the SQL text of a generated-column expression using current column names.
+pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+    Ok(generated_expr_with_names(expr, columns)?.to_string())
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -8781,8 +8764,7 @@ impl Index {
         table: &BTreeTable,
         schema: &Schema,
     ) -> Result<Index> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateIndex {
                 idx_name,
@@ -9158,6 +9140,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
 
     fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
         Arc::new(BTreeTable::from_sql(sql, root_page).unwrap())
@@ -9189,7 +9172,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let syms = conn.syms.read();
         conn.with_schema(MAIN_DB_ID, |schema| {
             assert!(schema.type_registry.values().all(|t| t.is_builtin));
@@ -9500,15 +9485,6 @@ mod tests {
     use crate::alloc::vec;
 
     #[test]
-    fn schema_clones_share_the_role_catalog() {
-        let schema = Schema::new();
-
-        let clone = schema.try_clone().unwrap();
-
-        assert!(Arc::ptr_eq(&schema.roles, &clone.roles));
-    }
-
-    #[test]
     fn test_column_definition_flag_conversion() {
         for bits in 0..=u8::MAX {
             let Some(flags) = FromDefinitionFlags::from_bits(bits) else {
@@ -9639,7 +9615,7 @@ mod tests {
             "CREATE TABLE t(a TEXT, b aNy AS (a)) STRICT",
         ] {
             let Some(Cmd::Stmt(Stmt::CreateTable { body, .. })) =
-                Parser::new(sql.as_bytes()).next_cmd()?
+                crate::dialect::engine::parse_statement(sql)?
             else {
                 panic!("expected CREATE TABLE: {sql}");
             };

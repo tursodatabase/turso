@@ -147,6 +147,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
         ),
+        AutomaticIndex => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["automatic_index"],
+        ),
         BusyTimeout => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["busy_timeout"],
@@ -357,6 +361,11 @@ impl PragmaVirtualTable {
             }
         }
 
+        // Without the table argument, do not pass a schema value as that argument.
+        if self.has_pragma_arg && arg0_idx.is_none() {
+            arg1_idx = None;
+        }
+
         let argv_arg0_idx = arg0_idx.map_or(0, |_| 1);
         let argv_arg1_idx = arg1_idx.map_or(argv_arg0_idx, |_| argv_arg0_idx + 1);
 
@@ -535,6 +544,7 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
     use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
 
     #[test]
@@ -542,7 +552,9 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =
             Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE scan_target(first, second)")
             .unwrap();
 

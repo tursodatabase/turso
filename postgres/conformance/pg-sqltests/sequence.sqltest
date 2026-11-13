@@ -131,3 +131,13 @@ test create-sequence-with-minvalue-too-small-for-bigint {
 expect error {
     value "-99999999999999999999" is out of range for type bigint
 }
+
+@skip-if postgres "PostgreSQL supports ALTER SEQUENCE ... RENAME"
+test alter-sequence-rename-is-not-supported {
+    CREATE SEQUENCE rn_sequence;
+    ALTER SEQUENCE rn_sequence RENAME TO rn_sequence_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER SEQUENCE ... RENAME is not supported
+}

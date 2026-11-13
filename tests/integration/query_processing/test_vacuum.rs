@@ -10,7 +10,8 @@ use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, StepResult, Value,
+    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, SessionRole,
+    StepResult, Value,
 };
 use turso_parser::{ast::Cmd, parser::Parser};
 use turso_sqlite::SqliteDialect;
@@ -2887,7 +2888,7 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
@@ -6715,7 +6716,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
     let path = "queued-vacuum-reset-during-checkpoint.db";
     let source_wal_path = format!("{path}-wal");
     let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     populate_queued_multibatch(&conn)?;
 
@@ -6761,7 +6762,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
 
     stmt.reset()?;
 
-    let reader = db.connect(ConnectOpts::new())?;
+    let reader = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     let before_schema = normalized_schema_snapshot(&conn);

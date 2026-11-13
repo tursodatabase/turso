@@ -158,6 +158,7 @@ pub fn translate(
         search_path.as_deref(),
         row_security_role,
     );
+    resolver.automatic_index = connection.automatic_index();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
@@ -171,9 +172,9 @@ pub fn translate(
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
     if check_privileges
         && !resolver
-            .schema()
-            .roles
-            .is_superuser(connection.current_role())
+            .catalog
+            .dialect
+            .role_is_superuser(resolver.schema(), connection.current_role())
     {
         resolver.role_is_not_superuser = true;
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
@@ -259,6 +260,8 @@ fn translate_statement(
             | ast::Stmt::AlterSequenceOwnedBy { .. }
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
+            | ast::Stmt::CreatePolicy(_)
+            | ast::Stmt::DropPolicy { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -435,8 +438,8 @@ fn translate_statement(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
-        ast::Stmt::CreateRole { role_name } => {
-            roles::translate_create_role(&role_name, resolver, program)?
+        ast::Stmt::CreateRole { role_name, options } => {
+            roles::translate_create_role(role_name, options, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
@@ -587,6 +590,23 @@ fn translate_statement(
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;
         }
+        ast::Stmt::CreatePolicy(policy) => {
+            row_security::translate_create_policy(&policy, resolver, program, connection)?;
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => {
+            row_security::translate_drop_policy(
+                &policy_name,
+                &tbl_name,
+                if_exists,
+                resolver,
+                program,
+                connection,
+            )?;
+        }
     };
 
     if is_write {
@@ -678,6 +698,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::AlterSequenceOwnedBy { .. } => "alter_sequence_owned_by",
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
+        ast::Stmt::CreatePolicy(_) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 
@@ -688,6 +710,7 @@ mod tests {
     use crate::io::MemoryIO;
     use crate::namespace::NamespaceId;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
+    use crate::security::roles::SessionRole;
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
     use crate::Database;
@@ -740,14 +763,18 @@ mod tests {
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
-        let cmd = parser.next().unwrap().unwrap();
+        let cmd = crate::dialect::engine::parse_statement("SELECT 'x' REGEXP 'y'")
+            .transpose()
+            .unwrap()
+            .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -774,7 +801,9 @@ mod tests {
     fn nth_value_reads_from_saved_rows_without_an_accumulator() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE items(value)").unwrap();
 
         let statement = conn
@@ -809,7 +838,9 @@ mod tests {
     fn delete_without_where_clears_table_and_index_btrees() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
             .unwrap();
         conn.execute("CREATE UNIQUE INDEX items_name ON items(name)")
@@ -891,7 +922,9 @@ mod tests {
     fn delete_keeps_row_loop_when_rows_need_individual_processing() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
 
@@ -946,7 +979,9 @@ mod tests {
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
@@ -967,8 +1002,10 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
-        let cmd = parser.next().unwrap().unwrap();
+        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
+            .transpose()
+            .unwrap()
+            .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -1000,7 +1037,9 @@ mod tests {
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
@@ -1010,8 +1049,10 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
-        let cmd = parser.next().unwrap().unwrap();
+        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
+            .transpose()
+            .unwrap()
+            .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -1043,7 +1084,9 @@ mod tests {
     fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE ref(x);").unwrap();
         conn.execute("CREATE TABLE t(a INTEGER);").unwrap();

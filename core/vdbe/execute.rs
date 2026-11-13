@@ -156,7 +156,6 @@ use super::{
 };
 use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
-use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
@@ -181,6 +180,7 @@ use super::{Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
+use crate::security::roles::SessionRole;
 use crate::vdbe::builder::CursorTypeExt;
 use crate::{
     bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
@@ -4226,6 +4226,16 @@ pub fn op_halt_if_null(
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
     }
+}
+
+pub fn op_row_security_violation(
+    _program: &Program,
+    _state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(RowSecurityViolation { denial }, insn);
+    Err(LimboError::PermissionDenied(denial.clone()).into())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10911,7 +10921,7 @@ pub fn op_function(
                     };
 
                     let column_def =
-                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+                        crate::dialect::engine::parse_column_definition(column_def, true)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -13955,47 +13965,14 @@ pub fn op_add_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_add_role(
+pub fn op_catalog_change(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
-        AddRole {
-            db,
-            id_reg,
-            name,
-            superuser,
-        },
-        insn
-    );
-    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[*id_reg].get_value() else {
-        return Err(LimboError::InternalError(format!(
-            "AddRole: role rowid register r[{id_reg}] does not hold an integer"
-        ))
-        .into());
-    };
-    let role = crate::security::roles::Role {
-        id: crate::security::roles::RoleId::from_rowid(*rowid),
-        name: name.clone(),
-        superuser: *superuser,
-    };
-    program
-        .connection
-        .with_database_schema_mut(*db, |schema| Arc::make_mut(&mut schema.roles).add(role))?;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-pub fn op_relation_change(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        RelationChange {
+        CatalogChange {
             db,
             change,
             value_regs
@@ -14010,7 +13987,7 @@ pub fn op_relation_change(
     program
         .connection
         .with_database_schema_mut(*db, |schema| {
-            dialect.apply_relation_change(schema, change, &values)
+            dialect.apply_catalog_change(schema, change, &values)
         })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -17301,13 +17278,12 @@ fn replace_trigger_sql(
     trigger_name: &str,
     sql: &str,
 ) -> Result<()> {
-    let mut parser = Parser::new(sql.as_bytes());
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         event,
         when_clause,
         commands,
         ..
-    })) = parser.next_cmd()?
+    })) = crate::dialect::engine::parse_statement(sql)?
     else {
         return Err(LimboError::ParseError(format!(
             "invalid trigger sql: {sql}"
@@ -19363,8 +19339,9 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
-                    None => output_db.connect(ConnectOpts::new())?,
+                    Some(codec) => output_db
+                        .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))?,
+                    None => output_db.connect(ConnectOpts::new(SessionRole::Superuser))?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
@@ -19567,6 +19544,7 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::security::roles::SessionRole;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::EngineDialect;
@@ -19647,7 +19625,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -19708,7 +19688,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -19773,7 +19755,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -19835,7 +19819,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -19860,7 +19846,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -19905,7 +19893,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -20568,7 +20558,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")
