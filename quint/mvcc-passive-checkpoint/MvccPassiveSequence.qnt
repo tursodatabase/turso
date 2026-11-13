@@ -67,6 +67,7 @@ module MvccPassiveSequence {
   const MaxVal: int           // Sequence values are 1..MaxVal. They are the row keys.
   const Txs: Set[str]         // Connections.
   const MaxTs: int            // Bound on the clock for transaction begins and commits.
+  const CheckpointFailures: bool // A pass can stop before it finishes.
   const MaxCheckpoints: int   // Bound on the number of checkpoint passes.
   const Ascending: bool       // true: increment 1, start 1. false: increment -1,
                               // start MaxVal.
@@ -542,6 +543,16 @@ module MvccPassiveSequence {
     tx' = tx, writes' = writes, handed' = handed, err' = err,
   }
 
+  action CheckpointFail(at: str): bool = all {
+    CheckpointFailures,
+    ck.pc == at,
+    ck' = { ...ck, pc: "idle", seqdel: Set() },
+    clock' = clock, chain' = chain, lastCommitted' = lastCommitted, llog' = llog,
+    wal' = wal, nBackfill' = nBackfill, db' = db, dbMeta' = dbMeta, durable' = durable,
+    backfillFloor' = backfillFloor, nCk' = nCk, tx' = tx, writes' = writes,
+    handed' = handed, err' = err,
+  }
+
   // ---------------------------------------------------------------------------
   // Garbage collection: the passive rules of gc_version_chain
 
@@ -595,6 +606,8 @@ module MvccPassiveSequence {
       TxCommit(t),
       TxFinish(t),
     },
+    nondet at = Set("collect", "compact", "compacted", "committed", "published", "backfilled", "truncated").oneOf()
+    CheckpointFail(at),
     CheckpointStart,
     CheckpointCollect,
     CheckpointCompact,

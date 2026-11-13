@@ -62,6 +62,8 @@ module MvccPassiveCheckpoint {
   const Keys: Set[str]            // Row keys of one table.
   const Readers: Set[str]         // Reader connections.
   const MaxTs: int                // Bound on the logical clock (commits and reader begins).
+  const SplitLogTruncate: bool // The truncate decision and I/O finish in separate steps.
+  const CheckpointFailures: bool // A pass can stop before it finishes.
   const MaxCheckpoints: int       // Bound on the number of checkpoint passes.
 
   // Rules of the design. true in the main configuration.
@@ -139,7 +141,7 @@ module MvccPassiveCheckpoint {
   type WalFrame = { w: str -> int, meta: int }
   type Cand = { k: str, s: int }
   type CkState = { pc: str, snap: int, old: int, todo: Set[str], wset: str -> int,
-                   frame: int, full: int, cand: Set[Cand], clearOk: bool }
+                   frame: int, full: int, cand: Set[Cand], clearOk: bool, truncate: bool }
   type RdState = { pc: str, mark: int, b: int, key: str, vis1: int, valid1: bool,
                    deps1: Set[int] }
   type ErrRec = { reader: str, key: str, begin: int, mark: int, got: Set[int],
@@ -249,7 +251,7 @@ module MvccPassiveCheckpoint {
     durable' = 0,
     backfillFloor' = 0,
     ck' = { pc: "idle", snap: 0, old: 0, todo: Set(), wset: EmptyFn, frame: 0,
-            full: 0, cand: Set(), clearOk: false },
+            full: 0, cand: Set(), clearOk: false, truncate: false },
     nCk' = 0,
     rd' = Readers.mapBy(r => { pc: "idle", mark: 0, b: 0, key: AnyKey, vis1: None,
                                valid1: false, deps1: Set() }),
@@ -525,7 +527,7 @@ module MvccPassiveCheckpoint {
     ck.pc == "idle",
     nCk < MaxCheckpoints,
     ck' = { pc: "collect", snap: SnapshotTs, old: durable, todo: Keys, wset: EmptyFn,
-            frame: 0, full: if (DirtyKeys) fullGen else 0, cand: Set(), clearOk: false },
+            frame: 0, full: if (DirtyKeys) fullGen else 0, cand: Set(), clearOk: false, truncate: false },
     nCk' = nCk + 1,
     chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
     dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor,
@@ -634,11 +636,21 @@ module MvccPassiveCheckpoint {
     }
   }
 
-  // The logical log is all or nothing: it is cut only when every record in it
-  // is at or below the boundary that the B-tree now holds.
-  action CheckpointTruncateLog: bool = all {
+  // LogicalLog::truncate checks the boundary before the file truncate completes.
+  action CheckpointTruncateDecide: bool = all {
     ck.pc == "backfilled",
-    llog' = if (llog.forall(l => l.ts <= durable)) Set() else llog,
+    llog' = if (not(SplitLogTruncate) and llog.forall(l => l.ts <= durable)) Set() else llog,
+    ck' = { ...ck, pc: if (SplitLogTruncate) "truncateDecided" else "truncated",
+            truncate: llog.forall(l => l.ts <= durable) },
+    chain' = chain, wal' = wal, nBackfill' = nBackfill, db' = db, dbMeta' = dbMeta,
+    durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
+    UnchangedForCheckpoint,
+    UnchangedRowVars,
+  }
+
+  action CheckpointTruncateApply: bool = all {
+    ck.pc == "truncateDecided",
+    llog' = if (ck.truncate) Set() else llog,
     ck' = { ...ck, pc: "truncated" },
     chain' = chain, wal' = wal, nBackfill' = nBackfill, db' = db, dbMeta' = dbMeta,
     durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
@@ -708,6 +720,16 @@ module MvccPassiveCheckpoint {
     UnchangedForCheckpoint,
     aborted' = aborted, readDeps' = readDeps, dirty' = dirty, lateMarks' = lateMarks,
     fullMin' = fullMin, markFails' = markFails, gcs' = gcs,
+  }
+
+  action CheckpointFail(at: str): bool = all {
+    CheckpointFailures,
+    ck.pc == at,
+    ck' = { ...ck, pc: "idle" },
+    chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
+    dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
+    UnchangedForCheckpoint,
+    UnchangedRowVars,
   }
 
   // ---------------------------------------------------------------------------
@@ -827,13 +849,16 @@ module MvccPassiveCheckpoint {
         ReaderEnd(r),
       },
     },
+    nondet at = Set("collect", "committed", "published", "backfilled", "truncateDecided", "truncated", "prune", "clear").oneOf()
+    CheckpointFail(at),
     CheckpointStart,
     nondet k = Keys.oneOf()
     CheckpointCollect(k),
     CheckpointCommit,
     CheckpointPublish,
     CheckpointBackfill,
-    CheckpointTruncateLog,
+    CheckpointTruncateDecide,
+    CheckpointTruncateApply,
     CheckpointStamp,
     all {
       ck.cand != Set(),

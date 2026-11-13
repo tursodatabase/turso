@@ -76,6 +76,7 @@ module MvccPassiveSchema {
   const Pages: Set[int]         // Page numbers that can be a root page (integers > 1).
   const Readers: Set[str]       // Reader connections.
   const MaxTs: int              // Bound on the logical clock.
+  const CheckpointFailures: bool // A pass can stop before it finishes.
   const MaxCheckpoints: int     // Bound on the number of checkpoint passes.
   const Indexes: Set[str]       // Objects that are indexes of IdxTable. Set() = no indexes.
   const IdxTable: str           // The table that the indexes belong to.
@@ -909,10 +910,18 @@ module MvccPassiveSchema {
     }
   }
 
+  action CheckpointTruncateLog: bool = all {
+    ck.pc == "backfilled",
+    ck' = { ...ck, pc: "truncated" },
+    bind' = bind, wal' = wal, nBackfill' = nBackfill, db' = db, durable' = durable,
+    backfillFloor' = backfillFloor, nCk' = nCk,
+    UnchangedForCheckpoint, err' = err,
+  }
+
   // TruncateWal and the stamp: set backfill_floor, stamp the row versions
   // that this pass wrote, and drop retired bindings (gc_rootpage_entries).
   action CheckpointFinish: bool = all {
-    ck.pc == "backfilled",
+    ck.pc == "truncated",
     backfillFloor' = nBackfill,
     chain' = Objs.mapBy(o =>
                if (ck.written.contains(o))
@@ -927,6 +936,15 @@ module MvccPassiveSchema {
     clock' = clock, lastCommitted' = lastCommitted, UnchangedSchemaVars, ins' = ins,
     wal' = wal, nBackfill' = nBackfill, db' = db, durable' = durable, nCk' = nCk,
     rd' = rd, seen' = seen, err' = err,
+  }
+
+  action CheckpointFail(at: str): bool = all {
+    CheckpointFailures,
+    ck.pc == at,
+    ck' = { ...ck, pc: "idle", ops: Set(), created: Set(), freed: Set() },
+    bind' = bind, wal' = wal, nBackfill' = nBackfill, db' = db, durable' = durable,
+    backfillFloor' = backfillFloor, nCk' = nCk,
+    UnchangedForCheckpoint, err' = err,
   }
 
   // ---------------------------------------------------------------------------
@@ -971,6 +989,8 @@ module MvccPassiveSchema {
         ReaderEnd(r),
       },
     },
+    nondet at = Set("collect", "committed", "published", "backfilled", "truncated").oneOf()
+    CheckpointFail(at),
     CheckpointStart,
     nondet o = Objs.oneOf()
     CheckpointObj(o),
@@ -979,6 +999,7 @@ module MvccPassiveSchema {
     CheckpointCommit,
     CheckpointPublish,
     CheckpointBackfill,
+    CheckpointTruncateLog,
     CheckpointFinish,
     nondet o = Objs.oneOf()
     Gc(o),
