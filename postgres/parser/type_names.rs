@@ -2,6 +2,7 @@
 //! and what the other names name.
 
 use crate::names::extract_key_columns;
+use crate::translator::is_catalog_table_name;
 use crate::ParseError;
 use pg_query::protobuf::node::Node;
 use pg_query::protobuf::TypeName;
@@ -77,6 +78,18 @@ pub(crate) fn built_in_type(schema: Option<&str>, name: &str) -> Option<BuiltInT
         Some(BuiltInType::Base)
     } else {
         None
+    }
+}
+
+/// Whether `name` of `schema` is a type that PostgreSQL defines, but that
+/// the lists of built-in types do not have: a type of information_schema,
+/// such as `information_schema.cardinal_number`, or the row type of a
+/// catalog relation, such as `pg_class`.
+pub(crate) fn is_system_type(schema: Option<&str>, name: &str) -> bool {
+    match schema {
+        Some("information_schema") => true,
+        Some(schema) if schema != "pg_catalog" => false,
+        _ => is_catalog_table_name(name),
     }
 }
 

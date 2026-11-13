@@ -11,7 +11,8 @@ use crate::sqlstate::{
     SQLSTATE_UNDEFINED_OBJECT,
 };
 use crate::type_names::{
-    built_in_type, catalog_type, schema_and_name, type_name_text, BuiltInType, TypeLookup,
+    built_in_type, catalog_type, is_system_type, schema_and_name, type_name_text, BuiltInType,
+    TypeLookup,
 };
 use crate::{FunctionTypeUse, ParseError};
 use pg_query::protobuf::{
@@ -528,8 +529,8 @@ enum TypeClass {
     /// `table.column%TYPE`.
     ColumnType,
     /// A type that is not built in: a custom type, such as a domain or an
-    /// enum, or the row type of a table or view, as PostgreSQL writes it in
-    /// errors.
+    /// enum, the row type of a table or view, or a type that PostgreSQL
+    /// defines outside the built-in lists, as PostgreSQL writes it in errors.
     Catalog(String),
     /// A type that does not exist. If `schema` does not exist either,
     /// PostgreSQL reports the schema.
@@ -552,12 +553,13 @@ fn classify_type(
         BuiltInType::Pseudo => TypeClass::Pseudo(name.to_string()),
     });
     let not_built_in = || -> Result<TypeClass, ParseError> {
-        Ok(match catalog_type(type_lookup, schema, name) {
-            Some(_) => TypeClass::Catalog(type_name_text(type_name)?),
-            None => TypeClass::Missing {
+        if is_system_type(schema, name) || catalog_type(type_lookup, schema, name).is_some() {
+            Ok(TypeClass::Catalog(type_name_text(type_name)?))
+        } else {
+            Ok(TypeClass::Missing {
                 schema: schema.map(str::to_string),
-            },
-        })
+            })
+        }
     };
     if type_name.array_bounds.is_empty() {
         return match class {
