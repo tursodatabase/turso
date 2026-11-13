@@ -11015,6 +11015,9 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
+        }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
         }
@@ -11247,6 +11250,9 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
         )> {
             self.inner.truncate(checkpointed_through_ts)
+        }
+        fn finish_logical_log_truncate(&self) {
+            self.inner.finish_logical_log_truncate();
         }
         fn reset_to_fresh_header(&self) -> Result<Completion> {
             self.inner.reset_to_fresh_header()
