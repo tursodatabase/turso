@@ -64,6 +64,7 @@ crossbeam-epoch = "0.9.18"
 [features]
 default = ["test_helper", "fts", "io_uring"]
 checksum = ["turso_core/checksum"]
+unstable-btree-api = ["turso_core/unstable-btree-api"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]
 io_memory_yield = ["turso_core/io_memory_yield"]
