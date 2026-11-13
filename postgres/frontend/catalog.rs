@@ -296,6 +296,10 @@ impl Dialect for PostgresDialect {
         schema_roles(schema).can_set_role(member, role)
     }
 
+    fn role_has_privileges_of(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        schema_roles(schema).has_privileges_of(member, role)
+    }
+
     fn relation_owner(
         &self,
         schema: &Schema,

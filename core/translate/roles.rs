@@ -254,7 +254,8 @@ pub fn check_statement_privileges(
 }
 
 /// Whether the current role may run an owner-gated statement on the table or
-/// view `name` names: the dialect says the role owns it. A relation that does not
+/// view `name` names: the role has the privileges of the owner, as the
+/// owner itself does. A relation that does not
 /// resolve is let through, so the statement fails in translation with its
 /// usual missing-relation error, as PostgreSQL orders the checks.
 fn may_act_as_owner_of_table(
@@ -277,16 +278,12 @@ fn may_act_as_owner(
     let Some(namespace) = namespace else {
         return true;
     };
-    if namespace.database_id != MAIN_DB_ID {
-        return false;
-    }
-    let normalized = crate::util::normalize_ident(name);
-    resolver.with_schema(MAIN_DB_ID, |schema| {
-        resolver
-            .catalog
-            .dialect
-            .relation_owner(schema, namespace.id, &normalized)
-            == Some(connection.current_role())
+    relation_owner(resolver, namespace, name).is_some_and(|owner| {
+        resolver.catalog.dialect.role_has_privileges_of(
+            resolver.schema(),
+            connection.current_role(),
+            owner,
+        )
     })
 }
 
@@ -312,10 +309,16 @@ fn settable_role(
 /// The role that owns the table or view `name` of the main database names.
 fn table_owner(resolver: &Resolver, name: &ast::QualifiedName) -> Option<RoleId> {
     let namespace = resolver.find_existing_table(name).ok().flatten()?;
+    relation_owner(resolver, namespace, name.name.as_str())
+}
+
+/// The role that owns relation `name` of `namespace`, as the dialect stores
+/// it. Only relations of the main database have an owner.
+fn relation_owner(resolver: &Resolver, namespace: NamespaceRef, name: &str) -> Option<RoleId> {
     if namespace.database_id != MAIN_DB_ID {
         return None;
     }
-    let normalized = crate::util::normalize_ident(name.name.as_str());
+    let normalized = crate::util::normalize_ident(name);
     resolver.with_schema(MAIN_DB_ID, |schema| {
         resolver
             .catalog

@@ -181,6 +181,20 @@ impl RoleCatalog {
                     .contains(&role))
     }
 
+    /// Whether `member` has the privileges of `role`, as in PostgreSQL: it
+    /// is `role` or a superuser, or reaches `role` through memberships that
+    /// inherit privileges.
+    pub(crate) fn has_privileges_of(&self, member: RoleId, role: RoleId) -> bool {
+        member == role || self.is_superuser(member) || self.roles_used_by(member).contains(&role)
+    }
+
+    /// `role` and every role whose privileges it has without `SET ROLE`:
+    /// the roles it reaches through memberships that inherit privileges.
+    pub(crate) fn roles_used_by(&self, role: RoleId) -> Vec<RoleId> {
+        self.memberships
+            .reached_from(role, |membership| membership.inherit_option)
+    }
+
     /// The memberships of the roles.
     pub(crate) fn memberships(&self) -> &Memberships {
         &self.memberships
@@ -504,6 +518,33 @@ mod tests {
         assert!(!catalog.can_set_role(id("alice"), id("bob")));
         assert!(!catalog.can_set_role(id("dave"), id("alice")));
         assert!(!catalog.can_set_role(id("carol"), RoleId::PUBLIC));
+    }
+
+    #[test]
+    fn a_member_has_the_privileges_of_the_roles_it_inherits_from() {
+        // carol is a member of bob without inheriting, and bob of alice.
+        let catalog = RoleCatalog::new(
+            &[
+                role_row(1, "alice", 0),
+                role_row(2, "bob", 0),
+                noinherit_role_row(3, "carol"),
+                role_row(4, "admin", 1),
+            ],
+            &[membership_row(1, 1, 2, 1), membership_row(2, 2, 3, 0)],
+        )
+        .unwrap();
+        let id = |name| catalog.get_by_name(name).unwrap().id;
+
+        assert!(catalog.has_privileges_of(id("bob"), id("alice")));
+        assert!(catalog.has_privileges_of(id("carol"), id("carol")));
+        assert!(!catalog.has_privileges_of(id("carol"), id("bob")));
+        assert!(!catalog.has_privileges_of(id("carol"), id("alice")));
+        assert!(!catalog.has_privileges_of(id("alice"), id("bob")));
+        assert!(catalog.has_privileges_of(id("admin"), id("carol")));
+        assert_eq!(
+            catalog.roles_used_by(id("bob")),
+            vec![id("bob"), id("alice")]
+        );
     }
 
     #[test]

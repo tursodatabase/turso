@@ -324,3 +324,192 @@ test grant-role-with-columns-fails {
 expect error {
     column names cannot be included in GRANT/REVOKE ROLE
 }
+
+# Inherited privileges: a member with INHERIT has the privileges of the roles
+# it is a member of, through chains of memberships that inherit.
+
+test member-reads-a-table-granted-to-its-role {
+    CREATE ROLE rm_read_group;
+    CREATE ROLE rm_read_member;
+    CREATE TABLE rm_read_docs (x INT);
+    INSERT INTO rm_read_docs VALUES (1);
+    GRANT SELECT ON rm_read_docs TO rm_read_group;
+    GRANT rm_read_group TO rm_read_member;
+    SET ROLE rm_read_member;
+    SELECT x FROM rm_read_docs;
+}
+expect {
+    1
+}
+
+test noinherit-member-does-not-read-a-table-granted-to-its-role {
+    CREATE ROLE rm_noread_group;
+    CREATE ROLE rm_noread_member NOINHERIT;
+    CREATE TABLE rm_noread_docs (x INT);
+    GRANT SELECT ON rm_noread_docs TO rm_noread_group;
+    GRANT rm_noread_group TO rm_noread_member;
+    SET ROLE rm_noread_member;
+    SELECT x FROM rm_noread_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_noread_docs
+}
+
+test member-reads-through-a-chain-of-roles {
+    CREATE ROLE rm_chain_top;
+    CREATE ROLE rm_chain_middle;
+    CREATE ROLE rm_chain_member;
+    CREATE TABLE rm_chain_docs (x INT);
+    INSERT INTO rm_chain_docs VALUES (2);
+    GRANT SELECT ON rm_chain_docs TO rm_chain_top;
+    GRANT rm_chain_top TO rm_chain_middle;
+    GRANT rm_chain_middle TO rm_chain_member;
+    SET ROLE rm_chain_member;
+    SELECT x FROM rm_chain_docs;
+}
+expect {
+    2
+}
+
+test a-noinherit-role-in-the-chain-stops-the-privileges {
+    CREATE ROLE rm_stop_top;
+    CREATE ROLE rm_stop_middle NOINHERIT;
+    CREATE ROLE rm_stop_member;
+    CREATE TABLE rm_stop_docs (x INT);
+    GRANT SELECT ON rm_stop_docs TO rm_stop_top;
+    GRANT rm_stop_top TO rm_stop_middle;
+    GRANT rm_stop_middle TO rm_stop_member;
+    SET ROLE rm_stop_member;
+    SELECT x FROM rm_stop_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_stop_docs
+}
+
+test member-combines-the-privileges-of-several-roles {
+    CREATE ROLE rm_combined_reader;
+    CREATE ROLE rm_combined_writer;
+    CREATE ROLE rm_combined_member;
+    CREATE TABLE rm_combined_docs (x INT);
+    INSERT INTO rm_combined_docs VALUES (1);
+    GRANT SELECT ON rm_combined_docs TO rm_combined_reader;
+    GRANT UPDATE ON rm_combined_docs TO rm_combined_writer;
+    GRANT rm_combined_reader, rm_combined_writer TO rm_combined_member;
+    SET ROLE rm_combined_member;
+    UPDATE rm_combined_docs SET x = x + 1;
+    SELECT x FROM rm_combined_docs;
+}
+expect {
+    2
+}
+
+test member-loses-the-privileges-when-the-membership-is-revoked {
+    CREATE ROLE rm_lost_group;
+    CREATE ROLE rm_lost_member;
+    CREATE TABLE rm_lost_docs (x INT);
+    GRANT SELECT ON rm_lost_docs TO rm_lost_group;
+    GRANT rm_lost_group TO rm_lost_member;
+    REVOKE rm_lost_group FROM rm_lost_member;
+    SET ROLE rm_lost_member;
+    SELECT x FROM rm_lost_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_lost_docs
+}
+
+test member-uses-a-sequence-granted-to-its-role {
+    CREATE ROLE rm_seq_group;
+    CREATE ROLE rm_seq_member;
+    CREATE SEQUENCE rm_seq_counter;
+    GRANT USAGE ON SEQUENCE rm_seq_counter TO rm_seq_group;
+    GRANT rm_seq_group TO rm_seq_member;
+    SET ROLE rm_seq_member;
+    SELECT nextval('rm_seq_counter');
+}
+expect {
+    1
+}
+
+# A member of the owner acts as the owner.
+
+test member-of-the-owner-reads-and-drops-the-table {
+    CREATE ROLE rm_owner_role;
+    CREATE ROLE rm_owner_role_member;
+    CREATE TABLE rm_owned_docs (x INT);
+    INSERT INTO rm_owned_docs VALUES (3);
+    ALTER TABLE rm_owned_docs OWNER TO rm_owner_role;
+    GRANT rm_owner_role TO rm_owner_role_member;
+    SET ROLE rm_owner_role_member;
+    SELECT x FROM rm_owned_docs;
+    DROP TABLE rm_owned_docs;
+    RESET ROLE;
+    SELECT count(*) FROM pg_class WHERE relname = 'rm_owned_docs';
+}
+expect {
+    3
+    0
+}
+
+test member-of-the-owner-grants-as-the-owner {
+    CREATE ROLE rm_grant_owner;
+    CREATE ROLE rm_grant_owner_member;
+    CREATE ROLE rm_grant_reader;
+    CREATE TABLE rm_granted_docs (x INT);
+    ALTER TABLE rm_granted_docs OWNER TO rm_grant_owner;
+    GRANT rm_grant_owner TO rm_grant_owner_member;
+    SET ROLE rm_grant_owner_member;
+    GRANT SELECT ON rm_granted_docs TO rm_grant_reader;
+    RESET ROLE;
+    SELECT relacl FROM pg_class WHERE relname = 'rm_granted_docs';
+}
+expect {
+    {rm_grant_owner=arwdDxtm/rm_grant_owner,rm_grant_reader=r/rm_grant_owner}
+}
+
+test noinherit-member-of-the-owner-may-not-drop-the-table {
+    CREATE ROLE rm_nodrop_owner;
+    CREATE ROLE rm_nodrop_member NOINHERIT;
+    CREATE TABLE rm_nodrop_docs (x INT);
+    ALTER TABLE rm_nodrop_docs OWNER TO rm_nodrop_owner;
+    GRANT rm_nodrop_owner TO rm_nodrop_member;
+    SET ROLE rm_nodrop_member;
+    DROP TABLE rm_nodrop_docs;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table rm_nodrop_docs
+}
+
+test noinherit-member-of-the-owner-may-not-grant {
+    CREATE ROLE rm_nogrant_owner;
+    CREATE ROLE rm_nogrant_member NOINHERIT;
+    CREATE ROLE rm_nogrant_reader;
+    CREATE TABLE rm_nogrant_docs (x INT);
+    ALTER TABLE rm_nogrant_docs OWNER TO rm_nogrant_owner;
+    GRANT rm_nogrant_owner TO rm_nogrant_member;
+    SET ROLE rm_nogrant_member;
+    GRANT SELECT ON rm_nogrant_docs TO rm_nogrant_reader;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_nogrant_docs
+}
+
+# Membership in the superuser role gives its privileges, but does not make a
+# role a superuser.
+test member-of-postgres-reads-its-tables {
+    CREATE ROLE rm_postgres_member;
+    CREATE TABLE rm_postgres_docs (x INT);
+    INSERT INTO rm_postgres_docs VALUES (4);
+    GRANT postgres TO rm_postgres_member;
+    SET ROLE rm_postgres_member;
+    SELECT x FROM rm_postgres_docs;
+    SELECT CAST(rolsuper AS INTEGER) FROM pg_roles WHERE rolname = current_user;
+}
+expect {
+    4
+    0
+}

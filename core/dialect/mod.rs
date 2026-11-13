@@ -477,6 +477,14 @@ pub trait Dialect: Send + Sync + 'static {
         role != RoleId::PUBLIC && (member == role || self.role_is_superuser(schema, member))
     }
 
+    /// Whether `member` has the privileges of `role`: it is `role`, a
+    /// superuser, or, in a dialect with role membership, a role that
+    /// inherits the privileges of `role`. An owner check asks this of the
+    /// owner, so a role with the owner's privileges acts as the owner.
+    fn role_has_privileges_of(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        member == role || self.role_is_superuser(schema, member)
+    }
+
     /// The role that owns relation `name` of `namespace`, when the dialect
     /// stores ownership. None means ownership is unknown, and only a
     /// superuser may drop or alter the relation.
