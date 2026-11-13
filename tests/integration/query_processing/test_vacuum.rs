@@ -667,6 +667,48 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression test for https://github.com/tursodatabase/turso/issues/11753.
+///
+/// VACUUM INTO must copy a consistent snapshot of the source taken when the
+/// statement starts. `BEGIN DEFERRED` on its own opens no read transaction, so
+/// the source connection keeps serving the nested copy statements from its own
+/// stale page cache and the copy silently drops rows another connection
+/// committed before VACUUM INTO ran.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_reads_latest_committed_snapshot(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    // Connection 1 inserts a row and reads it back, warming its page cache for
+    // `t`.
+    let conn1 = tmp_db.connect_limbo();
+    conn1.execute("INSERT INTO t VALUES (1)")?;
+    let warmed: Vec<(i64,)> = conn1.exec_rows("SELECT a FROM t ORDER BY a");
+    assert_eq!(warmed, vec![(1,)]);
+
+    // A second connection commits another row. Connection 1 has not observed
+    // this commit, so its cached copy of `t` is now stale.
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("INSERT INTO t VALUES (2)")?;
+
+    // VACUUM INTO on connection 1 must copy the current committed state, not
+    // connection 1's stale cache.
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuum-into-snapshot.db");
+    conn1.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let copied: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t ORDER BY a");
+    assert_eq!(
+        copied,
+        vec![(1,), (2,)],
+        "VACUUM INTO copy must contain the row another connection committed before it ran",
+    );
+
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, path TEXT);")]
 fn test_vacuum_into_path_expression(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
