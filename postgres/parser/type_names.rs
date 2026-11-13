@@ -21,13 +21,46 @@ pub enum PgType {
 /// one, in the schemas of the search path.
 pub type TypeLookup<'a> = dyn Fn(Option<&str>, &str) -> Option<PgType> + 'a;
 
-/// What `name` of `schema` names among the types that are not built in, as
-/// `type_lookup` finds it. `_mood` also names the array type of `mood`.
-pub(crate) fn catalog_type(
+/// What a type name names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeKind {
+    /// A built-in type of PostgreSQL.
+    BuiltIn(BuiltInType),
+    /// The array type of a built-in type that is not polymorphic, written
+    /// with an underscore, such as `_int4`.
+    BuiltInArray(BuiltInType),
+    /// A type that PostgreSQL defines outside the lists of built-in types.
+    System,
+    /// A type of the catalog, as `type_lookup` finds it.
+    Catalog(PgType),
+}
+
+/// What `name` of `schema` names, or None when it names no type.
+/// `_int4` names the array type of `int4`, and `_mood` the array type of
+/// `mood`. PostgreSQL has no array type of a polymorphic type.
+pub(crate) fn type_kind(
     type_lookup: &TypeLookup<'_>,
     schema: Option<&str>,
     name: &str,
-) -> Option<PgType> {
+) -> Option<TypeKind> {
+    let array_of = name
+        .strip_prefix('_')
+        .and_then(|element| built_in_type(schema, element))
+        .filter(|kind| *kind != BuiltInType::Polymorphic);
+    if let Some(kind) = built_in_type(schema, name) {
+        Some(TypeKind::BuiltIn(kind))
+    } else if let Some(kind) = array_of {
+        Some(TypeKind::BuiltInArray(kind))
+    } else if is_system_type(schema, name) {
+        Some(TypeKind::System)
+    } else {
+        catalog_type(type_lookup, schema, name).map(TypeKind::Catalog)
+    }
+}
+
+/// What `name` of `schema` names among the types that are not built in, as
+/// `type_lookup` finds it. `_mood` also names the array type of `mood`.
+fn catalog_type(type_lookup: &TypeLookup<'_>, schema: Option<&str>, name: &str) -> Option<PgType> {
     type_lookup(schema, name).or_else(|| {
         name.strip_prefix('_')
             .and_then(|element| type_lookup(schema, element))
@@ -67,7 +100,7 @@ fn name_part(node: &pg_query::protobuf::Node) -> Result<&str, ParseError> {
 
 /// The kind of the built-in type that `name` of `schema` names. The built-in
 /// types are in pg_catalog, which the search path always has.
-pub(crate) fn built_in_type(schema: Option<&str>, name: &str) -> Option<BuiltInType> {
+fn built_in_type(schema: Option<&str>, name: &str) -> Option<BuiltInType> {
     if schema.is_some_and(|schema| schema != "pg_catalog") {
         None
     } else if POLYMORPHIC_TYPES.contains(&name) {
@@ -85,7 +118,7 @@ pub(crate) fn built_in_type(schema: Option<&str>, name: &str) -> Option<BuiltInT
 /// the lists of built-in types do not have: a type of information_schema,
 /// such as `information_schema.cardinal_number`, or the row type of a
 /// catalog relation, such as `pg_class`.
-pub(crate) fn is_system_type(schema: Option<&str>, name: &str) -> bool {
+fn is_system_type(schema: Option<&str>, name: &str) -> bool {
     match schema {
         Some("information_schema") => true,
         Some(schema) if schema != "pg_catalog" => false,

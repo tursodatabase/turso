@@ -18,10 +18,7 @@ use crate::sqlstate::{
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
     SQLSTATE_WINDOWING_ERROR,
 };
-use crate::type_names::{
-    built_in_type, catalog_type, is_system_type, schema_and_name, type_name_text, PgType,
-    TypeLookup,
-};
+use crate::type_names::{schema_and_name, type_kind, type_name_text, PgType, TypeKind, TypeLookup};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -5698,18 +5695,17 @@ impl PostgreSQLTranslator {
             return Ok(());
         }
         let (schema, name) = schema_and_name(type_name)?;
-        // `_mood` is the array type of `mood`.
-        let element = name.strip_prefix('_');
-        if has_turso_type(schema, name)
-            || built_in_type(schema, name).is_some()
-            || element.is_some_and(|element| built_in_type(schema, element).is_some())
-            || is_system_type(schema, name)
-        {
+        if has_turso_type(schema, name) {
             return Ok(());
         }
-        match catalog_type(lookup.as_ref(), schema, name) {
-            Some(PgType::Custom) => Ok(()),
-            Some(PgType::Row) => Err(ParseError::not_supported(
+        match type_kind(lookup.as_ref(), schema, name) {
+            Some(
+                TypeKind::BuiltIn(_)
+                | TypeKind::BuiltInArray(_)
+                | TypeKind::System
+                | TypeKind::Catalog(PgType::Custom),
+            ) => Ok(()),
+            Some(TypeKind::Catalog(PgType::Row)) => Err(ParseError::not_supported(
                 used_as.row_type_feature(&type_name_text(type_name)?),
             )),
             None => Err(ParseError::Sqlstate {

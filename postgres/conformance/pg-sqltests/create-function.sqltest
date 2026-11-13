@@ -513,6 +513,26 @@ expect error {
     SQL functions cannot have arguments of type record\[\]
 }
 
+# `_record` is the array type of `record`.
+test record-array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_record) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42P13
+expect error {
+    SQL functions cannot have arguments of type record\[\]
+}
+
+# `_int4` is the array type of `int4`.
+test array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_int4) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of array type _int4 is not supported
+}
+
 test any-parameter {
     CREATE FUNCTION f("any") RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
@@ -621,6 +641,16 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     a function result of array type pg_catalog\.int4\[\] is not supported
+}
+
+test returns-array-named-with-underscore {
+    CREATE FUNCTION pair() RETURNS _int4 AS $$ SELECT ARRAY[1, 2] $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function result of array type _int4 is not supported
 }
 
 test returns-column-type {

@@ -527,6 +527,15 @@ expect error {
     type "__int4" does not exist
 }
 
+# PostgreSQL has no array type of a polymorphic type.
+test select-cast-to-array-of-polymorphic-type {
+    SELECT NULL::_anyelement;
+}
+@sqlstate 42704
+expect error {
+    type "_anyelement" does not exist
+}
+
 test select-cast-to-information-schema-domain {
     SELECT 5::information_schema.cardinal_number;
 }

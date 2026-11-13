@@ -11,8 +11,7 @@ use crate::sqlstate::{
     SQLSTATE_UNDEFINED_OBJECT,
 };
 use crate::type_names::{
-    built_in_type, catalog_type, is_system_type, schema_and_name, type_name_text, BuiltInType,
-    TypeLookup,
+    schema_and_name, type_kind, type_name_text, BuiltInType, TypeKind, TypeLookup,
 };
 use crate::{FunctionTypeUse, ParseError};
 use pg_query::protobuf::{
@@ -545,35 +544,44 @@ fn classify_type(
         return Ok(TypeClass::ColumnType);
     }
     let (schema, name) = schema_and_name(type_name)?;
-    let class = built_in_type(schema, name).map(|kind| match kind {
-        BuiltInType::Base => TypeClass::Base,
-        BuiltInType::Polymorphic => TypeClass::Polymorphic(name.to_string()),
-        // "any" is a keyword, so PostgreSQL quotes it.
-        BuiltInType::Pseudo if name == "any" => TypeClass::Pseudo("\"any\"".to_string()),
-        BuiltInType::Pseudo => TypeClass::Pseudo(name.to_string()),
-    });
-    let not_built_in = || -> Result<TypeClass, ParseError> {
-        if is_system_type(schema, name) || catalog_type(type_lookup, schema, name).is_some() {
-            Ok(TypeClass::Catalog(type_name_text(type_name)?))
-        } else {
-            Ok(TypeClass::Missing {
-                schema: schema.map(str::to_string),
-            })
-        }
-    };
-    if type_name.array_bounds.is_empty() {
-        return match class {
-            Some(class) => Ok(class),
-            None => not_built_in(),
-        };
-    }
+    let brackets = "[]".repeat(type_name.array_bounds.len());
     // PostgreSQL has arrays of base types and of some pseudo-types, such as
     // record[], but not of polymorphic types.
-    match class {
-        Some(TypeClass::Base) => Ok(TypeClass::Array(type_name_text(type_name)?)),
-        Some(TypeClass::Pseudo(name)) => Ok(TypeClass::Pseudo(
-            name + &"[]".repeat(type_name.array_bounds.len()),
-        )),
-        _ => not_built_in(),
+    Ok(match type_kind(type_lookup, schema, name) {
+        Some(TypeKind::BuiltIn(BuiltInType::Base)) if brackets.is_empty() => TypeClass::Base,
+        Some(TypeKind::BuiltIn(BuiltInType::Base) | TypeKind::BuiltInArray(BuiltInType::Base)) => {
+            TypeClass::Array(type_name_text(type_name)?)
+        }
+        Some(TypeKind::BuiltIn(BuiltInType::Pseudo)) => {
+            TypeClass::Pseudo(pseudo_type_text(name) + &brackets)
+        }
+        Some(TypeKind::BuiltInArray(BuiltInType::Pseudo)) => {
+            let element = name
+                .strip_prefix('_')
+                .expect("the name of an array type starts with an underscore");
+            TypeClass::Pseudo(pseudo_type_text(element) + "[]" + &brackets)
+        }
+        Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) if brackets.is_empty() => {
+            TypeClass::Polymorphic(name.to_string())
+        }
+        Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) | None => TypeClass::Missing {
+            schema: schema.map(str::to_string),
+        },
+        Some(TypeKind::BuiltInArray(BuiltInType::Polymorphic)) => {
+            unreachable!("type_kind gives no array type of a polymorphic type")
+        }
+        Some(TypeKind::System | TypeKind::Catalog(_)) => {
+            TypeClass::Catalog(type_name_text(type_name)?)
+        }
+    })
+}
+
+/// A pseudo-type as PostgreSQL writes it in errors. "any" is a keyword, so
+/// PostgreSQL quotes it.
+fn pseudo_type_text(name: &str) -> String {
+    if name == "any" {
+        "\"any\"".to_string()
+    } else {
+        name.to_string()
     }
 }
