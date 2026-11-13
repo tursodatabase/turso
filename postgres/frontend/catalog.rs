@@ -61,7 +61,7 @@ impl Dialect for PostgresDialect {
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
-            return turso_core::dialect::engine::parse(sql);
+            return self.parse_internal(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
@@ -78,15 +78,28 @@ impl Dialect for PostgresDialect {
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
-            Err(_) => turso_core::dialect::engine::parse(sql),
+            Err(_) => self.parse_internal(sql),
         }
+    }
+
+    fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        Ok((cmd, parser.offset()))
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> Result<turso_parser::ast::ColumnDefinition> {
+        Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
+            let table = BTreeTable::from_stored_sql(self, sql, root_page, true)?;
             if !table.has_rowid {
                 return Err(LimboError::ParseError(format!(
                     "PostgreSQL does not support WITHOUT ROWID table '{}'",
@@ -116,7 +129,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::parse_table_sql_ast(sql);
+            return turso_core::dialect::parse_table_sql_ast(self, sql);
         };
 
         let parse_result =
@@ -135,7 +148,7 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::table_sql_for_replay(sql);
+            return turso_core::dialect::table_sql_for_replay(self, sql);
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -184,11 +197,11 @@ impl Dialect for PostgresDialect {
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        turso_core::dialect::engine::format_table_sql(tbl_name, body)
+        turso_core::dialect::format_table_sql(tbl_name, body)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::engine::register_builtin_catalog(schema, enable_custom_types)
+        schema.register_builtin_catalog(self, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -204,7 +217,7 @@ impl Dialect for PostgresDialect {
         if name.eq_ignore_ascii_case("random") {
             return Ok(None);
         }
-        turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -4304,7 +4317,7 @@ mod tests {
 
     #[test]
     fn primary_key_index_prefixes_colliding_names() {
-        let mut schema = Schema::new();
+        let mut schema = Schema::with_options(true, &turso_sqlite::SqliteDialect).unwrap();
         let public = NamespaceId::new(1);
         schema.add_namespace(public, "public");
         for name in [
@@ -4321,8 +4334,13 @@ mod tests {
                 .add_btree_table(
                     public,
                     Arc::new(
-                        BTreeTable::from_sql(&format!("CREATE TABLE {name} ({columns})"), 2)
-                            .unwrap(),
+                        BTreeTable::from_stored_sql(
+                            &turso_sqlite::SqliteDialect,
+                            &format!("CREATE TABLE {name} ({columns})"),
+                            2,
+                            false,
+                        )
+                        .unwrap(),
                     ),
                 )
                 .unwrap();
@@ -4335,7 +4353,11 @@ mod tests {
     #[test]
     fn postgres_rejects_without_rowid_schema() {
         let sql = "CREATE TABLE t(a TEXT PRIMARY KEY, b) WITHOUT ROWID";
-        assert!(!BTreeTable::from_sql(sql, 2).unwrap().has_rowid);
+        assert!(
+            !BTreeTable::from_stored_sql(&turso_sqlite::SqliteDialect, sql, 2, false)
+                .unwrap()
+                .has_rowid
+        );
         let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
         assert_eq!(
             error.to_string(),

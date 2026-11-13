@@ -1379,12 +1379,6 @@ impl NamespaceSchema {
     }
 }
 
-impl Default for Schema {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// What kind of number a type's values are in a RANGE frame, which decides
 /// the offsets a frame over them may have, as PostgreSQL's `in_range`
 /// functions do. The same kind says which frames a value of the type may be
@@ -1428,7 +1422,10 @@ pub enum TypeOrigin {
     User,
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
+fn bootstrap_builtin_types(
+    dialect: &dyn crate::dialect::Dialect,
+    registry: &mut HashMap<String, Arc<TypeDef>>,
+) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
 
     // Whether values of the type take a COLLATE. In PostgreSQL only text
@@ -1469,7 +1466,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     for &(accepts_collate, range_offsets, sql) in types {
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
-        }))) = crate::dialect::engine::parse_statement(sql)
+        }))) = crate::dialect::parse_statement(dialect, sql)
         else {
             return Err(crate::LimboError::InternalError(format!(
                 "failed to parse built-in type SQL: {sql}"
@@ -1515,16 +1512,6 @@ impl Schema {
         }
     }
 
-    /// Create a schema with custom types enabled.
-    ///
-    /// Panics if a hardcoded built-in type definition is malformed (programmer
-    /// bug). Production code that opens user databases should prefer
-    /// [`Schema::with_options`] which returns `Result`.
-    pub fn new() -> Self {
-        Self::with_options(true, &crate::dialect::EngineDialect)
-            .expect("built-in type definitions are malformed")
-    }
-
     pub fn with_options(
         enable_custom_types: bool,
         dialect: &dyn crate::dialect::Dialect,
@@ -1541,7 +1528,7 @@ impl Schema {
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         let mut type_registry = HashMap::default();
         if enable_custom_types {
-            bootstrap_builtin_types(&mut type_registry)?;
+            bootstrap_builtin_types(dialect, &mut type_registry)?;
         }
         let mut namespaces = HashMap::default();
         namespaces.insert(NamespaceId::ROOT, root);
@@ -1646,7 +1633,11 @@ impl Schema {
     /// namespaces table, and builds the materialized views that waited for
     /// them. A database without a namespaces table has the default
     /// namespaces. A schema that does not support namespaces has none.
-    pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
+    pub fn load_namespace_names(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        rows: &[(i64, String)],
+    ) -> Result<()> {
         if !self.supports_namespaces {
             return Ok(());
         }
@@ -1671,6 +1662,7 @@ impl Schema {
         self.namespace_names_loaded = true;
         if let Some(pending) = self.pending_materialized_views.take() {
             self.populate_materialized_views(
+                dialect,
                 pending.materialized_view_info,
                 pending.dbsp_state_roots,
                 pending.dbsp_state_index_roots,
@@ -2116,6 +2108,62 @@ impl Schema {
             .insert(name, sequence);
     }
 
+    /// Insert the standard SQLite-style catalog tables.
+    ///
+    /// `pragma_*` virtual tables use the dedicated `crate::vtab::VirtualTableType::Pragma`
+    /// variant (they aren't `InternalVirtualTable`), so they are inserted
+    /// directly. The rest go through [`Schema::register_internal_vtab`] — the
+    /// same path external callers use via [`crate::Database::register_internal_vtab`].
+    pub fn register_builtin_catalog(
+        &mut self,
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        enable_custom_types: bool,
+    ) -> crate::Result<()> {
+        for vtab in Self::pragma_vtabs(dialect) {
+            self.insert_table(
+                NamespaceId::ROOT,
+                vtab.name.to_owned(),
+                Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
+            );
+        }
+
+        #[cfg(feature = "json")]
+        {
+            self.register_internal_vtab(dialect, crate::json::vtab::JsonVirtualTable::json_each())?;
+            self.register_internal_vtab(dialect, crate::json::vtab::JsonVirtualTable::json_tree())?;
+        }
+        #[cfg(feature = "cli_only")]
+        {
+            self.register_internal_vtab(dialect, crate::dbpage::DbPageTable::new())?;
+            self.register_internal_vtab(dialect, crate::btree_dump::BtreeDumpTable::new())?;
+        }
+        if enable_custom_types {
+            self.register_internal_vtab(dialect, crate::turso_types_vtab::TursoTypesTable::new())?;
+        }
+        Ok(())
+    }
+
+    /// Build a `VirtualTable` for each PRAGMA table-valued function.
+    fn pragma_vtabs(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> Vec<Arc<crate::vtab::VirtualTable>> {
+        crate::pragma::PragmaVirtualTable::functions()
+            .into_iter()
+            .map(|(tab, schema_sql)| {
+                Arc::new(crate::vtab::VirtualTable {
+                    name: format!("pragma_{}", tab.pragma_name),
+                    columns: crate::vtab::VirtualTable::resolve_columns(dialect, schema_sql)
+                        .expect("pragma table-valued function schema resolution should not fail"),
+                    kind: turso_ext::VTabKind::TableValuedFunction,
+                    vtab_type: crate::vtab::VirtualTableType::Pragma(tab),
+                    vtab_id: 0,
+                    is_droppable: false,
+                    innocuous: true,
+                })
+            })
+            .collect()
+    }
+
     /// Add an `InternalVirtualTable` to the schema's catalog. The wrapped
     /// table appears under the name returned by its `name()` method and is
     /// queryable like any other table. Returns the name actually inserted.
@@ -2123,12 +2171,16 @@ impl Schema {
     /// Intended for callers that want to surface state as a queryable table
     /// without going through `CREATE VIRTUAL TABLE` — for example, extensions
     /// that contribute metadata tables or alternative-dialect catalogs.
-    pub fn register_internal_vtab<T>(&mut self, table: T) -> crate::Result<String>
+    pub fn register_internal_vtab<T>(
+        &mut self,
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        table: T,
+    ) -> crate::Result<String>
     where
         T: crate::vtab::InternalVirtualTable + 'static,
     {
         let objects = self.namespace_mut(NamespaceId::ROOT);
-        let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
+        let vtab = crate::vtab::VirtualTable::wrap_internal_table(dialect, table)?;
         let name = vtab.name.clone();
         let lookup_name = normalize_ident(&name);
         objects.tables.insert(
@@ -2404,17 +2456,26 @@ impl Schema {
 
     /// Parse a CREATE TYPE SQL string and add the type to the in-memory
     /// registry. `syms` has the functions its DECODE may call.
-    pub fn add_type_from_sql(&mut self, sql: &str, syms: &SymbolTable) -> crate::Result<()> {
-        self.insert_type_from_sql(sql)?;
+    pub fn add_type_from_sql(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        sql: &str,
+        syms: &SymbolTable,
+    ) -> crate::Result<()> {
+        self.insert_type_from_sql(dialect, sql)?;
         self.update_value_types(syms)
     }
 
     /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
     /// in-memory registry without working out the kind its DECODE gives.
-    pub fn insert_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+    pub fn insert_type_from_sql(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        sql: &str,
+    ) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
 
-        let cmd = crate::dialect::engine::parse_statement(sql);
+        let cmd = crate::dialect::parse_statement(dialect, sql);
         match cmd {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
@@ -2528,11 +2589,12 @@ impl Schema {
     /// type affinities on all STRICT tables.
     fn load_type_definitions(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         type_sqls: &[String],
         syms: &SymbolTable,
     ) -> crate::Result<()> {
         for sql in type_sqls {
-            self.insert_type_from_sql(sql).map_err(|e| {
+            self.insert_type_from_sql(dialect, sql).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
             })?;
         }
@@ -3599,6 +3661,7 @@ impl Schema {
                         .expect("accumulators must be initialized in Init phase");
                     let type_sqls = std::mem::replace(&mut state.type_sqls, vec![]);
                     self.populate_types_views_then_indices(
+                        dialect,
                         syms,
                         &type_sqls,
                         acc.materialized_view_info,
@@ -3636,6 +3699,7 @@ impl Schema {
     /// automatic_indices: indices created automatically for primary key and unique constraints
     pub fn populate_indices(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
@@ -3652,6 +3716,7 @@ impl Schema {
                 ))
             })?;
             let mut index = Index::from_sql(
+                dialect,
                 syms,
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
@@ -3789,6 +3854,7 @@ impl Schema {
 
     pub fn order_persisted_materialized_views(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         view_info: HashMap<String, StoredMaterializedView>,
     ) -> Result<Vec<(String, StoredMaterializedView)>> {
         let mut view_info = view_info;
@@ -3800,7 +3866,7 @@ impl Schema {
         let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
 
         for (view_key, (namespace, sql, _)) in &view_info {
-            let cmd = crate::dialect::engine::parse_statement(sql)?.ok_or_else(|| {
+            let cmd = crate::dialect::parse_statement(dialect, sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_key} has an empty schema definition"
                 ))
@@ -3877,12 +3943,13 @@ impl Schema {
     /// keys, with the namespace, SQL text and root page of each.
     pub fn populate_materialized_views(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         materialized_view_info: HashMap<String, StoredMaterializedView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_key, (namespace, sql, main_root)) in
-            self.order_persisted_materialized_views(materialized_view_info)?
+            self.order_persisted_materialized_views(dialect, materialized_view_info)?
         {
             let view_name = self.demangle_name(&view_key).1.to_string();
             // The marker is mandatory even when the circuit has no stateful
@@ -3935,7 +4002,7 @@ impl Schema {
                 }
             }
 
-            let cmd = crate::dialect::engine::parse_statement(&sql)?.ok_or_else(|| {
+            let cmd = crate::dialect::parse_statement(dialect, &sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_name} has an empty schema definition"
                 ))
@@ -3985,7 +4052,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root, namespace)?;
+            let incremental_view =
+                IncrementalView::from_sql(dialect, &sql, self, main_root, namespace)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -4112,6 +4180,7 @@ impl Schema {
     #[allow(clippy::too_many_arguments)]
     pub fn populate_types_views_then_indices(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         type_sqls: &[String],
         materialized_view_info: HashMap<String, StoredMaterializedView>,
@@ -4125,7 +4194,7 @@ impl Schema {
             self.refuse_custom_types()?;
         }
         if !type_sqls.is_empty() {
-            self.load_type_definitions(type_sqls, syms)?;
+            self.load_type_definitions(dialect, type_sqls, syms)?;
         }
         if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
@@ -4141,14 +4210,27 @@ impl Schema {
             pending
                 .dbsp_state_index_roots
                 .extend(dbsp_state_index_roots);
-            return self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled);
+            return self.populate_indices(
+                dialect,
+                syms,
+                from_sql_indexes,
+                automatic_indices,
+                mvcc_enabled,
+            );
         }
         self.populate_materialized_views(
+            dialect,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
         )?;
-        self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled)
+        self.populate_indices(
+            dialect,
+            syms,
+            from_sql_indexes,
+            automatic_indices,
+            mvcc_enabled,
+        )
     }
 
     /// Refuse a schema that uses custom types when they are not enabled.
@@ -4297,7 +4379,7 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    let create_vtab = match crate::dialect::engine::parse_statement(sql)? {
+                    let create_vtab = match crate::dialect::parse_statement(dialect, sql)? {
                         Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
@@ -4320,6 +4402,7 @@ impl Schema {
                             .map(crate::Value::from_text)
                             .collect();
                         crate::VirtualTable::table(
+                            dialect,
                             Some(name),
                             create_vtab.module_name.as_str(),
                             args,
@@ -4462,7 +4545,7 @@ impl Schema {
                 }
 
                 // Parse the SQL to determine if it's a regular or materialized view
-                let parsed = crate::dialect::engine::parse_statement(sql);
+                let parsed = crate::dialect::parse_statement(dialect, sql);
                 if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
                     // Tolerate view rows whose stored SQL no longer parses
                     // (e.g. older versions wrote view column lists without
@@ -4527,7 +4610,7 @@ impl Schema {
                     for_each_row,
                     when_clause,
                     commands,
-                }))) = crate::dialect::engine::parse_statement(sql)
+                }))) = crate::dialect::parse_statement(dialect, sql)
                 else {
                     return Err(crate::LimboError::ParseError(format!(
                         "invalid trigger sql: {sql}"
@@ -6009,21 +6092,16 @@ impl BTreeTable {
         })
     }
 
-    /// Builds a table from the SQLite text of its `CREATE TABLE`, as a
-    /// database that does not support namespaces holds it.
-    pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
-        Self::from_stored_sql(sql, root_page, false)
-    }
-
-    /// Builds a table from the SQLite text of its `CREATE TABLE`.
-    /// `supports_namespaces` says whether the database supports namespaces, so
+    /// Builds a table from the SQLite text of its `CREATE TABLE`, which
+    /// `dialect` parses. `supports_namespaces` says whether the database supports namespaces, so
     /// that a foreign key may name the mangled name of a table of one.
     pub fn from_stored_sql(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
         sql: &str,
         root_page: i64,
         supports_namespaces: bool,
     ) -> Result<BTreeTable> {
-        let cmd = crate::dialect::engine::parse_statement(sql)?;
+        let cmd = crate::dialect::parse_statement(dialect, sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
                 Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
@@ -8754,13 +8832,14 @@ impl IndexColumn {
 
 impl Index {
     pub fn from_sql(
+        dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         sql: &str,
         root_page: i64,
         table: &BTreeTable,
         schema: &Schema,
     ) -> Result<Index> {
-        let cmd = crate::dialect::engine::parse_statement(sql)?;
+        let cmd = crate::dialect::parse_statement(dialect, sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateIndex {
                 idx_name,
@@ -8791,7 +8870,7 @@ impl Index {
                         columns: index_columns.try_clone()?,
                         parameters,
                     };
-                    let descriptor = module.attach(&configuration)?;
+                    let descriptor = module.attach(dialect, &configuration)?;
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),

@@ -63,15 +63,18 @@ fn fts_test_stats(
     columns: &[(&str, usize)],
 ) -> turso_core::index_method::IndexMethodTestStats {
     let attachment = FtsIndexMethod
-        .attach(&IndexMethodConfiguration {
-            table_name: table_name.to_string(),
-            index_name: index_name.to_string(),
-            columns: columns
-                .iter()
-                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
-                .collect(),
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: table_name.to_string(),
+                index_name: index_name.to_string(),
+                columns: columns
+                    .iter()
+                    .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
+                    .collect(),
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
     let mut cursor = attachment.init().unwrap();
     run(db, || {
@@ -188,12 +191,15 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
 
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "t".to_string(),
+                index_name: "t_idx".to_string(),
+                columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -280,12 +286,15 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
 
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "t".to_string(),
+                index_name: "t_idx".to_string(),
+                columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -372,12 +381,15 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
 
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "t".to_string(),
+                index_name: "t_idx".to_string(),
+                columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -704,15 +716,18 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
 
     let index = FtsIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::BINARY),
-                IndexColumn::new("body", 2, CollationSeq::BINARY),
-            ],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "docs".to_string(),
+                index_name: "fts_docs".to_string(),
+                columns: vec![
+                    IndexColumn::new("title", 1, CollationSeq::BINARY),
+                    IndexColumn::new("body", 2, CollationSeq::BINARY),
+                ],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -755,15 +770,18 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
 
     let index = FtsIndexMethod;
     let attached = index
-        .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::BINARY),
-                IndexColumn::new("body", 2, CollationSeq::BINARY),
-            ],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "docs".to_string(),
+                index_name: "fts_docs".to_string(),
+                columns: vec![
+                    IndexColumn::new("title", 1, CollationSeq::BINARY),
+                    IndexColumn::new("body", 2, CollationSeq::BINARY),
+                ],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
 
     conn.wal_insert_begin().unwrap();
@@ -5120,12 +5138,15 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .unwrap();
 
     let attachment = FtsIndexMethod
-        .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "docs_fts".to_string(),
-            columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
-            parameters: HashMap::default(),
-        })
+        .attach(
+            &SqliteDialect,
+            &IndexMethodConfiguration {
+                table_name: "docs".to_string(),
+                index_name: "docs_fts".to_string(),
+                columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
+                parameters: HashMap::default(),
+            },
+        )
         .unwrap();
     let readers = (0..5).map(|_| tmp_db.connect_limbo()).collect::<Vec<_>>();
 

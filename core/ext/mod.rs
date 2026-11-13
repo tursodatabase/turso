@@ -51,6 +51,9 @@ pub struct ExtensionCtx {
     /// We must bump the prepare context generation so prepared statements
     /// know they need to be reprepared after extension registration.
     prepare_context_generation: *const AtomicU64,
+    /// Parses the `CREATE TABLE` text a virtual table module gives for its
+    /// columns.
+    dialect: Arc<dyn crate::dialect::Dialect>,
 }
 
 pub(crate) unsafe extern "C" fn register_vtab_module(
@@ -84,7 +87,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
         }
 
         if kind == VTabKind::TableValuedFunction {
-            if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
+            if let Ok(vtab) = VirtualTable::function(ext_ctx.dialect.as_ref(), &name_str, syms) {
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
                 let mut guard = mutex.lock();
@@ -314,6 +317,7 @@ impl Database {
             syms,
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: std::ptr::null(),
+            dialect: self.dialect(),
         }));
         #[allow(unused)]
         let mut ext_api = ExtensionApi {
@@ -389,6 +393,7 @@ impl Connection {
             syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: &self.prepare_context_generation as *const _,
+            dialect: self.dialect(),
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;
         ExtensionApi {

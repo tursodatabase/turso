@@ -97,7 +97,12 @@ pub fn emit_sequence_backing_table(
     )?;
 
     // Open the newly-created table by its root page register and insert the initial row.
-    let seq_btree = Arc::new(BTreeTable::from_sql(&sql, 0)?);
+    let seq_btree = Arc::new(BTreeTable::from_stored_sql(
+        resolver.catalog.dialect.as_ref(),
+        &sql,
+        0,
+        false,
+    )?);
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: seq_cursor_id,

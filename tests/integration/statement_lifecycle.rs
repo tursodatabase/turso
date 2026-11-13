@@ -30,6 +30,7 @@ struct FailingPrepareCursor {
 impl turso_core::index_method::IndexMethod for FailingPrepareIndexMethod {
     fn attach(
         &self,
+        _dialect: &dyn turso_core::dialect::Dialect,
         configuration: &turso_core::index_method::IndexMethodConfiguration,
     ) -> Result<Arc<dyn turso_core::index_method::IndexMethodAttachment>> {
         Ok(Arc::new(FailingPrepareAttachment {

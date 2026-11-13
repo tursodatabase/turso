@@ -275,12 +275,15 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            index_method = Some(index_module.attach(&IndexMethodConfiguration {
-                table_name: tbl.name.clone(),
-                index_name: idx_name.clone(),
-                columns: columns.try_clone()?,
-                parameters,
-            })?);
+            index_method = Some(index_module.attach(
+                resolver.catalog.dialect.as_ref(),
+                &IndexMethodConfiguration {
+                    table_name: tbl.name.clone(),
+                    index_name: idx_name.clone(),
+                    columns: columns.try_clone()?,
+                    parameters,
+                },
+            )?);
         }
     }
     let idx = Arc::new(Index {

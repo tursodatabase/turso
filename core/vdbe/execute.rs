@@ -1447,8 +1447,13 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
-    let table =
-        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
+    let table = crate::VirtualTable::table(
+        conn.dialect().as_ref(),
+        Some(&table_name),
+        &module_name,
+        args,
+        &conn.syms.read(),
+    )?;
     {
         conn.syms.write().vtabs.insert(table_name, table);
     }
@@ -10920,8 +10925,10 @@ pub fn op_function(
                         }
                     };
 
-                    let column_def =
-                        crate::dialect::engine::parse_column_definition(column_def, true)?;
+                    let column_def = program
+                        .connection
+                        .dialect()
+                        .parse_internal_column_definition(column_def)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -13960,7 +13967,9 @@ pub fn op_add_type(
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     let syms = conn.syms.read();
-    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql, &syms))??;
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.add_type_from_sql(conn.dialect().as_ref(), sql, &syms)
+    })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14870,6 +14879,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
 
                 // The schema already holds every stored type.
                 let populate_result = schema.populate_types_views_then_indices(
+                    conn.dialect().as_ref(),
                     &syms,
                     &[],
                     materialized_view_info,
@@ -17009,6 +17019,7 @@ pub fn op_alter_column(
                 let mut rewrites = Vec::new();
                 for (view_name, view) in schema.views(*namespace) {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                        conn.dialect().as_ref(),
                         &view.sql,
                         schema,
                         *namespace,
@@ -17038,6 +17049,7 @@ pub fn op_alter_column(
                     let mut rewrites = Vec::new();
                     for (view_name, view) in schema.views(NamespaceId::ROOT) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                            conn.dialect().as_ref(),
                             &view.sql,
                             schema,
                             NamespaceId::ROOT,
@@ -17226,7 +17238,13 @@ pub fn op_alter_column(
     if *rename {
         for (trigger_namespace, trigger_name, sql) in rewritten_triggers {
             conn.with_database_schema_mut(trigger_namespace.database_id, |schema| {
-                replace_trigger_sql(schema, trigger_namespace.id, trigger_name, sql)
+                replace_trigger_sql(
+                    conn.dialect().as_ref(),
+                    schema,
+                    trigger_namespace.id,
+                    trigger_name,
+                    sql,
+                )
             })??;
         }
 
@@ -17273,6 +17291,7 @@ pub fn op_alter_column(
 }
 
 fn replace_trigger_sql(
+    dialect: &dyn crate::dialect::Dialect,
     schema: &mut Schema,
     namespace: NamespaceId,
     trigger_name: &str,
@@ -17283,7 +17302,7 @@ fn replace_trigger_sql(
         when_clause,
         commands,
         ..
-    })) = crate::dialect::engine::parse_statement(sql)?
+    })) = crate::dialect::parse_statement(dialect, sql)?
     else {
         return Err(LimboError::ParseError(format!(
             "invalid trigger sql: {sql}"

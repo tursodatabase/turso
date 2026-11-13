@@ -75,6 +75,7 @@ fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
     let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
     schema
         .insert_type_from_sql(
+            &SqliteDialect,
             "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
         )
         .unwrap();
@@ -187,6 +188,7 @@ fn schema_wide_scans_see_every_namespace() {
             other,
             Arc::new(
                 Index::from_sql(
+                    &SqliteDialect,
                     &SymbolTable::new(),
                     "CREATE INDEX i ON t (x)",
                     4,
@@ -270,7 +272,7 @@ fn persisted_materialized_views_are_loaded_in_dependency_order() {
 
     let ordered = Schema::with_options(true, &SqliteDialect)
         .unwrap()
-        .order_persisted_materialized_views(views)
+        .order_persisted_materialized_views(&SqliteDialect, views)
         .unwrap();
     assert_eq!(
         ordered
@@ -303,7 +305,7 @@ fn persisted_materialized_view_cycle_is_corrupt() {
 
     let error = Schema::with_options(true, &SqliteDialect)
         .unwrap()
-        .order_persisted_materialized_views(views)
+        .order_persisted_materialized_views(&SqliteDialect, views)
         .unwrap_err();
     assert!(matches!(error, LimboError::Corrupt(_)));
 }
@@ -498,7 +500,7 @@ fn test_column_definition_matches_create_table() -> Result<()> {
         "CREATE TABLE t(a TEXT, b aNy AS (a)) STRICT",
     ] {
         let Some(Cmd::Stmt(Stmt::CreateTable { body, .. })) =
-            turso_core::dialect::engine::parse_statement(sql)?
+            turso_core::dialect::parse_statement(&SqliteDialect, sql)?
         else {
             panic!("expected CREATE TABLE: {sql}");
         };
@@ -1975,7 +1977,13 @@ fn test_named_unique_constraint_propagates_through_schema() {
     );
 
     schema
-        .populate_indices(&SymbolTable::default(), vec![], automatic_indices, false)
+        .populate_indices(
+            &SqliteDialect,
+            &SymbolTable::default(),
+            vec![],
+            automatic_indices,
+            false,
+        )
         .unwrap();
 
     let indexes: std::vec::Vec<_> = schema.get_indices(NamespaceId::ROOT, "t_u").collect();

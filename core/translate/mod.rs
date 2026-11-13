@@ -151,7 +151,8 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
+            Arc::new(crate::dialect::DefaultDialect::new(connection.dialect()))
+                as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },

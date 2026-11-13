@@ -48,13 +48,17 @@ impl VirtualTable {
     /// `Schema`'s catalog. The table's `name()` becomes the catalog name and
     /// its `sql()` is parsed to derive the column metadata. Returns an error
     /// if the SQL string is not a valid `CREATE TABLE` statement.
-    pub(crate) fn wrap_internal_table<T>(table: T) -> crate::Result<Arc<VirtualTable>>
+    pub(crate) fn wrap_internal_table<T>(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        table: T,
+    ) -> crate::Result<Arc<VirtualTable>>
     where
         T: InternalVirtualTable + 'static,
     {
         let name = table.name();
         let sql = table.sql();
         Ok(Arc::new(Self::new_internal(
+            dialect,
             name,
             sql,
             VTabKind::TableValuedFunction,
@@ -63,12 +67,13 @@ impl VirtualTable {
     }
 
     /// Build a virtual table around an [`InternalVirtualTable`]
-    /// implementation. `sql` must be a `CREATE TABLE` statement; it is
-    /// parsed to derive the column metadata. Schema dialects use this to
+    /// implementation. `sql` must be a `CREATE TABLE` statement in SQLite
+    /// syntax; `dialect` parses it to derive the column metadata. Schema dialects use this to
     /// construct catalog tables (e.g. a `pg_catalog` surface) with a
     /// non-table-valued-function kind and install them through
     /// [`crate::dialect::Dialect::register_catalog`].
     pub fn new_internal(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
         name: String,
         sql: String,
         kind: VTabKind,
@@ -76,7 +81,7 @@ impl VirtualTable {
     ) -> crate::Result<Self> {
         Ok(VirtualTable {
             name,
-            columns: Self::resolve_columns(sql)?,
+            columns: Self::resolve_columns(dialect, sql)?,
             kind,
             vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
@@ -85,7 +90,11 @@ impl VirtualTable {
         })
     }
 
-    pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
+    pub(crate) fn function(
+        dialect: &dyn crate::dialect::Dialect,
+        name: &str,
+        syms: &SymbolTable,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
             crate::ext::create_virtual_table(
@@ -102,7 +111,7 @@ impl VirtualTable {
 
         let vtab = VirtualTable {
             name: name.to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns: Self::resolve_columns(dialect, schema)?,
             kind: VTabKind::TableValuedFunction,
             vtab_type,
             vtab_id: 0,
@@ -113,6 +122,7 @@ impl VirtualTable {
     }
 
     pub fn table(
+        dialect: &dyn crate::dialect::Dialect,
         tbl_name: Option<&str>,
         module_name: &str,
         args: Vec<Value>,
@@ -123,7 +133,7 @@ impl VirtualTable {
             crate::ext::create_virtual_table(module_name, module, args, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns: Self::resolve_columns(dialect, schema)?,
             kind: VTabKind::VirtualTable,
             vtab_type,
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
@@ -133,9 +143,12 @@ impl VirtualTable {
         Ok(Arc::new(vtab))
     }
 
-    pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
+    pub(crate) fn resolve_columns(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        schema: String,
+    ) -> crate::Result<Vec<Column>> {
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
-            crate::dialect::engine::parse_statement(&schema)?.ok_or_else(|| {
+            crate::dialect::parse_statement(dialect, &schema)?.ok_or_else(|| {
                 LimboError::ParseError(
                     "Failed to parse schema from virtual table module".to_string(),
                 )

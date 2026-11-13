@@ -43,8 +43,10 @@ pub const DEFAULT_FTS_MERGE_THRESHOLD: i64 = 32;
 /// (this trait acts like a "factory")
 pub trait IndexMethod: std::fmt::Debug + Send + Sync {
     /// create attachment of the index method to the specific table with specific method configuration
+    /// `dialect` parses the SELECT patterns of the method, which are SQLite syntax
     fn attach(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>>;
 
@@ -94,8 +96,10 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
 
     /// Called when ALTER TABLE renames column `from` of the indexed table to `to`
     /// Returns the attachment to use from now on, or None to keep this one
+    /// `dialect` parses the SELECT patterns of the new attachment
     fn rename_column(
         &self,
+        _dialect: &dyn crate::dialect::Dialect,
         _from: &str,
         _to: &str,
     ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
@@ -771,10 +775,13 @@ pub(crate) fn open_table_cursor(
 }
 
 /// helper method to parse select patterns for [IndexMethodAttachment::definition] call
-pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
+pub(crate) fn parse_patterns(
+    dialect: &dyn crate::dialect::Dialect,
+    patterns: &[&str],
+) -> Result<Vec<ast::Select>> {
     let mut parsed = Vec::new();
     for pattern in patterns {
-        let Some(ast) = crate::dialect::engine::parse_statement(pattern).transpose() else {
+        let Some(ast) = crate::dialect::parse_statement(dialect, pattern).transpose() else {
             return Err(LimboError::ParseError(format!(
                 "unable to parse pattern statement: {pattern}",
             )));

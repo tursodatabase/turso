@@ -9582,6 +9582,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )?;
         }
         fresh.populate_types_views_then_indices(
+            connection.dialect().as_ref(),
             &syms,
             type_sqls,
             materialized_view_info,
@@ -10199,9 +10200,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 };
                                 let has_btree = match row_type {
                                     "index" => root_page != 0,
-                                    "table" => {
-                                        !sql.is_some_and(crate::util::sql_is_create_virtual_table)
-                                    }
+                                    "table" => !sql.is_some_and(|sql| {
+                                        crate::util::sql_is_create_virtual_table(
+                                            connection.dialect().as_ref(),
+                                            sql,
+                                        )
+                                    }),
                                     _ => false,
                                 };
                                 if has_btree {
@@ -10625,6 +10629,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )?;
         }
         fresh.populate_types_views_then_indices(
+            connection.dialect().as_ref(),
             &syms,
             type_sqls,
             materialized_view_info,

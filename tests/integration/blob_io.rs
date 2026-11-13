@@ -17,7 +17,7 @@ use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, Statement,
     Value, IO,
 };
-use turso_parser::ast::Privilege;
+use turso_parser::ast::{self, Privilege};
 
 fn fresh_db() -> Arc<Connection> {
     fresh_db_with_dialect(Arc::new(SqliteDialect))
@@ -866,6 +866,21 @@ struct SecretTableDialect;
 impl Dialect for SecretTableDialect {
     fn name(&self) -> &'static str {
         "secret-table-test"
+    }
+
+    fn parse(&self, sql: &str) -> turso_core::Result<(Option<ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal(&self, sql: &str) -> turso_core::Result<(Option<ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
     }
 
     fn role_has_privilege(
