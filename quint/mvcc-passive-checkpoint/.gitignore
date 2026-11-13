@@ -1,0 +1,4 @@
+states*/
+traces/
+_apalache-out/
+*.log

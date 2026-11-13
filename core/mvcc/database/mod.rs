@@ -8264,6 +8264,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let min_reader_mark = self
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read());
+        self.assert_floor_below_readers(min_reader_mark);
 
         let mut dropped = 0;
         let mut processed = 0;
@@ -8278,19 +8279,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if processed >= max_chains {
                 break;
             }
-            // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
-            if !self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
-                let mut versions = entry.value().write();
-                dropped += self.gc_chain_now(
-                    &mut versions,
-                    lwm,
-                    ckpt_max,
-                    min_reader_mark,
-                    drop_current_if_in_btree,
-                );
-                if !passive && versions.is_empty() {
-                    entry.remove();
-                }
+            let mut versions = entry.value().write();
+            self.assert_stamps_at_or_after_binding(&entry.key().table_id, &versions);
+            dropped += self.gc_chain_now(
+                &mut versions,
+                lwm,
+                ckpt_max,
+                min_reader_mark,
+                drop_current_if_in_btree,
+            );
+            if !passive && versions.is_empty() {
+                entry.remove();
             }
             last_key = Some(entry.key().clone());
             processed += 1;
@@ -8356,6 +8355,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let min_reader_mark = self
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read());
+        self.assert_floor_below_readers(min_reader_mark);
 
         let cursor = self.gc_index_cursor.lock().clone();
         let outer_start = match &cursor {
@@ -8367,10 +8367,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 break;
             }
             let index_id = *outer.key();
-            // GC floor: retain a freshly-materialized index not yet visible to all readers.
-            if self.rootpage_gc_protected(&index_id, min_reader_mark) {
-                continue;
-            }
             let inner = outer.value();
             // Resume after the saved key only within the index that the cursor
             // pointed into; every later index starts from its first key.
@@ -8383,6 +8379,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     break 'outer;
                 }
                 let mut versions = inner_entry.value().write();
+                self.assert_stamps_at_or_after_binding(&index_id, &versions);
                 dropped += self.gc_chain_now(
                     &mut versions,
                     lwm,
@@ -8460,13 +8457,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
+        self.assert_floor_below_readers(min_reader_mark);
 
         for entry in self.rows.iter() {
-            // GC floor: retain rows of a freshly-materialized btree not yet visible to all readers.
-            if self.rootpage_gc_protected(&entry.key().table_id, min_reader_mark) {
-                continue;
-            }
             let mut versions = entry.value().write();
+            self.assert_stamps_at_or_after_binding(&entry.key().table_id, &versions);
             dropped += self.gc_chain_now(
                 &mut versions,
                 lwm,
@@ -8500,16 +8495,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .compute_min_reader_mark()
             .min(*self.backfill_floor.read())
             .min(reader_mark_floor);
+        self.assert_floor_below_readers(min_reader_mark);
 
         for outer_entry in self.index_rows.iter() {
-            // GC floor: retain a freshly-materialized index not yet visible to all readers.
-            if self.rootpage_gc_protected(outer_entry.key(), min_reader_mark) {
-                continue;
-            }
             let inner_map = outer_entry.value();
 
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
+                self.assert_stamps_at_or_after_binding(outer_entry.key(), &versions);
                 dropped += self.gc_chain_now(
                     &mut versions,
                     lwm,
@@ -10712,9 +10705,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Lexicographic minimum WAL read mark over all active/preparing transactions
-    /// ([`WalPos::STAGED`] if none). A freshly-materialized object's version-store rows may be GC'd
-    /// only once `materialized_at <= this`, i.e. every live reader can now physically reach it —
-    /// otherwise a reader whose read mark predates the materialization would lose the rows.
+    /// ([`WalPos::STAGED`] if none). GC keeps a version stamped above it, because a reader at that
+    /// mark cannot see the version in the B-tree.
     pub fn compute_min_reader_mark(&self) -> WalPos {
         self.txs
             .iter()
@@ -10729,14 +10721,64 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(WalPos::STAGED)
     }
 
-    /// GC floor for a freshly *created* btree: while a reader's read mark predates the binding's
-    /// `materialized_at` (the creation frame) it cannot reach the btree and relies on the version
-    /// store. Incremental re-materialization of existing rows is handled precisely per-version via
-    /// [`RowVersion::materialized_at`] in [`Self::gc_version_chain`], not here.
-    fn rootpage_gc_protected(&self, table_id: &MVTableId, min_reader_mark: WalPos) -> bool {
-        self.table_id_to_rootpage
-            .get(table_id)
-            .is_some_and(|e| e.value().materialized_at > min_reader_mark)
+    /// Panics if an open transaction has a read mark below the GC floor, because GC
+    /// could then drop a version that this transaction still reads from the version
+    /// store. A WAL restart puts the floor at `(s + 1, 0)` above a database-file reader
+    /// at `(s, N)`. No frame lies between the two, so that case is allowed.
+    pub(crate) fn assert_floor_below_readers(&self, floor: WalPos) {
+        for entry in self.txs.iter() {
+            let tx = entry.value();
+            if !matches!(
+                tx.state.load(),
+                TransactionState::Active | TransactionState::Preparing(_)
+            ) {
+                continue;
+            }
+            let mark = tx.read_mark;
+            let after_restart = mark.checkpoint_seq.checked_add(1) == Some(floor.checkpoint_seq)
+                && floor.frame == 0;
+            turso_assert!(
+                mark >= floor || after_restart,
+                "GC floor is above the read mark of an open transaction",
+                {
+                    "floor_checkpoint_seq": floor.checkpoint_seq,
+                    "floor_frame": { floor.frame },
+                    "read_mark_checkpoint_seq": mark.checkpoint_seq,
+                    "read_mark_frame": { mark.frame }
+                }
+            );
+        }
+    }
+
+    /// Panics if a version of `table_id` is stamped below the frame of the table's
+    /// root page binding. GC drops only versions stamped at or below the floor, so
+    /// this keeps every version of a B-tree that a reader cannot open yet.
+    fn assert_stamps_at_or_after_binding(
+        &self,
+        table_id: &MVTableId,
+        versions: &RowVersionChain<A>,
+    ) {
+        let Some(entry) = self.table_id_to_rootpage.get(table_id) else {
+            return;
+        };
+        let binding = *entry.value();
+        if binding.root_page.is_none() || binding.materialized_at == WalPos::STAGED {
+            return;
+        }
+        for version in versions.iter() {
+            let stamp = version.materialized_at();
+            turso_assert!(
+                stamp == WalPos::ORIGIN || stamp >= binding.materialized_at,
+                "row version is stamped below the frame of its root page binding",
+                {
+                    "table_id": table_id,
+                    "stamp_checkpoint_seq": stamp.checkpoint_seq,
+                    "stamp_frame": { stamp.frame },
+                    "binding_checkpoint_seq": binding.materialized_at.checkpoint_seq,
+                    "binding_frame": { binding.materialized_at.frame }
+                }
+            );
+        }
     }
 
     pub fn tx_should_abort(&self, tx_id: u64) -> bool {
