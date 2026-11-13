@@ -570,7 +570,7 @@ fn classify_type(
         Some(TypeKind::BuiltInArray(BuiltInType::Polymorphic)) => {
             unreachable!("type_kind gives no array type of a polymorphic type")
         }
-        Some(TypeKind::System | TypeKind::Catalog(_)) => {
+        Some(TypeKind::System | TypeKind::Catalog(_) | TypeKind::CatalogArray(_)) => {
             TypeClass::Catalog(type_name_text(type_name)?)
         }
     })

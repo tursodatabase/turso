@@ -1064,6 +1064,25 @@ expect {
     {sad,happy}
 }
 
+# `_int4` is an array type, and PostgreSQL has no array type of an array
+# type.
+test table-column-of-array-of-array-type {
+    CREATE TABLE t (a _int4[]);
+}
+@sqlstate 42704
+expect error {
+    type "_int4\[\]" does not exist
+}
+
+test table-column-of-array-of-enum-array-type {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE TABLE t (a _mood[]);
+}
+@sqlstate 42704
+expect error {
+    type "_mood\[\]" does not exist
+}
+
 test table-domain-over-missing-type {
     CREATE DOMAIN d AS nosuch;
 }

@@ -518,6 +518,25 @@ expect error {
     type "public\.int4" does not exist
 }
 
+# `_int4` is an array type, and PostgreSQL has no array type of an array
+# type.
+test select-cast-to-array-of-array-type {
+    SELECT '{1}'::_int4[];
+}
+@sqlstate 42704
+expect error {
+    type "_int4\[\]" does not exist
+}
+
+test select-cast-to-array-of-array-type-of-enum {
+    CREATE TYPE mood AS ENUM ('sad');
+    SELECT '{sad}'::_mood[];
+}
+@sqlstate 42704
+expect error {
+    type "_mood\[\]" does not exist
+}
+
 # `_int4` is the array type of `int4`, but `__int4` is no type.
 test select-cast-to-type-named-with-two-underscores {
     SELECT 1::__int4;
@@ -588,6 +607,14 @@ test select-cast-to-enum-named-with-underscore {
 }
 expect {
     a
+}
+
+test select-cast-to-array-of-enum-named-with-underscore {
+    CREATE TYPE _letter AS ENUM ('a');
+    SELECT '{a}'::_letter[];
+}
+expect {
+    {a}
 }
 
 test select-cast-integer-to-domain-over-boolean {

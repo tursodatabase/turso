@@ -276,7 +276,6 @@ fn array_types_with_more_than_seven_dimensions_are_not_supported() {
     for sql in [
         "CREATE TABLE v3 (c4 INT[][][][][][][][])",
         "CREATE TABLE v3 (c4 posint[][][][][][][][])",
-        "CREATE TABLE v3 (c4 _int4[][][][][][][])",
         "ALTER TABLE seven ADD COLUMN c int[][][][][][][][]",
         "SELECT '{}'::int[][][][][][][][]",
         "SELECT CAST('{}' AS posint[][][][][][][][])",

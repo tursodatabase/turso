@@ -5694,24 +5694,31 @@ impl PostgreSQLTranslator {
         if self.skips_type_checks.get() {
             return Ok(());
         }
+        let undefined_type = || {
+            Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_UNDEFINED_OBJECT,
+                message: format!("type \"{}\" does not exist", type_name_text(type_name)?),
+            })
+        };
         let (schema, name) = schema_and_name(type_name)?;
+        let has_brackets = !type_name.array_bounds.is_empty();
         if has_turso_type(schema, name) {
+            // tursopg reads `_int4` as int4[], and PostgreSQL has no array
+            // type of an array type.
+            if has_brackets && name.starts_with('_') {
+                return undefined_type();
+            }
             return Ok(());
         }
         match type_kind(lookup.as_ref(), schema, name) {
-            Some(
-                TypeKind::BuiltIn(_)
-                | TypeKind::BuiltInArray(_)
-                | TypeKind::System
-                | TypeKind::Catalog(PgType::Custom),
-            ) => Ok(()),
-            Some(TypeKind::Catalog(PgType::Row)) => Err(ParseError::not_supported(
-                used_as.row_type_feature(&type_name_text(type_name)?),
-            )),
-            None => Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_UNDEFINED_OBJECT,
-                message: format!("type \"{}\" does not exist", type_name_text(type_name)?),
-            }),
+            Some(TypeKind::BuiltInArray(_) | TypeKind::CatalogArray(_)) if has_brackets => {
+                undefined_type()
+            }
+            Some(TypeKind::Catalog(PgType::Row) | TypeKind::CatalogArray(PgType::Row)) => Err(
+                ParseError::not_supported(used_as.row_type_feature(&type_name_text(type_name)?)),
+            ),
+            Some(_) => Ok(()),
+            None => undefined_type(),
         }
     }
 }
