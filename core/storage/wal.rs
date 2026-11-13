@@ -118,7 +118,7 @@ impl CheckpointResult {
 }
 
 #[cfg(host_shared_wal)]
-pub(crate) fn coordination_path_for_wal_path(wal_path: &str) -> String {
+pub fn coordination_path_for_wal_path(wal_path: &str) -> String {
     if let Some(db_path) = wal_path.strip_suffix("-wal") {
         format!("{db_path}-tshm")
     } else {
@@ -624,13 +624,13 @@ pub trait WalCoordination: Debug + Send + Sync {
     /// Whether a process-local "last connection" close may run shutdown checkpointing.
     fn should_checkpoint_on_close(&self) -> bool;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn backend_name(&self) -> &'static str;
 
     #[cfg(any(test, feature = "test_helper"))]
     fn shared_ptr(&self) -> usize;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn open_mode_name(&self) -> Option<&'static str> {
         None
     }
@@ -1424,7 +1424,7 @@ impl WalCoordination for InProcessWalCoordination {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn backend_name(&self) -> &'static str {
         "in_process"
     }
@@ -2489,7 +2489,7 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.is_last_process_mapping()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn backend_name(&self) -> &'static str {
         "tshm"
     }
@@ -2499,7 +2499,7 @@ impl WalCoordination for ShmWalCoordination {
         Arc::as_ptr(&self.shared) as usize
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn open_mode_name(&self) -> Option<&'static str> {
         Some(match self.authority.open_mode() {
             SharedWalCoordinationOpenMode::Exclusive => "exclusive",
@@ -4940,13 +4940,13 @@ impl WalFile {
         self.coordination.shared_ptr()
     }
 
-    #[cfg(test)]
-    pub(crate) fn coordination_backend_name(&self) -> &'static str {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn coordination_backend_name(&self) -> &'static str {
         self.coordination.backend_name()
     }
 
-    #[cfg(test)]
-    pub(crate) fn coordination_open_mode_name(&self) -> Option<&'static str> {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn coordination_open_mode_name(&self) -> Option<&'static str> {
         self.coordination.open_mode_name()
     }
 

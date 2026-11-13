@@ -913,7 +913,7 @@ impl MappedSharedWalCoordination {
     }
 
     #[cfg(any(test, feature = "test_helper"))]
-    pub(crate) fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
+    pub fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
         self.frame_index_blocks_scanned.swap(0, Ordering::Relaxed)
     }
 
@@ -1350,7 +1350,7 @@ impl MappedSharedWalCoordination {
     /// Discard the durable shared frame index so the caller can rebuild it
     /// from a local WAL scan. The caller must decide separately when that is
     /// safe; this is intentionally distinct from transient-state repair.
-    pub(crate) fn discard_durable_frame_index_for_exclusive_rebuild(&self) {
+    pub fn discard_durable_frame_index_for_exclusive_rebuild(&self) {
         let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         header.frame_index_len.store(0, Ordering::Release);
@@ -1358,7 +1358,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Return whether the durable shared frame index exhausted its reserved capacity.
-    pub(crate) fn frame_index_overflowed(&self) -> bool {
+    pub fn frame_index_overflowed(&self) -> bool {
         self.header().frame_index_overflowed.load(Ordering::Acquire) != 0
     }
 
@@ -1407,7 +1407,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Clear the persisted durable proof that positive checkpoint progress is safe to trust.
-    pub(crate) fn clear_backfill_proof(&self) {
+    pub fn clear_backfill_proof(&self) {
         let header = self.header();
         header.backfill_proof_version.store(0, Ordering::Release);
         header.backfill_proof_nbackfills.store(0, Ordering::Release);

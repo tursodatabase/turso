@@ -23,13 +23,6 @@ pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
-#[cfg(all(
-    test,
-    feature = "fs",
-    host_shared_wal,
-    any(not(target_os = "windows"), feature = "experimental_win_iocp")
-))]
-mod multiprocess_tests;
 pub mod mvcc;
 pub mod namespace;
 pub mod native_ext;
@@ -139,8 +132,6 @@ pub use database::{
     SharedWalOpenTelemetry,
 };
 pub(crate) use database::{DatabaseCatalog, InitState};
-#[cfg(test)]
-pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
 pub use dialect::{CatalogChange, Dialect, NewOwner};

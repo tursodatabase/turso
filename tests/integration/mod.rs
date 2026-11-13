@@ -19,6 +19,13 @@ mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
 mod lossy_index_keys;
+#[cfg(all(
+    feature = "fs",
+    any(unix, target_os = "windows"),
+    target_pointer_width = "64",
+    any(not(target_os = "windows"), feature = "win_iocp")
+))]
+mod multiprocess_tests;
 mod mvcc;
 mod mvcc_store;
 mod native_extension;

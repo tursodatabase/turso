@@ -1,15 +1,40 @@
-use super::*;
-use crate::database::remove_file_from_database_registry;
-use crate::security::roles::SessionRole;
-use crate::storage::database::DatabaseFile;
-use crate::sync::atomic::Ordering;
 use std::process::Command;
 use std::time::Duration;
+#[allow(unused_imports)]
+use turso_core::cdc::CaptureDataChangesExt;
+use turso_core::connection::Connection;
+use turso_core::database::remove_file_from_database_registry;
+use turso_core::database::ConnectOpts;
+use turso_core::database::Database;
+use turso_core::database::DatabaseKey;
+use turso_core::database::DatabaseOpts;
+use turso_core::database::OpenDbAsyncState;
+use turso_core::database::OpenOptions;
+use turso_core::database::RegistryEntry;
+use turso_core::database::DATABASE_MANAGER;
+use turso_core::error::LimboError;
+use turso_core::io::MemoryIO;
+use turso_core::io::OpenFlags;
+use turso_core::io::PlatformIO;
+use turso_core::io::IO;
+use turso_core::security::roles::SessionRole;
+use turso_core::storage::database::DatabaseFile;
+use turso_core::storage::wal::CheckpointMode;
+use turso_core::storage::wal::CheckpointResult;
+use turso_core::storage::wal::WalFile;
+use turso_core::sync::atomic::Ordering;
+use turso_core::sync::Arc;
+use turso_core::types::IOResult;
+use turso_core::types::Value;
+#[allow(unused_imports)]
+use turso_core::util::IOExt;
+use turso_core::*;
+use turso_sqlite::SqliteDialect;
 
-#[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-use crate::WindowsIOCP;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(all(target_os = "windows", feature = "win_iocp"))]
+use turso_core::WindowsIOCP;
 
 const MULTIPROCESS_SEQUENCE_NEXTVAL_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_sequence_nextval_child_process";
@@ -41,12 +66,12 @@ const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
-    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+    #[cfg(all(target_os = "windows", feature = "win_iocp"))]
     {
         Arc::new(WindowsIOCP::new().unwrap())
     }
 
-    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    #[cfg(not(all(target_os = "windows", feature = "win_iocp")))]
     {
         Arc::new(PlatformIO::new().unwrap())
     }
@@ -140,7 +165,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
 }
 
@@ -151,7 +176,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
 fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
     let db_file = Arc::new(DatabaseFile::new(file));
-    let options = OpenOptions::new(Arc::new(EngineDialect))
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
         .storage(db_file)
         .db_opts(multiprocess_wal_db_opts());
     let mut state = OpenDbAsyncState::new();
@@ -174,7 +199,7 @@ fn open_multiprocess_db_with_flags(
         flags,
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
 }
 
@@ -213,7 +238,7 @@ fn flip_db_header_reserved_byte(path: &std::path::Path) {
         let mut page = vec![0u8; 4096];
         file.read_exact(&mut page).unwrap();
         page[72] ^= 0x01;
-        crate::storage::checksum::ChecksumContext::new()
+        turso_core::storage::checksum::ChecksumContext::new()
             .add_checksum_to_page(&mut page, 1)
             .unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
@@ -246,7 +271,7 @@ fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
 }
 
 #[test]
-#[cfg(host_shared_wal)]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn shared_wal_coordination_path_probe_accepts_nonexistent_relative_paths() {
     let result = Database::path_allows_shared_wal_coordination(std::path::Path::new(
         "nonexistent-relative-multiprocess-wal.db",
@@ -263,7 +288,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -283,7 +308,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     let db_path = dir.path().join("coordination-default-locked.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -310,7 +335,7 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .expect_err("multiprocess WAL should reject IO backends without shared coordination");
     assert!(
@@ -347,7 +372,7 @@ fn multiprocess_wal_rejects_opening_mvcc_database() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -374,7 +399,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -421,7 +446,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         .join("coordination-default-parent-multiprocess-child.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -955,7 +980,7 @@ fn default_locked_db_child_process() {
     };
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(EngineDialect))
+    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect))
         .expect_err("default non-multiprocess open should stay DB-file locked across processes");
     assert!(
         matches!(err, LimboError::LockingError(_)),
@@ -1227,7 +1252,7 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         OpenFlags::default(),
         multiprocess_wal_db_opts().with_vacuum(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -1502,7 +1527,7 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     );
 
     let input = "insert into child_table(value) values ('parent-schema')";
-    let (cmd, _) = crate::dialect::engine::parse(input).unwrap();
+    let (cmd, _) = turso_core::dialect::engine::parse(input).unwrap();
     let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
         panic!("translated statement input did not parse as a statement");
     };
@@ -2294,7 +2319,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -2307,7 +2332,7 @@ fn memory_database_keeps_in_process_wal_backend() {
 #[test]
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
