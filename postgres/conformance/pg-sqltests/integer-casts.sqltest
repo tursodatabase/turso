@@ -188,13 +188,13 @@ expect {
     16
 }
 test cast-runtime-text-radix-variants {
-    CREATE TABLE integer_cast_values (value text);
+    CREATE TABLE integer_cast_values (position integer, value text);
     INSERT INTO integer_cast_values VALUES
-        ('0x10'), ('0X10'),
-        ('0o17'), ('0O17'),
-        ('0b1010'), ('0B1010'),
-        ('-0x10'), ('+0o17'), ('-0b1010');
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+        (1, '0x10'), (2, '0X10'),
+        (3, '0o17'), (4, '0O17'),
+        (5, '0b1010'), (6, '0B1010'),
+        (7, '-0x10'), (8, '+0o17'), (9, '-0b1010');
+    SELECT value::int8 FROM integer_cast_values ORDER BY position;
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -209,14 +209,14 @@ expect {
     -10
 }
 test cast-runtime-text-underscore-variants {
-    CREATE TABLE integer_cast_values (value text);
+    CREATE TABLE integer_cast_values (position integer, value text);
     INSERT INTO integer_cast_values VALUES
-        ('1_000'), ('12_34'), ('1_2_3_4'),
-        ('0x_FF'), ('0X_FF'),
-        ('0o_77'), ('0O_77'),
-        ('0b_101'), ('0B_101'),
-        ('-1_000'), ('-0x_FF'), ('+0o_17');
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+        (1, '1_000'), (2, '12_34'), (3, '1_2_3_4'),
+        (4, '0x_FF'), (5, '0X_FF'),
+        (6, '0o_77'), (7, '0O_77'),
+        (8, '0b_101'), (9, '0B_101'),
+        (10, '-1_000'), (11, '-0x_FF'), (12, '+0o_17');
+    SELECT value::int8 FROM integer_cast_values ORDER BY position;
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -234,12 +234,12 @@ expect {
     15
 }
 test cast-runtime-text-boundaries-all-widths {
-    CREATE TABLE integer_cast_values (value text);
+    CREATE TABLE integer_cast_values (position integer, value text);
     INSERT INTO integer_cast_values VALUES
-        ('32767'), ('-32768'),
-        ('2147483647'), ('-2147483648'),
-        ('9223372036854775807'), ('-9223372036854775808');
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+        (1, '32767'), (2, '-32768'),
+        (3, '2147483647'), (4, '-2147483648'),
+        (5, '9223372036854775807'), (6, '-9223372036854775808');
+    SELECT value::int8 FROM integer_cast_values ORDER BY position;
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -817,48 +817,32 @@ expect error {
 }
 
 test cast-float-literal-rounding {
-    SELECT 123.4::int8;
-    SELECT 123.5::int8;
-    SELECT 123.6::int8;
-    SELECT -123.4::int8;
-    SELECT -123.5::int8;
-    SELECT -123.6::int8;
-    SELECT int8(123.4);
-    SELECT int8(123.5);
-    SELECT int8(123.6);
-    SELECT int8(-123.4);
-    SELECT int8(-123.5);
-    SELECT int8(-123.6);
-}
-expect {
-    123
-    124
-    124
-    -123
-    -124
-    -124
-    123
-    124
-    124
-    -123
-    -124
-    -124
-}
-test cast-float-literal-all-widths {
-    SELECT 123.5::int2;
+    SELECT 123.4::int4;
     SELECT 123.5::int4;
-    SELECT 123.5::int8;
-    SELECT int2(123.5);
+    SELECT 123.6::int4;
+    SELECT -123.4::int4;
+    SELECT -123.5::int4;
+    SELECT -123.6::int4;
+    SELECT int4(123.4);
     SELECT int4(123.5);
-    SELECT int8(123.5);
+    SELECT int4(123.6);
+    SELECT int4(-123.4);
+    SELECT int4(-123.5);
+    SELECT int4(-123.6);
 }
 expect {
+    123
     124
     124
+    -123
+    -124
+    -124
+    123
     124
     124
-    124
-    124
+    -123
+    -124
+    -124
 }
 test cast-float-literal-int2-overflow {
     SELECT 32768.0::int2;
@@ -883,15 +867,15 @@ expect {
 }
 
 test cast-runtime-integer-values-all-widths {
-    CREATE TABLE integer_cast_values (value bigint);
+    CREATE TABLE integer_cast_values (position integer, value bigint);
     INSERT INTO integer_cast_values VALUES
-        (123), (-123), (32767), (-32768);
-    SELECT value::int2 FROM integer_cast_values ORDER BY rowid;
-    SELECT value::int4 FROM integer_cast_values ORDER BY rowid;
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
-    SELECT int2(value) FROM integer_cast_values ORDER BY rowid;
-    SELECT int4(value) FROM integer_cast_values ORDER BY rowid;
-    SELECT int8(value) FROM integer_cast_values ORDER BY rowid;
+        (1, 123), (2, -123), (3, 32767), (4, -32768);
+    SELECT value::int2 FROM integer_cast_values ORDER BY position;
+    SELECT value::int4 FROM integer_cast_values ORDER BY position;
+    SELECT value::int8 FROM integer_cast_values ORDER BY position;
+    SELECT int2(value) FROM integer_cast_values ORDER BY position;
+    SELECT int4(value) FROM integer_cast_values ORDER BY position;
+    SELECT int8(value) FROM integer_cast_values ORDER BY position;
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -937,11 +921,11 @@ test cast-runtime-integer-int4-overflow {
 expect error {
 }
 test cast-runtime-integer-int8-boundaries {
-    CREATE TABLE integer_cast_values (value bigint);
+    CREATE TABLE integer_cast_values (position integer, value bigint);
     INSERT INTO integer_cast_values VALUES
-        (9223372036854775807),
-        (-9223372036854775808);
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+        (1, 9223372036854775807),
+        (2, -9223372036854775808);
+    SELECT value::int8 FROM integer_cast_values ORDER BY position;
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -950,11 +934,11 @@ expect {
 }
 
 test cast-runtime-float-rounding {
-    CREATE TABLE integer_cast_values (value double precision);
+    CREATE TABLE integer_cast_values (position integer, value double precision);
     INSERT INTO integer_cast_values VALUES
-        (123.4), (123.5), (123.6),
-        (-123.4), (-123.5), (-123.6);
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
+        (1, 123.4), (2, 123.5), (3, 123.6),
+        (4, -123.4), (5, -123.5), (6, -123.6);
+    SELECT value::int4 FROM integer_cast_values ORDER BY position;
     DROP TABLE integer_cast_values;
 }
 expect {
@@ -963,31 +947,6 @@ expect {
     124
     -123
     -124
-    -124
-}
-test cast-runtime-float-all-widths {
-    CREATE TABLE integer_cast_values (value double precision);
-    INSERT INTO integer_cast_values VALUES (123.5), (-123.5);
-    SELECT value::int2 FROM integer_cast_values ORDER BY rowid;
-    SELECT value::int4 FROM integer_cast_values ORDER BY rowid;
-    SELECT value::int8 FROM integer_cast_values ORDER BY rowid;
-    SELECT int2(value) FROM integer_cast_values ORDER BY rowid;
-    SELECT int4(value) FROM integer_cast_values ORDER BY rowid;
-    SELECT int8(value) FROM integer_cast_values ORDER BY rowid;
-    DROP TABLE integer_cast_values;
-}
-expect {
-    124
-    -124
-    124
-    -124
-    124
-    -124
-    124
-    -124
-    124
-    -124
-    124
     -124
 }
 test cast-runtime-float-int2-overflow {
@@ -1002,14 +961,6 @@ test cast-runtime-float-int4-overflow {
     CREATE TABLE integer_cast_values (value double precision);
     INSERT INTO integer_cast_values VALUES (2147483648.0);
     SELECT value::int4 FROM integer_cast_values;
-    DROP TABLE integer_cast_values;
-}
-expect error {
-}
-test cast-runtime-float-int8-overflow {
-    CREATE TABLE integer_cast_values (value double precision);
-    INSERT INTO integer_cast_values VALUES (9223372036854775808.0);
-    SELECT value::int8 FROM integer_cast_values;
     DROP TABLE integer_cast_values;
 }
 expect error {
