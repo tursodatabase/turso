@@ -1,10 +1,6 @@
 //! Benchmarks one blocking MVCC checkpoint of a database whose MVCC store holds N
 //! rows that no checkpoint has written. The inserts of these rows are setup and are
-//! not measured.
-//!
-//! `PRAGMA wal_checkpoint(TRUNCATE)` starts the checkpoint in the `table` and
-//! `table-with-index` groups. The commit of an `INSERT` of one row starts it in the
-//! `after-insert` group.
+//! not measured. Only `Connection::checkpoint` is measured.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -19,7 +15,8 @@ use codspeed_criterion_compat::{
 };
 
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SessionRole,
+    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO,
+    SessionRole,
 };
 
 #[cfg(not(target_family = "wasm"))]
@@ -33,33 +30,15 @@ struct UncheckpointedRows {
     _temp_dir: tempfile::TempDir,
     _db: Arc<Database>,
     conn: Arc<Connection>,
-    /// The table has the ids `0..num_rows`.
-    num_rows: u64,
 }
 
 impl UncheckpointedRows {
     fn checkpoint(self) -> Self {
         self.conn
-            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
             .unwrap();
-        self
-    }
-
-    /// Makes each commit that writes to the logical log start a checkpoint.
-    fn checkpoint_after_each_commit(self) -> Self {
-        self.conn
-            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
-            .unwrap();
-        self
-    }
-
-    /// Inserts one row with the id `num_rows`, which is not in the table.
-    fn insert_one_row(mut self) -> Self {
-        let id = self.num_rows;
-        self.conn
-            .execute(format!("INSERT INTO t(id, v) VALUES ({id}, {id})"))
-            .unwrap();
-        self.num_rows += 1;
         self
     }
 }
@@ -109,7 +88,6 @@ fn insert_rows(num_rows: u64, create_table: &str) -> UncheckpointedRows {
         _temp_dir: temp_dir,
         _db: db,
         conn,
-        num_rows,
     }
 }
 
@@ -145,29 +123,6 @@ fn bench_checkpoint(c: &mut Criterion) {
         }
         group.finish();
     }
-
-    let mut group = c.benchmark_group("mvcc-checkpoint/after-insert");
-    for num_rows in [1_000, 10_000, 100_000] {
-        group.throughput(Throughput::Elements(num_rows));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(num_rows),
-            &num_rows,
-            |b, &num_rows| {
-                b.iter_batched(
-                    || {
-                        insert_rows(
-                            num_rows,
-                            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
-                        )
-                        .checkpoint_after_each_commit()
-                    },
-                    |rows| black_box(rows.insert_one_row()),
-                    BatchSize::PerIteration,
-                )
-            },
-        );
-    }
-    group.finish();
 }
 
 #[cfg(not(feature = "codspeed"))]
