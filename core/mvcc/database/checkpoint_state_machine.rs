@@ -356,6 +356,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Roots allocated this checkpoint; resolved until publish.
     pending_alloc_roots: std::collections::HashMap<MVTableId, u64>,
     collect_table_cursor: TableWalkCursor,
+    /// Table keys that collection visits before it yields.
+    #[cfg(test)]
+    collect_preemption_threshold: usize,
     collect_table_phase: CollectTablePhase,
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
@@ -977,6 +980,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             pending_rootmap_ops: crate::alloc::vec![],
             pending_alloc_roots: std::collections::HashMap::new(),
             collect_table_cursor: TableWalkCursor::default(),
+            #[cfg(test)]
+            collect_preemption_threshold: COLLECT_PREEMPTION_THRESHOLD,
             collect_table_phase: CollectTablePhase::Schema,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
@@ -1008,6 +1013,41 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> CheckpointState {
         self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_collect_preemption_threshold_for_test(&mut self, keys: usize) {
+        self.collect_preemption_threshold = keys;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_ts_for_test(&self) -> u64 {
+        self.snapshot_ts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_collected_table_key_for_test(&self) -> Option<&RowID> {
+        self.collect_table_cursor.last_visited.as_ref()
+    }
+
+    /// The collected table rows, each with true for a delete.
+    #[cfg(test)]
+    pub(crate) fn collected_table_rows_for_test(&self) -> std::vec::Vec<(RowID, bool)> {
+        self.write_set
+            .iter()
+            .map(|(row_id, version, _)| (row_id.clone(), version.end().is_some()))
+            .collect()
+    }
+
+    fn collect_preemption_threshold(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.collect_preemption_threshold
+        }
+        #[cfg(not(test))]
+        {
+            COLLECT_PREEMPTION_THRESHOLD
+        }
     }
 
     #[cfg(test)]
@@ -1312,6 +1352,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn collect_table_rows_from_store(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
+        let threshold = self.collect_preemption_threshold();
         let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
         let mut cursor = std::mem::take(&mut self.collect_table_cursor);
@@ -1320,7 +1361,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let row_versions = chain.read();
             self.collect_table_row_versions(key, &row_versions)?;
             *processed += 1;
-            Ok(*processed >= COLLECT_PREEMPTION_THRESHOLD)
+            Ok(*processed >= threshold)
         });
         self.collect_table_cursor = cursor;
         result
@@ -1328,6 +1369,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn collect_table_rows_from_dirty_keys(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
+        let threshold = self.collect_preemption_threshold();
         let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
         let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
@@ -1345,7 +1387,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     let row_versions = chain.read();
                     self.collect_table_row_versions(key, &row_versions)?;
                 }
-                Ok(*processed >= COLLECT_PREEMPTION_THRESHOLD)
+                Ok(*processed >= threshold)
             },
         );
         self.collect_table_cursor = cursor;
@@ -4685,6 +4727,40 @@ mod tests {
 
         assert_eq!(checkpoint.write_set.len(), 1);
         assert_eq!(checkpoint.write_set[0].0.row_id, RowKey::Int(5));
+    }
+
+    #[test]
+    fn collect_table_rows_yields_after_each_key_with_threshold_one() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        checkpoint.set_collect_preemption_threshold_for_test(1);
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        for rowid in [3, 5] {
+            insert_row_version(&mvstore, committed_table_row_version(table_id, rowid));
+        }
+        let key = |rowid| RowID::new(table_id, RowKey::Int(rowid));
+
+        assert!(checkpoint.collect_table_rows().unwrap().is_some());
+        assert_eq!(
+            checkpoint.last_collected_table_key_for_test(),
+            Some(&key(3))
+        );
+        assert_eq!(
+            checkpoint.collected_table_rows_for_test(),
+            vec![(key(3), false)]
+        );
+
+        assert!(checkpoint.collect_table_rows().unwrap().is_some());
+        assert_eq!(
+            checkpoint.last_collected_table_key_for_test(),
+            Some(&key(5))
+        );
+        assert_eq!(
+            checkpoint.collected_table_rows_for_test(),
+            vec![(key(3), false), (key(5), false)]
+        );
+
+        assert!(checkpoint.collect_table_rows().unwrap().is_none());
     }
 
     #[test]
