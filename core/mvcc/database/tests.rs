@@ -623,6 +623,100 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
 }
 
 #[test]
+fn mvcc_vacuum_gate_blocks_new_passive_read_and_write_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    let store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+
+    store.try_begin_vacuum_gate().unwrap();
+    assert!(matches!(
+        store.begin_tx(pager.clone()),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        store.begin_exclusive_tx(pager.clone(), None, &conn, None),
+        Err(LimboError::Busy)
+    ));
+    store.release_vacuum_gate();
+
+    let tx_id = store.begin_tx(pager).unwrap();
+    store.remove_tx(tx_id);
+}
+
+#[test]
+fn passive_transactions_begin_during_explicit_truncate_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let checkpoint_conn = db.connect();
+    checkpoint_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    checkpoint_conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    checkpoint_conn
+        .execute("INSERT INTO t VALUES (1, 'one')")
+        .unwrap();
+    checkpoint_conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    checkpoint_conn
+        .execute("INSERT INTO t VALUES (2, 'two')")
+        .unwrap();
+
+    let store = db.get_mvcc_store();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    checkpoint_conn.set_yield_injector(Some(Arc::new(PauseAtCheckpointPoint {
+        point: CheckpointYieldPoint::BeforePublishWindow,
+        reached: reached_tx,
+        resume: std::sync::Mutex::new(Some(resume_rx)),
+    })));
+    let checkpoint =
+        std::thread::spawn(move || checkpoint_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"));
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(store.blocking_checkpoint_lock.is_write_locked());
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_text("one")],
+            vec![Value::from_i64(2), Value::from_text("two")],
+        ]
+    );
+    reader.execute("COMMIT").unwrap();
+
+    resume_tx.send(()).unwrap();
+    checkpoint.join().unwrap().unwrap();
+}
+
+/// Blocks the checkpoint thread once at `point` until the test sends on `resume`.
+#[derive(Debug)]
+struct PauseAtCheckpointPoint {
+    point: CheckpointYieldPoint,
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl YieldInjector for PauseAtCheckpointPoint {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == self.point.point() {
+            if let Some(resume) = self.resume.lock().unwrap().take() {
+                self.reached.send(()).unwrap();
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        false
+    }
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
