@@ -1025,6 +1025,16 @@ expect @tursopg error {
     a column of row type v is not supported
 }
 
+# PostgreSQL skips the statement before it looks up the column types.
+test table-create-if-not-exists-of-existing-table-with-missing-type {
+    CREATE TABLE emp (name text);
+    CREATE TABLE IF NOT EXISTS emp (c nosuch);
+    SELECT count(*) FROM emp;
+}
+expect {
+    0
+}
+
 test table-add-column-of-missing-type {
     CREATE TABLE t (a int);
     ALTER TABLE t ADD COLUMN b nosuch;

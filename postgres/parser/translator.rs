@@ -70,6 +70,10 @@ pub struct PostgreSQLTranslator {
     /// None when nothing is known about the catalog, as when a stored
     /// statement is translated again.
     type_lookup: Option<Box<TypeLookup<'static>>>,
+    /// True while CREATE TABLE IF NOT EXISTS of a relation that exists is
+    /// translated. PostgreSQL skips such a statement before it looks up the
+    /// column types.
+    skips_type_checks: std::cell::Cell<bool>,
     /// Table name in scope while a generation expression is being translated.
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
@@ -567,7 +571,11 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
-        let (stmt, serial_sequences) = self.translate_create_table(create)?;
+        self.skips_type_checks
+            .set(create.if_not_exists && self.names_existing_relation(create));
+        let translated = self.translate_create_table(create);
+        self.skips_type_checks.set(false);
+        let (stmt, serial_sequences) = translated?;
         let ast::Stmt::CreateTable { tbl_name, .. } = &stmt else {
             unreachable!("translate_create_table returns a CREATE TABLE statement");
         };
@@ -607,6 +615,17 @@ impl PostgreSQLTranslator {
             postreqs,
             serial_sequences,
         })
+    }
+
+    /// Whether the schema of CREATE TABLE `create` has a relation of the
+    /// table's name. The frontend writes the schema into every CREATE TABLE
+    /// before it translates the statement.
+    fn names_existing_relation(&self, create: &pg_query::protobuf::CreateStmt) -> bool {
+        let (Some(relation), Some(is_taken)) = (&create.relation, &self.relation_name_is_taken)
+        else {
+            return false;
+        };
+        !relation.schemaname.is_empty() && is_taken(&relation.schemaname, &relation.relname)
     }
 
     /// Translates `ALTER SEQUENCE name OWNED BY { table.column | NONE }`, the
@@ -5664,8 +5683,8 @@ impl PostgreSQLTranslator {
     /// Checks `type_name`, used as `used_as`, when tursopg has no type of
     /// its own for it. Core then gets the name as it is written and takes
     /// it for a custom type, so the name must be one. A built-in type of
-    /// PostgreSQL is left to core. Without a type lookup, nothing is
-    /// checked.
+    /// PostgreSQL is left to core. Nothing is checked without a type
+    /// lookup, or in a statement that PostgreSQL skips.
     fn check_type_name(
         &self,
         type_name: &pg_query::protobuf::TypeName,
@@ -5674,6 +5693,9 @@ impl PostgreSQLTranslator {
         let Some(lookup) = &self.type_lookup else {
             return Ok(());
         };
+        if self.skips_type_checks.get() {
+            return Ok(());
+        }
         let (schema, name) = schema_and_name(type_name)?;
         // `_mood` is the array type of `mood`.
         let element = name.strip_prefix('_');
