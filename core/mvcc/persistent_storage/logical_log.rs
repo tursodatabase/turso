@@ -597,6 +597,7 @@ pub struct LogicalLog {
     /// becomes `header` once the write succeeded; see
     /// `publish_finished_header_write`.
     pending_header_write: Option<(LogHeader, Completion)>,
+    pending_truncate: Option<(LogHeader, Completion)>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -630,6 +631,7 @@ impl LogicalLog {
             running_crc: 0,
             pending_running_crc: None,
             pending_header_write: None,
+            pending_truncate: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -908,6 +910,11 @@ impl LogicalLog {
     }
 
     pub fn upgrade_header_for_log_tx(&mut self, tx: &LogRecord) -> Result<Option<Completion>> {
+        self.publish_finished_truncate();
+        if let Some((_, c)) = &self.pending_truncate {
+            return Ok(Some(c.clone()));
+        }
+
         #[cfg(feature = "conn_raw_api")]
         let portable_changes_enabled =
             tx.portable_changes_enabled || !tx.portable_changes.is_empty();
@@ -978,6 +985,7 @@ impl LogicalLog {
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
+        self.publish_finished_truncate();
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
         });
@@ -1058,13 +1066,9 @@ impl LogicalLog {
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
-        self.publish_finished_header_write();
-        self.pending_header_write = None;
+        self.finish_pending_header_write();
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
-        self.pending_running_crc = None;
-        self.header = Some(header);
 
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
@@ -1072,8 +1076,8 @@ impl LogicalLog {
             }
         });
         let c = self.file.truncate(0, completion)?;
-        self.offset = 0;
-        self.max_appended_commit_ts = 0;
+        self.pending_truncate = Some((header, c.clone()));
+        self.publish_finished_truncate();
         Ok(c)
     }
 
@@ -1085,6 +1089,10 @@ impl LogicalLog {
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
         use super::LogicalLogTruncateOutcome;
+        self.publish_finished_truncate();
+        if let Some((_, c)) = &self.pending_truncate {
+            return Ok((c.clone(), LogicalLogTruncateOutcome::Truncated));
+        }
         if self.max_appended_commit_ts > checkpointed_through_ts {
             // Uncheckpointed frames remain — skip truncation.
             let c = Completion::new_trunc(|_| {});
@@ -1131,6 +1139,11 @@ impl LogicalLog {
     /// flight. Used before the header is read or rewritten by a path that
     /// never runs while a header write is in progress.
     fn finish_pending_header_write(&mut self) {
+        self.publish_finished_truncate();
+        turso_assert!(
+            self.pending_truncate.is_none(),
+            "logical log was used while a truncate was in flight"
+        );
         self.publish_finished_header_write();
         turso_assert!(
             self.pending_header_write.is_none(),
@@ -1160,6 +1173,23 @@ impl LogicalLog {
             self.running_crc = derive_initial_crc(header.salt);
         }
         self.header = Some(header);
+    }
+
+    pub(super) fn publish_finished_truncate(&mut self) {
+        let Some((header, c)) = self.pending_truncate.take() else {
+            return;
+        };
+        if !c.finished() {
+            self.pending_truncate = Some((header, c));
+            return;
+        }
+        if c.succeeded() {
+            self.running_crc = derive_initial_crc(header.salt);
+            self.pending_running_crc = None;
+            self.header = Some(header);
+            self.offset = 0;
+            self.max_appended_commit_ts = 0;
+        }
     }
 }
 

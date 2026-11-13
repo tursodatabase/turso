@@ -205,17 +205,24 @@ impl DurableStorage for Storage {
         m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.logical_log
-            .write()
-            .log_tx_deferred_offset(m, on_serialization_complete)
+        let mut log = self.logical_log.write();
+        let result = log.log_tx_deferred_offset(m, on_serialization_complete);
+        self.shadow_offset_store(log.offset);
+        result
     }
 
     fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
-        self.logical_log.write().upgrade_header_for_log_tx(m)
+        let mut log = self.logical_log.write();
+        let result = log.upgrade_header_for_log_tx(m);
+        self.shadow_offset_store(log.offset);
+        result
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
-        self.logical_log.write().sync(sync_type)
+        let mut log = self.logical_log.write();
+        let result = log.sync(sync_type);
+        self.shadow_offset_store(log.offset);
+        result
     }
 
     fn update_header(&self) -> Result<Completion> {
@@ -233,7 +240,6 @@ impl DurableStorage for Storage {
         // skipped (uncheckpointed frames remain), so should_checkpoint() stays
         // accurate.
         let new_offset = log.offset;
-        drop(log);
         self.shadow_offset_store(new_offset);
         Ok((c, outcome))
     }
@@ -249,7 +255,10 @@ impl DurableStorage for Storage {
     }
 
     fn logical_log_offset(&self) -> u64 {
-        self.log_offset.load(Ordering::Relaxed)
+        let mut log = self.logical_log.write();
+        log.publish_finished_truncate();
+        self.shadow_offset_store(log.offset);
+        log.offset
     }
 
     fn encryption_ctx(&self) -> Option<EncryptionContext> {
@@ -275,7 +284,8 @@ impl DurableStorage for Storage {
     }
 
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
-        self.logical_log.write().advance_offset_after_success(bytes);
+        let mut log = self.logical_log.write();
+        log.advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
         Ok(())
     }
@@ -294,6 +304,13 @@ impl DurableStorage for Storage {
 
     fn set_header(&self, header: logical_log::LogHeader) {
         self.logical_log.write().set_header(header);
+    }
+
+    fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
+        let mut log = self.logical_log.write();
+        log.publish_finished_truncate();
+        self.shadow_offset_store(log.offset);
+        Ok(())
     }
 }
 
