@@ -21997,6 +21997,521 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     drive_to_done_or_timeout(&mut commit_b, 30); // this times out if pager_commit_lock or the group retry set is leaked
 }
 
+#[test]
+fn passive_checkpoint_finishes_with_an_open_exclusive_writer() {
+    use crate::mvcc::database::checkpoint_state_machine::CheckpointStateMachine;
+    use crate::storage::wal::CheckpointMode;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    writer.execute("BEGIN IMMEDIATE").unwrap();
+    writer.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    let checkpointer = db.connect();
+    let mv = db.get_mvcc_store();
+    let mut checkpoint = CheckpointStateMachine::new(
+        checkpointer.pager.load().clone(),
+        mv,
+        checkpointer.clone(),
+        true,
+        checkpointer.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    let mut finished = false;
+    for _ in 0..10_000 {
+        match checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(c) => c.wait(checkpointer.db.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    if !finished {
+        checkpoint
+            .cleanup_after_external_io_error(LimboError::Interrupt)
+            .unwrap();
+    }
+    assert!(finished, "passive checkpoint waited for the open writer");
+    assert_eq!(
+        get_rows(&checkpointer, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
+    writer.execute("COMMIT").unwrap();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    assert_eq!(
+        get_rows(&checkpointer, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("b")]]
+    );
+}
+
+#[test]
+fn checkpoint_retains_log_for_prepared_append() {
+    use crate::mvcc::database::checkpoint_state_machine::{
+        CheckpointState, CheckpointStateMachine,
+    };
+    use crate::mvcc::persistent_storage::{DurableStorage, Storage};
+    use crate::storage::wal::CheckpointMode;
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().join("append-race.db");
+    let path_str = path.to_str().unwrap();
+    let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path_str,
+            OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        remove_file_from_database_registry(path_str);
+    }
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file = Arc::new(DelayedLogicalLogTruncateFile {
+            inner: io
+                .open_file(
+                    path.with_extension("db-log").to_str().unwrap(),
+                    OpenFlags::default(),
+                    false,
+                )
+                .unwrap(),
+            io: io.clone(),
+            pending: Mutex::new(None),
+        });
+        let storage = Arc::new(Storage::new(file.clone(), io.clone(), None));
+        let db = Database::open(
+            io.clone(),
+            path_str,
+            crate::OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(opts)
+                .durable_storage(storage as Arc<dyn DurableStorage>),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+        let mv = db.get_mv_store().clone().unwrap();
+        let cp_conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let mut checkpoint = CheckpointStateMachine::new(
+            cp_conn.pager.load().clone(),
+            mv.clone(),
+            cp_conn.clone(),
+            true,
+            cp_conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        for _ in 0..200_000 {
+            if checkpoint.state_for_test() == CheckpointState::TruncateLogicalLog {
+                break;
+            }
+            match checkpoint.step(&()).unwrap() {
+                TransitionResult::Io(c) => c.wait(io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => panic!("checkpoint finished too early"),
+            }
+        }
+        assert_eq!(
+            checkpoint.state_for_test(),
+            CheckpointState::TruncateLogicalLog
+        );
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
+        let mut commit = mv
+            .commit_tx(conn.get_mv_tx_id().unwrap(), &conn, crate::MAIN_DB_ID)
+            .unwrap();
+        for _ in 0..200_000 {
+            if matches!(
+                commit.inner_mut().state,
+                CommitState::WriteLogicalLog { .. }
+            ) {
+                break;
+            }
+            match commit.inner_mut().step(&mv).unwrap() {
+                TransitionResult::Io(c) => c.wait(io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => panic!("commit finished too early"),
+            }
+        }
+        assert!(matches!(
+            commit.inner_mut().state,
+            CommitState::WriteLogicalLog { .. }
+        ));
+        assert!(matches!(
+            checkpoint.step(&()).unwrap(),
+            TransitionResult::Continue
+        ));
+        assert!(file.pending.lock().is_none());
+        assert_eq!(
+            checkpoint.state_for_test(),
+            CheckpointState::FsyncLogicalLog
+        );
+        loop {
+            match checkpoint.step(&()).unwrap() {
+                TransitionResult::Io(c) => c.wait(io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => break,
+            }
+        }
+        loop {
+            match commit.inner_mut().step(&mv).unwrap() {
+                TransitionResult::Io(c) => c.wait(io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => break,
+            }
+        }
+        assert!(file.pending.lock().is_none());
+        assert_eq!(
+            get_rows(&cp_conn, "SELECT id, v FROM t ORDER BY id"),
+            vec![
+                vec![Value::from_i64(1), Value::build_text("a")],
+                vec![Value::from_i64(2), Value::build_text("b")],
+            ]
+        );
+    }
+    remove_file_from_database_registry(path_str);
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path_str,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("a")],
+            vec![Value::from_i64(2), Value::build_text("b")],
+        ]
+    );
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(db.get_mv_store().as_ref().unwrap().logical_log_offset(), 0);
+}
+
+#[rstest::rstest]
+#[case::full("FULL")]
+#[case::off("OFF")]
+fn checkpoint_observes_truncate_completed_before_offset_check(#[case] sync_mode: &str) {
+    checkpoint_observes_truncate_completion_with_io(
+        Arc::new(PlatformIO::new().unwrap()),
+        sync_mode,
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+#[rstest::rstest]
+#[case::full("FULL")]
+#[case::off("OFF")]
+fn uring_checkpoint_observes_truncate_completed_before_offset_check(#[case] sync_mode: &str) {
+    checkpoint_observes_truncate_completion_with_io(
+        Arc::new(crate::io::UringIO::new().unwrap()),
+        sync_mode,
+    );
+}
+
+fn checkpoint_observes_truncate_completion_with_io(test_io: Arc<dyn crate::IO>, sync_mode: &str) {
+    use crate::io::FileSyncType;
+    use crate::mvcc;
+    use crate::mvcc::database::{LogRecord, RowVersion};
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::storage::encryption::EncryptionContext;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::storage::wal::{CheckpointMode, TursoRwLock};
+    use crate::{CheckpointResult, File, Result, IO};
+
+    #[derive(Debug)]
+    struct CompleteTruncateBeforeReturnStorage {
+        inner: Arc<dyn DurableStorage>,
+        file: Arc<DelayedLogicalLogTruncateFile>,
+        lock: Mutex<Option<Arc<TursoRwLock>>>,
+        lock_held_during_end: AtomicBool,
+        end_called: AtomicBool,
+    }
+
+    impl CompleteTruncateBeforeReturnStorage {
+        fn new(
+            inner: Arc<dyn DurableStorage>,
+            file: Arc<DelayedLogicalLogTruncateFile>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                file,
+                lock: Mutex::new(None),
+                lock_held_during_end: AtomicBool::new(false),
+                end_called: AtomicBool::new(false),
+            })
+        }
+
+        fn set_lock(&self, lock: Arc<TursoRwLock>) {
+            *self.lock.lock() = Some(lock);
+        }
+    }
+
+    impl DurableStorage for CompleteTruncateBeforeReturnStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_id: &RowID,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            let result = self.inner.truncate(checkpointed_through_ts)?;
+            if let Some((len, c)) = self.file.pending.lock().take() {
+                self.file
+                    .io
+                    .wait_for_completion(self.file.inner.truncate(len, c)?)?;
+            }
+            assert!(result.0.succeeded());
+            Ok(result)
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.end_called.store(true, Ordering::Release);
+            let held = match self.lock.lock().as_ref() {
+                Some(lock) => {
+                    if lock.write() {
+                        lock.unlock();
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => false,
+            };
+            self.lock_held_during_end.store(held, Ordering::Release);
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = test_io.clone();
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        remove_file_from_database_registry(&path_str);
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = test_io.clone();
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let log_file = Arc::new(DelayedLogicalLogTruncateFile {
+        inner: log_file,
+        io: io.clone(),
+        pending: Mutex::new(None),
+    });
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file.clone(),
+        io.clone(),
+        None,
+    ));
+    let observe = CompleteTruncateBeforeReturnStorage::new(inner_storage, log_file);
+    let db = Database::open(
+        io,
+        &path_str,
+        crate::OpenOptions::new(Arc::new(EngineDialect))
+            .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let mv_store = db.get_mv_store().clone().unwrap();
+    observe.set_lock(mv_store.blocking_checkpoint_lock.clone());
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute(format!("PRAGMA synchronous = {sync_mode}"))
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::build_text("a")]]
+    );
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+    assert!(
+        observe.end_called.load(Ordering::Acquire),
+        "on_checkpoint_end must run for a successful truncate checkpoint"
+    );
+    assert!(
+        observe.lock_held_during_end.load(Ordering::Acquire),
+        "blocking_checkpoint_lock must still be held during on_checkpoint_end"
+    );
+    assert!(
+        mv_store.blocking_checkpoint_lock.write(),
+        "blocking_checkpoint_lock must be released after checkpoint returns"
+    );
+    mv_store.blocking_checkpoint_lock.unlock();
+}
+
+struct DelayedLogicalLogTruncateFile {
+    inner: Arc<dyn crate::File>,
+    io: Arc<dyn crate::IO>,
+    pending: Mutex<Option<(u64, Completion)>>,
+}
+impl std::fmt::Debug for DelayedLogicalLogTruncateFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DelayedLogicalLogTruncateFile")
+    }
+}
+impl crate::File for DelayedLogicalLogTruncateFile {
+    fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> crate::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+        self.inner.pread(pos, c)
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> crate::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+    fn sync(&self, c: Completion, mode: crate::io::FileSyncType) -> crate::Result<Completion> {
+        self.inner.sync(c, mode)
+    }
+    fn size(&self) -> crate::Result<u64> {
+        self.inner.size()
+    }
+    fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+        assert!(self.pending.lock().replace((len, c.clone())).is_none());
+        Ok(c)
+    }
+}
+
 /// `on_log_write_complete` may return extra durability work (turso-server waits
 /// for S3). The logical-log offset must not advance until that completion
 /// finishes.

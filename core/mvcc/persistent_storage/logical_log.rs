@@ -6150,6 +6150,305 @@ mod tests {
         ));
     }
 
+    #[rstest::rstest]
+    #[case::submission_error(false, false)]
+    #[case::completion_error(true, false)]
+    #[case::delayed_completion_error(true, true)]
+    fn failed_log_truncate_keeps_appended_rows_readable(
+        #[case] completion_error: bool,
+        #[case] delayed: bool,
+    ) {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let failing = Arc::new(TruncateFailingFile {
+            inner: io
+                .open_file("truncate-error.db-log", OpenFlags::Create, false)
+                .unwrap(),
+            fail_truncate: std::sync::atomic::AtomicBool::new(false),
+            completion_error,
+            delayed,
+            pending: std::sync::Mutex::new(None),
+        });
+        let file: Arc<dyn crate::File> = failing.clone();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+
+        failing
+            .fail_truncate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = log.truncate(u64::MAX);
+        if completion_error {
+            let (c, _) = result.unwrap();
+            if delayed {
+                let (_, pending) = failing.pending.lock().unwrap().take().unwrap();
+                pending.error(crate::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected truncate failure",
+                ));
+            }
+            assert!(io.wait_for_completion(c).is_err());
+        } else {
+            assert!(result.is_err());
+        }
+        failing
+            .fail_truncate
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let tx = crate::mvcc::database::LogRecord::new(20, crate::alloc::DynAllocator::default())
+            .unwrap();
+        assert!(log.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+
+        let rows: Vec<_> = read_table_ops(file, &io)
+            .into_iter()
+            .map(|op| {
+                let ExpectedTableOp::Upsert {
+                    rowid,
+                    payload,
+                    commit_ts,
+                    ..
+                } = op
+                else {
+                    panic!("unexpected delete");
+                };
+                (
+                    rowid,
+                    commit_ts,
+                    ImmutableRecordRef::from_bin_record(&payload)
+                        .get_values_owned()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 10, crate::alloc::vec![Value::build_text("a")]),
+                (2, 20, crate::alloc::vec![Value::build_text("b")])
+            ]
+        );
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        if delayed {
+            let (len, pending) = failing.pending.lock().unwrap().take().unwrap();
+            io.wait_for_completion(failing.inner.truncate(len, pending).unwrap())
+                .unwrap();
+        }
+        io.wait_for_completion(c).unwrap();
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 3, 30, false, false, "c");
+        assert_eq!(read_table_ops(failing.inner.clone(), &io).len(), 1);
+    }
+
+    #[test]
+    fn log_truncate_changes_writer_state_only_after_success() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = Arc::new(TruncateFailingFile {
+            inner: io
+                .open_file("truncate-delayed.db-log", OpenFlags::Create, false)
+                .unwrap(),
+            fail_truncate: std::sync::atomic::AtomicBool::new(false),
+            completion_error: false,
+            delayed: true,
+            pending: std::sync::Mutex::new(None),
+        });
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        let (c, _) = log.truncate(u64::MAX).unwrap();
+        assert!(!c.finished());
+        let tx = crate::mvcc::database::LogRecord::new(20, crate::alloc::DynAllocator::default())
+            .unwrap();
+        assert!(!log
+            .upgrade_header_for_log_tx(&tx)
+            .unwrap()
+            .unwrap()
+            .finished());
+
+        let (len, pending) = file.pending.lock().unwrap().take().unwrap();
+        io.wait_for_completion(file.inner.truncate(len, pending).unwrap())
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert!(log.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+        assert_eq!(log.offset, 0);
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+        let rows: Vec<_> = read_table_ops(file, &io)
+            .into_iter()
+            .map(|op| {
+                let ExpectedTableOp::Upsert {
+                    rowid,
+                    payload,
+                    commit_ts,
+                    ..
+                } = op
+                else {
+                    panic!("unexpected delete");
+                };
+                (
+                    rowid,
+                    commit_ts,
+                    ImmutableRecordRef::from_bin_record(&payload)
+                        .get_values_owned()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(2, 20, crate::alloc::vec![Value::build_text("b")])]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::success(true)]
+    #[case::failure(false)]
+    fn log_truncate_keeps_storage_offset_until_completion(#[case] success: bool) {
+        use crate::mvcc::persistent_storage::{DurableStorage, Storage};
+
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = Arc::new(TruncateFailingFile {
+            inner: io
+                .open_file("truncate-storage.db-log", OpenFlags::Create, false)
+                .unwrap(),
+            fail_truncate: std::sync::atomic::AtomicBool::new(false),
+            completion_error: false,
+            delayed: true,
+            pending: std::sync::Mutex::new(None),
+        });
+        let storage = Storage::new(file.clone(), io.clone(), None);
+        storage.set_checkpoint_threshold(1);
+        let append = |rowid, commit_ts, text| {
+            let row = table_row_version((-2).into(), rowid, commit_ts, text);
+            let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row], None);
+            assert!(storage.upgrade_header_for_log_tx(&tx).unwrap().is_none());
+            let (c, bytes) = storage.log_tx(tx, None).unwrap();
+            io.wait_for_completion(c).unwrap();
+            storage
+                .advance_logical_log_offset_after_success(bytes)
+                .unwrap();
+        };
+        append(1, 10, "a");
+        let before = storage.logical_log_offset();
+        assert!(storage.should_checkpoint());
+        let (c, _) = storage.truncate(u64::MAX).unwrap();
+        assert!(!c.finished());
+        assert_eq!(storage.logical_log_offset(), before);
+        let (len, pending) = file.pending.lock().unwrap().take().unwrap();
+        if success {
+            io.wait_for_completion(file.inner.truncate(len, pending).unwrap())
+                .unwrap();
+        } else {
+            pending.error(crate::CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "injected truncate failure",
+            ));
+        }
+        assert_eq!(io.wait_for_completion(c).is_ok(), success);
+        storage
+            .on_checkpoint_end(Ok(&crate::CheckpointResult::default()))
+            .unwrap();
+        if success {
+            assert_eq!(storage.logical_log_offset(), 0);
+            assert!(!storage.should_checkpoint());
+        } else {
+            assert_eq!(storage.logical_log_offset(), before);
+            assert!(storage.should_checkpoint());
+        }
+        append(2, 20, "b");
+        let rows: Vec<_> = read_table_ops(file, &io)
+            .into_iter()
+            .map(|op| {
+                let ExpectedTableOp::Upsert {
+                    rowid,
+                    payload,
+                    commit_ts,
+                    ..
+                } = op
+                else {
+                    panic!("unexpected delete");
+                };
+                (
+                    rowid,
+                    commit_ts,
+                    ImmutableRecordRef::from_bin_record(&payload)
+                        .get_values_owned()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        if success {
+            assert_eq!(
+                rows,
+                vec![(2, 20, crate::alloc::vec![Value::build_text("b")])]
+            );
+        } else {
+            assert_eq!(
+                rows,
+                vec![
+                    (1, 10, crate::alloc::vec![Value::build_text("a")]),
+                    (2, 20, crate::alloc::vec![Value::build_text("b")])
+                ]
+            );
+        }
+    }
+
+    struct TruncateFailingFile {
+        inner: Arc<dyn crate::File>,
+        fail_truncate: std::sync::atomic::AtomicBool,
+        completion_error: bool,
+        delayed: bool,
+        pending: std::sync::Mutex<Option<(u64, Completion)>>,
+    }
+
+    impl crate::File for TruncateFailingFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            if self.delayed {
+                assert!(self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .replace((len, c.clone()))
+                    .is_none());
+                return Ok(c);
+            }
+            if self.fail_truncate.load(std::sync::atomic::Ordering::SeqCst) {
+                if self.completion_error {
+                    c.error(crate::CompletionError::IOError(
+                        std::io::ErrorKind::Other,
+                        "injected truncate failure",
+                    ));
+                    return Ok(c);
+                }
+                return Err(crate::LimboError::InternalError(
+                    "injected truncate failure".into(),
+                ));
+            }
+            self.inner.truncate(len, c)
+        }
+    }
+
     /// Passive truncate must report Retained (and leave salt/offset alone) when commits
     /// remain above the checkpoint boundary.
     #[test]
