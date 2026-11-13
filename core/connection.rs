@@ -15,6 +15,7 @@ use crate::sync::{
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::IOResult;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -390,6 +391,73 @@ impl Drop for ExplicitCheckpointGuard {
             "dropping an inactive explicit checkpoint guard"
         );
         activity.explicit_checkpoint_active = false;
+    }
+}
+
+/// How much storage the main database uses, read by
+/// [`Connection::storage_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// The page size in bytes, as `PRAGMA page_size` returns it.
+    pub page_size: u32,
+    /// The pages in the database, as `PRAGMA page_count` returns it. Under
+    /// MVCC this counts the pages as of the last checkpoint of the logical
+    /// log: rows committed since then are only in the log.
+    pub page_count: u32,
+    /// The unused pages, as `PRAGMA freelist_count` returns it. Under MVCC,
+    /// as of the last checkpoint, like `page_count`.
+    pub freelist_count: u32,
+    /// The bytes written to the MVCC logical log since its last checkpoint,
+    /// which holds every change committed since then, deleted and replaced
+    /// rows included. 0 without MVCC.
+    pub logical_log_bytes: u64,
+}
+
+/// A read of [`StorageStats`], started by [`Connection::storage_stats`].
+pub struct StorageStatsRead {
+    connection: Arc<Connection>,
+    statement: Option<Statement>,
+    stats: Option<StorageStats>,
+}
+
+impl StorageStatsRead {
+    /// Reads the counts with a query of the engine's own, which the role the
+    /// connection's user set does not limit. It runs like a top-level
+    /// statement, in its own read transaction when no transaction is open.
+    /// Returns [`IOResult::IO`] when the query waits for storage: wait for
+    /// the completions and call `read` again. Do not run other statements
+    /// on the connection until it returns [`IOResult::Done`] or an error,
+    /// or until this value is dropped.
+    pub fn read(&mut self) -> Result<IOResult<StorageStats>> {
+        let statement = match &mut self.statement {
+            Some(statement) => statement,
+            None => self
+                .statement
+                .insert(self.connection.prepare_engine_metadata_read(
+                "SELECT * FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count()",
+            )?),
+        };
+        let stats = &mut self.stats;
+        crate::return_if_io!(statement.run_with_row_callback_nonblock(|row| {
+            let count = |idx| {
+                u32::try_from(row.get::<i64>(idx)?)
+                    .map_err(|_| LimboError::InternalError("negative storage count".to_string()))
+            };
+            *stats = Some(StorageStats {
+                page_size: count(0)?,
+                page_count: count(1)?,
+                freelist_count: count(2)?,
+                logical_log_bytes: 0,
+            });
+            Ok(())
+        }));
+        let mut stats = self.stats.ok_or_else(|| {
+            LimboError::InternalError("storage stats query returned no row".to_string())
+        })?;
+        if let Some(mv_store) = self.connection.mv_store().as_ref() {
+            stats.logical_log_bytes = mv_store.logical_log_offset();
+        }
+        Ok(IOResult::Done(stats))
     }
 }
 
@@ -2918,6 +2986,18 @@ impl Connection {
     }
     pub fn get_page_size(&self) -> PageSize {
         self.pager.load().get_page_size_unchecked()
+    }
+
+    /// Starts reading the page size, page count and freelist count of the
+    /// main database, and the size of its MVCC logical log. An embedder uses
+    /// it to measure the database on a user's connection, whatever role the
+    /// user set.
+    pub fn storage_stats(self: &Arc<Connection>) -> StorageStatsRead {
+        StorageStatsRead {
+            connection: self.clone(),
+            statement: None,
+            stats: None,
+        }
     }
 
     pub fn is_closed(&self) -> bool {
