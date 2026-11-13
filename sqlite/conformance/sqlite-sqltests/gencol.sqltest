@@ -6756,3 +6756,22 @@ test gencol_strict_alter_add_virtual_check_error_when_type_passes {
 expect error {
     CHECK constraint failed
 }
+
+# Like SQLite, a double-quoted name that is not a column is a string literal in a
+# generated column, also when it is a rowid name.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test gencol_double_quoted_string {
+    CREATE TABLE t(c, v AS (c || "q"), s AS (c || "rowid") STORED, n AS ("c" + 1));
+    INSERT INTO t(c) VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    1|1q|1rowid|2
+}
+
+test gencol_unquoted_name_is_not_a_string {
+    CREATE TABLE t(c, v AS (c || q));
+}
+expect error {
+    no such column: q
+}

@@ -13,9 +13,11 @@ use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, sanitize_string, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
+use crate::translate::index::{
+    double_quoted_names_to_strings, resolve_index_method_parameters, resolve_sorted_columns,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::schema::type_def_uses_type;
 use crate::type_ordering::TypeOrdering;
@@ -6427,12 +6429,101 @@ impl BTreeTable {
         Ok(map)
     }
 
+    /// Like SQLite, reads a double-quoted name in a CHECK constraint that is not a column of the
+    /// table as a string literal.
+    pub fn convert_double_quoted_check_names_to_strings(&mut self) -> Result<()> {
+        let mut check_constraints = std::mem::replace(&mut self.check_constraints, try_vec![]?);
+        for check_constraint in &mut check_constraints {
+            double_quoted_names_to_strings(&mut check_constraint.expr, self, true)?;
+        }
+        self.check_constraints = check_constraints;
+        Ok(())
+    }
+
+    /// Like SQLite, which reloads the schema after ADD COLUMN, reads the CHECK constraints and
+    /// generated columns again from the table's SQL when one has a string equal to the name
+    /// of `added_column`, so that a double-quoted string of that name now names the column.
+    pub fn reload_expressions_after_add_column(
+        &mut self,
+        added_column: &str,
+        supports_namespaces: bool,
+    ) -> Result<()> {
+        let names_added_column = self
+            .check_constraints
+            .iter()
+            .map(|check_constraint| &check_constraint.expr)
+            .chain(self.columns.iter().filter_map(Column::generated_expr))
+            .any(|expr| expr_has_string(expr, added_column));
+        if !names_added_column {
+            return Ok(());
+        }
+        let reloaded = Self::from_stored_sql(&self.to_sql(), self.root_page, supports_namespaces)?;
+        for check_constraint in &mut self.check_constraints {
+            // Without its source text, a CHECK is written to the SQL with its strings in
+            // single quotes, so reading it again changes nothing.
+            if check_constraint.source.is_none() {
+                continue;
+            }
+            if let Some(reloaded_check) = reloaded.check_constraints.iter().find(|reloaded| {
+                reloaded.column == check_constraint.column
+                    && reloaded.source == check_constraint.source
+            }) {
+                check_constraint.expr = reloaded_check.expr.clone();
+            }
+        }
+        let mut columns = self.columns_mut();
+        for (column, reloaded_column) in columns.iter_mut().zip(reloaded.columns()) {
+            if let (Some(expr), Some(reloaded_expr)) = (
+                column.generated_expr_mut(),
+                reloaded_column.generated_expr(),
+            ) {
+                *expr = reloaded_expr.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Like SQLite's sqlite_rename_quotefix on the table's SQL, writes the double-quoted names
+    /// that are strings in its CHECK constraints and generated columns as single-quoted strings,
+    /// so that a later column of that name does not change what they mean. Returns whether
+    /// anything changed.
+    pub fn single_quote_double_quoted_strings(&mut self) -> Result<bool> {
+        let mut changed = false;
+        let mut check_constraints = std::mem::replace(&mut self.check_constraints, try_vec![]?);
+        for check_constraint in &mut check_constraints {
+            if let Some(source) = &check_constraint.source {
+                let mut expr = parse_expr(source)?;
+                // The expression already has the strings; without the source text it is
+                // written with them in single quotes.
+                if double_quoted_names_to_strings(&mut expr, self, true)? {
+                    check_constraint.source = None;
+                    changed = true;
+                }
+            }
+        }
+        self.check_constraints = check_constraints;
+        for i in 0..self.columns.len() {
+            let original_sql = match self.columns[i].generated_type() {
+                GeneratedType::Virtual { original_sql, .. }
+                | GeneratedType::Stored { original_sql, .. } => original_sql,
+                GeneratedType::NotGenerated => continue,
+            };
+            let mut expr = parse_expr(original_sql)?;
+            if double_quoted_names_to_strings(&mut expr, self, false)? {
+                self.columns_mut()[i].set_generated_original_sql(expr.to_string());
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
         {
-            let mut guard = self.columns_mut();
-            for i in 0..guard.len() {
-                if guard[i].is_generated() {
-                    let mut expr = guard[i].generated_expr().cloned().unwrap();
+            for i in 0..self.columns.len() {
+                if self.columns[i].is_generated() {
+                    let mut expr = self.columns[i].generated_expr().cloned().unwrap();
+                    double_quoted_names_to_strings(&mut expr, self, false)?;
+                    let mut guard = self.columns_mut();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
                 }
@@ -6867,6 +6958,38 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
             .filter(|name| name.eq_ignore_ascii_case(col_name))
             .map(|_| i)
     })
+}
+
+/// Parses `sql`, the text of one expression.
+fn parse_expr(sql: &str) -> Result<Expr> {
+    // The newline ends a line comment at the end of `sql`.
+    let select_sql = format!("SELECT {sql}\n");
+    let cmd = crate::dialect::engine::parse_statement(&select_sql)?;
+    if let Some(Cmd::Stmt(Stmt::Select(select))) = cmd {
+        if let ast::OneSelect::Select { mut columns, .. } = select.body.select {
+            if columns.len() == 1 {
+                if let ResultColumn::Expr(expr, _) = columns.remove(0) {
+                    return Ok(*expr);
+                }
+            }
+        }
+    }
+    Err(LimboError::InternalError(format!(
+        "not an expression: {sql}"
+    )))
+}
+
+/// Whether `expr` has a string literal equal to `value`, ignoring ASCII case.
+pub fn expr_has_string(expr: &Expr, value: &str) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::Literal(ast::Literal::String(s)) = e {
+            found |= sanitize_string(s).eq_ignore_ascii_case(value);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("string search does not fail");
+    found
 }
 
 /// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
@@ -7715,6 +7838,7 @@ pub fn create_table(
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
+    table.convert_double_quoted_check_names_to_strings()?;
     if table.is_strict {
         for column in table.columns.iter_mut() {
             if column.primary_key() && !column.is_rowid_alias() {
@@ -8781,13 +8905,16 @@ impl Index {
                 tbl_name,
                 columns,
                 unique,
-                where_clause,
+                mut where_clause,
                 using,
                 with_clause,
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let index_columns = resolve_sorted_columns(table, &columns, schema, syms)?;
+                if let Some(where_clause) = &mut where_clause {
+                    double_quoted_names_to_strings(where_clause, table, true)?;
+                }
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");

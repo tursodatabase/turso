@@ -1875,6 +1875,7 @@ fn eval_partial_pred_for_row_image(
         expr,
         columns,
         &column_regs,
+        rowid_reg,
         &bt,
         r,
     )?;
@@ -1914,6 +1915,7 @@ fn emit_upsert_expr_index_value(
         expr,
         columns,
         &column_regs,
+        rowid_reg,
         &bt,
         dest_reg,
     )?;
