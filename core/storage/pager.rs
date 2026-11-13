@@ -1630,7 +1630,7 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
@@ -1755,7 +1755,7 @@ struct PendingRead {
 /// Test-only deterministic spill-yield injector for `Pager::read_page`. When
 /// armed, the next matching call (after `skip` ignored matches) returns
 /// `IO(yield)` once, then disarms itself.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 struct SpillYieldHook {
     /// `-1` = disarmed; otherwise the `page_idx` to fire on.
     target: std::sync::atomic::AtomicI64,
@@ -1763,7 +1763,7 @@ struct SpillYieldHook {
     skip: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl SpillYieldHook {
     const fn new() -> Self {
         Self {
@@ -1943,7 +1943,7 @@ impl Pager {
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             pages_dirtied_count: AtomicU64::new(0),
@@ -3672,7 +3672,7 @@ impl Pager {
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
         }
@@ -3814,8 +3814,8 @@ impl Pager {
 
     /// Test-only: arm `read_page` to return `IO(yield)` once for `page_id`
     /// after `skip` matching calls have passed through.
-    #[cfg(test)]
-    pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
         self.spill_yield.arm(page_id, skip);
     }
 
@@ -5470,7 +5470,7 @@ impl Pager {
     /// Test-only: evict clean, unpinned pages WITHOUT invalidating cursors, so we
     /// can exercise what happens to a cursor that still holds a `PageRef` to an
     /// evicted (buffer-taken) page — the exact hazard normal LRU eviction creates.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn test_evict_all_unpinned_clean(&self) {
         self.page_cache.write().test_evict_all_unpinned_clean();
     }

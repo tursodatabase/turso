@@ -128,7 +128,7 @@ impl<F: ScalarFunction> ScalarFactory for F {
     }
 }
 
-pub(crate) fn step_scalar(
+pub fn step_scalar(
     state: &mut ExtensionState,
     factory: &dyn ScalarFactory,
     connection: &Arc<Connection>,
@@ -159,7 +159,7 @@ impl<F: AggregateFunction> AggregateFactory for F {
     }
 }
 
-pub(crate) fn step_aggregate(
+pub fn step_aggregate(
     accumulator: &mut Register,
     factory: &dyn AggregateFactory,
     args: &[Value],
@@ -168,7 +168,7 @@ pub(crate) fn step_aggregate(
     accumulator.step(args)
 }
 
-pub(crate) fn finalize_aggregate(
+pub fn finalize_aggregate(
     accumulator: &mut Register,
     factory: &dyn AggregateFactory,
 ) -> IOResultOr<Value> {

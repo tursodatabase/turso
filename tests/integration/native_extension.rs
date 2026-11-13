@@ -1,17 +1,18 @@
-use crate::alloc::TryClone;
-use crate::function::ExternalFunc;
-use crate::namespace::NamespaceId;
-use crate::native_ext::*;
-use crate::security::roles::SessionRole;
-use crate::sync::{Arc, Mutex};
-use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
-use crate::{
-    Completion, ConnectOpts, Connection, Database, EngineDialect, IOResult, LimboError, MemoryIO,
-    Numeric, OpenOptions, Register, Result, Statement, StepResult, Value,
-};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use turso_core::alloc::TryClone;
+use turso_core::function::ExternalFunc;
+use turso_core::namespace::NamespaceId;
+use turso_core::native_ext::*;
+use turso_core::security::roles::SessionRole;
+use turso_core::sync::{Arc, Mutex};
+use turso_core::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
+use turso_core::{
+    Completion, ConnectOpts, Connection, Database, IOResult, LimboError, MemoryIO, Numeric,
+    OpenOptions, Register, Result, Statement, StepResult, Value,
+};
 use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
+use turso_sqlite::SqliteDialect;
 
 #[test]
 fn native_scalar_accepts_only_declared_argument_counts() {
@@ -26,7 +27,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
         ));
     }
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "null_to_nine".into(),
                 FunctionArity::OneOf(&[1, 3]),
@@ -70,7 +71,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 #[test]
 fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect))
+        OpenOptions::new(Arc::new(SqliteDialect))
             .extension_function(
                 ExternalFunc::new_native_scalar(
                     "typed_nine".into(),
@@ -102,7 +103,7 @@ fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
 
 #[test]
 fn native_scalar_borrows_the_same_registers_across_io() {
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let args = [
         Register::Value(Value::from_i64(7)),
         Register::Value(Value::from_i64(3)),
@@ -118,18 +119,21 @@ fn native_scalar_borrows_the_same_registers_across_io() {
         },
     )
     .unwrap();
-    let mut state = crate::native_ext::ExtensionState::None;
+    let mut state = turso_core::native_ext::ExtensionState::None;
     let value = finish(&queue, || {
         function.func.call_scalar(&mut state, &conn, &args)
     });
     assert_eq!(value, Value::from_i64(73));
-    assert!(matches!(state, crate::native_ext::ExtensionState::None));
+    assert!(matches!(
+        state,
+        turso_core::native_ext::ExtensionState::None
+    ));
 }
 
 #[test]
 fn native_scalar_receives_each_executing_connection() {
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "connection_changes".into(),
                 FunctionArity::Exact(1),
@@ -162,7 +166,7 @@ fn native_scalar_receives_each_executing_connection() {
 fn native_scalar_connection_context_survives_io_and_helper_queries() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let plain = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "connection_context_read".into(),
                 FunctionArity::Exact(1),
@@ -178,14 +182,14 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
     let first = plain
         .db
         .connect_with_context(
-            crate::ConnectOpts::new(SessionRole::Superuser),
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
             context.clone(),
         )
         .unwrap();
     let second = plain
         .db
         .connect_with_context(
-            crate::ConnectOpts::new(SessionRole::Superuser),
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
             Arc::new(AtomicI64::new(19)),
         )
         .unwrap();
@@ -261,7 +265,7 @@ impl ScalarCall for ConnectionContextCall {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
         }
-        crate::return_if_io!(self
+        turso_core::return_if_io!(self
             .statement
             .as_mut()
             .unwrap()
@@ -276,7 +280,7 @@ impl ScalarCall for ConnectionContextCall {
 #[test]
 fn native_scalar_preserves_unmatched_outer_join_rows() {
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "null_to_nine".into(),
                 FunctionArity::Exact(1),
@@ -306,7 +310,7 @@ fn native_scalar_preserves_unmatched_outer_join_rows() {
 fn native_scalar_helper_queries_resume_with_independent_call_state() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "nested_sum".into(),
                 FunctionArity::Exact(1),
@@ -341,7 +345,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
             for cancellation in ["reset", "drop", "error", "io_error", "interrupt"] {
                 let queue = Arc::new(Mutex::new(Vec::new()));
                 let conn = connection(
-                    OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+                    OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
                         ExternalFunc::new_native_scalar(
                             "nested_sum".into(),
                             FunctionArity::Exact(1),
@@ -405,10 +409,10 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                             .lock()
                             .pop()
                             .unwrap()
-                            .error(crate::CompletionError::Aborted);
+                            .error(turso_core::CompletionError::Aborted);
                         assert!(matches!(
                             statement.step().unwrap_err(),
-                            LimboError::CompletionError(crate::CompletionError::Aborted)
+                            LimboError::CompletionError(turso_core::CompletionError::Aborted)
                         ));
                     }
                     "interrupt" => {
@@ -488,7 +492,7 @@ fn io_error_in_a_read_statement_rolls_back_the_transaction() {
     for mode in ["wal", "mvcc"] {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let conn = connection(
-            OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
                 ExternalFunc::new_native_scalar(
                     "gated_seven".into(),
                     FunctionArity::Exact(1),
@@ -511,11 +515,11 @@ fn io_error_in_a_read_statement_rolls_back_the_transaction() {
             .lock()
             .pop()
             .unwrap()
-            .error(crate::CompletionError::Aborted);
+            .error(turso_core::CompletionError::Aborted);
         assert!(
             matches!(
                 stmt.step().unwrap_err(),
-                LimboError::CompletionError(crate::CompletionError::Aborted)
+                LimboError::CompletionError(turso_core::CompletionError::Aborted)
             ),
             "{mode}"
         );
@@ -710,7 +714,7 @@ fn extension_constructors_validate_argument_counts() {
                 let function = result.unwrap();
                 assert_eq!(function.func.arg_counts(), vec![argc]);
                 let options =
-                    OpenOptions::new(Arc::new(EngineDialect)).extension_function(function);
+                    OpenOptions::new(Arc::new(SqliteDialect)).extension_function(function);
                 assert_eq!(options.native_extensions.functions.len(), 1);
                 assert_eq!(
                     options.native_extensions.functions[0].func.arg_counts(),
@@ -725,7 +729,7 @@ fn extension_constructors_validate_argument_counts() {
 
 #[test]
 fn rejected_c_functions_leave_context_ownership_with_the_caller() {
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let api = unsafe { conn._build_turso_ext() };
     let name = std::ffi::CString::new("rejected").unwrap();
     let function_count = conn.syms.read().functions.len();
@@ -811,7 +815,7 @@ fn scalar_calls_resume_independently_and_create_once() {
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "DeLaYeD".into(),
                 FunctionArity::Exact(2),
@@ -851,7 +855,7 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -879,7 +883,7 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -908,7 +912,7 @@ fn failed_completion_releases_the_pending_scalar() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -928,10 +932,10 @@ fn failed_completion_releases_the_pending_scalar() {
         .lock()
         .pop()
         .unwrap()
-        .error(crate::CompletionError::Aborted);
+        .error(turso_core::CompletionError::Aborted);
     assert!(matches!(
         stmt.step().unwrap_err(),
-        LimboError::CompletionError(crate::CompletionError::Aborted)
+        LimboError::CompletionError(turso_core::CompletionError::Aborted)
     ));
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
@@ -942,7 +946,7 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let dropped = Arc::new(AtomicUsize::new(0));
         let conn = connection(
-            OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
                 ExternalFunc::new_native_scalar(
                     "delayed".into(),
                     FunctionArity::Exact(2),
@@ -983,10 +987,10 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
                 .lock()
                 .pop()
                 .unwrap()
-                .error(crate::CompletionError::Aborted);
+                .error(turso_core::CompletionError::Aborted);
             assert!(matches!(
                 stmt.step().unwrap_err(),
-                LimboError::CompletionError(crate::CompletionError::Aborted)
+                LimboError::CompletionError(turso_core::CompletionError::Aborted)
             ));
         } else {
             stmt.reset().unwrap();
@@ -1021,7 +1025,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
@@ -1074,7 +1078,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
 fn native_variadic_aggregates_use_callsite_argument_count() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 -1,
@@ -1107,7 +1111,7 @@ fn live_aggregate_accumulators_cannot_be_copied() {
         step_aggregate(&mut original, &factory, &args).unwrap(),
         IOResult::IO(_)
     ));
-    let builtin = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
+    let builtin = Register::Aggregate(AggContext::Builtin(turso_core::alloc::vec![
         Value::from_i64(17),
         Value::build_text("aggregate payload"),
     ]));
@@ -1150,7 +1154,7 @@ fn pending_aggregates_release_state_on_reset_and_failed_completion() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
@@ -1175,10 +1179,10 @@ fn pending_aggregates_release_state_on_reset_and_failed_completion() {
         .lock()
         .pop()
         .unwrap()
-        .error(crate::CompletionError::Aborted);
+        .error(turso_core::CompletionError::Aborted);
     assert!(matches!(
         stmt.step().unwrap_err(),
-        LimboError::CompletionError(crate::CompletionError::Aborted)
+        LimboError::CompletionError(turso_core::CompletionError::Aborted)
     ));
     assert_eq!(Arc::strong_count(&queue), 2);
 }
@@ -1194,7 +1198,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             Value::from_slice(&[0, 17, 255]).unwrap(),
         ];
         let calls = Arc::new(AtomicUsize::new(0));
-        let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
             "argument_module",
             VTabKind::VirtualTable,
             ArgumentsModule {
@@ -1214,7 +1218,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
-            let table = crate::vtab::VirtualTable::table(
+            let table = turso_core::vtab::VirtualTable::table(
                 Some("arguments"),
                 "argument_module",
                 args,
@@ -1231,7 +1235,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
 #[test]
 fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "argument_module",
         VTabKind::VirtualTable,
         ArgumentsModule {
@@ -1254,7 +1258,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
     ))
     .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    let mut schema = crate::schema::Schema::new();
+    let mut schema = turso_core::schema::Schema::with_options(true, &SqliteDialect).unwrap();
     schema
         .handle_schema_row(
             "table",
@@ -1265,13 +1269,13 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
                 "create virtual table reloaded using argument_module{args}"
             )),
             &conn.syms.read(),
-            &mut crate::alloc::vec![],
-            &mut crate::HashMap::default(),
-            &mut crate::HashMap::default(),
-            &mut crate::HashMap::default(),
-            &mut crate::HashMap::default(),
+            &mut turso_core::alloc::vec![],
+            &mut turso_core::HashMap::default(),
+            &mut turso_core::HashMap::default(),
+            &mut turso_core::HashMap::default(),
+            &mut turso_core::HashMap::default(),
             &|_| None,
-            &EngineDialect,
+            &SqliteDialect,
         )
         .unwrap();
     assert!(matches!(
@@ -1279,14 +1283,14 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
             .get_table(NamespaceId::ROOT, "reloaded")
             .unwrap()
             .as_ref(),
-        crate::schema::Table::Virtual(_)
+        turso_core::schema::Table::Virtual(_)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5);
 }
 
 #[test]
 fn c_module_creation_converts_core_arguments_at_the_callback() {
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let api = unsafe { conn._build_turso_ext() };
     let code = unsafe { CArgumentsModule::register_CArgumentsModule(&api) };
     unsafe { conn._free_extension_ctx(api) };
@@ -1309,7 +1313,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                     assert!(matches!(result, Err(LimboError::ExtensionError(_))));
                 }
             } else {
-                let result = crate::vtab::VirtualTable::table(
+                let result = turso_core::vtab::VirtualTable::table(
                     Some("arguments"),
                     "c_arguments_module",
                     args,
@@ -1319,7 +1323,9 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                     let table = result.unwrap();
                     let mut cursor = table.open(conn.clone()).unwrap();
                     assert!(matches!(
-                        cursor.filter(0, None, 0, crate::alloc::vec![]).unwrap(),
+                        cursor
+                            .filter(0, None, 0, turso_core::alloc::vec![])
+                            .unwrap(),
                         IOResult::Done(true)
                     ));
                     let IOResult::Done(value) = cursor.column(0).unwrap() else {
@@ -1340,7 +1346,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
 fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)]));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -1372,7 +1378,7 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
 fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl() {
     for mvcc in [false, true] {
         let queue = Arc::new(Mutex::new(Vec::new()));
-        let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
             "native_rows",
             VTabKind::TableValuedFunction,
             RowsModule {
@@ -1424,9 +1430,9 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
             Database::open(
                 io.clone(),
                 &path,
-                OpenOptions::new(Arc::new(EngineDialect))
+                OpenOptions::new(Arc::new(SqliteDialect))
                     .db_opts(
-                        crate::DatabaseOpts::new()
+                        turso_core::DatabaseOpts::new()
                             .with_views(true)
                             .with_experimental_mvcc_passive_checkpoint(true),
                     )
@@ -1475,7 +1481,7 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
 #[test]
 fn native_table_functions_survive_temp_table_rollback() {
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -1507,7 +1513,7 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
             writable: false,
         };
         let conn = connection(
-            OpenOptions::new(Arc::new(EngineDialect))
+            OpenOptions::new(Arc::new(SqliteDialect))
                 .native_module("restricted_rows", kind, module.clone())
                 .native_module("allowed_rows", kind, InnocuousModule(module)),
         );
@@ -1526,7 +1532,7 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
                 .current_schema()
                 .get_table(NamespaceId::ROOT, name)
                 .unwrap();
-            let crate::schema::Table::Virtual(table) = table.as_ref() else {
+            let turso_core::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };
             assert_eq!(table.innocuous, expected, "{name}");
@@ -1546,8 +1552,8 @@ fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
         writable: false,
     };
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect))
-            .db_opts(crate::DatabaseOpts::new().with_attach(true))
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(turso_core::DatabaseOpts::new().with_attach(true))
             .native_module("rows", VTabKind::VirtualTable, InnocuousModule(module)),
     );
     conn.execute("CREATE VIRTUAL TABLE vt USING rows").unwrap();
@@ -1571,7 +1577,7 @@ fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
 #[test]
 fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         InnocuousModule(RowsModule {
@@ -1606,7 +1612,7 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1656,7 +1662,7 @@ fn abandoned_native_write_does_not_apply_the_pending_update() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1700,7 +1706,7 @@ fn failed_native_write_rolls_back_earlier_rows() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 13), (2, 27)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1736,7 +1742,7 @@ fn pending_native_write_blocks_another_writer_and_commit() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -1781,7 +1787,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let options = OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
         ExternalFunc::new_native_scalar(
             "delayed".into(),
             FunctionArity::Exact(2),
@@ -1820,7 +1826,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
 fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 FunctionArity::Exact(2),
@@ -1886,7 +1892,7 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
 fn c_extensions_still_execute_with_native_registration() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect))
+        OpenOptions::new(Arc::new(SqliteDialect))
             .extension_function(
                 ExternalFunc::new_native_aggregate(
                     "WeIgHtEd".into(),
@@ -1976,7 +1982,7 @@ fn c_extensions_still_execute_with_native_registration() {
 #[test]
 fn c_and_native_tables_share_cursor_dispatch() {
     let queue = Arc::new(Mutex::new(Vec::new()));
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -2186,7 +2192,7 @@ impl ScalarCall for NestedSumCall {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
         }
-        crate::return_if_io!(self
+        turso_core::return_if_io!(self
             .statement
             .as_mut()
             .unwrap()
@@ -2765,7 +2771,7 @@ const DECLARED_FUNCTION_CALLS: &[(&str, &str)] = &[
 
 #[test]
 fn declared_return_type_of_extension_functions_matches_what_they_return() {
-    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let declared: Vec<(String, ReturnType)> = conn
         .syms
         .read()

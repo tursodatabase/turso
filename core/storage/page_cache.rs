@@ -409,7 +409,7 @@ impl PageCache {
     /// Test-only: evict every clean, unpinned page, exactly as sustained cache
     /// pressure through `evict_one` eventually would (buffer taken, page unloaded),
     /// but deterministically and without the clock's second-chance heuristics.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn test_evict_all_unpinned_clean(&mut self) {
         let keys: Vec<PageCacheKey> = self.map.keys().copied().collect();
         for key in keys {
