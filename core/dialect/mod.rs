@@ -622,7 +622,6 @@ mod tests {
     use turso_ext::{
         ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode, VTabKind,
     };
-    use turso_parser::parser::Parser;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `
     /// marker before delegating to SQLite parsing, mirroring how a frontend
@@ -1054,7 +1053,10 @@ mod tests {
             // A frontend prepares its translated AST while supplying the
             // original statement text.
             let input = "CREATE TABLE t (x INTEGER)";
-            let stmt = match Parser::new(input.as_bytes()).next_cmd().unwrap().unwrap() {
+            let stmt = match crate::dialect::engine::parse_statement(input)
+                .unwrap()
+                .unwrap()
+            {
                 Cmd::Stmt(stmt) => stmt,
                 other => panic!("unexpected command: {other:?}"),
             };

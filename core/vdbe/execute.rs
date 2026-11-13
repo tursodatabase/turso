@@ -156,7 +156,6 @@ use super::{
 };
 use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
-use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
@@ -10922,7 +10921,7 @@ pub fn op_function(
                     };
 
                     let column_def =
-                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+                        crate::dialect::engine::parse_column_definition(column_def, true)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -17279,13 +17278,12 @@ fn replace_trigger_sql(
     trigger_name: &str,
     sql: &str,
 ) -> Result<()> {
-    let mut parser = Parser::new(sql.as_bytes());
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         event,
         when_clause,
         commands,
         ..
-    })) = parser.next_cmd()?
+    })) = crate::dialect::engine::parse_statement(sql)?
     else {
         return Err(LimboError::ParseError(format!(
             "invalid trigger sql: {sql}"

@@ -24,7 +24,6 @@ use std::future::Future;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
-use turso_parser::parser::Parser;
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -425,7 +424,7 @@ pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
 /// whose SQL merely contains the text (e.g. in a DEFAULT literal).
 pub fn sql_is_create_virtual_table(sql: &str) -> bool {
     matches!(
-        Parser::new(sql.as_bytes()).next_cmd(),
+        crate::dialect::engine::parse_statement(sql),
         Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
     )
 }
@@ -3025,9 +3024,7 @@ mod rename_column_view {
         new_column: &str,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
-        let mut parser = Parser::new(view_sql.as_bytes());
-        let cmd = parser
-            .next_cmd()
+        let cmd = crate::dialect::engine::parse_statement(view_sql)
             .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}")))?;
         let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
             temporary,
@@ -4610,7 +4607,6 @@ pub mod tests {
     use super::*;
     use crate::schema::{BTreeTable, Type as SchemaValueType};
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
-    use turso_parser::parser::Parser;
 
     #[test]
     fn test_normalize_ident() {
@@ -4654,8 +4650,9 @@ pub mod tests {
     }
 
     fn select(sql: &str) -> ast::Select {
-        let mut parser = Parser::new(sql.as_bytes());
-        let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) = parser.next_cmd().unwrap() else {
+        let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
+            crate::dialect::engine::parse_statement(sql).unwrap()
+        else {
             panic!("expected SELECT: {sql}");
         };
         select
@@ -4853,9 +4850,7 @@ pub mod tests {
     #[test]
     fn test_rewrite_trigger_cmd_table_refs_cte_branch() {
         let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN WITH cte AS (SELECT * FROM temp.old) SELECT * FROM cte; END";
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser
-            .next_cmd()
+        let cmd = crate::dialect::engine::parse_statement(sql)
             .expect("trigger SQL should parse")
             .expect("trigger SQL should produce a statement");
         let ast::Cmd::Stmt(ast::Stmt::CreateTrigger { commands, .. }) = cmd else {
@@ -4891,9 +4886,7 @@ pub mod tests {
     #[test]
     fn test_rewrite_trigger_cmd_table_refs_expr_subquery_branch() {
         let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser
-            .next_cmd()
+        let cmd = crate::dialect::engine::parse_statement(sql)
             .expect("trigger SQL should parse")
             .expect("trigger SQL should produce a statement");
         let ast::Cmd::Stmt(ast::Stmt::CreateTrigger { commands, .. }) = cmd else {

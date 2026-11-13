@@ -138,10 +138,7 @@ use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
     SortOrder, TableInternalId, TypeOperator,
 };
-use turso_parser::{
-    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
-    parser::Parser,
-};
+use turso_parser::ast::{Cmd, CreateTableBody, ResultColumn, Stmt};
 
 pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
@@ -1433,7 +1430,6 @@ pub enum TypeOrigin {
 
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
-    use turso_parser::parser::Parser;
 
     // Whether values of the type take a COLLATE. In PostgreSQL only text
     // types do, so of the types below only varchar does.
@@ -1471,10 +1467,9 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     ];
 
     for &(accepts_collate, range_offsets, sql) in types {
-        let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
-        }))) = parser.next_cmd()
+        }))) = crate::dialect::engine::parse_statement(sql)
         else {
             return Err(crate::LimboError::InternalError(format!(
                 "failed to parse built-in type SQL: {sql}"
@@ -2418,10 +2413,8 @@ impl Schema {
     /// in-memory registry without working out the kind its DECODE gives.
     fn insert_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
-        use turso_parser::parser::Parser;
 
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd();
+        let cmd = crate::dialect::engine::parse_statement(sql);
         match cmd {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
@@ -3811,7 +3804,7 @@ impl Schema {
         let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
 
         for (view_key, (namespace, sql, _)) in &view_info {
-            let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
+            let cmd = crate::dialect::engine::parse_statement(sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_key} has an empty schema definition"
                 ))
@@ -3946,7 +3939,7 @@ impl Schema {
                 }
             }
 
-            let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
+            let cmd = crate::dialect::engine::parse_statement(&sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_name} has an empty schema definition"
                 ))
@@ -4308,7 +4301,7 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    let create_vtab = match Parser::new(sql.as_bytes()).next_cmd()? {
+                    let create_vtab = match crate::dialect::engine::parse_statement(sql)? {
                         Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
@@ -4464,7 +4457,6 @@ impl Schema {
             "view" => {
                 use crate::schema::View;
                 use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let (namespace, view_name) = self.demangle_name(name);
@@ -4474,8 +4466,7 @@ impl Schema {
                 }
 
                 // Parse the SQL to determine if it's a regular or materialized view
-                let mut parser = Parser::new(sql.as_bytes());
-                let parsed = parser.next_cmd();
+                let parsed = crate::dialect::engine::parse_statement(sql);
                 if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
                     // Tolerate view rows whose stored SQL no longer parses
                     // (e.g. older versions wrote view column lists without
@@ -4522,7 +4513,6 @@ impl Schema {
             }
             "trigger" => {
                 use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let (namespace, trigger_name) = self.demangle_name(name);
@@ -4531,7 +4521,6 @@ impl Schema {
                     self.add_namespace_of_object(namespace);
                 }
 
-                let mut parser = Parser::new(sql.as_bytes());
                 let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
                     temporary,
                     if_not_exists: _,
@@ -4542,7 +4531,7 @@ impl Schema {
                     for_each_row,
                     when_clause,
                     commands,
-                }))) = parser.next_cmd()
+                }))) = crate::dialect::engine::parse_statement(sql)
                 else {
                     return Err(crate::LimboError::ParseError(format!(
                         "invalid trigger sql: {sql}"
@@ -6038,8 +6027,7 @@ impl BTreeTable {
         root_page: i64,
         supports_namespaces: bool,
     ) -> Result<BTreeTable> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
                 Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
@@ -8776,8 +8764,7 @@ impl Index {
         table: &BTreeTable,
         schema: &Schema,
     ) -> Result<Index> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateIndex {
                 idx_name,
@@ -9628,7 +9615,7 @@ mod tests {
             "CREATE TABLE t(a TEXT, b aNy AS (a)) STRICT",
         ] {
             let Some(Cmd::Stmt(Stmt::CreateTable { body, .. })) =
-                Parser::new(sql.as_bytes()).next_cmd()?
+                crate::dialect::engine::parse_statement(sql)?
             else {
                 panic!("expected CREATE TABLE: {sql}");
             };
