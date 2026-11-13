@@ -874,20 +874,23 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
-            let _ =
-                resolver
-                    .catalog
-                    .dialect
-                    .inject_cast_metadata(program, type_name, target_register);
+            let _ = resolver.catalog.dialect.inject_cast_metadata(
+                program,
+                type_name,
+                target_register,
+                resolver.schema(),
+            );
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
     }
 
-    let _ = resolver
-        .catalog
-        .dialect
-        .inject_cast_metadata(program, type_name, target_register);
+    let _ = resolver.catalog.dialect.inject_cast_metadata(
+        program,
+        type_name,
+        target_register,
+        resolver.schema(),
+    );
 
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
     let type_affinity = cast_type_name
