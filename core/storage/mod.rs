@@ -12,24 +12,24 @@
 //! for the database, also either local or remote.
 pub mod btree;
 pub mod buffer_pool;
-pub(crate) mod checksum;
+pub mod checksum;
 pub mod database;
 pub mod encryption;
-pub(crate) mod journal_mode;
+pub mod journal_mode;
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;
 #[cfg(not(feature = "aristo-instr"))]
-pub(crate) mod page_cache;
-pub(crate) mod page_transform;
+pub mod page_cache;
+pub mod page_transform;
 #[allow(clippy::arc_with_non_send_sync)]
 pub mod pager;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
-pub(crate) mod shared_wal_coordination;
+pub mod shared_wal_coordination;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
-mod state_machines;
+pub mod state_machines;
 pub(crate) mod subjournal;
 #[allow(clippy::arc_with_non_send_sync)]
 pub mod wal;

@@ -57,13 +57,13 @@ pub mod connection;
 mod connection_hooks;
 pub mod database;
 pub mod dialect;
-mod error;
+pub mod error;
 mod ext;
 mod fast_lock;
 pub mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
-mod incremental;
+pub mod incremental;
 mod incremental_blob;
 pub use incremental_blob::Blob;
 mod info;
@@ -71,18 +71,18 @@ mod info;
 mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
-mod parameters;
+pub mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
-mod pragma;
+pub mod pragma;
 mod progress;
-mod pseudo;
+pub mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
-mod statement;
-mod stats;
+pub mod statement;
+pub mod stats;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
@@ -112,7 +112,7 @@ use crate::{
     vdbe::metrics::ConnectionMetrics,
 };
 pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use schema::Schema;
+pub use schema::Schema;
 use std::time::Duration;
 pub use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;

@@ -48,13 +48,13 @@ use crate::{LimboError, Result};
 pub(super) const FTS_STORAGE_FORMAT_VERSION: u32 = 2;
 
 pub(super) const FTS2_CONTROL_PATH: &str = "fts2/control";
-pub(super) const FTS2_SEGMENT_PREFIX: &str = "fts2/seg/";
+pub const FTS2_SEGMENT_PREFIX: &str = "fts2/seg/";
 pub(super) const FTS2_CHUNK_PREFIX: &str = "fts2/chunk/";
-pub(super) const FTS2_TOMB_PREFIX: &str = "fts2/tomb/";
+pub const FTS2_TOMB_PREFIX: &str = "fts2/tomb/";
 
 /// Every row path starts with this; a stored row without it was written
 /// by the pre-registry implementation.
-pub(super) const FTS2_PATH_PREFIX: &str = "fts2/";
+pub const FTS2_PATH_PREFIX: &str = "fts2/";
 
 const FTS2_CONTROL_MAGIC: &[u8; 8] = b"TFTSCTL2";
 const FTS2_SEGMENT_MAGIC: &[u8; 8] = b"TFTSSEG2";
@@ -69,7 +69,7 @@ pub(super) const FTS2_TOMBSTONE_DELETE_OPSTAMP: u64 = 1;
 /// segment that ever holds it. Segment positions do not: a merge renumbers.
 /// Tombstones name documents by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct DocumentIdentity(u128);
+pub struct DocumentIdentity(u128);
 
 impl DocumentIdentity {
     pub fn new(raw: u128) -> Self {
@@ -87,7 +87,7 @@ impl DocumentIdentity {
     }
 }
 
-pub(super) fn segment_registry_path(segment_id: &SegmentId) -> String {
+pub fn segment_registry_path(segment_id: &SegmentId) -> String {
     format!("{FTS2_SEGMENT_PREFIX}{}", segment_id.uuid_string())
 }
 
@@ -98,11 +98,11 @@ pub(super) fn segment_chunk_path(segment_id: &SegmentId, file_ord: u32) -> Strin
     )
 }
 
-pub(super) fn segment_chunk_prefix(segment_id: &SegmentId) -> String {
+pub fn segment_chunk_prefix(segment_id: &SegmentId) -> String {
     format!("{FTS2_CHUNK_PREFIX}{}/", segment_id.uuid_string())
 }
 
-pub(super) fn document_tombstone_path(identity: DocumentIdentity) -> String {
+pub fn document_tombstone_path(identity: DocumentIdentity) -> String {
     format!("{FTS2_TOMB_PREFIX}{:032x}", identity.raw())
 }
 
@@ -225,7 +225,7 @@ impl FtsControl {
 
 /// One file of an immutable segment, as recorded in its descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SegmentFileEntry {
+pub struct SegmentFileEntry {
     /// Tantivy file name, e.g. `<uuid>.term`.
     pub name: String,
     pub size: u64,
@@ -236,7 +236,7 @@ pub(super) struct SegmentFileEntry {
 /// segment; deleting it (merge) retires the segment. The segment id lives
 /// in the row path, not the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SegmentDescriptor {
+pub struct SegmentDescriptor {
     pub segment_id: SegmentId,
     pub max_doc: u32,
     pub files: Vec<SegmentFileEntry>,
@@ -318,7 +318,7 @@ impl SegmentDescriptor {
 /// one. The code builds it once per segment load and caches it with the
 /// segment bytes, because a segment never changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SegmentIdentities {
+pub struct SegmentIdentities {
     by_position: Vec<DocumentIdentity>,
     /// Positions sorted by their identity, for binary search.
     positions_by_identity: Vec<u32>,
@@ -373,7 +373,7 @@ impl SegmentIdentities {
 /// segment id. A segment never changes, so the cache needs no snapshot
 /// identity.
 #[derive(Debug)]
-pub(super) struct SegmentData {
+pub struct SegmentData {
     pub files: HashMap<String, FileBytes>,
     pub identities: SegmentIdentities,
     pub total_bytes: usize,
@@ -394,7 +394,7 @@ impl SegmentData {
 /// One segment as seen by a cursor's snapshot: immutable bytes plus the
 /// tombstoned doc ids visible at (or created by) this transaction.
 #[derive(Debug, Clone)]
-pub(super) struct LoadedSegment {
+pub struct LoadedSegment {
     pub descriptor: SegmentDescriptor,
     pub data: Arc<SegmentData>,
     /// Doc ids whose postings are dead at this snapshot. Ordered so cache
@@ -441,7 +441,7 @@ impl LoadedSegment {
 
 /// What `synthesize_meta_json` records about one segment.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct SegmentMetaSpec {
+pub struct SegmentMetaSpec {
     segment_id: SegmentId,
     max_doc: u32,
     num_deleted: u32,
@@ -476,7 +476,7 @@ impl SegmentMetaSpec {
 /// Serialize an alive bitset in Tantivy's `.del` format:
 /// `[u32 max_value LE][ceil(max_value/64) x u64 words LE]`, bit set = alive.
 #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotTombstone)]
-pub(super) fn alive_bitset_bytes(
+pub fn alive_bitset_bytes(
     max_doc: u32,
     deleted: &BTreeSet<u32>,
     allocator: &DynAllocator,
@@ -531,7 +531,7 @@ pub(super) fn alive_bitset(
 /// transaction or a mixed searcher could not read old segments; we pin the
 /// default everywhere.
 #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotMetadata)]
-pub(super) fn synthesize_meta_json(
+pub fn synthesize_meta_json(
     scratch: &Index,
     schema: &Schema,
     segments: &[SegmentMetaSpec],
@@ -609,7 +609,7 @@ pub(super) fn tombstone_del_file_name(segment_id: &SegmentId) -> String {
 const FOOTER_MAGIC_NUMBER: u32 = 1337;
 
 #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotTombstone)]
-pub(super) fn with_tantivy_footer(body: DynVec<u8>) -> Result<DynVec<u8>> {
+pub fn with_tantivy_footer(body: DynVec<u8>) -> Result<DynVec<u8>> {
     let crc = crc32fast::hash(&body);
     let footer = serde_json::json!({ "version": tantivy::version(), "crc": crc });
     let payload_start = body.len();

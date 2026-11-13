@@ -1,6 +1,47 @@
-use super::*;
-use crate::security::roles::SessionRole;
-use crate::{
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet as HashSet;
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use tantivy::index::SegmentId;
+use tantivy::indexer::AddOperation;
+use tantivy::indexer::SegmentWriter;
+use tantivy::schema::Schema;
+use tantivy::Index;
+use tantivy::IndexSettings;
+use tantivy::TantivyDocument;
+use turso_core::alloc::DynAllocator;
+use turso_core::alloc::DynVec;
+use turso_core::alloc::TursoFromIterator;
+use turso_core::index_method::fts::directory::BuildDirectory;
+use turso_core::index_method::fts::directory::FileBytes;
+use turso_core::index_method::fts::directory::SnapshotDirectory;
+use turso_core::index_method::fts::format::document_tombstone_path;
+use turso_core::index_method::fts::format::segment_chunk_prefix;
+use turso_core::index_method::fts::format::segment_registry_path;
+use turso_core::index_method::fts::format::DocumentIdentity;
+use turso_core::index_method::fts::format::LoadedSegment;
+use turso_core::index_method::fts::format::SegmentData;
+use turso_core::index_method::fts::format::SegmentIdentities;
+use turso_core::index_method::fts::format::FTS2_PATH_PREFIX;
+use turso_core::index_method::fts::format::FTS2_SEGMENT_PREFIX;
+use turso_core::index_method::fts::format::FTS2_TOMB_PREFIX;
+use turso_core::index_method::fts::rows::PathTarget;
+use turso_core::index_method::fts::rows::PendingRow;
+use turso_core::index_method::fts::*;
+use turso_core::index_method::IndexMethodCursor;
+use turso_core::security::roles::SessionRole;
+#[allow(unused_imports)]
+use turso_core::storage::btree::CursorTrait;
+use turso_core::sync::Arc;
+use turso_core::types::IOResult;
+use turso_core::vdbe::Register;
+use turso_core::Connection;
+use turso_core::LimboError;
+use turso_core::Result;
+use turso_core::Value;
+use turso_core::{
     alloc::TursoVecInExt,
     index_method::{
         IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
@@ -8,9 +49,9 @@ use crate::{
     },
     schema::IndexColumn,
 };
-use rustc_hash::FxHashMap;
-use std::num::NonZeroU32;
+use turso_parser::ast;
 use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
+use turso_sqlite::SqliteDialect;
 
 #[test]
 fn field_weights_reject_non_finite_and_non_positive_values() {
@@ -36,9 +77,17 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         let result = FtsIndexAttachment::new(IndexMethodConfiguration {
             table_name: "w".to_string(),
             index_name: "wx".to_string(),
-            columns: crate::alloc::vec![
-                IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
-                IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
+            columns: turso_core::alloc::vec![
+                IndexColumn::new(
+                    "title",
+                    0,
+                    turso_core::translate::collate::CollationSeq::BINARY
+                ),
+                IndexColumn::new(
+                    "body",
+                    1,
+                    turso_core::translate::collate::CollationSeq::BINARY
+                )
             ],
             parameters: FxHashMap::from_iter([(
                 "weights".to_string(),
@@ -62,8 +111,16 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
 #[test]
 fn field_weights_accept_finite_positive_boundaries() {
     let columns = [
-        IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
-        IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY),
+        IndexColumn::new(
+            "title",
+            0,
+            turso_core::translate::collate::CollationSeq::BINARY,
+        ),
+        IndexColumn::new(
+            "body",
+            1,
+            turso_core::translate::collate::CollationSeq::BINARY,
+        ),
     ];
     for (input, expected) in [
         ("1e-45", f32::from_bits(1)),
@@ -105,9 +162,17 @@ fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![
-            IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::BINARY),
-            IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::BINARY)
+        columns: turso_core::alloc::vec![
+            IndexColumn::new(
+                "title",
+                1,
+                turso_core::translate::collate::CollationSeq::BINARY
+            ),
+            IndexColumn::new(
+                "body",
+                2,
+                turso_core::translate::collate::CollationSeq::BINARY
+            )
         ],
         parameters: FxHashMap::<String, Value>::default(),
     })
@@ -132,7 +197,7 @@ fn score_result_uses_the_fields_selected_by_the_query() {
         let parameters = FxHashMap::from_iter([
             (1, Expr::Literal(Literal::String("'needle'".to_string()))),
             (
-                crate::util::FTS_FIELD_PARAMETER,
+                turso_core::util::FTS_FIELD_PARAMETER,
                 Expr::Literal(Literal::String(format!("'{fields}'"))),
             ),
         ]);
@@ -166,10 +231,10 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
     let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![IndexColumn::new(
+        columns: turso_core::alloc::vec![IndexColumn::new(
             "body",
             1,
-            crate::translate::collate::CollationSeq::BINARY
+            turso_core::translate::collate::CollationSeq::BINARY
         )],
         parameters: FxHashMap::<String, Value>::default(),
     })
@@ -883,18 +948,18 @@ fn fts_write_errors_do_not_infer_out_of_memory_from_the_message() {
 #[cfg(nightly)]
 mod allocation_failures {
     use super::*;
-    use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
-    use crate::DatabaseAllocators;
     use std::io::{ErrorKind, Write};
     use std::ptr::NonNull;
     use std::sync::atomic::AtomicIsize;
     use tantivy::directory::{Directory, TerminatingWrite};
+    use turso_core::alloc::{AllocError, ApiAllocator, Global, Layout};
+    use turso_core::DatabaseAllocators;
 
     #[test]
     fn atomic_write_failure_preserves_previous_metadata() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::AtomicMetadata.into()),
+            expected_site: Some(turso_core::alloc::FtsAllocationSite::AtomicMetadata.into()),
             ..Default::default()
         };
         let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
@@ -925,7 +990,7 @@ mod allocation_failures {
     fn capture_growth_failure_preserves_bytes_and_does_not_publish() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::CaptureBuffer.into()),
+            expected_site: Some(turso_core::alloc::FtsAllocationSite::CaptureBuffer.into()),
             ..Default::default()
         };
         let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
@@ -965,7 +1030,7 @@ mod allocation_failures {
     fn chunk_assembly_failure_returns_oom_and_retry_reads_the_same_bytes() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::AssembleBuffer.into()),
+            expected_site: Some(turso_core::alloc::FtsAllocationSite::AssembleBuffer.into()),
             ..Default::default()
         };
         let path = std::path::Path::new("segment.term");
@@ -989,7 +1054,7 @@ mod allocation_failures {
     fn snapshot_metadata_failure_returns_oom() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::SnapshotMetadata.into()),
+            expected_site: Some(turso_core::alloc::FtsAllocationSite::SnapshotMetadata.into()),
             ..Default::default()
         };
         let dyn_allocator = DynAllocator::new(allocator.clone());
@@ -1014,7 +1079,7 @@ mod allocation_failures {
     fn snapshot_tombstone_failure_returns_oom() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::SnapshotTombstone.into()),
+            expected_site: Some(turso_core::alloc::FtsAllocationSite::SnapshotTombstone.into()),
             ..Default::default()
         };
         let dyn_allocator = DynAllocator::new(allocator.clone());
@@ -1104,11 +1169,11 @@ mod allocation_failures {
 
     fn database_with_failing_fts_allocator(mvcc: bool) -> (Arc<Connection>, FailingAllocator) {
         let allocator = FailingAllocator::default();
-        let db = crate::Database::open(
-            Arc::new(crate::MemoryIO::new()),
+        let db = turso_core::Database::open(
+            Arc::new(turso_core::MemoryIO::new()),
             ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
-                .db_opts(crate::DatabaseOpts::default().with_index_method(true))
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(turso_core::DatabaseOpts::default().with_index_method(true))
                 .allocators(DatabaseAllocators {
                     fts: DynAllocator::new(allocator.clone()),
                     ..Default::default()
@@ -1144,7 +1209,7 @@ mod allocation_failures {
         remaining: Arc<AtomicIsize>,
         allocations: Arc<AtomicUsize>,
         #[cfg(feature = "allocation_metric")]
-        expected_site: Option<crate::alloc::AllocationSite>,
+        expected_site: Option<turso_core::alloc::AllocationSite>,
     }
 
     impl Default for FailingAllocator {
@@ -1169,7 +1234,7 @@ mod allocation_failures {
         fn allocate(&self, layout: Layout) -> std::result::Result<NonNull<[u8]>, AllocError> {
             #[cfg(feature = "allocation_metric")]
             if let Some(expected) = self.expected_site {
-                assert_eq!(crate::alloc::current_allocation_site(), Some(expected));
+                assert_eq!(turso_core::alloc::current_allocation_site(), Some(expected));
             }
             self.allocations.fetch_add(1, Ordering::Relaxed);
             let previous =
@@ -1193,15 +1258,15 @@ mod allocation_failures {
 /// ids 1 to 20 match 'hello' and the rest do not, and every match is in category 0 but the last,
 /// id 20, in category 1.
 fn documents_in_categories() -> Arc<Connection> {
-    let db = crate::Database::open(
-        Arc::new(crate::MemoryIO::new()),
+    let db = turso_core::Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
-            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(turso_core::DatabaseOpts::default().with_index_method(true)),
     )
     .unwrap();
     let conn = db
-        .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, cat INTEGER)")
         .unwrap();
@@ -1253,15 +1318,15 @@ fn fts_limit_applies_after_aggregates_and_distinct() {
 /// Nine documents inserted by one statement, mentioning 'hello' once, twice or three times, so
 /// their FTS scores take three values.
 fn scored_documents() -> Arc<Connection> {
-    let db = crate::Database::open(
-        Arc::new(crate::MemoryIO::new()),
+    let db = turso_core::Database::open(
+        Arc::new(turso_core::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
-            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(turso_core::DatabaseOpts::default().with_index_method(true)),
     )
     .unwrap();
     let conn = db
-        .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();

@@ -44,7 +44,7 @@ use crate::sync::Arc;
 const TANTIVY_META_FILE: &str = "meta.json";
 const TANTIVY_MANAGED_FILE: &str = ".managed.json";
 
-pub(super) type FileBytes = Arc<DynVec<u8>>;
+pub type FileBytes = Arc<DynVec<u8>>;
 
 struct FileByteSlice(FileBytes);
 
@@ -108,7 +108,7 @@ fn noop_lock() -> DirectoryLock {
 /// segment with tombstones. `meta_json` is the `meta.json` synthesized
 /// from the visible registry rows; no stored file ever carries that name.
 #[derive(Clone)]
-pub(super) struct SnapshotDirectory {
+pub struct SnapshotDirectory {
     files: Arc<HashMap<PathBuf, FileBytes>>,
     meta_json: FileBytes,
 }
@@ -224,7 +224,7 @@ struct BuildDirectoryInner {
 
 /// Private in-memory write buffer for building one immutable segment.
 #[derive(Clone, Default)]
-pub(super) struct BuildDirectory {
+pub struct BuildDirectory {
     inner: Arc<RwLock<BuildDirectoryInner>>,
     allocator: DynAllocator,
 }

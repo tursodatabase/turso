@@ -36,6 +36,7 @@ mod storage;
 mod suspended_statement_checkpoint;
 mod transaction_errors;
 mod trigger;
+mod unit;
 mod unreliable_io;
 mod views;
 mod wal;

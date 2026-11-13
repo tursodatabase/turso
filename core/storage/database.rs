@@ -51,7 +51,7 @@ impl IOContext {
         *codec = page_codec_from_encryption(encryption_ctx);
     }
 
-    pub(crate) fn set_page_codec(&mut self, codec: Arc<dyn PageCodec>) {
+    pub fn set_page_codec(&mut self, codec: Arc<dyn PageCodec>) {
         self.page_transform = PageTransform::Codec(codec);
     }
 
