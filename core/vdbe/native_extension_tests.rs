@@ -1569,6 +1569,37 @@ fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
 }
 
 #[test]
+fn create_virtual_table_if_not_exists_creates_the_table() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
+        "native_rows",
+        VTabKind::VirtualTable,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vt USING native_rows")
+        .unwrap();
+    // Like SQLite, the stored SQL leaves out IF NOT EXISTS.
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_schema WHERE name = 'vt'")
+        .unwrap();
+    assert_eq!(
+        collect(&mut stmt, &queue),
+        vec![vec![Value::from_text(
+            "CREATE VIRTUAL TABLE vt USING native_rows\n /*vt(value INTEGER, lower_bound INTEGER HIDDEN)*/"
+        )]]
+    );
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vt USING native_rows")
+        .unwrap();
+    let mut stmt = conn.prepare("SELECT value FROM vt").unwrap();
+    assert_eq!(collect(&mut stmt, &queue), vec![vec![Value::from_i64(4)]]);
+}
+
+#[test]
 fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(OpenOptions::new(Arc::new(EngineDialect)).native_module(
