@@ -8,7 +8,7 @@ use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::{ast, parser::Parser};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
@@ -134,9 +134,8 @@ impl VirtualTable {
     }
 
     pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
-        let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
-            parser.next_cmd()?.ok_or_else(|| {
+            crate::dialect::engine::parse_statement(&schema)?.ok_or_else(|| {
                 LimboError::ParseError(
                     "Failed to parse schema from virtual table module".to_string(),
                 )
@@ -653,6 +652,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
     use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
@@ -758,7 +758,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "external_metadata");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM external_metadata")
             .unwrap();
@@ -802,7 +804,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);

@@ -135,6 +135,27 @@ expect {
     3|4
 }
 
+test values-rows-of-different-lengths-errors {
+    VALUES (1), (1, 2);
+}
+@sqlstate 42601
+expect error {
+}
+
+test values-in-from-rows-of-different-lengths-errors {
+    SELECT * FROM (VALUES (1, 2), (1)) AS v;
+}
+@sqlstate 42601
+expect error {
+}
+
+test values-in-union-rows-of-different-lengths-errors {
+    VALUES (1), (1, 2) UNION VALUES (3);
+}
+@sqlstate 42601
+expect error {
+}
+
 test column-alias-list-longer-than-subquery-errors {
     SELECT * FROM (SELECT 1, 2) AS s(a, b, c);
 }

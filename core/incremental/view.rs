@@ -9,10 +9,7 @@ use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{turso_assert, LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
-use turso_parser::{
-    ast::{Cmd, Stmt},
-    parser::Parser,
-};
+use turso_parser::ast::{Cmd, Stmt};
 
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
@@ -714,8 +711,7 @@ impl IncrementalView {
         main_data_root: i64,
         namespace: NamespaceId,
     ) -> Result<Self> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         let cmd = cmd.expect("View is an empty statement");
         match cmd {
             Cmd::Stmt(Stmt::CreateMaterializedView {
@@ -882,6 +878,7 @@ mod tests {
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
+    use crate::security::roles::SessionRole;
     use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
     use crate::{ConnectOpts, Database, DatabaseOpts, EngineDialect, OpenFlags, StepResult};
@@ -1195,7 +1192,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE aggregate_base(x)").unwrap();
         conn.execute(
             "CREATE MATERIALIZED VIEW aggregate_view AS SELECT SUM(x) AS total FROM aggregate_base",
@@ -1239,7 +1238,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
             .unwrap();
         for id in 1..260 {

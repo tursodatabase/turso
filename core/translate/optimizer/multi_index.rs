@@ -1348,6 +1348,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         }
     }

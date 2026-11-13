@@ -1,5 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
-use crate::dialect::RelationChange;
+use crate::dialect::CatalogChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -359,11 +359,11 @@ pub fn translate_create_index(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             connection,
-            &[RelationChange::Create {
+            &[CatalogChange::Create {
                 namespace: namespace.id,
                 name: idx_name.clone(),
                 kind: crate::schema::RelationKind::Index,
@@ -483,6 +483,7 @@ pub(crate) fn emit_refill_index(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
@@ -1500,11 +1501,11 @@ pub fn translate_drop_index(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             connection,
-            &[RelationChange::Drop {
+            &[CatalogChange::Drop {
                 namespace: namespace.id,
                 name: idx_name.clone(),
             }],
@@ -1749,15 +1750,18 @@ pub fn translate_optimize(
 #[cfg(test)]
 mod tests {
     use super::canonical_create_index_sql;
-    use turso_parser::{ast, parser::Parser};
+    use turso_parser::ast;
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-        let mut parser = Parser::new(b"CREATE INDEX aux.idx1 ON t1(name);");
-        let stmt = match parser.next_cmd().unwrap().unwrap() {
-            ast::Cmd::Stmt(stmt) => stmt,
-            other => panic!("expected statement, got {other:?}"),
-        };
+        let stmt =
+            match crate::dialect::engine::parse_statement("CREATE INDEX aux.idx1 ON t1(name);")
+                .unwrap()
+                .unwrap()
+            {
+                ast::Cmd::Stmt(stmt) => stmt,
+                other => panic!("expected statement, got {other:?}"),
+            };
 
         // let's confirm that the stmt does carry `aux`
         let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {

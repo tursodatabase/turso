@@ -2,7 +2,7 @@ use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
-use turso_core::{ConnectOpts, Database, OpenFlags};
+use turso_core::{ConnectOpts, Database, OpenFlags, SessionRole};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 use turso_sqlite::SqliteDialect;
 
@@ -34,7 +34,9 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -67,7 +69,9 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -265,32 +269,6 @@ fn test_open_file_with_wrong_argument_count_in_schema() {
     }
 }
 
-/// The SQLite dialect has no roles, so a table named like the roles table of
-/// the PostgreSQL frontend is an ordinary table, as it is to sqlite3.
-#[test]
-fn test_open_file_with_table_named_like_the_roles_table() {
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let path = tmp_dir.path().join("roles.db");
-    let sqlite = rusqlite::Connection::open(&path).unwrap();
-    sqlite
-        .execute_batch(
-            "CREATE TABLE __turso_internal_roles(x);
-             INSERT INTO __turso_internal_roles VALUES (1);
-             CREATE TABLE t(a);
-             INSERT INTO t VALUES (5);",
-        )
-        .unwrap();
-    drop(sqlite);
-
-    let db = open_plain_file(&path).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
-    conn.force_reparse_schema_without_publish().unwrap();
-
-    let mut stmt = conn.prepare("SELECT a FROM t").unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    assert_that!(rows).is_equal_to(vec![vec![turso_core::Value::from_i64(5)]]);
-}
-
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
@@ -376,7 +354,9 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -405,7 +385,9 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 

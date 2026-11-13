@@ -774,8 +774,7 @@ pub(crate) fn open_table_cursor(
 pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
     let mut parsed = Vec::new();
     for pattern in patterns {
-        let mut parser = turso_parser::parser::Parser::new(pattern.as_bytes());
-        let Some(ast) = parser.next() else {
+        let Some(ast) = crate::dialect::engine::parse_statement(pattern).transpose() else {
             return Err(LimboError::ParseError(format!(
                 "unable to parse pattern statement: {pattern}",
             )));

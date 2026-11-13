@@ -6165,6 +6165,7 @@ pub mod test {
         Wal, WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile,
         WalSnapshot, NO_LOCK_HELD,
     };
+    use crate::security::roles::SessionRole;
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
@@ -6340,7 +6341,9 @@ pub mod test {
     #[test]
     fn test_truncate_file() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test (id integer primary key, value text)")
             .unwrap();
         let _ = conn.execute("insert into test (value) values ('test1'), ('test2'), ('test3')");
@@ -6363,7 +6366,9 @@ pub mod test {
         let (db, path) = get_database();
         let walpath = path.path().join("test.db-wal");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test (id integer primary key, value text)")
             .unwrap();
         for _i in 0..25 {
@@ -6406,7 +6411,9 @@ pub mod test {
         let (db, path) = get_database();
         let walpath = path.path().join("test.db-wal");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test (id integer primary key, value text)")
             .unwrap();
         conn.execute("insert into test (value) values ('v1'), ('v2')")
@@ -6480,7 +6487,9 @@ pub mod test {
     fn test_wal_checkpoint_defers_backfill_publication_until_db_sync() {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -6502,7 +6511,9 @@ pub mod test {
     fn test_checkpoint_sync_mode_off_leaves_backfill_unpublished() {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -6533,12 +6544,16 @@ pub mod test {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let writer = db.connect(ConnectOpts::new()).unwrap();
+        let writer = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         writer
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&writer, 20, 10);
-        let reader = db.connect(ConnectOpts::new()).unwrap();
+        let reader = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         reader.execute("begin").unwrap();
         let reader_rows = count_test_table(&reader);
         let pager = writer.pager.load();
@@ -9177,7 +9192,9 @@ pub mod test {
         let (db, path) = get_database();
         let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -9265,7 +9282,9 @@ pub mod test {
         let (db, path) = get_database();
         let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -10306,7 +10325,9 @@ pub mod test {
 
         let walpath = path.path().join("test.db-wal");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
@@ -10397,8 +10418,12 @@ pub mod test {
     #[test]
     fn test_wal_passive_partial_then_complete() {
         let (db, _tmp) = get_database();
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -10480,8 +10505,12 @@ pub mod test {
     #[test]
     fn test_wal_restart_blocks_readers() {
         let (db, _temp_dir) = get_database();
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         // Start a read transaction
         conn2
@@ -10549,7 +10578,9 @@ pub mod test {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 10, 5);
@@ -10584,7 +10615,9 @@ pub mod test {
     #[test]
     fn test_wal_concurrent_readers_during_checkpoint() {
         let (db, _path) = get_database();
-        let conn_writer = db.connect(ConnectOpts::new()).unwrap();
+        let conn_writer = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn_writer
             .execute("create table test(id integer primary key, value text)")
@@ -10592,8 +10625,12 @@ pub mod test {
         bulk_inserts(&conn_writer, 5, 10);
 
         // Start multiple readers at different points
-        let conn_r1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn_r2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn_r1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn_r2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         // R1 starts reading
         let r1_max_frame = {
@@ -10645,7 +10682,9 @@ pub mod test {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 10, 5);
@@ -10675,8 +10714,12 @@ pub mod test {
     #[test]
     fn test_wal_writer_blocks_restart_checkpoint() {
         let (db, _path) = get_database();
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -10720,7 +10763,9 @@ pub mod test {
     #[should_panic(expected = "must have a read transaction to begin a write transaction")]
     fn test_wal_read_transaction_required_before_write() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -10749,7 +10794,9 @@ pub mod test {
     #[test]
     fn test_wal_multiple_readers_at_different_frames() {
         let (db, _path) = get_database();
-        let conn_writer = db.connect(ConnectOpts::new()).unwrap();
+        let conn_writer = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn_writer
             .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)")
@@ -10765,17 +10812,23 @@ pub mod test {
 
         bulk_inserts(&conn_writer, 3, 5);
 
-        let conn1 = &db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = &db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let (r1_frame, _stmt) = start_reader(conn1); // reader 1
 
         bulk_inserts(&conn_writer, 3, 5);
 
-        let conn_r2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn_r2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let (r2_frame, _stmt2) = start_reader(&conn_r2); // reader 2
 
         bulk_inserts(&conn_writer, 3, 5);
 
-        let conn_r3 = db.connect(ConnectOpts::new()).unwrap();
+        let conn_r3 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let (r3_frame, _stmt3) = start_reader(&conn_r3); // reader 3
 
         assert!(r1_frame < r2_frame && r2_frame < r3_frame);
@@ -10821,7 +10874,9 @@ pub mod test {
     #[test]
     fn test_checkpoint_truncate_reset_handling() {
         let (db, path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let walpath = path.path().join("test.db-wal");
 
@@ -10875,7 +10930,9 @@ pub mod test {
     #[test]
     fn test_wal_checkpoint_truncate_db_file_contains_data() {
         let (db, path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let walpath = path.path().join("test.db-wal");
 
@@ -10964,8 +11021,12 @@ pub mod test {
     #[test]
     fn test_wal_stale_snapshot_in_write_transaction() {
         let (db, _path) = get_database();
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -11006,8 +11067,12 @@ pub mod test {
     #[test]
     fn test_wal_readlock0_optimization_behavior() {
         let (db, _path) = get_database();
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
@@ -11069,7 +11134,9 @@ pub mod test {
     #[test]
     fn test_wal_full_backfills_all() {
         let (db, _tmp) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         // Write some data to put frames in the WAL
         conn.execute("create table test(id integer primary key, value text)")
@@ -11102,8 +11169,12 @@ pub mod test {
     #[test]
     fn test_wal_full_waits_for_old_reader_then_succeeds() {
         let (db, _tmp) = get_database();
-        let writer = db.connect(ConnectOpts::new()).unwrap();
-        let reader = db.connect(ConnectOpts::new()).unwrap();
+        let writer = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let reader = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         writer
             .execute("create table test(id integer primary key, value text)")
@@ -11195,7 +11266,9 @@ pub mod test {
     #[test]
     fn test_rollback_releases_read_lock() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("BEGIN").unwrap();
@@ -11225,7 +11298,9 @@ pub mod test {
     #[test]
     fn test_rollback_releases_shared_read_lock_slot() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("BEGIN").unwrap();
@@ -11256,7 +11331,9 @@ pub mod test {
     #[test]
     fn test_rollback_releases_slot_zero_read_lock() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE test(id integer primary key, value text)")
             .unwrap();
@@ -11299,7 +11376,9 @@ pub mod test {
     #[test]
     fn test_savepoint_rollback_preserves_read_lock() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
             .unwrap();
@@ -11343,8 +11422,12 @@ pub mod test {
     #[test]
     fn test_savepoint_then_tx_rollback_allows_restart_checkpoint_from_other_connection() {
         let (db, _path) = get_database();
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn1
             .execute("CREATE TABLE test(id integer primary key, value text)")
@@ -11414,7 +11497,9 @@ pub mod test {
     #[test]
     fn test_checkpoint_succeeds_after_rollback() {
         let (db, _path) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE test(id integer primary key, value text)")
             .unwrap();

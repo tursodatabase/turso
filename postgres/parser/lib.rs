@@ -1,5 +1,8 @@
 pub mod cmdtag;
 pub mod copy;
+mod create_function;
+pub mod functions;
+mod names;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
@@ -22,11 +25,83 @@ pub enum ParseError {
     /// missing schema. Only a caller with a connection can find that out.
     #[error("a schema-qualified {kind} name is not supported")]
     SchemaQualifiedName { kind: String, schema: String },
+    /// A type of a function's parameter or result that is not built in. It
+    /// is a relation or a custom type, which tursopg does not support in a
+    /// function, or it does not exist. Only a caller with a connection can
+    /// find that out.
+    #[error("{} is not supported", .used_as.unsupported_feature(.full_name))]
+    UnresolvedFunctionType {
+        schema: Option<String>,
+        name: String,
+        /// The type as PostgreSQL writes it in errors, such as `public.t[]`.
+        full_name: String,
+        used_as: FunctionTypeUse,
+    },
+}
+
+impl ParseError {
+    /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
+    pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
+        Self::Sqlstate {
+            sqlstate: sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: format!("{what} is not supported"),
+        }
+    }
+}
+
+/// Where a type appears in the signature of a function.
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionTypeUse {
+    Parameter,
+    Result,
+    SetofResult,
+}
+
+impl FunctionTypeUse {
+    /// PostgreSQL's error when the type does not exist. PostgreSQL quotes
+    /// the name only in the error for a result.
+    pub fn missing_message(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("type {full_name} does not exist"),
+            Self::Result | Self::SetofResult => format!("type \"{full_name}\" does not exist"),
+        }
+    }
+
+    fn unsupported_feature(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("a function parameter of type {full_name}"),
+            Self::Result => format!("a function result of type {full_name}"),
+            Self::SetofResult => format!("a function result of type SETOF {full_name}"),
+        }
+    }
 }
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::parse(sql).map_err(parse_error)
+}
+
+/// The error for SQL that pg_query refuses. pg_query gives only the message
+/// of PostgreSQL's error, not its SQLSTATE, so the errors that PostgreSQL
+/// does not report as syntax errors are recognized by their message.
+fn parse_error(error: pg_query::Error) -> ParseError {
+    match &error {
+        pg_query::Error::Parse(message) if is_reserved_role_name_error(message) => {
+            ParseError::Sqlstate {
+                sqlstate: sqlstate::SQLSTATE_RESERVED_NAME,
+                message: message.clone(),
+            }
+        }
+        _ => ParseError::ParseError(error.to_string()),
+    }
+}
+
+/// Whether the message is PostgreSQL's error for a role name that the
+/// grammar refuses, such as `role name "none" is reserved` or
+/// `CURRENT_USER cannot be used as a role name here`.
+fn is_reserved_role_name_error(message: &str) -> bool {
+    (message.starts_with("role name \"") && message.ends_with("\" is reserved"))
+        || message.ends_with(" cannot be used as a role name here")
 }
 
 /// Whether the first statement in `parsed` sends rows to the client.
@@ -47,12 +122,14 @@ fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
 }
 
 /// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// The parser knows that the semicolons in the BEGIN ATOMIC body of CREATE
+/// FUNCTION do not end the statement. Text with a syntax error is an error,
+/// because PostgreSQL runs none of the statements in it.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     let parts =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     Ok(parts
         .into_iter()
         .map(|s| s.trim().to_string())
@@ -192,6 +269,53 @@ pub fn create_table_name(parse_result: &ParseResult) -> Option<(Option<String>, 
         return None;
     };
     let relation = create.relation.as_ref()?;
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// The schema, if the statement names one, and name of the table being
+/// altered, when the statement is `ALTER TABLE t ADD COLUMN`. Returns None
+/// for all other statements.
+pub fn alter_table_add_column_table(
+    parse_result: &ParseResult,
+) -> Option<(Option<String>, String)> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::AlterTableType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::AlterTableStmt(alter), ..) = nodes.first()? else {
+        return None;
+    };
+    let relation = alter.relation.as_ref()?;
+    let cmd = alter.cmds.first()?;
+    let Some(Node::AlterTableCmd(cmd)) = &cmd.node else {
+        return None;
+    };
+    if AlterTableType::try_from(cmd.subtype).ok()? != AlterTableType::AtAddColumn {
+        return None;
+    }
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// Returns the (schema, table) of a positional VALUES INSERT (no explicit column list).
+/// Returns None for any other statement, for INSERT with a column list, or for DEFAULT VALUES.
+pub fn positional_insert_table(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::InsertStmt(insert), ..) = nodes.first()? else {
+        return None;
+    };
+    if !insert.cols.is_empty() || insert.select_stmt.is_none() {
+        return None;
+    }
+    let relation = insert.relation.as_ref()?;
     Some((
         (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
         relation.relname.clone(),

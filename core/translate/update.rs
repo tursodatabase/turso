@@ -9,7 +9,7 @@ use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::row_security;
+use crate::translate::{roles, row_security};
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -196,6 +196,34 @@ fn prepare_and_optimize_update_plan(
         resolver,
         connection,
     )?;
+    // An ALTER that rewrites the schema table has had its own privileges
+    // checked already, and no policy applies to it.
+    if !is_internal_schema_change {
+        let reads_target_columns = update_reads_target_columns(&update_plan)?;
+        let target = &update_plan.target_table;
+        roles::check_write_privileges(
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+            ast::Privilege::Update,
+            reads_target_columns,
+        )?;
+        apply_update_policies(
+            &mut update_plan,
+            &mut read_scope_tables,
+            reads_target_columns,
+            resolver,
+            program,
+        )?;
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            update_plan.target_table.namespace,
+            update_plan.target_table.table.get_name(),
+        );
+    }
     mark_shared_cte_materialization_requirements(
         &mut read_scope_tables,
         &mut update_plan.non_from_clause_subqueries,
@@ -206,6 +234,62 @@ fn prepare_and_optimize_update_plan(
     let mut plan = Plan::Update(Box::new(update_plan));
     optimize_plan(program, &mut plan, resolver, connection)?;
     Ok(plan)
+}
+
+/// Whether SET, WHERE or RETURNING reads the columns of the target table,
+/// which makes the UPDATE need SELECT on it and its SELECT policies apply,
+/// as in PostgreSQL. Subqueries must be planned first, so that only a
+/// subquery that refers to the target table counts as reading it.
+fn update_reads_target_columns(plan: &UpdatePlan) -> crate::Result<bool> {
+    roles::reads_columns_of(
+        plan.target_table.internal_id,
+        plan.where_clause
+            .iter()
+            .map(|term| &term.expr)
+            .chain(plan.set_clauses.iter().map(|set| set.expr.as_ref()))
+            .chain(plan.returning.iter().flatten().map(|column| &column.expr)),
+        &plan.non_from_clause_subqueries,
+    )
+}
+
+/// Applies the target table's row-level security policies: the UPDATE
+/// changes only the rows that the UPDATE policies allow, and the SELECT
+/// policies too when `reads_target_columns`, and each new row must pass the
+/// checks in `plan.row_checks`. The target table is the first of
+/// `read_scope_tables`; the FROM tables have their SELECT policies already.
+fn apply_update_policies(
+    plan: &mut UpdatePlan,
+    read_scope_tables: &mut TableReferences,
+    reads_target_columns: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> crate::Result<()> {
+    let commands: &[Command] = if reads_target_columns {
+        &[Command::Update, Command::Select]
+    } else {
+        &[Command::Update]
+    };
+    let target_table = read_scope_tables.joined_tables_mut().remove(0);
+    plan.row_checks = row_security::new_row_checks(
+        resolver,
+        target_table.namespace,
+        target_table.table.get_name(),
+        Command::Update,
+        reads_target_columns,
+    );
+    let mut target_scope = TableReferences::new(vec![target_table], vec![]);
+    row_security::filter_rows(
+        commands,
+        &mut target_scope,
+        &mut plan.where_clause,
+        resolver,
+        program,
+    )?;
+    let target_table = target_scope.joined_tables_mut().remove(0);
+    read_scope_tables
+        .joined_tables_mut()
+        .insert(0, target_table);
+    Ok(())
 }
 
 fn validate_update(
@@ -306,6 +390,7 @@ fn prepare_update_plan(
         namespace,
         indexed,
         plan_estimate: None,
+        row_filter: None,
     };
     let mut table_refs_outside_from = Vec::new();
     for set in &body.sets {
@@ -333,7 +418,13 @@ fn prepare_update_plan(
         &mut from_tables,
         connection,
     )?;
-    row_security::filter_rows(Command::Select, &from_tables, &mut where_clause, resolver)?;
+    row_security::filter_rows(
+        &[Command::Select],
+        &mut from_tables,
+        &mut where_clause,
+        resolver,
+        program,
+    )?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
     // a column name that already appears in another FROM-side table without being
@@ -378,12 +469,6 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
-    row_security::filter_rows(
-        Command::Update,
-        &read_scope_tables,
-        &mut where_clause,
-        resolver,
-    )?;
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
@@ -484,6 +569,7 @@ fn prepare_update_plan(
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
+        row_checks: Vec::new(),
     })
 }
 
