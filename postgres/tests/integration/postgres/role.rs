@@ -862,3 +862,46 @@ fn session_role_may_not_set_a_role_after_its_membership_is_revoked() {
         "permission denied to set role \"readers\""
     );
 }
+
+/// A session that logs in as a role without privileges of its own switches
+/// to a role it is a member of, and a policy for that role decides which
+/// rows it reads.
+#[test]
+fn logged_in_role_reads_through_a_policy_after_set_role() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    for sql in [
+        "CREATE ROLE guest NOINHERIT",
+        "CREATE ROLE reader NOINHERIT",
+        "CREATE ROLE app_login NOINHERIT",
+        "GRANT guest, reader TO app_login",
+        "CREATE TABLE todos (id INT PRIMARY KEY, owner TEXT)",
+        "INSERT INTO todos VALUES (1, 'alice'), (2, 'bob')",
+        "ALTER TABLE todos ENABLE ROW LEVEL SECURITY",
+        "GRANT SELECT ON todos TO guest, reader",
+        "CREATE POLICY alices ON todos FOR SELECT TO reader USING (owner = 'alice')",
+    ] {
+        superuser.execute(sql).unwrap();
+    }
+
+    let app_login = connect_as(&db, "app_login");
+
+    let error = app_login.query("SELECT id FROM todos").err().unwrap();
+    assert_eq!(error.to_string(), "permission denied for table todos");
+    app_login.execute("SET ROLE guest").unwrap();
+    assert_eq!(todo_ids(&app_login), Vec::<String>::new());
+    app_login.execute("SET ROLE reader").unwrap();
+    assert_eq!(todo_ids(&app_login), vec!["1"]);
+}
+
+fn todo_ids(conn: &PgConnection) -> Vec<String> {
+    let mut stmt = conn
+        .query("SELECT id FROM todos ORDER BY id")
+        .unwrap()
+        .unwrap();
+    stmt.run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].to_string())
+        .collect()
+}
