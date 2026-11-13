@@ -1233,6 +1233,21 @@ pub fn translate_alter_table(
                 &table_name_norm,
                 resolver,
             );
+            if let Some(sequence) = &owned_sequence {
+                if let Some(usage) = crate::translate::schema::find_object_using_sequence(
+                    resolver,
+                    namespace,
+                    std::slice::from_ref(sequence),
+                    &table_name_norm,
+                    Some(column_name_norm.as_str()),
+                ) {
+                    crate::bail_parse_error!(
+                        "cannot drop column {} of table {} because other objects depend on it: {usage}",
+                        column_name_norm,
+                        table_name_norm
+                    );
+                }
+            }
             let mut rewrite_rows_result = Ok(());
             let mut owned_sequence_result = Ok(());
             translate_update_for_schema_change(
@@ -2986,6 +3001,9 @@ fn emit_rewrite_table_indexes(
 
 /// The sequence that `column` draws its values from, when the table owns
 /// it, so dropping the column drops it too.
+// FIXME: ownership is stored per table, so a column that only uses the sequence
+// of another column of its table is treated as the owner. Use the column
+// ownership of pg_depend once it is stored.
 fn owned_sequence_of_column(
     column: &crate::schema::Column,
     namespace: NamespaceRef,

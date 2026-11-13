@@ -348,6 +348,10 @@ impl Dialect for PostgresDialect {
         crate::classes::sequences_owned_by_table(schema, namespace, name)
     }
 
+    fn refuses_dropping_used_sequences(&self) -> bool {
+        true
+    }
+
     fn role_has_privilege(
         &self,
         schema: &Schema,

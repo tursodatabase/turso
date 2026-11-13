@@ -511,6 +511,12 @@ pub trait Dialect: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Whether DROP SEQUENCE refuses a sequence that a column default or a
+    /// view still uses.
+    fn refuses_dropping_used_sequences(&self) -> bool {
+        false
+    }
+
     /// Whether `role` has `privilege` on relation `name` of `namespace`,
     /// from the privileges the dialect stores. A dialect without privileges
     /// gives every role every privilege.
