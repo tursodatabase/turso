@@ -316,3 +316,72 @@ fn test_postgres_select_into_compound_rejected(db: TempDatabase) {
         "expected nested INTO rejection, got: {err}"
     );
 }
+
+#[test]
+fn drop_sequence_of_a_serial_column_is_refused() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE owner (id serial, label text)")
+        .unwrap();
+
+    let error = conn
+        .execute("DROP SEQUENCE owner_id_seq")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot drop sequence owner_id_seq because other objects depend on it"),
+        "{error}"
+    );
+
+    conn.execute("INSERT INTO owner (label) VALUES ('a')")
+        .unwrap();
+    let rows = conn
+        .query("SELECT id FROM owner")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].to_string(), "1");
+}
+
+#[test]
+fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE owner (id serial, label text)")
+        .unwrap();
+    conn.execute("CREATE TABLE borrower (n bigint DEFAULT nextval('owner_id_seq'))")
+        .unwrap();
+
+    let error = conn.execute("DROP TABLE owner").unwrap_err().to_string();
+    assert!(
+        error.contains("cannot drop table owner because other objects depend on it"),
+        "{error}"
+    );
+    let error = conn
+        .execute("ALTER TABLE owner DROP COLUMN id")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot drop column id of table owner because other objects depend on it"),
+        "{error}"
+    );
+
+    conn.execute("INSERT INTO owner (label) VALUES ('a')")
+        .unwrap();
+    conn.execute("INSERT INTO borrower DEFAULT VALUES").unwrap();
+    let rows = conn
+        .query("SELECT (SELECT id FROM owner), (SELECT n FROM borrower)")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0][0].to_string(), rows[0][1].to_string()),
+        ("1".to_string(), "2".to_string())
+    );
+
+    conn.execute("DROP TABLE borrower").unwrap();
+    conn.execute("DROP TABLE owner").unwrap();
+}
