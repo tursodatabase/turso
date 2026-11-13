@@ -37,7 +37,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
     io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
-    QueryMode, Statement, Value,
+    QueryMode, SessionRole, Statement, Value,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -281,7 +281,7 @@ impl Limbo {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
             (io, conn)
         };
         unsafe {
@@ -501,7 +501,7 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect(ConnectOpts::new())?;
+        self.conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -2057,7 +2057,7 @@ impl Limbo {
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
         let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect(ConnectOpts::new())?;
+        let target = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
@@ -2405,6 +2405,7 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_core::SessionRole;
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
@@ -2477,7 +2478,7 @@ mod tests {
     fn test_dump_and_reload_infinite_real() -> anyhow::Result<()> {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL);")?;
         conn.execute("INSERT INTO t VALUES(1, 1e400), (2, -1e400), (3, 1.5), (4, NULL);")?;
 
@@ -2500,7 +2501,7 @@ mod tests {
 
         let io2: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db2 = Database::open_file(io2, ":memory:", Arc::new(SqliteDialect))?;
-        let conn2 = db2.connect(ConnectOpts::new())?;
+        let conn2 = db2.connect(ConnectOpts::new(SessionRole::Superuser))?;
         for stmt in dump_sql.split(';') {
             let stmt = stmt.trim();
             if stmt.is_empty() {

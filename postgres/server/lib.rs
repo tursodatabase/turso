@@ -10,7 +10,9 @@ use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, Value};
-use turso_pg::{split_statements, PgConnection, StatementResultKind, TransactionState};
+use turso_pg::{
+    split_statements, sql_parse_error, PgConnection, StatementResultKind, TransactionState,
+};
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::ParseResult;
@@ -221,7 +223,7 @@ impl TursoPgHandler {
         // the block.
         let parse_error = |error: turso_pg_parser::ParseError| {
             conn.abort_transaction_block_on_error();
-            pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
+            pg_error(sql_parse_error(error).into())
         };
         turso_pg_parser::parse(&query.query).map_err(parse_error)?;
         let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;
@@ -408,8 +410,7 @@ fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo
 }
 
 fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
-    turso_pg_parser::parse(sql)
-        .map_err(|error| pg_error(turso_core::LimboError::ParseError(error.to_string()).into()))
+    turso_pg_parser::parse(sql).map_err(|error| pg_error(sql_parse_error(error).into()))
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
@@ -1461,6 +1462,7 @@ mod tests {
             ),
             ("SELECT random()", Type::FLOAT8),
             ("SELECT random() * 10", Type::FLOAT8),
+            ("SELECT array_to_json(ARRAY[1])", Type::JSON),
         ] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));

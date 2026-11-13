@@ -1,0 +1,534 @@
+# Row-level security policies through the PostgreSQL frontend: CREATE
+# POLICY and DROP POLICY, and the rows that each role then reads.
+#
+# Each test reads as the superuser or the owner where that helps, then as
+# roles that are not superusers. Roles are granted SELECT, because without
+# it PostgreSQL refuses to read the table at all. PostgreSQL roles belong to
+# the whole server, so every test uses its own role and table names.
+
+@database :memory:
+
+test policy-shows-each-role-its-own-rows {
+    CREATE ROLE rp_alice_1;
+    CREATE ROLE rp_bob_1;
+    CREATE TABLE rp_docs_1 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO rp_docs_1 VALUES (1, 'rp_alice_1', 'a'), (2, 'rp_bob_1', 'b'), (3, 'rp_alice_1', 'c');
+    ALTER TABLE rp_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_1 FOR SELECT USING (owner = current_user);
+    GRANT SELECT ON rp_docs_1 TO rp_alice_1, rp_bob_1;
+    SELECT count(*) FROM rp_docs_1;
+    SET ROLE rp_alice_1;
+    SELECT id FROM rp_docs_1 ORDER BY id;
+    SELECT count(*) FROM rp_docs_1;
+    SET ROLE rp_bob_1;
+    SELECT id FROM rp_docs_1 ORDER BY id;
+    SELECT max(id) FROM rp_docs_1;
+}
+expect {
+    3
+    1
+    3
+    2
+    2
+    2
+}
+
+test policy-with-scalar-subquery-of-current-user {
+    CREATE ROLE rp_alice_2;
+    CREATE TABLE rp_docs_2 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_2 VALUES (1, 'rp_alice_2'), (2, 'someone else');
+    ALTER TABLE rp_docs_2 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_2 USING (rp_docs_2.owner = (SELECT current_user));
+    GRANT SELECT ON rp_docs_2 TO rp_alice_2;
+    SET ROLE rp_alice_2;
+    SELECT id FROM rp_docs_2;
+}
+expect {
+    1
+}
+
+test policy-applies-only-to-the-roles-it-names {
+    CREATE ROLE rp_alice_3;
+    CREATE ROLE rp_bob_3;
+    CREATE TABLE rp_docs_3 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_3 VALUES (1), (2);
+    ALTER TABLE rp_docs_3 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_3 TO rp_alice_3 USING (true);
+    GRANT SELECT ON rp_docs_3 TO rp_alice_3, rp_bob_3;
+    SET ROLE rp_alice_3;
+    SELECT count(*) FROM rp_docs_3;
+    SET ROLE rp_bob_3;
+    SELECT count(*) FROM rp_docs_3;
+}
+expect {
+    2
+    0
+}
+
+test restrictive-policy-limits-permissive-ones {
+    CREATE ROLE rp_alice_4;
+    CREATE TABLE rp_docs_4 (id INT PRIMARY KEY, published BOOLEAN);
+    INSERT INTO rp_docs_4 VALUES (1, true), (2, false), (3, true);
+    ALTER TABLE rp_docs_4 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY some_rows ON rp_docs_4 USING (id < 3);
+    CREATE POLICY other_rows ON rp_docs_4 USING (id = 3);
+    CREATE POLICY only_published ON rp_docs_4 AS RESTRICTIVE USING (published);
+    GRANT SELECT ON rp_docs_4 TO rp_alice_4;
+    SET ROLE rp_alice_4;
+    SELECT id FROM rp_docs_4 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test restrictive-policy-alone-shows-no-rows {
+    CREATE ROLE rp_alice_5;
+    CREATE TABLE rp_docs_5 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_5 VALUES (1);
+    ALTER TABLE rp_docs_5 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_5 AS RESTRICTIVE USING (true);
+    GRANT SELECT ON rp_docs_5 TO rp_alice_5;
+    SET ROLE rp_alice_5;
+    SELECT count(*) FROM rp_docs_5;
+}
+expect {
+    0
+}
+
+test policies-for-other-commands-show-no-rows {
+    CREATE ROLE rp_alice_6;
+    CREATE TABLE rp_docs_6 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_6 VALUES (1);
+    ALTER TABLE rp_docs_6 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY ins ON rp_docs_6 FOR INSERT WITH CHECK (true);
+    CREATE POLICY upd ON rp_docs_6 FOR UPDATE USING (true) WITH CHECK (true);
+    CREATE POLICY del ON rp_docs_6 FOR DELETE USING (true);
+    GRANT SELECT ON rp_docs_6 TO rp_alice_6;
+    SET ROLE rp_alice_6;
+    SELECT count(*) FROM rp_docs_6;
+}
+expect {
+    0
+}
+
+test drop-policy-hides-the-rows-again {
+    CREATE ROLE rp_alice_7;
+    CREATE TABLE rp_docs_7 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_7 VALUES (1);
+    ALTER TABLE rp_docs_7 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_7 USING (true);
+    GRANT SELECT ON rp_docs_7 TO rp_alice_7;
+    SET ROLE rp_alice_7;
+    SELECT count(*) FROM rp_docs_7;
+    RESET ROLE;
+    DROP POLICY everything ON rp_docs_7;
+    SET ROLE rp_alice_7;
+    SELECT count(*) FROM rp_docs_7;
+}
+expect {
+    1
+    0
+}
+
+test policy-uses-columns-of-a-renamed-table {
+    CREATE ROLE rp_alice_12;
+    CREATE TABLE rp_docs_12 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_12 VALUES (1, 'rp_alice_12'), (2, 'someone else');
+    ALTER TABLE rp_docs_12 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_12 USING (rp_docs_12.owner = current_user);
+    ALTER TABLE rp_docs_12 RENAME TO rp_renamed_12;
+    GRANT SELECT ON rp_renamed_12 TO rp_alice_12;
+    SET ROLE rp_alice_12;
+    SELECT id FROM rp_renamed_12;
+}
+expect {
+    1
+}
+
+test policy-uses-columns-named-with-schema-and-table {
+    CREATE ROLE rp_alice_qualified;
+    CREATE TABLE rp_docs_qualified (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_qualified VALUES (1, 'rp_alice_qualified'), (2, 'someone else');
+    ALTER TABLE rp_docs_qualified ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_qualified
+        USING (public.rp_docs_qualified.owner = current_user);
+    GRANT SELECT ON rp_docs_qualified TO rp_alice_qualified;
+    SET ROLE rp_alice_qualified;
+    SELECT id FROM rp_docs_qualified;
+}
+expect {
+    1
+}
+
+test policy-to-current-user {
+    CREATE ROLE rp_alice_14;
+    CREATE TABLE rp_docs_14 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_14 VALUES (1);
+    ALTER TABLE rp_docs_14 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON rp_docs_14 TO rp_alice_14;
+    SET ROLE rp_alice_14;
+    SELECT count(*) FROM rp_docs_14;
+    RESET ROLE;
+    ALTER TABLE rp_docs_14 OWNER TO rp_alice_14;
+    SET ROLE rp_alice_14;
+    CREATE POLICY mine ON rp_docs_14 TO CURRENT_USER USING (true);
+    RESET ROLE;
+    ALTER TABLE rp_docs_14 OWNER TO postgres;
+    GRANT SELECT ON rp_docs_14 TO rp_alice_14;
+    SET ROLE rp_alice_14;
+    SELECT count(*) FROM rp_docs_14;
+}
+expect {
+    0
+    1
+}
+
+test policy-to-public-applies-to-every-role {
+    CREATE ROLE po_public_alice;
+    CREATE ROLE po_public_bob;
+    CREATE TABLE po_public_docs (id INT PRIMARY KEY);
+    INSERT INTO po_public_docs VALUES (1), (2);
+    ALTER TABLE po_public_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_public_docs TO PUBLIC USING (true);
+    GRANT SELECT ON po_public_docs TO po_public_alice, po_public_bob;
+    SET ROLE po_public_alice;
+    SELECT count(*) FROM po_public_docs;
+    SET ROLE po_public_bob;
+    SELECT count(*) FROM po_public_docs;
+}
+expect {
+    2
+    2
+}
+
+test policy-to-several-roles-applies-to-each-of-them {
+    CREATE ROLE po_several_alice;
+    CREATE ROLE po_several_bob;
+    CREATE ROLE po_several_carol;
+    CREATE TABLE po_several_docs (id INT PRIMARY KEY);
+    INSERT INTO po_several_docs VALUES (1), (2);
+    ALTER TABLE po_several_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_several_docs TO po_several_alice, po_several_bob USING (true);
+    GRANT SELECT ON po_several_docs TO po_several_alice, po_several_bob, po_several_carol;
+    SET ROLE po_several_alice;
+    SELECT count(*) FROM po_several_docs;
+    SET ROLE po_several_bob;
+    SELECT count(*) FROM po_several_docs;
+    SET ROLE po_several_carol;
+    SELECT count(*) FROM po_several_docs;
+}
+expect {
+    2
+    2
+    0
+}
+
+# The superuser creates the policies below, so SESSION_USER and CURRENT_ROLE
+# name the superuser, and the policy does not apply to other roles.
+test policy-to-session-user-applies-to-the-session-role-only {
+    CREATE ROLE po_session_alice;
+    CREATE TABLE po_session_docs (id INT PRIMARY KEY);
+    INSERT INTO po_session_docs VALUES (1), (2);
+    ALTER TABLE po_session_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_session_docs TO SESSION_USER USING (true);
+    GRANT SELECT ON po_session_docs TO po_session_alice;
+    SET ROLE po_session_alice;
+    SELECT count(*) FROM po_session_docs;
+}
+expect {
+    0
+}
+
+test policy-to-current-role-applies-to-the-current-role-only {
+    CREATE ROLE po_current_alice;
+    CREATE TABLE po_current_docs (id INT PRIMARY KEY);
+    INSERT INTO po_current_docs VALUES (1), (2);
+    ALTER TABLE po_current_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON po_current_docs TO CURRENT_ROLE USING (true);
+    GRANT SELECT ON po_current_docs TO po_current_alice;
+    SET ROLE po_current_alice;
+    SELECT count(*) FROM po_current_docs;
+}
+expect {
+    0
+}
+
+test policy-uses-a-stored-generated-column {
+    CREATE ROLE po_generated_alice;
+    CREATE TABLE po_generated_docs (id INT PRIMARY KEY, owner TEXT, lower_owner TEXT GENERATED ALWAYS AS (lower(owner)) STORED);
+    INSERT INTO po_generated_docs (id, owner) VALUES (1, 'PO_GENERATED_ALICE'), (2, 'someone else');
+    ALTER TABLE po_generated_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON po_generated_docs USING (lower_owner = current_user);
+    GRANT SELECT ON po_generated_docs TO po_generated_alice;
+    SET ROLE po_generated_alice;
+    SELECT id FROM po_generated_docs;
+}
+expect {
+    1
+}
+
+test role-that-does-not-own-the-table-cannot-create-a-policy {
+    CREATE ROLE rp_alice_15;
+    CREATE TABLE rp_docs_15 (id INT PRIMARY KEY);
+    SET ROLE rp_alice_15;
+    CREATE POLICY everything ON rp_docs_15 USING (true);
+}
+expect error {
+    must be owner of table rp_docs_15
+}
+
+test role-that-does-not-own-the-table-cannot-drop-a-policy {
+    CREATE ROLE rp_alice_16;
+    CREATE TABLE rp_docs_16 (id INT PRIMARY KEY);
+    CREATE POLICY everything ON rp_docs_16 USING (true);
+    SET ROLE rp_alice_16;
+    DROP POLICY everything ON rp_docs_16;
+}
+# PostgreSQL names the table a relation here.
+expect error {
+    must be owner of
+}
+
+test policy-name-must-be-unique-per-table {
+    CREATE TABLE rp_docs_18 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_18 USING (true);
+    CREATE POLICY p ON rp_docs_18 USING (false);
+}
+@sqlstate 42710
+expect error {
+    policy "p" for table "rp_docs_18" already exists
+}
+
+test drop-of-missing-policy-fails {
+    CREATE TABLE rp_docs_19 (id INT PRIMARY KEY);
+    DROP POLICY p ON rp_docs_19;
+}
+@sqlstate 42704
+expect error {
+    policy "p" for table "rp_docs_19" does not exist
+}
+
+test policy-names-that-differ-only-in-case-are-different-policies {
+    CREATE TABLE rp_docs_case (id INT PRIMARY KEY);
+    CREATE POLICY "Own" ON rp_docs_case USING (true);
+    CREATE POLICY own ON rp_docs_case USING (true);
+    DROP POLICY own ON rp_docs_case;
+    DROP POLICY "Own" ON rp_docs_case;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-of-a-quoted-policy-name-needs-its-case {
+    CREATE TABLE rp_docs_quoted (id INT PRIMARY KEY);
+    CREATE POLICY "Own" ON rp_docs_quoted USING (true);
+    DROP POLICY own ON rp_docs_quoted;
+}
+@sqlstate 42704
+expect error {
+    policy "own" for table "rp_docs_quoted" does not exist
+}
+
+test drop-policy-if-exists-skips-missing-policy-and-table {
+    CREATE TABLE rp_docs_20 (id INT PRIMARY KEY);
+    DROP POLICY IF EXISTS p ON rp_docs_20;
+    DROP POLICY IF EXISTS p ON rp_missing_20;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@skip-if postgres "PostgreSQL accepts CASCADE"
+test drop-policy-cascade-is-not-supported {
+    CREATE TABLE po_cascade_docs (id INT PRIMARY KEY);
+    CREATE POLICY everything ON po_cascade_docs USING (true);
+    DROP POLICY everything ON po_cascade_docs CASCADE;
+}
+@sqlstate 0A000
+expect error {
+    DROP POLICY ... CASCADE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER POLICY"
+test alter-policy-is-not-supported {
+    CREATE TABLE un_policy_docs (id INT PRIMARY KEY);
+    CREATE POLICY everything ON un_policy_docs USING (true);
+    ALTER POLICY everything ON un_policy_docs USING (false);
+}
+@sqlstate 0A000
+expect error {
+    ALTER POLICY is not supported
+}
+
+test policy-on-a-view-is-rejected {
+    CREATE TABLE rp_docs_21 (id INT PRIMARY KEY);
+    CREATE VIEW rp_view_21 AS SELECT id FROM rp_docs_21;
+    CREATE POLICY p ON rp_view_21 USING (true);
+}
+@sqlstate 42809
+expect error {
+    "rp_view_21" is not a table
+}
+
+test policy-with-aggregate-is-rejected {
+    CREATE TABLE rp_docs_24 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_24 USING (count(*) > 0);
+}
+@sqlstate 42803
+expect error {
+    aggregate functions are not allowed in policy expressions
+}
+
+test policy-with-unknown-column-is-rejected {
+    CREATE TABLE rp_docs_25 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_25 USING (missing = 1);
+}
+@sqlstate 42703
+expect error {
+    column "missing" does not exist
+}
+
+test policy-of-a-missing-table-is-rejected {
+    CREATE POLICY p ON rp_missing_26 USING (true);
+}
+@sqlstate 42P01
+expect error {
+    relation "rp_missing_26" does not exist
+}
+
+test with-check-on-select-policy-is-rejected {
+    CREATE TABLE rp_docs_27 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_27 FOR SELECT WITH CHECK (true);
+}
+@sqlstate 42601
+expect error {
+    WITH CHECK cannot be applied to SELECT or DELETE
+}
+
+test using-on-insert-policy-is-rejected {
+    CREATE TABLE rp_docs_28 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_28 FOR INSERT USING (true);
+}
+@sqlstate 42601
+expect error {
+    only WITH CHECK expression allowed for INSERT
+}
+
+@skip-if postgres "PostgreSQL renames the column in the policy too"
+test rename-of-column-a-policy-uses-is-rejected {
+    CREATE TABLE rp_docs_29 (id INT PRIMARY KEY, owner TEXT);
+    CREATE POLICY own ON rp_docs_29 USING (owner = current_user);
+    ALTER TABLE rp_docs_29 RENAME COLUMN owner TO author;
+}
+@sqlstate 2BP01
+expect error {
+    cannot change column "owner" of table "rp_docs_29" because policy "own" uses it
+}
+
+test drop-of-column-a-policy-uses-is-rejected {
+    CREATE TABLE rp_docs_30 (id INT PRIMARY KEY, owner TEXT);
+    CREATE POLICY own ON rp_docs_30 USING (owner = current_user);
+    ALTER TABLE rp_docs_30 DROP COLUMN owner;
+}
+@sqlstate 2BP01
+expect error {}
+
+test drop-table-drops-its-policies {
+    CREATE ROLE rp_alice_31;
+    CREATE TABLE rp_docs_31 (id INT PRIMARY KEY);
+    ALTER TABLE rp_docs_31 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_docs_31 USING (true);
+    DROP TABLE rp_docs_31;
+    CREATE TABLE rp_docs_31 (id INT PRIMARY KEY);
+    INSERT INTO rp_docs_31 VALUES (1);
+    ALTER TABLE rp_docs_31 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON rp_docs_31 TO rp_alice_31;
+    SET ROLE rp_alice_31;
+    SELECT count(*) FROM rp_docs_31;
+}
+expect {
+    0
+}
+
+@skip-if postgres "PostgreSQL stores conditions of any depth"
+test policy-too-deep-to-store-is-rejected {
+    CREATE TABLE rp_docs_33 (id INT PRIMARY KEY);
+    CREATE POLICY many ON rp_docs_33 USING (id = 100 OR id = 101 OR id = 102 OR id = 103 OR id = 104 OR id = 105 OR id = 106 OR id = 107 OR id = 108 OR id = 109 OR id = 110 OR id = 111 OR id = 112 OR id = 113 OR id = 114 OR id = 115 OR id = 116 OR id = 117 OR id = 118 OR id = 119 OR id = 120 OR id = 121 OR id = 122 OR id = 123 OR id = 124 OR id = 125 OR id = 126 OR id = 127 OR id = 128 OR id = 129 OR id = 130 OR id = 131 OR id = 132 OR id = 133 OR id = 134 OR id = 135 OR id = 136 OR id = 137 OR id = 138 OR id = 139 OR id = 140 OR id = 141 OR id = 142 OR id = 143 OR id = 144 OR id = 145 OR id = 146 OR id = 147 OR id = 148 OR id = 149 OR id = 150 OR id = 151 OR id = 152 OR id = 153 OR id = 154 OR id = 155 OR id = 156 OR id = 157 OR id = 158 OR id = 159 OR id = 160 OR id = 161 OR id = 162 OR id = 163 OR id = 164 OR id = 165 OR id = 166 OR id = 167 OR id = 168 OR id = 169 OR id = 170 OR id = 171 OR id = 172 OR id = 173 OR id = 174 OR id = 175 OR id = 176 OR id = 177 OR id = 178 OR id = 179 OR id = 180 OR id = 181 OR id = 182 OR id = 183 OR id = 184 OR id = 185 OR id = 186 OR id = 187 OR id = 188 OR id = 189 OR id = 190 OR id = 191 OR id = 192 OR id = 193 OR id = 194 OR id = 195 OR id = 196 OR id = 197 OR id = 198);
+}
+expect error {
+    the conditions of policy "many" cannot be stored
+}
+
+test policy-on-column-named-true {
+    CREATE ROLE rp_alice_34;
+    CREATE TABLE rp_docs_34 (id INT PRIMARY KEY, "true" BOOLEAN);
+    INSERT INTO rp_docs_34 VALUES (1, true), (2, false);
+    ALTER TABLE rp_docs_34 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY p ON rp_docs_34 USING ("true");
+    GRANT SELECT ON rp_docs_34 TO rp_alice_34;
+    SET ROLE rp_alice_34;
+    SELECT id FROM rp_docs_34;
+}
+expect {
+    1
+}
+
+test policy-with-parameter-is-rejected {
+    CREATE TABLE rp_docs_39 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_39 USING (id = $1);
+}
+@sqlstate 42P02
+expect error {
+    there is no parameter
+}
+
+test policy-with-unknown-function-is-rejected {
+    CREATE TABLE rp_docs_43 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_43 USING (rp_missing_43(id));
+}
+@sqlstate 42883
+expect error {}
+
+test policy-with-window-function-is-rejected {
+    CREATE TABLE rp_docs_44 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_44 USING (row_number() OVER () > 0);
+}
+@sqlstate 42P20
+expect error {
+    window functions are not allowed in policy expressions
+}
+
+@skip-if postgres "PostgreSQL supports subqueries with FROM in policies"
+test policy-with-subquery-that-reads-a-table-is-rejected {
+    CREATE TABLE rp_docs_45 (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_45 USING (id IN (SELECT id FROM rp_docs_45));
+}
+@sqlstate 0A000
+expect error {
+    subqueries in policies are not supported
+}
+
+@skip-if postgres "PostgreSQL renames the column in the policy too"
+test rename-of-column-a-policy-reads-in-a-subquery-is-rejected {
+    CREATE TABLE rp_docs_42 (id INT PRIMARY KEY, owner TEXT);
+    CREATE POLICY own ON rp_docs_42 USING ((SELECT owner) = current_user);
+    ALTER TABLE rp_docs_42 RENAME COLUMN owner TO author;
+}
+@sqlstate 2BP01
+expect error {
+    cannot change column "owner" of table "rp_docs_42" because policy "own" uses it
+}
+
+@skip-if postgres "PostgreSQL supports ALTER POLICY ... RENAME"
+test alter-policy-rename-is-not-supported {
+    CREATE TABLE rn_policy_docs (id INT PRIMARY KEY);
+    CREATE POLICY everything ON rn_policy_docs USING (true);
+    ALTER POLICY everything ON rn_policy_docs RENAME TO all_rows;
+}
+@sqlstate 0A000
+expect error {
+    ALTER POLICY ... RENAME is not supported
+}

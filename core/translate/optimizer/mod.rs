@@ -887,6 +887,9 @@ fn detect_simple_aggregate(
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
         || !plan.aggregates.first().unwrap().order_by().is_empty()
+        // The fast paths read the table without the loop that checks its
+        // row-level security filter.
+        || plan.table_references.joined_tables()[0].row_filter.is_some()
     {
         return Ok(None);
     }
@@ -2726,7 +2729,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: true,
+        allow_automatic_index: resolver.automatic_index,
         resolver,
     };
 
