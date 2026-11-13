@@ -125,8 +125,14 @@ pub fn str_to_integer_checked(
         _ => (10, input),
     };
 
-    if radix != 10 && clean.starts_with('_') {
-        clean = &clean[1..];
+    if radix != 10 {
+        if clean.starts_with(['+', '-']) {
+            return Err(i64::from_str_radix("_", radix).unwrap_err());
+        }
+
+        if clean.starts_with('_') {
+            clean = &clean[1..];
+        }
     }
 
     let invalid_underscore = clean.char_indices().any(|(i, ch)| {
