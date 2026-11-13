@@ -277,8 +277,9 @@ impl Dialect for PostgresDialect {
         crate::schema_state::apply_catalog_change(schema, change, values)
     }
 
+    /// The built-in superuser is found by its name, `postgres`, too.
     fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
-        schema_roles(schema).get_by_name(name).map(|role| role.id)
+        engine_role_by_name(schema_roles(schema), name)
     }
 
     fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
@@ -1013,6 +1014,15 @@ pub(crate) fn role_oid_by_name(roles: &RoleCatalog, name: &str) -> Option<i64> {
 pub(crate) enum PgRole {
     Engine(RoleId),
     DatabaseOwner,
+}
+
+/// The engine's role named `name`, the built-in superuser `postgres`
+/// included. `pg_database_owner` is not a role of the engine.
+pub(crate) fn engine_role_by_name(roles: &RoleCatalog, name: &str) -> Option<RoleId> {
+    match pg_role_by_name(roles, name)? {
+        PgRole::Engine(id) => Some(id),
+        PgRole::DatabaseOwner => None,
+    }
 }
 
 /// The role named `name` among those `pg_roles` lists.

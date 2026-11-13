@@ -488,3 +488,19 @@ test owner-alters-the-columns-of-its-own-table {
 expect {
     1
 }
+
+# ALTER ... OWNER TO needs the current role to be able to SET ROLE to the new
+# owner, which a member of the new owner can.
+test owner-may-give-its-table-to-a-role-it-is-a-member-of {
+    CREATE ROLE ro_member_owner;
+    CREATE TABLE ro_member_given (x INT);
+    ALTER TABLE ro_member_given OWNER TO ro_member_owner;
+    GRANT postgres TO ro_member_owner;
+    SET ROLE ro_member_owner;
+    ALTER TABLE ro_member_given OWNER TO postgres;
+    RESET ROLE;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_member_given';
+}
+expect {
+    postgres
+}

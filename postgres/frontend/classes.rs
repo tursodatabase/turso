@@ -47,14 +47,13 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_GRANT_OPERATION,
     SQLSTATE_UNDEFINED_OBJECT,
 };
-use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::auth_members::{
     AUTH_MEMBERS_TABLE_NAME, CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL,
     CREATE_AUTH_MEMBERS_TABLE_SQL,
 };
-use crate::catalog::{role_oid, role_oid_by_name};
+use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
 use crate::policies;
 use crate::roles::{
@@ -1122,10 +1121,7 @@ fn resolve_role(
     Ok(match role {
         ast::RoleSpec::CurrentRole => connection.current_role(),
         ast::RoleSpec::SessionUser => connection.session_role(),
-        ast::RoleSpec::Name(name) if name == BOOTSTRAP_SUPERUSER_NAME => RoleId::SUPERUSER,
-        ast::RoleSpec::Name(name) => schema_roles(schema)
-            .get_by_name(name)
-            .map(|role| role.id)
+        ast::RoleSpec::Name(name) => engine_role_by_name(schema_roles(schema), name)
             .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
     })
 }
