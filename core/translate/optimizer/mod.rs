@@ -11,7 +11,7 @@ use super::{
 };
 use crate::alloc::{TursoIteratorExt, TursoVecExt};
 use crate::schema::GeneratedType;
-use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::plan::{plan_is_correlated, BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic, Func},
@@ -968,7 +968,8 @@ struct TableAccessPlan {
 struct SubqueryPlanCache {
     // The original and changed forms copy the same child subqueries. Keep a
     // finished child plan so the next copy does not plan that child again.
-    from_clause: HashMap<TableInternalId, Plan>,
+    // The call count is part of the key: a plan made for N calls is wrong for M.
+    from_clause: HashMap<(TableInternalId, u64), Plan>,
     correlated: HashMap<(TableInternalId, u64), Plan>,
 }
 
@@ -1935,23 +1936,41 @@ fn optimize_subqueries(
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
+    // A correlated FROM-clause subquery runs on every call of this plan, so its
+    // join search must see the same call count. An uncorrelated one is
+    // materialized once and keeps a count of 1.
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0).max(1.0);
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            if let Some(cached) = cache.from_clause.remove(&table.internal_id) {
+            let calls = if calls > 1.0 && plan_is_correlated(&from_clause_subquery.plan) {
+                calls
+            } else {
+                1.0
+            };
+            let key = (table.internal_id, calls.to_bits());
+            if let Some(cached) = cache.from_clause.remove(&key) {
                 from_clause_subquery.plan = Box::new(cached);
                 continue;
             }
+            let set_calls = |select_plan: &mut SelectPlan| {
+                if calls > 1.0 {
+                    select_plan.input_cardinality_hint = Some(calls);
+                }
+            };
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
                 Plan::Select(select_plan) => {
+                    set_calls(select_plan);
                     optimize_select_plan_with_cache(select_plan, resolver, cache)?
                 }
                 Plan::CompoundSelect {
                     left, right_most, ..
                 } => {
+                    set_calls(right_most);
                     optimize_select_plan_with_cache(right_most, resolver, cache)?;
                     for (select_plan, _) in left {
+                        set_calls(select_plan);
                         optimize_select_plan_with_cache(select_plan, resolver, cache)?;
                     }
                 }
@@ -1978,10 +1997,9 @@ fn optimize_subqueries(
                 }
             }
             if save_plans {
-                cache.from_clause.insert(
-                    table.internal_id,
-                    from_clause_subquery.plan.as_ref().clone(),
-                );
+                cache
+                    .from_clause
+                    .insert(key, from_clause_subquery.plan.as_ref().clone());
             }
         }
     }
@@ -2278,7 +2296,7 @@ fn base_row_estimate(
         }
         Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
             Plan::Select(plan) => {
-                if let Some(rows) = plan.estimated_output_rows {
+                if let Some(rows) = rows_per_call(plan) {
                     return RowCountEstimate::AnalyzeStats(rows.max(1.0));
                 }
                 RowCountEstimate::hardcoded_fallback(params)
@@ -2291,9 +2309,9 @@ fn base_row_estimate(
                 // represents: (A op1 B) op2 C
                 // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
                 let fallback = *RowCountEstimate::hardcoded_fallback(params);
-                let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
-                let mut combined = left.first().map_or(
-                    right_most.estimated_output_rows.unwrap_or(fallback),
+                let est = |p: &SelectPlan| rows_per_call(p).unwrap_or(fallback);
+                let mut combined = left.first().map_or_else(
+                    || rows_per_call(right_most).unwrap_or(fallback),
                     |(p, _)| est(p),
                 );
                 // The estimates to the right of each operator: left[1..].est, then right_most.est
@@ -2317,6 +2335,14 @@ fn base_row_estimate(
         },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
+}
+
+/// Rows one execution of `plan` returns. `estimated_output_rows` covers all
+/// executions of a plan made for several calls, but the plan that reads a
+/// FROM-clause subquery reads it once per call.
+fn rows_per_call(plan: &SelectPlan) -> Option<f64> {
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0).max(1.0);
+    plan.estimated_output_rows.map(|rows| rows / calls)
 }
 
 /// Read a group count from ANALYZE for a simple list of table columns.
