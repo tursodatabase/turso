@@ -62,6 +62,8 @@ module MvccPassiveCheckpoint {
   const Keys: Set[str]            // Row keys of one table.
   const Readers: Set[str]         // Reader connections.
   const MaxTs: int                // Bound on the logical clock (commits and reader begins).
+  const FixRefuseCheckpointOwner: bool
+  const Mode: str
   const FixRecollectUnstamped: bool
   const SplitLogTruncate: bool // The truncate decision and I/O finish in separate steps.
   const CheckpointFailures: bool // A pass can stop before it finishes.
@@ -141,9 +143,9 @@ module MvccPassiveCheckpoint {
                     mark: int }
   type WalFrame = { w: str -> int, meta: int }
   type Cand = { k: str, s: int }
-  type CkState = { pc: str, snap: int, old: int, todo: Set[str], wset: str -> int,
+  type CkState = { pc: str, owner: str, snap: int, old: int, todo: Set[str], wset: str -> int,
                    frame: int, full: int, cand: Set[Cand], clearOk: bool, truncate: bool, completed: bool, seen: Set[str] }
-  type RdState = { pc: str, mark: int, b: int, key: str, vis1: int, valid1: bool,
+  type RdState = { pc: str, pinned: bool, mark: int, b: int, key: str, vis1: int, valid1: bool,
                    deps1: Set[int] }
   type ErrRec = { reader: str, key: str, begin: int, mark: int, got: Set[int],
                   want: int, deps: Set[int] }
@@ -230,7 +232,7 @@ module MvccPassiveCheckpoint {
     if (FramesWith(k, 1, m) == Set()) db.get(k)
     else Frame(Max(FramesWith(k, 1, m))).w.get(k)
 
-  val Pinned: Set[str] = Readers.filter(r => rd.get(r).pc != "idle")
+  val Pinned: Set[str] = Readers.filter(r => rd.get(r).pinned)
   val Registered: Set[str] = Readers.filter(r => Set("active", "reading").contains(rd.get(r).pc))
 
   // CHOOSE k \in Keys : TRUE
@@ -251,10 +253,10 @@ module MvccPassiveCheckpoint {
     dbMeta' = 0,
     durable' = 0,
     backfillFloor' = 0,
-    ck' = { pc: "idle", snap: 0, old: 0, todo: Set(), wset: EmptyFn, frame: 0,
+    ck' = { pc: "idle", owner: "", snap: 0, old: 0, todo: Set(), wset: EmptyFn, frame: 0,
             full: 0, cand: Set(), clearOk: false, truncate: false, completed: false, seen: Set() },
     nCk' = 0,
-    rd' = Readers.mapBy(r => { pc: "idle", mark: 0, b: 0, key: AnyKey, vis1: None,
+    rd' = Readers.mapBy(r => { pc: "idle", pinned: false, mark: 0, b: 0, key: AnyKey, vis1: None,
                                valid1: false, deps1: Set() }),
     writes' = Set(),
     logged' = Set(),
@@ -437,7 +439,7 @@ module MvccPassiveCheckpoint {
   // holds its WAL read mark for a while before it is in txs.
   action ReaderPin(r: str): bool = all {
     rd.get(r).pc == "idle",
-    rd' = rd.setBy(r, x => { ...x, pc: "pinned", mark: wal.length() }),
+    rd' = rd.setBy(r, x => { ...x, pc: "pinned", pinned: true, mark: wal.length() }),
     UnchangedForReaders, err' = err,
     UnchangedRowVars,
   }
@@ -504,7 +506,7 @@ module MvccPassiveCheckpoint {
 
   action ReaderEnd(r: str): bool = all {
     Set("pinned", "active").contains(rd.get(r).pc),
-    rd' = rd.setBy(r, x => { ...x, pc: "idle" }),
+    rd' = rd.setBy(r, x => { ...x, pc: "idle", pinned: false }),
     UnchangedForReaders, err' = err,
     UnchangedRowVars,
   }
@@ -524,16 +526,22 @@ module MvccPassiveCheckpoint {
     writes' = writes, logged' = logged, err' = err,
   }
 
-  action CheckpointStart: bool = all {
-    ck.pc == "idle",
-    nCk < MaxCheckpoints,
-    ck' = { pc: "collect", snap: SnapshotTs, old: durable, todo: Keys, wset: EmptyFn,
-            frame: 0, full: if (DirtyKeys) fullGen else 0, cand: Set(), clearOk: false, truncate: false, completed: false, seen: ck.seen },
-    nCk' = nCk + 1,
-    chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
-    dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor,
-    UnchangedForCheckpoint,
-    UnchangedRowVars,
+  action CheckpointStart: bool = {
+    nondet owner = (if (CheckpointOnReaderConnection == "none") Set("")
+                    else Readers.filter(r => rd.get(r).pc == "active").union(Set(""))).oneOf()
+    all {
+      (FixRefuseCheckpointOwner and owner != "") implies
+        not(Pinned.union(Registered).contains(owner)),
+      ck.pc == "idle",
+      nCk < MaxCheckpoints,
+      ck' = { pc: "collect", owner: owner, snap: SnapshotTs, old: durable, todo: Keys, wset: EmptyFn,
+              frame: 0, full: if (DirtyKeys) fullGen else 0, cand: Set(), clearOk: false, truncate: false, completed: false, seen: ck.seen },
+      nCk' = nCk + 1,
+      chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
+      dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor,
+      UnchangedForCheckpoint,
+      UnchangedRowVars,
+    }
   }
 
   // The key changed in (old, snap]: some resolved begin or end is in that range.
@@ -594,13 +602,28 @@ module MvccPassiveCheckpoint {
       ck' = { ...ck, pc: "committed", frame: if (write) wal.length() + 1 else 0 },
       chain' = chain, llog' = llog, nBackfill' = nBackfill, db' = db, dbMeta' = dbMeta,
       durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
-      UnchangedForCheckpoint,
+      clock' = clock, inflight' = inflight, lastCommitted' = lastCommitted,
+      rd' = if (ck.owner == "") rd else rd.setBy(ck.owner, x =>
+        { ...x, pinned: false,
+          mark: if (CheckpointOnReaderConnection == "movesMark") wal.length() + (if (write) 1 else 0)
+                else x.mark }),
+      writes' = writes, logged' = logged, err' = err,
       UnchangedRowVars,
     }
   }
 
   action CheckpointPublish: bool = all {
     ck.pc == "committed",
+    durable' = if (Mode == "truncateFlagOn") durable else Max(Set(ck.old, ck.snap)),
+    ck' = { ...ck, pc: if (Mode == "truncateFlagOn") "publishing" else "published" },
+    chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
+    dbMeta' = dbMeta, backfillFloor' = backfillFloor, nCk' = nCk,
+    UnchangedForCheckpoint,
+    UnchangedRowVars,
+  }
+
+  action CheckpointPublishBoundary: bool = all {
+    ck.pc == "publishing",
     durable' = Max(Set(ck.old, ck.snap)),
     ck' = { ...ck, pc: "published" },
     chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
@@ -612,13 +635,13 @@ module MvccPassiveCheckpoint {
   // PASSIVE WAL checkpoint: copy frames into the database file, but never past
   // a frame that a pinned reader does not see. Busy is the case upTo = nBackfill.
   action CheckpointBackfill: bool = {
-    nondet own = (if (CheckpointOnReaderConnection != "none") Pinned.union(Set("")) else Set("")).oneOf()
-    val marks = Pinned.exclude(Set(own)).map(r => rd.get(r).mark)
+    val marks = Pinned.map(r => rd.get(r).mark)
                   .union(if (WritersPinMarks) inflight.map(i => i.mark) else Set())
     val limit = if (GuardBackfillStopsAtReaders) Min(marks.union(Set(wal.length())))
                 else wal.length()
     all {
       ck.pc == "published",
+      Mode == "truncateFlagOn" implies Pinned == Set(),
       // \E to \in nBackfill..limit is false when the range is empty. "to" is
       // a built-in name in Quint, so the pick is named upTo.
       nBackfill <= limit,
@@ -634,8 +657,7 @@ module MvccPassiveCheckpoint {
       chain' = chain, llog' = llog, wal' = wal, durable' = durable,
       backfillFloor' = backfillFloor, nCk' = nCk,
       clock' = clock, inflight' = inflight, lastCommitted' = lastCommitted,
-      rd' = if (own == "" or CheckpointOnReaderConnection == "keepsMark") rd
-            else rd.setBy(own, x => { ...x, mark: wal.length() }),
+      rd' = rd,
       writes' = writes, logged' = logged, err' = err,
       UnchangedRowVars,
     }
@@ -734,7 +756,7 @@ module MvccPassiveCheckpoint {
   }
 
   action CheckpointFail(at: str): bool = all {
-    CheckpointFailures,
+    CheckpointFailures or (Mode == "truncateFlagOn" and at == "published" and Pinned != Set()),
     ck.pc == at,
     ck' = { ...ck, pc: "idle", completed: false,
       seen: if (at == "published" and ck.frame > 0 and ck.wset.keys() != Set()
@@ -743,7 +765,9 @@ module MvccPassiveCheckpoint {
               ck.seen.union(Set("failedPublished")) else ck.seen },
     chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
     dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
-    UnchangedForCheckpoint,
+    clock' = clock, inflight' = inflight, lastCommitted' = lastCommitted,
+    rd' = if (ck.owner == "") rd else rd.setBy(ck.owner, x => { ...x, pinned: false }),
+    writes' = writes, logged' = logged, err' = err,
     UnchangedRowVars,
   }
 
@@ -864,13 +888,14 @@ module MvccPassiveCheckpoint {
         ReaderEnd(r),
       },
     },
-    nondet at = Set("collect", "committed", "published", "backfilled", "truncateDecided", "truncated", "prune", "clear").oneOf()
+    nondet at = Set("collect", "committed", "publishing", "published", "backfilled", "truncateDecided", "truncated", "prune", "clear").oneOf()
     CheckpointFail(at),
     CheckpointStart,
     nondet k = Keys.oneOf()
     CheckpointCollect(k),
     CheckpointCommit,
     CheckpointPublish,
+    CheckpointPublishBoundary,
     CheckpointBackfill,
     CheckpointTruncateDecide,
     CheckpointTruncateApply,
@@ -937,7 +962,7 @@ module MvccPassiveCheckpoint {
 
   // GC never drops a version stamped above the read mark of a pinned reader.
   val GcKeepsVersionsAboveReaders: bool =
-    Keys.forall(k => Pinned.forall(r =>
+    Keys.forall(k => Pinned.union(Registered).forall(r =>
       chain.get(k).exclude(GcChain(k, Lwm, GcFloor)).forall(v => v.mat <= rd.get(r).mark)))
 
   val TypeOK: bool = and {
