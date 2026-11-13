@@ -4,10 +4,12 @@ This file lists each MVCC mechanism in the code, the checkpoint modes where it
 runs, and whether a spec in this folder models it. It also sorts each
 mechanism into design (a guarantee needs it), optimization (the same result
 with less work or memory), or dead (it runs in a mode where nothing needs it).
-It comes from a read of the code. No test ran for it, so every bug lead below
-is not verified until a test shows it.
+The mechanism table comes from a source read. The checkpoint-stop section below
+gives later model results and supplied Rust probe results. Other bug leads
+remain not verified.
 
-Line numbers are from main at commit 719fcc411. Short names in this file:
+The mechanism table uses code at commit 719fcc411. The checkpoint-stop section
+uses the requested base, 3a95ac963. Short names in this file:
 
 - `mod.rs` is `core/mvcc/database/mod.rs`.
 - `csm.rs` is `core/mvcc/database/checkpoint_state_machine.rs`.
@@ -27,9 +29,11 @@ The second is the `CheckpointMode` of one checkpoint. Together they give three m
 | T (flag on, TRUNCATE) | on | Truncate | `PRAGMA wal_checkpoint(TRUNCATE)` (vdbe/execute.rs:593, connection.rs:2605), journal mode change (vdbe/execute.rs:18792) |
 
 The code gates some paths on the flag and others on the checkpoint mode or on
-"blocking lock held". Mode T gets a mix of both. The specs model P. The sequence
-spec also has a mode "blocking", which matches B for locks but uses the P GC rules.
-No spec models T.
+"blocking lock held". Mode T gets a mix of both.
+The row and sequence specs model P and T. The sequence spec also has a mode
+"blocking", which matches B for locks but uses the P GC rules
+(`MvccPassiveSequence.qnt:80`). The T mode uses `Mode = "truncateFlagOn"`.
+The checkpoint-stop section gives its results and limits.
 
 What the blocking lock gives in each mode:
 
@@ -77,7 +81,7 @@ means that it runs in B but nothing in B needs it.
 
 | Mechanism | Code | Modes (gate) | Modeled? | Kind |
 |---|---|---|---|---|
-| Lifetime read guard on the blocking lock | mod.rs:6410-6420, mod.rs:6729, release mod.rs:6862 | B only (gate: flag off) | Sequence spec `TxBegin` waits while a blocking checkpoint runs (MvccPassiveSequence.qnt:245) | Design for B |
+| Lifetime read guard on the blocking lock | mod.rs:6410-6420, mod.rs:6729, release mod.rs:6862 | B only (gate: flag off) | Sequence spec `TxBegin` waits while a blocking checkpoint runs (MvccPassiveSequence.qnt:246) | Design for B |
 | Read mark taken before the clock lock | mod.rs:6757 | B, P, T | Row spec `ReaderPin`, `ReaderBegin`. Schema spec S21 | Design |
 | `schema_generation` check at begin | mod.rs:6768. Bump at csm.rs:2147 | B, P, T (no gate on the check or the bump) | Schema spec S10 (`noGenerationGate`: not needed) | Not needed in the model |
 | `schema_still_valid_for_tx` | mod.rs:7978 | P, T (gate: flag) | Schema spec S10 | Not needed in the model |
@@ -107,7 +111,7 @@ means that it runs in B but nothing in B needs it.
 | Debug check that every changed key is dirty | csm.rs:1763, csm.rs:1787 | B, P, T (debug) | `CollectsEveryChange` | Check |
 | `persistent_tx_ts_max` row in the same frame | `maybe_stage_mvcc_metadata_write` csm.rs:2423, staged at csm.rs:2632-2633 | B, P, T | Row spec `CheckpointCommit`, `RecoveryCorrect` | Design |
 | Write rows, `written_table_rowids` | csm.rs:2400-2411 | B, P, T | Not modeled (DESIGN-rows: schema cases) | Design |
-| `CompactSequences` | csm.rs:3208-3239, driver csm.rs:705-725, `pending_sequence_compactions` csm.rs:792 (skips CYCLE at csm.rs:817) | P records deletes. B and T delete inline and purge the chain (`purge_row_versions_during_checkpoint` mod.rs:8988). Gate: `CheckpointMode::Passive` (csm.rs:3224), not the flag | Sequence spec `CheckpointCompact` (`Mode` passive or blocking). T not modeled | Design (bounds the backing table) |
+| `CompactSequences` | csm.rs:3208-3239, driver csm.rs:705-725, `pending_sequence_compactions` csm.rs:792 (skips CYCLE at csm.rs:817) | P records deletes. B and T delete inline and purge the chain (`purge_row_versions_during_checkpoint` mod.rs:8988). Gate: `CheckpointMode::Passive` (csm.rs:3224), not the flag | Sequence spec `CheckpointCompact`, including mode T (see checkpoint-stop section) | Design (bounds the backing table) |
 | `CommitPagerTxn`, header stage | csm.rs:3241-3295 | B, P, T. T takes the lock here (csm.rs:3246-3252) | Row spec `CheckpointCommit`, schema spec issue11499 | Design |
 | Publish window | `apply_checkpoint_publish_window` csm.rs:2154-2205 | P: under the clock lock (`apply_passive_publish_window_ordered` csm.rs:2208). B and T: under the blocking lock (csm.rs:3313-3320), no clock lock | Row spec `CheckpointPublish`, schema spec `CheckpointPublish` | Design |
 | Publish drain bit | `checkpoint_publish_in_progress`, mod.rs:7957-7968, csm.rs:3298-3309 | P (gate: mode) | Not modeled | Dead (not verified). Only checkpoints CAS it, and `checkpoint_in_progress` already allows one checkpoint. No `begin_tx` reads it (rg finds only mod.rs:4442, mod.rs:4655, mod.rs:7959, mod.rs:7966), so the comment at csm.rs:2211-2212 is wrong. The busy retry at csm.rs:3300-3309 cannot fire |
@@ -117,7 +121,7 @@ means that it runs in B but nothing in B needs it.
 | `durable_txid_max` store | csm.rs:2186-2188 and again csm.rs:3481-3483 | B, P, T | Row spec `CheckpointPublish` | Design. The second store writes the same value |
 | `CheckpointWal` | csm.rs:3373-3397 | B, P, T. `Busy` goes on only in P (gate: mode) | Row spec `CheckpointBackfill` | Design |
 | `SyncDbFile`, publish `nBackfill` | csm.rs:3399-3438, csm.rs:1960 (a mode that restarts the log skips it) | B, P, T | Row spec `CheckpointBackfill` | Design |
-| `TruncateLogicalLog` | csm.rs:1919-1944, `LogicalLog::truncate` core/mvcc/persistent_storage/logical_log.rs:1083-1095 | B: whole log, asserted (csm.rs:3326-3338). P and T: if one record is above the boundary, keep all. Gate: `clears_whole_logical_log` csm.rs:1942, true for Truncate mode with the flag off | Row spec `CheckpointTruncateLog` | Design |
+| `TruncateLogicalLog` | csm.rs:1919-1944, `LogicalLog::truncate` core/mvcc/persistent_storage/logical_log.rs:1083-1095 | B: whole log, asserted (csm.rs:3326-3338). P and T: if one record is above the boundary, keep all. Gate: `clears_whole_logical_log` csm.rs:1942, true for Truncate mode with the flag off | Row spec `CheckpointTruncateDecide` and `CheckpointTruncateApply` (see checkpoint-stop section) | Design |
 | `TruncateWal` (WAL restart) | csm.rs:3440-3470 | B, T (gate `should_restart_log`) | Not modeled | Design for B |
 | Set `backfill_floor` | csm.rs:3484-3489 | B, P, T (no gate) | Row spec `CheckpointBackfill`, `GcFloor` | Design for P (R5). Dead in B |
 | `gc_rootpage_entries(lwm)` | csm.rs:3490-3491, mod.rs:4870 | B, P, T | Schema spec S5 | Design for P |
@@ -137,7 +141,7 @@ means that it runs in B but nothing in B needs it.
 | Rule 2, B form (`e > ckpt_max` and `in_btree or no current`) | mod.rs:8610-8619 | B (gate: flag off) | Not modeled | Design for B |
 | Rule 3 (last current, idle only) | mod.rs:8623-8640. B also needs `b <= ckpt_max` (mod.rs:8633) | B, P, T. Gates: `lwm == MAX`, `materialized_for_readers` | Row spec `GuardDropCurrentOnlyWhenIdle`, R3 | Design (memory) |
 | `gc_chain_now` checks `lwm == MAX` again | mod.rs:8154-8170 | B, P, T | Row spec `GuardGcRechecksIdleLwm` | Design |
-| `compute_min_reader_mark` in the floor | mod.rs:10718, used mod.rs:8251, mod.rs:8376-8378, mod.rs:8454-8457, mod.rs:8494-8497 | B, P, T | Row spec `GcFloorRule` | Optimization at most. DESIGN.md finding 1: it never lowers the floor |
+| `compute_min_reader_mark` in the floor | mod.rs:10718, used mod.rs:8251, mod.rs:8376-8378, mod.rs:8454-8457, mod.rs:8494-8497 | B, P, T | Row spec `GcFloorRule` | Optimization at most. The owner model can lower the floor after its pager pin disappears (`MvccPassiveCheckpoint.qnt:1078`). A wrong read without this term is not verified |
 | Pinned pager read marks in the floor | `gc_floor_reader_mark` csm.rs:2237-2250 | Checkpoint GC in B, P, T. Not in `gc_incremental` | Row spec `floorPinned` | Design option |
 | `prune_finalized_tx_states` | mod.rs:8542, only from `drop_unused_row_versions_inner` mod.rs:8434 | B, P, T (only in a full sweep) | Not modeled | Design |
 | Empty slot unlink, writer retry | mod.rs:8296, mod.rs:8380, mod.rs:8478, mod.rs:8517. Retry in `insert_version` mod.rs:8727-8752 | B, P, T (P keeps slots until `Finalize`) | Not modeled | Optimization (memory) |
@@ -209,9 +213,9 @@ mark), not the lock.
 
 ## 3. Gaps in the model, ranked by risk
 
-1. Mode T (flag on, explicit TRUNCATE) is not modeled, and the code mixes the B and P paths. `CompactSequences` deletes inline and purges chains (csm.rs:3224, mod.rs:8988) before T takes any lock (csm.rs:3246), while readers and writers are live. That is the `noDeferDeletes` bug of the sequence spec (rule S2), and a `setval` version can be purged too. Not verified with a test.
-2. Mode B GC rules are not modeled. Three B paths change reads: Rule 2 B form (mod.rs:8610-8619), Rule 3 with `b <= ckpt_max` (mod.rs:8633), and the B-tree fall-through read (mod.rs:6070-6087, cursor.rs:1203). B is the default mode. The sequence spec states that both modes use the P rules (MvccPassiveSequence.qnt:51), which is false for flag off.
-3. Mode T publish runs without the clock lock (csm.rs:3313-3320) while `begin_tx` runs with no blocking lock. A begin can read the header, `schema_generation` and the root map half updated. The comment at mod.rs:6751-6756 assumes the clock lock or the read guard. Not verified.
+1. Mode T now appears in the row and sequence specs. The sequence model checks inline compaction and Busy before stamping. See the checkpoint-stop section for the result. WAL restart and the blocking final GC sweep remain outside these models (`MvccPassiveSequence.qnt:48`, `MvccPassiveCheckpoint.qnt:43`). Their effects in T are not verified.
+2. Mode B GC rules are not modeled. Three B paths change reads: Rule 2 B form (mod.rs:8610-8619), Rule 3 with `b <= ckpt_max` (mod.rs:8633), and the B-tree fall-through read (mod.rs:6070-6087, cursor.rs:1203). B is the default mode. The sequence spec uses the P GC rules in all three modes (`MvccPassiveSequence.qnt:51`). It does not verify the B rules.
+3. Mode T publish runs without the clock wrapper (`core/mvcc/database/checkpoint_state_machine.rs:3356`). The row model splits publish at `MvccPassiveCheckpoint.qnt:649` and allows `ReaderBegin` between the steps. The row model has no header or root map. The schema model still applies publish in one step (`MvccPassiveSchema.qnt:874`). A half-published schema seen by a new reader is not verified.
 4. Mode T `Finalize` uses `reader_mark_floor = STAGED` (mod.rs:8188). So it ignores readers that pinned a read mark but are not in `txs` yet (rule R5). If the R5 argument holds after a WAL restart, `backfill_floor` still protects them. Not verified.
 5. Index rows are not in any spec. They have their own GC loop (mod.rs:8348), their own dirty map and the lockstep cursor (cursor.rs:524). A correct table with a wrong index still gives wrong query results.
 6. `finalized_tx_states` pruning (mod.rs:8542) is not modeled. Assume that GC prunes a TxID and a version still names it. Then visibility and conflict checks treat it as "visible" or "no conflict" (comment at mod.rs:6846-6853).
@@ -223,7 +227,7 @@ mark), not the lock.
 12. The sync object map and stable table ids are not modeled (SYNC.md).
 13. The rowid allocator cache is dropped with retired bindings (mod.rs:4880). Not modeled. A wrong cache can reuse a rowid.
 14. If the B stamp after `TruncateWal` (csm.rs:2257) is `ORIGIN`, Rule 3 never drops those versions in B. Memory only. Not verified.
-15. A checkpoint on the connection of an open MVCC transaction (`Connection::checkpoint`, or the auto-checkpoint after the inner commit of `nextval` inside `BEGIN CONCURRENT`) is in the row spec only as `CheckpointOnReaderConnection`: the backfill ignores that reader's mark. The spec does not model the reset of the connection's transaction state. The schema and sequence specs do not have this path.
+15. The row and sequence specs now store the checkpoint owner (`MvccPassiveCheckpoint.qnt:537`, `MvccPassiveSequence.qnt:434`). The sequence `TxCommit` can start a checkpoint on the outer reader's connection (`MvccPassiveSequence.qnt:374`). The model separates the pager pin from the registered MVCC snapshot. The schema spec still omits this owner path.
 16. The schema spec has one GC action (`GcDrop`). It drops a whole chain in one step under Rule 3 alone. It has no GC sample before the chain lock, no Rules 1 and 2, and no chain budget (`gc_index_incremental`).
 
 ## 4. Optimizations the design does not need, and the rule each one stands in for
@@ -253,6 +257,361 @@ Suggested spec work that follows from this:
    under "no tx open", and it ends with "store empty". Check `ReadsCorrect` and
    `RecoveryCorrect` with Rule 2 B form, Rule 3 with `b <= ckpt_max`, and the B-tree
    fall-through read.
-2. Add mode T to the sequence spec: the blocking checkpoint without `Registered == Set()`
-   at `CheckpointStart` (MvccPassiveSequence.qnt:384) and without the begin gate
-   (MvccPassiveSequence.qnt:245). Expect `ReadsCorrect` to fail. Then write the Rust test.
+2. Reproduce the mode T sequence trace in Rust. The model allows an open
+   reader at `CheckpointStart` (`MvccPassiveSequence.qnt:434`) and purges inline
+   at `CheckpointCompact` (`MvccPassiveSequence.qnt:500`). A Rust failure is
+   not verified. Section 5 gives the model result.
+
+## 5. Checkpoint stops, owners, and mode T
+
+The added model paths use Rust source at base `3a95ac963`.
+The supplied probe report is
+`/home/peristocles/scratch-modelgaps/probes/RESULTS.md`.
+Probe 4 reports stranded versions at line 87 of that file.
+Probe 5 reports leaked root pages at line 126 of that file.
+No Rust probe was repeated for these model changes.
+The recollect and resume repairs below are model proposals.
+Their Rust implementations are not verified.
+
+### Failure points and repairs
+
+A pass can fail before commit, between commit and publish, or after publish.
+Each model keeps durable writes and completed publications when it fails.
+The schema failure drops staged root operations.
+The cleanup in Rust starts at
+`core/mvcc/database/checkpoint_state_machine.rs:1079`.
+It clears staged roots at
+`core/mvcc/database/checkpoint_state_machine.rs:1087`.
+The pager commit completes at
+`core/mvcc/database/checkpoint_state_machine.rs:3333`.
+The next failure point is the publish yield at
+`core/mvcc/database/checkpoint_state_machine.rs:3341`.
+The boundary store is at
+`core/mvcc/database/checkpoint_state_machine.rs:2232`.
+These are separate model steps.
+
+| Model action | Source step or proposed behavior |
+|---|---|
+| `MvccPassiveCheckpoint.qnt:788` | Cleanup releases an owner pin only for a pager transaction it owns, `core/mvcc/database/checkpoint_state_machine.rs:1079` |
+| `MvccPassiveSchema.qnt:961` | Cleanup drops staged roots, `core/mvcc/database/checkpoint_state_machine.rs:1087` |
+| `MvccPassiveSequence.qnt:642` | Cleanup and TRUNCATE Busy, `core/mvcc/database/checkpoint_state_machine.rs:1079`, `core/mvcc/database/checkpoint_state_machine.rs:3421` |
+| `MvccPassiveSchema.qnt:933` | Failure phase before the stamp, `core/mvcc/database/checkpoint_state_machine.rs:3377`. Logical log contents are not modeled here |
+| `MvccPassiveSchema.qnt:978` | Proposed repair. Restore the committed root operations and publish before starting another pass. Rust fix not verified |
+| `MvccPassiveCheckpoint.qnt:697` | Test the boundary before truncate, `core/mvcc/persistent_storage/logical_log.rs:1088` |
+| `MvccPassiveCheckpoint.qnt:708` | Complete the submitted file truncate, `core/mvcc/persistent_storage/logical_log.rs:1074`. The destructive I/O ordering is not verified |
+| `MvccPassiveCheckpoint.qnt:649` | Mode T boundary store, `core/mvcc/database/checkpoint_state_machine.rs:2232`, without the passive clock wrapper at `core/mvcc/database/checkpoint_state_machine.rs:2250` |
+| `MvccPassiveSequence.qnt:260` | Keep the saved outer transaction while the inner transaction begins, `core/vdbe/execute.rs:14386`, `core/vdbe/execute.rs:14394` |
+| `MvccPassiveSequence.qnt:275` | Remove the outer MVCC transaction, `core/mvcc/database/mod.rs:6817` |
+| `MvccPassiveSequence.qnt:374` | The inner commit can start an auto-checkpoint, `core/vdbe/execute.rs:14502`, `core/mvcc/database/mod.rs:3700` |
+
+`NoStrandedVersions` checks the row store after a successful completed pass
+(`MvccPassiveCheckpoint.qnt:1011`). A failed pass can leave pending stamp work.
+The fixed configuration must complete a later pass without leaving that work.
+This is a safety check after completion. Eventual completion is not verified.
+`NoLeakedPages` checks every committed schema image without a pending-publish
+exception (`MvccPassiveSchema.qnt:1200`).
+
+The failure witnesses require a nonempty pager commit and the named failure.
+The row witness also requires an unstamped version below the published boundary
+(`MvccPassiveCheckpoint.qnt:1061`). The schema witness requires an allocation in that frame
+(`MvccPassiveSchema.qnt:1229`).
+The repair witnesses require the failure first, then an actual stamp or publish
+(`MvccPassiveCheckpoint.qnt:1062` and `MvccPassiveSchema.qnt:1230`).
+They do not count a no-op checkpoint as repair.
+
+### Sequence mode T and checkpoint owners
+
+Mode T has no `Registered == Set()` gate at checkpoint start and no checkpoint
+gate at transaction begin (`MvccPassiveSequence.qnt:434` and `MvccPassiveSequence.qnt:246`).
+The compactor deletes B-tree rows and purges their chains inline
+(`MvccPassiveSequence.qnt:500`). The Rust driver pairs delete and purge at
+`core/mvcc/database/checkpoint_state_machine.rs:736`.
+A pinned reader makes the WAL checkpoint fail with Busy
+(`MvccPassiveSequence.qnt:592` and `MvccPassiveSequence.qnt:642`).
+The model stops before the final stamp and sweep.
+The code's Busy error path is at
+`core/mvcc/database/checkpoint_state_machine.rs:3449`.
+Its final blocking sweep is at
+`core/mvcc/database/checkpoint_state_machine.rs:3576`.
+
+`reachTruncateBusy` requires a nonempty pager commit, a pinned reader, and
+failure at `published` (`MvccPassiveSequence.qnt:814`).
+`reachPurgeBeforeBusy` also requires that the same pass purged a chain
+(`MvccPassiveSequence.qnt:815`).
+A model read failure in mode T is a lead. A Rust reproduction is not verified.
+The supplied sequence probe did not reproduce a wrong read
+(`/home/peristocles/scratch-modelgaps/probes/RESULTS.md:55`).
+
+`CheckpointOwnerReaders` enables outer snapshots in the sequence spec.
+`TxCommit` picks `ckNow`. A successful inner commit can then start a checkpoint
+on that connection while the outer snapshot stays registered (`MvccPassiveSequence.qnt:374`).
+The pager commit releases the owner's pager pin (`MvccPassiveSequence.qnt:527`).
+`FixRefuseCheckpointOwner` refuses this checkpoint and keeps the outer pin.
+Both the row and sequence main configurations enable this proposed fix
+(`MvccPassiveCheckpoint.qnt:537` and `MvccPassiveSequence.qnt:434`).
+`reachAutoCheckpointOwner` requires a nonempty pager commit from the auto path
+while the outer reader remains registered (`MvccPassiveSequence.qnt:812`).
+
+The sequence main bounds use two values, two connections, `MaxTs = 6`,
+and two passes. The owner-off variants keep their earlier bounds.
+The mode T variants use two values, two connections, `MaxTs = 6`, and two passes.
+The owner variants use two values, one connection, `MaxTs = 5`, and two passes.
+`MaxTs` bounds transaction begins and commits (`MvccPassiveSequence.qnt:69`).
+Each passive publish advances the clock (`MvccPassiveSequence.qnt:578`).
+`TypeOK` permits the extra publish ticks (`MvccPassiveSequence.qnt:789`).
+The new leak bounds appear in `DESIGN-rows.md` and `DESIGN-schema.md`.
+The sequence model still reads each chain once and omits WAL restart.
+It does not verify the unlocked schema publish race.
+
+### The Rust fix uses early stamps and cleanup publication
+
+The read-only fix worktree is
+`/home/peristocles/.t3/worktrees/turso/t3-7761a9a5-3a389ac9d7146b01`.
+Its checked head is `633aeb51a`. The following source references use that head.
+The diff against `origin/main` adds two rules.
+The pager commit calls `stamp_committed_versions` before the publish yield
+(`core/mvcc/database/checkpoint_state_machine.rs:3301`).
+Cleanup publishes a committed pass with a pending header
+(`core/mvcc/database/checkpoint_state_machine.rs:1040`).
+Passive cleanup uses `apply_passive_publish_window_ordered` at
+`core/mvcc/database/checkpoint_state_machine.rs:1045`.
+Blocking cleanup uses `apply_checkpoint_publish_window` at
+`core/mvcc/database/checkpoint_state_machine.rs:1048`.
+
+Each model has `FixStampAtPagerCommit` and `FixCleanupPublishes` constants.
+They stay off in the earlier controls. The `rustFix*` variants turn both on.
+They do not enable the earlier recollect-or-resume repairs.
+
+| Model step | Model action | Rust source |
+|---|---|---|
+| Stamp after pager commit | `MvccPassiveCheckpoint.qnt:619`, `MvccPassiveSchema.qnt:796`, `MvccPassiveSequence.qnt:527` | `core/mvcc/database/checkpoint_state_machine.rs:3301`, `core/mvcc/database/checkpoint_state_machine.rs:3568` |
+| Publish in normal or failure path | `MvccPassiveCheckpoint.qnt:654`, `MvccPassiveSchema.qnt:879`, `MvccPassiveSequence.qnt:571` | `core/mvcc/database/checkpoint_state_machine.rs:1040`, `core/mvcc/database/checkpoint_state_machine.rs:2162` |
+| Failure calls cleanup publish | `MvccPassiveCheckpoint.qnt:788`, `MvccPassiveSchema.qnt:961`, `MvccPassiveSequence.qnt:642` | `core/mvcc/database/checkpoint_state_machine.rs:1043` |
+| Record GC of an early stamp with an open reader | `MvccPassiveCheckpoint.qnt:908`, `MvccPassiveCheckpoint.qnt:914` | `core/mvcc/database/mod.rs:8651` stamps the terminal event. The model then applies its existing GC rules |
+
+The row and sequence `rustFixOwner` configurations allow a checkpoint on the
+connection of an open outer snapshot. Their `Safety` values include all main
+invariants (`MvccPassiveCheckpoint.qnt:1052`, `MvccPassiveSequence.qnt:806`).
+Both saved owner traces contain a wrong snapshot read.
+Both regenerated traces include the new pager phase and a real frame commit.
+The row trace expects 0 and returns 2. The sequence trace expects 0 and returns 1.
+The reader's MVCC snapshot remains registered after its pager pin disappears.
+The fix does not address that path in these models.
+Rust reproductions of these saved traces are not verified.
+
+The sequence `rustFixTruncate` configuration also checks `Safety`.
+Its saved trace reads 0 where the snapshot expects 1 after inline compaction
+purges the older chain (`MvccPassiveSequence.qnt:500`).
+This trace fails before the second pass commits its pager transaction.
+Early stamping and cleanup publication cannot repair that earlier purge.
+The sequence model still omits the final blocking GC sweep.
+A Rust reproduction is not verified.
+
+The sequence model does not represent the backing table root or its initial row
+(`MvccPassiveSequence.qnt:48`). Its compaction treats that table as available.
+Rust resolves an unpublished negative root through `current_root_page`
+(`core/mvcc/database/checkpoint_state_machine.rs:805` at base `3a95ac963`).
+It skips a sequence if that root cannot resolve
+(`core/mvcc/database/checkpoint_state_machine.rs:827` at that base).
+A Rust replay must satisfy this root requirement before it creates the modeled values.
+Whether the saved trace meets all Rust root and initial-row conditions is not verified.
+
+`reachCleanupPublish` in each model requires a nonempty committed frame and
+an actual publish from failure cleanup (`MvccPassiveCheckpoint.qnt:1057`,
+`MvccPassiveSchema.qnt:1227`, `MvccPassiveSequence.qnt:810`).
+The schema witness also requires an allocated root in that frame.
+`reachEarlyStampGc` uses the lowest pinned mark as a control.
+It records an actual GC removal with a registered reader open
+(`MvccPassiveCheckpoint.qnt:914`).
+`reachEarlyStampGcAfterFailure` uses the code GC floor.
+It adds a failed published pass and completion
+of a later empty pass (`MvccPassiveCheckpoint.qnt:920`).
+Each passive publish and each cleanup publish is one model step.
+Errors inside that step and contention on the cleanup window are not verified.
+
+The simulator did not capture `reachEarlyStampGcAfterFailure` in 200,000
+walks of 40 steps. TLC reached it after 144,369 states.
+An ITF trace for that witness is not verified.
+
+The saved ITF traces are in `traces/bugs/` in this worktree.
+A second copy is in `/home/peristocles/scratch-modelgaps/stops-model-traces/`.
+`MvccPassiveCheckpoint-rustFixOwner.itf.json`,
+`MvccPassiveSequence-rustFixOwner.itf.json`, and
+`MvccPassiveSequence-rustFixTruncate.itf.json` contain the wrong reads.
+`MvccPassiveCheckpoint-reachEarlyStampGc.itf.json` contains the GC witness.
+
+The pager commit changes the connection transaction state at
+`core/storage/pager.rs:3429` at base `3a95ac963`.
+`set_tx_state` only writes that field (`core/connection.rs:4845` at that base).
+The MVCC transaction id has a separate setter (`core/connection.rs:4886`).
+The model therefore keeps the registered snapshot when it releases the pager pin.
+
+The owner model keeps the MVCC snapshot after it releases the pager pin
+(`MvccPassiveCheckpoint.qnt:238`, `MvccPassiveCheckpoint.qnt:239`).
+`GcKeepsVersionsAboveReaders` checks both sets (`MvccPassiveCheckpoint.qnt:1030`).
+The code floor still counts the retained registered mark (`MvccPassiveCheckpoint.qnt:824`).
+`ownCheckpointGc` therefore expects no GC violation.
+Its earlier expected failure assumed a different relation between those sets.
+The pinned-only control, `ownCheckpointGcPinnedFloor`, now expects the GC check to fail.
+It ignores that registered mark after the pin disappears.
+The new simulator trace uses a registered owner and a nonempty pager commit.
+At step 25, owner `r1` has begin timestamp 5 and mark 0, then commits frame 1.
+The first empty pass keeps every reader pin. No `committed` state has frame 0.
+The GC check sees an ended version stamped at frame 1 above the retained mark 0.
+A wrong read from this GC step is not verified.
+`reachReaderMarkBelowFloor` checks both sets too (`MvccPassiveCheckpoint.qnt:1078`).
+TLC reaches that retained-mark state after 38,049 states.
+
+| Owner control | Result | Distinct states |
+|---|---|---:|
+| `ownCheckpoint` | `ReadsCorrect` fails as expected | 148,132 |
+| `ownCheckpointBackfillFloor` | `ReadsCorrect` fails as expected | 146,017 |
+| `ownCheckpointKeepsMark` | `ReadsCorrect` fails as expected | 149,126 |
+| `ownCheckpointKeepsMarkBackfillFloor` | `ReadsCorrect` fails as expected | 150,509 |
+| `ownCheckpointGc` | No GC-floor violation | 32,893,504 |
+| `ownCheckpointGcBackfillFloor` | `GcKeepsVersionsAboveReaders` fails as expected | 128,575 |
+| `ownCheckpointGcPinnedFloor` | `GcKeepsVersionsAboveReaders` fails as expected | 135,575 |
+| `reachStampedAboveReader` | `NeverStampedAboveReader` fails as expected | 17,532 |
+| `reachReaderMarkBelowFloor` | `NeverReaderMarkBelowBackfillFloor` fails as expected | 38,049 |
+
+### Review corrections: empty passes, owners, and purge witnesses
+
+The empty-pass rule uses `5dd5ae137:core/mvcc/database/checkpoint_state_machine.rs:2650`.
+A pass with neither data work nor a new metadata boundary skips the pager transaction.
+The models enter `published` directly as the entry phase of the WAL checkpoint.
+They do not call `CheckpointCommit` or `CheckpointPublish` on that path.
+A higher boundary counts as metadata work, as the base metadata helper does
+(`3a95ac963:core/mvcc/database/checkpoint_state_machine.rs:2467`).
+
+`CheckpointBeginPager` chooses this path in the row model
+(`MvccPassiveCheckpoint.qnt:602`). The sequence collection does the same before
+compaction (`MvccPassiveSequence.qnt:465`). A nonempty pass acquires its pager
+transaction in `MvccPassiveSequence.qnt:478`.
+`pagerOwned` is true only during that transaction.
+Pager commit clears it. Failure cleanup clears an owner pin only while it is true
+(`MvccPassiveCheckpoint.qnt:788`, `MvccPassiveSequence.qnt:642`).
+This matches the cleanup lock-state checks
+(`5dd5ae137:core/mvcc/database/checkpoint_state_machine.rs:1058`).
+Both `TypeOK` checks reject a `committed` state with frame 0
+(`MvccPassiveCheckpoint.qnt:1034`, `MvccPassiveSequence.qnt:789`).
+
+Explicit owners must be between statements. Rows select only `active` readers
+(`MvccPassiveCheckpoint.qnt:537`). Sequences select only saved outer transactions with no inner statement
+(`MvccPassiveSequence.qnt:434`). The explicit checkpoint also blocks
+new operations on its owner until it stops.
+These gates represent the active-statement refusal at
+`3a95ac963:core/connection.rs:2590` and `3a95ac963:core/connection.rs:4833`.
+The nextval auto-checkpoint starts separately in `TxCommit`
+(`MvccPassiveSequence.qnt:374`). It can retain an outer transaction.
+
+Before a pager write, a pinned owner's mark must equal the current WAL length
+(`MvccPassiveCheckpoint.qnt:602`, `MvccPassiveSequence.qnt:478`).
+A stale snapshot stops the pass before it owns a pager transaction.
+It keeps the owner's pin. This represents `BusySnapshot`
+(`3a95ac963:core/storage/wal.rs:3598`).
+
+`purged` records each version that inline compaction actually removes
+(`MvccPassiveSequence.qnt:514`). Empty chains contribute no record.
+`RemovedRowNeeded` requires an open snapshot that needs that version's row as
+its current sequence value (`MvccPassiveSequence.qnt:663`).
+The reader must have an active read or a saved outer snapshot.
+The reader's saved B-tree image must lack that row.
+Its current read path must also lack that row.
+`NeverPurgesBeforeBusy` requires that state, a nonempty pager commit, and Busy
+at `published`. The weaker `NeverTruncateBusy` records compaction reaching Busy.
+
+The regenerated `rustFixTruncate` trace skips its first empty pager transaction.
+Its second pass removes row 1 before pager commit, then fails at `compacted`.
+The outer reader at timestamp 4 and mark 0 expects 1 and receives 0.
+The trace has no `committed` state with frame 0.
+The sequence purge failure remains in the model after the empty-pass correction.
+The backing-root and initial-row requirements above remain not verified in Rust.
+
+### Verification results
+
+Every command uses `WORKERS=8`. Shards execute one after another in this folder.
+The commands set the following values on the make command line:
+
+```sh
+QUINT=/home/peristocles/.local/share/quint/node_modules/.bin/quint
+JAVA_HOME=/home/peristocles/.local/share/mise/installs/java/temurin-21
+JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=/home/peristocles/scratch-modelgaps/tlc-tmp-u4
+```
+
+The command-line value for `JAVA_TOOL_OPTIONS` overrides the Makefile default.
+No command uses `/tmp` or the TLC `-cleanup` flag.
+Counterexample counts depend on the order of the eight workers.
+They count the states found before the first error. Passing counts cover all
+reachable states within the stated bounds.
+
+| Spec | Configuration | Result | Invariant | Distinct states |
+|---|---|---|---|---:|
+| Rows | `main` | Pass | All listed invariants | 17,344,980 |
+| Schema | `main` | Pass | All listed invariants | 21,177,855 |
+| Sequence | `main` | Pass | All listed invariants | 1,407,267 |
+
+| Spec | Configuration | Result | Invariant | Distinct states |
+|---|---|---|---|---:|
+| Rows | `failedPublish` | Fail (expected) | `NoStrandedVersions` | 2,790 |
+| Rows | `failedPublishFixed` | Pass | All listed invariants | 10,167 |
+| Rows | `reachFailedPublish` | Fail (expected) | `NeverFailsAfterPublish` | 731 |
+| Rows | `reachRepairedVersions` | Fail (expected) | `NeverRepairsVersions` | 4,685 |
+| Rows | `logTruncateRace` | Fail (expected) | `RecoveryCorrect` | 205 |
+| Rows | `reachTruncateAppend` | Fail (expected) | `NeverLosesAppendAtTruncate` | 503 |
+| Rows | `logTruncateAtomic` | Pass | All listed invariants | 615 |
+| Rows | `truncateFlagOn` | Fail (expected) | `NoStrandedVersions` | 34,195 |
+| Rows | `truncateFlagOnFixed` | Pass | All listed invariants | 300,115 |
+| Rows | `reachTruncateRepair` | Fail (expected) | `NeverRepairsVersions` | 73,059 |
+| Rows | `refuseCheckpointOwner` | Pass | All listed invariants | 210,694 |
+| Rows | `rustFix` | Pass | All listed invariants | 502,396 |
+| Rows | `rustFixOwner` | Fail (expected) | `Safety` | 23,598 |
+| Rows | `rustFixTruncate` | Pass | All listed invariants | 457,428 |
+| Rows | `reachCleanupPublish` | Fail (expected) | `NeverCleanupPublishes` | 1,086 |
+| Rows | `rustFixPinnedFloor` | Pass | All listed invariants | 1,037,362 |
+| Rows | `reachEarlyStampGc` | Fail (expected) | `NeverGcEarlyStampWithReader` | 7,970 |
+| Rows | `reachEarlyStampGcAfterFailure` | Fail (expected) | `NeverGcEarlyStampAfterFailure` | 144,369 |
+| Schema | `failedCommit` | Fail (expected) | `NoLeakedPages` | 772 |
+| Schema | `failedCommitFixed` | Pass | All listed invariants | 4,206 |
+| Schema | `reachFailedCommit` | Fail (expected) | `NeverFailsBeforePublish` | 230 |
+| Schema | `reachRepairedRoots` | Fail (expected) | `NeverRepairsRoots` | 552 |
+| Schema | `rustFix` | Pass | All listed invariants | 125,104 |
+| Schema | `reachCleanupPublish` | Fail (expected) | `NeverCleanupPublishes` | 454 |
+| Sequence | `truncateFlagOn` | Fail (expected) | `ReadsCorrect` | 18,618 |
+| Sequence | `truncateFlagOnStranded` | Fail (expected) | `NoStrandedVersions` | 7,587 |
+| Sequence | `reachTruncateBusy` | Fail (expected) | `NeverTruncateBusy` | 8,122 |
+| Sequence | `reachPurgeBeforeBusy` | Fail (expected) | `NeverPurgesBeforeBusy` | 32,112 |
+| Sequence | `ownCheckpoint` | Fail (expected) | `ReadsCorrect` | 2,874 |
+| Sequence | `refuseCheckpointOwner` | Pass | All listed invariants | 9,184 |
+| Sequence | `reachAutoCheckpointOwner` | Fail (expected) | `NeverAutoCheckpointOnReader` | 855 |
+| Sequence | `rustFix` | Pass | All listed invariants | 15,971 |
+| Sequence | `rustFixOwner` | Fail (expected) | `Safety` | 4,544 |
+| Sequence | `rustFixTruncate` | Fail (expected) | `Safety` | 261,184 |
+| Sequence | `reachCleanupPublish` | Fail (expected) | `NeverCleanupPublishes` | 1,350 |
+
+`make typecheck` passes for all three specs.
+`make check` passes for all three main configurations after the review fixes.
+The sequential variant shards check every row and sequence configuration.
+They also rerun schema `rustFix`. The schema source did not change in this review.
+Its other table entries retain the earlier results.
+
+68 of 69 scheduled configurations finished and matched their comments.
+The `MvccPassiveCheckpoint-gcSample` search did not finish within the review time box.
+Its result is not verified.
+
+The unchanged schema `alter` and `indexes` variants remain not verified from round 1.
+The full set of 109 configurations is therefore not verified.
+
+The review log is `/home/peristocles/scratch-modelgaps/round2-checks.log`.
+The full review result table is `/home/peristocles/scratch-modelgaps/round2-results.md`.
+The type-check log is `/home/peristocles/scratch-modelgaps/round2-typecheck.log`.
+The sequence mode-T checks repeat after the final purge-predicate restriction.
+Both `truncateFlagOn` and `rustFixTruncate` still fail as their comments require.
+The purge bug therefore remains reachable in the corrected model.
+A Rust reproduction remains not verified.
+
+The trace guide is `/home/peristocles/scratch-modelgaps/stops-model-traces/README.md`.
+It records the new nonempty owner commit and the corrected sequence purge trace.
+The archived guide and traces retain the round 1 evidence.
+The simulator found traces for both leak failures and their repair witnesses in round 1.
+The after-failure GC witness has a TLC result but no ITF trace.
+All completed TLC checks match their current comments.

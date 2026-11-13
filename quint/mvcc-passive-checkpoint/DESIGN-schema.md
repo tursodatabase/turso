@@ -79,7 +79,7 @@ the `ALTER` transaction reads. Before a checkpoint publishes the table's
 page, that is the temporary id. The `ALTER` also bumps the cookie.
 
 The checkpoint walks the versions of a `sqlite_schema` row oldest first
-(`maybe_get_checkpointable_versions`, checkpoint_state_machine.rs:1078). Take
+(`maybe_get_checkpointable_versions`, checkpoint_state_machine.rs:1079). Take
 an ended version and the version after it. If both have the same B-tree
 identity (the same kind and `rootpage`), the list keeps only the newer one
 (`is_schema_metadata_only_rewrite`, line 617). Otherwise the ended version
@@ -226,6 +226,9 @@ It checks these properties in every reachable state.
 A committed write that is lost after a crash breaks `RecoveryCorrect`.
 
 ## Configurations
+
+The counts below describe earlier configurations. The checkpoint-stop results
+near the end of this file describe the current configurations.
 
 The configurations are modules in `MvccPassiveSchemaConfigs.qnt`. The
 module `main` is the design: every special case
@@ -439,3 +442,90 @@ each change needs its own test in the Rust code first.
 - Multi-page B-trees. A page is either free or the whole B-tree of one table.
 - Two tables and an index in one configuration. `indexes` has one table
   and one index, so two tables with an index are not verified.
+
+## A pager commit that never publishes
+
+`CheckpointCommit` and `CheckpointPublish` stay separate
+(`MvccPassiveSchema.qnt:796` and `MvccPassiveSchema.qnt:874`).
+The code finishes the pager commit at
+`core/mvcc/database/checkpoint_state_machine.rs:3333`.
+It can yield before publish at line 3341 of that file.
+
+`CheckpointFail` can stop collection or any later modeled phase
+(`MvccPassiveSchema.qnt:961`). It keeps committed images and clears staged root operations.
+This matches `cleanup_after_external_io_error` at
+`core/mvcc/database/checkpoint_state_machine.rs:1079`.
+The code clears those operations at line 1087 of that file.
+A separate `CheckpointTruncateLog` action represents the phase before
+`CheckpointFinish` (`MvccPassiveSchema.qnt:933` and `MvccPassiveSchema.qnt:943`).
+It models a failure point, not logical log contents.
+The corresponding code phases start at
+`core/mvcc/database/checkpoint_state_machine.rs:3377` and line 3544 of that file.
+
+`NoLeakedPages` checks every committed frame (`MvccPassiveSchema.qnt:1200`).
+Each allocated page must appear in that frame's catalog or be free.
+It does not use the in-memory root bindings as a substitute for the catalog.
+A new table's first pager commit can be intact when its publish fails.
+The next pass allocates another root because the temporary root never changed.
+The next frame then has two allocated pages and only one catalog root.
+`failedCommit` reproduces this part of Rust probe 5.
+The model uses one root page per object. It does not model page contents.
+
+`FixPublishFailedCommit` saves the committed operations separately before
+cleanup discards the staged operations (`MvccPassiveSchema.qnt:961`).
+`CheckpointStart` refuses another pass while this publish is pending
+(`MvccPassiveSchema.qnt:605`). `CheckpointResumePublish` restores the pending publish
+(`MvccPassiveSchema.qnt:978`). Publish completes before any new pass allocates roots.
+This is a proposed model fix. Its Rust implementation is not verified.
+`PagesAccounted` allows this pending publish, as it allows a normal committed
+pass that is waiting to publish (`MvccPassiveSchema.qnt:1204`).
+`NoLeakedPages` has no such exception.
+
+`NeverFailsBeforePublish` requires an allocated root in a nonempty committed
+frame and a failure at `committed` (`MvccPassiveSchema.qnt:1229`).
+`NeverRepairsRoots` requires that failure and a later resumed publish
+(`MvccPassiveSchema.qnt:1230`). A no-op checkpoint cannot satisfy either witness.
+
+## Publish from cleanup in the Rust fix
+
+This section uses the read-only Rust fix at `633aeb51a` in
+`/home/peristocles/.t3/worktrees/turso/t3-7761a9a5-3a389ac9d7146b01`.
+`FixStampAtPagerCommit` stamps written row chains in `CheckpointCommit`
+(`MvccPassiveSchema.qnt:796`). The Rust call is at
+`core/mvcc/database/checkpoint_state_machine.rs:3301`.
+The stamp helper starts at
+`core/mvcc/database/checkpoint_state_machine.rs:3568`.
+
+`FixCleanupPublishes` calls `ApplyCheckpointPublish` from the failure action
+(`MvccPassiveSchema.qnt:961` and `MvccPassiveSchema.qnt:879`).
+It publishes committed root operations before it clears the staged operations.
+This models the cleanup window at
+`core/mvcc/database/checkpoint_state_machine.rs:1040`.
+The model applies the window atomically. Failures inside it are not verified.
+The earlier `FixPublishFailedCommit` remains a separate proposed repair.
+
+`rustFix` checks all main invariants and `NoLeakedPages` with both Rust constants.
+It uses one object, two pages, one reader, three timestamps, and two passes.
+`reachCleanupPublish` uses those bounds and requires an allocation in a
+committed frame, a failure at `committed`, and the actual cleanup publish
+(`MvccPassiveSchema.qnt:1227`).
+The schema model does not represent a checkpoint on its reader's connection.
+That path is not verified here. The row and sequence models check it.
+
+## Checkpoint-stop results
+
+The leak and repair configurations use one object, two pages, no reader, two clock
+timestamps, and two passes. The fixed configuration checks all main
+invariants and `NoLeakedPages`. Each witness uses the same bounds as its
+corresponding bug or fixed configuration.
+The results below count distinct TLC states with eight workers.
+A counterexample count covers only the search before TLC finds the error.
+
+| Configuration | Result | Invariant | Distinct states |
+|---|---|---|---:|
+| `failedCommit` | Fail (expected) | `NoLeakedPages` | 772 |
+| `failedCommitFixed` | Pass | All listed invariants | 4,206 |
+| `reachFailedCommit` | Fail (expected) | `NeverFailsBeforePublish` | 230 |
+| `reachRepairedRoots` | Fail (expected) | `NeverRepairsRoots` | 552 |
+| `rustFix` | Pass | All listed invariants | 125,104 |
+| `reachCleanupPublish` | Fail (expected) | `NeverCleanupPublishes` | 454 |
