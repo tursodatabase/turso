@@ -62,6 +62,7 @@ module MvccPassiveCheckpoint {
   const Keys: Set[str]            // Row keys of one table.
   const Readers: Set[str]         // Reader connections.
   const MaxTs: int                // Bound on the logical clock (commits and reader begins).
+  const FixRecollectUnstamped: bool
   const SplitLogTruncate: bool // The truncate decision and I/O finish in separate steps.
   const CheckpointFailures: bool // A pass can stop before it finishes.
   const MaxCheckpoints: int       // Bound on the number of checkpoint passes.
@@ -141,7 +142,7 @@ module MvccPassiveCheckpoint {
   type WalFrame = { w: str -> int, meta: int }
   type Cand = { k: str, s: int }
   type CkState = { pc: str, snap: int, old: int, todo: Set[str], wset: str -> int,
-                   frame: int, full: int, cand: Set[Cand], clearOk: bool, truncate: bool }
+                   frame: int, full: int, cand: Set[Cand], clearOk: bool, truncate: bool, completed: bool, seen: Set[str] }
   type RdState = { pc: str, mark: int, b: int, key: str, vis1: int, valid1: bool,
                    deps1: Set[int] }
   type ErrRec = { reader: str, key: str, begin: int, mark: int, got: Set[int],
@@ -251,7 +252,7 @@ module MvccPassiveCheckpoint {
     durable' = 0,
     backfillFloor' = 0,
     ck' = { pc: "idle", snap: 0, old: 0, todo: Set(), wset: EmptyFn, frame: 0,
-            full: 0, cand: Set(), clearOk: false, truncate: false },
+            full: 0, cand: Set(), clearOk: false, truncate: false, completed: false, seen: Set() },
     nCk' = 0,
     rd' = Readers.mapBy(r => { pc: "idle", mark: 0, b: 0, key: AnyKey, vis1: None,
                                valid1: false, deps1: Set() }),
@@ -527,7 +528,7 @@ module MvccPassiveCheckpoint {
     ck.pc == "idle",
     nCk < MaxCheckpoints,
     ck' = { pc: "collect", snap: SnapshotTs, old: durable, todo: Keys, wset: EmptyFn,
-            frame: 0, full: if (DirtyKeys) fullGen else 0, cand: Set(), clearOk: false, truncate: false },
+            frame: 0, full: if (DirtyKeys) fullGen else 0, cand: Set(), clearOk: false, truncate: false, completed: false, seen: ck.seen },
     nCk' = nCk + 1,
     chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
     dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor,
@@ -557,14 +558,18 @@ module MvccPassiveCheckpoint {
   // that moment, unless this pass is a full scan. A visited key with a stamp
   // at or below snap is a prune candidate (record_prune_candidate; the
   // DirtyStamps phase does the same for a full scan).
+  pure def LastEvent(v: Version): int = if (v.e != Inf) v.e else v.b
+
   action CheckpointCollect(k: str): bool = {
-    val visit = not(DirtyKeys) or ck.full != 0 or dirty.get(k) != 0
+    val repair = FixRecollectUnstamped and chain.get(k).exists(v =>
+      v.mat == 0 and Resolved(LastEvent(v)) and LastEvent(v) <= ck.snap)
+    val visit = repair or not(DirtyKeys) or ck.full != 0 or dirty.get(k) != 0
     all {
       ck.pc == "collect",
       ck.todo.contains(k),
       ck' = { ...ck,
               todo: ck.todo.exclude(Set(k)),
-              wset: if (visit and ChangedSince(chain.get(k), ck.old, ck.snap))
+              wset: if (visit and (repair or ChangedSince(chain.get(k), ck.old, ck.snap)))
                       ck.wset.put(k, ValueAt(chain.get(k), ck.snap))
                     else ck.wset,
               cand: if (DirtyKeys and dirty.get(k) != 0 and dirty.get(k) <= ck.snap)
@@ -651,7 +656,10 @@ module MvccPassiveCheckpoint {
   action CheckpointTruncateApply: bool = all {
     ck.pc == "truncateDecided",
     llog' = if (ck.truncate) Set() else llog,
-    ck' = { ...ck, pc: "truncated" },
+    ck' = { ...ck, pc: "truncated", seen:
+      if (ck.truncate and ck.frame > 0 and ck.wset.keys() != Set()
+          and llog.exists(l => l.ts > durable)) ck.seen.union(Set("truncateLostAppend"))
+      else ck.seen },
     chain' = chain, wal' = wal, nBackfill' = nBackfill, db' = db, dbMeta' = dbMeta,
     durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
     UnchangedForCheckpoint,
@@ -660,7 +668,6 @@ module MvccPassiveCheckpoint {
 
   // stamp_chain_materialized: on each written key, every version whose last
   // event is resolved and at or below snap is in the B-tree from this frame on.
-  pure def LastEvent(v: Version): int = if (v.e != Inf) v.e else v.b
 
   action CheckpointStamp: bool = all {
     ck.pc == "truncated",
@@ -671,7 +678,11 @@ module MvccPassiveCheckpoint {
                    if (Resolved(LastEvent(v)) and LastEvent(v) <= ck.snap) { ...v, mat: ck.frame }
                    else v)
                else chain.get(k)),
-    ck' = { ...ck, pc: if (DirtyKeys) "prune" else "idle" },
+    ck' = { ...ck, pc: if (DirtyKeys) "prune" else "idle", completed: true,
+      seen: if (FixRecollectUnstamped and ck.seen.contains("failedPublished")
+                 and ck.wset.keys().exists(k => chain.get(k).exists(v =>
+                   v.mat == 0 and Resolved(LastEvent(v)) and LastEvent(v) <= ck.old)))
+              ck.seen.union(Set("repairedVersions")) else ck.seen },
     llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db, dbMeta' = dbMeta,
     durable' = durable, nCk' = nCk,
     UnchangedForCheckpoint,
@@ -725,7 +736,11 @@ module MvccPassiveCheckpoint {
   action CheckpointFail(at: str): bool = all {
     CheckpointFailures,
     ck.pc == at,
-    ck' = { ...ck, pc: "idle" },
+    ck' = { ...ck, pc: "idle", completed: false,
+      seen: if (at == "published" and ck.frame > 0 and ck.wset.keys() != Set()
+                 and ck.wset.keys().exists(k => chain.get(k).exists(v =>
+                   v.mat == 0 and Resolved(LastEvent(v)) and LastEvent(v) <= durable)))
+              ck.seen.union(Set("failedPublished")) else ck.seen },
     chain' = chain, llog' = llog, wal' = wal, nBackfill' = nBackfill, db' = db,
     dbMeta' = dbMeta, durable' = durable, backfillFloor' = backfillFloor, nCk' = nCk,
     UnchangedForCheckpoint,
@@ -902,6 +917,11 @@ module MvccPassiveCheckpoint {
     if (replay == Set()) BtreeAt(k, wal.length())
     else replay.fold({ ts: -1, k: k, v: 0 }, (a, l) => if (l.ts > a.ts) l else a).v
 
+  val NoStrandedVersions: bool =
+    (ck.pc == "idle" and ck.completed) implies
+      Keys.forall(k => chain.get(k).forall(v =>
+        (Resolved(LastEvent(v)) and LastEvent(v) <= durable) implies v.mat != 0))
+
   val RecoveryCorrect: bool = Keys.forall(k => Recovered(k) == LatestIn(logged, k, Inf))
 
   // The WAL rule that the B-tree side of every read depends on: no pinned
@@ -935,6 +955,10 @@ module MvccPassiveCheckpoint {
   // ---------------------------------------------------------------------------
   // Reachability checks. Each one must be violated, which proves that the
   // model reaches the state.
+
+  val NeverFailsAfterPublish: bool = not(ck.seen.contains("failedPublished"))
+  val NeverRepairsVersions: bool = not(ck.seen.contains("repairedVersions"))
+  val NeverLosesAppendAtTruncate: bool = not(ck.seen.contains("truncateLostAppend"))
 
   val NeverDropsCurrentRow: bool =
     not(Keys.exists(k => chain.get(k) == Set() and LatestIn(writes, k, Inf) != 0))
