@@ -361,6 +361,11 @@ impl PragmaVirtualTable {
             }
         }
 
+        // Without the table argument, do not pass a schema value as that argument.
+        if self.has_pragma_arg && arg0_idx.is_none() {
+            arg1_idx = None;
+        }
+
         let argv_arg0_idx = arg0_idx.map_or(0, |_| 1);
         let argv_arg1_idx = arg1_idx.map_or(argv_arg0_idx, |_| argv_arg0_idx + 1);
 
