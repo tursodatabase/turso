@@ -1037,13 +1037,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
+        if self.pager_commit_done && self.staged_checkpoint_header.is_some() {
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            if matches!(self.mode, CheckpointMode::Passive { .. }) {
+                assert!(self.owns_checkpoint_in_progress);
+                assert!(self.mvstore.try_begin_passive_publish_window());
+                self.apply_passive_publish_window_ordered(materialized_at)?;
+            } else {
+                assert!(self.lock_states.blocking_checkpoint_lock_held);
+                self.apply_checkpoint_publish_window(materialized_at, None)?;
+            }
+        }
+
         // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
         let result = self.mvstore.storage.on_checkpoint_end(Err(err));
 
-        // Drop this checkpoint's staged (not-yet-applied) root-map mutations. They were never
-        // written to the shared map (deferred to the post-commit publish window), so a failed
-        // checkpoint simply discards them — no revert, no divergence. A post-commit failure
-        // finds these already drained, so nothing is dropped.
         self.pending_rootmap_ops.clear();
         self.pending_alloc_roots.clear();
 
