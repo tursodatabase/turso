@@ -820,6 +820,17 @@ fn translate_cast_expr(
     // runs numeric's `-` on 1.50.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
+    if let Some(tn) = type_name {
+        let name = crate::util::dequote(&tn.name);
+        if StrictType::named(&name).is_none()
+            && resolver.schema().get_type_def_unchecked(&name).is_none()
+            && !resolver.catalog.dialect.cast_type_exists(&name)
+        {
+            let brackets = "[]".repeat(tn.array_dimensions as usize);
+            crate::bail_parse_error!("type \"{name}{brackets}\" does not exist");
+        }
+    }
+
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
@@ -876,15 +887,6 @@ fn translate_cast_expr(
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
-        }
-    }
-
-    if let Some(name) = &cast_type_name {
-        if resolver.catalog.dialect.refuses_cast_to_unknown_type()
-            && StrictType::named(name).is_none()
-            && resolver.schema().get_type_def_unchecked(name).is_none()
-        {
-            crate::bail_parse_error!("type \"{name}\" does not exist");
         }
     }
 

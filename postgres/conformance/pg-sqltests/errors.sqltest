@@ -102,3 +102,19 @@ test error-cast-to-unknown-type-in-cast-syntax {
 }
 @sqlstate 42704
 expect error {}
+
+test error-cast-to-array-of-unknown-type {
+    SELECT '{1}'::nosuch[];
+}
+@sqlstate 42704
+expect error {
+    type "nosuch\[\]" does not exist
+}
+
+test error-cast-to-underscore-name-of-a-type-alias {
+    SELECT '{1}'::_integer;
+}
+@sqlstate 42704
+expect error {
+    type "_integer" does not exist
+}

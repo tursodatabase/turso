@@ -2615,10 +2615,10 @@ expect {
 # cast to an enum or a domain, still work where a cast to a name that is no
 # type is refused.
 test cast-to-known-types-still-works {
-    SELECT '(1,2)'::point, '1'::INT4, 'x'::"text", '<a/>'::xml;
+    SELECT '1'::INT4, 'x'::"text", '<a/>'::xml;
 }
 expect {
-    (1,2)|1|x|<a/>
+    1|x|<a/>
 }
 
 test cast-to-enum-and-domain {
@@ -2631,3 +2631,31 @@ test cast-to-enum-and-domain {
 expect {
     sad|3
 }
+
+# PostgreSQL types tursopg has no type for cast as they did before casts
+# to a name that is no type were refused.
+test cast-to-builtin-type-tursopg-does-not-map {
+    SELECT '1'::xid, '1'::int2vector, xid '1', '1'::pg_catalog.xid;
+}
+expect {
+    1|1|1|1
+}
+
+# `_int4` is PostgreSQL's name for int4[], and `_mood` for mood[].
+test cast-to-array-type-named-with-underscore {
+    CREATE TYPE cast_arr_mood AS ENUM ('happy');
+    SELECT '{1,2}'::_int4, ('{1,2}'::_int4)[2], '{a}'::_text, '{happy}'::_cast_arr_mood;
+    DROP TYPE cast_arr_mood;
+}
+expect {
+    {1,2}|2|{a}|{happy}
+}
+
+# A domain is checked even when its name is box, a PostgreSQL type's, in
+# other case.
+test cast-to-domain-named-like-a-builtin-type-checks-constraint {
+    CREATE DOMAIN "Box" AS int CHECK (VALUE > 0);
+    SELECT (-1)::"Box";
+}
+@sqlstate 23514
+expect error {}
