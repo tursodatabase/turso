@@ -1742,8 +1742,9 @@ fn try_prepare_special(
     parse_result: &turso_pg_parser::ParseResult,
     mut result_kind: StatementResultKind,
 ) -> Result<Option<crate::Statement>> {
-    let Some(stmt) =
-        frontend_stmt(sql, parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+    let type_lookup = |schema: Option<&str>, name: &str| lookup_type(&pg_conn.conn, schema, name);
+    let Some(stmt) = frontend_stmt(sql, parse_result, &type_lookup)
+        .map_err(|e| translation_error(&pg_conn.conn, e))?
     else {
         return Ok(None);
     };
@@ -1783,25 +1784,13 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
                 Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
             }
         }
-        ParseError::UnresolvedFunctionType {
-            ref schema,
-            ref name,
-            ref full_name,
-            used_as,
-        } => {
+        ParseError::MissingFunctionType { ref schema, .. } => {
             if let Some(schema) = schema {
                 if let Err(missing_schema) = check_schema_exists(conn, schema) {
                     return missing_schema;
                 }
             }
-            if lookup_type(conn, schema.as_deref(), name).is_some() {
-                sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
-            } else {
-                sqlstate_error(
-                    SQLSTATE_UNDEFINED_OBJECT,
-                    used_as.missing_message(full_name),
-                )
-            }
+            sqlstate_error(SQLSTATE_UNDEFINED_OBJECT, error.to_string())
         }
     }
 }

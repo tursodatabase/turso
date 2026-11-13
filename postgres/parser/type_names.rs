@@ -16,6 +16,23 @@ pub enum PgType {
     Row,
 }
 
+/// What a type name that is not built in names, in a schema or, without
+/// one, in the schemas of the search path.
+pub type TypeLookup<'a> = dyn Fn(Option<&str>, &str) -> Option<PgType> + 'a;
+
+/// What `name` of `schema` names among the types that are not built in, as
+/// `type_lookup` finds it. `_mood` also names the array type of `mood`.
+pub(crate) fn catalog_type(
+    type_lookup: &TypeLookup<'_>,
+    schema: Option<&str>,
+    name: &str,
+) -> Option<PgType> {
+    type_lookup(schema, name).or_else(|| {
+        name.strip_prefix('_')
+            .and_then(|element| type_lookup(schema, element))
+    })
+}
+
 /// The kind of a built-in type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltInType {

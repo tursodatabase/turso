@@ -27,14 +27,12 @@ pub enum ParseError {
     /// missing schema. Only a caller with a connection can find that out.
     #[error("a schema-qualified {kind} name is not supported")]
     SchemaQualifiedName { kind: String, schema: String },
-    /// A type of a function's parameter or result that is not built in. It
-    /// is the row type of a table or view, or a custom type, which tursopg
-    /// does not support in a function, or it does not exist. Only a caller
-    /// with a connection can find that out.
-    #[error("{} is not supported", .used_as.unsupported_feature(.full_name))]
-    UnresolvedFunctionType {
+    /// A type of a function's parameter or result that does not exist. If
+    /// its schema does not exist either, PostgreSQL reports the missing
+    /// schema. Only a caller with a connection can find that out.
+    #[error("{}", .used_as.missing_message(.full_name))]
+    MissingFunctionType {
         schema: Option<String>,
-        name: String,
         /// The type as PostgreSQL writes it in errors, such as `public.t[]`.
         full_name: String,
         used_as: FunctionTypeUse,
@@ -62,7 +60,7 @@ pub enum FunctionTypeUse {
 impl FunctionTypeUse {
     /// PostgreSQL's error when the type does not exist. PostgreSQL quotes
     /// the name only in the error for a result.
-    pub fn missing_message(self, full_name: &str) -> String {
+    fn missing_message(self, full_name: &str) -> String {
         match self {
             Self::Parameter => format!("type {full_name} does not exist"),
             Self::Result | Self::SetofResult => format!("type \"{full_name}\" does not exist"),

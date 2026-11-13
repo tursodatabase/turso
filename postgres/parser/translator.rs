@@ -18,7 +18,9 @@ use crate::sqlstate::{
     SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
     SQLSTATE_WINDOWING_ERROR,
 };
-use crate::type_names::{built_in_type, schema_and_name, type_name_text, PgType};
+use crate::type_names::{
+    built_in_type, catalog_type, schema_and_name, type_name_text, PgType, TypeLookup,
+};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -59,10 +61,6 @@ pub struct SerialSequence {
 /// Whether a schema, by name, has a relation of a name.
 type RelationNameCheck = Box<dyn Fn(&str, &str) -> bool>;
 
-/// What a type name that is not built in names, in a schema or, without
-/// one, in the schemas of the search path.
-type TypeLookup = Box<dyn Fn(Option<&str>, &str) -> Option<PgType>>;
-
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
@@ -71,7 +69,7 @@ pub struct PostgreSQLTranslator {
     relation_name_is_taken: Option<RelationNameCheck>,
     /// None when nothing is known about the catalog, as when a stored
     /// statement is translated again.
-    type_lookup: Option<TypeLookup>,
+    type_lookup: Option<Box<TypeLookup<'static>>>,
     /// Table name in scope while a generation expression is being translated.
     generation_expression_table: std::cell::RefCell<Option<String>>,
     /// Generated columns already present in the table, used for ADD COLUMN validation.
@@ -5685,9 +5683,7 @@ impl PostgreSQLTranslator {
         {
             return Ok(());
         }
-        let found =
-            lookup(schema, name).or_else(|| element.and_then(|element| lookup(schema, element)));
-        match found {
+        match catalog_type(lookup.as_ref(), schema, name) {
             Some(PgType::Custom) => Ok(()),
             Some(PgType::Row) => Err(ParseError::not_supported(
                 used_as.row_type_feature(&type_name_text(type_name)?),
@@ -8738,15 +8734,21 @@ pub enum FrontendStmt {
 }
 
 /// The statement of `parse_result` if the frontend runs it itself, `None` if
-/// it is translated.
+/// it is translated. `type_lookup` finds the types of CREATE FUNCTION that
+/// are not built in.
 pub fn frontend_stmt(
     sql: &str,
     parse_result: &ParseResult,
+    type_lookup: &TypeLookup<'_>,
 ) -> Result<Option<FrontendStmt>, ParseError> {
     if let Some(NodeRef::CreateFunctionStmt(stmt)) =
         parse_result.protobuf.nodes().first().map(|(node, ..)| node)
     {
-        return Err(crate::create_function::reject_create_function(sql, stmt));
+        return Err(crate::create_function::reject_create_function(
+            sql,
+            stmt,
+            type_lookup,
+        ));
     }
     if let Some(stmt) = try_extract_set(parse_result) {
         return Ok(Some(FrontendStmt::Set(stmt)));
@@ -9482,7 +9484,8 @@ mod tests {
     fn frontend_stmt_names_each_kind_the_frontend_runs() {
         let kind = |sql: &str| {
             let parsed = crate::parse(sql).unwrap();
-            frontend_stmt(sql, &parsed).unwrap().map(|stmt| match stmt {
+            let stmt = frontend_stmt(sql, &parsed, &|_, _| None).unwrap();
+            stmt.map(|stmt| match stmt {
                 FrontendStmt::Set(_) => "set",
                 FrontendStmt::SetTransaction => "set transaction",
                 FrontendStmt::Show(_) => "show",

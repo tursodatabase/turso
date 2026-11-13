@@ -403,6 +403,38 @@ expect @tursopg error {
     a function parameter of type mood is not supported
 }
 
+# `_mood` is the array type of `mood`.
+test enum-array-parameter-named-with-underscore {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(_mood) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of type _mood is not supported
+}
+
+# PostgreSQL looks up the result type after the parameter types.
+test enum-parameter-with-missing-result-type {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(mood) RETURNS nosuch AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type "nosuch" does not exist
+}
+
+# PostgreSQL parses the body after it looks up the types.
+test enum-parameter-with-body-syntax-error {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(mood) RETURNS int AS $$ SELEC 1 $$ LANGUAGE sql;
+}
+@sqlstate 42601
+expect error {
+    syntax error at or near "SELEC"
+}
+
 test missing-parameter-type {
     CREATE FUNCTION f(nosuch) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
