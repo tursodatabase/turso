@@ -63,7 +63,7 @@ pub(crate) fn create_virtual_table(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ExtensionTable {
+pub enum ExtensionTable {
     C(ExtVirtualTable),
     Native(NativeTable),
 }

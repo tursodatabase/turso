@@ -99,7 +99,7 @@ impl TransactionState {
     }
 }
 
-pub(crate) struct TempDatabase {
+pub struct TempDatabase {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
     #[cfg(not(target_family = "wasm"))]

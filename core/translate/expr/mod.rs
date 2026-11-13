@@ -48,7 +48,7 @@ mod condition;
 mod custom_type_operators;
 mod custom_types;
 mod emission;
-pub(crate) mod expr_type;
+pub mod expr_type;
 pub(crate) mod functions;
 mod translator;
 mod utils;

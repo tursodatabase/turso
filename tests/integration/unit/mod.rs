@@ -1,3 +1,4 @@
+pub mod alloc;
 pub mod btree;
 pub mod connection;
 pub mod database;

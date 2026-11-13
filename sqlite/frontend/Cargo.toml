@@ -15,8 +15,18 @@ turso_core = { path = "../../core", version = "0.9.0-pre.5", default-features = 
 turso_parser = { workspace = true }
 
 [dev-dependencies]
-turso_core = { workspace = true, features = ["allocation_metric"] }
+turso_core = { workspace = true, features = ["allocation_metric", "test_helper"] }
+turso_ext = { workspace = true }
+branches = { version = "0.4.3", default-features = false }
+icu_locale = "2.2.0"
+parking_lot = { workspace = true, features = ["arc_lock"] }
+quickcheck = { version = "1.0", default-features = false }
+quickcheck_macros = { version = "1.0", default-features = false }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rstest = "0.18.2"
 rusqlite = { workspace = true }
+rustc-hash = "2.0"
 tempfile = { workspace = true }
 
 [lints]

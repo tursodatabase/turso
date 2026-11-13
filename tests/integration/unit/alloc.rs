@@ -1,7 +1,3 @@
-use super::*;
-use crate::security::roles::SessionRole;
-use crate::ConnectOpts;
-use crate::DatabaseAllocators;
 use std::{
     ptr::NonNull,
     sync::{
@@ -9,6 +5,45 @@ use std::{
         Arc as StdArc,
     },
 };
+use turso_core::__turso_alloc_try_vec as try_vec;
+use turso_core::__turso_alloc_vec as vec;
+use turso_core::alloc::api::AllocError;
+use turso_core::alloc::api::ApiAllocator;
+use turso_core::alloc::api::Global;
+use turso_core::alloc::api::Layout;
+use turso_core::alloc::collections::DynVec;
+use turso_core::alloc::collections::TryClone;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoAllocExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoBinaryHeapExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoBoxExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoHashMapExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoHashSetExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoIteratorExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoNewExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoSliceExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoTryNewExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoTryWithCapacityExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoVecDequeExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoVecExt;
+#[allow(unused_imports)]
+use turso_core::alloc::collections::TursoVecInExt;
+use turso_core::alloc::*;
+use turso_core::security::roles::SessionRole;
+use turso_core::ConnectOpts;
+use turso_core::DatabaseAllocators;
+use turso_sqlite::SqliteDialect;
 
 struct LowerBoundOnly {
     next: usize,
@@ -106,8 +141,8 @@ fn dyn_allocator_delegates_skiplist_allocations() {
         allocations: allocations.clone(),
         deallocations,
     });
-    let map: crate::skiplist::SkipMap<i32, i32, _, DynAllocator> =
-        crate::skiplist::SkipMap::new_in(alloc);
+    let map: turso_core::skiplist::SkipMap<i32, i32, _, DynAllocator> =
+        turso_core::skiplist::SkipMap::new_in(alloc);
 
     map.try_insert(1, 2).unwrap();
 
@@ -123,19 +158,19 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
         allocations: allocations.clone(),
         deallocations,
     });
-    let io = StdArc::new(crate::MemoryIO::new());
-    let file = crate::IO::open_file(
+    let io = StdArc::new(turso_core::MemoryIO::new());
+    let file = turso_core::IO::open_file(
         io.as_ref(),
         "open-with-allocator.db",
-        crate::OpenFlags::Create,
+        turso_core::OpenFlags::Create,
         true,
     )
     .unwrap();
-    let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
-    let db = crate::Database::open(
+    let db_file = StdArc::new(turso_core::storage::database::DatabaseFile::new(file));
+    let db = turso_core::Database::open(
         io,
         "open-with-allocator.db",
-        crate::OpenOptions::new(StdArc::new(crate::EngineDialect))
+        turso_core::OpenOptions::new(StdArc::new(SqliteDialect))
             .storage(db_file)
             .allocators(DatabaseAllocators {
                 mv_store: alloc,
@@ -164,11 +199,11 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));
     let mv_allocations = StdArc::new(AtomicUsize::new(0));
-    let db = crate::Database::open(
-        StdArc::new(crate::MemoryIO::new()),
+    let db = turso_core::Database::open(
+        StdArc::new(turso_core::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(StdArc::new(crate::EngineDialect))
-            .db_opts(crate::DatabaseOpts::default().with_index_method(true))
+        turso_core::OpenOptions::new(StdArc::new(SqliteDialect))
+            .db_opts(turso_core::DatabaseOpts::default().with_index_method(true))
             .allocators(DatabaseAllocators {
                 mv_store: DynAllocator::new(CountingAlloc {
                     allocations: mv_allocations.clone(),
@@ -210,8 +245,8 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
     assert_eq!(
         rows,
         std::vec![
-            std::vec![crate::Value::from_i64(7)],
-            std::vec![crate::Value::from_i64(19)]
+            std::vec![turso_core::Value::from_i64(7)],
+            std::vec![turso_core::Value::from_i64(19)]
         ]
     );
 }
@@ -225,9 +260,9 @@ fn logical_log_shared_buffer_retains_dyn_allocator() {
         allocations: allocations.clone(),
         deallocations: deallocations.clone(),
     });
-    let record = crate::mvcc::database::LogRecord::new(1, alloc).unwrap();
+    let record = turso_core::mvcc::database::LogRecord::new(1, alloc).unwrap();
     let data: DynBoxedSlice<u8> = record.buf.into_boxed_slice();
-    let shared = crate::io::SharedBufferData::new(crate::sync::Arc::new(data));
+    let shared = turso_core::io::SharedBufferData::new(turso_core::sync::Arc::new(data));
     let returned = shared.clone();
 
     assert!(allocations.load(Ordering::Relaxed) > 0);

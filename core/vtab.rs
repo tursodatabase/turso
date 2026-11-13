@@ -11,7 +11,7 @@ use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VT
 use turso_parser::ast;
 
 #[derive(Debug, Clone)]
-pub(crate) enum VirtualTableType {
+pub enum VirtualTableType {
     Pragma(PragmaVirtualTable),
     External(crate::ext::ExtensionTable),
     Internal(Arc<RwLock<dyn InternalVirtualTable>>),
@@ -364,7 +364,7 @@ impl VirtualTableCursor {
 }
 
 #[derive(Debug)]
-pub(crate) struct ExtVirtualTable {
+pub struct ExtVirtualTable {
     implementation: Arc<VTabModuleImpl>,
     table_ptr: AtomicPtr<c_void>,
 }

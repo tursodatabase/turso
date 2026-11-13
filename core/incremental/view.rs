@@ -17,7 +17,7 @@ use turso_parser::ast::{Cmd, Stmt};
 /// branch. Bump this only after a layout has shipped or been shared.
 pub const DBSP_CIRCUIT_VERSION: u32 = 2;
 
-pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
+pub fn dbsp_version_marker_table_name(view_name: &str) -> String {
     format!(
         "{}{DBSP_CIRCUIT_VERSION}_{view_name}",
         crate::schema::DBSP_METADATA_TABLE_PREFIX

@@ -3700,7 +3700,8 @@ pub struct DatabaseCatalog {
 
 #[allow(unused)]
 impl DatabaseCatalog {
-    pub(crate) fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self {
             index_to_data: HashMap::default(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp

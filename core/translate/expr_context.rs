@@ -10,11 +10,7 @@ use super::{
     plan::TableReferences,
 };
 
-pub(crate) trait ExprProperties<
-    SourceId: Copy = TableInternalId,
-    SubqueryId: Copy = TableInternalId,
->
-{
+pub trait ExprProperties<SourceId: Copy = TableInternalId, SubqueryId: Copy = TableInternalId> {
     fn column_affinity(&self, source: SourceId, column: usize) -> Option<Affinity>;
     fn column_collation(&self, source: SourceId, column: usize) -> Result<Option<TextCollation>>;
     /// Whether the column is never NULL in this query. An outer join can make
@@ -35,10 +31,7 @@ pub struct ExprContext<'a, 'schema> {
 }
 
 impl<'a, 'schema> ExprContext<'a, 'schema> {
-    pub(crate) fn new(
-        tables: Option<&'a TableReferences>,
-        resolver: &'a Resolver<'schema>,
-    ) -> Self {
+    pub fn new(tables: Option<&'a TableReferences>, resolver: &'a Resolver<'schema>) -> Self {
         Self {
             tables: TableMetadata::new(tables),
             resolver,
@@ -121,12 +114,12 @@ impl ExprProperties for ExprContext<'_, '_> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct TableMetadata<'a> {
+pub struct TableMetadata<'a> {
     tables: Option<&'a TableReferences>,
 }
 
 impl<'a> TableMetadata<'a> {
-    pub(crate) fn new(tables: Option<&'a TableReferences>) -> Self {
+    pub fn new(tables: Option<&'a TableReferences>) -> Self {
         Self { tables }
     }
 }

@@ -60,7 +60,7 @@ type StepResult = vdbe::StepResult;
 /// runs in its own read transaction, but its names are looked up like in a
 /// helper statement: in every database, whatever the search path says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatementOrigin {
+pub enum StatementOrigin {
     Root,
     InternalHelper,
     Subprogram,

@@ -7,10 +7,10 @@
 use std::{fmt, ptr::NonNull};
 
 mod allocation_site;
-mod api;
+pub mod api;
 mod arc;
 mod backend;
-mod collections;
+pub mod collections;
 
 pub use allocation_site::{
     current_allocation_site, enter_allocation_site, AllocationSite, AllocationSiteGuard,
@@ -247,6 +247,3 @@ pub type Weak<T> = crate::sync::Weak<T>;
 pub type Rc<T> = std::rc::Rc<T>;
 
 pub type RcWeak<T> = std::rc::Weak<T>;
-
-#[cfg(test)]
-mod tests;
