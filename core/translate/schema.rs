@@ -1266,7 +1266,7 @@ pub fn translate_create_table(
         connection.is_nested_stmt(),
     )?;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
-        && bind_default_sequence_names(&mut body, resolver)?;
+        && bind_sequence_names_in_table_body(&mut body, resolver)?;
 
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
@@ -1614,21 +1614,44 @@ pub fn translate_create_table(
     Ok(())
 }
 
-/// Binds the sequences named in the column defaults of `body` to the
-/// schemas they resolve to now. See [`bind_sequence_names`].
-fn bind_default_sequence_names(
+/// Binds the sequences named in the column defaults and CHECK constraints
+/// of `body` to the schemas they resolve to now. See [`bind_sequence_names`].
+fn bind_sequence_names_in_table_body(
     body: &mut ast::CreateTableBody,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+    let ast::CreateTableBody::ColumnsAndConstraints {
+        columns,
+        constraints,
+        ..
+    } = body
+    else {
         return Ok(false);
     };
     let mut bound = false;
     for column in columns {
-        for constraint in &mut column.constraints {
-            if let ast::ColumnConstraint::Default(expr) = &mut constraint.constraint {
-                bound |= bind_sequence_names(expr, resolver)?;
-            }
+        bound |= bind_sequence_names_in_column_constraints(&mut column.constraints, resolver)?;
+    }
+    for constraint in constraints {
+        if let ast::TableConstraint::Check { expr, .. } = &mut constraint.constraint {
+            bound |= bind_sequence_names(expr, resolver)?;
+        }
+    }
+    Ok(bound)
+}
+
+/// Binds the sequences named in the DEFAULT and CHECK constraints of a
+/// column to the schemas they resolve to now. See [`bind_sequence_names`].
+pub(crate) fn bind_sequence_names_in_column_constraints(
+    constraints: &mut [ast::NamedColumnConstraint],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut bound = false;
+    for constraint in constraints {
+        if let ast::ColumnConstraint::Default(expr) | ast::ColumnConstraint::Check { expr, .. } =
+            &mut constraint.constraint
+        {
+            bound |= bind_sequence_names(expr, resolver)?;
         }
     }
     Ok(bound)

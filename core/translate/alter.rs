@@ -1300,7 +1300,13 @@ pub fn translate_alter_table(
             rewrite_rows_result?;
             owned_sequences_result?
         }
-        ast::AlterTableBody::AddColumn(col_def) => {
+        ast::AlterTableBody::AddColumn(mut col_def) => {
+            if resolver.catalog.dialect.binds_names_at_create() {
+                schema::bind_sequence_names_in_column_constraints(
+                    &mut col_def.constraints,
+                    resolver,
+                )?;
+            }
             let is_generated = col_def
                 .constraints
                 .iter()
