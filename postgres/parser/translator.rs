@@ -6803,17 +6803,6 @@ impl IntegerType {
     }
 }
 
-fn string_literal_text(node: &pg_query::protobuf::Node) -> Option<&str> {
-    let pg_query::protobuf::node::Node::AConst(a_const) = node.node.as_ref()? else {
-        return None;
-    };
-
-    match a_const.val.as_ref()? {
-        pg_query::protobuf::a_const::Val::Sval(string) => Some(string.sval.as_str()),
-        _ => None,
-    }
-}
-
 /// Checks whether a literal used as an integer cast operand exceeds the
 /// target integer type's range. If it does, substitutes an internal function
 /// that raises the appropriate PostgreSQL out-of-range error.
@@ -6826,7 +6815,7 @@ fn int_cast_operand(
     operand: ast::Expr,
     integer_type: IntegerType,
 ) -> ast::Expr {
-    let literal = numeric_literal_text(arg).or_else(|| string_literal_text(arg));
+    let literal = numeric_literal_text(arg);
 
     match literal {
         Some(literal) if numeric_literal_exceeds_range(literal, integer_type) => {
