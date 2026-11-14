@@ -1210,7 +1210,7 @@ fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
 
     reader.execute("BEGIN CONCURRENT").unwrap();
 
-    let durable_before = mv_store.durable_txid_max.load(Ordering::SeqCst);
+    let durable_before = mv_store.watermarks().durable_txid_max;
     let writer_thread = writer;
     let commit_handle = std::thread::spawn(move || {
         writer_thread.execute("BEGIN CONCURRENT").unwrap();
@@ -1221,17 +1221,17 @@ fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
     });
 
     for _ in 0..10_000 {
-        if mv_store.durable_txid_max.load(Ordering::SeqCst) > durable_before {
+        if mv_store.watermarks().durable_txid_max > durable_before {
             break;
         }
         std::thread::yield_now();
     }
-    if mv_store.durable_txid_max.load(Ordering::SeqCst) == durable_before {
+    if mv_store.watermarks().durable_txid_max == durable_before {
         reader.execute("COMMIT").unwrap();
     }
     commit_handle.join().unwrap();
 
-    let durable_after = mv_store.durable_txid_max.load(Ordering::SeqCst);
+    let durable_after = mv_store.watermarks().durable_txid_max;
     assert!(
         durable_after > durable_before,
         "auto passive checkpoint should publish durable boundary despite pinned reader (before={durable_before}, after={durable_after})",
@@ -2260,7 +2260,7 @@ fn test_recovery_clock_monotonicity() {
         conn.execute("INSERT INTO test(id, data) VALUES (1, 'foo')")
             .unwrap();
         let mvcc_store = db.get_mvcc_store();
-        mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst)
+        mvcc_store.watermarks().last_committed_tx_ts
     };
 
     db.restart();
@@ -4008,7 +4008,7 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
         let mvcc_store = db.get_mvcc_store();
-        let committed_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+        let committed_ts = mvcc_store.watermarks().last_committed_tx_ts;
         assert!(committed_ts > 0);
 
         let pager = conn.pager.load().clone();
@@ -4341,7 +4341,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
     let mvcc_store = db.get_mvcc_store();
-    let ts1 = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+    let ts1 = mvcc_store.watermarks().last_committed_tx_ts;
     assert!(ts1 > 0, "expected committed timestamp for first insert");
 
     let pager = conn.pager.load().clone();
@@ -4377,7 +4377,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
 
     // Pager commit already succeeded before log truncation.
     // Same-process retries must advance from this durable boundary.
-    let durable_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+    let durable_boundary = mvcc_store.watermarks().durable_txid_max;
     assert!(
         durable_boundary >= ts1,
         "expected in-memory durable checkpoint boundary to advance after pager commit: boundary={durable_boundary} ts1={ts1}"
@@ -4438,7 +4438,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     let mvcc_store = db.get_mvcc_store();
-    let first_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+    let first_boundary = mvcc_store.watermarks().durable_txid_max;
     assert!(first_boundary > 0);
 
     conn.execute(
@@ -4451,7 +4451,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
           WHERE sad_wind_216 = 788",
     )
     .unwrap();
-    let update_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+    let update_ts = mvcc_store.watermarks().last_committed_tx_ts;
     assert!(update_ts > first_boundary);
 
     let delayed_conn = db.connect();
@@ -4501,10 +4501,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         reached_wal_checkpoint,
         "expected checkpoint to reach WAL checkpoint"
     );
-    assert_eq!(
-        mvcc_store.durable_txid_max.load(Ordering::SeqCst),
-        update_ts
-    );
+    assert_eq!(mvcc_store.watermarks().durable_txid_max, update_ts);
     interrupted_checkpoint
         .cleanup_after_external_io_error(LimboError::Interrupt)
         .unwrap();
@@ -4887,10 +4884,7 @@ fn test_meta_recovery_case_12_replay_gate_skips_at_or_below_metadata_boundary() 
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         let root_page = metadata_root_page(&conn);
         conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
-        let ts3 = db
-            .get_mvcc_store()
-            .last_committed_tx_ts
-            .load(Ordering::SeqCst);
+        let ts3 = db.get_mvcc_store().watermarks().last_committed_tx_ts;
         drop(conn);
         force_close_for_artifact_tamper(&mut db);
         tamper_db_metadata_row_value_by_key(
@@ -7524,14 +7518,14 @@ fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
         .execute("UPDATE t SET v = 'b1' WHERE id = 2")
         .unwrap();
     conn_b.execute("COMMIT").unwrap();
-    let tx_b_committed = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    let tx_b_committed = mvcc_store.watermarks().last_committed_tx_ts;
     assert!(
         tx_b_committed > tx_a_end_ts,
         "tx_b should commit at a newer timestamp than the yielded tx_a"
     );
 
     commit_a.run_ignore_rows().unwrap();
-    let final_watermark = mvcc_store.last_committed_tx_ts.load(Ordering::Acquire);
+    let final_watermark = mvcc_store.watermarks().last_committed_tx_ts;
     assert_eq!(
         final_watermark, tx_b_committed,
         "finishing an older commit must not lower the committed timestamp watermark"
@@ -20292,7 +20286,7 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
         .expect("DDL transaction should be tracked")
         .begin_ts;
     assert!(
-        ddl_begin_ts >= mvcc_store.last_committed_tx_ts.load(Ordering::Acquire),
+        ddl_begin_ts >= mvcc_store.watermarks().last_committed_tx_ts,
         "pre-CAS timestamp check should pass before the injected writer commit"
     );
 

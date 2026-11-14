@@ -4354,6 +4354,15 @@ pub struct TxSnapshot {
     pub log_appended: bool,
 }
 
+/// Commit timestamps that say how far the commits and the checkpoints of a store have come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Watermarks {
+    /// Commit timestamp of the newest committed transaction.
+    pub last_committed_tx_ts: u64,
+    /// Highest commit timestamp that a checkpoint has made durable.
+    pub durable_txid_max: u64,
+}
+
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
 /// Test-only harness data, not part of the public MVCC API.
 #[cfg(test)]
@@ -7482,6 +7491,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             abort_now: tx.abort_now.load(Ordering::Acquire),
             log_appended: tx.log_appended.load(Ordering::Acquire),
         })
+    }
+
+    /// How far commits and checkpoints of this store have come.
+    pub fn watermarks(&self) -> Watermarks {
+        Watermarks {
+            last_committed_tx_ts: self.last_committed_tx_ts.load(Ordering::SeqCst),
+            durable_txid_max: self.durable_txid_max.load(Ordering::SeqCst),
+        }
     }
 
     /// Rolls back a savepoint within a transaction.
