@@ -1227,7 +1227,34 @@ pub fn translate_alter_table(
                 None
             };
 
+            let owned_sequences = if database_id == crate::MAIN_DB_ID {
+                resolver.catalog.dialect.sequences_owned_by_column(
+                    resolver.schema(),
+                    namespace.id,
+                    &table_name_norm,
+                    &column_name_norm,
+                )?
+            } else {
+                Vec::new()
+            };
+            if let Some(usage) = schema::find_object_using_sequence(
+                resolver,
+                connection,
+                namespace,
+                &owned_sequences,
+                schema::DroppedWithSequences::Column {
+                    table: &table_name_norm,
+                    column: &column_name_norm,
+                },
+            )? {
+                crate::bail_parse_error!(
+                    "cannot drop column {} of table {} because other objects depend on it: {usage}",
+                    column_name_norm,
+                    table_name_norm
+                );
+            }
             let mut rewrite_rows_result = Ok(());
+            let mut owned_sequences_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1248,6 +1275,12 @@ pub fn translate_alter_table(
                             database_id,
                         );
                     }
+                    owned_sequences_result = owned_sequences.iter().try_for_each(|sequence| {
+                        crate::translate::sequence::emit_drop_sequence(
+                            program, resolver, connection, namespace, sequence,
+                        )
+                        .map(|_| ())
+                    });
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1264,9 +1297,16 @@ pub fn translate_alter_table(
                     })
                 },
             )?;
-            rewrite_rows_result?
+            rewrite_rows_result?;
+            owned_sequences_result?
         }
-        ast::AlterTableBody::AddColumn(col_def) => {
+        ast::AlterTableBody::AddColumn(mut col_def) => {
+            if resolver.catalog.dialect.binds_names_at_create() {
+                schema::bind_sequence_names_in_column_constraints(
+                    &mut col_def.constraints,
+                    resolver,
+                )?;
+            }
             let is_generated = col_def
                 .constraints
                 .iter()
@@ -2500,6 +2540,22 @@ pub fn translate_alter_table(
                     namespace,
                     &altered_table,
                     &indexes_to_rewrite,
+                )?;
+            }
+
+            if col_name != old_column_name
+                && schema::dialect_relation_hooks_apply(connection, database_id)?
+            {
+                resolver.catalog.dialect.translate_catalog_changes(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    &[CatalogChange::RenameColumn {
+                        namespace: namespace.id,
+                        table: normalize_ident(table_name),
+                        old_name: old_column_name.to_string(),
+                        new_name: col_name.to_string(),
+                    }],
                 )?;
             }
 

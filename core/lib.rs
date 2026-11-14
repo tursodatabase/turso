@@ -144,7 +144,7 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
-pub use dialect::{CatalogChange, Dialect, NewOwner};
+pub use dialect::{CatalogChange, Dialect, NewOwner, OwnerColumn};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
     SQLITE_CONSTRAINT_UNIQUE,

@@ -392,3 +392,13 @@ test nextval-of-a-sequence-whose-name-has-a-quote {
 expect {
     1
 }
+
+test drop-sequence-used-by-a-default-is-allowed {
+    CREATE SEQUENCE ds_seq;
+    CREATE TABLE ds_tbl(a INTEGER DEFAULT (nextval('ds_seq')), b);
+    DROP SEQUENCE ds_seq;
+    SELECT count(*) FROM ds_tbl;
+}
+expect {
+    0
+}

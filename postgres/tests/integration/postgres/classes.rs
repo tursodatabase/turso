@@ -494,7 +494,7 @@ fn capture_data_changes_is_refused_under_the_postgres_dialect() {
 }
 
 #[test]
-fn dropping_a_table_releases_the_sequences_it_owned() {
+fn dropping_a_table_drops_the_sequences_it_owned() {
     let db = TempDatabase::builder().build();
     let pg = db.connect_postgres();
     pg.execute("CREATE ROLE alice").unwrap();
@@ -504,10 +504,12 @@ fn dropping_a_table_releases_the_sequences_it_owned() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("cannot change owner of sequence"), "{error}");
-    // Turso keeps the sequence of a dropped table, unlike PostgreSQL, so it
-    // becomes a sequence of its own.
     pg.execute("DROP TABLE d").unwrap();
-    pg.execute("ALTER SEQUENCE d_x_seq OWNER TO alice").unwrap();
+    let error = pg
+        .execute("ALTER SEQUENCE d_x_seq OWNER TO alice")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
 }
 
 /// The stored access control list of `relname`, as `pg_class.relacl` shows
@@ -757,10 +759,18 @@ fn write_catalog_without_relpolicies(path: &str) {
     write_old_catalog(path, "relrowsecurity");
 }
 
+/// Writes a database at `path` with the catalog as tursopg made it before
+/// it stored the column that owns a sequence: no `relownedbycolumn`. The
+/// table `app.t` owns the sequence `app.t_x_seq`.
+fn write_catalog_without_relownedbycolumn(path: &str) {
+    write_old_catalog(path, "relpolicies");
+}
+
 /// Writes a database at `path` with a catalog that has the columns of the
 /// first catalog and the later ones up to `last_column`: none for "",
-/// `relacl`, or `relacl` and `relrowsecurity`. It has a class row for the
-/// table `app.t`, written by hand.
+/// `relacl`, `relacl` and `relrowsecurity`, or those and `relpolicies`. It
+/// has class rows, written by hand, for the table `app.t` and for the
+/// sequence `app.t_x_seq` that the table owns.
 fn write_old_catalog(path: &str, last_column: &str) {
     let db = open_without_catalog(path);
     let conn = db
@@ -774,6 +784,10 @@ fn write_old_catalog(path: &str, last_column: &str) {
         "relrowsecurity" => (
             ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0",
             ", NULL, 0",
+        ),
+        "relpolicies" => (
+            ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0, relpolicies TEXT",
+            ", NULL, 0, NULL",
         ),
         _ => unreachable!("unknown catalog column {last_column}"),
     };
@@ -794,6 +808,13 @@ fn write_old_catalog(path: &str, last_column: &str) {
             "INSERT INTO __turso_internal_classes \
              VALUES (16384, 't', {app}, 'r', 0, 0{relacl_value})"
         ),
+        "CREATE SEQUENCE app.t_x_seq".to_string(),
+        format!(
+            "INSERT INTO __turso_internal_classes \
+             VALUES (16385, 't_x_seq', {app}, 'S', 0, 16384{relacl_value})"
+        ),
+        "UPDATE sqlite_sequence SET seq = 16385 WHERE name = '__turso_internal_classes'"
+            .to_string(),
     ] {
         conn.prepare_engine_schema_statement(&sql)
             .unwrap()
@@ -1003,6 +1024,67 @@ fn a_catalog_made_before_relpolicies_opens_read_only_without_the_column() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("readonly"), "{error}");
+}
+
+#[test]
+fn a_sequence_linked_before_relownedbycolumn_stops_drop_column_until_it_is_linked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relownedbycolumn.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relownedbycolumn(path);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    pg.execute("ALTER TABLE app.t ADD COLUMN label text")
+        .unwrap();
+    let error = pg
+        .execute("ALTER TABLE app.t DROP COLUMN label")
+        .unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+    assert!(
+        error
+            .message
+            .contains("run ALTER SEQUENCE t_x_seq OWNED BY t.<column> first"),
+        "{error}"
+    );
+
+    pg.execute("ALTER TABLE app.t RENAME COLUMN label TO body")
+        .unwrap();
+    pg.execute("ALTER SEQUENCE app.t_x_seq OWNED BY app.t.x")
+        .unwrap();
+    pg.execute("ALTER TABLE app.t DROP COLUMN body").unwrap();
+    pg.execute("SELECT nextval('app.t_x_seq')").unwrap();
+    pg.close().unwrap();
+    drop(pg);
+    drop(db);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    pg.execute("ALTER TABLE app.t ADD COLUMN label text")
+        .unwrap();
+    pg.execute("ALTER TABLE app.t DROP COLUMN x").unwrap();
+    let error = pg
+        .execute("SELECT nextval('app.t_x_seq')")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+}
+
+#[test]
+fn a_table_dropped_from_a_catalog_made_before_relownedbycolumn_drops_its_sequences() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-relownedbycolumn-drop-table.db");
+    let path = path.to_str().unwrap();
+    write_catalog_without_relownedbycolumn(path);
+
+    let db = open_pg_database(path, turso_core::OpenFlags::default());
+    let pg = turso_pg::Connection::connect(&db).unwrap();
+    pg.execute("DROP TABLE app.t").unwrap();
+    let error = pg
+        .execute("SELECT nextval('app.t_x_seq')")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
 }
 
 /// A table without a class row is one the engine made for itself. Nobody

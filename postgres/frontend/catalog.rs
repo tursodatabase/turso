@@ -294,6 +294,29 @@ impl Dialect for PostgresDialect {
         crate::classes::relation_owner(schema, namespace, name)
     }
 
+    fn sequences_owned_by_table(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<String> {
+        crate::classes::sequences_owned_by_table(schema, namespace, name)
+    }
+
+    fn sequences_owned_by_column(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: &str,
+    ) -> turso_core::Result<Vec<String>> {
+        crate::classes::sequences_owned_by_column(schema, namespace, table, column)
+    }
+
+    fn refuses_dropping_used_sequences(&self) -> bool {
+        true
+    }
+
     fn role_has_privilege(
         &self,
         schema: &Schema,

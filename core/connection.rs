@@ -622,6 +622,9 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// The namespace whose objects this connection is dropping one statement
+    /// at a time.
+    pub(super) namespace_being_dropped: RwLock<Option<NamespaceId>>,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Whether non-TEMP triggers fire for statements prepared on this
     /// connection. TEMP triggers always fire, matching SQLite's
@@ -2146,6 +2149,18 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Names the namespace whose objects the statements prepared from now on
+    /// drop one at a time, or None. An object of that namespace that depends
+    /// on a dropped object does not stop the drop, because it is dropped too.
+    pub fn set_namespace_being_dropped(&self, namespace: Option<NamespaceId>) {
+        *self.namespace_being_dropped.write() = namespace;
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn namespace_being_dropped(&self) -> Option<NamespaceId> {
+        *self.namespace_being_dropped.read()
     }
 
     /// Turns non-TEMP triggers on or off for statements prepared from now on.

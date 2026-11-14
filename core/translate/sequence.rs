@@ -11,7 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{CatalogChange, NewOwner};
+use crate::dialect::{CatalogChange, NewOwner, OwnerColumn};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -1233,28 +1233,29 @@ pub fn translate_drop_sequence(
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
     };
+    if resolver.catalog.dialect.refuses_dropping_used_sequences() {
+        if let Some(usage) = schema::find_object_using_sequence(
+            resolver,
+            connection,
+            namespace,
+            std::slice::from_ref(&normalized_name),
+            schema::DroppedWithSequences::Nothing,
+        )? {
+            bail_parse_error!(
+                "cannot drop sequence {normalized_name} because other objects depend on it: {usage}"
+            );
+        }
+    }
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let dropped = emit_drop_sequence_cleanup(program, resolver, namespace, &normalized_name)?;
+    let dropped = emit_drop_sequence(program, resolver, connection, namespace, &normalized_name)?;
     if !dropped {
         if if_exists {
             return Ok(());
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
-    }
-
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[CatalogChange::Drop {
-                namespace: namespace.id,
-                name: normalized_name.clone(),
-            }],
-        )?;
     }
 
     // Bump schema version so other connections detect the change
@@ -1266,6 +1267,33 @@ pub fn translate_drop_sequence(
     });
 
     Ok(())
+}
+
+/// Emits the removal of sequence `seq_name` of `namespace` from the schema
+/// and from the dialect's schema state. Returns false, emitting nothing,
+/// when the sequence does not exist.
+pub(crate) fn emit_drop_sequence(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    seq_name: &str,
+) -> Result<bool> {
+    if !emit_drop_sequence_cleanup(program, resolver, namespace, seq_name)? {
+        return Ok(false);
+    }
+    if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Drop {
+                namespace: namespace.id,
+                name: seq_name.to_string(),
+            }],
+        )?;
+    }
+    Ok(true)
 }
 
 /// Qualifies each sequence named without a schema in `expr` with the schema
@@ -1350,7 +1378,7 @@ pub fn translate_alter_sequence_owned_by(
     let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
         bail_parse_error!("sequence \"{normalized_name}\" does not exist");
     };
-    let table = match owner {
+    let owner_column = match owner {
         Some((table_name, column)) => {
             let normalized_table = normalize_ident(table_name.name.as_str());
             // The lookup names a namespace even when no table has the name,
@@ -1369,13 +1397,15 @@ pub fn translate_alter_sequence_owned_by(
             {
                 bail_parse_error!("sequence must be in same schema as table it is linked to");
             }
-            let has_column = table.get_column(column.as_str()).is_some();
-            if !has_column {
+            let Some(column_name) = table
+                .get_column(column.as_str())
+                .and_then(|(_, column)| column.name.clone())
+            else {
                 bail_parse_error!(
                     "column \"{}\" of relation \"{normalized_table}\" does not exist",
                     column.as_str()
                 );
-            }
+            };
             let dialect = &resolver.catalog.dialect;
             let (sequence_owner, table_owner) =
                 resolver.with_schema(namespace.database_id, |schema| {
@@ -1387,7 +1417,10 @@ pub fn translate_alter_sequence_owned_by(
             if sequence_owner.is_some() && table_owner.is_some() && sequence_owner != table_owner {
                 bail_parse_error!("sequence must have same owner as table it is linked to");
             }
-            Some(normalized_table)
+            Some(OwnerColumn {
+                table: normalized_table,
+                column: column_name,
+            })
         }
         None => None,
     };
@@ -1403,7 +1436,7 @@ pub fn translate_alter_sequence_owned_by(
         &[CatalogChange::ChangeOwner {
             namespace: namespace.id,
             name: normalized_name,
-            owner: NewOwner::Table(table),
+            owner: NewOwner::Column(owner_column),
         }],
     )?;
     schema::emit_schema_cookie(resolver, program);
@@ -1430,6 +1463,24 @@ pub(crate) fn resolve_sequence_name(
     resolver
         .sequence_of_mangled_name(&bare_name)
         .or_else(|| Some((resolver.find_existing_sequence(&bare_name)?, bare_name)))
+}
+
+/// The namespace and bare name of the sequence that `expr` calls `nextval`,
+/// `currval` or `setval` on, when that sequence exists.
+pub(crate) fn sequence_called_by(
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Option<(NamespaceRef, String)> {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return None;
+    };
+    if !is_sequence_function(name.as_str()) {
+        return None;
+    }
+    let ast::Expr::Literal(ast::Literal::String(text)) = args.first()?.as_ref() else {
+        return None;
+    };
+    resolve_sequence_name(&crate::util::dequote(text), resolver)
 }
 
 pub(crate) fn is_sequence_function(name: &str) -> bool {

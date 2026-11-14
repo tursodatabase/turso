@@ -252,3 +252,17 @@ expect {
     1
     1
 }
+
+test grant-usage-on-all-sequences-in-schema-includes-the-sequences-of-serial-columns {
+    CREATE ROLE sq_all_serial_user;
+    CREATE TABLE sq_all_serial_t (id serial, body text);
+    GRANT INSERT ON sq_all_serial_t TO sq_all_serial_user;
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO sq_all_serial_user;
+    SET ROLE sq_all_serial_user;
+    INSERT INTO sq_all_serial_t (body) VALUES ('a');
+    RESET ROLE;
+    SELECT id, body FROM sq_all_serial_t;
+}
+expect {
+    1|a
+}

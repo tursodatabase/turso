@@ -634,6 +634,9 @@ pub(crate) fn translate_create_policy(
         .flatten()
     {
         prepare_policy_expr(expr, namespace, &table, resolver)?;
+        if resolver.catalog.dialect.binds_names_at_create() {
+            crate::translate::sequence::bind_sequence_names(expr, resolver)?;
+        }
     }
     translate_change(
         CatalogChange::CreatePolicy {

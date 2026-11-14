@@ -91,3 +91,389 @@ test alter-sequence-rename-is-not-supported {
 expect error {
     ALTER SEQUENCE ... RENAME is not supported
 }
+
+test drop-table-drops-its-serial-sequence {
+    CREATE TABLE zz_drop_serial (id serial, label text);
+    DROP TABLE zz_drop_serial;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_drop_serial_id_seq';
+}
+expect {
+    0
+}
+
+test recreated-table-gets-the-first-serial-sequence-name {
+    CREATE TABLE zz_recreate (id serial);
+    DROP TABLE zz_recreate;
+    CREATE TABLE zz_recreate (id serial);
+    SELECT relname FROM pg_class WHERE relname LIKE 'zz_recreate%' AND relkind = 'S';
+}
+expect {
+    zz_recreate_id_seq
+}
+
+test rolled-back-drop-table-keeps-its-serial-sequence {
+    CREATE TABLE zz_rollback_drop (id serial, label text);
+    INSERT INTO zz_rollback_drop (label) VALUES ('a');
+    BEGIN;
+    DROP TABLE zz_rollback_drop;
+    ROLLBACK;
+    INSERT INTO zz_rollback_drop (label) VALUES ('b');
+    SELECT id, label FROM zz_rollback_drop ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test drop-table-keeps-a-sequence-it-does-not-own {
+    CREATE SEQUENCE zz_keep_seq;
+    CREATE TABLE zz_keep_owner (id serial, n bigint DEFAULT nextval('zz_keep_seq'));
+    DROP TABLE zz_keep_owner;
+    SELECT relname FROM pg_class WHERE relname LIKE 'zz_keep%' AND relkind = 'S';
+}
+expect {
+    zz_keep_seq
+}
+
+test drop-column-drops-its-serial-sequence {
+    CREATE TABLE zz_dropcol_serial (id serial, label text);
+    ALTER TABLE zz_dropcol_serial DROP COLUMN id;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_dropcol_serial_id_seq';
+}
+expect {
+    0
+}
+
+test drop-column-keeps-the-sequences-of-other-columns {
+    CREATE TABLE zz_dropcol_two (
+        a serial,
+        b serial,
+        label text
+    );
+    ALTER TABLE zz_dropcol_two DROP COLUMN b;
+    INSERT INTO zz_dropcol_two (label) VALUES ('x');
+    SELECT relname FROM pg_class WHERE relname LIKE 'zz_dropcol_two%' AND relkind = 'S';
+}
+expect {
+    zz_dropcol_two_a_seq
+}
+
+test drop-column-keeps-a-sequence-it-does-not-own {
+    CREATE SEQUENCE zz_dropcol_shared;
+    CREATE TABLE zz_dropcol_user (n bigint DEFAULT nextval('zz_dropcol_shared'), label text);
+    ALTER TABLE zz_dropcol_user DROP COLUMN n;
+    SELECT relname FROM pg_class WHERE relname LIKE 'zz_dropcol_shared%' AND relkind = 'S';
+}
+expect {
+    zz_dropcol_shared
+}
+
+test rolled-back-drop-column-keeps-its-serial-sequence {
+    CREATE TABLE zz_dropcol_rollback (id serial, label text);
+    INSERT INTO zz_dropcol_rollback (label) VALUES ('a');
+    BEGIN;
+    ALTER TABLE zz_dropcol_rollback DROP COLUMN id;
+    ROLLBACK;
+    INSERT INTO zz_dropcol_rollback (label) VALUES ('b');
+    SELECT id, label FROM zz_dropcol_rollback ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test drop-table-refuses-when-another-default-uses-its-sequence {
+    DROP TABLE IF EXISTS zz_dep_user;
+    DROP TABLE IF EXISTS zz_dep_owner;
+    CREATE TABLE zz_dep_owner (id serial, label text);
+    CREATE TABLE zz_dep_user (n bigint DEFAULT nextval('zz_dep_owner_id_seq'));
+    DROP TABLE zz_dep_owner;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table zz_dep_owner because other objects depend on it
+}
+
+test drop-table-works-once-the-other-default-is-gone {
+    DROP TABLE IF EXISTS zz_dep_user2;
+    DROP TABLE IF EXISTS zz_dep_owner2;
+    CREATE TABLE zz_dep_owner2 (id serial, label text);
+    CREATE TABLE zz_dep_user2 (n bigint DEFAULT nextval('zz_dep_owner2_id_seq'));
+    DROP TABLE zz_dep_user2;
+    DROP TABLE zz_dep_owner2;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_dep_owner2_id_seq';
+}
+expect {
+    0
+}
+
+test drop-column-refuses-when-another-default-uses-its-sequence {
+    DROP TABLE IF EXISTS zz_depcol_user;
+    DROP TABLE IF EXISTS zz_depcol_owner;
+    CREATE TABLE zz_depcol_owner (id serial, label text);
+    CREATE TABLE zz_depcol_user (n bigint DEFAULT nextval('zz_depcol_owner_id_seq'));
+    ALTER TABLE zz_depcol_owner DROP COLUMN id;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop column id of table zz_depcol_owner because other objects depend on it
+}
+
+test drop-column-refuses-when-a-column-of-the-same-table-uses-its-sequence {
+    DROP TABLE IF EXISTS zz_depsame;
+    CREATE TABLE zz_depsame (id serial, copy bigint DEFAULT nextval('zz_depsame_id_seq'));
+    ALTER TABLE zz_depsame DROP COLUMN id;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop column id of table zz_depsame because other objects depend on it
+}
+
+test drop-sequence-refuses-when-a-default-uses-it {
+    DROP TABLE IF EXISTS zz_dropseq_user;
+    DROP SEQUENCE IF EXISTS zz_dropseq;
+    CREATE SEQUENCE zz_dropseq;
+    CREATE TABLE zz_dropseq_user (n bigint DEFAULT nextval('zz_dropseq'));
+    DROP SEQUENCE zz_dropseq;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence zz_dropseq because other objects depend on it
+}
+
+test drop-sequence-refuses-when-a-view-uses-it {
+    DROP VIEW IF EXISTS zz_dropseq_view;
+    DROP SEQUENCE IF EXISTS zz_dropseq2;
+    CREATE SEQUENCE zz_dropseq2;
+    CREATE VIEW zz_dropseq_view AS SELECT nextval('zz_dropseq2') AS n;
+    DROP SEQUENCE zz_dropseq2;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence zz_dropseq2 because other objects depend on it
+}
+
+test drop-sequence-works-once-nothing-uses-it {
+    DROP TABLE IF EXISTS zz_dropseq_user3;
+    DROP SEQUENCE IF EXISTS zz_dropseq3;
+    CREATE SEQUENCE zz_dropseq3;
+    CREATE TABLE zz_dropseq_user3 (n bigint DEFAULT nextval('zz_dropseq3'));
+    DROP TABLE zz_dropseq_user3;
+    DROP SEQUENCE zz_dropseq3;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_dropseq3';
+}
+expect {
+    0
+}
+
+test drop-table-refuses-when-a-view-uses-its-serial-sequence {
+    DROP VIEW IF EXISTS zz_serialview_view;
+    DROP TABLE IF EXISTS zz_serialview;
+    CREATE TABLE zz_serialview (id serial);
+    CREATE VIEW zz_serialview_view AS SELECT nextval('zz_serialview_id_seq') AS n;
+    DROP TABLE zz_serialview;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table zz_serialview because other objects depend on it
+}
+
+test drop-sequence-refuses-when-a-default-calls-it-inside-an-expression {
+    DROP TABLE IF EXISTS zz_dropseq_expr_user;
+    DROP SEQUENCE IF EXISTS zz_dropseq_expr;
+    CREATE SEQUENCE zz_dropseq_expr;
+    CREATE TABLE zz_dropseq_expr_user (n bigint DEFAULT nextval('zz_dropseq_expr') + 1);
+    DROP SEQUENCE zz_dropseq_expr;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence zz_dropseq_expr because other objects depend on it
+}
+
+test drop-column-keeps-a-sequence-that-another-column-owns {
+    CREATE SEQUENCE zz_other_owner;
+    CREATE TABLE zz_other_owner_t (id int, x bigint DEFAULT nextval('zz_other_owner'));
+    ALTER SEQUENCE zz_other_owner OWNED BY zz_other_owner_t.id;
+    ALTER TABLE zz_other_owner_t DROP COLUMN x;
+    SELECT nextval('zz_other_owner');
+}
+expect {
+    1
+}
+
+test drop-column-drops-a-sequence-it-owns-but-does-not-use {
+    CREATE SEQUENCE zz_owned_unused;
+    CREATE TABLE zz_owned_unused_t (id int, label text);
+    ALTER SEQUENCE zz_owned_unused OWNED BY zz_owned_unused_t.id;
+    ALTER TABLE zz_owned_unused_t DROP COLUMN id;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_owned_unused';
+}
+expect {
+    0
+}
+
+test drop-column-keeps-a-sequence-that-is-owned-by-none-again {
+    CREATE TABLE zz_released (id serial, label text);
+    ALTER SEQUENCE zz_released_id_seq OWNED BY NONE;
+    ALTER TABLE zz_released DROP COLUMN label;
+    DROP TABLE zz_released;
+    SELECT nextval('zz_released_id_seq');
+}
+expect {
+    1
+}
+
+test drop-column-drops-the-sequence-of-a-renamed-serial-column {
+    CREATE TABLE zz_renamed_owner (id serial, label text);
+    ALTER TABLE zz_renamed_owner RENAME COLUMN id TO ident;
+    ALTER TABLE zz_renamed_owner DROP COLUMN ident;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_renamed_owner_id_seq';
+}
+expect {
+    0
+}
+
+test drop-column-keeps-the-sequence-of-a-renamed-serial-column {
+    CREATE TABLE zz_renamed_kept (id serial, label text, extra int);
+    ALTER TABLE zz_renamed_kept RENAME COLUMN id TO ident;
+    ALTER TABLE zz_renamed_kept DROP COLUMN extra;
+    INSERT INTO zz_renamed_kept (label) VALUES ('a');
+    SELECT ident, label FROM zz_renamed_kept;
+}
+expect {
+    1|a
+}
+
+test drop-sequence-refuses-when-a-check-constraint-uses-it {
+    CREATE SEQUENCE zz_dropseq_check;
+    CREATE TABLE zz_dropseq_check_user (n bigint CHECK (n <= nextval('zz_dropseq_check')));
+    DROP SEQUENCE zz_dropseq_check;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence zz_dropseq_check because other objects depend on it
+}
+
+test drop-sequence-refuses-when-a-policy-uses-it {
+    CREATE SEQUENCE zz_dropseq_policy;
+    CREATE TABLE zz_dropseq_policy_user (n bigint);
+    CREATE POLICY zz_dropseq_policy_p ON zz_dropseq_policy_user
+        USING (n <= nextval('zz_dropseq_policy'));
+    DROP SEQUENCE zz_dropseq_policy;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence zz_dropseq_policy because other objects depend on it
+}
+
+test drop-table-refuses-when-a-check-constraint-of-another-table-uses-its-sequence {
+    CREATE TABLE zz_check_owner (id serial, label text);
+    CREATE TABLE zz_check_user (n bigint CHECK (n <= nextval('zz_check_owner_id_seq')));
+    DROP TABLE zz_check_owner;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop table zz_check_owner because other objects depend on it
+}
+
+test drop-table-drops-a-sequence-that-only-its-own-check-constraint-uses {
+    CREATE SEQUENCE zz_own_check;
+    CREATE TABLE zz_own_check_t (id int, n bigint CHECK (n <= nextval('zz_own_check')));
+    ALTER SEQUENCE zz_own_check OWNED BY zz_own_check_t.id;
+    DROP TABLE zz_own_check_t;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_own_check';
+}
+expect {
+    0
+}
+
+test check-constraint-keeps-the-sequence-it-was-created-with-after-search-path-changes {
+    CREATE SCHEMA zz_bind_check;
+    CREATE SEQUENCE zz_bind_check.q;
+    CREATE SEQUENCE q;
+    SET search_path TO zz_bind_check, public;
+    CREATE TABLE public.zz_bind_check_t (
+        n bigint CHECK (n <= nextval('q')),
+        m bigint,
+        CHECK (m <= nextval('q') + 100)
+    );
+    RESET search_path;
+    DROP SEQUENCE public.q;
+    INSERT INTO zz_bind_check_t VALUES (1, 2);
+    SELECT last_value FROM pg_sequences WHERE sequencename = 'q';
+}
+expect {
+    2
+}
+
+test drop-sequence-refuses-the-sequence-a-check-constraint-was-created-with {
+    CREATE SCHEMA zz_bind_refuse;
+    CREATE SEQUENCE zz_bind_refuse.q;
+    CREATE SEQUENCE q;
+    SET search_path TO zz_bind_refuse, public;
+    CREATE TABLE public.zz_bind_refuse_t (n bigint CHECK (n <= nextval('q')));
+    RESET search_path;
+    DROP SEQUENCE zz_bind_refuse.q;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence
+}
+
+test policy-keeps-the-sequence-it-was-created-with-after-search-path-changes {
+    CREATE SCHEMA zz_bind_policy;
+    CREATE SEQUENCE zz_bind_policy.q;
+    CREATE SEQUENCE q;
+    CREATE TABLE zz_bind_policy_t (n bigint);
+    SET search_path TO zz_bind_policy, public;
+    CREATE POLICY zz_bind_policy_p ON public.zz_bind_policy_t USING (n <= nextval('q'));
+    RESET search_path;
+    DROP SEQUENCE public.q;
+    DROP SEQUENCE zz_bind_policy.q;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence
+}
+
+test added-column-default-keeps-the-sequence-it-was-created-with-after-search-path-changes {
+    CREATE SCHEMA zz_bind_add;
+    CREATE SEQUENCE zz_bind_add.q;
+    CREATE SEQUENCE q;
+    CREATE TABLE zz_bind_add_t (a int);
+    SET search_path TO zz_bind_add, public;
+    ALTER TABLE public.zz_bind_add_t ADD COLUMN n bigint DEFAULT nextval('q');
+    RESET search_path;
+    DROP SEQUENCE public.q;
+    INSERT INTO zz_bind_add_t (a) VALUES (1);
+    SELECT a, n FROM zz_bind_add_t;
+    DROP SEQUENCE zz_bind_add.q;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence
+}
+
+test drop-column-drops-its-sequence-when-only-its-own-check-constraint-uses-it {
+    CREATE TABLE zz_own_col_check (
+        id serial CHECK (id <= nextval('zz_own_col_check_id_seq')),
+        label text
+    );
+    ALTER TABLE zz_own_col_check DROP COLUMN id;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_own_col_check_id_seq';
+}
+expect {
+    0
+}
+
+test drop-column-refuses-when-a-check-constraint-of-another-column-uses-its-sequence {
+    CREATE TABLE zz_other_col_check (
+        id serial,
+        n bigint CHECK (n <= nextval('zz_other_col_check_id_seq'))
+    );
+    ALTER TABLE zz_other_col_check DROP COLUMN id;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop column id of table zz_other_col_check because other objects depend on it
+}
