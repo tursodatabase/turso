@@ -1,0 +1,243 @@
+# How pg_policy and the pg_policies view show row-level security policies,
+# through the PostgreSQL frontend. Oids differ between servers, so the tests
+# compare them instead of printing them. pg_get_expr prints a condition as
+# PostgreSQL's ruleutils does: every operator in parentheses, and a cast
+# where a quoted literal meets a column.
+# PostgreSQL roles belong to the whole server, so every test uses its own
+# role and table names.
+
+@database :memory:
+
+test pg-policy-shows-command-kind-roles-and-conditions {
+    CREATE ROLE pp_alice_1;
+    CREATE ROLE pp_bob_1;
+    CREATE TABLE pp_docs_1 (id INT PRIMARY KEY, owner TEXT, published BOOLEAN);
+    CREATE POLICY p_all ON pp_docs_1 USING (owner = current_user);
+    CREATE POLICY p_select ON pp_docs_1 AS RESTRICTIVE FOR SELECT TO pp_alice_1, pp_bob_1
+        USING (published);
+    CREATE POLICY p_insert ON pp_docs_1 FOR INSERT TO pp_alice_1 WITH CHECK (id > 0);
+    CREATE POLICY p_update ON pp_docs_1 FOR UPDATE
+        USING (id > 0) WITH CHECK (id < 100 AND owner IS NOT NULL);
+    CREATE POLICY p_delete ON pp_docs_1 AS PERMISSIVE FOR DELETE TO PUBLIC
+        USING (NOT published);
+    SELECT polname, polcmd, polpermissive,
+           CASE WHEN polroles = '{0}' THEN 'public' ELSE 'named roles' END,
+           pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_1')
+    ORDER BY polname;
+    SELECT pol.polname, r.rolname
+    FROM pg_policy pol JOIN pg_roles r ON r.oid = ANY (pol.polroles)
+    WHERE pol.polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_1')
+    ORDER BY 1, 2;
+}
+expect {
+    p_all|*|t|public|(owner = CURRENT_USER)|
+    p_delete|d|t|public|(NOT published)|
+    p_insert|a|t|named roles||(id > 0)
+    p_select|r|f|named roles|published|
+    p_update|w|t|public|(id > 0)|((id < 100) AND (owner IS NOT NULL))
+    p_insert|pp_alice_1
+    p_select|pp_alice_1
+    p_select|pp_bob_1
+}
+
+test pg-policy-prints-conditions-as-postgres-does {
+    CREATE TABLE pp_docs_2 (id INT, owner TEXT, published BOOLEAN, n BIGINT,
+                            v VARCHAR(10), "Weird Col" INT, price NUMERIC(10, 2));
+    CREATE POLICY p1 ON pp_docs_2 USING (pp_docs_2.owner = (SELECT current_user));
+    CREATE POLICY p2 ON pp_docs_2 USING (true) WITH CHECK (false);
+    CREATE POLICY p3 ON pp_docs_2 USING (NOT published OR id IN (1, 2));
+    CREATE POLICY p4 ON pp_docs_2 USING (owner = 'a''b' AND v = 'x' AND n > 5 AND id = -1);
+    CREATE POLICY p5 ON pp_docs_2 USING ("Weird Col" IS NULL OR id IS NOT NULL);
+    CREATE POLICY p6 ON pp_docs_2
+        USING (id + 1 * 2 > 3 AND lower(owner) <> 'x' AND owner LIKE 'a%');
+    CREATE POLICY p7 ON pp_docs_2
+        USING (session_user = owner AND id BETWEEN 1 AND 3 AND price > 1.5);
+    CREATE POLICY p8 ON pp_docs_2
+        USING ((id > 0 AND id < 5) OR (id > 10 AND (id < 20 OR id = 30)));
+    CREATE POLICY p9 ON pp_docs_2
+        USING (coalesce(id, 0) = 0 AND owner IN ('a', 'b') AND id NOT IN (1) AND id != 3);
+    CREATE POLICY p10 ON pp_docs_2
+        USING (current_user = 'x' AND id = 2147483648 AND current_role = owner);
+    SELECT polname, pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_2')
+    ORDER BY length(polname), polname;
+}
+expect {
+    p1|(owner = ( SELECT CURRENT_USER AS "current_user"))|
+    p2|true|false
+    p3|((NOT published) OR (id = ANY (ARRAY[1, 2])))|
+    p4|((owner = 'a''b'::text) AND ((v)::text = 'x'::text) AND (n > 5) AND (id = '-1'::integer))|
+    p5|(("Weird Col" IS NULL) OR (id IS NOT NULL))|
+    p6|(((id + (1 * 2)) > 3) AND (lower(owner) <> 'x'::text) AND (owner ~~ 'a%'::text))|
+    p7|((SESSION_USER = owner) AND ((id >= 1) AND (id <= 3)) AND (price > 1.5))|
+    p8|(((id > 0) AND (id < 5)) OR ((id > 10) AND ((id < 20) OR (id = 30))))|
+    p9|((COALESCE(id, 0) = 0) AND (owner = ANY (ARRAY['a'::text, 'b'::text])) AND (id <> 1) AND (id <> 3))|
+    p10|((CURRENT_USER = 'x'::name) AND (id = '2147483648'::bigint) AND (CURRENT_ROLE = owner))|
+}
+
+# PostgreSQL casts the narrower of two number types to the wider one, the
+# elements of an IN list to the widest type of the list, and a varchar
+# argument of a text function to text, and prints each cast.
+test pg-policy-prints-implicit-casts-as-postgres-does {
+    CREATE TABLE pp_docs_9 (id INT, s SMALLINT, n BIGINT, m NUMERIC(10, 2), v VARCHAR(10),
+                            t TEXT);
+    CREATE POLICY p1 ON pp_docs_9 USING (n IN (1, -2) AND id IN (1, 3000000000));
+    CREATE POLICY p2 ON pp_docs_9 USING (m = 1 AND m = id AND m = n AND id > 1.5);
+    CREATE POLICY p3 ON pp_docs_9 USING (m + 1 > 2 AND m IN (1.5, 2) AND m BETWEEN 1 AND 2);
+    CREATE POLICY p4 ON pp_docs_9 USING (s = 1 AND s IN (1, 2) AND s = id AND id + n > 1);
+    CREATE POLICY p5 ON pp_docs_9 USING (upper(v) = 'A' AND length(v) > 1 AND v = t);
+    CREATE POLICY p6 ON pp_docs_9 USING (coalesce(id, n) = 0 AND coalesce(m, 0) = 0);
+    CREATE POLICY p7 ON pp_docs_9 USING (n NOT IN (1, 2) AND abs(id) > 1 AND -n > 1);
+    SELECT polname, pg_get_expr(polqual, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_9')
+    ORDER BY polname;
+}
+expect {
+    p1|((n = ANY (ARRAY[(1)::bigint, ('-2'::integer)::bigint])) AND (id = ANY (ARRAY[(1)::bigint, '3000000000'::bigint])))
+    p2|((m = (1)::numeric) AND (m = (id)::numeric) AND (m = (n)::numeric) AND ((id)::numeric > 1.5))
+    p3|(((m + (1)::numeric) > (2)::numeric) AND (m = ANY (ARRAY[1.5, (2)::numeric])) AND ((m >= (1)::numeric) AND (m <= (2)::numeric)))
+    p4|((s = 1) AND (s = ANY (ARRAY[1, 2])) AND (s = id) AND ((id + n) > 1))
+    p5|((upper((v)::text) = 'A'::text) AND (length((v)::text) > 1) AND ((v)::text = t))
+    p6|((COALESCE((id)::bigint, n) = 0) AND (COALESCE(m, (0)::numeric) = (0)::numeric))
+    p7|((n <> ALL (ARRAY[(1)::bigint, (2)::bigint])) AND (abs(id) > 1) AND ((- n) > 1))
+}
+
+# A condition that tursopg cannot print as pg_get_expr does is shown as
+# CREATE POLICY wrote it, which PostgreSQL reads back, rather than as the
+# engine's SQL.
+test pg-policy-shows-conditions-it-cannot-print-as-written {
+    CREATE TABLE pp_docs_10 (id INT, owner TEXT, v VARCHAR(10));
+    CREATE POLICY p1 ON pp_docs_10 USING (owner LIKE 'a%' AND v IN ('a', 'b'));
+    CREATE POLICY p2 ON pp_docs_10 USING (owner ILIKE 'A%') WITH CHECK (id::text = owner);
+    SELECT polname, pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_10')
+    ORDER BY polname;
+}
+expect {
+    p1|((owner ~~ 'a%'::text) AND ((v)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])))|
+    p2|(owner ~~* 'A%'::text)|((id)::text = owner)
+}
+expect @tursopg {
+    p1|owner LIKE 'a%' AND v IN ('a', 'b')|
+    p2|owner ILIKE 'A%'|id::text = owner
+}
+
+test pg-policy-shows-quoted-and-mixed-case-names {
+    CREATE TABLE "PP Docs 3" ("Owner" TEXT, id INT);
+    CREATE POLICY "Own Rows" ON "PP Docs 3" FOR SELECT
+        USING ("Owner" = current_user AND id > 0);
+    CREATE POLICY own_rows ON "PP Docs 3" USING (true);
+    SELECT polname, pg_get_expr(polqual, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'PP Docs 3')
+    ORDER BY polname;
+}
+expect {
+    Own Rows|(("Owner" = CURRENT_USER) AND (id > 0))
+    own_rows|true
+}
+
+test pg-policy-oids-are-distinct-and-kept-after-renaming-the-table {
+    CREATE TABLE pp_docs_4 (id INT, owner TEXT);
+    CREATE POLICY a ON pp_docs_4 USING (owner = current_user);
+    CREATE POLICY b ON pp_docs_4 USING (true);
+    CREATE TABLE pp_saved_4 AS
+        SELECT oid AS policy_oid, polrelid AS table_oid, polname FROM pg_policy
+        WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_4');
+    ALTER TABLE pp_docs_4 RENAME TO pp_renamed_4;
+    SELECT count(DISTINCT policy_oid) FROM pp_saved_4 WHERE policy_oid <> table_oid;
+    SELECT s.polname, c.relname, pg_get_expr(p.polqual, p.polrelid)
+    FROM pp_saved_4 s
+    JOIN pg_policy p
+        ON p.oid = s.policy_oid AND p.polrelid = s.table_oid AND p.polname = s.polname
+    JOIN pg_class c ON c.oid = p.polrelid
+    ORDER BY s.polname;
+}
+expect {
+    2
+    a|pp_renamed_4|(owner = CURRENT_USER)
+    b|pp_renamed_4|true
+}
+
+test pg-policy-rows-are-gone-after-drop-policy-and-drop-table {
+    CREATE TABLE pp_docs_5 (id INT);
+    CREATE TABLE pp_other_5 (id INT);
+    CREATE POLICY dropped ON pp_docs_5 USING (true);
+    CREATE POLICY kept ON pp_docs_5 USING (true);
+    CREATE POLICY with_table ON pp_other_5 USING (true);
+    CREATE TABLE pp_saved_5 AS
+        SELECT oid AS table_oid FROM pg_class WHERE relname IN ('pp_docs_5', 'pp_other_5');
+    DROP POLICY dropped ON pp_docs_5;
+    DROP TABLE pp_other_5;
+    SELECT polname FROM pg_policy
+    WHERE polrelid IN (SELECT table_oid FROM pp_saved_5)
+    ORDER BY polname;
+}
+expect {
+    kept
+}
+
+test pg-policy-rows-are-rolled-back-with-their-transaction {
+    CREATE TABLE pp_docs_6 (id INT);
+    CREATE POLICY kept ON pp_docs_6 USING (true);
+    BEGIN;
+    CREATE POLICY rolled_back ON pp_docs_6 USING (true);
+    DROP POLICY kept ON pp_docs_6;
+    SELECT polname FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_6');
+    ROLLBACK;
+    SELECT polname FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_6');
+}
+expect {
+    rolled_back
+    kept
+}
+
+test pg-policies-shows-each-policy {
+    CREATE ROLE pp_alice_7;
+    CREATE ROLE "PP Bob 7";
+    CREATE SCHEMA pp_schema_7;
+    CREATE TABLE pp_schema_7.pp_docs_7 (id INT, owner TEXT);
+    CREATE POLICY p_all ON pp_schema_7.pp_docs_7
+        USING (owner = current_user) WITH CHECK (id > 0);
+    CREATE POLICY p_select ON pp_schema_7.pp_docs_7 AS RESTRICTIVE FOR SELECT
+        TO pp_alice_7, "PP Bob 7" USING (id < 10);
+    CREATE POLICY p_insert ON pp_schema_7.pp_docs_7 FOR INSERT TO pp_alice_7
+        WITH CHECK (true);
+    CREATE POLICY p_update ON pp_schema_7.pp_docs_7 FOR UPDATE TO PUBLIC USING (true);
+    CREATE POLICY "P Delete" ON pp_schema_7.pp_docs_7 FOR DELETE USING (false);
+    SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check
+    FROM pg_catalog.pg_policies
+    WHERE tablename = 'pp_docs_7'
+    ORDER BY policyname;
+}
+expect {
+    pp_schema_7|pp_docs_7|P Delete|PERMISSIVE|{public}|DELETE|false|
+    pp_schema_7|pp_docs_7|p_all|PERMISSIVE|{public}|ALL|(owner = CURRENT_USER)|(id > 0)
+    pp_schema_7|pp_docs_7|p_insert|PERMISSIVE|{pp_alice_7}|INSERT||true
+    pp_schema_7|pp_docs_7|p_select|RESTRICTIVE|{"PP Bob 7",pp_alice_7}|SELECT|(id < 10)|
+    pp_schema_7|pp_docs_7|p_update|PERMISSIVE|{public}|UPDATE|true|
+}
+
+test pg-policies-follows-renamed-and-dropped-tables {
+    CREATE TABLE pp_docs_8 (id INT);
+    CREATE TABLE pp_other_8 (id INT);
+    CREATE POLICY kept ON pp_docs_8 USING (id = 1);
+    CREATE POLICY dropped ON pp_docs_8 USING (id = 2);
+    CREATE POLICY with_table ON pp_other_8 USING (id = 3);
+    ALTER TABLE pp_docs_8 RENAME TO pp_renamed_8;
+    DROP POLICY dropped ON pp_renamed_8;
+    DROP TABLE pp_other_8;
+    SELECT tablename, policyname, qual FROM pg_policies
+    WHERE tablename IN ('pp_docs_8', 'pp_renamed_8', 'pp_other_8')
+    ORDER BY policyname;
+}
+expect {
+    pp_renamed_8|kept|(id = 1)
+}

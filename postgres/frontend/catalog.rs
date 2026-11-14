@@ -13,9 +13,10 @@ use turso_core::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
         AUTOINCREMENT_SEQ_PREFIX,
     },
+    security::policy::RowPolicy,
     security::roles::RoleId,
-    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
-    OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
+    text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
+    NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
@@ -424,11 +425,17 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
 fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+    pg_type_oid(ty_str).unwrap_or(25) // default to text
+}
+
+/// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
+/// for a type name tursopg does not know.
+pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
     };
-    match base.to_uppercase().as_str() {
+    let oid = match base.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" => 23,
         "SMALLINT" | "INT2" => 21,
         "BIGINT" | "INT8" => 20,
@@ -451,8 +458,9 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
-        _ => 25, // default to text
-    }
+        _ => return None,
+    };
+    Some(oid)
 }
 
 /// The oid of relation `name` of `namespace`, from its stored class row.
@@ -1419,6 +1427,175 @@ impl SnapshotRows for PgTablesTable {
 
         rows
     }
+}
+
+#[derive(Debug)]
+struct PgPolicyTable;
+
+impl SnapshotRows for PgPolicyTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_policy (
+            oid INTEGER,
+            polname TEXT,
+            polrelid INTEGER,
+            polcmd TEXT,
+            polpermissive BOOLEAN,
+            polroles INTEGER[],
+            polqual TEXT,
+            polwithcheck TEXT,
+            tableoid INTEGER HIDDEN
+        )";
+    /// PostgreSQL's oid of pg_policy.
+    const TABLE_OID: Option<i64> = Some(3256);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    /// `polqual` and `polwithcheck` hold the conditions as text, which
+    /// `pg_get_expr` returns as it is.
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        catalog_policies(&schema)
+            .into_iter()
+            .map(|policy| {
+                let roles = policy
+                    .roles
+                    .iter()
+                    .map(|role| role_oid(*role).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    Value::from_i64(policy.oid),
+                    Value::build_text(policy.policy.name.clone()),
+                    Value::from_i64(policy.table_oid),
+                    Value::build_text(
+                        crate::policies::command_letter(policy.policy.command).to_string(),
+                    ),
+                    Value::from_i64(i64::from(policy.policy.permissive)),
+                    Value::build_text(format!("{{{roles}}}")),
+                    policy.qual.map_or(Value::Null, Value::build_text),
+                    policy.with_check.map_or(Value::Null, Value::build_text),
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgPoliciesTable;
+
+impl SnapshotRows for PgPoliciesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_policies (
+            schemaname TEXT,
+            tablename TEXT,
+            policyname TEXT,
+            permissive TEXT,
+            roles TEXT[],
+            cmd TEXT,
+            qual TEXT,
+            with_check TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    /// As PostgreSQL's view: `roles` is `{public}` for PUBLIC and the role
+    /// names in order otherwise.
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let role_catalog = schema_roles(&schema);
+        catalog_policies(&schema)
+            .into_iter()
+            .map(|policy| {
+                let mut roles: Vec<String> = if policy.roles == [RoleId::PUBLIC] {
+                    vec!["public".to_string()]
+                } else {
+                    policy
+                        .roles
+                        .iter()
+                        .filter_map(|role| role_name_by_oid(role_catalog, role_oid(*role)))
+                        .collect()
+                };
+                roles.sort();
+                let permissive = if policy.policy.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                };
+                let command = match policy.policy.command {
+                    ast::PolicyCommand::All => "ALL",
+                    ast::PolicyCommand::Select => "SELECT",
+                    ast::PolicyCommand::Insert => "INSERT",
+                    ast::PolicyCommand::Update => "UPDATE",
+                    ast::PolicyCommand::Delete => "DELETE",
+                };
+                vec![
+                    Value::build_text(schema_name_of(&schema, policy.namespace).to_string()),
+                    Value::build_text(policy.table_name.to_string()),
+                    Value::build_text(policy.policy.name.clone()),
+                    Value::build_text(permissive),
+                    Value::build_text(text_array_literal(roles.iter().map(String::as_str))),
+                    Value::build_text(command),
+                    policy.qual.map_or(Value::Null, Value::build_text),
+                    policy.with_check.map_or(Value::Null, Value::build_text),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// A row-level security policy as the catalogs show it.
+struct CatalogPolicy<'a> {
+    oid: i64,
+    table_oid: i64,
+    namespace: NamespaceId,
+    table_name: &'a str,
+    policy: &'a RowPolicy,
+    /// The roles the policy applies to: only [`RoleId::PUBLIC`] when it is
+    /// one of them, as PostgreSQL stores them.
+    roles: Vec<RoleId>,
+    /// The `USING` condition as PostgreSQL prints it.
+    qual: Option<String>,
+    /// The `WITH CHECK` condition as PostgreSQL prints it.
+    with_check: Option<String>,
+}
+
+/// The policies of every table, ordered by table oid and then as created.
+fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
+    let Some(catalog) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
+    let mut policies = Vec::new();
+    for class in catalog.classes() {
+        if class.relpolicies.is_empty() {
+            continue;
+        }
+        let Some(table) = schema.get_btree_table(class.relnamespace, &class.relname) else {
+            continue;
+        };
+        // A condition the printer cannot print as pg_get_expr does is shown
+        // as CREATE POLICY wrote it, which PostgreSQL also reads.
+        let condition_text = |condition: &Option<ast::Expr>, written: &Option<String>| {
+            let condition = condition.as_ref()?;
+            crate::deparse::condition_text(condition, &table).or_else(|| written.clone())
+        };
+        for (details, policy) in class.relpolicies.iter() {
+            let roles = if policy.roles.contains(&RoleId::PUBLIC) {
+                vec![RoleId::PUBLIC]
+            } else {
+                policy.roles.clone()
+            };
+            policies.push(CatalogPolicy {
+                oid: details.oid,
+                table_oid: class.oid,
+                namespace: class.relnamespace,
+                table_name: &class.relname,
+                policy,
+                roles,
+                qual: condition_text(&policy.using_expr, &details.using_sql),
+                with_check: condition_text(&policy.check_expr, &details.check_sql),
+            });
+        }
+    }
+    policies
 }
 
 #[derive(Debug)]
@@ -2632,7 +2809,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        SnapshotCatalog::<PgPolicyTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_policies",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgPoliciesTable>(PhantomData),
     );
     options = options.native_module(
         "pg_trigger",
@@ -4369,6 +4551,7 @@ mod tests {
             "pg_settings",
             "pg_extension",
             "pg_policy",
+            "pg_policies",
             "pg_trigger",
             "pg_statistic_ext",
             "pg_inherits",

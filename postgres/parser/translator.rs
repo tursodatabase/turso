@@ -1058,6 +1058,8 @@ impl PostgreSQLTranslator {
             .as_ref()
             .map(|expr| self.translate_expr(expr).map(Box::new))
             .transpose()?;
+        let using_sql = policy.qual.as_deref().map(deparse_expr).transpose()?;
+        let check_sql = policy.with_check.as_deref().map(deparse_expr).transpose()?;
         Ok(ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
             policy_name: ast::Name::exact(policy.policy_name.clone()),
             tbl_name: self.qualified_name_from_range_var(table)?,
@@ -1066,6 +1068,8 @@ impl PostgreSQLTranslator {
             roles: policy_roles(&policy.roles)?,
             using_expr,
             check_expr,
+            using_sql,
+            check_sql,
         })))
     }
 
@@ -5963,6 +5967,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_amproc"
             | "pg_tables"
             | "pg_indexes"
+            | "pg_policies"
     )
 }
 
@@ -5972,7 +5977,13 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 pub fn is_catalog_view_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "pg_roles" | "pg_seclabels" | "pg_sequences" | "pg_settings" | "pg_tables" | "pg_indexes"
+        "pg_roles"
+            | "pg_seclabels"
+            | "pg_sequences"
+            | "pg_settings"
+            | "pg_tables"
+            | "pg_indexes"
+            | "pg_policies"
     )
 }
 
@@ -6613,6 +6624,32 @@ fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>,
             }
         })
         .collect()
+}
+
+/// `expr` as PostgreSQL SQL, as pg_query prints it in `SELECT expr`.
+fn deparse_expr(expr: &pg_query::protobuf::Node) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{LimitOption, ResTarget, SelectStmt, SetOperation};
+
+    let select = Node::SelectStmt(Box::new(SelectStmt {
+        target_list: vec![pg_query::protobuf::Node {
+            node: Some(Node::ResTarget(Box::new(ResTarget {
+                val: Some(Box::new(expr.clone())),
+                ..Default::default()
+            }))),
+        }],
+        op: SetOperation::SetopNone as i32,
+        limit_option: LimitOption::Default as i32,
+        ..Default::default()
+    }));
+    let sql = select
+        .deparse()
+        .map_err(|e| ParseError::ParseError(e.to_string()))?;
+    sql.strip_prefix("SELECT ")
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ParseError::ParseError(format!("unexpected deparse of an expression: {sql}"))
+        })
 }
 
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with

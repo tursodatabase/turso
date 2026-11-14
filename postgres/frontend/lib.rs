@@ -3,6 +3,7 @@ mod auth_functions;
 mod catalog;
 mod classes;
 mod copy;
+mod deparse;
 mod error;
 mod functions;
 mod open;

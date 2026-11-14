@@ -1005,6 +1005,65 @@ fn a_catalog_made_before_relpolicies_opens_read_only_without_the_column() {
     assert!(error.contains("readonly"), "{error}");
 }
 
+#[test]
+fn policies_take_oids_from_the_relation_oid_counter_and_keep_them_across_a_reopen() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    pg.execute("CREATE POLICY first ON t USING (x = 1)")
+        .unwrap();
+    pg.execute("CREATE POLICY second ON t USING (x = 2)")
+        .unwrap();
+    pg.execute("CREATE TABLE u (x INTEGER)").unwrap();
+    assert_eq!(
+        stored_policy_oids(&conn, "t"),
+        vec![("first".to_string(), 16385), ("second".to_string(), 16386)]
+    );
+    assert_eq!(class_row(&conn, "u").unwrap().0, 16387);
+
+    // The dropped policy had the highest oid, which is not used again.
+    pg.execute("DROP POLICY second ON t").unwrap();
+    pg.execute("CREATE POLICY third ON t USING (x = 3)")
+        .unwrap();
+    assert_eq!(
+        stored_policy_oids(&conn, "t"),
+        vec![("first".to_string(), 16385), ("third".to_string(), 16388)]
+    );
+
+    drop(pg);
+    drop(conn);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE POLICY fourth ON t USING (x = 4)")
+        .unwrap();
+    assert_eq!(
+        stored_policy_oids(&conn, "t"),
+        vec![
+            ("first".to_string(), 16385),
+            ("third".to_string(), 16388),
+            ("fourth".to_string(), 16389)
+        ]
+    );
+}
+
+/// The policies of `relname` as `(polname, oid)`, read from the catalog
+/// table.
+fn stored_policy_oids(conn: &Arc<Connection>, relname: &str) -> Vec<(String, i64)> {
+    conn.prepare(format!(
+        "SELECT json_extract(p.value, '$.polname'), json_extract(p.value, '$.oid') \
+         FROM __turso_internal_classes c, json_each(c.relpolicies) p \
+         WHERE c.relname = '{relname}' ORDER BY p.key"
+    ))
+    .unwrap()
+    .run_collect_rows()
+    .unwrap()
+    .into_iter()
+    .map(|row| (row[0].to_string(), row[1].as_int().unwrap()))
+    .collect()
+}
+
 /// A table without a class row is one the engine made for itself. Nobody
 /// granted a role anything on it.
 #[test]
