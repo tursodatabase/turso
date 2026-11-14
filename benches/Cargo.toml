@@ -64,6 +64,11 @@ path = "mvcc_recovery_benchmark.rs"
 harness = false
 
 [[bench]]
+name = "mvcc_checkpoint_benchmark"
+path = "mvcc_checkpoint_benchmark.rs"
+harness = false
+
+[[bench]]
 name = "checkpoint_n_rows"
 path = "checkpoint_n_rows.rs"
 harness = false
