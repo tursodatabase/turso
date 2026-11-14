@@ -1502,9 +1502,10 @@ impl ScalarFunc {
         )
     }
 
-    /// Returns the valid arities for this function.
+    /// Returns the valid arities for this function, encoded like SQLite's `narg`.
     /// Each value becomes a separate row in PRAGMA function_list.
-    /// -1 means truly variable arguments (e.g. coalesce, printf).
+    /// -1 means any number of arguments (e.g. printf), and N <= -2 means at
+    /// least -(N + 2) arguments (e.g. -4 for coalesce, which needs two).
     pub fn arities(&self) -> &'static [i32] {
         match self {
             // 0-arg
@@ -1551,12 +1552,11 @@ impl ScalarFunc {
             Self::Like => &[2, 3],
             Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
             Self::Substr | Self::Substring => &[2, 3],
+            // Variable-arg with a minimum argument count
+            Self::Concat => &[-3],
+            Self::Coalesce | Self::Iif | Self::ConcatWs => &[-4],
             // Truly variable-arg
             Self::Char
-            | Self::Coalesce
-            | Self::Iif
-            | Self::Concat
-            | Self::ConcatWs
             | Self::Date
             | Self::Time
             | Self::DateTime
@@ -1579,7 +1579,7 @@ impl ScalarFunc {
             Self::TableColumnsJsonArray | Self::ConnTxnId => &[1],
             Self::BinRecordJsonObject => &[2],
             // Scalar max/min (multi-arg)
-            Self::Max | Self::Min => &[-1],
+            Self::Max | Self::Min => &[-3],
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],
@@ -2124,7 +2124,7 @@ impl Func {
         funcs.push(FunctionListEntry {
             name: "if".into(),
             func_type: "s",
-            narg: -1,
+            narg: -4,
             deterministic: true,
         });
 
@@ -2135,6 +2135,6 @@ impl Func {
 pub struct FunctionListEntry {
     pub name: String,
     pub func_type: &'static str, // "s" = scalar, "a" = aggregate, "w" = window
-    pub narg: i32,               // -1 = variable
+    pub narg: i32,               // -1 = variable, N <= -2 = at least -(N + 2)
     pub deterministic: bool,
 }

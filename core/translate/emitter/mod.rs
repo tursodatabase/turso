@@ -653,6 +653,18 @@ impl<'a> Resolver<'a> {
             .unwrap_or_default()
     }
 
+    /// Number of queries collecting aggregates from their subqueries.
+    pub(crate) fn aggregate_collecting_depth(&self) -> usize {
+        self.enclosing_query_aggregates.borrow().len()
+    }
+
+    /// Drops the collections that queries planned after
+    /// [`Self::aggregate_collecting_depth`] returned `depth` began and did not
+    /// take because their planning failed.
+    pub(crate) fn stop_collecting_aggregates_above(&self, depth: usize) {
+        self.enclosing_query_aggregates.borrow_mut().truncate(depth);
+    }
+
     /// Number of aggregates moved up so far to the innermost collecting query.
     pub(crate) fn count_aggregates_moved_from_subqueries(&self) -> usize {
         self.enclosing_query_aggregates

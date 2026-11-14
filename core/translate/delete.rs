@@ -348,6 +348,7 @@ pub fn prepare_delete_plan(
         &mut table_references,
         None,
         &mut where_predicates,
+        false,
         resolver,
     )?;
     // Plan subqueries in RETURNING expressions before processing
