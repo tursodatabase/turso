@@ -1,10 +1,12 @@
 use crate::functions::validate_pg_input;
+use crate::numeric::{cast_value_to_integer, IntegerWidth};
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use turso_core::schema::RelationKind;
+use turso_core::schema::{RelationKind, ResolvedType};
+use turso_core::ProgramState;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     namespace::mangle_name,
@@ -17,6 +19,7 @@ use turso_core::{
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
     OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
+use turso_core::{Insn, Numeric, ProgramBuilder};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
@@ -352,6 +355,185 @@ impl Dialect for PostgresDialect {
 
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
+    }
+
+    fn inject_cast_metadata(
+        &self,
+        program: &mut ProgramBuilder,
+        type_name: &Option<ast::Type>,
+        target_register: usize,
+        schema: &Schema,
+    ) -> Result<()> {
+        let Some(type_name) = type_name.as_ref() else {
+            return Ok(());
+        };
+
+        let name = type_name.name.as_str();
+
+        // First check whether this is a direct PostgreSQL integer type.
+        let integer_width = match name.to_ascii_uppercase().as_str() {
+            "INT2" | "SMALLINT" => Some(IntegerWidth::Int16),
+            "INT4" | "INTEGER" | "INT" => Some(IntegerWidth::Int32),
+            "INT8" | "BIGINT" => Some(IntegerWidth::Int64),
+            _ => None,
+        };
+
+        // For domains, resolve the actual base type.
+        // Only PostgreSQL integer domains should receive metadata.
+        let domain_name = if integer_width.is_none() {
+            let Some(resolved) = schema.resolve_type_unchecked(name)? else {
+                return Ok(());
+            };
+
+            if integer_width_from_domain(&resolved).is_none() {
+                return Ok(());
+            }
+
+            Some(name.to_string())
+        } else {
+            None
+        };
+
+        let metadata_reg_first = program.alloc_registers(2);
+
+        // Preserve the original operand.
+        program.emit_insn(Insn::Copy {
+            src_reg: target_register,
+            dst_reg: metadata_reg_first,
+            extra_amount: 0,
+        });
+
+        // Store either the direct integer width or the domain name.
+        if let Some(width) = integer_width {
+            program.emit_insn(Insn::Int64 {
+                _p1: 0,
+                out_reg: metadata_reg_first + 1,
+                _p3: 0,
+                value: width as i64,
+            });
+        } else if let Some(domain_name) = domain_name {
+            program.emit_insn(Insn::String8 {
+                value: domain_name,
+                dest: metadata_reg_first + 1,
+            });
+        }
+
+        // Replace the target register with the metadata pointer.
+        program.emit_insn(Insn::Int64 {
+            _p1: 0,
+            out_reg: target_register,
+            _p3: 0,
+            value: metadata_reg_first as i64,
+        });
+
+        Ok(())
+    }
+
+    // assumes pointer semantics for to integer casting, i.e, passed value contains the register id to two contiguous registers where the first register is operand and the second register is the integer width
+    fn cast_to_integer(
+        &self,
+        value: &Value,
+        program: &ProgramState,
+        schema: &Schema,
+    ) -> Result<Value> {
+        let Value::Numeric(Numeric::Integer(pointer)) = value else {
+            unreachable!(
+                "pointer semantics contract enforces target register to contain an index to the operand register index for postgres integer casts"
+            );
+        };
+
+        let operand = program.get_register(*pointer as usize).get_value();
+
+        let metadata = program.get_register((*pointer + 1) as usize).get_value();
+
+        let integer_width = match metadata {
+            Value::Numeric(Numeric::Integer(width)) => {
+                IntegerWidth::try_from(*width).map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "invalid PostgreSQL integer width metadata: {width}"
+                    ))
+                })?
+            }
+
+            Value::Text(domain_name) => {
+                let resolved = schema
+                    .resolve_type_unchecked(domain_name.as_ref())?
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "PostgreSQL domain {domain_name} is not registered"
+                        ))
+                    })?;
+
+                integer_width_from_resolved_type(&resolved)?
+            }
+
+            _ => {
+                return Err(LimboError::InternalError(
+                    "invalid PostgreSQL integer cast metadata".to_string(),
+                ));
+            }
+        };
+
+        cast_value_to_integer(operand, integer_width)
+    }
+}
+
+fn integer_width_from_domain(resolved: &ResolvedType) -> Option<IntegerWidth> {
+    if !resolved.is_domain() {
+        return None;
+    }
+
+    // Find the registered builtin base type, skipping the domain itself.
+    // This also handles nested domains.
+    if let Some(base_type) = resolved.chain.iter().skip(1).find(|td| td.is_builtin) {
+        return match base_type.name.to_ascii_lowercase().as_str() {
+            "smallint" | "int2" => Some(IntegerWidth::Int16),
+            "integer" | "int4" | "int" => Some(IntegerWidth::Int32),
+            "bigint" | "int8" => Some(IntegerWidth::Int64),
+            _ => None,
+        };
+    }
+
+    // int4 is represented directly as the terminal primitive because
+    // it does not have a registered builtin TypeDef.
+    match resolved.primitive.to_ascii_lowercase().as_str() {
+        "smallint" | "int2" => Some(IntegerWidth::Int16),
+        "integer" | "int4" | "int" => Some(IntegerWidth::Int32),
+        "bigint" | "int8" => Some(IntegerWidth::Int64),
+        _ => None,
+    }
+}
+
+fn integer_width_from_resolved_type(resolved: &ResolvedType) -> Result<IntegerWidth> {
+    // int2 and int8 are registered as aliases for the built-in
+    // smallint and bigint types. Their width is identified through
+    // the builtin TypeDef in the resolved chain.
+    for type_def in &resolved.chain {
+        if !type_def.is_builtin {
+            continue;
+        }
+
+        return match type_def.name.to_ascii_lowercase().as_str() {
+            "smallint" | "int2" => Ok(IntegerWidth::Int16),
+            "bigint" | "int8" => Ok(IntegerWidth::Int64),
+
+            // Do not infer integer width from the storage primitive
+            // of another builtin type (e.g. boolean is stored as integer).
+            name => Err(LimboError::InternalError(format!(
+                "unsupported PostgreSQL integer domain base type: {name}"
+            ))),
+        };
+    }
+
+    // int4 is not registered as a builtin custom type, so it appears
+    // directly as the terminal primitive.
+    match resolved.primitive.to_ascii_lowercase().as_str() {
+        "int4" | "integer" | "int" => Ok(IntegerWidth::Int32),
+        "int2" | "smallint" => Ok(IntegerWidth::Int16),
+        "int8" | "bigint" => Ok(IntegerWidth::Int64),
+        primitive => Err(LimboError::InternalError(format!(
+            "unsupported PostgreSQL integer domain base type: {primitive}"
+        ))),
     }
 }
 

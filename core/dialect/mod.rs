@@ -22,7 +22,7 @@ use crate::{
     namespace::NamespaceId,
     schema::{BTreeTable, RelationKind, Schema},
     security::{policy::RowPolicy, roles::RoleId},
-    vdbe::{builder::ProgramBuilder, Register},
+    vdbe::{builder::ProgramBuilder, ProgramState, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
@@ -602,6 +602,20 @@ pub trait Dialect: Send + Sync + 'static {
     /// replace the constraint error.
     fn constraint_errors_show_values(&self) -> bool {
         false
+    }
+
+    fn cast_to_integer(&self, value: &Value, _: &ProgramState, _: &Schema) -> Result<Value> {
+        Ok(value.exec_cast("INTEGER")?)
+    }
+
+    fn inject_cast_metadata(
+        &self,
+        _: &mut ProgramBuilder,
+        _: &Option<ast::Type>,
+        _: usize,
+        _: &Schema,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 

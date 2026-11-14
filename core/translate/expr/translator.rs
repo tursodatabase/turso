@@ -874,10 +874,23 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
+            let _ = resolver.catalog.dialect.inject_cast_metadata(
+                program,
+                type_name,
+                target_register,
+                resolver.schema(),
+            );
             emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
     }
+
+    let _ = resolver.catalog.dialect.inject_cast_metadata(
+        program,
+        type_name,
+        target_register,
+        resolver.schema(),
+    );
 
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
     let type_affinity = cast_type_name
@@ -1127,6 +1140,22 @@ fn translate_function_call_expr(
                 arg_count: total_count,
                 ..func_ctx
             };
+            emit_function_call(program, func_ctx, &arg_registers, target_register)?;
+
+            Ok(target_register)
+        }
+        Func::DialectInPlace(_) => {
+            assert_eq!(args_count, 1);
+
+            translate_expr(
+                program,
+                referenced_tables,
+                &args[0],
+                target_register,
+                resolver,
+            )?;
+
+            let arg_registers = vec![target_register];
             emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 
             Ok(target_register)
