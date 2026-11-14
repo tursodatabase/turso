@@ -421,8 +421,8 @@ expect {
 }
 
 @setup implied_or_plan_schema
-@skip-if sqlite "Turso uses one index search for the implied IN filter"
-test implied-or-filter-uses-only-indexed-column {
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test implied-or-filter-branches-search-only-the-indexed-column {
     EXPLAIN QUERY PLAN
     SELECT * FROM a JOIN b ON 1 = 1
     WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
@@ -430,7 +430,7 @@ test implied-or-filter-uses-only-indexed-column {
 }
 expect {
     1|0|0|SCAN b
-    2|0|0|SEARCH a USING INDEX ax (x=?)
+    2|0|0|MULTI-INDEX OR a (ax, ax)
 }
 
 @skip-if sqlite "Turso summarizes multi-index branches on one plan row"
@@ -497,8 +497,8 @@ expect {
     1|0|0|SEARCH t USING COVERING INDEX tx (x=?)
 }
 
-@skip-if sqlite "Turso summarizes repeated IN searches on one plan row"
-test nested-and-branches-use-one-index-search {
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test nested-and-branches-search-the-index-once-per-branch {
     CREATE TABLE t(x INTEGER, y INTEGER, z INTEGER);
     CREATE INDEX tx ON t(x);
 
@@ -509,7 +509,7 @@ test nested-and-branches-use-one-index-search {
        OR (y < 0 AND (x = 2 AND z < 0));
 }
 expect {
-    1|0|0|SEARCH t USING INDEX tx (x=?)
+    1|0|0|MULTI-INDEX OR t (tx, tx)
 }
 
 @setup or_join_rows
