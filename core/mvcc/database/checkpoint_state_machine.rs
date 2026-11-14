@@ -3221,7 +3221,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         pending_delete_rowid: None,
                         pager: self.pager.clone(),
                         mvstore: self.mvstore.clone(),
-                        passive: matches!(self.mode, CheckpointMode::Passive { .. }),
+                        passive: self.mvstore.uses_passive_checkpoint(),
                         compacted: crate::alloc::vec![],
                     });
                 }
@@ -3295,7 +3295,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                 }
                 inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
-                if passive {
+                if self.mvstore.uses_passive_checkpoint() {
                     if !self.mvstore.try_begin_passive_publish_window() {
                         if passive_auto_publish_retry {
                             tracing::debug!(
