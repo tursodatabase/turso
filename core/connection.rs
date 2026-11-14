@@ -5828,6 +5828,68 @@ mod tests {
     }
 
     #[test]
+    fn test_ddl_in_one_transaction_changes_the_schema_in_place() {
+        fn schema_ptr(conn: &Connection, db: usize) -> *const Schema {
+            match db {
+                crate::MAIN_DB_ID => Arc::as_ptr(&conn.schema.read()),
+                crate::TEMP_DB_ID => {
+                    Arc::as_ptr(&conn.temp.database.read().as_ref().unwrap().db.schema.lock())
+                }
+                _ => Arc::as_ptr(&conn.database_schemas.read()[&db]),
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("main.db"));
+        let aux_path = temp_dir.path().join("aux.db");
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
+        let aux_id = conn.qualifier("aux").unwrap().database_id();
+
+        for (db, name) in [
+            (crate::MAIN_DB_ID, "main"),
+            (crate::TEMP_DB_ID, "temp"),
+            (aux_id, "aux"),
+        ] {
+            conn.execute("BEGIN").unwrap();
+            // The first DDL copies the schema, which the committed schema still shares.
+            conn.execute(format!("CREATE TABLE {name}.a(x)")).unwrap();
+            let private_schema = schema_ptr(&conn, db);
+            conn.execute(format!("CREATE TABLE {name}.b(x UNIQUE)"))
+                .unwrap();
+            conn.execute(format!("CREATE INDEX {name}.b_x ON b(x)"))
+                .unwrap();
+            conn.execute(format!(
+                "CREATE TRIGGER {name}.b_insert AFTER INSERT ON b BEGIN SELECT 1; END"
+            ))
+            .unwrap();
+            assert_eq!(
+                schema_ptr(&conn, db),
+                private_schema,
+                "DDL on {name} copied a schema that only this transaction uses"
+            );
+            conn.execute(format!("INSERT INTO {name}.b VALUES (1)"))
+                .unwrap();
+
+            conn.execute("SAVEPOINT sp").unwrap();
+            conn.execute(format!("CREATE TABLE {name}.c(x)")).unwrap();
+            conn.execute(format!("CREATE TABLE {name}.d(x)")).unwrap();
+            conn.execute("ROLLBACK TO sp").unwrap();
+            assert!(conn.execute(format!("SELECT * FROM {name}.c")).is_err());
+            assert!(conn.execute(format!("SELECT * FROM {name}.d")).is_err());
+            conn.execute(format!("SELECT * FROM {name}.b")).unwrap();
+
+            conn.execute("ROLLBACK").unwrap();
+            for object in ["a", "b"] {
+                assert!(
+                    conn.execute(format!("SELECT * FROM {name}.{object}"))
+                        .is_err(),
+                    "{name}.{object} survived ROLLBACK"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_temp_tables_are_connection_local_and_shadow_main() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("main.db");

@@ -14660,15 +14660,19 @@ pub fn op_page_count(
 /// resume later without losing intermediate parsing state.
 pub struct OpParseSchemaInner {
     stmt: crate::Statement,
-    schema_arc: Arc<Schema>,
-    from_sql_indexes: crate::alloc::Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
-    dbsp_state_roots: crate::HashMap<String, i64>,
-    dbsp_state_index_roots: crate::HashMap<String, i64>,
-    materialized_view_info: crate::HashMap<String, crate::schema::StoredMaterializedView>,
+    rows: crate::alloc::Vec<SchemaRow>,
     trigger_target_database_id: Option<usize>,
     db: usize,
     previous_auto_commit: bool,
+}
+
+/// A row of `sqlite_schema` read by ParseSchema.
+struct SchemaRow {
+    ty: String,
+    name: String,
+    tbl_name: String,
+    root_page: i64,
+    sql: Option<String>,
 }
 
 pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
@@ -14732,39 +14736,21 @@ pub fn op_parse_schema(
         .needs_stmt_subtransactions
         .store(false, Ordering::Relaxed);
 
-    // Get a mutable schema clone *without* holding the schema lock during
-    // nested statement execution.  The nested Statement may call reprepare()
-    // which also acquires the schema / database_schemas write lock, so holding
-    // it here would deadlock on the same thread (parking_lot RwLock is not
-    // re-entrant).
-    let schema_arc = if *db == crate::TEMP_DB_ID {
-        // TEMP: single source of truth is `temp_db.db.schema`. Skip
-        // `database_schemas` staging entirely — it would only go stale.
-        conn.temp
-            .database
+    if *db != crate::MAIN_DB_ID
+        && *db != crate::TEMP_DB_ID
+        && !conn
+            .attached_databases
             .read()
-            .as_ref()
-            .map(|temp_db| temp_db.db.schema.lock().clone())
-            .unwrap_or_else(|| conn.empty_temp_schema())
-    } else if *db != crate::MAIN_DB_ID {
-        let fallback_schema = {
-            let attached_dbs = conn.attached_databases.read();
-            let Some(entry) = attached_dbs.index_to_data.get(db) else {
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
-                return Err(LimboError::InternalError(format!(
-                    "stale reference to detached database (index {db})"
-                ))
-                .into());
-            };
-            let schema = entry.db.schema.lock().clone();
-            schema
-        };
-        let mut schemas = conn.database_schemas().write();
-        schemas.entry(*db).or_insert(fallback_schema).clone() // cheap Arc clone; write lock released at end of block
-    } else {
-        conn.schema.read().clone()
-    };
+            .index_to_data
+            .contains_key(db)
+    {
+        conn.auto_commit
+            .store(previous_auto_commit, Ordering::SeqCst);
+        return Err(LimboError::InternalError(format!(
+            "stale reference to detached database (index {db})"
+        ))
+        .into());
+    }
 
     // Set up MVCC transaction for the nested statement
     let mv_tx = program.connection.get_mv_tx();
@@ -14773,12 +14759,7 @@ pub fn op_parse_schema(
     // Store state for resumption across IO boundaries
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
-        schema_arc,
-        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)?,
-        automatic_indices: Default::default(),
-        dbsp_state_roots: Default::default(),
-        dbsp_state_index_roots: Default::default(),
-        materialized_view_info: Default::default(),
+        rows: TursoAllocExt::new(),
         trigger_target_database_id: *trigger_target_database_id,
         db: *db,
         previous_auto_commit,
@@ -14809,54 +14790,20 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     .as_mut()
                     .expect("parse schema state should exist");
                 let row = inner.stmt.row().expect("row should be present");
-                let ty = row.get::<&str>(0)?;
-                let name = row.get::<&str>(1)?;
-                let table_name = row.get::<&str>(2)?;
-                let root_page = row.get::<i64>(3)?;
-                let sql = row.get::<&str>(4).ok();
-                let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
-                let syms = conn.syms.read();
-                let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.current_qualifiers()
-                        .database_id(&crate::util::normalize_ident(alias))
-                };
-                schema.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    root_page,
-                    sql,
-                    &syms,
-                    &mut inner.from_sql_indexes,
-                    &mut inner.automatic_indices,
-                    &mut inner.dbsp_state_roots,
-                    &mut inner.dbsp_state_index_roots,
-                    &mut inner.materialized_view_info,
-                    &attached_resolver,
-                    conn.dialect().as_ref(),
-                )?;
-                if ty == "trigger" {
-                    if let Some(target_database_id) = inner.trigger_target_database_id {
-                        schema.set_trigger_target_database_id(
-                            NamespaceId::ROOT,
-                            name,
-                            target_database_id,
-                        )?;
-                    }
-                }
+                inner.rows.try_push(SchemaRow {
+                    ty: row.get::<&str>(0)?.to_string(),
+                    name: row.get::<&str>(1)?.to_string(),
+                    tbl_name: row.get::<&str>(2)?.to_string(),
+                    root_page: row.get::<i64>(3)?,
+                    sql: row.get::<&str>(4).ok().map(str::to_string),
+                })?;
                 continue;
             }
             StepResult::Done => {
-                // Take the state to finalize
                 let OpParseSchemaInner {
                     stmt,
-                    mut schema_arc,
-                    from_sql_indexes,
-                    automatic_indices,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                    materialized_view_info,
-                    trigger_target_database_id: _,
+                    rows,
+                    trigger_target_database_id,
                     db,
                     previous_auto_commit,
                 } = *state
@@ -14864,49 +14811,81 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     .parse_schema()
                     .take()
                     .expect("parse schema state should exist");
-                let schema = Schema::try_make_mut(&mut schema_arc)?;
-                let mv_store = stmt.mv_store();
-                let syms = conn.syms.read();
-
-                // The schema already holds every stored type.
-                let populate_result = schema.populate_types_views_then_indices(
-                    &syms,
-                    &[],
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
-
-                // Store the modified schema back
-                if db == crate::TEMP_DB_ID {
-                    // TEMP: write directly to `temp_db.db.schema` — the single
-                    // source of truth; never stage in `database_schemas`.
-                    //
-                    // Refresh schema_version from the pager header first. At
-                    // this point SetCookie has already run for the current
-                    // DDL, so the header cookie is authoritative; without this
-                    // the cached version can drift on subsequent temp DDLs in
-                    // the same transaction and trigger a spurious
-                    // SchemaUpdated -> reprepare -> rollback_attached() loop
-                    // that wipes in-flight dirty pages.
-                    if let Some(temp_db) = conn.temp.database.read().as_ref() {
-                        if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
-                            schema.schema_version = cookie;
-                        }
-                        *temp_db.db.schema.lock() = schema_arc;
-                    }
-                } else if db != crate::MAIN_DB_ID {
-                    conn.database_schemas().write().insert(db, schema_arc);
-                } else {
-                    *conn.schema.write() = schema_arc;
-                }
+                let has_mv_store = stmt.mv_store().is_some();
                 drop(stmt);
                 conn.auto_commit
                     .store(previous_auto_commit, Ordering::SeqCst);
-                populate_result?;
+                // The rows are added only after the nested `sqlite_schema` scan
+                // finishes, so the schema is changed in place and copied only when
+                // another owner (the committed schema or a savepoint) still shares it.
+                // The qualifiers are read before `with_database_schema_mut` locks the
+                // schema: reading them takes the main schema lock, which that call may hold.
+                let qualifiers = conn.current_qualifiers();
+                // SetCookie has already run for the current temp DDL, so the temp pager's
+                // header cookie is the new schema version. Without it the cached version
+                // can differ from the header on later temp DDL in the same transaction,
+                // which fails the statement with SchemaUpdated and makes the reprepare
+                // roll back the temp pages it has written.
+                let temp_schema_cookie = if db == crate::TEMP_DB_ID {
+                    conn.temp
+                        .database
+                        .read()
+                        .as_ref()
+                        .and_then(|temp_db| temp_db.pager.get_schema_cookie_cached())
+                } else {
+                    None
+                };
+                let syms = conn.syms.read();
+                let dialect = conn.dialect();
+                conn.with_database_schema_mut(db, |schema| {
+                    let attached_resolver =
+                        |alias: &str| qualifiers.database_id(&crate::util::normalize_ident(alias));
+                    let mut from_sql_indexes = crate::alloc::Vec::try_with_capacity_ext(10)?;
+                    let mut automatic_indices = crate::HashMap::default();
+                    let mut dbsp_state_roots = crate::HashMap::default();
+                    let mut dbsp_state_index_roots = crate::HashMap::default();
+                    let mut materialized_view_info = crate::HashMap::default();
+                    for row in &rows {
+                        schema.handle_schema_row(
+                            &row.ty,
+                            &row.name,
+                            &row.tbl_name,
+                            row.root_page,
+                            row.sql.as_deref(),
+                            &syms,
+                            &mut from_sql_indexes,
+                            &mut automatic_indices,
+                            &mut dbsp_state_roots,
+                            &mut dbsp_state_index_roots,
+                            &mut materialized_view_info,
+                            &attached_resolver,
+                            dialect.as_ref(),
+                        )?;
+                        if row.ty == "trigger" {
+                            if let Some(target_database_id) = trigger_target_database_id {
+                                schema.set_trigger_target_database_id(
+                                    NamespaceId::ROOT,
+                                    &row.name,
+                                    target_database_id,
+                                )?;
+                            }
+                        }
+                    }
+                    if let Some(cookie) = temp_schema_cookie {
+                        schema.schema_version = cookie;
+                    }
+                    // The schema already holds every stored type.
+                    schema.populate_types_views_then_indices(
+                        &syms,
+                        &[],
+                        materialized_view_info,
+                        dbsp_state_roots,
+                        dbsp_state_index_roots,
+                        from_sql_indexes,
+                        automatic_indices,
+                        has_mv_store,
+                    )
+                })??;
 
                 state.pc += 1;
                 state.active_op_state.clear();
