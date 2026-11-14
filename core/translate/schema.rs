@@ -3463,9 +3463,9 @@ fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver
              create {normalized_name} before {name}"
         );
     }
-    if let Some(owner) =
-        find_in_any_database(resolver, |schema| find_cast_to_type(schema, &registry_key))?
-    {
+    if let Some(owner) = find_in_any_database(resolver, |schema| {
+        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+    })? {
         bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
     }
     Ok(())
@@ -3508,9 +3508,9 @@ pub fn translate_drop_type(
 
     // Check if anything in any database uses this type
     let registry_key = type_registry_key(type_name);
-    if let Some(type_use) =
-        find_in_any_database(resolver, |schema| find_type_use(schema, &registry_key))?
-    {
+    if let Some(type_use) = find_in_any_database(resolver, |schema| {
+        find_type_use(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+    })? {
         bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
     }
 
@@ -3619,7 +3619,11 @@ fn find_in_any_database(
 
 /// Describes the first object in `schema` that uses the type: a column of
 /// that type, or any stored expression that casts to it.
-fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_type_use(
+    schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
+    registry_key: &str,
+) -> Result<Option<String>> {
     for namespace in schema.namespace_ids() {
         for table in schema.tables(namespace) {
             for column in table.columns() {
@@ -3633,13 +3637,17 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
             }
         }
     }
-    find_cast_to_type(schema, registry_key)
+    find_cast_to_type(schema, dialect, registry_key)
 }
 
 /// Describes the first stored expression in `schema` that casts to the type.
-fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_cast_to_type(
+    schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
+    registry_key: &str,
+) -> Result<Option<String>> {
     let mut type_use = None;
-    walk_schema_expressions(schema, &mut |owner, expr| {
+    walk_schema_expressions(schema, dialect, &mut |_, owner, expr| {
         if type_use.is_none() && is_cast_to_type(expr, registry_key) {
             type_use = Some(owner.to_string());
         }
