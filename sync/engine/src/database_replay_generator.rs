@@ -363,7 +363,11 @@ impl DatabaseReplayGenerator {
                             before.get(1)
                         );
                     };
-                    let query = format!("DROP {} {}", entity_type.as_str(), entity_name.as_str());
+                    let query = format!(
+                        "DROP {} {}",
+                        entity_type.as_str(),
+                        quote_ident(entity_name.as_str())
+                    );
                     let delete = ReplayInfo {
                         change_type: DatabaseChangeType::Delete,
                         query,
@@ -834,6 +838,33 @@ impl DatabaseReplayGenerator {
                     self.execute_ddl(ddl)?;
                 }
                 Ok(())
+            }
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::DropColumn(col_name),
+            }) => {
+                let table_name = tbl_name.name.as_str();
+                let local_columns = self
+                    .local_column_definitions(coro, table_name)
+                    .await?
+                    .unwrap_or_default();
+                let col_name = col_name.as_str();
+
+                if has_column(&local_columns, col_name) {
+                    self.execute_ddl(ddl)?;
+                } else {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: column {col_name} is already missing from {table_name}, skipping"
+                    );
+                }
+                Ok(())
+            }
+            turso_parser::ast::Stmt::DropTable { if_exists, .. }
+            | turso_parser::ast::Stmt::DropIndex { if_exists, .. }
+            | turso_parser::ast::Stmt::DropTrigger { if_exists, .. }
+            | turso_parser::ast::Stmt::DropView { if_exists, .. } => {
+                *if_exists = true;
+                self.execute_ddl(&stmt.to_string())
             }
             _ => {
                 self.conn.execute(ddl)?;
