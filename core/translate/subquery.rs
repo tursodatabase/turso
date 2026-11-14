@@ -30,10 +30,9 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
-            WalkControl,
+            check_custom_types, expr_contains_subquery, get_expr_affinity, unwrap_parens,
+            walk_expr, walk_expr_mut, WalkControl,
         },
-        insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,

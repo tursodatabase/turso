@@ -20,8 +20,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_contains_subquery, expr_vector_size,
+        unwrap_parens, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2653,7 +2653,15 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
+            // Rewrite BETWEEN before binding names. Binding counts how often each column is
+            // used, and covering-index checks compare those counts with the uses an index can
+            // supply. Splitting a bound BETWEEN would copy its left side without counting it.
+            rewrite_between_exprs(
+                &mut expr.expr,
+                Some(resolver),
+                Some(table_references),
+                result_columns,
+            )?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2694,7 +2702,12 @@ pub fn parse_where(
     }
 }
 
-pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
+pub fn rewrite_between_exprs(
+    expr: &mut Expr,
+    resolver: Option<&Resolver<'_>>,
+    referenced_tables: Option<&TableReferences>,
+    result_columns: Option<&[ResultSetColumn]>,
+) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         if let Expr::Between {
             lhs,
@@ -2703,30 +2716,53 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
             end,
         } = e
         {
-            if is_literal_between_bound(start) && is_literal_between_bound(end) {
-                let mut lhs_has_subquery = false;
+            let mut bound_lhs = None;
+            if let (Some(resolver), Some(tables), Some(columns)) =
+                (resolver, referenced_tables, result_columns)
+            {
+                let mut lhs_has_alias = false;
                 walk_expr(lhs, &mut |expr| {
-                    if matches!(
-                        expr,
-                        Expr::Subquery(_)
-                            | Expr::Exists(_)
-                            | Expr::InSelect { .. }
-                            | Expr::SubqueryResult { .. }
-                    ) {
-                        lhs_has_subquery = true;
+                    if lhs_has_alias {
                         return Ok(WalkControl::SkipChildren);
+                    }
+                    if let Expr::Id(id) = expr {
+                        let name = normalize_ident(id.as_str());
+                        lhs_has_alias = columns.iter().any(|column| {
+                            column
+                                .alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(&name))
+                        });
                     }
                     Ok(WalkControl::Continue)
                 })?;
-                let lhs_is_nondeterministic = match resolver {
-                    Some(resolver) => {
-                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
-                    }
-                    None => false,
-                };
-                if lhs_has_subquery || lhs_is_nondeterministic {
-                    return Ok(WalkControl::Continue);
+                if lhs_has_alias {
+                    // Bind a copy to see which expression each name stands for. A column of the
+                    // same name wins over an alias, and the first matching alias wins over later
+                    // ones. The copy keeps the real column use counts untouched.
+                    let mut expr = lhs.clone();
+                    let mut tables = tables.clone();
+                    bind_and_rewrite_expr(
+                        &mut expr,
+                        Some(&mut tables),
+                        Some(columns),
+                        resolver,
+                        BindingBehavior::TryCanonicalColumnsFirst,
+                    )?;
+                    bound_lhs = Some(expr);
                 }
+            }
+            let lhs_to_check = bound_lhs.as_deref().unwrap_or(lhs);
+            let lhs_is_nondeterministic = match resolver {
+                Some(resolver) => {
+                    expr_contains_nondeterministic_scalar_function(lhs_to_check, resolver)?
+                }
+                None => false,
+            };
+            // Keep the left side evaluated once. Conditions skip the second comparison
+            // when the first decides; scalar, IN and EXISTS subqueries in bounds run first.
+            if expr_contains_subquery(lhs_to_check) || lhs_is_nondeterministic {
+                return Ok(WalkControl::Continue);
             }
 
             let lhs_expr = std::mem::take(lhs.as_mut());
@@ -2767,15 +2803,6 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
         Ok(WalkControl::Continue)
     })?;
     Ok(())
-}
-
-fn is_literal_between_bound(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(_) => true,
-        Expr::Unary(_, inner) => is_literal_between_bound(inner),
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
-        _ => false,
-    }
 }
 
 /**
