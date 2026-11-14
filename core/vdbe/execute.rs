@@ -4249,7 +4249,7 @@ pub enum OpTransactionState {
 
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum TransactionYieldPoint {
+pub enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
 }

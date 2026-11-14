@@ -1553,7 +1553,7 @@ pub enum WriteRowState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CommitYieldPoint {
+pub enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     /// Fires once on the first entry into `step_build_log_record` (cursor=0,
@@ -1583,7 +1583,7 @@ pub(crate) enum CommitYieldPoint {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum ExclusiveTxYieldPoint {
+pub enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 

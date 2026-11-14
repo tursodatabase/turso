@@ -229,7 +229,7 @@ pub enum CheckpointState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CheckpointYieldPoint {
+pub enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
