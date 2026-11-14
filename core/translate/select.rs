@@ -1500,7 +1500,7 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
             Operation::Search(search) => match search {
                 Search::RowidEq { .. } => 1,
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
-                Search::InSeek { index, source } => match source {
+                Search::InSeek { index, source, .. } => match source {
                     // table cursor + new ephemeral cursor + optional index cursor
                     InSeekSource::LiteralList { .. } => 2 + index.is_some() as usize,
                     // table cursor + optional index cursor (ephemeral already counted)

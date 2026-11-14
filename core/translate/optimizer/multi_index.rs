@@ -413,17 +413,22 @@ fn choose_multi_index_branch_access(
         .as_ref()
         .map(|branch| branch.cost)
         .unwrap_or(Cost(f64::INFINITY));
+    // A branch only collects rowids and has no ORDER BY order to keep. It does
+    // not take an equality prefix because the branch seeks only the IN column.
     if let Some(chosen_in_seek) = choose_best_in_seek_candidate(
         rhs_table,
         table_constraints,
         lhs_mask,
+        rhs_idx,
         branch_terms,
         table_references,
+        analyze_stats,
         1.0,
         base_row_count,
         params,
         in_seek_threshold,
         BranchReadMode::RowIdOnly,
+        false,
     )? {
         let Some(source) = in_seek_source_from_expr(
             &branch_terms[chosen_in_seek.constraint_idx].expr,

@@ -47,6 +47,6 @@ QUERY PLAN
 |--LIST SUBQUERY 1
 |  `--SCAN lineitem USING INDEX sqlite_autoindex_lineitem_1
 |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
 |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
 `--USE SORTER FOR GROUP BY
