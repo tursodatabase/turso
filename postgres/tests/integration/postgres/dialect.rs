@@ -1915,6 +1915,45 @@ fn test_postgres_window_avg_partition(db: TempDatabase) {
     }
 }
 
+// PostgreSQL rejects `1e308::float8 * 10` as an overflow, so its results
+// below come from the same rows written with 'Infinity'::float8. NaN is
+// returned as NULL.
+#[turso_macros::test(mvcc)]
+fn test_postgres_window_sum_avg_are_finite_after_infinite_values_leave_frame(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (n int, x float8)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1, 1e308::float8 * 10), (2, 1), (3, 2), (4, 4), \
+         (5, -1e308::float8 * 10), (6, 1e308::float8 * 10), (7, 8)",
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT n, avg(x) OVER (ORDER BY n ROWS BETWEEN CURRENT ROW AND CURRENT ROW) \
+             FROM t ORDER BY n",
+        ),
+        ["1|Inf", "2|1.0", "3|2.0", "4|4.0", "5|-Inf", "6|Inf", "7|8.0"]
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            "SELECT n, sum(x) OVER w, avg(x) OVER w FROM t \
+             WINDOW w AS (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY n",
+        ),
+        [
+            "1|Inf|Inf",
+            "2|Inf|Inf",
+            "3|3.0|1.5",
+            "4|6.0|3.0",
+            "5|-Inf|-Inf",
+            "6||",
+            "7|Inf|Inf",
+        ]
+    );
+}
+
 // ==================== OPERATORS: ||, ILIKE, JSON ====================
 
 #[turso_macros::test(mvcc)]
