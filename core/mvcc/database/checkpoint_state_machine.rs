@@ -264,6 +264,7 @@ enum RootMapOp {
 /// The states of the locks held by the state machine - these are tracked for error handling so that they are
 /// released if the state machine fails.
 pub struct LockStates {
+    pager_commit_lock_held: bool,
     blocking_checkpoint_lock_held: bool,
     pager_read_tx: bool,
     pager_write_tx: bool,
@@ -942,6 +943,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Self {
             state: CheckpointState::PrepareCheckpoint,
             lock_states: LockStates {
+                pager_commit_lock_held: false,
                 blocking_checkpoint_lock_held: false,
                 pager_read_tx: false,
                 pager_write_tx: false,
@@ -1020,6 +1022,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     /// Drop checkpoint locks. Call only after `on_checkpoint_end`.
     fn release_checkpoint_locks_if_needed(&mut self) {
+        if self.lock_states.pager_commit_lock_held {
+            self.mvstore.commit_coordinator.unlock_pager_commit_lock();
+            self.lock_states.pager_commit_lock_held = false;
+        }
         if self.lock_states.blocking_checkpoint_lock_held {
             tracing::debug!("Releasing blocking checkpoint lock");
             self.checkpoint_lock.unlock();
@@ -3331,6 +3337,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::TruncateLogicalLog => {
+                if !self.lock_states.pager_commit_lock_held {
+                    if !self.mvstore.commit_coordinator.pager_commit_lock.write() {
+                        if self.clears_whole_logical_log() {
+                            return Err(crate::LimboError::Busy);
+                        }
+                        self.state = CheckpointState::FsyncLogicalLog;
+                        return Ok(TransitionResult::Continue);
+                    }
+                    self.lock_states.pager_commit_lock_held = true;
+                }
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
@@ -3357,6 +3373,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             CheckpointState::FsyncLogicalLog => {
+                if self.lock_states.pager_commit_lock_held {
+                    self.mvstore.storage.logical_log_offset();
+                    self.mvstore.commit_coordinator.unlock_pager_commit_lock();
+                    self.lock_states.pager_commit_lock_held = false;
+                }
                 // Skip fsync when synchronous mode is off
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
