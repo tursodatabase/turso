@@ -273,3 +273,104 @@ test distinct-spilled-many-duplicates {
 expect {
     5000|12497500
 }
+
+@cross-check-integrity
+test distinct-with-part-of-multi-column-unique {
+    CREATE TABLE t (a NOT NULL, b NOT NULL, c, UNIQUE (a, b));
+    INSERT INTO t VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0);
+    SELECT DISTINCT a, c FROM t ORDER BY a;
+}
+expect {
+    1|0
+    2|0
+}
+
+@cross-check-integrity
+test distinct-with-nullable-text-primary-key {
+    CREATE TABLE t (k TEXT PRIMARY KEY, a);
+    INSERT INTO t VALUES (NULL, 1), (NULL, 1);
+    SELECT count(*) FROM (SELECT DISTINCT k, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-unique-index-other-collation {
+    CREATE TABLE t (x TEXT COLLATE NOCASE NOT NULL, a);
+    CREATE UNIQUE INDEX t_x ON t (x COLLATE BINARY);
+    INSERT INTO t VALUES ('a', 1), ('A', 1);
+    SELECT count(*) FROM (SELECT DISTINCT x, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-non-unique-index {
+    CREATE TABLE t (u NOT NULL, a);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES ('p', 1), ('p', 1);
+    SELECT count(*) FROM (SELECT DISTINCT u, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-partial-unique-index {
+    CREATE TABLE t (u NOT NULL, a);
+    CREATE UNIQUE INDEX t_u ON t (u) WHERE a > 5;
+    INSERT INTO t VALUES ('p', 1), ('p', 1);
+    SELECT count(*) FROM (SELECT DISTINCT u, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-expression-unique-index {
+    CREATE TABLE t (u NOT NULL, v NOT NULL, a);
+    CREATE UNIQUE INDEX t_uv ON t (u, lower(v));
+    INSERT INTO t VALUES ('p', 'x', 1), ('p', 'y', 1);
+    SELECT count(*) FROM (SELECT DISTINCT u, a FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test distinct-with-rowid-in-join {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, a);
+    CREATE TABLE t2 (b);
+    INSERT INTO t1 VALUES (1, 'x');
+    INSERT INTO t2 VALUES (5), (5);
+    SELECT DISTINCT t1.id, t1.a FROM t1, t2;
+}
+expect {
+    1|x
+}
+
+@cross-check-integrity
+test distinct-with-outer-column {
+    CREATE TABLE o (id INTEGER PRIMARY KEY);
+    CREATE TABLE t (a);
+    INSERT INTO o VALUES (1);
+    INSERT INTO t VALUES (5), (5);
+    SELECT (SELECT count(*) FROM (SELECT DISTINCT o.id, t.a FROM t)) FROM o;
+    SELECT (SELECT count(*) FROM (SELECT DISTINCT o.rowid, t.a FROM t)) FROM o;
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+test distinct-with-rowid-and-count-distinct {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a);
+    INSERT INTO t VALUES (1, 5), (2, 5);
+    SELECT n FROM (SELECT DISTINCT id, count(DISTINCT a) AS n FROM t);
+}
+expect {
+    1
+}
