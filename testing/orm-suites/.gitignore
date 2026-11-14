@@ -1,0 +1,5 @@
+.cache/
+__pycache__/
+results/
+# The repository root ignores *.txt.
+!known-failures.txt
