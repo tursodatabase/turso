@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, rc::Rc};
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
@@ -20,7 +20,7 @@ pub(crate) struct CatalogContext<'a> {
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
     qualifiers: &'a crate::Qualifiers,
-    non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
+    non_main_schema_cache: Rc<RefCell<HashMap<usize, Arc<Schema>>>>,
     pub symbol_table: &'a SymbolTable,
     pub enable_custom_types: bool,
     /// Schema dialect of the database being compiled against; used when a
@@ -87,7 +87,7 @@ impl<'a> CatalogContext<'a> {
             temp_database,
             attached_databases,
             qualifiers,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
+            non_main_schema_cache: Rc::new(RefCell::new(HashMap::default())),
             symbol_table,
             enable_custom_types,
             dialect,
@@ -108,7 +108,7 @@ impl<'a> CatalogContext<'a> {
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
             qualifiers: self.qualifiers,
-            non_main_schema_cache: RefCell::new(HashMap::default()),
+            non_main_schema_cache: self.non_main_schema_cache.clone(),
             symbol_table: self.symbol_table,
             enable_custom_types: self.enable_custom_types,
             dialect: self.dialect.clone(),
@@ -120,6 +120,10 @@ impl<'a> CatalogContext<'a> {
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    pub(crate) fn used_non_main_schemas(&self) -> HashMap<usize, Arc<Schema>> {
+        self.non_main_schema_cache.borrow().clone()
     }
 
     pub fn has_temp_database(&self) -> bool {

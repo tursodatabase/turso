@@ -5072,6 +5072,23 @@ pub fn op_transaction_inner(
                     }
                 }
 
+                if *db != crate::MAIN_DB_ID
+                    && *db != crate::TEMP_DB_ID
+                    && mv_store.is_none()
+                    && !program.connection.get_auto_commit()
+                {
+                    let schema = program
+                        .used_non_main_schemas
+                        .get(db)
+                        .expect("attached transaction must have a prepared schema");
+                    program
+                        .connection
+                        .attached_read_schemas()
+                        .write()
+                        .entry(*db)
+                        .or_insert_with(|| schema.clone());
+                }
+
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {

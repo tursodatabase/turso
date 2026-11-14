@@ -2161,6 +2161,7 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    pub(crate) used_non_main_schemas: rustc_hash::FxHashMap<usize, Arc<crate::schema::Schema>>,
 }
 
 #[derive(Clone)]
@@ -3478,6 +3479,7 @@ impl Program {
 
     /// End read transactions on all attached databases that had transactions started.
     fn end_attached_read_txns(&self, connection: &Connection) {
+        connection.attached_read_schemas().write().clear();
         connection.with_all_attached_pagers_with_index(|pagers| {
             pagers.iter().for_each(|(db_id, attached_pager)| {
                 if connection.mv_store_for_db(*db_id).is_some() {

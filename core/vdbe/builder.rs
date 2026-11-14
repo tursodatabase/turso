@@ -330,6 +330,7 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
+    pub(crate) used_non_main_schemas: HashMap<usize, Arc<Schema>>,
     /// Temporary cursor mappings for code that reads a source through a second cursor.
     /// A later mapping takes priority, which permits nested translation scopes.
     cursor_overrides: Vec<(CursorKey, CursorID)>,
@@ -866,6 +867,7 @@ impl ProgramBuilder {
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
+            used_non_main_schemas: HashMap::default(),
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
@@ -2583,6 +2585,7 @@ impl ProgramBuilder {
             custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            used_non_main_schemas: self.used_non_main_schemas,
         };
         Ok(prepared)
     }
