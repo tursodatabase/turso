@@ -1,16 +1,18 @@
 //! Tests of the MVCC checkpoint that step it by hand.
 //!
 //! Each test commits rows with SQL, starts a checkpoint and steps it up to the point of
-//! interest.
+//! interest. A test that needs a commit in the middle of a checkpoint uses a passive
+//! checkpoint, because that is the only kind that lets writers commit while it collects rows.
 
 use crate::common::{ExecRows, TempDatabase};
 use std::sync::Arc;
 use turso_core::mvcc::database::checkpoint::COLLECT_PREEMPTION_THRESHOLD;
 use turso_core::mvcc::database::{
-    CheckpointState, CheckpointStateMachine, MVTableId, MvStore, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    CheckpointState, CheckpointStateMachine, MVTableId, MvStore, RowID, RowKey,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use turso_core::state_machine::{StateTransition, TransitionResult};
-use turso_core::{CheckpointMode, Connection, IO};
+use turso_core::{CheckpointMode, Connection, DatabaseOpts, IO};
 
 /// More rows than a checkpoint visits before it yields.
 const MANY_ROWS: usize = COLLECT_PREEMPTION_THRESHOLD + 10;
@@ -220,9 +222,188 @@ fn first_checkpoint_after_reopen_collects_rows_that_no_commit_marked() {
     checkpoint.finish();
 }
 
+#[test]
+fn collection_finishes_while_table_rows_are_appended() {
+    for walk in [Walk::EveryRow, Walk::ChangedRows] {
+        let db = passive_checkpoint_database("collect_appended_table_rows");
+        let conn = connect_without_auto_checkpoint(&db);
+        let writer = connect_without_auto_checkpoint(&db);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        prepare_walk(&db, &conn, walk);
+        insert_rows(&conn, "t", 1, MANY_ROWS);
+        insert_rows(&conn, "other", 1, 1);
+        let table = btree_id(&conn, "t");
+        let other = btree_id(&conn, "other");
+
+        let mut checkpoint = SteppedCheckpoint::start(&db, &conn, PASSIVE);
+        checkpoint.step_until(CheckpointState::CollectTableRows);
+        let mut next_rowid = MANY_ROWS + 1;
+        let mut yields = 0;
+        while checkpoint.state() == CheckpointState::CollectTableRows {
+            if checkpoint.step() == Step::Yielded {
+                yields += 1;
+                assert!(
+                    yields <= 4,
+                    "{walk:?}: collection kept walking rows committed after its snapshot"
+                );
+                insert_rows(&writer, "t", next_rowid, COLLECT_PREEMPTION_THRESHOLD);
+                next_rowid += COLLECT_PREEMPTION_THRESHOLD;
+            }
+        }
+        assert!(yields > 0, "{walk:?}: the test needs a yield to append at");
+
+        assert_eq!(
+            checkpoint.collected_table_rowids(table),
+            (1..=MANY_ROWS as i64).collect::<Vec<_>>(),
+            "{walk:?}: only the rows committed before the snapshot are collected"
+        );
+        assert_eq!(checkpoint.collected_table_rowids(other), vec![1]);
+        checkpoint.finish();
+    }
+}
+
+#[test]
+fn collection_finishes_while_index_rows_are_appended() {
+    for walk in [Walk::EveryRow, Walk::ChangedRows] {
+        let db = passive_checkpoint_database("collect_appended_index_rows");
+        let conn = connect_without_auto_checkpoint(&db);
+        let writer = connect_without_auto_checkpoint(&db);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        prepare_walk(&db, &conn, walk);
+        insert_rows(&conn, "t", 1, MANY_ROWS);
+        let index = btree_id(&conn, "t_v");
+
+        let mut checkpoint = SteppedCheckpoint::start(&db, &conn, PASSIVE);
+        checkpoint.step_until(CheckpointState::CollectIndexRows);
+        let mut next_rowid = MANY_ROWS + 1;
+        let mut yields = 0;
+        while checkpoint.state() == CheckpointState::CollectIndexRows {
+            if checkpoint.step() == Step::Yielded {
+                yields += 1;
+                assert!(
+                    yields <= 4,
+                    "{walk:?}: collection kept walking index rows committed after its snapshot"
+                );
+                insert_rows(&writer, "t", next_rowid, COLLECT_PREEMPTION_THRESHOLD);
+                next_rowid += COLLECT_PREEMPTION_THRESHOLD;
+            }
+        }
+        assert!(yields > 0, "{walk:?}: the test needs a yield to append at");
+
+        assert_eq!(
+            checkpoint.collected_index_row_count(index),
+            MANY_ROWS,
+            "{walk:?}: only the index rows committed before the snapshot are collected"
+        );
+        checkpoint.finish();
+    }
+}
+
+#[test]
+fn rows_committed_after_the_snapshot_stay_marked_for_the_next_checkpoint() {
+    for walk in [Walk::EveryRow, Walk::ChangedRows] {
+        let db = passive_checkpoint_database("prune_keeps_later_commits");
+        let conn = connect_without_auto_checkpoint(&db);
+        let writer = connect_without_auto_checkpoint(&db);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        prepare_walk(&db, &conn, walk);
+        conn.execute("INSERT INTO t VALUES (1, 'written'), (3, 'deleted later')")
+            .unwrap();
+        let table = btree_id(&conn, "t");
+        let store = store(&conn);
+
+        let mut checkpoint = SteppedCheckpoint::start(&db, &conn, PASSIVE);
+        checkpoint.step_until(CheckpointState::CollectTableRows);
+        writer
+            .execute("INSERT INTO t VALUES (2, 'inserted later')")
+            .unwrap();
+        writer.execute("DELETE FROM t WHERE id = 3").unwrap();
+        checkpoint.finish();
+
+        assert!(
+            !is_marked(&store, table, 1),
+            "{walk:?}: a row the checkpoint wrote in full is no longer marked"
+        );
+        assert!(
+            is_marked(&store, table, 2),
+            "{walk:?}: a row inserted after the snapshot is still marked"
+        );
+        assert!(
+            is_marked(&store, table, 3),
+            "{walk:?}: a row deleted after the snapshot is still marked"
+        );
+        assert_eq!(
+            store.checkpoint_dirty_index_keys.len(),
+            2,
+            "{walk:?}: the index rows of the later insert and the later delete are still marked"
+        );
+
+        SteppedCheckpoint::start(&db, &conn, PASSIVE).finish();
+        assert!(store.checkpoint_dirty_table_keys.is_empty());
+        assert!(store.checkpoint_dirty_index_keys.is_empty());
+    }
+}
+
+#[test]
+fn row_changed_after_collection_stays_marked_for_the_next_checkpoint() {
+    let db = passive_checkpoint_database("prune_keeps_row_marked_again");
+    let conn = connect_without_auto_checkpoint(&db);
+    let writer = connect_without_auto_checkpoint(&db);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (7, 'first')").unwrap();
+    let table = btree_id(&conn, "t");
+    let store = store(&conn);
+
+    let mut checkpoint = SteppedCheckpoint::start(&db, &conn, PASSIVE);
+    checkpoint.step_until_collected();
+    assert_eq!(checkpoint.collected_table_rowids(table), vec![7]);
+    writer
+        .execute("UPDATE t SET v = 'second' WHERE id = 7")
+        .unwrap();
+    checkpoint.finish();
+
+    assert!(
+        is_marked(&store, table, 7),
+        "a row marked again after collection must stay marked"
+    );
+}
+
+#[test]
+fn clearing_the_marks_yields_on_many_rows() {
+    let db = TempDatabase::new_with_mvcc("prune_many_rows");
+    let conn = connect_without_auto_checkpoint(&db);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    insert_rows(&conn, "t", 1, MANY_ROWS);
+    let store = store(&conn);
+
+    let mut checkpoint = SteppedCheckpoint::start(&db, &conn, TRUNCATE);
+    checkpoint.step_until(CheckpointState::PruneDirtyKeys);
+    assert_eq!(
+        checkpoint.step(),
+        Step::Yielded,
+        "clearing more than COLLECT_PREEMPTION_THRESHOLD marks must yield"
+    );
+    assert_eq!(checkpoint.state(), CheckpointState::PruneDirtyKeys);
+    checkpoint.finish();
+
+    assert!(store.checkpoint_dirty_table_keys.is_empty());
+}
+
 type Store = MvStore<turso_core::mvcc::MvccClock, turso_core::alloc::DynAllocator>;
 
 const TRUNCATE: CheckpointMode = CheckpointMode::Truncate {
+    upper_bound_inclusive: None,
+};
+const PASSIVE: CheckpointMode = CheckpointMode::Passive {
     upper_bound_inclusive: None,
 };
 
@@ -345,6 +526,14 @@ impl SteppedCheckpoint {
     }
 }
 
+fn passive_checkpoint_database(name: &str) -> TempDatabase {
+    TempDatabase::builder()
+        .with_db_name(name)
+        .with_mvcc(true)
+        .with_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true))
+        .build()
+}
+
 /// The tests start every checkpoint themselves, so a commit must not start one.
 fn connect_without_auto_checkpoint(db: &TempDatabase) -> Arc<Connection> {
     let conn = db.connect_limbo();
@@ -378,4 +567,11 @@ fn btree_id(conn: &Arc<Connection>, name: &str) -> MVTableId {
         "SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"
     ));
     store(conn).get_table_id_from_root_page(rows[0].0)
+}
+
+/// Whether the row is marked as changed since the last checkpoint that wrote it.
+fn is_marked(store: &Store, table: MVTableId, rowid: i64) -> bool {
+    store
+        .checkpoint_dirty_table_keys
+        .contains_key(&RowID::new(table, RowKey::Int(rowid)))
 }
