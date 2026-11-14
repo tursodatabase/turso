@@ -37,6 +37,13 @@ expect error {
     FILTER may not be used with non-aggregate random()
 }
 
+test scalar-function-star-runs-as-zero-arguments {
+    SELECT typeof(random(*));
+}
+expect {
+    integer
+}
+
 test scalar-function-filter-star-rejected {
     SELECT random(*) FILTER (WHERE 1);
 }
