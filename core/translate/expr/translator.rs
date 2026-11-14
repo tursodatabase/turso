@@ -420,6 +420,10 @@ fn translate_subquery_result_expr(
                         )?;
                     }
                 }
+            }
+            // The NULL checks come after every column is loaded, because the
+            // scan at label_null_rewind compares all of them.
+            for i in 0..lhs_column_count {
                 // If LHS is NULL, we need to check if ephemeral is empty first.
                 // - If empty: IN returns FALSE, NOT IN returns TRUE
                 // - If not empty: result is NULL (unknown)
@@ -553,12 +557,25 @@ fn translate_subquery_result_expr(
         SubqueryType::RowValue {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
-            assert_register_range_allocated(program, target_register, *num_regs)?;
+            if *num_regs != 1 {
+                crate::bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+            }
+            if let Some(row_count_reg) = *row_count_reg {
+                program.emit_insn(Insn::HaltIfNull {
+                    constraint_info: None,
+                    target_reg: row_count_reg,
+                    err_code: SQLITE_ERROR,
+                    description: "more than one row returned by a subquery used as an expression"
+                        .to_string(),
+                    on_error: None,
+                });
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: *result_reg_start,
                 dst_reg: target_register,
-                extra_amount: num_regs - 1,
+                extra_amount: 0,
             });
             Ok(target_register)
         }
@@ -1083,13 +1100,33 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
-            let regs = program.alloc_registers(args_count);
+            let argument_types: Vec<String> = match &func_ctx.func {
+                Func::External(external) if external.func.receives_argument_types() => {
+                    let env = TypeEnv::new(referenced_tables, resolver);
+                    args.iter()
+                        .map(|arg| name_without_domains(type_of(arg, &env), resolver.schema()))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let total_count = args_count + argument_types.len();
+            let regs = program.alloc_registers(total_count);
             for (i, arg_expr) in args.iter().enumerate() {
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
             }
+            for (i, type_name) in argument_types.into_iter().enumerate() {
+                program.emit_insn(Insn::String8 {
+                    value: type_name,
+                    dest: regs + args_count + i,
+                });
+            }
 
             // Use shared function call helper
-            let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
+            let arg_registers: Vec<usize> = (regs..regs + total_count).collect();
+            let func_ctx = FuncCtx {
+                arg_count: total_count,
+                ..func_ctx
+            };
             emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 
             Ok(target_register)
@@ -3194,20 +3231,16 @@ fn translate_parenthesized_expr(
     let ast::Expr::Parenthesized(exprs) = expr else {
         unreachable!("translate_parenthesized_expr expects Expr::Parenthesized");
     };
-    if exprs.is_empty() {
-        crate::bail_parse_error!("parenthesized expression with no arguments");
-    }
-    assert_register_range_allocated(program, target_register, exprs.len())?;
-    for (i, expr) in exprs.iter().enumerate() {
-        translate_expr(
-            program,
-            referenced_tables,
-            expr,
-            target_register + i,
-            resolver,
-        )?;
-    }
-    Ok(target_register)
+    // Comparisons, IN and BETWEEN read a row value one component at a time
+    // with translate_row_value. Anywhere else a row value would need more
+    // than the one register it is given.
+    let [expr] = exprs.as_slice() else {
+        if exprs.is_empty() {
+            crate::bail_parse_error!("parenthesized expression with no arguments");
+        }
+        crate::bail_parse_error!("row value misused");
+    };
+    translate_expr(program, referenced_tables, expr, target_register, resolver)
 }
 
 #[inline(never)]

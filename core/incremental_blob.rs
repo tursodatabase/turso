@@ -30,6 +30,7 @@ use crate::namespace::NamespaceId;
 use crate::translate::collate::CollationSeq;
 use std::num::NonZero;
 use std::sync::Arc;
+use turso_parser::ast::Privilege;
 
 use crate::alloc::TursoSliceExt;
 use crate::schema::{BTreeTable, Column, Schema};
@@ -289,6 +290,7 @@ impl Connection {
                 "incremental blob I/O is not supported in MVCC mode".to_string(),
             ));
         }
+        crate::translate::row_security::check_blob_open(self, table, read_write)?;
         let fk_enforced = self.foreign_keys_enabled();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
             if schema.is_materialized_view(NamespaceId::ROOT, table)
@@ -400,7 +402,7 @@ fn check_blob_privileges(
     read_write: bool,
 ) -> Result<()> {
     let role = conn.current_role();
-    if schema.roles.is_superuser(role) {
+    if conn.dialect().role_is_superuser(schema, role) {
         return Ok(());
     }
     let denied = |action| {
@@ -414,7 +416,7 @@ fn check_blob_privileges(
     }
     if conn
         .dialect()
-        .role_may_read(schema, NamespaceId::ROOT, table, role)
+        .role_has_privilege(schema, NamespaceId::ROOT, table, role, Privilege::Select)
     {
         return Ok(());
     }

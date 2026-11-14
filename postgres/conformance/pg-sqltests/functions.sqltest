@@ -1663,3 +1663,102 @@ test random-divisor-is-not-an-integer {
 expect {
     ok
 }
+
+test array-to-json-of-integers-texts-and-nulls {
+    SELECT array_to_json(ARRAY[1, 5, 99]),
+           array_to_json(ARRAY['a', 'b "c"', NULL]),
+           array_to_json(string_to_array('public', '')::name[]),
+           array_to_json(ARRAY[]::int[]),
+           coalesce(array_to_json(NULL::int[])::text, 'none');
+}
+expect {
+    [1,5,99]|["a","b \"c\"",null]|["public"]|[]|none
+}
+
+test array-to-json-pretty-puts-line-feeds-between-elements {
+    SELECT replace(array_to_json(ARRAY[1, 2, 3], true)::text, chr(10), '|'),
+           replace(array_to_json(ARRAY[1, 2, 3], false)::text, chr(10), '|');
+}
+expect {
+    [1,| 2,| 3]|[1,2,3]
+}
+
+test array-to-json-with-null-pretty-is-null {
+    SELECT coalesce(array_to_json(ARRAY[1, 2], NULL)::text, 'none');
+}
+expect {
+    none
+}
+
+test array-to-json-pretty-can-be-a-boolean-literal-string {
+    SELECT replace(array_to_json(ARRAY[1, 2], 'true')::text, chr(10), '|'),
+           array_to_json(ARRAY[1, 2], 'off');
+}
+expect {
+    [1,| 2]|[1,2]
+}
+
+test array-to-json-pretty-must-be-a-boolean {
+    SELECT array_to_json(ARRAY[1, 2], 'maybe');
+}
+expect error {
+    invalid input syntax for type boolean: "maybe"
+}
+
+test array-to-json-pretty-puts-line-feeds-only-between-outer-elements {
+    SELECT replace(array_to_json(ARRAY[[1, 2], [3, 4]], true)::text, chr(10), '|');
+}
+expect {
+    [[1,2],| [3,4]]
+}
+
+test array-to-json-writes-booleans-as-true-and-false {
+    SELECT array_to_json(ARRAY[true, false, NULL]),
+           array_to_json(ARRAY[[true], [false]]);
+}
+expect {
+    [true,false,null]|[[true],[false]]
+}
+
+test array-to-json-writes-floats-like-float8-output {
+    SELECT array_to_json(ARRAY[1.0::float8, 1e20::float8, 0.1::float8 + 0.2::float8,
+                               1.5e-5::float8]);
+}
+expect {
+    [1,1e+20,0.30000000000000004,1.5e-05]
+}
+
+test array-to-json-writes-bytea-as-hex-strings {
+    SELECT array_to_json(ARRAY['abc'::bytea, NULL]);
+}
+expect {
+    ["\\\\x616263",null]
+}
+
+test array-to-json-writes-dates-and-timestamps-in-iso-format {
+    SELECT array_to_json(ARRAY['2024-01-02'::date]),
+           array_to_json(ARRAY['2024-01-02 03:04:05.5'::timestamp]),
+           array_to_json(ARRAY['2024-01-02 03:04:05'::timestamptz]);
+}
+expect {
+    ["2024-01-02"]|["2024-01-02T03:04:05.5"]|["2024-01-02T03:04:05+00:00"]
+}
+
+test array-to-json-embeds-json-and-jsonb-values {
+    CREATE TABLE array_to_json_documents (id int, j json, jb jsonb);
+    INSERT INTO array_to_json_documents VALUES (1, '{"a":1}', '[1]'), (2, '"x"', 'null');
+    SELECT array_to_json(array_agg(j ORDER BY id)),
+           array_to_json(array_agg(jb ORDER BY id))
+    FROM array_to_json_documents;
+}
+expect {
+    [{"a":1},"x"]|[[1],null]
+}
+
+test array-to-json-result-is-json {
+    SELECT array_to_json(ARRAY[array_to_json(ARRAY[1, 2])]),
+           array_to_json(ARRAY[1, 2]) -> 1;
+}
+expect {
+    [[1,2]]|2
+}

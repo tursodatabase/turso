@@ -60,12 +60,10 @@ use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
-pub mod checkpoint_state_machine;
+pub mod checkpoint;
 #[cfg(not(nightly))]
 mod version_chain;
-pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
-};
+pub use checkpoint::{sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -1555,7 +1553,7 @@ pub enum WriteRowState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CommitYieldPoint {
+pub enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     /// Fires once on the first entry into `step_build_log_record` (cursor=0,
@@ -1585,7 +1583,7 @@ pub(crate) enum CommitYieldPoint {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum ExclusiveTxYieldPoint {
+pub enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 

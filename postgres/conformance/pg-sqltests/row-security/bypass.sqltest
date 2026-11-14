@@ -1,0 +1,347 @@
+# Which roles row-level security does not apply to, through the PostgreSQL
+# frontend: superusers, roles with BYPASSRLS and the owner of the table. A view reads its tables as
+# the view's owner, so a view shows its readers the rows its owner sees.
+# PostgreSQL roles belong to the whole server, so every test uses its own
+# role and table names.
+
+@database :memory:
+
+test reset-role-reads-every-row-again {
+    CREATE ROLE ra_role_42;
+    CREATE TABLE ra_docs_42 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_42 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_42 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_42 TO ra_role_42;
+    SET ROLE ra_role_42;
+    SELECT count(*) FROM ra_docs_42;
+    RESET ROLE;
+    SELECT count(*) FROM ra_docs_42;
+}
+expect {
+    0
+    3
+}
+
+test set-role-none-reads-every-row-again {
+    CREATE ROLE ra_role_43;
+    CREATE TABLE ra_docs_43 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_43 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_43 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_43 TO ra_role_43;
+    SET ROLE ra_role_43;
+    SELECT count(*) FROM ra_docs_43;
+    SET ROLE NONE;
+    SELECT count(*) FROM ra_docs_43;
+}
+expect {
+    0
+    3
+}
+
+test set-role-to-the-superuser-reads-every-row {
+    CREATE ROLE ra_role_44;
+    CREATE TABLE ra_docs_44 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_44 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_44 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_44 TO ra_role_44;
+    SET ROLE postgres;
+    SELECT count(*) FROM ra_docs_44;
+}
+expect {
+    3
+}
+
+test set-local-role-ends-with-the-transaction {
+    CREATE ROLE ra_role_45;
+    CREATE TABLE ra_docs_45 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_45 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_45 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_45 TO ra_role_45;
+    BEGIN;
+    SET LOCAL ROLE ra_role_45;
+    SELECT count(*) FROM ra_docs_45;
+    COMMIT;
+    SELECT count(*) FROM ra_docs_45;
+}
+expect {
+    0
+    3
+}
+
+test superuser-inserts-updates-and-deletes-rows {
+    CREATE ROLE ra_role_52;
+    CREATE TABLE ra_docs_52 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_52 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_52 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_52 TO ra_role_52;
+    INSERT INTO ra_docs_52 VALUES (5, 'erin', 'e');
+    UPDATE ra_docs_52 SET title = 'z' WHERE id = 1;
+    DELETE FROM ra_docs_52 WHERE id = 2;
+    SELECT id, title FROM ra_docs_52 ORDER BY id;
+}
+expect {
+    1|z
+    3|c
+    5|e
+}
+
+test superuser-inserts-rows-selected-from-table-with-row-security {
+    CREATE ROLE ra_role_53;
+    CREATE TABLE ra_docs_53 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_53 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_53 (id INT);
+    INSERT INTO ra_notes_53 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_53 TO ra_role_53;
+    ALTER TABLE ra_docs_53 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_53 TO ra_role_53;
+    INSERT INTO ra_notes_53 SELECT id + 10 FROM ra_docs_53;
+    SELECT id FROM ra_notes_53 ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    11
+    12
+    13
+}
+
+test superuser-updates-from-table-with-row-security {
+    CREATE ROLE ra_role_54;
+    CREATE TABLE ra_docs_54 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_54 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_54 (id INT);
+    INSERT INTO ra_notes_54 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_54 TO ra_role_54;
+    ALTER TABLE ra_docs_54 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_54 TO ra_role_54;
+    UPDATE ra_notes_54 SET id = d.id * 10 FROM ra_docs_54 d WHERE d.id = ra_notes_54.id;
+    SELECT id FROM ra_notes_54 ORDER BY id;
+}
+expect {
+    4
+    10
+    20
+}
+
+test superuser-deletes-with-subquery-on-table-with-row-security {
+    CREATE ROLE ra_role_55;
+    CREATE TABLE ra_docs_55 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_55 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_55 (id INT);
+    INSERT INTO ra_notes_55 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_55 TO ra_role_55;
+    ALTER TABLE ra_docs_55 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_55 TO ra_role_55;
+    DELETE FROM ra_notes_55 WHERE id IN (SELECT id FROM ra_docs_55);
+    SELECT id FROM ra_notes_55;
+}
+expect {
+    4
+}
+
+# The owner of a table bypasses its row-level security, as in PostgreSQL,
+# unless FORCE ROW LEVEL SECURITY is set, which is not supported.
+test owner-reads-every-row {
+    CREATE ROLE ra_owner_59;
+    CREATE TABLE ra_docs_59 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_59 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_59 OWNER TO ra_owner_59;
+    SET ROLE ra_owner_59;
+    ALTER TABLE ra_docs_59 ENABLE ROW LEVEL SECURITY;
+    SELECT count(*) FROM ra_docs_59;
+}
+expect {
+    3
+}
+
+test former-owner-reads-no-rows {
+    CREATE ROLE ra_owner_60;
+    CREATE ROLE ra_role_60;
+    CREATE TABLE ra_docs_60 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_60 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_60 ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE ra_docs_60 OWNER TO ra_owner_60;
+    GRANT SELECT ON ra_docs_60 TO ra_role_60;
+    SET ROLE ra_owner_60;
+    SELECT count(*) FROM ra_docs_60;
+    RESET ROLE;
+    ALTER TABLE ra_docs_60 OWNER TO ra_role_60;
+    GRANT SELECT ON ra_docs_60 TO ra_owner_60;
+    SET ROLE ra_owner_60;
+    SELECT count(*) FROM ra_docs_60;
+}
+expect {
+    3
+    0
+}
+
+test view-owned-by-superuser-shows-every-row {
+    CREATE ROLE ra_role_61;
+    CREATE TABLE ra_docs_61 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_61 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_61 ENABLE ROW LEVEL SECURITY;
+    CREATE VIEW ra_view_61 AS SELECT id FROM ra_docs_61;
+    GRANT SELECT ON ra_view_61 TO ra_role_61;
+    GRANT SELECT ON ra_docs_61 TO ra_role_61;
+    SET ROLE ra_role_61;
+    SELECT count(*) FROM ra_view_61;
+    SELECT count(*) FROM ra_docs_61;
+}
+expect {
+    3
+    0
+}
+
+test view-owned-by-role-shows-no-rows {
+    CREATE ROLE ra_view_owner_62;
+    CREATE ROLE ra_role_62;
+    CREATE TABLE ra_docs_62 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_62 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_62 ENABLE ROW LEVEL SECURITY;
+    CREATE VIEW ra_view_62 AS SELECT id FROM ra_docs_62;
+    ALTER VIEW ra_view_62 OWNER TO ra_view_owner_62;
+    GRANT SELECT ON ra_docs_62 TO ra_view_owner_62;
+    GRANT SELECT ON ra_view_62 TO ra_role_62;
+    SET ROLE ra_role_62;
+    SELECT count(*) FROM ra_view_62;
+}
+expect {
+    0
+}
+
+test view-reads-with-the-policies-of-its-owner {
+    CREATE ROLE rp_alice_13;
+    CREATE TABLE rp_docs_13 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_docs_13 VALUES (1, 'rp_alice_13'), (2, 'someone else');
+    ALTER TABLE rp_docs_13 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON rp_docs_13 USING (owner = current_user);
+    CREATE VIEW rp_view_13 AS SELECT id FROM rp_docs_13;
+    GRANT SELECT ON rp_view_13 TO rp_alice_13;
+    SET ROLE rp_alice_13;
+    SELECT id FROM rp_view_13;
+}
+expect {
+    1
+    2
+}
+
+@skip-if postgres "PostgreSQL supports security_invoker views"
+test view-that-reads-as-its-reader-is-not-supported {
+    CREATE TABLE by_invoker_base (id INT);
+    CREATE VIEW by_invoker_view WITH (security_invoker = true) AS SELECT id FROM by_invoker_base;
+}
+@sqlstate 0A000
+expect error {
+    CREATE VIEW ... WITH \(options\) is not supported
+}
+
+test owner-writes-every-row-of-its-table-with-row-security {
+    CREATE ROLE rw_owner_20;
+    CREATE TABLE rw_docs_20 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rw_docs_20 VALUES (1, 'someone else');
+    ALTER TABLE rw_docs_20 ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rw_docs_20 OWNER TO rw_owner_20;
+    SET ROLE rw_owner_20;
+    INSERT INTO rw_docs_20 VALUES (2, 'someone else');
+    UPDATE rw_docs_20 SET owner = 'x' WHERE id = 1;
+    DELETE FROM rw_docs_20 WHERE id = 2;
+    SELECT id, owner FROM rw_docs_20;
+}
+expect {
+    1|x
+}
+
+test bypassrls-role-reads-every-row {
+    CREATE ROLE rb_role_70 BYPASSRLS;
+    CREATE TABLE rb_docs_70 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_70 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_70 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY only_alice ON rb_docs_70 USING (owner = 'alice');
+    GRANT SELECT ON rb_docs_70 TO rb_role_70;
+    SET ROLE rb_role_70;
+    SELECT id FROM rb_docs_70 ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+test nobypassrls-role-reads-only-the-rows-of-the-policies {
+    CREATE ROLE rb_role_71 NOBYPASSRLS;
+    CREATE TABLE rb_docs_71 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_71 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_71 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY only_alice ON rb_docs_71 USING (owner = 'alice');
+    GRANT SELECT ON rb_docs_71 TO rb_role_71;
+    SET ROLE rb_role_71;
+    SELECT id FROM rb_docs_71 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test bypassrls-role-inserts-updates-and-deletes-rows-without-policies {
+    CREATE ROLE rb_role_72 BYPASSRLS;
+    CREATE TABLE rb_docs_72 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_72 VALUES (1, 'alice'), (2, 'bob');
+    ALTER TABLE rb_docs_72 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON rb_docs_72 TO rb_role_72;
+    SET ROLE rb_role_72;
+    INSERT INTO rb_docs_72 VALUES (3, 'carol');
+    UPDATE rb_docs_72 SET owner = 'x' WHERE id = 1;
+    DELETE FROM rb_docs_72 WHERE id = 2;
+    SELECT id, owner FROM rb_docs_72 ORDER BY id;
+}
+expect {
+    1|x
+    3|carol
+}
+
+test bypassrls-role-still-needs-privileges {
+    CREATE ROLE rb_role_73 BYPASSRLS;
+    CREATE TABLE rb_docs_73 (id INT PRIMARY KEY);
+    ALTER TABLE rb_docs_73 ENABLE ROW LEVEL SECURITY;
+    SET ROLE rb_role_73;
+    SELECT id FROM rb_docs_73;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rb_docs_73
+}
+
+test view-owned-by-bypassrls-role-shows-every-row {
+    CREATE ROLE rb_view_owner_74 BYPASSRLS;
+    CREATE ROLE rb_role_74;
+    CREATE TABLE rb_docs_74 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_74 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_74 ENABLE ROW LEVEL SECURITY;
+    CREATE VIEW rb_view_74 AS SELECT id FROM rb_docs_74;
+    ALTER VIEW rb_view_74 OWNER TO rb_view_owner_74;
+    GRANT SELECT ON rb_docs_74 TO rb_view_owner_74;
+    GRANT SELECT ON rb_view_74 TO rb_role_74;
+    SET ROLE rb_role_74;
+    SELECT count(*) FROM rb_view_74;
+}
+expect {
+    3
+}
+
+test bypassrls-role-reads-through-a-view-with-the-policies-of-its-owner {
+    CREATE ROLE rb_view_owner_75;
+    CREATE ROLE rb_role_75 BYPASSRLS;
+    CREATE TABLE rb_docs_75 (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rb_docs_75 VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rb_docs_75 ENABLE ROW LEVEL SECURITY;
+    CREATE VIEW rb_view_75 AS SELECT id FROM rb_docs_75;
+    ALTER VIEW rb_view_75 OWNER TO rb_view_owner_75;
+    GRANT SELECT ON rb_docs_75 TO rb_view_owner_75;
+    GRANT SELECT ON rb_view_75 TO rb_role_75;
+    SET ROLE rb_role_75;
+    SELECT count(*) FROM rb_view_75;
+}
+expect {
+    0
+}

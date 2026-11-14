@@ -7,6 +7,8 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
+use crate::pg_type::type_exists;
+use crate::roles::connection_roles;
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
     SettingScope,
@@ -27,15 +29,16 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
+    check_enum_labels, execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgGrantSelectStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
+    PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
     PostgreSQLTranslator, SerialSequence,
 };
 use turso_pg_parser::ParseError;
 
 use crate::copy::parse_copy_text_format;
+use turso_core::SessionRole;
 
 #[derive(Clone)]
 pub struct PgConnection {
@@ -92,20 +95,25 @@ pub fn open_database_with_io(
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    let db = turso_core::Database::open(
-        io,
-        path,
-        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
-            .storage(db_file)
-            .flags(flags)
-            .db_opts(opts.with_mvcc(true)),
-    )?;
-    // After the open, the classes table exists before the database holds
-    // any relation, and every relation gets its row from its CREATE. A
-    // database with relations but no catalog is from an earlier tursopg and
-    // is refused.
-    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
-    Ok(db)
+    let options = turso_core::OpenOptions::new(Arc::new(PostgresDialect))
+        .storage(db_file)
+        .flags(flags)
+        .db_opts(opts.with_mvcc(true));
+    let mut state = crate::OpenDatabaseState::default();
+    loop {
+        match crate::open_database_async(
+            &mut state,
+            io.clone(),
+            path,
+            &options,
+            turso_core::ConnectOpts::new(SessionRole::Superuser),
+        )
+        .map_err(|error| *error)?
+        {
+            IOResult::Done(db) => return Ok(db),
+            IOResult::IO(completions) => completions.wait(io.as_ref())?,
+        }
+    }
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -128,14 +136,14 @@ fn refuse_a_file_with_tables_in_no_schema(
     if db.mvcc_enabled() {
         return Ok(());
     }
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    let conn = db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
     refuse_tables_in_no_schema(&conn)?;
     Ok(())
 }
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        Self::connect_with(db, turso_core::ConnectOpts::new())
+        Self::connect_with(db, turso_core::ConnectOpts::new(SessionRole::Superuser))
     }
 
     /// Opens a session on `db`, connecting with `opts`, such as the
@@ -285,6 +293,8 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
         Ok(stmts) => Ok(stmts),
+        // Preparing the whole text reports its syntax error, and none of its
+        // statements run.
         Err(_) => Ok(vec![sql.trim().to_string()]),
     }
 }
@@ -293,7 +303,7 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
 /// made by an earlier version of tursopg or by SQLite. This version keeps
 /// every table in a schema and would hide those, so it refuses the
 /// database instead.
-fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
+pub(crate) fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
     let schema = conn.current_schema();
     let has_tables_in_no_schema = schema
         .tables(turso_core::NamespaceId::ROOT)
@@ -375,8 +385,7 @@ fn prepare_statement_inner(
 ) -> Result<crate::Statement> {
     reject_sqlite_catalog_access(sql)?;
 
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let parse_result = turso_pg_parser::parse(sql).map_err(crate::error::sql_parse_error)?;
 
     // In an aborted transaction block PostgreSQL accepts only the statements
     // that end it and rejects everything else with 25P02.
@@ -424,10 +433,49 @@ fn prepare_statement_inner(
         None => (Cow::Borrowed(sql), parse_result),
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
+    let existing_generated = turso_pg_parser::alter_table_add_column_table(&parse_result)
+        .and_then(|(schema, table)| {
+            relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
+                .into_iter()
+                .find_map(|ns| {
+                    pg_conn.conn.with_schema(ns.database_id(), |s| {
+                        s.get_btree_table(ns.target.id, &table).map(|t| {
+                            t.columns()
+                                .iter()
+                                .filter(|c| c.is_generated())
+                                .filter_map(|c| c.name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                })
+        })
+        .unwrap_or_default();
+    if let Some((schema, table)) = turso_pg_parser::positional_insert_table(&parse_result) {
+        let has_generated = relation_lookup_namespaces(&pg_conn.conn, schema.as_deref())
+            .into_iter()
+            .find_map(|ns| {
+                pg_conn.conn.with_schema(ns.database_id(), |s| {
+                    s.get_btree_table(ns.target.id, &table)
+                        .map(|t| t.columns().iter().any(|c| c.is_generated()))
+                })
+            })
+            .unwrap_or(false);
+        if has_generated {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "positional INSERT into table \"{table}\" with generated columns \
+                     requires an explicit column list"
+                ),
+            ));
+        }
+    }
     let conn_for_names = Arc::clone(&pg_conn.conn);
-    let translator = PostgreSQLTranslator::new().with_relation_name_check(move |schema, name| {
-        schema_has_relation(&conn_for_names, schema, name)
-    });
+    let translator = PostgreSQLTranslator::new()
+        .with_relation_name_check(move |schema, name| {
+            schema_has_relation(&conn_for_names, schema, name)
+        })
+        .with_existing_generated_columns(existing_generated);
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
@@ -443,17 +491,18 @@ fn prepare_statement_inner(
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
     if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
-        return pg_conn
+        let stmt = pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
-            .map_err(schema_error)
-            .map(|s| {
-                crate::Statement::new(s)
-                    .with_result_kind(result_kind)
-                    .with_tx_tracking(conn, tx, role)
-                    .with_query_start_marking(marks_query_start)
-                    .with_post_run(post_run)
-            });
+            .map_err(schema_error)?;
+        // Preparing CREATE TYPE refuses a taken type name, which PostgreSQL
+        // reports before bad enum labels.
+        check_enum_labels(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?;
+        return Ok(crate::Statement::new(stmt)
+            .with_result_kind(result_kind)
+            .with_tx_tracking(conn, tx, role)
+            .with_query_start_marking(marks_query_start)
+            .with_post_run(post_run));
     }
 
     // Validate the prerequisites and the target command during prepare
@@ -1110,11 +1159,11 @@ impl DeferredOperation {
                         }
                         return Ok(None);
                     }
-                    FrontendStmt::GrantSelect(stmt) => {
+                    FrontendStmt::Grant(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        grant_select_commands(conn, stmt)?
+                        grant_commands(conn, stmt)?
                     }
                     FrontendStmt::Set(_)
                     | FrontendStmt::SetTransaction
@@ -1713,7 +1762,7 @@ fn try_prepare_special(
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
         | FrontendStmt::CommentOn(_)
-        | FrontendStmt::GrantSelect(_)) => crate::Statement::with_deferred(
+        | FrontendStmt::Grant(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1730,6 +1779,26 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
             match check_schema_exists(conn, schema) {
                 Err(missing_schema) => missing_schema,
                 Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+            }
+        }
+        ParseError::UnresolvedFunctionType {
+            ref schema,
+            ref name,
+            ref full_name,
+            used_as,
+        } => {
+            if let Some(schema) = schema {
+                if let Err(missing_schema) = check_schema_exists(conn, schema) {
+                    return missing_schema;
+                }
+            }
+            if type_exists(conn, schema.as_deref(), name) {
+                sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
+            } else {
+                sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    used_as.missing_message(full_name),
+                )
             }
         }
     }
@@ -1773,9 +1842,9 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
-        // Who may grant on each table is decided from its stored privileges
-        // when the engine's GRANT runs.
-        FrontendStmt::GrantSelect(_) => return Ok(()),
+        // Who may grant or revoke on each table is decided from its stored
+        // privileges when the engine's GRANT or REVOKE runs.
+        FrontendStmt::Grant(_) => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),
@@ -1803,14 +1872,12 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
     Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
-/// The engine GRANT that stores a GRANT SELECT. The engine checks the
-/// tables and the dialect the roles, tables first as in PostgreSQL. `ALL
+/// The engine statement that stores a GRANT or REVOKE. The engine checks
+/// the tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
-/// schema, and no statement when there are none.
-fn grant_select_commands(
-    conn: &Arc<Connection>,
-    stmt: &PgGrantSelectStmt,
-) -> Result<Vec<DeferredStatement>> {
+/// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
+/// there are none.
+fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<DeferredStatement>> {
     let relations = match &stmt.tables {
         PgGrantTables::Named(tables) => tables.clone(),
         PgGrantTables::AllInSchemas(schemas) => {
@@ -1818,12 +1885,29 @@ fn grant_select_commands(
             for schema in schemas {
                 check_schema_exists(conn, schema)?;
                 let schema = schema.to_lowercase();
+                // The catalog views are not listed among the schema's
+                // objects. A GRANT on them changes nothing, since every role
+                // reads them, but a REVOKE would leave every role reading
+                // them.
+                if stmt.revoke
+                    && !stmt.on_sequences
+                    && matches!(schema.as_str(), "pg_catalog" | "information_schema")
+                {
+                    return Err(sqlstate_error(
+                        SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        format!(
+                            "REVOKE on the system catalogs of schema {schema} is not supported"
+                        ),
+                    ));
+                }
                 relations.extend(
                     schema_objects(conn, &schema)
                         .into_iter()
                         .filter_map(|object| match object {
-                            SchemaObject::Table(name) | SchemaObject::View(name) => Some(name),
-                            SchemaObject::Sequence(_) => None,
+                            SchemaObject::Table(name) | SchemaObject::View(name) => {
+                                (!stmt.on_sequences).then_some(name)
+                            }
+                            SchemaObject::Sequence(name) => stmt.on_sequences.then_some(name),
                         })
                         .map(|name| {
                             ast::QualifiedName::fullname(
@@ -1837,9 +1921,9 @@ fn grant_select_commands(
         }
     };
     if relations.is_empty() {
-        // With nothing to grant on, the roles are still checked, as in
+        // With no relation to change, the roles are still checked, as in
         // PostgreSQL; otherwise the dialect checks them.
-        let roles = conn.role_catalog();
+        let roles = connection_roles(conn);
         for grantee in &stmt.roles {
             if let PgGrantee::Role(name) = grantee {
                 if catalog::role_oid_by_name(&roles, name).is_none() {
@@ -1854,7 +1938,9 @@ fn grant_select_commands(
     }
     Ok(vec![DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
-            privileges: vec![ast::Privilege::Select],
+            revoke: stmt.revoke,
+            privileges: stmt.privileges.clone(),
+            on_sequences: stmt.on_sequences,
             relations,
             grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
         })),
@@ -1932,9 +2018,10 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 PgSetTo::Default => "RESET",
                 PgSetTo::Values(_) | PgSetTo::Current => "SET",
             };
-            return Err(LimboError::ParseError(format!(
-                "{command} {name} is not supported"
-            )));
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("{command} {name} is not supported"),
+            ));
         }
     };
     // Change the setting when the statement runs, not when it is prepared.
@@ -1956,9 +2043,10 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
             .name_as_defined(name)
             .unwrap_or_else(|| name.clone()),
         None => {
-            return Err(LimboError::ParseError(format!(
-                "SHOW {name} is not supported"
-            )))
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("SHOW {name} is not supported"),
+            ))
         }
     };
     pg_conn.conn.prepare(format!(
@@ -2025,7 +2113,7 @@ pub(crate) fn set_role(
     let role = match value.filter(|name| *name != "none") {
         None => None,
         Some(name) => {
-            let roles = conn.role_catalog();
+            let roles = connection_roles(conn);
             let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
                 return Err(sqlstate_error(
                     SQLSTATE_UNDEFINED_OBJECT,
@@ -2388,7 +2476,9 @@ mod tests {
     use crate::PostgresDialect;
     use chumsky::Parser;
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, Value};
+    use turso_core::{
+        Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, SessionRole, Value,
+    };
 
     #[test]
     fn a_materialized_view_of_a_schema_is_maintained_and_dropped_with_the_schema() {
@@ -2570,7 +2660,7 @@ mod tests {
             OpenOptions::new(Arc::new(PostgresDialect)),
         )
         .unwrap();
-        db.connect(turso_core::ConnectOpts::new())
+        db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
             .unwrap();

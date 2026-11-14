@@ -414,6 +414,16 @@ expect {
     u|1
 }
 
+@skip-if postgres "PostgreSQL supports ALTER SCHEMA ... RENAME"
+test alter-schema-rename-is-not-supported {
+    CREATE SCHEMA rn_schema;
+    ALTER SCHEMA rn_schema RENAME TO rn_schema_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER SCHEMA ... RENAME is not supported
+}
+
 test drop-sequence-clears-the-session-currval {
     CREATE SEQUENCE s;
     SELECT nextval('s');

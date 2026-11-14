@@ -30,9 +30,26 @@ impl ExternalFunc {
                 arity,
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
+                receives_argument_types: false,
                 function: Arc::new(function),
             },
         })
+    }
+
+    /// Makes each call also get the type name of each argument, such as
+    /// `boolean[]` or `integer`, as one more text argument per argument, after
+    /// them. A function that writes values whose stored form doesn't tell
+    /// their type, such as a boolean stored as 1, uses this.
+    pub fn receiving_argument_types(mut self) -> Self {
+        let ExtFunc::NativeScalar {
+            receives_argument_types,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can receive its argument types");
+        };
+        *receives_argument_types = true;
+        self
     }
 
     pub fn new_native_aggregate<F: AggregateFunction + 'static>(
@@ -52,7 +69,7 @@ impl ExternalFunc {
 }
 
 impl ExtFunc {
-    pub(crate) fn call_scalar(
+    pub fn call_scalar(
         &self,
         state: &mut ExtensionState,
         connection: &Arc<Connection>,

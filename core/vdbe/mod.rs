@@ -24,8 +24,6 @@ use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
-#[cfg(test)]
-mod blob_io_tests;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -34,12 +32,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
-#[cfg(test)]
-mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
-#[cfg(test)]
-mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 #[allow(unused_imports)] // for benchmarks
@@ -1218,6 +1212,12 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// Whether this statement has passed a `Transaction` instruction and is
+    /// counted in `Connection::n_active_read_statements`.
+    pub(crate) is_active_read: bool,
+    /// Whether this statement is a DROP that has passed a `Transaction`
+    /// instruction and is counted in `Connection::n_active_destroy_statements`.
+    pub(crate) is_active_destroy: bool,
     /// Write activity on the main database when this statement became an
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
@@ -1329,6 +1329,8 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            is_active_read: false,
+            is_active_destroy: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
@@ -1401,6 +1403,10 @@ impl ProgramState {
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        turso_assert!(
+            !self.is_active_read && !self.is_active_destroy,
+            "resetting a statement still counted as an active reader"
+        );
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -1518,6 +1524,23 @@ impl ProgramState {
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
         self.pending_fresh_tx = None;
+    }
+
+    /// Removes this statement from the connection's counts of reading and
+    /// dropping statements. The next `Transaction` instruction counts it again.
+    pub(crate) fn stop_counting_as_reader(&mut self, connection: &Connection) {
+        if self.is_active_read {
+            connection
+                .n_active_read_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_read = false;
+        }
+        if self.is_active_destroy {
+            connection
+                .n_active_destroy_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_destroy = false;
+        }
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -2139,6 +2162,10 @@ pub struct PreparedProgram {
     /// Whether the statement may write more than one row; see
     /// `crate::vdbe::builder::ProgramBuilder::is_multi_write`.
     pub is_multi_write: bool,
+    /// Whether the errors of the statement's constraints leave out the
+    /// values of the row or key that broke them; see
+    /// `crate::vdbe::builder::ProgramBuilderFlags::hides_constraint_values`.
+    pub hides_constraint_values: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
@@ -2162,6 +2189,9 @@ pub struct PreparedProgram {
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
     pub(crate) used_non_main_schemas: rustc_hash::FxHashMap<usize, Arc<crate::schema::Schema>>,
+    /// Whether the program frees a b-tree (`Insn::Destroy`) or the storage of an
+    /// index method (`Insn::IndexMethodDestroy`), as DROP TABLE and DROP INDEX do.
+    pub destroys_btree: bool,
 }
 
 #[derive(Clone)]
@@ -4503,6 +4533,7 @@ pub(crate) fn decode_serial_type_into_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -4534,7 +4565,9 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);

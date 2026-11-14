@@ -18,26 +18,30 @@ pub mod engine;
 pub(crate) use engine::EngineDialect;
 
 use crate::{
+    function::ScalarFunc,
     namespace::NamespaceId,
     schema::{BTreeTable, RelationKind, Schema},
-    security::roles::RoleId,
-    vdbe::builder::ProgramBuilder,
-    Connection, Func, LimboError, OpenOptions, Result, Value,
+    security::{policy::RowPolicy, roles::RoleId},
+    vdbe::{builder::ProgramBuilder, Register},
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
-use turso_parser::ast::{Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt};
+use turso_parser::ast::{
+    self, Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt,
+};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
-/// A change a statement makes to a relation of the main database. DDL
-/// translation tells the dialect about it through
-/// [`Dialect::translate_relation_changes`], and the dialect's own bytecode
-/// tells it back through [`Dialect::apply_relation_change`] once the change
+/// A change a statement makes to the dialect's catalog of the main
+/// database: to a relation, or to the roles. Translation tells the dialect
+/// about it through
+/// [`Dialect::translate_catalog_changes`], and the dialect's own bytecode
+/// tells it back through [`Dialect::apply_catalog_change`] once the change
 /// is written.
 #[derive(Debug, Clone)]
-pub enum RelationChange {
+pub enum CatalogChange {
     Create {
         namespace: NamespaceId,
         name: String,
@@ -61,16 +65,44 @@ pub enum RelationChange {
         name: String,
         owner: NewOwner,
     },
-    /// `GRANT privileges ON relation TO grantees`.
+    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
+    /// relation FROM grantees` when `revoke` is set.
     Grant {
+        revoke: bool,
         namespace: NamespaceId,
         name: String,
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
+    /// `enabled` is false.
+    SetRowSecurity {
+        namespace: NamespaceId,
+        name: String,
+        enabled: bool,
+    },
+    /// `CREATE POLICY` on table `name`. Its expressions refer to the
+    /// table's columns by their unqualified names.
+    CreatePolicy {
+        namespace: NamespaceId,
+        name: String,
+        policy: Box<ast::CreatePolicy>,
+    },
+    /// `DROP POLICY policy_name ON name`.
+    DropPolicy {
+        namespace: NamespaceId,
+        name: String,
+        policy_name: String,
+        if_exists: bool,
+    },
+    /// `CREATE ROLE name`: a role that is not a superuser and cannot log in.
+    CreateRole {
+        name: String,
+        options: ast::RoleOptions,
+    },
 }
 
-/// Whom a relation belongs to after a [`RelationChange::ChangeOwner`].
+/// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
 #[derive(Debug, Clone)]
 pub enum NewOwner {
     /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
@@ -79,6 +111,16 @@ pub enum NewOwner {
     Table(Option<String>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// What a built-in scalar function may read besides its arguments.
+pub struct ScalarFuncContext<'a> {
+    pub connection: &'a Connection,
+    pub io: &'a dyn IO,
+    /// The statement's clock: every function of one step sees the same time.
+    pub clock: &'a dyn Clock,
+    /// The collation of the call site, for functions that compare arguments.
+    pub collation: CollationSeq,
 }
 
 /// SQL dialect layered on top of the engine.
@@ -216,6 +258,21 @@ pub trait Dialect: Send + Sync + 'static {
         engine::resolve_builtin_function(name, arg_count)
     }
 
+    /// Run built-in scalar function `func` on the registers that hold its
+    /// arguments.
+    ///
+    /// The default runs the shared implementation in
+    /// [`engine::call_builtin_scalar`]; a dialect overrides it for the
+    /// functions whose behavior differs and delegates the rest.
+    fn call_scalar(
+        &self,
+        context: &ScalarFuncContext<'_>,
+        func: &ScalarFunc,
+        args: &[Register],
+    ) -> Result<Value> {
+        engine::call_builtin_scalar(context, func, args)
+    }
+
     /// Execute a dialect scalar function at runtime.
     ///
     /// Receives the connection — unlike extension functions — because
@@ -279,32 +336,25 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a database of this dialect stores roles in the roles table.
-    ///
-    /// SQLite has no roles, so a table named like the roles table is an
-    /// ordinary table.
-    fn supports_roles(&self) -> bool {
-        false
-    }
-
-    /// SQL that reads the dialect's own schema state, such as the PostgreSQL
-    /// frontend's relation catalog table, or None when this database keeps
-    /// none. The statement runs with engine semantics after the schema rows
-    /// load, and its rows go to [`Dialect::build_schema_state`].
-    fn schema_state_query(&self, schema: &Schema) -> Option<String> {
+    /// SQL statements that read the dialect's own schema state, such as the
+    /// PostgreSQL frontend's relation catalog table, or none when this
+    /// database keeps none. The statements run with engine semantics after
+    /// the schema rows load, and their rows go to
+    /// [`Dialect::build_schema_state`].
+    fn schema_state_queries(&self, schema: &Schema) -> Vec<String> {
         let _ = schema;
-        None
+        Vec::new()
     }
 
-    /// Builds [`Schema::dialect_schema`] from the rows that
-    /// [`Dialect::schema_state_query`] returned. `schema` is the schema the
-    /// state is built for, already holding every other object.
+    /// Builds [`Schema::dialect_schema`] from the rows of each statement of
+    /// [`Dialect::schema_state_queries`], in the same order. `schema` is the
+    /// schema the state is built for, already holding every other object.
     fn build_schema_state(
         &self,
         schema: &Schema,
-        rows: &[Vec<Value>],
+        results: &[Vec<Vec<Value>>],
     ) -> Result<Arc<dyn Any + Send + Sync>> {
-        let _ = (schema, rows);
+        let _ = (schema, results);
         Err(LimboError::InternalError(
             "the dialect queried schema state it cannot build".to_string(),
         ))
@@ -315,19 +365,21 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership or privileges and refuses `ALTER ... OWNER TO`,
-    /// `ALTER SEQUENCE ... OWNED BY` and `GRANT`.
-    fn translate_relation_changes(
+    /// has no roles, ownership, privileges or row-level security and refuses
+    /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
+    /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
+    /// `CREATE POLICY` and `DROP POLICY`.
+    fn translate_catalog_changes(
         &self,
         program: &mut ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[RelationChange],
+        changes: &[CatalogChange],
     ) -> Result<()> {
         let _ = (program, schema, connection);
         for change in changes {
             match change {
-                RelationChange::ChangeOwner {
+                CatalogChange::ChangeOwner {
                     owner: NewOwner::Role(_),
                     ..
                 } => {
@@ -335,7 +387,7 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER ... OWNER TO is not supported".to_string(),
                     ));
                 }
-                RelationChange::ChangeOwner {
+                CatalogChange::ChangeOwner {
                     owner: NewOwner::Table(_),
                     ..
                 } => {
@@ -343,8 +395,23 @@ pub trait Dialect: Send + Sync + 'static {
                         "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
                     ));
                 }
-                RelationChange::Grant { .. } => {
-                    return Err(LimboError::ParseError("GRANT is not supported".to_string()));
+                CatalogChange::Grant { revoke, .. } => {
+                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
+                    return Err(LimboError::ParseError(format!(
+                        "{statement} is not supported"
+                    )));
+                }
+                CatalogChange::SetRowSecurity { .. }
+                | CatalogChange::CreatePolicy { .. }
+                | CatalogChange::DropPolicy { .. } => {
+                    return Err(LimboError::ParseError(
+                        "row-level security is not supported".to_string(),
+                    ));
+                }
+                CatalogChange::CreateRole { .. } => {
+                    return Err(LimboError::ParseError(
+                        "CREATE ROLE is not supported".to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -356,10 +423,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// schema state, to the in-memory copy in `schema`. `values` are the
     /// registers the dialect named when it emitted the instruction, such as
     /// the id its state gave a created relation.
-    fn apply_relation_change(
+    fn apply_catalog_change(
         &self,
         schema: &mut Schema,
-        change: &RelationChange,
+        change: &CatalogChange,
         values: &[Value],
     ) -> Result<()> {
         let _ = (schema, change, values);
@@ -372,6 +439,34 @@ pub trait Dialect: Send + Sync + 'static {
     /// made while it was attached could not be opened later.
     fn supports_relation_ddl_in_attached_databases(&self) -> bool {
         true
+    }
+
+    /// The id of the role named `name`, case-sensitively, when the dialect
+    /// stores roles. A dialect without roles has none, so a connection can
+    /// run only as the superuser.
+    fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
+        let _ = (schema, name);
+        None
+    }
+
+    /// Whether `role` passes every privilege check. [`RoleId::SUPERUSER`]
+    /// does in every dialect.
+    fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
+        let _ = schema;
+        role == RoleId::SUPERUSER
+    }
+
+    /// Whether row-level security does not limit `role`. As in PostgreSQL,
+    /// it does not limit a superuser.
+    fn role_bypass_rls(&self, schema: &Schema, role: RoleId) -> bool {
+        self.role_is_superuser(schema, role)
+    }
+
+    /// Whether a session whose current role is `member` may switch to `role`
+    /// with `SET ROLE`. A superuser may switch to any role, any role may
+    /// switch to itself, and no session may switch to [`RoleId::PUBLIC`].
+    fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        role != RoleId::PUBLIC && (member == role || self.role_is_superuser(schema, member))
     }
 
     /// The role that owns relation `name` of `namespace`, when the dialect
@@ -387,18 +482,38 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
-    /// Whether `role` may read relation `name` of `namespace`, from the
-    /// privileges the dialect stores. A dialect without privileges lets
-    /// every role read.
-    fn role_may_read(
+    /// Whether `role` has `privilege` on relation `name` of `namespace`,
+    /// from the privileges the dialect stores. A dialect without privileges
+    /// gives every role every privilege.
+    fn role_has_privilege(
         &self,
         schema: &Schema,
         namespace: NamespaceId,
         name: &str,
         role: RoleId,
+        privilege: Privilege,
     ) -> bool {
-        let _ = (schema, namespace, name, role);
+        let _ = (schema, namespace, name, role, privilege);
         true
+    }
+
+    /// Whether table `name` of `namespace` has row-level security enabled.
+    /// A dialect without row-level security never has it enabled.
+    fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        let _ = (schema, namespace, name);
+        false
+    }
+
+    /// The policies of table `name` of `namespace`, for every role and
+    /// command. A dialect without row-level security has none.
+    fn row_security_policies<'a>(
+        &self,
+        schema: &'a Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> &'a [RowPolicy] {
+        let _ = (schema, namespace, name);
+        &[]
     }
 
     /// Whether `PRAGMA capture_data_changes_conn` may create its change
@@ -428,6 +543,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL raises an error so that the result does not depend on the
     /// order of the proposed rows. SQLite updates the row again.
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
+
+    /// Whether a subquery used as an expression, such as `x = (SELECT ...)`,
+    /// raises an error when it returns more than one row.
+    ///
+    /// PostgreSQL raises SQLSTATE 21000. SQLite uses the first row.
+    fn rejects_scalar_subquery_with_several_rows(&self) -> bool {
         false
     }
 
@@ -487,6 +610,7 @@ mod tests {
     use super::*;
     use crate::io::PlatformIO;
     use crate::native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule};
+    use crate::security::roles::SessionRole;
     use crate::storage::database::DatabaseFile;
     use crate::sync::atomic::{AtomicUsize, Ordering};
     use crate::types::IOResultOr;
@@ -498,7 +622,6 @@ mod tests {
     use turso_ext::{
         ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode, VTabKind,
     };
-    use turso_parser::parser::Parser;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `
     /// marker before delegating to SQLite parsing, mirroring how a frontend
@@ -727,7 +850,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         {
             let db = open_db(&io, "dialect-load.db", Arc::new(EngineDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
             conn.close().unwrap();
         }
@@ -740,7 +865,9 @@ mod tests {
 
         // DDL reparses the schema via the ParseSchema opcode, again through
         // the dialect.
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let before = dialect.parse_calls.load(Ordering::SeqCst);
         conn.execute("CREATE TABLE u (y INTEGER)").unwrap();
         assert!(dialect.parse_calls.load(Ordering::SeqCst) > before);
@@ -756,7 +883,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let dialect = Arc::new(TestDialect::default());
         let db = open_db(&io, "dialect-reprepare.db", dialect.clone()).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let mut stmt = conn.prepare("test: SELECT 42").unwrap();
         conn.set_full_column_names(true);
@@ -772,7 +901,9 @@ mod tests {
     fn consume_stmt_reports_parse_error() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(EngineDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         assert!(conn.consume_stmt("SELECT * FROM").is_err());
         conn.close().unwrap();
@@ -790,8 +921,12 @@ mod tests {
                 .unwrap()
         };
 
-        let conn1 = db.connect(ConnectOpts::new()).unwrap();
-        let conn2 = db.connect(ConnectOpts::new()).unwrap();
+        let conn1 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let conn2 = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         assert_eq!(
             query_catalog(&conn1),
             vec![vec![Value::Numeric(Numeric::Integer(42))]]
@@ -823,7 +958,9 @@ mod tests {
             Arc::new(TestDialect::default()),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let error = conn.execute("DROP TABLE test_catalog").unwrap_err();
         assert!(
@@ -833,7 +970,9 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        let new_conn = db.connect(ConnectOpts::new()).unwrap();
+        let new_conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         for catalog_conn in [&conn, &new_conn] {
             let rows = catalog_conn
                 .prepare("SELECT value FROM test_catalog")
@@ -853,14 +992,18 @@ mod tests {
 
         {
             let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             conn.execute("PRAGMA journal_mode = mvcc").unwrap();
             conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
             conn.close().unwrap();
         }
 
         let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let rows = conn
             .prepare("SELECT value FROM test_catalog")
             .unwrap()
@@ -881,7 +1024,9 @@ mod tests {
         .unwrap();
 
         for temp_store in ["MEMORY", "FILE"] {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             conn.execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
             conn.execute("CREATE TEMP TABLE t (x INTEGER)").unwrap();
@@ -901,12 +1046,17 @@ mod tests {
         {
             let dialect = Arc::new(TestDialect::default());
             let db = open_db(&io, "dialect-store.db", dialect).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
 
             // A frontend prepares its translated AST while supplying the
             // original statement text.
             let input = "CREATE TABLE t (x INTEGER)";
-            let stmt = match Parser::new(input.as_bytes()).next_cmd().unwrap().unwrap() {
+            let stmt = match crate::dialect::engine::parse_statement(input)
+                .unwrap()
+                .unwrap()
+            {
                 Cmd::Stmt(stmt) => stmt,
                 other => panic!("unexpected command: {other:?}"),
             };
@@ -933,7 +1083,9 @@ mod tests {
         let dialect = Arc::new(TestDialect::default());
         let db = open_db(&io, "dialect-store.db", dialect.clone()).unwrap();
         assert!(dialect.parse_calls.load(Ordering::SeqCst) >= 1);
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
         let rows = conn
             .prepare("SELECT x FROM t")
@@ -991,11 +1143,96 @@ mod tests {
         }
     }
 
+    /// A dialect that resolves the built-in names but runs `upper` its own
+    /// way, as a frontend does for a built-in whose behavior differs in its
+    /// dialect.
+    struct ShoutingUpperDialect;
+
+    impl Dialect for ShoutingUpperDialect {
+        fn name(&self) -> &'static str {
+            "shouting"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            engine::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
+            engine::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            engine::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            _input: &str,
+            tbl_name: &QualifiedName,
+            body: &CreateTableBody,
+        ) -> Result<String> {
+            engine::format_table_sql(tbl_name, body)
+        }
+
+        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
+            engine::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+            engine::resolve_builtin_function(name, arg_count)
+        }
+
+        fn call_scalar(
+            &self,
+            context: &ScalarFuncContext<'_>,
+            func: &ScalarFunc,
+            args: &[Register],
+        ) -> Result<Value> {
+            let value = engine::call_builtin_scalar(context, func, args)?;
+            if !matches!(func, ScalarFunc::Upper) {
+                return Ok(value);
+            }
+            Ok(Value::build_text(format!("{value}!")))
+        }
+    }
+
+    #[test]
+    fn dialect_owns_builtin_scalar_function_behavior() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-shouting.db", Arc::new(ShoutingUpperDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+
+        conn.execute("CREATE TABLE t (s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('hi')").unwrap();
+        let rows = conn
+            .prepare("SELECT upper(s), lower('ABC'), abs(-7) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::build_text("HI!"),
+                Value::build_text("abc"),
+                Value::from_i64(7),
+            ]]
+        );
+        conn.close().unwrap();
+    }
+
     #[test]
     fn dialect_scalar_function_resolves_and_executes() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-funcs.db", Arc::new(TestDialect::default())).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         // Dialect-provided scalar executes through exec_scalar_function.
         let rows = conn
@@ -1029,7 +1266,9 @@ mod tests {
             Arc::new(TestDialect::default()),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE lhs (id INTEGER)").unwrap();
         conn.execute("CREATE TABLE rhs (id INTEGER, value INTEGER)")
@@ -1053,7 +1292,9 @@ mod tests {
     fn dialect_owns_the_function_surface() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-nofuncs.db", Arc::new(NoFunctionsDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         // Function-free SQL works, including DDL (whose internal helper
         // statements resolve with SQLite semantics regardless of dialect).
@@ -1073,7 +1314,9 @@ mod tests {
     fn cdc_generated_functions_bypass_the_dialect() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-cdc.db", Arc::new(NoFunctionsDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("PRAGMA capture_data_changes_conn('full')")
@@ -1113,7 +1356,9 @@ mod tests {
     fn alter_table_rewrites_dialect_formatted_sql() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-alter-table.db", Arc::new(StrictTestDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("ALTER TABLE t RENAME TO u").unwrap();
@@ -1136,7 +1381,9 @@ mod tests {
     fn alter_table_rename_column_decodes_dialect_formatted_sql() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-alter-column.db", Arc::new(StrictTestDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("ALTER TABLE t RENAME COLUMN x TO y").unwrap();
@@ -1221,7 +1468,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
         conn.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -1234,7 +1483,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let output_conn = output_db.connect(ConnectOpts::new()).unwrap();
+        let output_conn = output_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let schema_rows = output_conn
             .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
             .unwrap()
@@ -1272,7 +1523,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS aux",
             attached_path.display()
@@ -1290,7 +1543,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let output_conn = output_db.connect(ConnectOpts::new()).unwrap();
+        let output_conn = output_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         assert_eq!(
             output_conn
                 .prepare("SELECT x FROM t")
@@ -1316,7 +1571,9 @@ mod tests {
             Arc::new(StrictTestDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
         conn.execute("INSERT INTO t VALUES (42)").unwrap();
 

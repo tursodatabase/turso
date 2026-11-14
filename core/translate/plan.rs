@@ -715,6 +715,9 @@ pub enum QueryDestination {
         result_reg_start: usize,
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
+        /// The register that counts the stored rows, when a second row is an
+        /// error (see [ast::SubqueryType::RowValue]).
+        row_count_reg: Option<usize>,
     },
     /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
     /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.
@@ -1076,6 +1079,8 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// The checks of row-level security that each new row must pass.
+    pub(crate) row_checks: Vec<crate::translate::row_security::RowCheck>,
 }
 
 impl UpdatePlan {
@@ -1826,6 +1831,10 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
+    /// The condition that row-level security puts on the rows of the table.
+    /// It is checked as soon as the loop reads a row, before any other
+    /// condition, so no expression of the query sees a row it fails.
+    pub row_filter: Option<ast::Expr>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -2241,13 +2250,18 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Returns the CTE with the given name from the nearest enclosing scope.
+    /// Within one scope, a query's own WITH clause comes after the references
+    /// it inherits, so the last match wins.
     pub fn find_cte_outer_query_ref_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .rev()
+            .filter(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .min_by_key(|t| t.scope_depth)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -3319,6 +3333,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3372,6 +3387,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3410,6 +3426,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use turso_core::Value;
+use turso_core::{SessionRole, Value};
 use turso_pg::{
     Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags, StepResult,
     TransactionState,
@@ -2010,7 +2010,9 @@ fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>)
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.set_foreign_keys_enabled(true);
     (io, conn)
 }

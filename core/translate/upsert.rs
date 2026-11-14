@@ -7,6 +7,7 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_generated_columns;
+use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -22,6 +23,7 @@ use crate::translate::insert::{
 };
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::row_security::{emit_row_checks, UpsertRowChecks};
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
@@ -488,6 +490,7 @@ pub fn emit_upsert(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
+    row_checks: &UpsertRowChecks,
 ) -> crate::Result<()> {
     let constraint_on_error = do_update_constraint_on_error(program);
 
@@ -687,6 +690,23 @@ pub fn emit_upsert(
         });
     }
 
+    // The conflicting row must be one the role may update, or the statement
+    // fails, after the WHERE above, as in PostgreSQL.
+    emit_row_checks(
+        program,
+        resolver,
+        &row_checks.conflicting_row,
+        table_references,
+        ctx.conflict_rowid_reg,
+        table.columns().iter().enumerate().map(|(idx, col)| {
+            if col.is_rowid_alias() {
+                (col, ctx.conflict_rowid_reg)
+            } else {
+                (col, layout.to_register(current_start, idx))
+            }
+        }),
+    )?;
+
     // Apply SET; capture rowid change if any
     let mut new_rowid_reg: Option<usize> = None;
     for (col_idx, expr) in set_pairs.iter_mut() {
@@ -838,6 +858,24 @@ pub fn emit_upsert(
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
         }
+
+        // Rows that row-level security does not let the role write fail
+        // before the CHECK constraints, as in PostgreSQL.
+        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        emit_row_checks(
+            program,
+            resolver,
+            &row_checks.updated_row,
+            table_references,
+            rowid_reg,
+            bt.columns().iter().enumerate().map(|(idx, col)| {
+                if col.is_rowid_alias() {
+                    (col, rowid_reg)
+                } else {
+                    (col, layout.to_register(new_start, idx))
+                }
+            }),
+        )?;
 
         // Evaluate CHECK constraints on the new values
         emit_check_constraints(
@@ -1753,6 +1791,7 @@ fn emit_generated_column_notnull_checks(
 pub fn collect_set_clauses_for_upsert(
     table: &Table,
     set_items: &mut [ast::Set],
+    resolver: &Resolver,
 ) -> crate::Result<Vec<(usize, Box<ast::Expr>)>> {
     let lookup: HashMap<String, usize> = table
         .columns()
@@ -1775,12 +1814,15 @@ pub fn collect_set_clauses_for_upsert(
                 values.len()
             );
         }
-        for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
+        for (cn, mut e) in set.col_names.iter().zip(values.into_iter()) {
             let ident = normalize_ident(cn.as_str());
             let idx = match lookup.get(&ident) {
                 Some(idx) => {
-                    // cannot upsert generated column
-                    table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
+                    let col = &table.columns()[*idx];
+                    col.ensure_not_generated("UPDATE", cn.as_str())?;
+                    if matches!(e.as_ref(), ast::Expr::Default) {
+                        e = column_default_expr(col, table.is_strict(), resolver);
+                    }
                     *idx
                 }
                 None => match rowid_name_column_index(table, &ident) {

@@ -12,7 +12,7 @@ Yield injection is test-only infrastructure for forcing cooperative-yield or fai
 - `core/mvcc/yield_hooks.rs`: `YieldPointMarker`, `YieldContext`, `ProvidesYieldContext`.
 - `core/connection.rs`: per-connection injector slots and `yield_instance_id_counter`.
 - `core/mvcc/database/mod.rs`: commit points and commit cleanup.
-- `core/mvcc/database/checkpoint_state_machine.rs`: checkpoint points.
+- `core/mvcc/database/checkpoint.rs`: checkpoint points.
 - `core/mvcc/cursor.rs`: cursor points.
 - `core/mvcc/database/tests.rs`: fixed test injectors and regression examples.
 - `testing/concurrent-simulator/yield_injection.rs`: simulator injector.

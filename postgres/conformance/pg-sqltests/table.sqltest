@@ -40,6 +40,37 @@ expect {
 }
 
 @setup users
+test table-update-column-list-from-row {
+    UPDATE users SET (name, age) = ('bobby', 26) WHERE id = 2;
+    UPDATE users SET active = true, (name, age) = ROW('caroline', 36) WHERE id = 3;
+    UPDATE users SET (age) = ROW(31) WHERE id = 1;
+    SELECT name, age, active FROM users ORDER BY id;
+}
+expect {
+    alice|31|t
+    bobby|26|f
+    caroline|36|t
+}
+
+@setup users
+test table-update-column-list-from-subquery {
+    UPDATE users SET (name, age) = (SELECT name, age FROM users WHERE id = 3) WHERE id = 1;
+    SELECT name, age FROM users ORDER BY id;
+}
+expect {
+    carol|35
+    bob|25
+    carol|35
+}
+
+@setup users
+test table-update-column-list-from-a-plain-value-errors {
+    UPDATE users SET (age) = (31);
+}
+@sqlstate 0A000
+expect error {source for a multiple-column UPDATE item must be a sub-SELECT or ROW}
+
+@setup users
 test table-delete {
     DELETE FROM users WHERE age > 34;
     SELECT count(*) FROM users;
@@ -483,6 +514,15 @@ setup upsert {
 }
 
 @setup upsert
+test table-upsert-updates-column-list-from-row {
+    INSERT INTO upsert_t VALUES (1, 5, 7) ON CONFLICT (a) DO UPDATE SET (k, b) = (excluded.k + 1, excluded.b);
+    SELECT a, k, b FROM upsert_t;
+}
+expect {
+    1|6|7
+}
+
+@setup upsert
 test table-upsert-existing-row-updated-twice-rejected {
     INSERT INTO upsert_t VALUES (1, 10, 1), (1, 11, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
 }
@@ -815,4 +855,96 @@ test array-of-booleans-from-literal-and-aggregate {
 expect {
     1|0
     1
+}
+
+test table-insert-values-shorter-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-longer-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3, 4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-shorter-row-without-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u VALUES (1, 2, 3), (4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-different-row-length-with-default {
+    CREATE TABLE u (id int, a int, b int DEFAULT 9);
+    INSERT INTO u VALUES (1, 2, DEFAULT), (3, 4);
+}
+@sqlstate 42601
+expect error {}
+
+@skip-if postgres "PostgreSQL supports ALTER VIEW ... RENAME"
+test alter-view-rename-is-not-supported {
+    CREATE TABLE rn_view_base (id INT);
+    CREATE VIEW rn_view AS SELECT id FROM rn_view_base;
+    ALTER VIEW rn_view RENAME TO rn_view_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER VIEW ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER INDEX ... RENAME"
+test alter-index-rename-is-not-supported {
+    CREATE TABLE rn_index_base (id INT);
+    CREATE INDEX rn_index ON rn_index_base (id);
+    ALTER INDEX rn_index RENAME TO rn_index_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER INDEX ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TYPE ... RENAME"
+test alter-type-rename-is-not-supported {
+    CREATE TYPE rn_type AS ENUM ('a');
+    ALTER TYPE rn_type RENAME TO rn_type_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TYPE ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TABLE ... RENAME CONSTRAINT"
+test alter-table-rename-constraint-is-not-supported {
+    CREATE TABLE rn_constrained (id INT CONSTRAINT rn_positive CHECK (id > 0));
+    ALTER TABLE rn_constrained RENAME CONSTRAINT rn_positive TO rn_still_positive;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TABLE ... RENAME CONSTRAINT is not supported
+}
+
+test update-set-default-uses-column-default {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int DEFAULT 7, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT a, b FROM defaults_t;
+}
+expect {
+    7|x
+}
+
+test update-set-default-without-column-default-sets-null {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT CASE WHEN a IS NULL THEN 1 ELSE 0 END, b FROM defaults_t;
+}
+expect {
+    1|x
 }

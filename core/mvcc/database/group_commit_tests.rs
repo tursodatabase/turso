@@ -1,6 +1,7 @@
 use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
+use crate::security::roles::SessionRole;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::{ConnectOpts, Connection, Database, LimboError, StepResult, SyncMode, Value};
 use std::sync::{Arc, Barrier};
@@ -60,7 +61,9 @@ fn group_commit_pragma_is_store_wide() {
 fn group_commit_pragma_needs_mvcc() {
     let io = Arc::new(crate::io::MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     let err = conn
         .execute("PRAGMA mvcc_group_commit = yes")
@@ -225,7 +228,9 @@ fn batched_records_survive_a_restart() {
                 let shared = shared.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let conn = shared.connect(ConnectOpts::new()).unwrap();
+                    let conn = shared
+                        .connect(ConnectOpts::new(SessionRole::Superuser))
+                        .unwrap();
                     for round in 0..rounds {
                         let pk = (round * WRITERS + writer) as i64;
                         conn.execute("BEGIN CONCURRENT").unwrap();

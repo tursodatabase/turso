@@ -10,7 +10,7 @@ pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTa
 pub use vtab::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
 
 pub use function::AggregateState;
-pub(crate) use function::{
+pub use function::{
     finalize_aggregate, step_aggregate, step_scalar, AggregateFactory, ScalarFactory, ScalarStep,
 };
 pub(crate) use vtab::{ModuleFactory, NativeCursor, NativeTable};
@@ -20,7 +20,7 @@ use crate::sync::Arc;
 use crate::types::Cursor;
 use crate::{Database, OpenOptions, Result};
 
-pub(crate) enum ExtensionState {
+pub enum ExtensionState {
     None,
     ScalarCall(Box<dyn ScalarStep>),
     TableUpdate(Box<dyn TableUpdate>),
@@ -44,8 +44,8 @@ impl OpenOptions {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct NativeExtensions {
-    pub(crate) functions: Vec<Arc<ExternalFunc>>,
+pub struct NativeExtensions {
+    pub functions: Vec<Arc<ExternalFunc>>,
     modules: Vec<(String, Arc<crate::ext::VTabImpl>)>,
 }
 

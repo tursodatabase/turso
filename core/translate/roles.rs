@@ -6,25 +6,24 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! Privileges other than ownership are not checked yet, so a role that is
-//! not a superuser may not write to any table, use a sequence or change the
-//! schema it does not own. It may read tables, which row-level security
-//! limits, and switch roles.
+//! A role that is not a superuser reads and writes the tables it owns or was
+//! granted privileges on, which row-level security limits, and switches
+//! roles. It may not use a sequence or change the schema it does not own.
 
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
 use crate::Connection;
 use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
-use crate::security::roles::{
-    CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
-};
+use crate::security::roles::RoleId;
 use crate::translate::emitter::Resolver;
-use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
+use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
+use crate::translate::row_security::translate_change;
+use crate::translate::schema::emit_schema_cookie;
+use crate::vdbe::builder::ProgramBuilder;
+use crate::{bail_parse_error, CatalogChange, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
@@ -40,11 +39,12 @@ pub fn check_statement_privileges(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let denial = match stmt {
-        ast::Stmt::Select(_) => return Ok(()),
-        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
-            write_denial(tbl_name)
-        }
-        ast::Stmt::Update(update) => write_denial(&update.tbl_name),
+        // The privileges on the tables a statement reads and writes are
+        // checked when it resolves them, with check_privilege.
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. } => return Ok(()),
         ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }
         | ast::Stmt::Rollback { .. }
@@ -85,8 +85,8 @@ pub fn check_statement_privileges(
                 Object::Schema(MAIN_SCHEMA_NAME.to_string()),
             )
         }
-        // The dialect decides who may grant on each relation, from the
-        // privileges it stores.
+        // The dialect decides who may grant or revoke on each relation, from
+        // the privileges it stores.
         ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
@@ -135,6 +135,26 @@ pub fn check_statement_privileges(
                 _ if owner => return Ok(()),
                 _ => owner_denial(),
             }
+        }
+        // Only the table's owner may create or drop its policies, as in
+        // PostgreSQL.
+        ast::Stmt::CreatePolicy(policy) => {
+            if may_act_as_owner_of_table(resolver, connection, &policy.tbl_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Alter,
+                Object::Table(policy.tbl_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::DropPolicy { tbl_name, .. } => {
+            if may_act_as_owner_of_table(resolver, connection, tbl_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Alter,
+                Object::Table(tbl_name.name.as_str().to_string()),
+            )
         }
         ast::Stmt::DropTable { tbl_name, .. } => {
             if may_act_as_owner_of_table(resolver, connection, tbl_name) {
@@ -190,7 +210,7 @@ pub fn check_statement_privileges(
         ast::Stmt::DropSchema { name } => {
             PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string()))
         }
-        ast::Stmt::CreateRole { role_name } => {
+        ast::Stmt::CreateRole { role_name, .. } => {
             PermissionDenied::privilege(Action::Create, Object::Role(role_name.clone()))
         }
         ast::Stmt::Pragma {
@@ -254,13 +274,14 @@ fn may_act_as_owner(
 /// Whether the session may `SET ROLE` to `role`, which is what giving a
 /// relation to `role` takes.
 fn may_set_role(resolver: &Resolver, connection: &Arc<Connection>, role: &ast::RoleSpec) -> bool {
-    let roles = &resolver.schema().roles;
+    let dialect = &resolver.catalog.dialect;
+    let schema = resolver.schema();
     let target = match role {
         ast::RoleSpec::CurrentRole => Some(connection.current_role()),
         ast::RoleSpec::SessionUser => Some(connection.session_role()),
-        ast::RoleSpec::Name(name) => roles.get_by_name(name).map(|role| role.id),
+        ast::RoleSpec::Name(name) => dialect.role_by_name(schema, name),
     };
-    target.is_some_and(|target| roles.can_set_role(connection.current_role(), target))
+    target.is_some_and(|target| dialect.can_set_role(schema, connection.current_role(), target))
 }
 
 /// The name a denial calls `role` by.
@@ -272,17 +293,29 @@ fn role_spec_name(role: &ast::RoleSpec) -> String {
     }
 }
 
-fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
-    PermissionDenied::privilege(
-        Action::Write,
-        Object::Table(tbl_name.name.as_str().to_string()),
-    )
-}
-
-/// Fails if the statement is compiled for a role that is not a superuser,
-/// which may not change `sequence` with `nextval()` or `setval()`.
-pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Result<()> {
-    if !resolver.role_is_not_superuser {
+/// Fails if the statement is compiled for a role that may not change
+/// `sequence` of `namespace`, as in PostgreSQL: `nextval()` needs USAGE or
+/// UPDATE on it, and `setval()` needs UPDATE. Unlike a table, a sequence
+/// that a view uses is checked for the role that reads the view, because
+/// PostgreSQL checks a function's privileges for the role that calls it.
+pub(crate) fn check_sequence_change(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    sequence: &str,
+    is_nextval: bool,
+) -> Result<()> {
+    if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let schema = resolver.schema();
+    let role = resolver.row_security_role;
+    let has = |privilege| {
+        resolver
+            .catalog
+            .dialect
+            .role_has_privilege(schema, namespace.id, sequence, role, privilege)
+    };
+    if has(ast::Privilege::Update) || (is_nextval && has(ast::Privilege::Usage)) {
         return Ok(());
     }
     Err(permission_denied(PermissionDenied::privilege(
@@ -291,39 +324,179 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     )))
 }
 
-/// Fails if the statement is compiled for a role that may not read relation
-/// `name` of `namespace`, a table, view or materialized view, which `object`
-/// names in the error. Inside a view, the view's owner is the reader, as in
-/// PostgreSQL, so a view shows its readers the tables its owner may read.
-/// Relations outside the main database, temp among them, have no
-/// privileges, and everyone reads them.
-pub(crate) fn check_read_privilege(
+/// Fails if the current role of `connection` may not read the value of
+/// `sequence` of `namespace` with `currval()`. `currval()` checks this when
+/// it runs, because its argument may be a sequence name that is only known
+/// then.
+pub(crate) fn check_sequence_read(
+    connection: &Connection,
+    namespace: NamespaceRef,
+    sequence: &str,
+) -> Result<()> {
+    if connection.may_read_sequence(namespace, sequence) {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        Object::Sequence(sequence.to_string()),
+    )))
+}
+
+/// Fails if the statement is compiled for a role that does not have
+/// `privilege` on relation `name` of `namespace`, a table, view or
+/// materialized view, which `object` names in the error. Inside a view, the
+/// view's owner is the reader, as in PostgreSQL, so a view shows its readers
+/// the tables its owner may read. Relations outside the main database, temp
+/// among them, have no privileges, and everyone uses them.
+pub(crate) fn check_privilege(
     resolver: &Resolver,
     connection: &Arc<Connection>,
     namespace: NamespaceRef,
     name: &str,
+    privilege: ast::Privilege,
     object: Object,
 ) -> Result<()> {
     if !resolver.role_is_not_superuser || namespace.database_id != MAIN_DB_ID {
         return Ok(());
     }
-    let dialect = &resolver.catalog.dialect;
     let schema = resolver.schema();
-    let reader = match resolver.catalog.enclosing_view() {
-        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => dialect
-            .relation_owner(schema, view_namespace.id, &view_name)
-            .unwrap_or_else(|| connection.current_role()),
-        _ => connection.current_role(),
-    };
-    if schema.roles.is_superuser(reader)
-        || dialect.role_may_read(schema, namespace.id, name, reader)
+    let role = table_reader(resolver, connection.current_role());
+    if resolver.catalog.dialect.role_is_superuser(schema, role)
+        || resolver
+            .catalog
+            .dialect
+            .role_has_privilege(schema, namespace.id, name, role, privilege)
     {
         return Ok(());
     }
+    let action = match privilege {
+        ast::Privilege::Select => Action::Read,
+        _ => Action::Write,
+    };
     Err(permission_denied(PermissionDenied::privilege(
-        Action::Read,
-        object,
+        action, object,
     )))
+}
+
+/// Checks the privileges that a write to table `name` of `namespace` needs:
+/// `privilege`, and SELECT too when `reads_columns` says that the statement
+/// reads the table's columns, as in PostgreSQL.
+pub(crate) fn check_write_privileges(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+    privilege: ast::Privilege,
+    reads_columns: bool,
+) -> Result<()> {
+    let object = || Object::Table(name.to_string());
+    check_privilege(resolver, connection, namespace, name, privilege, object())?;
+    if reads_columns {
+        check_privilege(
+            resolver,
+            connection,
+            namespace,
+            name,
+            ast::Privilege::Select,
+            object(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Makes the constraint errors of a statement that writes table `name` of
+/// `namespace` leave out the values of the row or key that broke the
+/// constraint, when the statement is compiled for a role without SELECT on
+/// the table. As in PostgreSQL, only a role that may read the table sees
+/// them; otherwise a role that may only write the table could read it from
+/// the writes that fail.
+pub(crate) fn hide_constraint_values_from_role_without_select(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    name: &str,
+) {
+    let may_read = check_privilege(
+        resolver,
+        connection,
+        namespace,
+        name,
+        ast::Privilege::Select,
+        Object::Table(name.to_string()),
+    )
+    .is_ok();
+    if !may_read {
+        program.flags.set_hides_constraint_values(true);
+    }
+}
+
+/// Whether any of `exprs` reads a column of table `table`, directly or from
+/// one of the planned `subqueries` that it refers to.
+pub(crate) fn reads_columns_of<'a>(
+    table: ast::TableInternalId,
+    exprs: impl IntoIterator<Item = &'a ast::Expr>,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let mut reads = false;
+    for expr in exprs {
+        walk_expr(expr, &mut |expr| {
+            reads |= match expr {
+                ast::Expr::Column { table: read, .. } | ast::Expr::RowId { table: read, .. } => {
+                    *read == table
+                }
+                ast::Expr::SubqueryResult { subquery_id, .. } => {
+                    subquery_reads_columns_of(table, *subquery_id, subqueries)?
+                }
+                ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_) => {
+                    return Err(LimboError::InternalError(
+                        "subquery is not planned before its privileges are checked".to_string(),
+                    ));
+                }
+                _ => false,
+            };
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(reads)
+}
+
+fn subquery_reads_columns_of(
+    table: ast::TableInternalId,
+    subquery_id: ast::TableInternalId,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let Some(subquery) = subqueries.iter().find(|s| s.internal_id == subquery_id) else {
+        return Err(LimboError::InternalError(format!(
+            "subquery {subquery_id} not found"
+        )));
+    };
+    let outer_ref_ids = match &subquery.state {
+        SubqueryState::Unevaluated { plan: Some(plan) } => plan.used_outer_query_ref_ids(),
+        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids.clone(),
+        SubqueryState::Unevaluated { plan: None } => {
+            return Err(LimboError::InternalError(format!(
+                "subquery {subquery_id} has no plan"
+            )));
+        }
+    };
+    Ok(outer_ref_ids.contains(&table))
+}
+
+/// The role that reads the tables of a statement compiled for `role`. Inside
+/// a view of the main database it is the view's owner, as in PostgreSQL, so
+/// a view shows its readers what its owner may see: the tables its owner may
+/// read, and their rows that row-level security shows its owner. A view
+/// without a known owner is read as `role`.
+pub(crate) fn table_reader(resolver: &Resolver, role: RoleId) -> RoleId {
+    match resolver.catalog.enclosing_view() {
+        Some((view_namespace, view_name)) if view_namespace.database_id == MAIN_DB_ID => resolver
+            .catalog
+            .dialect
+            .relation_owner(resolver.schema(), view_namespace.id, &view_name)
+            .unwrap_or(role),
+        _ => role,
+    }
 }
 
 /// Fails if the statement is compiled for a role that is not a superuser,
@@ -356,8 +529,8 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT`: the dialect stores the privileges with each relation, through
-/// its relation hooks, as it stores ownership.
+/// `GRANT` and `REVOKE`: the dialect changes the privileges it stores with
+/// each relation, through its relation hooks, as it stores ownership.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
@@ -383,12 +556,16 @@ pub fn translate_grant(
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
         }
+        if grant.on_sequences && kind != ast::RelationKind::Sequence {
+            bail_parse_error!("\"{normalized_name}\" is not a sequence");
+        }
         // Only the main database has dialect schema state to store the
         // privileges in; a temp table has none, and nothing to store.
         if namespace.database_id != MAIN_DB_ID {
             continue;
         }
-        changes.push(crate::RelationChange::Grant {
+        changes.push(crate::CatalogChange::Grant {
+            revoke: grant.revoke,
             namespace: namespace.id,
             name: normalized_name,
             privileges: grant.privileges.clone(),
@@ -397,7 +574,7 @@ pub fn translate_grant(
     }
     let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_relation_changes(
+    resolver.catalog.dialect.translate_catalog_changes(
         program,
         resolver.schema(),
         connection,
@@ -407,169 +584,25 @@ pub fn translate_grant(
     Ok(())
 }
 
-/// Creates a role that is not a superuser and cannot log in.
+/// `CREATE ROLE`: the dialect stores the role, through the same hook as its
+/// other catalog changes.
 pub fn translate_create_role(
-    role_name: &str,
+    role_name: String,
+    options: ast::RoleOptions,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
-    if !resolver.catalog.dialect.supports_roles() {
-        bail_parse_error!("CREATE ROLE is not supported");
-    }
-    if resolver.schema().roles.get_by_name(role_name).is_some() {
-        bail_parse_error!("role \"{role_name}\" already exists");
-    }
-    let superuser = false;
-
-    let existing = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME);
-    let (roles_table, roles_root_page, (name_index, name_index_root_page)) = match existing {
-        Some(table) => {
-            let name_index = resolver
-                .schema()
-                .get_indices(NamespaceId::ROOT, ROLES_TABLE_NAME)
-                .find(|index| index.name == ROLES_NAME_INDEX_NAME)
-                .cloned()
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!("{ROLES_TABLE_NAME} has no name index"))
-                })?;
-            emit_schema_cookie(resolver, program);
-            let root_page = RegisterOrLiteral::Literal(table.root_page);
-            let name_index_root_page = RegisterOrLiteral::Literal(name_index.root_page);
-            (table, root_page, (name_index, name_index_root_page))
-        }
-        // Creating the table bumps the schema cookie too.
-        None => {
-            let mut created = emit_create_internal_table(
-                program,
-                resolver,
-                ROLES_TABLE_NAME,
-                CREATE_ROLES_TABLE_SQL,
-                &[CREATE_ROLES_NAME_INDEX_SQL],
-            )?;
-            let name_index = created.indexes.pop().expect("one index was created");
-            (created.table, created.root_page, name_index)
-        }
+    let change = CatalogChange::CreateRole {
+        name: role_name,
+        options,
     };
-    let roles_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(roles_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: roles_cursor_id,
-        root_page: roles_root_page,
-        db: MAIN_DB_ID,
-    });
-    let name_index_cursor_id = program.alloc_cursor_index(None, &name_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: name_index_cursor_id,
-        root_page: name_index_root_page,
-        db: MAIN_DB_ID,
-    });
-
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: roles_cursor_id,
-        rowid_reg: id_reg,
-        prev_largest_reg: 0,
-    });
-    let first_column_reg = program.alloc_registers(3);
-    program.emit_insn(Insn::Null {
-        dest: first_column_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::String8 {
-        value: role_name.to_string(),
-        dest: first_column_reg + 1,
-    });
-    program.emit_insn(Insn::Integer {
-        value: superuser as i64,
-        dest: first_column_reg + 2,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(first_column_reg),
-        count: to_u32(3),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: roles_cursor_id,
-        key_reg: id_reg,
-        record_reg,
-        flag: InsertFlags::new().skip_last_rowid(),
-        table_name: ROLES_TABLE_NAME.to_string(),
-    });
-    emit_role_name_index_entry(
-        program,
-        name_index_cursor_id,
-        &name_index.name,
-        role_name,
-        id_reg,
-    );
-
-    program.emit_insn(Insn::AddRole {
-        db: MAIN_DB_ID,
-        id_reg,
-        name: role_name.to_string(),
-        superuser,
-    });
-    Ok(())
-}
-
-/// Adds the role's name to the name index, failing if another role has the
-/// name. The in-memory catalog has already rejected a name it knows, so this
-/// only fails if the stored table has a role the catalog does not.
-fn emit_role_name_index_entry(
-    program: &mut ProgramBuilder,
-    cursor_id: usize,
-    index_name: &str,
-    role_name: &str,
-    id_reg: usize,
-) {
-    let key_reg = program.alloc_registers(2);
-    program.emit_insn(Insn::String8 {
-        value: role_name.to_string(),
-        dest: key_reg,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: id_reg,
-        dst_reg: key_reg + 1,
-        extra_amount: 0,
-    });
-    let no_conflict = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
-        cursor_id,
-        target_pc: no_conflict,
-        record_reg: key_reg,
-        num_regs: 1,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_CONSTRAINT_UNIQUE,
-        description: format!("role \"{role_name}\" already exists"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(no_conflict);
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(key_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: Some(index_name.to_string()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id,
-        record_reg,
-        unpacked_start: Some(key_reg),
-        unpacked_count: Some(2),
-        flags: IdxInsertFlags::new(),
-    });
+    translate_change(change, resolver, program, connection)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::security::roles::SessionRole;
     use std::sync::Arc;
 
     use turso_parser::ast;
@@ -584,7 +617,9 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let error = create_role(&conn, "alice").unwrap_err();
 
@@ -597,6 +632,7 @@ mod tests {
     fn create_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {
         let create_role = ast::Cmd::Stmt(ast::Stmt::CreateRole {
             role_name: name.to_string(),
+            options: ast::RoleOptions::default(),
         });
         conn.prepare_translated_cmd(create_role, &format!("CREATE ROLE {name}"))?
             .run_ignore_rows()

@@ -8,7 +8,7 @@ use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::{ast, parser::Parser};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
@@ -20,7 +20,7 @@ pub(crate) enum VirtualTableType {
 #[derive(Clone, Debug)]
 pub struct VirtualTable {
     pub(crate) name: String,
-    pub(crate) columns: Vec<Column>,
+    pub columns: Vec<Column>,
     pub(crate) kind: VTabKind,
     pub(crate) vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
@@ -29,7 +29,7 @@ pub struct VirtualTable {
     pub(crate) is_droppable: bool,
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
-    pub(crate) innocuous: bool,
+    pub innocuous: bool,
 }
 
 impl VirtualTable {
@@ -134,9 +134,8 @@ impl VirtualTable {
     }
 
     pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
-        let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
-            parser.next_cmd()?.ok_or_else(|| {
+            crate::dialect::engine::parse_statement(&schema)?.ok_or_else(|| {
                 LimboError::ParseError(
                     "Failed to parse schema from virtual table module".to_string(),
                 )
@@ -160,7 +159,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
+    pub fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
         match &self.vtab_type {
             VirtualTableType::Pragma(table) => {
                 Ok(VirtualTableCursor::new_pragma(table.open(conn)?))
@@ -186,7 +185,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn destroy(&self) -> crate::Result<()> {
+    pub fn destroy(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
             VirtualTableType::External(table) => table.destroy(),
@@ -323,7 +322,7 @@ impl VirtualTableCursor {
         })
     }
 
-    pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
+    pub fn column(&mut self, column: usize) -> IOResultOr<Value> {
         if self.null_flag {
             return Ok(IOResult::Done(Value::Null));
         }
@@ -335,7 +334,7 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn filter(
+    pub fn filter(
         &mut self,
         idx_num: i32,
         idx_str: Option<String>,
@@ -631,6 +630,10 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
         order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode>;
     fn sql(&self) -> String;
+    /// Whether only a superuser may read the table. True for tables that
+    /// show the database file, because they show the rows row-level
+    /// security hides. There is no default, so a new table must say.
+    fn superuser_only(&self) -> bool;
 }
 
 pub trait InternalVirtualTableCursor: Send + Sync {
@@ -649,6 +652,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::security::roles::SessionRole;
     use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
@@ -666,6 +670,9 @@ mod tests {
         }
         fn sql(&self) -> String {
             format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+        }
+        fn superuser_only(&self) -> bool {
+            false
         }
         fn open(
             &self,
@@ -751,7 +758,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "external_metadata");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM external_metadata")
             .unwrap();
@@ -795,7 +804,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);

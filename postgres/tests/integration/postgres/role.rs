@@ -1,5 +1,47 @@
 use crate::common::TempDatabase;
-use turso_pg::PgConnection;
+use turso_core::{ConnectOpts, NamespaceId, SessionRole, MAIN_DB_ID};
+use turso_pg::{ErrorReport, PgConnection};
+
+#[test]
+fn session_runs_as_the_role_it_was_opened_as() {
+    let db = TempDatabase::builder().build();
+    let superuser = db.connect_postgres();
+    superuser.execute("CREATE ROLE alice").unwrap();
+    superuser.execute("CREATE TABLE t (x INT)").unwrap();
+
+    let alice = PgConnection::connect_with(
+        &db.db,
+        ConnectOpts::new(SessionRole::Named("alice".to_string())),
+    )
+    .unwrap();
+
+    assert_eq!(current_user(&alice), "alice");
+    assert_eq!(session_user(&alice), "alice");
+    assert!(!alice.inner().current_role_is_superuser());
+    let Err(error) = alice.query("SELECT x FROM t") else {
+        panic!("a role without privileges read table t");
+    };
+    assert_eq!(error.to_string(), "permission denied for table t");
+    alice.execute("RESET ROLE").unwrap();
+    assert_eq!(current_user(&alice), "alice");
+    assert_eq!(current_user(&superuser), "postgres");
+}
+
+#[test]
+fn connecting_as_a_role_that_does_not_exist_fails() {
+    let db = TempDatabase::builder().build();
+
+    for name in ["alice", "public"] {
+        let Err(error) = db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Named(name.to_string())))
+        else {
+            panic!("connecting as {name}, which does not exist, succeeded");
+        };
+
+        assert_eq!(error.to_string(), format!("role \"{name}\" does not exist"));
+    }
+}
 
 #[test]
 fn created_role_is_visible_to_another_connection() {
@@ -81,16 +123,16 @@ fn stored_roles_table_keeps_role_names_unique() {
     let db = db.reopen();
 
     let conn = db.connect_limbo();
-    let has_unique_name_index = conn.with_schema(turso_core::MAIN_DB_ID, |schema| {
+    let has_unique_name_index = conn.with_schema(MAIN_DB_ID, |schema| {
         schema
-            .get_indices(turso_core::NamespaceId::ROOT, "__turso_internal_roles")
+            .get_indices(NamespaceId::ROOT, "__turso_internal_authid")
             .any(|index| {
                 index.unique
                     && index
                         .columns
                         .iter()
                         .map(|column| column.name.as_str())
-                        .eq(["name"])
+                        .eq(["rolname"])
             })
     });
     assert!(has_unique_name_index);
@@ -188,6 +230,76 @@ fn statement_prepared_as_role_without_privileges_runs_after_reset_role() {
     conn.execute("SELECT x FROM t").unwrap();
 }
 
+/// Foreign-key checks and actions need no privileges on the other table, as
+/// in PostgreSQL. The PostgreSQL frontend does not turn foreign keys on, so
+/// the test does.
+#[test]
+fn foreign_key_checks_and_actions_need_no_privileges_on_the_other_table() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.inner().set_foreign_keys_enabled(true);
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE parent (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id int, parent int REFERENCES parent (id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("GRANT INSERT ON child TO alice").unwrap();
+    conn.execute("GRANT DELETE ON parent TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.execute("INSERT INTO child VALUES (10, 1), (20, 2)")
+        .unwrap();
+    conn.execute("DELETE FROM parent").unwrap();
+
+    conn.execute("RESET ROLE").unwrap();
+    let mut count = conn.query("SELECT count(*) FROM child").unwrap().unwrap();
+    assert_eq!(
+        count.run_collect_rows().unwrap(),
+        vec![vec![turso_core::Value::from_i64(0)]]
+    );
+}
+
+/// As in PostgreSQL, a constraint error shows the values of a row only to a
+/// role that may read the table. Otherwise a role with UPDATE but not SELECT
+/// could read the rows from the errors of updates that fail.
+#[test]
+fn constraint_errors_show_values_only_to_a_role_with_select() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute(
+        "CREATE TABLE docs (id int PRIMARY KEY, secret text, n int CHECK (n < 1000), \
+         a int, b int, UNIQUE (a, b))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'alpha', 0, 1, 10), (2, 'bravo', 0, 2, 10)")
+        .unwrap();
+    conn.execute("GRANT INSERT, UPDATE ON docs TO alice")
+        .unwrap();
+    let detail = |sql: &str| ErrorReport::from(conn.execute(sql).unwrap_err().core_error()).detail;
+
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(detail("UPDATE docs SET n = 5000"), None);
+    assert_eq!(detail("UPDATE docs SET a = 1"), None);
+    assert_eq!(detail("INSERT INTO docs VALUES (1, 'x', 0, 3, 3)"), None);
+    assert_eq!(detail("INSERT INTO docs VALUES (3, 'x', 5000, 3, 3)"), None);
+
+    conn.execute("RESET ROLE").unwrap();
+    conn.execute("GRANT SELECT ON docs TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(
+        detail("UPDATE docs SET n = 5000").as_deref(),
+        Some("Failing row contains (1, alpha, 5000, 1, 10).")
+    );
+    assert_eq!(
+        detail("UPDATE docs SET a = 1").as_deref(),
+        Some("Key (a, b)=(1, 10) already exists.")
+    );
+}
+
 #[test]
 fn set_role_changes_only_its_own_connection() {
     let db = TempDatabase::builder().build();
@@ -253,6 +365,95 @@ fn role_without_privileges_cannot_call_pragma_functions() {
             format!("permission denied to examine \"{pragma}\""),
             "{sql}"
         );
+    }
+}
+
+/// An embedder, such as a server measuring the database after each write,
+/// reads the storage counts and turns off the automatic checkpoint on the
+/// connection of a user who switched to a role that may not run the
+/// PRAGMAs that do the same.
+#[test]
+fn storage_stats_and_checkpoint_setting_work_after_set_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x text)").unwrap();
+    conn.execute("GRANT ALL ON t TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    let superuser = db.connect_postgres();
+    let log_path = format!("{}-log", db.path.display());
+
+    conn.inner().disable_mvcc_auto_checkpoint().unwrap();
+    assert_eq!(pragma(&superuser, "mvcc_checkpoint_threshold"), -1);
+
+    let before = storage_stats(&db, &conn);
+    conn.execute("INSERT INTO t VALUES (repeat('a', 10000))")
+        .unwrap();
+    let after_insert = storage_stats(&db, &conn);
+    assert_eq!(after_insert.logical_log_bytes, file_size(&log_path));
+    let mut stmt = superuser.query("SELECT length(x) FROM t").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0].to_string(), "10000");
+    // The row is only in the logical log until it is checkpointed.
+    assert!(
+        after_insert.logical_log_bytes >= before.logical_log_bytes + 10000,
+        "{before:?} {after_insert:?}"
+    );
+    superuser
+        .inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let after_checkpoint = storage_stats(&db, &conn);
+
+    assert_eq!(after_checkpoint.logical_log_bytes, file_size(&log_path));
+    assert_eq!(
+        after_checkpoint.page_size as i64,
+        pragma(&superuser, "page_size")
+    );
+    assert_eq!(
+        after_checkpoint.page_count as i64,
+        pragma(&superuser, "page_count")
+    );
+    assert_eq!(
+        after_checkpoint.freelist_count as i64,
+        pragma(&superuser, "freelist_count")
+    );
+    assert!(
+        after_checkpoint.page_count > after_insert.page_count,
+        "{after_insert:?} {after_checkpoint:?}"
+    );
+    for sql in [
+        "PRAGMA page_size",
+        "PRAGMA page_count",
+        "PRAGMA freelist_count",
+        "PRAGMA mvcc_checkpoint_threshold = -1",
+    ] {
+        let error = conn.inner().prepare(sql).unwrap_err();
+        assert!(
+            matches!(error, turso_core::LimboError::PermissionDenied(_)),
+            "{sql}: {error}"
+        );
+    }
+}
+
+fn storage_stats(db: &TempDatabase, conn: &PgConnection) -> turso_core::StorageStats {
+    let mut read = conn.inner().storage_stats();
+    loop {
+        match read.read().unwrap() {
+            turso_core::IOResult::Done(stats) => return stats,
+            turso_core::IOResult::IO(io) => io.wait(&*db.io).unwrap(),
+        }
+    }
+}
+
+fn file_size(path: &str) -> u64 {
+    std::fs::metadata(path).map_or(0, |file| file.len())
+}
+
+fn pragma(conn: &PgConnection, name: &str) -> i64 {
+    let rows = conn.inner().pragma_query(name).unwrap();
+    match rows[0][0] {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) => value,
+        ref value => panic!("PRAGMA {name} returned {value:?}"),
     }
 }
 
@@ -410,7 +611,7 @@ fn interrupted_create_role_leaves_no_role_behind() {
         }
 
         assert!(
-            conn.inner().role_catalog().get_by_name("alice").is_none(),
+            !role_names(&conn).iter().any(|name| name == "alice"),
             "interrupted at step {interrupt_at_step}, the role is still in the catalog"
         );
         conn.execute("CREATE ROLE alice").unwrap();
@@ -438,6 +639,11 @@ fn run_interrupted_at(
 
 fn current_user(conn: &PgConnection) -> String {
     let mut stmt = conn.query("SELECT current_user").unwrap().unwrap();
+    stmt.run_collect_rows().unwrap()[0][0].to_string()
+}
+
+fn session_user(conn: &PgConnection) -> String {
+    let mut stmt = conn.query("SELECT session_user").unwrap().unwrap();
     stmt.run_collect_rows().unwrap()[0][0].to_string()
 }
 

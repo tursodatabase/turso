@@ -1,11 +1,14 @@
 use crate::alloc::TursoFromIterator;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
+use crate::security::permission::Object;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::update::bind_set_expr;
+use crate::translate::{roles, row_security};
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
@@ -303,6 +306,21 @@ pub fn translate_insert(
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate(table_name.as_str(), resolver, &table, namespace, connection)?;
+    roles::check_write_privileges(
+        resolver,
+        connection,
+        namespace,
+        table.get_name(),
+        ast::Privilege::Insert,
+        false,
+    )?;
+    roles::hide_constraint_values_from_role_without_select(
+        program,
+        resolver,
+        connection,
+        namespace,
+        table.get_name(),
+    );
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -372,6 +390,7 @@ pub fn translate_insert(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
@@ -407,6 +426,37 @@ pub fn translate_insert(
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    let updates_on_conflict = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    let reads_columns = updates_on_conflict
+        || upsert_actions
+            .iter()
+            .any(|(_, _, upsert)| upsert.index.is_some())
+        || roles::reads_columns_of(
+            table_references.joined_tables()[0].internal_id,
+            result_columns.iter().map(|column| &column.expr),
+            &returning_subqueries,
+        )?;
+    check_upsert_privileges(
+        &table_references,
+        &upsert_actions,
+        reads_columns,
+        resolver,
+        connection,
+    )?;
+    let row_checks = row_security::new_row_checks(
+        resolver,
+        namespace,
+        table_name.as_str(),
+        crate::security::policy::Command::Insert,
+        reads_columns,
+    );
+    let upsert_row_checks = if updates_on_conflict {
+        crate::translate::row_security::upsert_row_checks(resolver, namespace, table_name.as_str())
+    } else {
+        Default::default()
+    };
     let has_fks = fk_enabled
         && (resolver.with_schema(database_id, |s| {
             s.has_child_fks(namespace.id, table_name.as_str())
@@ -831,6 +881,25 @@ pub fn translate_insert(
         )?;
     }
 
+    // Rows that row-level security does not let the role write fail before
+    // the CHECK constraints, as in PostgreSQL, and before ON CONFLICT looks
+    // for a conflicting row, so that every row proposed is checked.
+    crate::translate::row_security::emit_row_checks(
+        program,
+        resolver,
+        &row_checks,
+        &table_references,
+        insertion.key_register(),
+        insertion.col_mappings.iter().map(|m| {
+            let reg = if m.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                m.register
+            };
+            (m.column, reg)
+        }),
+    )?;
+
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
     let check_halt_on_error = program.constraint_halt_on_error(ctx.on_conflict);
     emit_check_constraints(
@@ -1164,6 +1233,7 @@ pub fn translate_insert(
             connection,
             &mut table_references,
             tbl_name.alias.as_ref().map(|alias| alias.as_str()),
+            &upsert_row_checks,
         )?;
     }
 
@@ -1668,6 +1738,7 @@ fn resolve_upserts(
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
+    row_checks: &crate::translate::row_security::UpsertRowChecks,
 ) -> Result<()> {
     for (position, (_, label, upsert)) in upsert_actions.iter_mut().enumerate() {
         // Like SQLite, only compile an action that some constraint check can
@@ -1692,7 +1763,7 @@ fn resolve_upserts(
         } = upsert.do_clause
         {
             // Normalize SET pairs once
-            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
+            let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets, resolver)?;
             let set_column_names: Vec<_> = sets
                 .iter()
                 .flat_map(|set| set.col_names.iter().cloned())
@@ -1711,6 +1782,7 @@ fn resolve_upserts(
                 connection,
                 table_references,
                 table_alias,
+                row_checks,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -2019,6 +2091,46 @@ fn emit_notnulls(
     Ok(())
 }
 
+/// Checks the privileges an INSERT needs besides INSERT, as in PostgreSQL:
+/// UPDATE for ON CONFLICT DO UPDATE, and SELECT when `reads_columns` says
+/// that RETURNING reads the table's columns, ON CONFLICT names the columns
+/// that conflict, or DO UPDATE reads the row that conflicts.
+fn check_upsert_privileges(
+    table_references: &TableReferences,
+    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    reads_columns: bool,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let target = &table_references.joined_tables()[0];
+    let name = target.table.get_name();
+    let object = || Object::Table(name.to_string());
+    let updates = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    if updates {
+        roles::check_privilege(
+            resolver,
+            connection,
+            target.namespace,
+            name,
+            ast::Privilege::Update,
+            object(),
+        )?;
+    }
+    if reads_columns {
+        roles::check_privilege(
+            resolver,
+            connection,
+            target.namespace,
+            name,
+            ast::Privilege::Select,
+            object(),
+        )?;
+    }
+    Ok(())
+}
+
 struct BoundInsertResult {
     #[allow(clippy::vec_box)]
     values: Vec<Box<Expr>>,
@@ -2068,17 +2180,26 @@ fn resolve_defaults_in_row(
             })
         };
         *expr = match col {
-            Some(col) => col.default.clone().unwrap_or_else(|| {
-                if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                    if let Some(default_expr) = resolved.default_expr() {
-                        return Box::new(default_expr.clone());
-                    }
-                }
-                Box::new(ast::Expr::Literal(ast::Literal::Null))
-            }),
+            Some(col) => column_default_expr(col, is_strict, resolver),
             None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
         };
     }
+}
+
+/// The value a column takes when a statement writes DEFAULT to it.
+pub(crate) fn column_default_expr(
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> Box<Expr> {
+    column.default.clone().unwrap_or_else(|| {
+        if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+            if let Some(default_expr) = resolved.default_expr() {
+                return Box::new(default_expr.clone());
+            }
+        }
+        Box::new(ast::Expr::Literal(ast::Literal::Null))
+    })
 }
 
 #[turso_macros::trace_stack]
@@ -2203,12 +2324,11 @@ fn bind_insert(
         } = &mut upsert_opt.do_clause
         {
             for set in sets.iter_mut() {
-                bind_and_rewrite_expr(
+                bind_set_expr(
                     &mut set.expr,
                     None,
-                    None,
-                    resolver,
                     BindingBehavior::AllowUnboundIdentifiers,
+                    resolver,
                 )?;
             }
             if let Some(ref mut where_expr) = where_clause {

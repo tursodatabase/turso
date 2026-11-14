@@ -339,6 +339,7 @@ When working on a new feature, please consider adding a test case for it.
 
 The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
 Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
+Tests for SQL that the PostgreSQL frontend also runs go in `testing/shared-sqltests/`.
 
 To run tests:
 
@@ -406,6 +407,10 @@ If you need to reproduce a run, just defined the `SEED` environment variable as 
 ```console
 SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
+
+To give each run a different mix of workloads, connections, and fault probabilities, add `--swarm`.
+The seed also picks these settings, so `SEED=1234` repeats a swarm run.
+See [the Whopper README](testing/concurrent-simulator/README.md#swarm-testing).
 
 You can also run Whopper in exploration mode to find more serious bugs:
 
