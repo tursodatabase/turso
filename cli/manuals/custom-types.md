@@ -144,7 +144,7 @@ SELECT val FROM t ORDER BY val;
 
 ### Types with Their Own Order
 
-The built-in `numeric` type and arrays have their own order, set by Turso. It is used in every comparison of their values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index, and expressions of the type compare the same way:
+The built-in `numeric` and `uuid` types and arrays have their own order, set by Turso. A `uuid` compares as the UUID a text names, so `id = 'A0EEBC99-...'` matches the stored `a0eebc99-...`. It is used in every comparison of their values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index, and expressions of the type compare the same way:
 
 ```sql
 CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), i integer) STRICT;

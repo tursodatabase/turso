@@ -313,12 +313,14 @@ pub enum OperatorArg {
 pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
-/// The order of a built-in type whose stored values do not sort in the type's
-/// order: numeric is stored as a blob. Every other type, and every user type,
-/// sorts and compares by its stored value as SQLite does.
+/// The order of a built-in type whose values SQLite's comparison does not
+/// order: numeric is stored as a blob, and a uuid has several text spellings.
+/// Every other type, and every user type, sorts and compares by its stored
+/// value as SQLite does.
 fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
     match type_name {
         "numeric" => Some(TypeOrdering::Numeric),
+        "uuid" => Some(TypeOrdering::Uuid),
         _ => None,
     }
 }
@@ -2184,8 +2186,8 @@ impl Schema {
     }
 
     /// Fails when `element_type` is neither a STRICT type nor a custom type,
-    /// or when it has its own order, as numeric does. Array elements compare
-    /// by their stored form, which does not sort in the type's order.
+    /// or when it has its own order and its stored form does not sort in it,
+    /// as numeric's does not. Array elements compare by their stored form.
     pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
         let Some(type_def) = self.get_type_def_unchecked(element_type) else {
             return match StrictType::named(element_type) {
@@ -2196,7 +2198,10 @@ impl Schema {
                 ),
             };
         };
-        if self.type_ordering(type_def).is_some() {
+        if self
+            .type_ordering(type_def)
+            .is_some_and(|ordering| !ordering.sorts_stored_values())
+        {
             crate::bail_parse_error!(
                 "arrays of type {} are not supported, because their elements would not compare in the order of {}",
                 type_def.name,
