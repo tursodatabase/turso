@@ -89,10 +89,12 @@ pub fn translate(
     origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
-    let change_cnt_on = matches!(
-        stmt,
-        ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
-    );
+    let change_cnt_on = !connection.is_mvcc_bootstrap_connection()
+        && matches!(origin, crate::statement::StatementOrigin::Root)
+        && matches!(
+            stmt,
+            ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
+        );
 
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
         None
@@ -192,7 +194,7 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input, origin)?,
     };
 
     program.epilogue(schema);
@@ -210,6 +212,7 @@ pub fn translate_inner(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    origin: crate::statement::StatementOrigin,
 ) -> Result<()> {
     // Subqueries are numbered per program, and a trigger body or foreign-key
     // action is compiled into a program of its own with the resolver of the
@@ -218,7 +221,7 @@ pub fn translate_inner(
     // another statement is compiled.
     let callers_row_value_subqueries = std::mem::take(&mut resolver.row_value_subqueries);
     let callers_in_subquery_column_types = std::mem::take(&mut resolver.in_subquery_column_types);
-    let result = translate_statement(stmt, resolver, program, connection, input);
+    let result = translate_statement(stmt, resolver, program, connection, input, origin);
     resolver.row_value_subqueries = callers_row_value_subqueries;
     resolver.in_subquery_column_types = callers_in_subquery_column_types;
     result
@@ -230,6 +233,7 @@ fn translate_statement(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    origin: crate::statement::StatementOrigin,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -546,6 +550,7 @@ fn translate_statement(
             with,
             program,
             connection,
+            origin,
         )?,
         ast::Stmt::CreateSequence {
             if_not_exists,

@@ -2151,3 +2151,77 @@ fn test_mvcc_open_tolerates_null_sqlite_sequence_name() -> anyhow::Result<()> {
     assert_eq!(rows, vec![(6,)]);
     Ok(())
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/11588:
+/// PRAGMA journal_mode=mvcc must not increment changes() or total_changes(),
+/// nor overwrite last_insert_rowid().
+#[test]
+fn test_mvcc_pragma_journal_mode_preserves_changes_and_rowid() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_changes_counter.db");
+    let conn = tmp_db.connect_limbo();
+
+    // On a fresh database, PRAGMA journal_mode=mvcc must leave changes() and total_changes() at 0|0.
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    let counts: Vec<(i64, i64)> = conn.exec_rows("SELECT changes(), total_changes()");
+    assert_eq!(counts, vec![(0, 0)]);
+
+    // With prior writes, switching to MVCC must preserve existing change counts and last_insert_rowid().
+    let tmp_db2 = TempDatabase::new("test_mvcc_changes_counter_with_prior_writes.db");
+    let conn2 = tmp_db2.connect_limbo();
+    conn2.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn2.execute("INSERT INTO t VALUES(42, 'hello')")?;
+    let counts: Vec<(i64, i64, i64)> =
+        conn2.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts, vec![(1, 1, 42)]);
+
+    conn2.execute("PRAGMA journal_mode = 'mvcc'")?;
+    let counts_after: Vec<(i64, i64, i64)> =
+        conn2.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_after, vec![(1, 1, 42)]);
+    Ok(())
+}
+
+/// Regression test for the #11596 CDC finding: enabling change capture must not
+/// overwrite last_insert_rowid() with the rowid of an internal bookkeeping row.
+#[test]
+fn test_cdc_pragma_capture_data_changes_preserves_rowid_autoincrement() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_cdc_capture_pragma_rowid_autoincrement.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(100, 'hello')")?;
+    let counts: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts, vec![(1, 1, 100)]);
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+    let counts_after: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_after, vec![(1, 1, 100)]);
+
+    conn.execute("INSERT INTO t VALUES(101, 'world')")?;
+    let counts_final: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_final, vec![(1, 4, 101)]);
+    Ok(())
+}
+
+/// Regression test for the WAL + AUTOINCREMENT half of #11596: changing to
+/// MVCC on an AUTOINCREMENT table must not overwrite last_insert_rowid().
+#[test]
+fn test_mvcc_pragma_wal_autoincrement_preserves_rowid() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_wal_autoincrement_rowid.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES(100, 'hello')")?;
+    let counts: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts, vec![(1, 1, 100)]);
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    let counts_after: Vec<(i64, i64, i64)> =
+        conn.exec_rows("SELECT changes(), total_changes(), last_insert_rowid()");
+    assert_eq!(counts_after, vec![(1, 1, 100)]);
+    Ok(())
+}
