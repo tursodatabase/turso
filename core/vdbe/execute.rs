@@ -17817,6 +17817,12 @@ pub fn op_hash_probe(
     if hash_table.has_spilled() {
         let partition_idx = match partition_idx {
             Some(partition_idx) => partition_idx,
+            // A grace probe (no probe rowid) belongs to the partition grace is
+            // processing, which can be a sub-partition that key routing never yields.
+            None if probe_rowid_reg.is_none() => match hash_table.grace_current_partition_idx() {
+                Some(partition_idx) => partition_idx,
+                None => hash_table.partition_for_keys(&probe_keys)?,
+            },
             None => hash_table.partition_for_keys(&probe_keys)?,
         };
 
