@@ -81,7 +81,7 @@ use super::persistent_storage::logical_log::{
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
     is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
-    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
+    PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
 #[cfg(test)]
@@ -690,6 +690,7 @@ fn table_name_for_rootpage(connection: &Connection, rootpage: i64) -> Option<Str
 
 #[cfg(feature = "conn_raw_api")]
 fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllocator>(
+    schema_store: &dyn crate::schema::SchemaStore,
     mvcc_store: &MvStore<Clock, A>,
     rootpage: i64,
 ) -> Option<String> {
@@ -706,10 +707,10 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
             if row_version.end().is_some() {
                 continue;
             }
-            let Ok(row) = portable_schema_row_from_record(row_version.payload(entry.key())) else {
+            let Ok(row) = schema_store.decode_root_record(row_version.payload(entry.key())) else {
                 continue;
             };
-            if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
+            if row.root_page == rootpage || row.root_page == alternate_rootpage {
                 return Some(row.name);
             }
         }
@@ -730,17 +731,18 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
     // only a fallback for a stale id serialized before a concurrent checkpoint
     // published new roots.
     let direct = i64::from(table_id);
-    if let Some(name) = table_name_for_rootpage(connection, direct)
-        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
-    {
+    if let Some(name) = table_name_for_rootpage(connection, direct).or_else(|| {
+        table_name_for_rootpage_in_mvcc_schema(connection.db.schema_store(), mvcc_store, direct)
+    }) {
         return Some(name);
     }
     let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
     if rootpage == direct {
         return None;
     }
-    table_name_for_rootpage(connection, rootpage)
-        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
+    table_name_for_rootpage(connection, rootpage).or_else(|| {
+        table_name_for_rootpage_in_mvcc_schema(connection.db.schema_store(), mvcc_store, rootpage)
+    })
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -2412,8 +2414,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         continue;
                     }
                     for row_version in row_versions.read().iter() {
-                        let Some(identity) = sqlite_schema_btree_identity(id.table_id, row_version)
-                        else {
+                        let Some(identity) = sqlite_schema_btree_identity(
+                            self.connection.db.schema_store(),
+                            id.table_id,
+                            row_version,
+                        ) else {
                             continue;
                         };
                         let our_begin = is_our_begin(row_version);
@@ -2834,7 +2839,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         ..
                     } if *table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let rowid = rowid.row_id.to_int_or_panic();
-                        let row = portable_schema_row_from_record(record_bytes)?;
+                        let row = self
+                            .connection
+                            .db
+                            .schema_store()
+                            .decode_root_record(record_bytes)?;
                         has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(rowid);
                         schema_upserts.insert(rowid, row);
@@ -2850,7 +2859,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                             ));
                         }
                         let schema_rowid = rowid.row_id.to_int_or_panic();
-                        let row = portable_schema_row_from_record(record_bytes)?;
+                        let row = self
+                            .connection
+                            .db
+                            .schema_store()
+                            .decode_root_record(record_bytes)?;
                         has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(schema_rowid);
                         schema_deletes.insert(schema_rowid, row);
@@ -2878,7 +2891,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (Some(old_row), Some(new_row)) => {
                         if is_portable_table_schema_row(old_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(old_row.rootpage),
+                                portable_table_id_from_rootpage(old_row.root_page),
                                 PortableTableRef {
                                     name: old_row.name.clone(),
                                 },
@@ -2886,7 +2899,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         }
                         if is_portable_table_schema_row(new_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(new_row.rootpage),
+                                portable_table_id_from_rootpage(new_row.root_page),
                                 PortableTableRef {
                                     name: new_row.name.clone(),
                                 },
@@ -2896,7 +2909,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (None, Some(new_row)) => {
                         if is_portable_table_schema_row(new_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(new_row.rootpage),
+                                portable_table_id_from_rootpage(new_row.root_page),
                                 PortableTableRef {
                                     name: new_row.name.clone(),
                                 },
@@ -2906,7 +2919,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (Some(old_row), None) => {
                         if is_portable_table_schema_row(old_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(old_row.rootpage),
+                                portable_table_id_from_rootpage(old_row.root_page),
                                 PortableTableRef {
                                     name: old_row.name.clone(),
                                 },
@@ -2931,7 +2944,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             let rootpage_for_table_id = |table_id: MVTableId| -> i64 {
                 let direct = i64::from(table_id);
                 if table_name_for_rootpage(&self.connection, direct)
-                    .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
+                    .or_else(|| {
+                        table_name_for_rootpage_in_mvcc_schema(
+                            self.connection.db.schema_store(),
+                            mvcc_store,
+                            direct,
+                        )
+                    })
                     .is_some()
                 {
                     return direct;
@@ -2965,8 +2984,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
 
             if !needed_rootpages.is_empty() {
                 for rootpage in needed_rootpages {
-                    let Some(name) = table_name_for_rootpage(&self.connection, rootpage)
-                        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
+                    let Some(name) =
+                        table_name_for_rootpage(&self.connection, rootpage).or_else(|| {
+                            table_name_for_rootpage_in_mvcc_schema(
+                                self.connection.db.schema_store(),
+                                mvcc_store,
+                                rootpage,
+                            )
+                        })
                     else {
                         continue;
                     };
@@ -10378,25 +10403,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
                                     continue;
                                 };
-                                if record.column_count() < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
-                                    )));
-                                }
-                                let (
-                                    ValueRef::Text(row_type),
-                                    ValueRef::Numeric(Numeric::Integer(root_page)),
-                                ) = record.get_two_values(0, 3)?
-                                else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type and root_page must be text and integer"
-                                            .to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                if (row_type == "table" || row_type == "index") && root_page > 0 {
-                                    dropped_root_pages.insert(root_page);
+                                let schema_record = connection
+                                    .db
+                                    .schema_store()
+                                    .decode_root_record(record.get_payload())?;
+                                if schema_record.is_btree_table_or_index()
+                                    && schema_record.root_page > 0
+                                {
+                                    dropped_root_pages.insert(schema_record.root_page);
                                 }
                                 schema_rows.remove(&rowid_int);
                             }

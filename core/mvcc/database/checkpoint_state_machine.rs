@@ -14,6 +14,7 @@ use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMar
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::{mangle_name, NamespaceId};
 use crate::schema::{Index, Schema};
+use crate::schema::{SchemaRowType, SchemaStore};
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::comparator::{BasicComparator, Comparator};
 use crate::skiplist::{SkipMap, SkiplistAllocator};
@@ -29,8 +30,8 @@ use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
-    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
-    SyncMode, TransactionState, Value, ValueRef,
+    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Pager, Result, SyncMode,
+    TransactionState, Value,
 };
 use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -53,8 +54,6 @@ macro_rules! with_mvcc_checkpoint_allocation_site {
 
 /// Root page of the `sqlite_schema` B-tree in the database file.
 const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
-/// Column count of a `sqlite_schema` record (type, name, tbl_name, rootpage, sql).
-const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectTablePhase {
@@ -553,6 +552,7 @@ pub struct SqliteSchemaBtreeIdentity {
     verify = "full"
 )]
 pub fn sqlite_schema_btree_identity(
+    schema_store: &dyn SchemaStore,
     table_id: MVTableId,
     version: &RowVersion,
 ) -> Option<SqliteSchemaBtreeIdentity> {
@@ -571,24 +571,15 @@ pub fn sqlite_schema_btree_identity(
         return None;
     }
 
-    let row_data = ImmutableRecordRef::from_bin_record(payload);
-    let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
-        return None;
+    let record = schema_store
+        .decode_root_record(payload)
+        .unwrap_or_else(|err| panic!("sqlite_schema record is malformed: {err}"));
+    let kind = match record.row_type {
+        SchemaRowType::Table => SqliteSchemaBtreeKind::Table,
+        SchemaRowType::Index => SqliteSchemaBtreeKind::Index,
+        _ => return None,
     };
-
-    let kind = match col0 {
-        ValueRef::Text(type_str) => match type_str.as_str() {
-            "table" => SqliteSchemaBtreeKind::Table,
-            "index" => SqliteSchemaBtreeKind::Index,
-            _ => return None,
-        },
-        _ => panic!("sqlite_schema.type column must be TEXT, got {col0:?}"),
-    };
-
-    let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 else {
-        panic!("sqlite_schema.rootpage column must be INTEGER, got {col3:?}");
-    };
-
+    let root_page = record.root_page;
     if root_page == 0 {
         return None;
     }
@@ -597,9 +588,14 @@ pub fn sqlite_schema_btree_identity(
 }
 
 /// `lhs` and `rhs` are versions of a `sqlite_schema` row.
-fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> bool {
-    sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, lhs)
+fn sqlite_schema_versions_refer_to_btree(
+    schema_store: &dyn SchemaStore,
+    lhs: &RowVersion,
+    rhs: &RowVersion,
+) -> bool {
+    sqlite_schema_btree_identity(schema_store, SQLITE_SCHEMA_MVCC_TABLE_ID, lhs)
         .zip(sqlite_schema_btree_identity(
+            schema_store,
             SQLITE_SCHEMA_MVCC_TABLE_ID,
             rhs,
         ))
@@ -614,19 +610,23 @@ fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> 
 /// register destroyed tables/indexes and skip stale recovered rows. Same-object rewrites, such as
 /// `ALTER TABLE ... RENAME COLUMN`, must collapse to the latest version; otherwise checkpoint
 /// treats one schema row chain as a DROP+CREATE pair and emits duplicate work for the same rowid.
-fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersion>) -> bool {
+fn is_schema_metadata_only_rewrite(
+    schema_store: &dyn SchemaStore,
+    current: &RowVersion,
+    next: Option<&RowVersion>,
+) -> bool {
     if current.end().is_none() {
         return false;
     }
 
     let Some(_current_identity) =
-        sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, current)
+        sqlite_schema_btree_identity(schema_store, SQLITE_SCHEMA_MVCC_TABLE_ID, current)
     else {
         return false;
     };
 
     match next {
-        Some(next) => !sqlite_schema_versions_refer_to_btree(current, next),
+        Some(next) => !sqlite_schema_versions_refer_to_btree(schema_store, current, next),
         None => true,
     }
 }
@@ -1150,7 +1150,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             //   deleting a missing sqlite_schema row would be wrong.
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
-                && sqlite_schema_btree_identity(table_id, version).is_some()
+                && sqlite_schema_btree_identity(
+                    self.connection.db.schema_store(),
+                    table_id,
+                    version,
+                )
+                .is_some()
                 && self
                     .durable_txid_max_old
                     .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
@@ -1180,7 +1185,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 if let Some(previous_version) = versions_to_checkpoint.last() {
                     let should_drop_previous = previous_version.end().is_some()
-                        && !is_schema_metadata_only_rewrite(previous_version, Some(version));
+                        && !is_schema_metadata_only_rewrite(
+                            self.connection.db.schema_store(),
+                            previous_version,
+                            Some(version),
+                        );
                     if should_drop_previous {
                         versions_to_checkpoint.pop();
                     }
@@ -1377,7 +1386,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // These don't need to be written to the B-tree, we just need to track them.
             let mut skip_write = false;
 
-            if let Some(schema_identity) = sqlite_schema_btree_identity(key.table_id, &version) {
+            if let Some(schema_identity) = sqlite_schema_btree_identity(
+                self.connection.db.schema_store(),
+                key.table_id,
+                &version,
+            ) {
                 let root_page = schema_identity.root_page;
                 match schema_identity.kind {
                     SqliteSchemaBtreeKind::Index => {
@@ -2048,9 +2061,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
                 existing.data = row_version.data;
                 if existing.end().is_some() {
-                    if let Some(identity) =
-                        sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, existing)
-                    {
+                    if let Some(identity) = sqlite_schema_btree_identity(
+                        self.connection.db.schema_store(),
+                        SQLITE_SCHEMA_MVCC_TABLE_ID,
+                        existing,
+                    ) {
                         if identity.root_page > 0 {
                             self.ended_created_roots.insert(identity.root_page);
                         }
@@ -2894,6 +2909,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .expect("Table ID does not have a root page");
                     let row_version = {
                         let alloc = self.mvstore.allocator();
+                        let connection = Arc::clone(&self.connection);
                         let (row_id, row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -2901,12 +2917,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record =
-                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
-
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                        let record = connection
+                            .db
+                            .schema_store()
+                            .with_root_page(row_version.payload(row_id), root_page as i64)?;
                         // Btree creation has already happened by this point; an injected fault
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
@@ -2929,6 +2943,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .expect("Index ID does not have a root page");
                     let row_version = {
                         let alloc = self.mvstore.allocator();
+                        let connection = Arc::clone(&self.connection);
                         let (row_id, row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -2936,11 +2951,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     "row version not found in write set".to_string(),
                                 )
                             })?;
-                        let record =
-                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                        let record = connection
+                            .db
+                            .schema_store()
+                            .with_root_page(row_version.payload(row_id), root_page as i64)?;
                         // Btree creation has already happened by this point; an injected fault
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
@@ -3728,7 +3742,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
         let cursor = BTreeCursor::new_table(
             pager.clone(),
             SQLITE_SCHEMA_ROOT_PAGE,
-            SQLITE_SCHEMA_COLUMN_COUNT,
+            connection.db.schema_store().root_record_column_count(),
         );
         Self {
             pager,
@@ -3928,6 +3942,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::{Row, SortableIndexKey};
+    use crate::schema::SqliteSchemaStore;
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
@@ -3976,7 +3991,10 @@ mod tests {
         let record = ImmutableRecordRef::from_shared_record(payload.clone());
 
         assert_eq!(record.get_payload().as_ptr(), payload_ptr);
-        assert_eq!(record.column_count(), SQLITE_SCHEMA_COLUMN_COUNT);
+        assert_eq!(
+            record.column_count(),
+            SqliteSchemaStore.root_record_column_count()
+        );
     }
 
     #[test]
@@ -3985,14 +4003,22 @@ mod tests {
         let new = sqlite_schema_row_version(3, "index", "idx_t_a", "t", 7, Some(2), None);
 
         assert_eq!(
-            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &old),
+            sqlite_schema_btree_identity(&SqliteSchemaStore, SQLITE_SCHEMA_MVCC_TABLE_ID, &old),
             Some(SqliteSchemaBtreeIdentity {
                 kind: SqliteSchemaBtreeKind::Index,
                 root_page: 7,
             })
         );
-        assert!(sqlite_schema_versions_refer_to_btree(&old, &new));
-        assert!(!is_schema_metadata_only_rewrite(&old, Some(&new)));
+        assert!(sqlite_schema_versions_refer_to_btree(
+            &SqliteSchemaStore,
+            &old,
+            &new
+        ));
+        assert!(!is_schema_metadata_only_rewrite(
+            &SqliteSchemaStore,
+            &old,
+            Some(&new)
+        ));
     }
 
     #[test]
@@ -4000,8 +4026,16 @@ mod tests {
         let old = sqlite_schema_row_version(2, "table", "t", "t", 5, Some(1), Some(2));
         let new = sqlite_schema_row_version(2, "table", "t", "t", 5, Some(2), None);
 
-        assert!(sqlite_schema_versions_refer_to_btree(&old, &new));
-        assert!(!is_schema_metadata_only_rewrite(&old, Some(&new)));
+        assert!(sqlite_schema_versions_refer_to_btree(
+            &SqliteSchemaStore,
+            &old,
+            &new
+        ));
+        assert!(!is_schema_metadata_only_rewrite(
+            &SqliteSchemaStore,
+            &old,
+            Some(&new)
+        ));
     }
 
     #[test]
@@ -4009,15 +4043,27 @@ mod tests {
         let dropped = sqlite_schema_row_version(3, "index", "idx_t_v", "t", -4, Some(1), Some(2));
         let recreated = sqlite_schema_row_version(3, "index", "idx_t_v", "t", -5, Some(2), None);
 
-        assert!(!sqlite_schema_versions_refer_to_btree(&dropped, &recreated));
-        assert!(is_schema_metadata_only_rewrite(&dropped, Some(&recreated)));
+        assert!(!sqlite_schema_versions_refer_to_btree(
+            &SqliteSchemaStore,
+            &dropped,
+            &recreated
+        ));
+        assert!(is_schema_metadata_only_rewrite(
+            &SqliteSchemaStore,
+            &dropped,
+            Some(&recreated)
+        ));
     }
 
     #[test]
     fn sqlite_schema_identity_detects_drop_without_successor() {
         let dropped = sqlite_schema_row_version(3, "index", "idx_t_v", "t", 11, Some(1), Some(2));
 
-        assert!(is_schema_metadata_only_rewrite(&dropped, None));
+        assert!(is_schema_metadata_only_rewrite(
+            &SqliteSchemaStore,
+            &dropped,
+            None
+        ));
     }
 
     #[test]
@@ -4027,14 +4073,16 @@ mod tests {
             sqlite_schema_row_version(9, "trigger", "trg_t", "t", 0, Some(2), None);
 
         assert_eq!(
-            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &trigger),
+            sqlite_schema_btree_identity(&SqliteSchemaStore, SQLITE_SCHEMA_MVCC_TABLE_ID, &trigger),
             None
         );
         assert!(!sqlite_schema_versions_refer_to_btree(
+            &SqliteSchemaStore,
             &trigger,
             &rewritten_trigger
         ));
         assert!(!is_schema_metadata_only_rewrite(
+            &SqliteSchemaStore,
             &trigger,
             Some(&rewritten_trigger)
         ));
@@ -4054,10 +4102,18 @@ mod tests {
         };
 
         assert_eq!(
-            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &tombstone),
+            sqlite_schema_btree_identity(
+                &SqliteSchemaStore,
+                SQLITE_SCHEMA_MVCC_TABLE_ID,
+                &tombstone
+            ),
             None
         );
-        assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
+        assert!(!is_schema_metadata_only_rewrite(
+            &SqliteSchemaStore,
+            &tombstone,
+            None
+        ));
     }
 
     fn index_row_version(

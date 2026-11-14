@@ -210,6 +210,9 @@ pub struct ReparseSchemaInner {
     /// Held for the whole reparse so a concurrent reparse on this connection
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
+    /// The connection's schema before the reparse began. Put back if the
+    /// reparse fails, so a half-built schema never stays installed.
+    previous: Arc<Schema>,
     fresh: Schema,
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
@@ -1574,6 +1577,7 @@ impl Connection {
         preserved_sequences: Option<SequencesByNamespace>,
     ) -> Result<ReparseSchemaInner> {
         let guard = self.schema_reparse_guard();
+        let previous = self.current_schema();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(
@@ -1582,7 +1586,7 @@ impl Connection {
         )?;
         fresh.schema_version = cookie;
 
-        fresh.copy_table_valued_functions(&self.schema.read());
+        fresh.copy_table_valued_functions(&previous);
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1591,7 +1595,13 @@ impl Connection {
         // with a new clean schema that has the same header cookie.
         self.install_schema_keeping_dialect_schema(&fresh)?;
 
-        let stmt = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
+        let stmt = match self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema") {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                self.restore_schema_after_failed_reparse(previous);
+                return Err(err);
+            }
+        };
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1601,6 +1611,7 @@ impl Connection {
         };
         Ok(ReparseSchemaInner {
             _guard: guard,
+            previous,
             fresh,
             preserved_sequences,
             parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
@@ -1610,7 +1621,32 @@ impl Connection {
 
     /// Drive the schema-rebuild phases held in `state` (must be `Building`).
     /// Yields IO; on completion installs the finished schema and resets `state`.
+    /// On failure puts the connection's previous schema back and resets `state`.
     fn drive_reparse_building(
+        self: &Arc<Connection>,
+        state: &mut ReparseSchemaState,
+    ) -> crate::types::IOResultOr<()> {
+        let result = self.drive_reparse_phases(state);
+        if result.is_err() {
+            if let ReparseSchemaState::Building(inner) = std::mem::take(state) {
+                self.restore_schema_after_failed_reparse(inner.previous);
+            }
+        }
+        result
+    }
+
+    /// The phases read engine tables through the connection, so each phase
+    /// that needs one installs the half-built schema first. A failure then
+    /// leaves that half-built schema on the connection: its version already
+    /// matches the cookie, so nothing would read the schema again, and it has
+    /// no roles and no dialect schema state. Putting the previous schema back
+    /// keeps the catalogs intact, and its older version makes the next
+    /// statement read the schema again.
+    fn restore_schema_after_failed_reparse(&self, previous: Arc<Schema>) {
+        *self.schema.write() = previous;
+    }
+
+    fn drive_reparse_phases(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
     ) -> crate::types::IOResultOr<()> {
@@ -1840,9 +1876,7 @@ impl Connection {
                         fresh.schema_version,
                         fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
-                    self.with_schema_mut(|schema| {
-                        *schema = fresh;
-                    })?;
+                    *self.schema.write() = Arc::new(fresh);
                     return Ok(IOResult::Done(()));
                 }
             }

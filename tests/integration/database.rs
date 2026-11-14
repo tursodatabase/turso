@@ -620,6 +620,122 @@ fn test_errors_on_zero_divisor_dialect() {
     }
 }
 
+/// A schema re-read installs the half-built schema on the connection to read
+/// the engine tables through it. If the re-read then fails, that half-built
+/// schema must not stay: its version already matches the cookie, so nothing
+/// would read the schema again, and it has no roles and no dialect schema
+/// state. The connection must keep the schema it had, whose older version
+/// makes the next statement catch up with the current schema.
+#[test]
+fn test_failed_schema_reparse_keeps_previous_schema() {
+    use crate::common::TempDatabase;
+    use std::any::Any;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use turso_core::{Dialect, LimboError};
+    use turso_sqlite::SqliteDialect;
+
+    /// A dialect with schema state that is read from `sqlite_schema` and
+    /// whose build fails on demand.
+    struct FailingCatalogDialect {
+        fail_build: AtomicBool,
+    }
+    impl Dialect for FailingCatalogDialect {
+        fn name(&self) -> &'static str {
+            SqliteDialect.name()
+        }
+        fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+        fn parse_table_sql(
+            &self,
+            sql: &str,
+            root_page: i64,
+        ) -> turso_core::Result<turso_core::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> turso_core::Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> turso_core::Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> turso_core::Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+        fn register_catalog(
+            &self,
+            schema: &mut turso_core::schema::Schema,
+            enable_custom_types: bool,
+        ) -> turso_core::Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+        fn resolve_function(
+            &self,
+            name: &str,
+            arg_count: usize,
+        ) -> turso_core::Result<Option<turso_core::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
+        fn schema_state_queries(&self, _schema: &turso_core::schema::Schema) -> Vec<String> {
+            vec!["SELECT name FROM sqlite_schema".to_string()]
+        }
+        fn build_schema_state(
+            &self,
+            _schema: &turso_core::schema::Schema,
+            _results: &[Vec<Vec<turso_core::Value>>],
+        ) -> turso_core::Result<Arc<dyn Any + Send + Sync>> {
+            if self.fail_build.load(Ordering::SeqCst) {
+                return Err(LimboError::Corrupt(
+                    "injected failure while reading the dialect schema state".to_string(),
+                ));
+            }
+            Ok(Arc::new(()))
+        }
+    }
+
+    let dialect = Arc::new(FailingCatalogDialect {
+        fail_build: AtomicBool::new(false),
+    });
+    let db = TempDatabase::builder()
+        .with_dialect(dialect.clone())
+        .build();
+    let writer = db.connect_limbo();
+    let reader = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    let before = reader.current_schema();
+    assert!(before.dialect_schema.is_some());
+
+    dialect.fail_build.store(true, Ordering::SeqCst);
+    let err = reader.force_reparse_schema_without_publish().unwrap_err();
+    assert!(matches!(err, LimboError::Corrupt(_)), "{err:?}");
+    let after = reader.current_schema();
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "a failed schema re-read must leave the previous schema installed, \
+         got schema_version {} with dialect_schema {}",
+        after.schema_version,
+        if after.dialect_schema.is_some() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+
+    dialect.fail_build.store(false, Ordering::SeqCst);
+    let mut stmt = reader.prepare("SELECT count(*) FROM t").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows[0][0], turso_core::Value::from_i64(0));
+    let caught_up = reader.current_schema();
+    assert!(caught_up.schema_version > before.schema_version);
+    assert!(caught_up.dialect_schema.is_some());
+}
+
 /// SQLite lets a user create a table named like the namespaces table of a
 /// database that supports namespaces. Under the SQLite dialect it is an
 /// ordinary table, and loading the schema must not read it as one.
