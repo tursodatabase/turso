@@ -1,0 +1,32 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/10000
+@cross-check-integrity
+test integer-with-size-primary-key-is-not-rowid-alias {
+    CREATE TABLE t(a INTEGER(10) PRIMARY KEY, b);
+    INSERT INTO t VALUES (5, 'x');
+    SELECT rowid = a, rowid, a FROM t;
+}
+expect {
+    0|1|5
+}
+
+@cross-check-integrity
+test integer-with-size-table-primary-key-is-not-rowid-alias {
+    CREATE TABLE t(a INTEGER(10), b, PRIMARY KEY(a));
+    INSERT INTO t VALUES (5, 'x');
+    SELECT rowid = a, rowid, a FROM t;
+}
+expect {
+    0|1|5
+}
+
+@cross-check-integrity
+test integer-primary-key-is-rowid-alias {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (5, 'x');
+    SELECT rowid = a, rowid, a FROM t;
+}
+expect {
+    1|5|5
+}

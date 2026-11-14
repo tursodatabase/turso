@@ -991,6 +991,7 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
 /// element type name is `INTEGER`.
 pub(crate) fn is_rowid_alias_type(written_type: &ast::Type) -> bool {
     !written_type.is_array()
+        && written_type.size.is_none()
         && (written_type.name.eq_ignore_ascii_case("INTEGER")
             || written_type.name.eq_ignore_ascii_case("[INTEGER]"))
 }
