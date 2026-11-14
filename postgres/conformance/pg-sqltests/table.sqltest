@@ -328,6 +328,18 @@ expect {
     6
 }
 
+test table-index-expression-with-qualified-column-and-table-alias {
+    CREATE TABLE t_qualified_index (a int, b int);
+    INSERT INTO t_qualified_index VALUES (1, 1), (2, 2);
+    CREATE INDEX t_qualified_index_b ON t_qualified_index ((t_qualified_index.b + 1));
+    UPDATE t_qualified_index AS t SET b = 5 WHERE a = 2;
+    DELETE FROM t_qualified_index t WHERE a = 1;
+    SELECT a, b FROM t_qualified_index WHERE b + 1 = 6;
+}
+expect {
+    2|5
+}
+
 test table-numeric-column-compared-with-expression {
     CREATE TABLE nm (v numeric(10,2));
     INSERT INTO nm VALUES (1.50);
