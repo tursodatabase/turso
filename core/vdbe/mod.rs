@@ -3804,7 +3804,11 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
-                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                Some(
+                    LimboError::WriteWriteConflict
+                    | LimboError::SchemaConflict
+                    | LimboError::CommitDependencyAborted,
+                ) => {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
                     // statement savepoint, as DDL does.

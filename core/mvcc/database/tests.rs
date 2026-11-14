@@ -9104,6 +9104,150 @@ fn test_commit_dependency_missing_tx_assumes_committed() {
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
 }
 
+/// `MvccCursor::insert` reads the row and then calls `update_to_table_or_index`
+/// without holding the row's version chain lock in between. If the version it
+/// read belongs to a committing writer that aborts in between, the update finds
+/// no visible version. It must fail with CommitDependencyAborted instead of
+/// returning false, which made the cursor panic.
+#[test]
+fn test_update_fails_when_speculatively_read_writer_aborts() {
+    // The writer either inserts row 1, or updates row 1 while it exists only in
+    // the B-tree. After its rollback, neither leaves a version the updater can see.
+    for btree_resident in [false, true] {
+        let db = MvccTestDb::new();
+        let table_id: MVTableId = (-2).into();
+        let id = RowID::new(table_id, RowKey::Int(1));
+
+        let writer_conn = db.db.connect(ConnectOpts::new()).unwrap();
+        let writer = db
+            .mvcc_store
+            .begin_tx(writer_conn.pager.load().clone())
+            .unwrap();
+        let written = generate_simple_string_row(table_id, 1, "writer");
+        if btree_resident {
+            db.mvcc_store
+                .insert_btree_resident_to_table_or_index(writer, written, None)
+                .unwrap();
+        } else {
+            db.mvcc_store.insert(writer, written).unwrap();
+        }
+        db.mvcc_store.get_commit_timestamp(|ts| {
+            db.mvcc_store
+                .txs
+                .get(&writer)
+                .unwrap()
+                .value()
+                .state
+                .store(TransactionState::Preparing(ts));
+        });
+
+        let updater_conn = db.db.connect(ConnectOpts::new()).unwrap();
+        let updater = db
+            .mvcc_store
+            .begin_tx(updater_conn.pager.load().clone())
+            .unwrap();
+        let read = db.mvcc_store.read(updater, &id).unwrap();
+        assert_eq!(
+            read,
+            Some(generate_simple_string_row(table_id, 1, "writer")),
+            "the updater should read the Preparing writer's version"
+        );
+
+        db.mvcc_store.rollback_tx(
+            writer,
+            writer_conn.pager.load().clone(),
+            &writer_conn,
+            crate::MAIN_DB_ID,
+        );
+
+        let result = db
+            .mvcc_store
+            .update(updater, generate_simple_string_row(table_id, 1, "updater"));
+        assert!(
+            matches!(result, Err(LimboError::CommitDependencyAborted)),
+            "btree_resident={btree_resident}: expected CommitDependencyAborted, got {result:?}"
+        );
+        let commit_result = commit_tx(db.mvcc_store.clone(), &updater_conn, updater);
+        assert!(
+            matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
+            "btree_resident={btree_resident}: expected CommitDependencyAborted, got {commit_result:?}"
+        );
+    }
+}
+
+/// A statement that fails with CommitDependencyAborted rolls back its whole
+/// transaction, like WriteWriteConflict: the transaction depends on an aborted
+/// one and can never commit. A single-row UPDATE has no statement savepoint, and
+/// under MVCC its Insert step can raise this error after its Delete step wrote.
+#[test]
+fn test_commit_dependency_aborted_statement_rolls_back_txn() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE hot (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO hot VALUES (1, 0)").unwrap();
+        conn.close().unwrap();
+    }
+    let mvcc_store = db.get_mvcc_store();
+
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE hot SET n = 100 WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+    mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
+
+    let updater_conn = db.connect();
+    updater_conn.execute("BEGIN CONCURRENT").unwrap();
+    updater_conn
+        .execute("INSERT INTO hot VALUES (2, 0)")
+        .unwrap();
+    let rows = updater_conn
+        .prepare("SELECT n FROM hot WHERE id = 1")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(100)]],
+        "the updater should read the Preparing writer's version"
+    );
+
+    mvcc_store.rollback_tx(
+        writer_tx_id,
+        writer_conn.pager.load().clone(),
+        &writer_conn,
+        crate::MAIN_DB_ID,
+    );
+
+    let result = updater_conn.execute("UPDATE hot SET n = n + 1 WHERE id = 1");
+    assert!(
+        matches!(result, Err(LimboError::CommitDependencyAborted)),
+        "expected CommitDependencyAborted, got {result:?}"
+    );
+    assert!(
+        updater_conn.get_auto_commit(),
+        "the updater's transaction should be rolled back"
+    );
+
+    let rows = updater_conn
+        .prepare("SELECT id, n FROM hot ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
+}
+
 /// Test that read-only transactions with resolved dependencies do NOT advance
 /// last_committed_tx_ts. A read-only tx going through WaitForDependencies →
 /// CommitEnd would update last_committed_tx_ts, causing spurious Busy errors
