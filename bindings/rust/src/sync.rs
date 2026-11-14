@@ -112,6 +112,10 @@ pub struct Builder {
     // from the first pull-updates response; Some(true) forces MVCC logical-log
     // pulls; Some(false) forces page-stream pulls.
     logical_mvcc_pull: Option<bool>,
+    // Bootstrap chunk size in bytes; None bootstraps in one request.
+    pull_bytes_threshold: Option<usize>,
+    // Maximum number of bootstrap chunk requests in flight; None means 1.
+    pull_parallel_requests: Option<usize>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -142,6 +146,8 @@ impl Builder {
             remote_encryption_key: None,
             remote_encryption_cipher: None,
             logical_mvcc_pull: None,
+            pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -310,6 +316,22 @@ impl Builder {
         self
     }
 
+    /// Split the initial bootstrap download into `/pull-updates` requests of
+    /// at least `bytes` each. By default the bootstrap is one request. Has no
+    /// effect with the query partial-sync bootstrap strategy.
+    pub fn with_pull_bytes_threshold(mut self, bytes: usize) -> Self {
+        self.pull_bytes_threshold = Some(bytes);
+        self
+    }
+
+    /// Maximum number of bootstrap chunk requests in flight at once when the
+    /// bootstrap is split with [`Builder::with_pull_bytes_threshold`].
+    /// Defaults to 1.
+    pub fn with_pull_parallel_requests(mut self, requests: usize) -> Self {
+        self.pull_parallel_requests = Some(requests);
+        self
+    }
+
     /// Compose the `experimental_features` comma-separated string consumed by
     /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
     /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
@@ -395,7 +417,8 @@ impl Builder {
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
-            pull_bytes_threshold: None,
+            pull_bytes_threshold: self.pull_bytes_threshold,
+            pull_parallel_requests: self.pull_parallel_requests,
             logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
@@ -832,20 +855,29 @@ impl IoWorker {
                         body,
                         headers,
                     } => {
-                        IoWorker::process_http(
-                            &sync,
-                            base_url.as_deref(),
-                            auth_token.as_ref(),
-                            &wakers,
-                            &client,
-                            url.as_deref(),
-                            &method,
-                            &path,
-                            body.map(Bytes::from),
-                            &headers,
-                            completion,
-                        )
-                        .await;
+                        // Each request streams its body on its own task, so
+                        // requests the engine issues together run in parallel.
+                        let sync = sync.clone();
+                        let base_url = base_url.clone();
+                        let auth_token = auth_token.clone();
+                        let wakers = wakers.clone();
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            IoWorker::process_http(
+                                &sync,
+                                base_url.as_deref(),
+                                auth_token.as_ref(),
+                                &wakers,
+                                &client,
+                                url.as_deref(),
+                                &method,
+                                &path,
+                                body.map(Bytes::from),
+                                &headers,
+                                completion,
+                            )
+                            .await;
+                        });
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
                         IoWorker::process_full_read(&path, completion, &sync).await;
@@ -1828,6 +1860,44 @@ mod tests {
                 vec![Value::Text("sync".to_string())],
             ]
         );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_bootstrap_parallel_chunks() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server
+            .db_sql("CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT value, randomblob(1024) FROM generate_series(1, 200)")
+            .await
+            .unwrap();
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .with_pull_bytes_threshold(8192)
+            .with_pull_parallel_requests(4)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        let rows = conn
+            .query("SELECT COUNT(*), SUM(x), SUM(length(y)) FROM t", ())
+            .await
+            .unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![vec![
+                Value::Integer(200),
+                Value::Integer(20100),
+                Value::Integer(200 * 1024)
+            ]]
+        );
+        let rows = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(all, vec![vec![Value::Text("ok".to_string())]]);
     }
 
     #[tokio::test]
