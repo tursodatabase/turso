@@ -15515,6 +15515,398 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
     );
 }
 
+#[rstest::rstest]
+#[case::change_before_pager_commit(true)]
+#[case::change_after_pager_commit(false)]
+fn checkpoint_gc_reclaims_versions_after_concurrent_update_ends(
+    #[case] change_before_commit: bool,
+    #[values(true, false)] rollback: bool,
+) {
+    use crate::mvcc::database::checkpoint_state_machine::{
+        CheckpointState, CheckpointStateMachine,
+    };
+    use crate::storage::wal::CheckpointMode;
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    let checkpointer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    writer.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let mv = db.get_mvcc_store();
+    let mut cp = CheckpointStateMachine::new(
+        checkpointer.pager.load().clone(),
+        mv.clone(),
+        checkpointer.clone(),
+        true,
+        checkpointer.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    for _ in 0..200_000 {
+        if cp.state_for_test() == CheckpointState::CommitPagerTxn {
+            break;
+        }
+        match cp.step(&()).unwrap() {
+            TransitionResult::Io(c) => c.wait(checkpointer.db.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint ended early"),
+        }
+    }
+    assert_eq!(cp.state_for_test(), CheckpointState::CommitPagerTxn);
+    if change_before_commit {
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    }
+    let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    checkpointer.set_yield_injector(Some(park.clone()));
+    for _ in 0..200_000 {
+        match cp.step(&()).unwrap() {
+            TransitionResult::Io(c) => {
+                if park.is_empty() {
+                    break;
+                }
+                c.wait(checkpointer.db.io.as_ref()).unwrap();
+            }
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint ended early"),
+        }
+    }
+    assert!(park.is_empty());
+    checkpointer.set_yield_injector(None);
+    if !change_before_commit {
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    }
+    writer
+        .execute(if rollback { "ROLLBACK" } else { "COMMIT" })
+        .unwrap();
+    let mut done = false;
+    for _ in 0..200_000 {
+        match cp.step(&()).unwrap() {
+            TransitionResult::Io(c) => c.wait(checkpointer.db.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                done = true;
+                break;
+            }
+        }
+    }
+    assert!(done);
+    for _ in 0..3 {
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        mv.gc_incremental(1000);
+        mv.drop_unused_row_versions_and_slots();
+    }
+    let table_versions = mv
+        .rows
+        .iter()
+        .filter(|e| e.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
+        .map(|e| e.value().read().len())
+        .sum::<usize>();
+    let index_versions = mv
+        .index_rows
+        .iter()
+        .map(|e| {
+            e.value()
+                .iter()
+                .map(|row| row.value().read().len())
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        get_rows(&checkpointer, "SELECT v FROM t NOT INDEXED"),
+        vec![vec![Value::build_text(if rollback { "a" } else { "b" })]]
+    );
+    assert_eq!(
+        get_rows(&checkpointer, "SELECT v FROM t INDEXED BY t_v"),
+        vec![vec![Value::build_text(if rollback { "a" } else { "b" })]]
+    );
+    assert_eq!(
+        (table_versions, index_versions),
+        (0, 0),
+        "idle GC must reclaim checkpointed table and index versions after rollback"
+    );
+}
+
+#[test]
+fn checkpoint_retry_reclaims_versions_after_busy_truncate() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t ORDER BY id"),
+        vec![vec![Value::build_text("a")], vec![Value::build_text("b")]]
+    );
+    writer.execute("UPDATE t SET v = 'c' WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 2").unwrap();
+    writer.execute("INSERT INTO t VALUES (3, 'd')").unwrap();
+
+    assert!(matches!(
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+        Err(LimboError::Busy)
+    ));
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t ORDER BY id"),
+        vec![vec![Value::build_text("a")], vec![Value::build_text("b")]]
+    );
+    reader.execute("COMMIT").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        get_rows(&writer, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("c")],
+            vec![Value::from_i64(3), Value::build_text("d")]
+        ]
+    );
+    assert_eq!(
+        get_rows(&writer, "SELECT id, v FROM t INDEXED BY t_v ORDER BY v"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("c")],
+            vec![Value::from_i64(3), Value::build_text("d")]
+        ]
+    );
+    assert_eq!(
+        get_rows(&writer, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+    let mv = db.get_mvcc_store();
+    assert_eq!(skipmap_version_count(&mv), 0);
+    let index_versions: usize = mv
+        .index_rows
+        .iter()
+        .map(|index| {
+            index
+                .value()
+                .iter()
+                .map(|row| row.value().read().len())
+                .sum::<usize>()
+        })
+        .sum();
+    assert_eq!(index_versions, 0);
+}
+
+#[rstest::rstest]
+#[case::blocking(false, "TRUNCATE")]
+#[case::passive(true, "PASSIVE")]
+#[case::passive_truncate(true, "TRUNCATE")]
+fn checkpoint_retry_reclaims_versions_after_publish_error(
+    #[case] passive: bool,
+    #[case] mode: &str,
+) {
+    let db = if passive {
+        MvccTestDbNoConn::new_with_random_db_passive()
+    } else {
+        MvccTestDbNoConn::new_with_random_db()
+    };
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = 'c' WHERE id = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'd')").unwrap();
+
+    let failure = FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("checkpoint publish error".to_string()),
+    )]);
+    conn.set_failure_injector(Some(failure.clone()));
+    let error = conn
+        .execute(format!("PRAGMA wal_checkpoint({mode})"))
+        .unwrap_err();
+    conn.set_failure_injector(None);
+    assert!(failure.is_empty());
+    assert!(matches!(error, LimboError::TxError(message) if message == "checkpoint publish error"));
+    conn.execute(format!("PRAGMA wal_checkpoint({mode})"))
+        .unwrap();
+    let mv = db.get_mvcc_store();
+    mv.drop_unused_row_versions();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("c")],
+            vec![Value::from_i64(3), Value::build_text("d")]
+        ]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id, v FROM t INDEXED BY t_v ORDER BY v"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("c")],
+            vec![Value::from_i64(3), Value::build_text("d")]
+        ]
+    );
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+    assert_eq!(skipmap_version_count(&mv), 0);
+    let index_versions: usize = mv
+        .index_rows
+        .iter()
+        .map(|index| {
+            index
+                .value()
+                .iter()
+                .map(|row| row.value().read().len())
+                .sum::<usize>()
+        })
+        .sum();
+    assert_eq!(index_versions, 0);
+}
+
+#[rstest::rstest]
+#[case::keep_table(false)]
+#[case::drop_table(true)]
+fn abandoned_checkpoint_keeps_committed_root_pages(#[case] drop_table: bool) {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE old(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup.execute("INSERT INTO old VALUES (1)").unwrap();
+        setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        setup
+            .execute("CREATE TABLE fresh(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup.execute("CREATE INDEX fresh_v ON fresh(v)").unwrap();
+        setup
+            .execute("INSERT INTO fresh VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+
+        let checkpoint = db.connect();
+        checkpoint
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+        checkpoint.set_yield_injector(Some(park.clone()));
+        let mut insert = checkpoint
+            .prepare("INSERT INTO fresh VALUES (3, 'c')")
+            .unwrap();
+        let io = checkpoint.pager.load().io.clone();
+        for _ in 0..200_000 {
+            match insert.step().unwrap() {
+                crate::StepResult::Yield | crate::StepResult::IO => {
+                    if park.is_empty() {
+                        break;
+                    }
+                    io.step().unwrap();
+                }
+                other => panic!("checkpoint did not stop before publish: {other:?}"),
+            }
+        }
+        checkpoint.set_yield_injector(None);
+        assert!(park.is_empty());
+        if drop_table {
+            setup.execute("DROP TABLE fresh").unwrap();
+        }
+        drop(insert);
+        checkpoint
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+
+        if !drop_table {
+            setup.execute("INSERT INTO fresh VALUES (4, 'd')").unwrap();
+        }
+        setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(
+            get_rows(&setup, "PRAGMA integrity_check"),
+            vec![vec![Value::build_text("ok")]]
+        );
+        if !drop_table {
+            assert_eq!(
+                get_rows(&setup, "SELECT id, v FROM fresh ORDER BY id"),
+                vec![
+                    vec![Value::from_i64(1), Value::build_text("a")],
+                    vec![Value::from_i64(2), Value::build_text("b")],
+                    vec![Value::from_i64(3), Value::build_text("c")],
+                    vec![Value::from_i64(4), Value::build_text("d")]
+                ]
+            );
+            assert_eq!(
+                get_rows(&setup, "SELECT id FROM fresh INDEXED BY fresh_v ORDER BY v"),
+                vec![
+                    vec![Value::from_i64(1)],
+                    vec![Value::from_i64(2)],
+                    vec![Value::from_i64(3)],
+                    vec![Value::from_i64(4)]
+                ]
+            );
+        }
+    }
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM old"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    if drop_table {
+        assert_eq!(
+            get_rows(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('fresh', 'fresh_v')"
+            ),
+            vec![vec![Value::from_i64(0)]]
+        );
+    } else {
+        assert_eq!(
+            get_rows(&conn, "SELECT id, v FROM fresh ORDER BY id"),
+            vec![
+                vec![Value::from_i64(1), Value::build_text("a")],
+                vec![Value::from_i64(2), Value::build_text("b")],
+                vec![Value::from_i64(3), Value::build_text("c")],
+                vec![Value::from_i64(4), Value::build_text("d")]
+            ]
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT id FROM fresh INDEXED BY fresh_v ORDER BY v"),
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)],
+                vec![Value::from_i64(4)]
+            ]
+        );
+    }
+}
+
 /// Test that inserting a duplicate primary key fails when the existing row
 /// was committed before this transaction started (and thus is visible).
 #[test]

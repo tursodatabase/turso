@@ -1037,13 +1037,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
+        if self.pager_commit_done && self.staged_checkpoint_header.is_some() {
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            if matches!(self.mode, CheckpointMode::Passive { .. }) {
+                assert!(self.owns_checkpoint_in_progress);
+                assert!(self.mvstore.try_begin_passive_publish_window());
+                self.apply_passive_publish_window_ordered(materialized_at)?;
+            } else {
+                assert!(self.lock_states.blocking_checkpoint_lock_held);
+                self.apply_checkpoint_publish_window(materialized_at, None)?;
+            }
+        }
+
         // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
         let result = self.mvstore.storage.on_checkpoint_end(Err(err));
 
-        // Drop this checkpoint's staged (not-yet-applied) root-map mutations. They were never
-        // written to the shared map (deferred to the post-commit publish window), so a failed
-        // checkpoint simply discards them — no revert, no divergence. A post-commit failure
-        // finds these already drained, so nothing is dropped.
         self.pending_rootmap_ops.clear();
         self.pending_alloc_roots.clear();
 
@@ -3290,6 +3298,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             self.pager_commit_done = true;
                             self.lock_states.pager_read_tx = false;
                             self.lock_states.pager_write_tx = false;
+                            self.stamp_committed_versions();
                         }
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
@@ -3550,6 +3559,61 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         LimboError::InternalError("checkpoint_result not set".to_string())
                     })?,
                 ))
+            }
+        }
+    }
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, A> {
+    fn stamp_committed_versions(&self) {
+        let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+        for &(table_id, rowid) in &self.written_table_rowids {
+            self.stamp_committed_row(&RowID::new(table_id, RowKey::Int(rowid)), materialized_at);
+        }
+        for rowid in &self.unwritten_table_rows {
+            self.stamp_committed_row(rowid, materialized_at);
+        }
+        for &slot in &self.written_index_slots {
+            self.stamp_committed_row(&self.index_write_set[slot].0, materialized_at);
+        }
+        for (index_id, key) in &self.unwritten_index_rows {
+            self.stamp_committed_row(
+                &RowID::new(*index_id, RowKey::Record(key.clone())),
+                materialized_at,
+            );
+        }
+    }
+
+    fn stamp_committed_row(&self, rowid: &RowID, materialized_at: WalPos) {
+        match &rowid.row_id {
+            RowKey::Int(_) => {
+                if let Some(entry) = self.mvstore.rows.get(rowid) {
+                    self.mvstore.stamp_chain_materialized(
+                        &mut entry.value().write(),
+                        materialized_at,
+                        self.snapshot_ts,
+                    );
+                } else {
+                    assert!(self
+                        .mvcc_meta_table
+                        .is_some_and(|(table_id, _)| table_id == rowid.table_id));
+                }
+            }
+            RowKey::Record(key) => {
+                let index = self
+                    .mvstore
+                    .index_rows
+                    .get(&rowid.table_id)
+                    .expect("committed index must exist in index_rows");
+                let entry = index
+                    .value()
+                    .get(key)
+                    .expect("committed index row must exist in index_rows");
+                self.mvstore.stamp_chain_materialized(
+                    &mut entry.value().write(),
+                    materialized_at,
+                    self.snapshot_ts,
+                );
             }
         }
     }
