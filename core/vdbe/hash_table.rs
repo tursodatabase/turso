@@ -197,16 +197,21 @@ impl HashEntry {
         Self::size_from_values(&self.key_values, &self.payload_values)
     }
 
+    /// Estimate the memory one entry holds: the entry itself, one `Value` per
+    /// key and payload column, and the text and blob bytes those values own.
     fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
-        let value_size = |v: &Value| match v {
-            Value::Null => 1,
-            Value::Numeric(_) => 8,
+        let value_heap_size = |v: &Value| match v {
             Value::Text(t) => t.as_str().len(),
             Value::Blob(b) => b.len(),
+            Value::Null | Value::Numeric(_) => 0,
         };
-        let key_size: usize = key_values.iter().map(value_size).sum();
-        let payload_size: usize = payload_values.iter().map(value_size).sum();
-        key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
+        let value_count = key_values.len() + payload_values.len();
+        let heap_size: usize = key_values
+            .iter()
+            .chain(payload_values)
+            .map(value_heap_size)
+            .sum();
+        std::mem::size_of::<Self>() + value_count * std::mem::size_of::<Value>() + heap_size
     }
 
     /// Calculate the serialized size of a single Value.
@@ -4148,6 +4153,29 @@ mod hashtests {
             let key = vec![Value::from_i64(rowid)];
             let _ = ht.insert(key, rowid, vec![], None);
         }
+    }
+
+    #[test]
+    fn test_hash_table_spills_when_entry_structs_exceed_budget() {
+        let count = 1000;
+        let min_bytes_held =
+            count * (std::mem::size_of::<HashEntry>() + std::mem::size_of::<Value>());
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: min_bytes_held - 1,
+            num_keys: 1,
+            collations: vec![CollationSeq::BINARY],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            ..Default::default()
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        insert_many_force_spill(&mut ht, 0, count as i64);
+        assert!(
+            ht.has_spilled(),
+            "{count} integer keys hold at least {min_bytes_held} bytes, over the budget"
+        );
     }
 
     #[test]
