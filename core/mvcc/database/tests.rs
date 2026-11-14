@@ -1734,11 +1734,7 @@ fn advance_checkpoint_until_wal_has_commit_frame(
     conn: &Arc<Connection>,
 ) {
     let pager = conn.pager.load().clone();
-    let initial_wal_max_frame = pager
-        .wal
-        .as_ref()
-        .expect("mvcc mode requires wal")
-        .get_max_frame_in_wal();
+    let initial_wal_max_frame = pager.wal_max_frame().expect("mvcc mode requires wal");
     let mut checkpoint_sm = CheckpointStateMachine::new(
         pager.clone(),
         mvcc_store,
@@ -1752,13 +1748,7 @@ fn advance_checkpoint_until_wal_has_commit_frame(
     );
 
     for _ in 0..10_000 {
-        if pager
-            .wal
-            .as_ref()
-            .expect("mvcc mode requires wal")
-            .get_max_frame_in_wal()
-            > initial_wal_max_frame
-        {
+        if pager.wal_max_frame().expect("mvcc mode requires wal") > initial_wal_max_frame {
             return;
         }
 
@@ -2708,14 +2698,7 @@ fn test_bootstrap_completes_interrupted_checkpoint_with_committed_wal() {
         advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
 
         let pager = conn.pager.load().clone();
-        assert!(
-            pager
-                .wal
-                .as_ref()
-                .expect("wal must exist")
-                .get_max_frame_in_wal()
-                > 0
-        );
+        assert!(pager.wal_max_frame().expect("wal must exist") > 0);
         let log_file = db.get_mvcc_store().get_logical_log_file();
         assert!(log_file.size().unwrap() > LOG_HDR_SIZE as u64);
     }
@@ -8272,11 +8255,10 @@ fn test_mvcc_read_tx_lifecycle() {
     conn.execute("SELECT * FROM t").unwrap();
 
     let pager = conn.pager.load();
-    let wal = pager.wal.as_ref().expect("wal should be enabled");
-    assert!(wal.holds_read_lock());
+    assert!(pager.holds_read_lock());
 
     conn.execute("COMMIT").unwrap();
-    assert!(!wal.holds_read_lock());
+    assert!(!pager.holds_read_lock());
 }
 
 /// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
@@ -8288,13 +8270,12 @@ fn test_mvcc_conn_drop_releases_read_tx() {
 
     conn.execute("CREATE TABLE t(x)").unwrap();
 
-    let pager = conn.pager.load();
+    let pager = conn.pager.load().clone();
     pager.begin_read_tx().unwrap();
-    let wal = pager.wal.as_ref().expect("wal should be enabled").clone();
-    assert!(wal.holds_read_lock());
+    assert!(pager.holds_read_lock());
 
     drop(conn);
-    assert!(!wal.holds_read_lock());
+    assert!(!pager.holds_read_lock());
 }
 
 /// What this test checks: The implementation maintains the intended invariant for this scenario.
