@@ -4465,6 +4465,8 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Passive publish drain: set for the brief in-memory publish window so new `begin_tx`
     /// calls contend out instead of pinning a lifetime checkpoint read guard.
     checkpoint_publish_in_progress: AtomicBool,
+    /// Set while VACUUM holds its stop-the-world gate. New transactions return `Busy`.
+    vacuum_gate_held: AtomicBool,
     /// Bumped when a passive checkpoint publishes physical btree roots into the shared schema.
     /// Open transactions compare their captured value and get [`LimboError::SchemaUpdated`].
     schema_generation: AtomicU64,
@@ -4678,6 +4680,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpoint_publish_in_progress: AtomicBool::new(false),
+            vacuum_gate_held: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
             checkpoint_full_scan_generation: AtomicU64::new(1),
@@ -4910,24 +4913,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Acquire MVCC's stop-the-world gate for VACUUM.
-    ///
-    /// This is the same lock used by MVCC checkpointing. All MVCC transactions
-    /// hold it in read mode for their whole lifetime, so acquiring it in write
-    /// mode proves there are no active MVCC transactions and prevents new ones
-    /// from starting until VACUUM releases it.
     pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
         if !self.blocking_checkpoint_lock.write() {
             return Err(LimboError::Busy);
         }
-        turso_assert!(
-            self.txs.is_empty(),
-            "MVCC vacuum gate acquired while transactions are still active"
-        );
+        let mut txs_empty = false;
+        self.clock.get_timestamp(|_| {
+            txs_empty = self.txs.is_empty();
+            if txs_empty {
+                self.vacuum_gate_held.store(true, Ordering::Release);
+            }
+        });
+        if !txs_empty {
+            self.blocking_checkpoint_lock.unlock();
+            return Err(LimboError::Busy);
+        }
         Ok(())
     }
 
     /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
     pub(crate) fn release_vacuum_gate(&self) {
+        self.vacuum_gate_held.store(false, Ordering::Release);
         self.blocking_checkpoint_lock.unlock();
     }
 
@@ -6546,7 +6552,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
             let mut schema_stale = false;
+            let mut vacuum_in_progress = false;
             let begin_ts = self.clock.get_timestamp(|ts| {
+                if self.vacuum_gate_held.load(Ordering::Acquire) {
+                    vacuum_in_progress = true;
+                    return;
+                }
                 let schema_generation = self.schema_generation();
                 if expected_schema_generation.is_some_and(|exp| exp != schema_generation) {
                     schema_stale = true;
@@ -6568,6 +6579,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ),
                 );
             });
+            if vacuum_in_progress {
+                unlock_checkpoint_guard();
+                return Err(LimboError::Busy);
+            }
             if schema_stale {
                 unlock_checkpoint_guard();
                 return Err(LimboError::SchemaUpdated);
@@ -6782,7 +6797,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
         let mut schema_change_unpublished = false;
+        let mut vacuum_in_progress = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
+            if self.vacuum_gate_held.load(Ordering::Acquire) {
+                vacuum_in_progress = true;
+                return;
+            }
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
             // same clock, so it cannot interleave between this capture and the insert.
@@ -6817,11 +6837,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 ),
             );
         });
-        if schema_stale || schema_change_unpublished {
+        if schema_stale || schema_change_unpublished || vacuum_in_progress {
             if !passive {
                 self.blocking_checkpoint_lock.unlock();
             }
-            if schema_change_unpublished {
+            if schema_change_unpublished || vacuum_in_progress {
                 return Err(LimboError::Busy);
             }
             return Err(LimboError::SchemaUpdated);

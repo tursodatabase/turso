@@ -6680,6 +6680,36 @@ fn test_mvcc_plain_vacuum_active_tx_returns_busy() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_mvcc_plain_vacuum_with_open_passive_reader_returns_busy() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder()
+        .with_mvcc(true)
+        .with_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true))
+        .build();
+    let vacuum_conn = tmp_db.connect_limbo();
+    vacuum_conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")?;
+    vacuum_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    vacuum_conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")?;
+    vacuum_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
+
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN CONCURRENT")?;
+    let expected_rows = vec![(1, "one".to_string()), (2, "two".to_string())];
+    let before: Vec<(i64, String)> = reader.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(before, expected_rows);
+
+    let result = vacuum_conn.execute("VACUUM");
+    assert!(matches!(result, Err(LimboError::Busy)), "{result:?}");
+    let after: Vec<(i64, String)> = reader.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(after, expected_rows);
+    reader.execute("COMMIT")?;
+
+    vacuum_conn.execute("VACUUM")?;
+    let after_vacuum: Vec<(i64, String)> = vacuum_conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(after_vacuum, expected_rows);
+    Ok(())
+}
+
 fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>> {
     Ok(Database::open_file_with_flags(
         io,
