@@ -2807,10 +2807,8 @@ impl MappedSharedWalCoordination {
             }
             let local_index = local_plus_one as u32 - 1;
             if local_index >= visible_entries {
-                // In a linear-probing hash table, an entry beyond visible_entries
-                // does not terminate the probe chain — valid entries may follow.
-                // (A writer may have built the hash with more entries than this
-                // reader's snapshot makes visible.)
+                // Not visible to this reader, but the probe chain goes on.
+                slot = (slot + 1) % FRAME_INDEX_BLOCK_HASH_SLOTS as usize;
                 continue;
             }
             let entry = unsafe { *mapping.entries_ptr.as_ptr().add(local_index as usize) };
