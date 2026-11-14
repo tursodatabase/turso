@@ -36,7 +36,7 @@ impl<'a> ImportFile<'a> {
     pub fn import_csv(&mut self, args: ImportArgs) {
         // Check if the target table exists
         let table_check_query = format!(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='{}';",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='{}' COLLATE NOCASE;",
             args.table
         );
 

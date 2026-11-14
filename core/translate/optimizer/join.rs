@@ -3184,6 +3184,7 @@ mod tests {
         let mut available_indexes = AvailableIndexes::default();
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
+            declared_name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new(
@@ -3282,6 +3283,7 @@ mod tests {
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
+            declared_name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new(
@@ -3425,7 +3427,8 @@ mod tests {
                 // add primary key index called sqlite_autoindex_<tablename>_1
                 let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
-                    name: index_name,
+                    name: index_name.clone(),
+                    declared_name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
                     columns: crate::alloc::vec![IndexColumn::new(
@@ -3449,6 +3452,7 @@ mod tests {
             });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
+            declared_name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new(
@@ -3466,6 +3470,7 @@ mod tests {
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
+            declared_name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new(
@@ -3981,6 +3986,7 @@ mod tests {
         // Create a two-column index on (x,y)
         let index = Arc::new(Index {
             name: "idx_xy".to_string(),
+            declared_name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
@@ -4086,6 +4092,7 @@ mod tests {
         let table = _create_btree_table("t1", columns);
         let index = Arc::new(Index {
             name: "idx1".to_string(),
+            declared_name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
@@ -4210,6 +4217,7 @@ mod tests {
         let table = _create_btree_table("t1", columns);
         let index = Arc::new(Index {
             name: "idx1".to_string(),
+            declared_name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
             columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
@@ -4396,6 +4404,7 @@ mod tests {
     ) -> Arc<Index> {
         Arc::new(Index {
             name: name.to_string(),
+            declared_name: name.to_string(),
             table_name: table_name.to_string(),
             where_clause: None,
             columns: columns
@@ -4555,6 +4564,7 @@ mod tests {
         let mut available_indexes = AvailableIndexes::default();
         let index_t2_a = Arc::new(Index {
             name: "idx_t2_a".to_string(),
+            declared_name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![IndexColumn::new(

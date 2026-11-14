@@ -114,6 +114,7 @@ pub fn create_dbsp_state_index(
     }
     Ok(Index {
         name: "dbsp_state_pk".to_string(),
+        declared_name: "dbsp_state_pk".to_string(),
         table_name: state_table.name.clone(),
         root_page,
         columns,

@@ -101,6 +101,7 @@ pub(crate) fn emit_recursive_cte(
 
     let queue_index = Arc::new(Index {
         name: format!("recursive-queue-{}", recursive_cte.name),
+        declared_name: format!("recursive-queue-{}", recursive_cte.name),
         table_name: String::new(),
         root_page: 0,
         columns: queue_index_columns,
@@ -139,6 +140,7 @@ pub(crate) fn emit_recursive_cte(
         }
         let seen_row_index = Arc::new(Index {
             name: format!("recursive-distinct-{}", recursive_cte.name),
+            declared_name: format!("recursive-distinct-{}", recursive_cte.name),
             table_name: String::new(),
             root_page: 0,
             columns: seen_row_index_columns,

@@ -2022,7 +2022,7 @@ impl Schema {
 
     pub fn trigger_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Trigger>> {
         self.triggers_mut(namespace)
-            .find(|trigger| trigger.name == name)
+            .find(|trigger| trigger.name.eq_ignore_ascii_case(name))
     }
 
     /// Takes every trigger of `table_name` out of the namespace.
@@ -3049,11 +3049,12 @@ impl Schema {
     ) -> Option<Arc<Trigger>> {
         let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
-        let name = normalize_ident(name);
-        objects
-            .triggers
-            .get(&table_name)
-            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+        objects.triggers.get(&table_name).and_then(|triggers| {
+            triggers
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(name))
+                .cloned()
+        })
     }
 
     pub fn get_triggers_for_table(
@@ -3071,12 +3072,11 @@ impl Schema {
 
     pub fn get_trigger(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Trigger>> {
         let objects = self.namespace(namespace);
-        let name = normalize_ident(name);
         objects
             .triggers
             .values()
             .flatten()
-            .find(|t| t.name == name)
+            .find(|t| t.name.eq_ignore_ascii_case(name))
             .cloned()
     }
 
@@ -3674,6 +3674,7 @@ impl Schema {
             )?;
             let index_name = self.demangle_name(&index.name).1.to_string();
             index.name = index_name;
+            index.declared_name = self.demangle_name(&index.declared_name).1.to_string();
             index.table_name.clone_from(&table.name);
             self.add_index(namespace, Arc::new(index))?;
         }
@@ -5074,6 +5075,7 @@ impl TryClone for Index {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             table_name: self.table_name.clone(),
             root_page: self.root_page,
             columns: self.columns.try_clone()?,
@@ -8636,6 +8638,8 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
 #[derive(Debug, Clone)]
 pub struct Index {
     pub name: String,
+    /// The name as written in `sqlite_schema`; `name` is its lowercased form.
+    pub declared_name: String,
     pub table_name: String,
     pub root_page: i64,
     pub columns: Vec<IndexColumn>,
@@ -8808,6 +8812,7 @@ impl Index {
                     let descriptor = module.attach(&configuration)?;
                     Ok(Index {
                         name: index_name,
+                        declared_name: idx_name.name.as_str().to_string(),
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
                         columns: index_columns,
@@ -8822,6 +8827,7 @@ impl Index {
                 } else {
                     Ok(Index {
                         name: index_name,
+                        declared_name: idx_name.name.as_str().to_string(),
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
                         columns: index_columns,
@@ -8898,6 +8904,7 @@ impl Index {
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
+            declared_name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: primary_keys,
@@ -8952,6 +8959,7 @@ impl Index {
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
+            declared_name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: unique_cols,

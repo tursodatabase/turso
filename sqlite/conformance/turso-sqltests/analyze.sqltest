@@ -11,7 +11,7 @@ test analyze-replaces-legacy-mixed-case-table-statistics {
     SELECT * FROM sqlite_stat1;
 }
 expect {
-    myt|i|3 1
+    MyT|i|3 1
 }
 
 # Things that do work:

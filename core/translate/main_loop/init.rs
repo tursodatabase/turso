@@ -610,6 +610,7 @@ fn right_join_metadata(
     let key_len = key_columns.len();
     let matched_rows_index = Arc::new(Index {
         name: format!("right_join_matches_{}", usize::from(table.internal_id)),
+        declared_name: format!("right_join_matches_{}", usize::from(table.internal_id)),
         table_name: table.table.get_name().to_string(),
         root_page: 0,
         columns: key_columns,
