@@ -1455,7 +1455,7 @@ test cmp-time-with-invalid-text-is-an-error {
     SELECT count(*) FROM t WHERE tm < 'garbage';
 }
 expect error {
-    invalid time value
+    invalid input syntax for type time
 }
 
 @requires strict "uses STRICT tables"
@@ -1680,7 +1680,7 @@ test cmp-time-row-value-with-invalid-text-is-an-error {
     SELECT count(*) FROM t WHERE (tm, id) = ('garbage', 1);
 }
 expect error {
-    invalid time value
+    invalid input syntax for type time
 }
 
 @requires strict "uses STRICT tables"

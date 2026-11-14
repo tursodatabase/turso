@@ -252,6 +252,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
+        LimboError::DatetimeFieldOverflow(_) => SQLSTATE_DATETIME_FIELD_OVERFLOW,
         LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
         LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {
@@ -416,9 +417,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg == "invalid date value" || msg == "invalid timestamp value" {
-        SQLSTATE_INVALID_DATETIME_FORMAT
-    } else if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if msg == "integer out of range for smallint" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
