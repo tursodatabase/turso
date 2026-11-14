@@ -1266,3 +1266,106 @@ fn reopen_after_wal_lost_frames(file_name: &str, mark_overflowed: bool, keep_fir
     assert_eq!(wal_max_frame(&conn_b), expected_frames);
     assert_eq!(read_header(&conn_b), expected_header);
 }
+
+const MULTIPROCESS_DEAD_WRITER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_dead_writer_child_process";
+
+/// Child roles for `new_writer_after_killed_writer_with_uncommitted_frames_commits`.
+/// `spill` appends uncommitted frames (the page cache spills them to the WAL),
+/// reports readiness and waits until the parent terminates it. `commit` is the
+/// next writer: one write transaction that must commit.
+#[test]
+fn multiprocess_dead_writer_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let role = std::env::var("TURSO_MULTIPROCESS_ROLE").unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    match role.as_str() {
+        "spill" => {
+            let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap();
+            let pager = conn.pager.load();
+            pager.begin_read_tx().unwrap();
+            pager
+                .io
+                .block(|| pager.begin_write_tx(conn.wal_auto_actions()))
+                .unwrap();
+            // More new pages than the page cache holds, so it spills dirty
+            // pages to the WAL before any commit.
+            for _ in 0..8000 {
+                pager.io.block(|| pager.allocate_page()).unwrap();
+            }
+            std::fs::write(&ready_file, b"ready").unwrap();
+            // Never released: the parent terminates this process.
+            wait_for_file(&ready_file.with_extension("never"));
+        }
+        "commit" => commit_new_pages(&conn, 1),
+        other => panic!("unknown role {other}"),
+    }
+}
+
+/// A writer terminated after its page cache spilled uncommitted frames leaves
+/// their entries in the shared frame index, above the published max_frame. The
+/// next writer must discard them instead of tripping the monotonic-frame assert.
+#[test]
+fn new_writer_after_killed_writer_with_uncommitted_frames_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("mp-dead-writer.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("spilled");
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    commit_new_pages(&conn, 1);
+    let header_before = read_header(&conn);
+    let wal_len_before = std::fs::metadata(format!("{db_path_str}-wal"))
+        .unwrap()
+        .len();
+
+    let spawn = |role: &str| {
+        Command::new(std::env::current_exe().unwrap())
+            .arg(MULTIPROCESS_DEAD_WRITER_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_MULTIPROCESS_DB_PATH", &db_path)
+            .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+            .env("TURSO_MULTIPROCESS_ROLE", role)
+            .spawn()
+            .unwrap()
+    };
+
+    let mut victim = spawn("spill");
+    wait_for_file(&ready_file);
+    victim.kill().unwrap();
+    let status = victim.wait().unwrap();
+    #[cfg(unix)]
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+    #[cfg(not(unix))]
+    assert!(!status.success());
+    let wal_len_after = std::fs::metadata(format!("{db_path_str}-wal"))
+        .unwrap()
+        .len();
+    assert!(
+        wal_len_after > wal_len_before,
+        "precondition: the terminated writer must have appended uncommitted frames"
+    );
+
+    let status = spawn("commit").wait().unwrap();
+    assert!(status.success(), "next writer failed: {status:?}");
+    // The next writer's page is the only growth: none of the terminated
+    // writer's pages became visible.
+    assert_eq!(
+        read_header(&conn),
+        (header_before.0 + 1, header_before.1),
+        "database size and user version after the next writer"
+    );
+}
