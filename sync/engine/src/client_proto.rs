@@ -28,6 +28,9 @@ pub enum LogicalSchemaAction {
     Refresh = 3,
     /// Replay an ALTER statement exactly as supplied by the server.
     Alter = 4,
+    RenameTable = 5,
+    RenameTableToTemporaryName = 6,
+    RenameTemporaryTable = 7,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
