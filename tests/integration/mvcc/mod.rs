@@ -1,3 +1,6 @@
+mod checkpoint;
+mod test_db;
+
 use crate::common::{ExecRows, TempDatabase};
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;

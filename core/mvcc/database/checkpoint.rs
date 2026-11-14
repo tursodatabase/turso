@@ -40,7 +40,9 @@ use std::ops::Bound;
 use strum::EnumCount;
 
 use super::lookup_tx_state;
-const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
+/// A checkpoint step that walks rows yields after it has visited this many, so that a large
+/// store does not keep the caller from doing other work.
+pub const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 macro_rules! with_mvcc_checkpoint_allocation_site {
     ($site:ident, $expr:expr) => {{
@@ -227,7 +229,7 @@ pub enum CheckpointState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CheckpointYieldPoint {
+pub enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
@@ -1005,17 +1007,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn state_for_test(&self) -> CheckpointState {
+    /// The step the checkpoint is at.
+    pub fn state(&self) -> CheckpointState {
         self.state
     }
 
-    #[cfg(test)]
-    pub(crate) fn checkpoint_bounds_for_test(&self) -> (Option<u64>, u64) {
+    /// The commit timestamps this checkpoint covers: the highest one an earlier checkpoint
+    /// wrote, if any, and the highest one this checkpoint writes.
+    pub fn bounds(&self) -> (Option<u64>, u64) {
         (
             self.durable_txid_max_old.map(u64::from),
             self.durable_txid_max_new,
         )
+    }
+
+    /// The table rows this checkpoint has chosen so far to write to the database file.
+    /// A version with an end timestamp is written as a delete.
+    pub fn collected_table_rows(&self) -> impl Iterator<Item = (&RowID, &RowVersion)> {
+        self.write_set
+            .iter()
+            .map(|(row_id, version, _)| (row_id, version))
+    }
+
+    /// The index rows this checkpoint has chosen so far to write to the database file.
+    /// The table id of each `RowID` is the index id.
+    pub fn collected_index_rows(&self) -> impl Iterator<Item = (&RowID, &RowVersion)> {
+        self.index_write_set
+            .iter()
+            .map(|(row_id, version, _)| (row_id, version))
+    }
+
+    /// Whether this checkpoint has found that `table_id` was dropped.
+    pub fn collected_table_drop(&self, table_id: MVTableId) -> bool {
+        self.destroyed_tables.contains(&table_id)
     }
 
     /// Drop checkpoint locks. Call only after `on_checkpoint_end`.
@@ -1080,117 +1104,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         versions: &[RowVersion],
         table_id: MVTableId,
     ) -> smallvec::SmallVec<[RowVersion; 1]> {
-        let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
-            smallvec::SmallVec::with_capacity(1);
-        let mut exists_in_db_file = false;
-        // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
-        for version in versions.iter() {
-            // A row is in the database file if:
-            // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
-            // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
-            // Resolve in-flight TxID begin/end markers to the owning tx's true state
-            // (concurrent collection may not have rewritten the chain to a Timestamp yet).
-            // Only a Committed tx contributes a timestamp; others resolve to None.
-            let begin_ts = self.committed_ts(version.begin());
-            let mut end_ts = self.committed_ts(version.end());
-            // Insert not visible at our snapshot (committed during the collection
-            // phase): defer to the next pass and don't let it affect DB-file existence now.
-            if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
-                continue;
-            }
-            // Tombstone committed after our snapshot: clamp to "live" (end=None) so the
-            // row is checkpointed as PRESENT, not stranded; a later pass (delete <=
-            // snapshot) checkpoints the deletion. Fixes the future-tombstone orphan bug.
-            let future_committed_tombstone = end_ts.is_some_and(|e| e > self.snapshot_ts);
-            if future_committed_tombstone {
-                end_ts = None;
-            }
-            if begin_ts.is_none() && end_ts.is_none() {
-                // Rolled-back garbage and active TxID-only placeholders are not part of
-                // the durable row history, so they must not influence DB-file existence.
-                continue;
-            }
-            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
-            // This also applies to synthetic tombstones that use begin=None.
-            if version.btree_resident {
-                exists_in_db_file = true;
-            }
-            // A row exists in the DB file if it was checkpointed in a previous checkpoint.
-            // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
-            // These timestamp-derived transitions must run after the btree_resident seed so a
-            // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
-            if self
-                .durable_txid_max_old
-                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
-            {
-                exists_in_db_file = true;
-            }
-            if self
-                .durable_txid_max_old
-                .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
-            {
-                exists_in_db_file = false;
-            }
-            // Should checkpoint the newest version if:
-            // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
-            // We need the `self.durable_txid_max_old.is_none()` check because before
-            // the first checkpoint there is no persisted MVCC watermark.
-            let is_uncheckpointed_insert = end_ts.is_none()
-                && self.durable_txid_max_old.is_none_or(|txid_max_old| {
-                    begin_ts.is_some_and(|b| b > u64::from(txid_max_old))
-                });
-            // - It is a delete, AND some version of the row exists in the database file.
-            let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
-            // - It is a delete of an uncheckpointed sqlite_schema row for a
-            //   table or index. The schema row itself is not in the DB file, but
-            //   checkpoint still needs it so it can remember that the table or
-            //   index was destroyed and skip that object's data/index rows.
-            //   Views and triggers have rootpage=0, so their uncheckpointed
-            //   deletes can be ignored here: there is no B-tree to destroy, and
-            //   deleting a missing sqlite_schema row would be wrong.
-            let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                && !exists_in_db_file
-                && sqlite_schema_btree_identity(table_id, version).is_some()
-                && self
-                    .durable_txid_max_old
-                    .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
-            let should_checkpoint =
-                is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
-            if should_checkpoint {
-                // Future tombstone: push a clamped clone so the B-tree write sees a live insert.
-                let checkpoint_version = if future_committed_tombstone {
-                    let mut v = version.clone();
-                    v.set_end(None);
-                    v
-                } else {
-                    let mut version = version.clone();
-                    // Normalize the clone's end to the resolved end_ts so downstream
-                    // is_delete is consistent (in-flight/aborted end -> live insert).
-                    version.set_end(end_ts.map(TxTimestampOrID::Timestamp));
-                    version
-                };
-                if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    if versions_to_checkpoint.is_empty() {
-                        versions_to_checkpoint.push(checkpoint_version)
-                    } else {
-                        versions_to_checkpoint[0] = checkpoint_version
-                    }
-                    continue;
-                }
-
-                if let Some(previous_version) = versions_to_checkpoint.last() {
-                    let should_drop_previous = previous_version.end().is_some()
-                        && !is_schema_metadata_only_rewrite(previous_version, Some(version));
-                    if should_drop_previous {
-                        versions_to_checkpoint.pop();
-                    }
-                }
-
-                versions_to_checkpoint.push(checkpoint_version);
-            }
-        }
-
-        versions_to_checkpoint
+        checkpointable_versions(
+            versions,
+            table_id,
+            self.durable_txid_max_old,
+            self.snapshot_ts,
+            |ts_or_id| self.committed_ts(ts_or_id),
+        )
     }
 
     /// Resolve the table/index id whose B-tree binding owned `root_page` at the moment of the
@@ -3555,6 +3475,128 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 }
 
+/// Returns the versions of one row that a checkpoint has to write to the database file.
+///
+/// `versions` is the row's version chain from oldest to newest. `durable_txid_max_old` is the
+/// highest commit timestamp an earlier checkpoint already wrote, and `snapshot_ts` is the highest
+/// commit timestamp this checkpoint writes. `committed_ts` gives the commit timestamp of a begin
+/// or end marker, or `None` if its transaction has not committed.
+fn checkpointable_versions(
+    versions: &[RowVersion],
+    table_id: MVTableId,
+    durable_txid_max_old: Option<NonZeroU64>,
+    snapshot_ts: u64,
+    committed_ts: impl Fn(Option<TxTimestampOrID>) -> Option<u64>,
+) -> smallvec::SmallVec<[RowVersion; 1]> {
+    let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
+        smallvec::SmallVec::with_capacity(1);
+    let mut exists_in_db_file = false;
+    // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
+    for version in versions.iter() {
+        // A row is in the database file if:
+        // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
+        // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
+        // Resolve in-flight TxID begin/end markers to the owning tx's true state
+        // (concurrent collection may not have rewritten the chain to a Timestamp yet).
+        // Only a Committed tx contributes a timestamp; others resolve to None.
+        let begin_ts = committed_ts(version.begin());
+        let mut end_ts = committed_ts(version.end());
+        // Insert not visible at our snapshot (committed during the collection
+        // phase): defer to the next pass and don't let it affect DB-file existence now.
+        if begin_ts.is_some_and(|b| b > snapshot_ts) {
+            continue;
+        }
+        // Tombstone committed after our snapshot: clamp to "live" (end=None) so the
+        // row is checkpointed as PRESENT, not stranded; a later pass (delete <=
+        // snapshot) checkpoints the deletion. Fixes the future-tombstone orphan bug.
+        let future_committed_tombstone = end_ts.is_some_and(|e| e > snapshot_ts);
+        if future_committed_tombstone {
+            end_ts = None;
+        }
+        if begin_ts.is_none() && end_ts.is_none() {
+            // Rolled-back garbage and active TxID-only placeholders are not part of
+            // the durable row history, so they must not influence DB-file existence.
+            continue;
+        }
+        // Rows marked btree_resident existed in the DB file before MVCC tracked them.
+        // This also applies to synthetic tombstones that use begin=None.
+        if version.btree_resident {
+            exists_in_db_file = true;
+        }
+        // A row exists in the DB file if it was checkpointed in a previous checkpoint.
+        // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
+        // These timestamp-derived transitions must run after the btree_resident seed so a
+        // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
+        if durable_txid_max_old
+            .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
+        {
+            exists_in_db_file = true;
+        }
+        if durable_txid_max_old
+            .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
+        {
+            exists_in_db_file = false;
+        }
+        // Should checkpoint the newest version if:
+        // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
+        // We need the `durable_txid_max_old.is_none()` check because before
+        // the first checkpoint there is no persisted MVCC watermark.
+        let is_uncheckpointed_insert = end_ts.is_none()
+            && durable_txid_max_old
+                .is_none_or(|txid_max_old| begin_ts.is_some_and(|b| b > u64::from(txid_max_old)));
+        // - It is a delete, AND some version of the row exists in the database file.
+        let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
+        // - It is a delete of an uncheckpointed sqlite_schema row for a
+        //   table or index. The schema row itself is not in the DB file, but
+        //   checkpoint still needs it so it can remember that the table or
+        //   index was destroyed and skip that object's data/index rows.
+        //   Views and triggers have rootpage=0, so their uncheckpointed
+        //   deletes can be ignored here: there is no B-tree to destroy, and
+        //   deleting a missing sqlite_schema row would be wrong.
+        let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+            && !exists_in_db_file
+            && sqlite_schema_btree_identity(table_id, version).is_some()
+            && durable_txid_max_old
+                .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
+        let should_checkpoint =
+            is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
+        if should_checkpoint {
+            // Future tombstone: push a clamped clone so the B-tree write sees a live insert.
+            let checkpoint_version = if future_committed_tombstone {
+                let mut v = version.clone();
+                v.set_end(None);
+                v
+            } else {
+                let mut version = version.clone();
+                // Normalize the clone's end to the resolved end_ts so downstream
+                // is_delete is consistent (in-flight/aborted end -> live insert).
+                version.set_end(end_ts.map(TxTimestampOrID::Timestamp));
+                version
+            };
+            if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                if versions_to_checkpoint.is_empty() {
+                    versions_to_checkpoint.push(checkpoint_version)
+                } else {
+                    versions_to_checkpoint[0] = checkpoint_version
+                }
+                continue;
+            }
+
+            if let Some(previous_version) = versions_to_checkpoint.last() {
+                let should_drop_previous = previous_version.end().is_some()
+                    && !is_schema_metadata_only_rewrite(previous_version, Some(version));
+                if should_drop_previous {
+                    versions_to_checkpoint.pop();
+                }
+            }
+
+            versions_to_checkpoint.push(checkpoint_version);
+        }
+    }
+
+    versions_to_checkpoint
+}
+
 struct CollectEntry<'a, 'g, K, V, C, A: SkiplistAllocator> {
     entry: Option<RefEntry<'a, K, V, C, A>>,
     guard: &'g epoch::Guard,
@@ -4110,53 +4152,6 @@ mod tests {
         (key_arc, row_version)
     }
 
-    #[test]
-    fn checkpoint_retry_does_not_replay_checkpointed_btree_resident_delete() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore.clone(),
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-        checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
-        checkpoint.durable_txid_max_new = 10;
-
-        let index_id = MVTableId::from(-42);
-        let (garbage_key, garbage_version) =
-            index_row_version("blue_river_906", 75, 1, None, None, true);
-        let (_, tombstone_version) =
-            index_row_version("blue_river_906", 75, 2, None, Some(10), true);
-
-        insert_dirty_index_version(&mvstore, index_id, garbage_key, garbage_version);
-        let entry = mvstore
-            .index_rows
-            .get(&index_id)
-            .expect("index entry should exist after first insert");
-        let tombstone_key = entry
-            .value()
-            .front()
-            .expect("key bucket should exist after first insert")
-            .key()
-            .clone();
-        insert_dirty_index_version(&mvstore, index_id, tombstone_key, tombstone_version);
-
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-
-        assert!(
-            checkpoint.index_write_set.is_empty(),
-            "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
-        );
-    }
-
     fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> (RowID, RowVersion) {
         table_row_version(table_id, rowid, 1, Some(5), None, false)
     }
@@ -4206,13 +4201,11 @@ mod tests {
 
     #[test]
     fn checkpoint_collection_uses_btree_marker_for_existence_but_writes_surviving_replacement() {
-        let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, replacement) = table_row_version(table_id, 1, 2, Some(5), None, false);
 
-        let checkpointable =
-            checkpoint.maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id);
+        let checkpointable = versions_to_write(&[btree_tombstone, replacement], table_id, 2);
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4221,13 +4214,12 @@ mod tests {
 
     #[test]
     fn checkpoint_collection_uses_btree_marker_for_later_delete_of_replacement() {
-        let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable = checkpoint
-            .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id);
+        let checkpointable =
+            versions_to_write(&[btree_tombstone, deleted_replacement], table_id, 2);
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4236,51 +4228,46 @@ mod tests {
 
     #[test]
     fn checkpoint_collection_skips_delete_of_never_checkpointed_replacement_without_btree_marker() {
-        let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable =
-            checkpoint.maybe_get_checkpointable_versions(&[deleted_replacement], table_id);
+        let checkpointable = versions_to_write(&[deleted_replacement], table_id, 2);
 
         assert!(checkpointable.is_empty());
     }
 
     #[test]
-    fn collect_table_rows_preempts_on_large_scan() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore.clone(),
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
+    fn retry_checkpoint_does_not_replay_checkpointed_btree_resident_delete() {
+        let index_id = MVTableId::from(-42);
+        let (_, garbage_version) = index_row_version("blue_river_906", 75, 1, None, None, true);
+        let (_, tombstone_version) =
+            index_row_version("blue_river_906", 75, 2, None, Some(10), true);
 
-        let table_id = MVTableId::from(-2);
-        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for i in 0..row_count as i64 {
-            insert_row_version(&mvstore, committed_table_row_version(table_id, i));
-        }
+        let to_write = versions_to_write(&[garbage_version, tombstone_version], index_id, 10);
 
-        // The first chunk fills up before the scan finishes, so it must yield.
-        let first = checkpoint.collect_table_rows().unwrap();
         assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "scanning more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
+            to_write.is_empty(),
+            "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
         );
+    }
 
-        // Resume from the cursor until the scan finishes; every row must still
-        // be collected exactly once across the chunks.
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        assert_eq!(checkpoint.write_set.len(), row_count);
+    /// The versions a checkpoint writes when an earlier checkpoint wrote everything up to
+    /// `last_checkpoint_ts`.
+    fn versions_to_write(
+        versions: &[RowVersion],
+        table_id: MVTableId,
+        last_checkpoint_ts: u64,
+    ) -> smallvec::SmallVec<[RowVersion; 1]> {
+        checkpointable_versions(
+            versions,
+            table_id,
+            NonZeroU64::new(last_checkpoint_ts),
+            u64::MAX,
+            |marker| match marker {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+                _ => None,
+            },
+        )
     }
 
     fn insert_row_version(
@@ -4328,334 +4315,6 @@ mod tests {
         mvstore.rows.insert(key, Arc::new(RwLock::new(versions)));
     }
 
-    fn insert_dirty_index_version(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        index_id: MVTableId,
-        key: Arc<SortableIndexKey>,
-        version: RowVersion,
-    ) {
-        let stamp = version_stamp(&version);
-        let (key, _, _) = mvstore
-            .insert_index_version(index_id, key, version)
-            .unwrap();
-        mvstore
-            .mark_checkpoint_dirty_key(&RowID::new(index_id, RowKey::Record(key)), stamp)
-            .unwrap();
-    }
-
-    #[test]
-    fn collect_table_rows_skips_user_keys_after_schema_drop() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let dropped = MVTableId::from(-2);
-        let kept = MVTableId::from(-3);
-        insert_row_version(
-            &mvstore,
-            (
-                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
-                sqlite_schema_row_version(2, "table", "t", "t", -2, Some(5), Some(6)),
-            ),
-        );
-        insert_row_version(&mvstore, committed_table_row_version(dropped, 1));
-        insert_row_version(&mvstore, committed_table_row_version(dropped, 2));
-        insert_row_version(&mvstore, committed_table_row_version(kept, 1));
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-
-        assert!(
-            checkpoint.destroyed_tables.contains(&dropped),
-            "schema DROP must mark the table before user keys are visited"
-        );
-        assert!(
-            checkpoint
-                .write_set
-                .iter()
-                .all(|(row_id, _, _)| row_id.table_id != dropped),
-            "user rows of a table dropped in the schema pass must not enter write_set"
-        );
-        assert!(
-            checkpoint
-                .write_set
-                .iter()
-                .any(|(row_id, _, _)| row_id.table_id == kept),
-            "rows of a table that was not dropped must still be collected"
-        );
-    }
-
-    #[test]
-    fn collect_table_rows_yields_in_schema_pass() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        let schema_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for i in 0..schema_count as i64 {
-            insert_row_version(
-                &mvstore,
-                (
-                    RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(i + 1)),
-                    sqlite_schema_row_version(i + 1, "table", "t", "t", -2, Some(5), None),
-                ),
-            );
-        }
-        insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
-
-        let first = checkpoint.collect_table_rows().unwrap();
-        assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "a schema pass larger than COLLECT_PREEMPTION_THRESHOLD must yield"
-        );
-        assert_eq!(checkpoint.collect_table_phase, CollectTablePhase::Schema);
-        assert_eq!(
-            checkpoint
-                .collect_table_cursor
-                .last_visited
-                .as_ref()
-                .map(|key| key.table_id),
-            Some(SQLITE_SCHEMA_MVCC_TABLE_ID)
-        );
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        assert!(
-            checkpoint
-                .write_set
-                .iter()
-                .any(|(row_id, _, _)| row_id.table_id == table_id),
-            "user rows after a schema-pass yield must still be collected"
-        );
-    }
-
-    #[test]
-    fn collect_table_rows_yields_in_user_pass() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        insert_row_version(
-            &mvstore,
-            (
-                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
-                sqlite_schema_row_version(2, "table", "t", "t", -2, Some(5), None),
-            ),
-        );
-        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for i in 0..row_count as i64 {
-            insert_row_version(&mvstore, committed_table_row_version(table_id, i));
-        }
-
-        let first = checkpoint.collect_table_rows().unwrap();
-        assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "a user pass larger than COLLECT_PREEMPTION_THRESHOLD must yield"
-        );
-        assert_eq!(checkpoint.collect_table_phase, CollectTablePhase::User);
-        assert_eq!(
-            checkpoint
-                .collect_table_cursor
-                .last_visited
-                .as_ref()
-                .map(|key| key.table_id),
-            Some(table_id)
-        );
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        assert_eq!(
-            checkpoint
-                .write_set
-                .iter()
-                .filter(|(row_id, _, _)| row_id.table_id == table_id)
-                .count(),
-            row_count
-        );
-    }
-
-    #[test]
-    fn collect_index_rows_preempts_on_large_scan() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore.clone(),
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-
-        let index_id = MVTableId::from(-7);
-        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for i in 0..row_count as i64 {
-            let (key, version) = index_row_version("k", i, 1, Some(5), None, false);
-            insert_dirty_index_version(&mvstore, index_id, key, version);
-        }
-
-        let first = checkpoint.collect_index_rows().unwrap();
-        assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "scanning more than COLLECT_PREEMPTION_THRESHOLD index rows must preempt with an explicit yield"
-        );
-
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-        assert_eq!(checkpoint.index_write_set.len(), row_count);
-    }
-
-    #[test]
-    fn gc_checkpointed_table_versions_preempts_on_large_scan() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore.clone(),
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-        checkpoint.lock_states.blocking_checkpoint_lock_held = true;
-        checkpoint.durable_txid_max_new = 5;
-
-        let table_id = MVTableId::from(-2);
-        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for i in 0..row_count as i64 {
-            let (row_id, version) = committed_table_row_version(table_id, i);
-            let mut versions =
-                <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
-                    RowVersion,
-                    crate::alloc::DynAllocator,
-                >>::new_in(crate::alloc::DynAllocator::default());
-            versions.push(version.clone());
-            mvstore
-                .rows
-                .insert(row_id.clone(), Arc::new(RwLock::new(versions)));
-            checkpoint.write_set.push((row_id, version, None));
-            checkpoint.written_table_rowids.insert((table_id, i));
-        }
-        // The real run publishes `backfill_floor` from the checkpointed WAL right
-        // before entering `GcTableRows`. Rule 3 needs every reader mark to have
-        // reached the stamp, and `gc_floor_reader_mark` is clamped by this floor,
-        // so a fixture that jumps straight into the state must publish it too.
-        *mvstore.backfill_floor.write() = WalPos::from_pair(checkpoint.pager.wal_pos());
-        checkpoint.state = CheckpointState::GcTableRows {
-            next_index: 0,
-            lwm: u64::MAX,
-        };
-
-        let first = checkpoint.gc_checkpointed_table_versions();
-        assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "GCing more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
-        );
-
-        while checkpoint.gc_checkpointed_table_versions().is_some() {}
-        // Write-set GC clears version chains but leaves empty SkipMap slots;
-        // Truncate Finalize `_and_slots` unlinks them.
-        let slots = mvstore
-            .rows
-            .iter()
-            .filter(|entry| entry.key().table_id == table_id)
-            .count();
-        let versions: usize = mvstore
-            .rows
-            .iter()
-            .filter(|entry| entry.key().table_id == table_id)
-            .map(|entry| entry.value().read().len())
-            .sum();
-        assert_eq!(versions, 0, "write-set GC must reclaim version chains");
-        assert_eq!(
-            slots, row_count,
-            "empty slots remain until Finalize `_and_slots`"
-        );
-        mvstore.drop_unused_row_versions_and_slots();
-        let remaining = mvstore
-            .rows
-            .iter()
-            .filter(|entry| entry.key().table_id == table_id)
-            .count();
-        assert_eq!(remaining, 0);
-    }
-
-    #[test]
-    fn gc_checkpointed_index_versions_preempts_on_large_scan() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore.clone(),
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-        checkpoint.lock_states.blocking_checkpoint_lock_held = true;
-        checkpoint.durable_txid_max_new = 5;
-
-        let index_id = MVTableId::from(-7);
-        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for i in 0..row_count as i64 {
-            let (key, version) = index_row_version("k", i, 1, Some(5), None, false);
-            let row_id = RowID::new(index_id, RowKey::Record(key.clone()));
-            insert_dirty_index_version(&mvstore, index_id, key, version.clone());
-            checkpoint.index_write_set.push((row_id, version, false));
-            checkpoint.written_index_slots.insert(i as usize);
-        }
-        // See the table variant: publish the floor the real `GcIndexRows` entry
-        // would have published, or Rule 3 keeps every stamped current.
-        *mvstore.backfill_floor.write() = WalPos::from_pair(checkpoint.pager.wal_pos());
-        checkpoint.state = CheckpointState::GcIndexRows {
-            next_index: 0,
-            lwm: u64::MAX,
-        };
-
-        let first = checkpoint.gc_checkpointed_index_versions();
-        assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "GCing more than COLLECT_PREEMPTION_THRESHOLD index rows must preempt with an explicit yield"
-        );
-
-        while checkpoint.gc_checkpointed_index_versions().is_some() {}
-        // Write-set GC clears version chains but leaves empty SkipMap slots;
-        // Truncate Finalize `_and_slots` unlinks them.
-        let inner = mvstore
-            .index_rows
-            .get(&index_id)
-            .expect("index map must exist");
-        let slots = inner.value().len();
-        let versions: usize = inner
-            .value()
-            .iter()
-            .map(|entry| entry.value().read().len())
-            .sum();
-        assert_eq!(
-            versions, 0,
-            "write-set GC must reclaim index version chains"
-        );
-        assert_eq!(
-            slots, row_count,
-            "empty index slots remain until Finalize `_and_slots`"
-        );
-        mvstore.drop_unused_row_versions_and_slots();
-        let remaining = mvstore
-            .index_rows
-            .get(&index_id)
-            .map_or(0, |entry| entry.value().len());
-        assert_eq!(remaining, 0);
-    }
-
     fn dirty_table_key(
         mvstore: &crate::sync::Arc<
             MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
@@ -4666,49 +4325,6 @@ mod tests {
         mvstore
             .checkpoint_dirty_table_keys
             .contains_key(&RowID::new(table_id, RowKey::Int(rowid)))
-    }
-
-    #[test]
-    fn collect_table_rows_visits_only_dirty_keys() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        for rowid in 1..=10 {
-            insert_clean_row_version(
-                &mvstore,
-                table_row_version(table_id, rowid, 1, Some(1), None, false),
-            );
-        }
-        insert_row_version(&mvstore, committed_table_row_version(table_id, 5));
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-
-        assert_eq!(checkpoint.write_set.len(), 1);
-        assert_eq!(checkpoint.write_set[0].0.row_id, RowKey::Int(5));
-    }
-
-    #[test]
-    fn collect_table_rows_full_scan_visits_every_row() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        checkpoint.full_scan_generation = NonZeroU64::new(1);
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        for rowid in 1..=10 {
-            insert_clean_row_version(
-                &mvstore,
-                table_row_version(table_id, rowid, 1, Some(1), None, false),
-            );
-        }
-        insert_clean_row_version(&mvstore, committed_table_row_version(table_id, 5));
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-
-        assert_eq!(
-            checkpoint.write_set.len(),
-            1,
-            "a full scan must find a checkpointable row that no commit marked"
-        );
-        assert_eq!(checkpoint.write_set[0].0.row_id, RowKey::Int(5));
     }
 
     #[test]
@@ -4726,222 +4342,6 @@ mod tests {
 
         assert!(checkpoint.prune_dirty_keys().is_none());
         assert!(!dirty_table_key(&mvstore, table_id, 7));
-    }
-
-    #[test]
-    fn prune_dirty_keys_keeps_key_marked_again_after_collect() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        let key = RowID::new(table_id, RowKey::Int(7));
-        mvstore.mark_checkpoint_dirty_key(&key, 5).unwrap();
-        checkpoint.snapshot_ts = 10;
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        mvstore.mark_checkpoint_dirty_key(&key, 50).unwrap();
-
-        assert!(checkpoint.prune_dirty_keys().is_none());
-        let entry = mvstore
-            .checkpoint_dirty_table_keys
-            .get(&key)
-            .expect("a key marked after collect must stay dirty");
-        assert_eq!(entry.value().load(Ordering::Acquire), 50);
-    }
-
-    #[test]
-    fn collect_index_rows_visits_only_dirty_keys() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let index_id = MVTableId::from(-7);
-        let (clean_key, clean_version) = index_row_version("k", 1, 1, Some(1), None, false);
-        mvstore
-            .insert_index_version(index_id, clean_key, clean_version)
-            .unwrap();
-        let (dirty_key, dirty_version) = index_row_version("k", 2, 1, Some(5), None, false);
-        insert_dirty_index_version(&mvstore, index_id, dirty_key, dirty_version);
-
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-
-        assert_eq!(checkpoint.index_write_set.len(), 1);
-        assert_eq!(checkpoint.index_write_set[0].1.id, 1);
-        assert!(checkpoint.collect_dirty_index_cursor.last_visited.is_some());
-        assert!(checkpoint.collect_index_key_cursor.is_none());
-    }
-
-    fn collect_while_rows_are_appended(
-        mut collect: impl FnMut() -> Result<Option<IOCompletions>>,
-        mut append: impl FnMut(),
-    ) {
-        let mut yields = 0;
-        while collect().unwrap().is_some() {
-            yields += 1;
-            assert!(
-                yields <= 4,
-                "collect kept scanning rows committed after its snapshot"
-            );
-            append();
-        }
-    }
-
-    fn append_table_rows(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        table_id: MVTableId,
-        next_rowid: &mut i64,
-    ) {
-        for _ in 0..COLLECT_PREEMPTION_THRESHOLD {
-            insert_row_version(
-                mvstore,
-                table_row_version(table_id, *next_rowid, 1, Some(20), None, false),
-            );
-            *next_rowid += 1;
-        }
-    }
-
-    fn append_index_rows(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        index_id: MVTableId,
-        next_rowid: &mut i64,
-    ) {
-        for _ in 0..COLLECT_PREEMPTION_THRESHOLD {
-            let (key, version) = index_row_version("k", *next_rowid, 1, Some(20), None, false);
-            insert_dirty_index_version(mvstore, index_id, key, version);
-            *next_rowid += 1;
-        }
-    }
-
-    #[test]
-    fn collect_table_rows_finishes_while_rows_are_appended() {
-        for full_scan in [false, true] {
-            let mut checkpoint = checkpoint_for_collect_tests();
-            checkpoint.snapshot_ts = 10;
-            checkpoint.full_scan_generation = full_scan.then(|| NonZeroU64::new(1).unwrap());
-            let mvstore = checkpoint.mvstore.clone();
-            let walked = MVTableId::from(-3);
-            let other = MVTableId::from(-2);
-            let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-            for rowid in 0..row_count as i64 {
-                insert_row_version(&mvstore, committed_table_row_version(walked, rowid));
-            }
-            insert_row_version(&mvstore, committed_table_row_version(other, 1));
-
-            let mut next_rowid = row_count as i64;
-            collect_while_rows_are_appended(
-                || checkpoint.collect_table_rows(),
-                || append_table_rows(&mvstore, walked, &mut next_rowid),
-            );
-
-            assert_eq!(
-                checkpoint.write_set.len(),
-                row_count + 1,
-                "full_scan={full_scan}: every row committed before the snapshot is collected once"
-            );
-        }
-    }
-
-    #[test]
-    fn collect_index_rows_finishes_while_index_rows_are_appended() {
-        for full_scan in [false, true] {
-            let mut checkpoint = checkpoint_for_collect_tests();
-            checkpoint.snapshot_ts = 10;
-            checkpoint.full_scan_generation = full_scan.then(|| NonZeroU64::new(1).unwrap());
-            let mvstore = checkpoint.mvstore.clone();
-            let walked = MVTableId::from(-8);
-            let other = MVTableId::from(-7);
-            let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-            for rowid in 0..row_count as i64 {
-                let (key, version) = index_row_version("k", rowid, 1, Some(5), None, false);
-                insert_dirty_index_version(&mvstore, walked, key, version);
-            }
-            let (key, version) = index_row_version("k", 1, 1, Some(5), None, false);
-            insert_dirty_index_version(&mvstore, other, key, version);
-
-            let mut next_rowid = row_count as i64;
-            collect_while_rows_are_appended(
-                || checkpoint.collect_index_rows(),
-                || append_index_rows(&mvstore, walked, &mut next_rowid),
-            );
-
-            assert_eq!(
-                checkpoint.index_write_set.len(),
-                row_count + 1,
-                "full_scan={full_scan}: every index row committed before the snapshot is collected once"
-            );
-        }
-    }
-
-    #[test]
-    fn prune_dirty_keys_keeps_keys_with_versions_past_the_snapshot() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
-        insert_row_version(
-            &mvstore,
-            table_row_version(table_id, 2, 1, Some(50), None, false),
-        );
-        insert_row_version(
-            &mvstore,
-            table_row_version(table_id, 3, 1, Some(5), Some(50), false),
-        );
-        let index_id = MVTableId::from(-7);
-        let (old_key, old_version) = index_row_version("k", 1, 1, Some(5), None, false);
-        insert_dirty_index_version(&mvstore, index_id, old_key, old_version);
-        let (new_key, new_version) = index_row_version("k", 2, 1, Some(50), None, false);
-        insert_dirty_index_version(&mvstore, index_id, new_key, new_version);
-        checkpoint.snapshot_ts = 10;
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-
-        assert!(checkpoint.prune_dirty_keys().is_none());
-
-        assert!(!dirty_table_key(&mvstore, table_id, 1));
-        assert!(dirty_table_key(&mvstore, table_id, 2));
-        assert!(dirty_table_key(&mvstore, table_id, 3));
-        let remaining: std::vec::Vec<_> = mvstore
-            .checkpoint_dirty_index_keys
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        assert_eq!(
-            remaining.len(),
-            1,
-            "only the index key with a newer version stays: {remaining:?}"
-        );
-        let index = mvstore.index_rows.get(&index_id).unwrap();
-        let RowKey::Record(remaining_key) = &remaining[0].row_id else {
-            panic!("index dirty keys carry Record keys");
-        };
-        let chain = index.value().get(remaining_key).unwrap();
-        assert_eq!(
-            chain.value().read()[0].begin(),
-            Some(TxTimestampOrID::Timestamp(50))
-        );
-    }
-
-    #[test]
-    fn prune_dirty_keys_preempts_on_large_map() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
-        for rowid in 0..row_count as i64 {
-            insert_row_version(&mvstore, committed_table_row_version(table_id, rowid));
-        }
-        checkpoint.snapshot_ts = 10;
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-
-        let first = checkpoint.prune_dirty_keys();
-        assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "pruning more than COLLECT_PREEMPTION_THRESHOLD keys must preempt with an explicit yield"
-        );
-        while checkpoint.prune_dirty_keys().is_some() {}
-        assert!(mvstore.checkpoint_dirty_table_keys.is_empty());
     }
 
     #[test]
@@ -4971,30 +4371,5 @@ mod tests {
             .map(|(row_id, _, _)| row_id.row_id.to_int_or_panic())
             .collect();
         assert_eq!(collected, vec![1, 2, 3, 150, 200]);
-    }
-
-    #[test]
-    fn full_scan_prunes_dirty_keys_it_covered() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        checkpoint.full_scan_generation = NonZeroU64::new(1);
-        checkpoint.snapshot_ts = 10;
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
-        insert_row_version(
-            &mvstore,
-            table_row_version(table_id, 2, 1, Some(50), None, false),
-        );
-        let index_id = MVTableId::from(-7);
-        let (key, version) = index_row_version("k", 1, 1, Some(5), None, false);
-        insert_dirty_index_version(&mvstore, index_id, key, version);
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-        assert!(checkpoint.prune_dirty_keys().is_none());
-
-        assert!(!dirty_table_key(&mvstore, table_id, 1));
-        assert!(dirty_table_key(&mvstore, table_id, 2));
-        assert!(mvstore.checkpoint_dirty_index_keys.is_empty());
     }
 }
