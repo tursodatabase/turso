@@ -6947,6 +6947,7 @@ fn test_vacuum_into_uri_only_cipher_errors(tmp_db: TempDatabase) -> anyhow::Resu
         err.to_string(),
         "hexkey is required when cipher is provided"
     );
+    assert!(matches!(err, LimboError::InvalidArgument(_)));
     Ok(())
 }
 
@@ -6965,5 +6966,6 @@ fn test_vacuum_into_uri_only_hexkey_errors(tmp_db: TempDatabase) -> anyhow::Resu
         err.to_string(),
         "cipher is required when hexkey is provided"
     );
+    assert!(matches!(err, LimboError::InvalidArgument(_)));
     Ok(())
 }

@@ -19211,22 +19211,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 };
                 let dest_path = dest_path.as_str().to_string();
                 let target = crate::util::OpenOptions::parse(&dest_path)?;
-                let encryption_opts = match (target.cipher, target.hexkey) {
-                    (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
-                    (Some(_), None) => {
-                        return Err(LimboError::ParseError(
-                            "hexkey is required when cipher is provided".to_string(),
-                        )
-                        .into());
-                    }
-                    (None, Some(_)) => {
-                        return Err(LimboError::ParseError(
-                            "cipher is required when hexkey is provided".to_string(),
-                        )
-                        .into());
-                    }
-                    (None, None) => None,
-                };
+                let encryption_opts = target.encryption_opts()?;
                 let output_in_memory = target.path.is_empty()
                     || target.path == crate::util::MEMORY_PATH
                     || target.mode == crate::util::OpenMode::Memory;
