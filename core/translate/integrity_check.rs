@@ -260,6 +260,19 @@ fn translate_integrity_check_for_schema(
             continue;
         }
 
+        // Opening a cursor on such a table fails, so report it and check the rest.
+        if !btree_table.has_rowid && btree_table.primary_key_repeats_column_with_other_collation() {
+            program.emit_string8(
+                format!(
+                    "table {}: not checked, Turso does not support a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations",
+                    btree_table.name
+                ),
+                registers.message,
+            );
+            emit_integrity_result_row(program, &registers);
+            continue;
+        }
+
         let table_ref_id = program.table_reference_counter.next();
         let table_cursor_id = program.alloc_cursor_id_keyed(
             CursorKey::table(table_ref_id),
