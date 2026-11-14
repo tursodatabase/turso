@@ -62,6 +62,10 @@ impl MvccTestDbNoConn {
         Self::new_encrypted_with_cipher(hexkey, cipher)
     }
 
+    pub fn new_encrypted(hex_key: &str) -> Self {
+        Self::new_encrypted_with_cipher(hex_key, "aes256gcm")
+    }
+
     fn new_encrypted_with_cipher(hex_key: &str, cipher: &str) -> Self {
         Self::create(
             DatabaseOpts::new().with_encryption(true),
@@ -140,6 +144,11 @@ impl MvccTestDbNoConn {
                 "a connection is still open, so the database would not be closed"
             );
         }
+    }
+
+    /// Changes the encryption that the next `restart` opens the database with.
+    pub fn set_encryption(&mut self, enc_opts: Option<EncryptionOpts>) {
+        self.enc_opts = enc_opts;
     }
 
     pub fn path(&self) -> &str {
