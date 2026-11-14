@@ -25,6 +25,7 @@ mod pragma;
 mod query_processing;
 mod query_timeout;
 mod queued_io;
+mod recursive_cte_runaway;
 mod reindex;
 mod statement_lifecycle;
 mod statement_metadata;
