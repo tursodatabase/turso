@@ -4679,6 +4679,128 @@ mod tests {
         }
     }
 
+    fn wal_frame(page_no: u32, db_size: u32) -> Vec<u8> {
+        let mut frame = vec![0; super::WAL_FRAME_SIZE];
+        turso_core::types::WalFrameInfo { page_no, db_size }.put_to_frame_header(&mut frame);
+        frame
+    }
+
+    /// Applies a page-stream changes file made of `changes_bytes` to a replica
+    /// that has one local row. The changes file comes from the network and the
+    /// disk, so a broken one must come back as an error: the process must not
+    /// abort, the synced revision must not move, and the local row must survive.
+    fn assert_broken_changes_file_is_rejected(changes_bytes: Vec<u8>) {
+        let main_file = NamedTempFile::new().unwrap();
+        let changes_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let changes_path = changes_file.path().to_str().unwrap().to_string();
+        std::fs::write(&changes_path, changes_bytes).unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let old_revision = DatabasePullRevision::V1 {
+            revision: "old-revision".to_string(),
+        };
+        let new_revision = DatabasePullRevision::V1 {
+            revision: "new-revision".to_string(),
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    default_test_opts(),
+                )
+                .await?;
+                engine
+                    .update_meta(&coro, |meta| {
+                        meta.synced_revision = Some(old_revision.clone());
+                        meta.remote_pull_protocol = RemotePullProtocol::Pages;
+                    })
+                    .await?;
+                let conn = engine.connect_rw(&coro).await?;
+                conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")?;
+                conn.execute("INSERT INTO items VALUES (1, 'local')")?;
+
+                let changes_file =
+                    io.open_file(&changes_path, turso_core::OpenFlags::None, false)?;
+                let result = engine
+                    .apply_changes_from_remote(
+                        &coro,
+                        DbChangesStatus {
+                            time: turso_core::WallClockInstant {
+                                secs: 10,
+                                micros: 0,
+                            },
+                            revision: new_revision,
+                            file_slot: Some(MutexSlot {
+                                value: changes_file,
+                                slot: Arc::new(Mutex::new(None)),
+                            }),
+                            stream_kind: DbChangesStreamKind::Pages,
+                        },
+                    )
+                    .await;
+                assert!(result.is_err(), "a broken changes file must be rejected");
+                assert_eq!(engine.meta().synced_revision, Some(old_revision));
+
+                drop(conn);
+                drop(engine);
+                let verify_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )?;
+                let verify_conn = verify_db.connect(ConnectOpts::new())?;
+                let mut stmt = verify_conn.prepare("SELECT id, value FROM items")?;
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![vec![
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::Text(turso_core::types::Text::new("local")),
+                    ]]
+                );
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_changes_from_remote_rejects_an_empty_changes_file() {
+        assert_broken_changes_file_is_rejected(Vec::new());
+    }
+
+    #[test]
+    fn apply_changes_from_remote_rejects_a_changes_file_cut_in_the_middle_of_a_frame() {
+        let mut bytes = wal_frame(1, 1);
+        bytes.extend_from_slice(&wal_frame(2, 2)[..100]);
+        assert_broken_changes_file_is_rejected(bytes);
+    }
+
+    #[test]
+    fn apply_changes_from_remote_rejects_a_changes_file_without_a_commit_frame() {
+        assert_broken_changes_file_is_rejected(wal_frame(1, 0));
+    }
+
     /// Full-fidelity page-stream response: header (with the given protocol
     /// hint) followed by one PageData message per page of `db_bytes`.
     fn encoded_page_stream_response(
