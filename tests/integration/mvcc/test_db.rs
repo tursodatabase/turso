@@ -1,5 +1,8 @@
 use std::sync::Arc;
+use turso_core::alloc::DynAllocator;
 use turso_core::io::PlatformIO;
+use turso_core::mvcc::database::MvStore;
+use turso_core::mvcc::MvccClock;
 use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags,
     SessionRole,
@@ -92,13 +95,7 @@ impl MvccTestDbNoConn {
 
     /// Like `restart`, but returns the error of the open instead of panicking.
     pub fn restart_result(&mut self) -> turso_core::Result<()> {
-        if let Some(db) = self.db.take() {
-            assert_eq!(
-                Arc::strong_count(&db),
-                1,
-                "a connection is still open, so the database would not be closed"
-            );
-        }
+        self.close();
         self.open()
     }
 
@@ -114,6 +111,26 @@ impl MvccTestDbNoConn {
         )?;
         self.db = Some(db);
         Ok(())
+    }
+
+    /// Closes the database without opening it again, so that a test can change its files.
+    /// The test must have dropped every connection first.
+    pub fn close(&mut self) {
+        if let Some(db) = self.db.take() {
+            assert_eq!(
+                Arc::strong_count(&db),
+                1,
+                "a connection is still open, so the database would not be closed"
+            );
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn get_mvcc_store(&self) -> Arc<MvStore<MvccClock, DynAllocator>> {
+        self.get_db().get_mv_store().clone().unwrap()
     }
 
     pub fn get_db(&self) -> Arc<Database> {
