@@ -453,3 +453,27 @@ test added-column-default-keeps-the-sequence-it-was-created-with-after-search-pa
 expect error {
     cannot drop sequence
 }
+
+test drop-column-drops-its-sequence-when-only-its-own-check-constraint-uses-it {
+    CREATE TABLE zz_own_col_check (
+        id serial CHECK (id <= nextval('zz_own_col_check_id_seq')),
+        label text
+    );
+    ALTER TABLE zz_own_col_check DROP COLUMN id;
+    SELECT count(*) FROM pg_class WHERE relname = 'zz_own_col_check_id_seq';
+}
+expect {
+    0
+}
+
+test drop-column-refuses-when-a-check-constraint-of-another-column-uses-its-sequence {
+    CREATE TABLE zz_other_col_check (
+        id serial,
+        n bigint CHECK (n <= nextval('zz_other_col_check_id_seq'))
+    );
+    ALTER TABLE zz_other_col_check DROP COLUMN id;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop column id of table zz_other_col_check because other objects depend on it
+}
