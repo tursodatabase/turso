@@ -73,14 +73,16 @@ When the database uses MVCC (`PRAGMA journal_mode = mvcc`), additional rules app
 - Indexes, triggers, and views are recreated after the data is copied so that triggers do not fire during the copy.
 - Custom index methods (for example FTS and vector) rebuild their backing structures from the copied data.
 - `sqlite_sequence` counters used by `AUTOINCREMENT` columns are preserved.
-- Reserved space, text encoding, user version, and application ID are copied from the source.
+- Text encoding, user version, and application ID are copied from the source. Reserved space is also copied unless destination encryption is requested, in which case it is set to the space required by that cipher.
 - The page size is copied from the source, unless a valid `PRAGMA page_size = N` ran earlier on the same connection. Then the destination uses `N` and the source keeps its own page size. An in-memory source always uses its own page size. A requested size of 512 becomes 1024 when the source has more than 32 reserved bytes per page. An in-place `VACUUM` drops the requested size.
 - If the source uses MVCC, the destination is created with MVCC enabled but with fresh state. The source's MVCC metadata table is not copied across.
 - The file is fully synced and a TRUNCATE checkpoint is performed before the statement returns, so the destination is durable without further action.
 
 <Warning>
-`VACUUM INTO` does not carry encryption through to the destination. Even when the source is encrypted, the compacted copy is written as an ordinary unencrypted database file and can be opened without a key. Reserved header bytes are still copied across, so the destination's page layout matches the source.
+`VACUUM INTO` does not inherit a source's built-in encryption cipher or key. To encrypt the destination, supply both `cipher` and `hexkey` in its `file:` URI. Without them, a source using built-in encryption is exported as an unencrypted database file that can be opened without a key.
 </Warning>
+
+Sources using an external page codec preserve that codec for ordinary copies. Requesting built-in encryption for a copy of a source with an external codec is currently unsupported.
 
 ### Requirements
 
@@ -88,7 +90,7 @@ In addition to the [common requirements](#common-requirements):
 
 - The destination file must not already exist, unless it is empty. Delete or move a non-empty file first if you want to overwrite it.
 - `VACUUM temp INTO filename` is a no-op and does not create a file, matching SQLite's behavior. The `filename` expression is not evaluated.
-- The destination is opened the way `ATTACH` opens a file name, so a `file:` URI such as `'file:backup.db'` writes `backup.db`. URI parameters other than `mode` are ignored, and `cipher` and `hexkey` are rejected.
+- The destination is opened the way `ATTACH` opens a file name, so a `file:` URI such as `'file:backup.db'` writes `backup.db`. The `mode`, `cipher`, and `hexkey` URI parameters are supported; other URI parameters are ignored. Encryption requires both `cipher` and `hexkey`, with a key of the size required by the selected [cipher](/docs/sql-reference/pragmas#cipher). These parameters are checked when the statement executes, after evaluating the destination expression.
 - `VACUUM INTO ':memory:'`, `VACUUM INTO ''`, `VACUUM INTO 'file::memory:'`, `VACUUM INTO 'file:'`, and any URI with `mode=memory` build the copy in an in-memory database that is discarded when the statement finishes, so no file is created. Other names, such as `':memory:backup'`, are used as file names.
 
 `VACUUM INTO` takes a consistent view of the source by starting an implicit read transaction for the duration of the copy, so the destination always reflects a single snapshot of the source even if other connections write to it during the copy.
@@ -113,6 +115,16 @@ The source database is unchanged. `backup.db` can be opened as a standalone data
 ```bash
 tursodb backup.db
 ```
+
+### Write an Encrypted Compacted Copy
+
+Specify the destination cipher and key in a `file:` URI. Replace the example key with your own key:
+
+```sql
+VACUUM INTO 'file:backup-encrypted.db?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+```
+
+Open `backup-encrypted.db` using the same cipher and key. The destination key can differ from the source key, and the source can also be unencrypted.
 
 ### Vacuum an Attached Database Into a New File
 
@@ -157,7 +169,8 @@ VACUUM;
 | `cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first` | In-place `VACUUM` on an MVCC database with pending log entries. |
 | `output file already exists: <path>` | The destination for `VACUUM INTO` already exists and is not empty. |
 | `unable to open database: <path>` | The `VACUUM INTO` URI has `mode=ro` or `mode=rw`, which cannot create the destination. |
-| `VACUUM INTO does not support the cipher and hexkey URI parameters` | The `VACUUM INTO` URI asks for an encrypted destination. |
+| `hexkey is required when cipher is provided` | The destination URI specifies a cipher without a key. |
+| `cipher is required when hexkey is provided` | The destination URI specifies a key without a cipher. |
 | `non-text filename` | The `VACUUM INTO` destination expression did not evaluate to text, for example `NULL`, a number, or a blob. |
 | `no such database: <name>` | `VACUUM <schema> INTO` referenced an unknown schema. |
 
