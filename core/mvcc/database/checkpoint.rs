@@ -1080,117 +1080,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         versions: &[RowVersion],
         table_id: MVTableId,
     ) -> smallvec::SmallVec<[RowVersion; 1]> {
-        let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
-            smallvec::SmallVec::with_capacity(1);
-        let mut exists_in_db_file = false;
-        // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
-        for version in versions.iter() {
-            // A row is in the database file if:
-            // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
-            // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
-            // Resolve in-flight TxID begin/end markers to the owning tx's true state
-            // (concurrent collection may not have rewritten the chain to a Timestamp yet).
-            // Only a Committed tx contributes a timestamp; others resolve to None.
-            let begin_ts = self.committed_ts(version.begin());
-            let mut end_ts = self.committed_ts(version.end());
-            // Insert not visible at our snapshot (committed during the collection
-            // phase): defer to the next pass and don't let it affect DB-file existence now.
-            if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
-                continue;
-            }
-            // Tombstone committed after our snapshot: clamp to "live" (end=None) so the
-            // row is checkpointed as PRESENT, not stranded; a later pass (delete <=
-            // snapshot) checkpoints the deletion. Fixes the future-tombstone orphan bug.
-            let future_committed_tombstone = end_ts.is_some_and(|e| e > self.snapshot_ts);
-            if future_committed_tombstone {
-                end_ts = None;
-            }
-            if begin_ts.is_none() && end_ts.is_none() {
-                // Rolled-back garbage and active TxID-only placeholders are not part of
-                // the durable row history, so they must not influence DB-file existence.
-                continue;
-            }
-            // Rows marked btree_resident existed in the DB file before MVCC tracked them.
-            // This also applies to synthetic tombstones that use begin=None.
-            if version.btree_resident {
-                exists_in_db_file = true;
-            }
-            // A row exists in the DB file if it was checkpointed in a previous checkpoint.
-            // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
-            // These timestamp-derived transitions must run after the btree_resident seed so a
-            // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
-            if self
-                .durable_txid_max_old
-                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
-            {
-                exists_in_db_file = true;
-            }
-            if self
-                .durable_txid_max_old
-                .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
-            {
-                exists_in_db_file = false;
-            }
-            // Should checkpoint the newest version if:
-            // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
-            // We need the `self.durable_txid_max_old.is_none()` check because before
-            // the first checkpoint there is no persisted MVCC watermark.
-            let is_uncheckpointed_insert = end_ts.is_none()
-                && self.durable_txid_max_old.is_none_or(|txid_max_old| {
-                    begin_ts.is_some_and(|b| b > u64::from(txid_max_old))
-                });
-            // - It is a delete, AND some version of the row exists in the database file.
-            let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
-            // - It is a delete of an uncheckpointed sqlite_schema row for a
-            //   table or index. The schema row itself is not in the DB file, but
-            //   checkpoint still needs it so it can remember that the table or
-            //   index was destroyed and skip that object's data/index rows.
-            //   Views and triggers have rootpage=0, so their uncheckpointed
-            //   deletes can be ignored here: there is no B-tree to destroy, and
-            //   deleting a missing sqlite_schema row would be wrong.
-            let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                && !exists_in_db_file
-                && sqlite_schema_btree_identity(table_id, version).is_some()
-                && self
-                    .durable_txid_max_old
-                    .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
-            let should_checkpoint =
-                is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
-            if should_checkpoint {
-                // Future tombstone: push a clamped clone so the B-tree write sees a live insert.
-                let checkpoint_version = if future_committed_tombstone {
-                    let mut v = version.clone();
-                    v.set_end(None);
-                    v
-                } else {
-                    let mut version = version.clone();
-                    // Normalize the clone's end to the resolved end_ts so downstream
-                    // is_delete is consistent (in-flight/aborted end -> live insert).
-                    version.set_end(end_ts.map(TxTimestampOrID::Timestamp));
-                    version
-                };
-                if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    if versions_to_checkpoint.is_empty() {
-                        versions_to_checkpoint.push(checkpoint_version)
-                    } else {
-                        versions_to_checkpoint[0] = checkpoint_version
-                    }
-                    continue;
-                }
-
-                if let Some(previous_version) = versions_to_checkpoint.last() {
-                    let should_drop_previous = previous_version.end().is_some()
-                        && !is_schema_metadata_only_rewrite(previous_version, Some(version));
-                    if should_drop_previous {
-                        versions_to_checkpoint.pop();
-                    }
-                }
-
-                versions_to_checkpoint.push(checkpoint_version);
-            }
-        }
-
-        versions_to_checkpoint
+        checkpointable_versions(
+            versions,
+            table_id,
+            self.durable_txid_max_old,
+            self.snapshot_ts,
+            |ts_or_id| self.committed_ts(ts_or_id),
+        )
     }
 
     /// Resolve the table/index id whose B-tree binding owned `root_page` at the moment of the
@@ -3555,6 +3451,128 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 }
 
+/// Returns the versions of one row that a checkpoint has to write to the database file.
+///
+/// `versions` is the row's version chain from oldest to newest. `durable_txid_max_old` is the
+/// highest commit timestamp an earlier checkpoint already wrote, and `snapshot_ts` is the highest
+/// commit timestamp this checkpoint writes. `committed_ts` gives the commit timestamp of a begin
+/// or end marker, or `None` if its transaction has not committed.
+fn checkpointable_versions(
+    versions: &[RowVersion],
+    table_id: MVTableId,
+    durable_txid_max_old: Option<NonZeroU64>,
+    snapshot_ts: u64,
+    committed_ts: impl Fn(Option<TxTimestampOrID>) -> Option<u64>,
+) -> smallvec::SmallVec<[RowVersion; 1]> {
+    let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
+        smallvec::SmallVec::with_capacity(1);
+    let mut exists_in_db_file = false;
+    // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
+    for version in versions.iter() {
+        // A row is in the database file if:
+        // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
+        // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
+        // Resolve in-flight TxID begin/end markers to the owning tx's true state
+        // (concurrent collection may not have rewritten the chain to a Timestamp yet).
+        // Only a Committed tx contributes a timestamp; others resolve to None.
+        let begin_ts = committed_ts(version.begin());
+        let mut end_ts = committed_ts(version.end());
+        // Insert not visible at our snapshot (committed during the collection
+        // phase): defer to the next pass and don't let it affect DB-file existence now.
+        if begin_ts.is_some_and(|b| b > snapshot_ts) {
+            continue;
+        }
+        // Tombstone committed after our snapshot: clamp to "live" (end=None) so the
+        // row is checkpointed as PRESENT, not stranded; a later pass (delete <=
+        // snapshot) checkpoints the deletion. Fixes the future-tombstone orphan bug.
+        let future_committed_tombstone = end_ts.is_some_and(|e| e > snapshot_ts);
+        if future_committed_tombstone {
+            end_ts = None;
+        }
+        if begin_ts.is_none() && end_ts.is_none() {
+            // Rolled-back garbage and active TxID-only placeholders are not part of
+            // the durable row history, so they must not influence DB-file existence.
+            continue;
+        }
+        // Rows marked btree_resident existed in the DB file before MVCC tracked them.
+        // This also applies to synthetic tombstones that use begin=None.
+        if version.btree_resident {
+            exists_in_db_file = true;
+        }
+        // A row exists in the DB file if it was checkpointed in a previous checkpoint.
+        // For btree_resident rows we seed exists_in_db_file above, regardless of begin encoding.
+        // These timestamp-derived transitions must run after the btree_resident seed so a
+        // checkpointed tombstone can clear DB-file existence on a retry checkpoint.
+        if durable_txid_max_old
+            .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)))
+        {
+            exists_in_db_file = true;
+        }
+        if durable_txid_max_old
+            .is_some_and(|txid_max_old| end_ts.is_some_and(|e| e <= u64::from(txid_max_old)))
+        {
+            exists_in_db_file = false;
+        }
+        // Should checkpoint the newest version if:
+        // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
+        // We need the `durable_txid_max_old.is_none()` check because before
+        // the first checkpoint there is no persisted MVCC watermark.
+        let is_uncheckpointed_insert = end_ts.is_none()
+            && durable_txid_max_old
+                .is_none_or(|txid_max_old| begin_ts.is_some_and(|b| b > u64::from(txid_max_old)));
+        // - It is a delete, AND some version of the row exists in the database file.
+        let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
+        // - It is a delete of an uncheckpointed sqlite_schema row for a
+        //   table or index. The schema row itself is not in the DB file, but
+        //   checkpoint still needs it so it can remember that the table or
+        //   index was destroyed and skip that object's data/index rows.
+        //   Views and triggers have rootpage=0, so their uncheckpointed
+        //   deletes can be ignored here: there is no B-tree to destroy, and
+        //   deleting a missing sqlite_schema row would be wrong.
+        let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+            && !exists_in_db_file
+            && sqlite_schema_btree_identity(table_id, version).is_some()
+            && durable_txid_max_old
+                .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
+        let should_checkpoint =
+            is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
+        if should_checkpoint {
+            // Future tombstone: push a clamped clone so the B-tree write sees a live insert.
+            let checkpoint_version = if future_committed_tombstone {
+                let mut v = version.clone();
+                v.set_end(None);
+                v
+            } else {
+                let mut version = version.clone();
+                // Normalize the clone's end to the resolved end_ts so downstream
+                // is_delete is consistent (in-flight/aborted end -> live insert).
+                version.set_end(end_ts.map(TxTimestampOrID::Timestamp));
+                version
+            };
+            if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                if versions_to_checkpoint.is_empty() {
+                    versions_to_checkpoint.push(checkpoint_version)
+                } else {
+                    versions_to_checkpoint[0] = checkpoint_version
+                }
+                continue;
+            }
+
+            if let Some(previous_version) = versions_to_checkpoint.last() {
+                let should_drop_previous = previous_version.end().is_some()
+                    && !is_schema_metadata_only_rewrite(previous_version, Some(version));
+                if should_drop_previous {
+                    versions_to_checkpoint.pop();
+                }
+            }
+
+            versions_to_checkpoint.push(checkpoint_version);
+        }
+    }
+
+    versions_to_checkpoint
+}
+
 struct CollectEntry<'a, 'g, K, V, C, A: SkiplistAllocator> {
     entry: Option<RefEntry<'a, K, V, C, A>>,
     guard: &'g epoch::Guard,
@@ -4206,13 +4224,11 @@ mod tests {
 
     #[test]
     fn checkpoint_collection_uses_btree_marker_for_existence_but_writes_surviving_replacement() {
-        let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, replacement) = table_row_version(table_id, 1, 2, Some(5), None, false);
 
-        let checkpointable =
-            checkpoint.maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id);
+        let checkpointable = versions_to_write(&[btree_tombstone, replacement], table_id);
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4221,13 +4237,11 @@ mod tests {
 
     #[test]
     fn checkpoint_collection_uses_btree_marker_for_later_delete_of_replacement() {
-        let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable = checkpoint
-            .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id);
+        let checkpointable = versions_to_write(&[btree_tombstone, deleted_replacement], table_id);
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4236,14 +4250,26 @@ mod tests {
 
     #[test]
     fn checkpoint_collection_skips_delete_of_never_checkpointed_replacement_without_btree_marker() {
-        let checkpoint = checkpoint_for_collect_tests();
         let table_id = MVTableId::from(-2);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable =
-            checkpoint.maybe_get_checkpointable_versions(&[deleted_replacement], table_id);
+        let checkpointable = versions_to_write(&[deleted_replacement], table_id);
 
         assert!(checkpointable.is_empty());
+    }
+
+    /// The versions a checkpoint writes when an earlier checkpoint wrote everything up to
+    /// timestamp 2.
+    fn versions_to_write(
+        versions: &[RowVersion],
+        table_id: MVTableId,
+    ) -> smallvec::SmallVec<[RowVersion; 1]> {
+        checkpointable_versions(versions, table_id, NonZeroU64::new(2), u64::MAX, |marker| {
+            match marker {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+                _ => None,
+            }
+        })
     }
 
     #[test]
