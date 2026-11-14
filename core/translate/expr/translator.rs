@@ -1096,6 +1096,17 @@ fn translate_function_call_expr(
                 name.as_str()
             )
         }
+        Func::External(f) if f.func.is_aggregate() => {
+            crate::bail_parse_error!(
+                "misuse of {} function {}()",
+                if filter_over.over_clause.is_some() {
+                    "window"
+                } else {
+                    "aggregate"
+                },
+                name.as_str()
+            )
+        }
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }

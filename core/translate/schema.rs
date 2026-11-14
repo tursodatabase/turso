@@ -106,7 +106,9 @@ pub(crate) fn validate_check_expr(
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), args.len())? {
-                    if matches!(func, Func::Agg(..)) {
+                    let is_extension_aggregate =
+                        matches!(&func, Func::External(f) if f.func.is_aggregate());
+                    if matches!(func, Func::Agg(..)) || is_extension_aggregate {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
                     if matches!(func, Func::Window(..)) {
@@ -121,7 +123,9 @@ pub(crate) fn validate_check_expr(
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
                 if let Some(func) = resolver.resolve_function(name.as_str(), 0)? {
-                    if matches!(func, Func::Agg(..)) {
+                    let is_extension_aggregate =
+                        matches!(&func, Func::External(f) if f.func.is_aggregate());
+                    if matches!(func, Func::Agg(..)) || is_extension_aggregate {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
                     if matches!(func, Func::Window(..)) {
