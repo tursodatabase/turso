@@ -3603,7 +3603,8 @@ impl Database {
         Ok(name)
     }
 
-    pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+    /// The schema that new connections start with.
+    pub fn clone_schema(&self) -> Arc<Schema> {
         let schema = self.schema.lock();
         schema.clone()
     }

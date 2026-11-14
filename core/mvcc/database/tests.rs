@@ -1484,7 +1484,7 @@ fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
 
     db.conn.demote_to_mvcc_connection();
     db.conn.reparse_schema().unwrap();
-    let schema = db.conn.schema.read().clone();
+    let schema = db.conn.current_schema();
     db.conn.promote_to_regular_connection();
 
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
@@ -16262,12 +16262,12 @@ fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoi
     let rootpage = rows[0][0].as_int().unwrap();
     assert!(rootpage > 0);
     {
-        let schema = checkpoint.db.schema.lock();
+        let schema = checkpoint.db.clone_schema();
         assert_eq!(schema.table_name_for_root_page(rootpage), Some("items"));
         assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
     }
     {
-        let schema = checkpoint.schema.read();
+        let schema = checkpoint.current_schema();
         assert_eq!(schema.table_name_for_root_page(rootpage), Some("items"));
         assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
     }
@@ -20639,7 +20639,7 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
         "passive checkpoint must yield at AfterDurableBoundaryAdvanced (publish window done)"
     );
     assert!(
-        conn_c.db.schema.lock().dropped_root_pages.is_empty(),
+        conn_c.db.clone_schema().dropped_root_pages.is_empty(),
         "parked checkpoint should have published its own pages; live set must be clean"
     );
     let conn_d = db.connect();
@@ -20647,8 +20647,7 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
     assert!(
         conn_c
             .db
-            .schema
-            .lock()
+            .clone_schema()
             .dropped_root_pages
             .contains(&keep_root),
         "concurrent DROP must record keep's root in the live shared dropped_root_pages"
@@ -21050,7 +21049,7 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
             crate::IOResult::IO(io) => io.wait(database.io.as_ref()).unwrap(),
         }
     };
-    let schema = conn.schema.read();
+    let schema = conn.current_schema();
     assert!(
         schema
             .analyze_stats
@@ -21125,8 +21124,7 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     // A fresh blocking connect works once nothing is parked.
     let conn = db.connect();
     assert!(conn
-        .schema
-        .read()
+        .current_schema()
         .analyze_stats
         .table_stats(NamespaceId::ROOT, "t1")
         .is_some());
