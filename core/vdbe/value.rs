@@ -1302,7 +1302,7 @@ impl Value {
     }
 
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
-    pub fn exec_concat(&self, rhs: &Value) -> Result<Value> {
+    pub fn exec_concat(&self, rhs: &Value, blobs_concat_to_blob: bool) -> Result<Value> {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             if lhs.len() + rhs.len() > Self::MAX_BLOB_LENGTH as usize {
                 return Err(LimboError::TooBig);
@@ -1313,7 +1313,15 @@ impl Value {
                 )?;
             blob.extend_from_slice(lhs);
             blob.extend_from_slice(rhs);
-            return Ok(Value::Blob(blob));
+            if blobs_concat_to_blob {
+                return Ok(Value::Blob(blob));
+            }
+            // SQLite's `||` always gives TEXT. Text must be valid UTF-8 here, so
+            // bytes that are not stay a BLOB, which keeps them unchanged.
+            return Ok(match crate::types::validate_utf8(&blob) {
+                Some(text) => Value::build_text(text.to_owned()),
+                None => Value::Blob(blob),
+            });
         }
 
         let Some(lhs) = self.cast_text_ref() else {
@@ -1899,7 +1907,7 @@ mod tests {
         let lhs = blob(&[1, 2]);
         let rhs = blob(&[3, 4]);
 
-        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+        assert_eq!(lhs.exec_concat(&rhs, true).unwrap(), blob(&[1, 2, 3, 4]));
     }
 
     #[test]

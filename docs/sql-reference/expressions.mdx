@@ -116,6 +116,10 @@ Comparison operators, `IN` and `BETWEEN` also accept row values, which compare e
 |----------|-------------|---------|--------|
 | `\|\|` | Concatenation | `'hello' \|\| ' ' \|\| 'world'` | `'hello world'` |
 
+The result is text, even when both operands are blobs. One exception differs from SQLite: when both operands are blobs and the joined bytes are not valid UTF-8, the result is a blob holding those bytes.
+
+Turso 0.9.0-pre.4 and earlier returned a blob for every blob `||` blob. An index on such an expression made by those versions holds blob keys, so rebuild it with [`REINDEX`](/docs/sql-reference/statements/reindex) before writing to the table.
+
 When either operand is an array, `||` performs array concatenation instead. See [Array Operators](#array-operators).
 
 ### Array Operators

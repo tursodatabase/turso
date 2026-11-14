@@ -761,21 +761,21 @@ fn or_true_false(bencher: Bencher) {
 fn concat_two_strings(bencher: Bencher) {
     let a = Value::build_text("hello ");
     let b = Value::build_text("world");
-    bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b))));
+    bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b), false)));
 }
 
 #[turso_macros::divan_bench]
 fn concat_string_integer(bencher: Bencher) {
     let a = Value::build_text("count: ");
     let b = Value::from_i64(42);
-    bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b))));
+    bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b), false)));
 }
 
 #[turso_macros::divan_bench]
 fn concat_blobs(bencher: Bencher) {
     let a = Value::from_slice(b"hello ").expect(turso_core::alloc::ALLOC_ERR_MSG);
     let b = Value::from_slice(b"world").expect(turso_core::alloc::ALLOC_ERR_MSG);
-    bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b))));
+    bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b), false)));
 }
 
 #[turso_macros::divan_bench]
