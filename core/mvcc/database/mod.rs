@@ -1653,6 +1653,9 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     group_batch: Option<GroupBatch>,
     /// This state machine issued at least one `log_tx` (leader or exclusive).
     wrote_logical_log: bool,
+    /// False for a commit that leaves a transaction or a raw WAL-insert session
+    /// open on its connection.
+    run_auto_checkpoint: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
@@ -1768,9 +1771,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pending_log_append_bytes: None,
             group_batch: None,
             wrote_logical_log: false,
+            run_auto_checkpoint: true,
             sync_mode,
             _phantom: PhantomData,
         })
+    }
+
+    /// The checkpoint runs on this connection and would release the WAL locks that
+    /// the surrounding transaction or WAL session still holds, so it waits for a
+    /// later commit.
+    pub(crate) fn skip_auto_checkpoint(&mut self) {
+        self.run_auto_checkpoint = false;
     }
 
     /// The committing transaction, or `None` if it is not (or no longer) in
@@ -3695,7 +3706,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                if appended_to_log && mvcc_store.storage.should_checkpoint() {
+                if appended_to_log
+                    && self.run_auto_checkpoint
+                    && mvcc_store.storage.should_checkpoint()
+                {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,

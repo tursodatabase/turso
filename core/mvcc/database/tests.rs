@@ -5144,6 +5144,189 @@ fn test_sequence_watermark_tracks_nextval_allocations() {
     assert_eq!(rows[0][0].as_int().unwrap(), 3);
 }
 
+/// `nextval()` inside BEGIN CONCURRENT commits its own inner transaction. When
+/// that commit reaches the checkpoint threshold, the checkpoint waits for a
+/// later commit, and the outer transaction keeps its snapshot.
+fn nextval_inner_commit_keeps_outer_snapshot(db: MvccTestDbNoConn, checkpoint_sql: &str) {
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..20 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    setup.execute(checkpoint_sql).unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(20)]]
+    );
+    let writer = db.connect();
+    writer
+        .execute("UPDATE t SET v = 'new7' WHERE id = 7")
+        .unwrap();
+    writer.execute("DELETE FROM t WHERE id = 8").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (100, 'v100')")
+        .unwrap();
+
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let floor_before = *mv.backfill_floor.read();
+    assert_eq!(
+        get_rows(&reader, "SELECT nextval('s')"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(*mv.backfill_floor.read(), floor_before);
+
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(20)]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t WHERE id = 7"),
+        vec![vec![Value::build_text("v7")]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t WHERE id = 8"),
+        vec![vec![Value::build_text("v8")]]
+    );
+    assert!(get_rows(&reader, "SELECT v FROM t WHERE id = 100").is_empty());
+    reader.execute("COMMIT").unwrap();
+
+    writer
+        .execute("INSERT INTO t VALUES (101, 'v101')")
+        .unwrap();
+    assert!(*mv.backfill_floor.read() > floor_before);
+}
+
+#[test]
+fn test_nextval_inner_commit_keeps_outer_snapshot_passive() {
+    nextval_inner_commit_keeps_outer_snapshot(
+        MvccTestDbNoConn::new_with_random_db_passive(),
+        "PRAGMA wal_checkpoint(PASSIVE)",
+    );
+}
+
+#[test]
+fn test_nextval_inner_commit_keeps_outer_snapshot_blocking() {
+    nextval_inner_commit_keeps_outer_snapshot(
+        MvccTestDbNoConn::new_with_random_db(),
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+    );
+}
+
+fn own_connection_checkpoint_refused_in_open_transaction(
+    db: MvccTestDbNoConn,
+    checkpoint_sql: &str,
+    mode: CheckpointMode,
+) {
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..20 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    conn.execute(checkpoint_sql).unwrap();
+    conn.execute("DELETE FROM t WHERE id = 5").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(19)]]
+    );
+    conn.execute("UPDATE t SET v = 'new7' WHERE id = 7")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id = 8").unwrap();
+    conn.execute("INSERT INTO t VALUES (100, 'v100')").unwrap();
+
+    let err = reader.checkpoint(mode).unwrap_err();
+    assert!(matches!(err, LimboError::TableLocked), "{err:?}");
+
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(19)]]
+    );
+    assert!(get_rows(&reader, "SELECT v FROM t WHERE id = 5").is_empty());
+    assert!(get_rows(&reader, "SELECT id FROM t WHERE v = 'v5'").is_empty());
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t WHERE id = 7"),
+        vec![vec![Value::build_text("v7")]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t WHERE id = 8"),
+        vec![vec![Value::build_text("v8")]]
+    );
+    assert!(get_rows(&reader, "SELECT v FROM t WHERE id = 100").is_empty());
+    reader.execute("COMMIT").unwrap();
+
+    reader.checkpoint(mode).unwrap();
+}
+
+#[test]
+fn test_own_connection_checkpoint_refused_in_open_transaction_passive() {
+    own_connection_checkpoint_refused_in_open_transaction(
+        MvccTestDbNoConn::new_with_random_db_passive(),
+        "PRAGMA wal_checkpoint(PASSIVE)",
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+}
+
+#[test]
+fn test_own_connection_checkpoint_refused_in_open_transaction_blocking() {
+    own_connection_checkpoint_refused_in_open_transaction(
+        MvccTestDbNoConn::new_with_random_db(),
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_raw_wal_session_commit_at_checkpoint_threshold() {
+    for passive in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db_with_opts(
+            DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive),
+        );
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        conn.wal_auto_actions_disable();
+        conn.wal_insert_begin().unwrap();
+        conn.start_nested();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
+        conn.commit_main_mvcc_tx_for_wal_session().unwrap();
+        conn.end_nested();
+        conn.wal_insert_end(true).unwrap();
+        assert_eq!(
+            get_rows(&db.connect(), "SELECT x FROM t"),
+            vec![vec![Value::from_i64(42)]],
+            "passive={passive}"
+        );
+    }
+}
+
 /// What this test checks: a sync-style cursor that bounds its scan by
 /// `sequence_watermark_experimental()` (read *outside* a transaction, as the
 /// contract requires) never skips a committed row, even while many writers

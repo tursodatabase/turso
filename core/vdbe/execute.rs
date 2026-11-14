@@ -543,16 +543,9 @@ pub fn op_checkpoint(
     }
 
     let pager = program.get_pager_from_database_index(database)?;
-    // Like SQLite, refuse only when this connection's open transaction has already
-    // read or written the database. After a plain BEGIN nothing is held yet, so the
-    // checkpoint runs. The error does not end the transaction.
-    if !program.connection.auto_commit.load(Ordering::SeqCst)
-        && (pager.holds_read_lock()
-            || pager.holds_write_lock()
-            || program.connection.get_mv_tx_for_db(*database).is_some())
-    {
-        return Err(LimboError::TableLocked.into());
-    }
+    program
+        .connection
+        .refuse_checkpoint_in_open_transaction(&pager, *database)?;
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -14480,7 +14473,11 @@ pub fn op_sequence_commit_inner_tx(
                 .into());
             }
         };
-        state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
+        let mut commit_sm = mv_store.commit_tx(inner_tx_id, &conn, *db)?;
+        if saved_outer.is_some() {
+            commit_sm.inner_mut().skip_auto_checkpoint();
+        }
+        state.sequence_inner_commit = Some(commit_sm);
     }
 
     let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
