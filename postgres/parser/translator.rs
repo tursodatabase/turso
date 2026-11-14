@@ -137,6 +137,7 @@ impl PostgreSQLTranslator {
             | "pg_namespace"
             | "pg_attribute"
             | "pg_roles"
+            | "pg_auth_members"
             | "pg_am"
             | "pg_database"
             | "pg_proc"
@@ -246,13 +247,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
-            NodeRef::GrantRoleStmt(grant) => {
-                return Err(ParseError::not_supported(if grant.is_grant {
-                    "GRANT of role membership"
-                } else {
-                    "REVOKE of role membership"
-                }))
-            }
+            NodeRef::GrantRoleStmt(grant) => translate_grant_role(grant)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -1063,7 +1058,7 @@ impl PostgreSQLTranslator {
             tbl_name: self.qualified_name_from_range_var(table)?,
             permissive: policy.permissive,
             command,
-            roles: policy_roles(&policy.roles)?,
+            roles: role_list(&policy.roles, "CREATE POLICY")?,
             using_expr,
             check_expr,
         })))
@@ -5911,6 +5906,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_namespace"
             | "pg_attribute"
             | "pg_roles"
+            | "pg_auth_members"
             | "pg_proc"
             | "pg_database"
             | "pg_am"
@@ -6486,6 +6482,68 @@ fn translate_create_role(
     })
 }
 
+/// `GRANT role TO role` or `REVOKE role FROM role`. A membership is stored
+/// without options, so the options of the statement, `GRANTED BY` and
+/// `CASCADE` are refused rather than ignored.
+fn translate_grant_role(stmt: &pg_query::protobuf::GrantRoleStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::DropBehavior;
+
+    let statement = if stmt.is_grant { "GRANT" } else { "REVOKE" };
+    // GRANT gives options as `WITH ADMIN OPTION`, `WITH INHERIT TRUE` or
+    // `WITH SET FALSE`. REVOKE takes one away as `ADMIN OPTION FOR`.
+    if let Some(option) = stmt.opt.first() {
+        let Some(Node::DefElem(elem)) = &option.node else {
+            return Err(ParseError::ParseError(format!(
+                "{statement}: unexpected role membership option"
+            )));
+        };
+        let option = elem.defname.to_uppercase();
+        return Err(ParseError::not_supported(
+            match (stmt.is_grant, option.as_str()) {
+                (true, "ADMIN") => "GRANT ... WITH ADMIN OPTION".to_string(),
+                (true, _) => format!("GRANT ... WITH {option}"),
+                (false, _) => format!("REVOKE {option} OPTION FOR"),
+            },
+        ));
+    }
+    if stmt.grantor.is_some() {
+        return Err(ParseError::not_supported(format!(
+            "{statement} ... GRANTED BY"
+        )));
+    }
+    if stmt.behavior == DropBehavior::DropCascade as i32 {
+        return Err(ParseError::not_supported(
+            "REVOKE of role membership with CASCADE",
+        ));
+    }
+    let roles = stmt
+        .granted_roles
+        .iter()
+        .map(|role| {
+            let Some(Node::AccessPriv(role)) = &role.node else {
+                return Err(ParseError::ParseError(format!(
+                    "{statement}: unexpected role node"
+                )));
+            };
+            // The grammar takes roles in the same list as privileges, which
+            // may name columns.
+            if role.priv_name.is_empty() || !role.cols.is_empty() {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
+                    message: "column names cannot be included in GRANT/REVOKE ROLE".to_string(),
+                });
+            }
+            Ok(role.priv_name.clone())
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ast::Stmt::GrantRole(ast::GrantRole {
+        revoke: !stmt.is_grant,
+        roles,
+        grantees: role_list(&stmt.grantee_roles, statement)?,
+    }))
+}
+
 /// The keyword that a CREATE ROLE option is written with, such as `NOLOGIN`
 /// for the option PostgreSQL's parser names `canlogin` with value false.
 fn role_option_keyword(elem: &pg_query::protobuf::DefElem) -> String {
@@ -6583,8 +6641,12 @@ fn translate_drop_policy(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stm
     })
 }
 
-/// The roles of a policy's TO clause.
-fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>, ParseError> {
+/// The roles of a role list, such as a policy's TO clause, which
+/// `statement` names in its errors.
+fn role_list(
+    roles: &[pg_query::protobuf::Node],
+    statement: &str,
+) -> Result<Vec<ast::Grantee>, ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::RoleSpecType;
 
@@ -6592,9 +6654,9 @@ fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>,
         .iter()
         .map(|role| {
             let Some(Node::RoleSpec(spec)) = &role.node else {
-                return Err(ParseError::ParseError(
-                    "CREATE POLICY: unexpected role node".into(),
-                ));
+                return Err(ParseError::ParseError(format!(
+                    "{statement}: unexpected role node"
+                )));
             };
             match RoleSpecType::try_from(spec.roletype) {
                 Ok(RoleSpecType::RolespecPublic) => Ok(ast::Grantee::Public),
@@ -6607,9 +6669,9 @@ fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>,
                 Ok(RoleSpecType::RolespecCstring) => Ok(ast::Grantee::Role(ast::RoleSpec::Name(
                     spec.rolename.clone(),
                 ))),
-                _ => Err(ParseError::ParseError(
-                    "CREATE POLICY: unknown role kind".into(),
-                )),
+                _ => Err(ParseError::ParseError(format!(
+                    "{statement}: unknown role kind"
+                ))),
             }
         })
         .collect()
@@ -13740,23 +13802,120 @@ mod tests {
     }
 
     #[test]
-    fn grant_and_revoke_of_role_membership_are_not_supported() {
-        for (sql, message) in [
-            ("GRANT admins TO alice", "GRANT of role membership"),
-            ("REVOKE admins FROM alice", "REVOKE of role membership"),
+    fn grant_and_revoke_of_roles_name_the_roles_and_the_grantees() {
+        let role = |name: &str| ast::Grantee::Role(ast::RoleSpec::Name(name.to_string()));
+        for (sql, revoke, roles, grantees) in [
+            (
+                "GRANT admins TO alice",
+                false,
+                vec!["admins"],
+                vec![role("alice")],
+            ),
+            (
+                "GRANT admins, \"Readers\" TO alice, CURRENT_USER, SESSION_USER, PUBLIC",
+                false,
+                vec!["admins", "Readers"],
+                vec![
+                    role("alice"),
+                    ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+                    ast::Grantee::Role(ast::RoleSpec::SessionUser),
+                    ast::Grantee::Public,
+                ],
+            ),
+            (
+                "REVOKE admins FROM alice",
+                true,
+                vec!["admins"],
+                vec![role("alice")],
+            ),
+            (
+                "REVOKE admins FROM alice RESTRICT",
+                true,
+                vec!["admins"],
+                vec![role("alice")],
+            ),
         ] {
             let parsed = crate::parse(sql).unwrap();
             assert_eq!(try_extract_grant(&parsed).unwrap(), None, "{sql}");
-            match PostgreSQLTranslator::new().translate(&parsed) {
+            let translated = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+            assert_eq!(
+                translated,
+                ast::Stmt::GrantRole(ast::GrantRole {
+                    revoke,
+                    roles: roles.into_iter().map(str::to_string).collect(),
+                    grantees,
+                }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_and_revoke_of_roles_refuse_options() {
+        for (sql, message) in [
+            (
+                "GRANT admins TO alice WITH ADMIN OPTION",
+                "GRANT ... WITH ADMIN OPTION is not supported",
+            ),
+            (
+                "GRANT admins TO alice WITH ADMIN TRUE",
+                "GRANT ... WITH ADMIN OPTION is not supported",
+            ),
+            (
+                "GRANT admins TO alice WITH INHERIT FALSE",
+                "GRANT ... WITH INHERIT is not supported",
+            ),
+            (
+                "GRANT admins TO alice WITH SET TRUE",
+                "GRANT ... WITH SET is not supported",
+            ),
+            (
+                "GRANT admins TO alice GRANTED BY postgres",
+                "GRANT ... GRANTED BY is not supported",
+            ),
+            (
+                "REVOKE ADMIN OPTION FOR admins FROM alice",
+                "REVOKE ADMIN OPTION FOR is not supported",
+            ),
+            (
+                "REVOKE INHERIT OPTION FOR admins FROM alice",
+                "REVOKE INHERIT OPTION FOR is not supported",
+            ),
+            (
+                "REVOKE admins FROM alice GRANTED BY postgres",
+                "REVOKE ... GRANTED BY is not supported",
+            ),
+            (
+                "REVOKE admins FROM alice CASCADE",
+                "REVOKE of role membership with CASCADE is not supported",
+            ),
+        ] {
+            match PostgreSQLTranslator::new().translate(&crate::parse(sql).unwrap()) {
                 Err(ParseError::Sqlstate {
                     sqlstate,
                     message: got,
                 }) => {
                     assert_eq!(sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
-                    assert_eq!(got, format!("{message} is not supported"), "{sql}");
+                    assert_eq!(got, message, "{sql}");
                 }
                 other => panic!("{sql}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn grant_of_a_role_with_columns_fails() {
+        match PostgreSQLTranslator::new()
+            .translate(&crate::parse("GRANT admins (x) TO alice").unwrap())
+        {
+            Err(ParseError::Sqlstate { sqlstate, message }) => {
+                assert_eq!(sqlstate, SQLSTATE_INVALID_GRANT_OPERATION);
+                assert_eq!(
+                    message,
+                    "column names cannot be included in GRANT/REVOKE ROLE"
+                );
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

@@ -100,6 +100,8 @@ pub enum CatalogChange {
         name: String,
         options: ast::RoleOptions,
     },
+    /// `GRANT role TO role` or `REVOKE role FROM role`.
+    GrantRole(ast::GrantRole),
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
@@ -366,7 +368,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
     /// has no roles, ownership, privileges or row-level security and refuses
-    /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
+    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
     /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
     /// `CREATE POLICY` and `DROP POLICY`.
     fn translate_catalog_changes(
@@ -412,6 +414,12 @@ pub trait Dialect: Send + Sync + 'static {
                     return Err(LimboError::ParseError(
                         "CREATE ROLE is not supported".to_string(),
                     ));
+                }
+                CatalogChange::GrantRole(grant) => {
+                    let statement = if grant.revoke { "REVOKE" } else { "GRANT" };
+                    return Err(LimboError::ParseError(format!(
+                        "{statement} of role membership is not supported"
+                    )));
                 }
                 _ => {}
             }
@@ -467,6 +475,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// switch to itself, and no session may switch to [`RoleId::PUBLIC`].
     fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
         role != RoleId::PUBLIC && (member == role || self.role_is_superuser(schema, member))
+    }
+
+    /// Whether `member` has the privileges of `role`: it is `role`, a
+    /// superuser, or, in a dialect with role membership, a role that
+    /// inherits the privileges of `role`. An owner check asks this of the
+    /// owner, so a role with the owner's privileges acts as the owner.
+    fn role_has_privileges_of(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        member == role || self.role_is_superuser(schema, member)
     }
 
     /// The role that owns relation `name` of `namespace`, when the dialect

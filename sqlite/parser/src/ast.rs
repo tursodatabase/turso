@@ -212,6 +212,9 @@ pub enum Stmt {
     /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
     /// frontend with roles translates its own GRANT into this.
     Grant(Grant),
+    /// `GRANT role TO role`: membership of roles in other roles. Not SQLite
+    /// syntax; a frontend with roles translates its own statement into this.
+    GrantRole(GrantRole),
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -1587,6 +1590,17 @@ pub struct Grant {
     /// which names any relation.
     pub on_sequences: bool,
     pub relations: Vec<QualifiedName>,
+    pub grantees: Vec<Grantee>,
+}
+
+/// `GRANT roles TO grantees`, which makes each grantee a member of each
+/// role, or `REVOKE roles FROM grantees` when `revoke` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GrantRole {
+    pub revoke: bool,
+    /// The names of the roles that the grantees become members of.
+    pub roles: Vec<String>,
     pub grantees: Vec<Grantee>,
 }
 

@@ -1,0 +1,515 @@
+# GRANT role TO role and REVOKE role FROM role through the PostgreSQL
+# frontend, and the memberships they make in pg_auth_members.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+
+@database :memory:
+
+# What GRANT stores: pg_auth_members.
+
+test grant-role-shows-the-membership-in-pg-auth-members {
+    CREATE ROLE rm_shown_group;
+    CREATE ROLE rm_shown_member;
+    GRANT rm_shown_group TO rm_shown_member;
+    SELECT r.rolname, m.rolname, g.rolname,
+        CAST(a.admin_option AS INTEGER), CAST(a.inherit_option AS INTEGER),
+        CAST(a.set_option AS INTEGER)
+    FROM pg_auth_members a
+    JOIN pg_roles r ON r.oid = a.roleid
+    JOIN pg_roles m ON m.oid = a.member
+    JOIN pg_roles g ON g.oid = a.grantor
+    WHERE m.rolname = 'rm_shown_member';
+}
+expect {
+    rm_shown_group|rm_shown_member|postgres|0|1|1
+}
+
+test grant-role-to-a-noinherit-role-does-not-inherit {
+    CREATE ROLE rm_noinherit_group;
+    CREATE ROLE rm_noinherit_member NOINHERIT;
+    GRANT rm_noinherit_group TO rm_noinherit_member;
+    SELECT CAST(a.inherit_option AS INTEGER)
+    FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'rm_noinherit_member';
+}
+expect {
+    0
+}
+
+test grant-several-roles-to-several-roles {
+    CREATE ROLE rm_many_g1;
+    CREATE ROLE rm_many_g2;
+    CREATE ROLE rm_many_m1;
+    CREATE ROLE rm_many_m2;
+    GRANT rm_many_g1, rm_many_g2 TO rm_many_m1, rm_many_m2;
+    SELECT r.rolname, m.rolname
+    FROM pg_auth_members a
+    JOIN pg_roles r ON r.oid = a.roleid
+    JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname IN ('rm_many_m1', 'rm_many_m2')
+    ORDER BY r.rolname, m.rolname;
+}
+expect {
+    rm_many_g1|rm_many_m1
+    rm_many_g1|rm_many_m2
+    rm_many_g2|rm_many_m1
+    rm_many_g2|rm_many_m2
+}
+
+test grant-role-twice-keeps-one-membership {
+    CREATE ROLE rm_twice_group;
+    CREATE ROLE rm_twice_member;
+    GRANT rm_twice_group TO rm_twice_member;
+    GRANT rm_twice_group TO rm_twice_member, rm_twice_member;
+    SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'rm_twice_member';
+}
+expect {
+    1
+}
+
+test grant-role-to-a-mixed-case-role {
+    CREATE ROLE "RmCasedGroup";
+    CREATE ROLE "RmCasedMember";
+    GRANT "RmCasedGroup" TO "RmCasedMember";
+    SELECT r.rolname
+    FROM pg_auth_members a
+    JOIN pg_roles r ON r.oid = a.roleid
+    JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'RmCasedMember';
+}
+expect {
+    RmCasedGroup
+}
+
+test grant-role-to-current-user-makes-the-current-role-a-member {
+    CREATE ROLE rm_current_group;
+    GRANT rm_current_group TO CURRENT_USER;
+    SELECT m.rolname
+    FROM pg_auth_members a
+    JOIN pg_roles r ON r.oid = a.roleid
+    JOIN pg_roles m ON m.oid = a.member
+    WHERE r.rolname = 'rm_current_group';
+}
+expect {
+    postgres
+}
+
+test grant-role-in-a-rolled-back-transaction-leaves-no-membership {
+    CREATE ROLE rm_rollback_group;
+    CREATE ROLE rm_rollback_member;
+    BEGIN;
+    GRANT rm_rollback_group TO rm_rollback_member;
+    ROLLBACK;
+    SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'rm_rollback_member';
+}
+expect {
+    0
+}
+
+# REVOKE
+
+test revoke-role-removes-the-membership {
+    CREATE ROLE rm_revoke_group;
+    CREATE ROLE rm_revoke_kept;
+    CREATE ROLE rm_revoke_member;
+    GRANT rm_revoke_group, rm_revoke_kept TO rm_revoke_member;
+    REVOKE rm_revoke_group FROM rm_revoke_member;
+    SELECT r.rolname
+    FROM pg_auth_members a
+    JOIN pg_roles r ON r.oid = a.roleid
+    JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'rm_revoke_member';
+}
+expect {
+    rm_revoke_kept
+}
+
+test revoke-role-that-was-not-granted-changes-nothing {
+    CREATE ROLE rm_not_granted_group;
+    CREATE ROLE rm_not_granted_member;
+    REVOKE rm_not_granted_group FROM rm_not_granted_member;
+    REVOKE rm_not_granted_group FROM rm_not_granted_group;
+    REVOKE pg_database_owner FROM rm_not_granted_member;
+    REVOKE rm_not_granted_group FROM pg_database_owner;
+    SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'rm_not_granted_member';
+}
+expect {
+    0
+}
+
+test grant-role-after-revoke-grants-it-again {
+    CREATE ROLE rm_regrant_group;
+    CREATE ROLE rm_regrant_member;
+    GRANT rm_regrant_group TO rm_regrant_member;
+    REVOKE rm_regrant_group FROM rm_regrant_member;
+    GRANT rm_regrant_group TO rm_regrant_member;
+    SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+    WHERE m.rolname = 'rm_regrant_member';
+}
+expect {
+    1
+}
+
+# Loops
+
+test grant-role-to-itself-fails {
+    CREATE ROLE rm_self;
+    GRANT rm_self TO rm_self;
+}
+@sqlstate 0LP01
+expect error {
+    role "rm_self" is a member of role "rm_self"
+}
+
+test grant-role-that-makes-a-loop-fails {
+    CREATE ROLE rm_loop_a;
+    CREATE ROLE rm_loop_b;
+    CREATE ROLE rm_loop_c;
+    GRANT rm_loop_a TO rm_loop_b;
+    GRANT rm_loop_b TO rm_loop_c;
+    GRANT rm_loop_c TO rm_loop_a;
+}
+@sqlstate 0LP01
+expect error {
+    role "rm_loop_c" is a member of role "rm_loop_a"
+}
+
+test grant-role-that-fails-grants-none-of-its-roles {
+    CREATE ROLE rm_atomic_group;
+    CREATE ROLE rm_atomic_member;
+    GRANT rm_atomic_group, rm_atomic_member TO rm_atomic_member;
+}
+@sqlstate 0LP01
+expect error {
+    role "rm_atomic_member" is a member of role "rm_atomic_member"
+}
+
+# Roles that do not exist, PUBLIC and pg_database_owner
+
+test grant-of-a-role-that-does-not-exist-fails {
+    CREATE ROLE rm_missing_member;
+    GRANT rm_missing_group TO rm_missing_member;
+}
+@sqlstate 42704
+expect error {
+    role "rm_missing_group" does not exist
+}
+
+test grant-to-a-role-that-does-not-exist-fails {
+    CREATE ROLE rm_missing_grantee_group;
+    GRANT rm_missing_grantee_group TO rm_missing_grantee;
+}
+@sqlstate 42704
+expect error {
+    role "rm_missing_grantee" does not exist
+}
+
+test grant-names-a-missing-grantee-before-a-missing-role {
+    GRANT rm_missing_both_group TO rm_missing_both_member;
+}
+@sqlstate 42704
+expect error {
+    role "rm_missing_both_member" does not exist
+}
+
+test revoke-of-a-role-that-does-not-exist-fails {
+    CREATE ROLE rm_revoke_missing_member;
+    REVOKE rm_revoke_missing_group FROM rm_revoke_missing_member;
+}
+@sqlstate 42704
+expect error {
+    role "rm_revoke_missing_group" does not exist
+}
+
+test grant-of-public-fails {
+    CREATE ROLE rm_public_member;
+    GRANT public TO rm_public_member;
+}
+@sqlstate 42704
+expect error {
+    role "public" does not exist
+}
+
+test grant-to-public-fails {
+    CREATE ROLE rm_public_group;
+    GRANT rm_public_group TO PUBLIC;
+}
+@sqlstate 42704
+expect error {
+    role "public" does not exist
+}
+
+test grant-of-pg-database-owner-fails {
+    CREATE ROLE rm_owner_member;
+    GRANT pg_database_owner TO rm_owner_member;
+}
+@sqlstate 0A000
+expect error {
+    role "pg_database_owner" cannot have explicit members
+}
+
+test grant-to-pg-database-owner-fails {
+    CREATE ROLE rm_owner_group;
+    GRANT rm_owner_group TO pg_database_owner;
+}
+@sqlstate 0A000
+expect error {
+    role "pg_database_owner" cannot be a member of any role
+}
+
+# Only a superuser may grant or revoke role membership.
+
+test grant-role-as-a-role-that-is-not-a-superuser-fails {
+    CREATE ROLE rm_denied_group;
+    CREATE ROLE rm_denied_member;
+    SET ROLE rm_denied_member;
+    GRANT rm_denied_group TO rm_denied_member;
+}
+@sqlstate 42501
+expect error {
+    permission denied to grant role "rm_denied_group"
+}
+
+test revoke-role-as-a-role-that-is-not-a-superuser-fails {
+    CREATE ROLE rm_revoke_denied_group;
+    CREATE ROLE rm_revoke_denied_member;
+    GRANT rm_revoke_denied_group TO rm_revoke_denied_member;
+    SET ROLE rm_revoke_denied_member;
+    REVOKE rm_revoke_denied_group FROM rm_revoke_denied_member;
+}
+@sqlstate 42501
+expect error {
+    permission denied to revoke role "rm_revoke_denied_group"
+}
+
+test grant-as-a-role-that-is-not-a-superuser-names-a-missing-role-first {
+    CREATE ROLE rm_denied_missing_member;
+    SET ROLE rm_denied_missing_member;
+    GRANT rm_denied_missing_group TO rm_denied_missing_member;
+}
+@sqlstate 42704
+expect error {
+    role "rm_denied_missing_group" does not exist
+}
+
+test grant-of-pg-database-owner-as-a-role-that-is-not-a-superuser-fails-for-the-role {
+    CREATE ROLE rm_denied_owner_member;
+    SET ROLE rm_denied_owner_member;
+    GRANT pg_database_owner TO rm_denied_owner_member;
+}
+@sqlstate 0A000
+expect error {
+    role "pg_database_owner" cannot have explicit members
+}
+
+test revoke-of-pg-database-owner-as-a-role-that-is-not-a-superuser-fails {
+    CREATE ROLE rm_denied_owner_revoker;
+    SET ROLE rm_denied_owner_revoker;
+    REVOKE pg_database_owner FROM rm_denied_owner_revoker;
+}
+@sqlstate 42501
+expect error {
+    permission denied to revoke role "pg_database_owner"
+}
+
+test grant-role-with-columns-fails {
+    CREATE ROLE rm_columns_group;
+    CREATE ROLE rm_columns_member;
+    GRANT rm_columns_group (x) TO rm_columns_member;
+}
+@sqlstate 0LP01
+expect error {
+    column names cannot be included in GRANT/REVOKE ROLE
+}
+
+# Inherited privileges: a member with INHERIT has the privileges of the roles
+# it is a member of, through chains of memberships that inherit.
+
+test member-reads-a-table-granted-to-its-role {
+    CREATE ROLE rm_read_group;
+    CREATE ROLE rm_read_member;
+    CREATE TABLE rm_read_docs (x INT);
+    INSERT INTO rm_read_docs VALUES (1);
+    GRANT SELECT ON rm_read_docs TO rm_read_group;
+    GRANT rm_read_group TO rm_read_member;
+    SET ROLE rm_read_member;
+    SELECT x FROM rm_read_docs;
+}
+expect {
+    1
+}
+
+test noinherit-member-does-not-read-a-table-granted-to-its-role {
+    CREATE ROLE rm_noread_group;
+    CREATE ROLE rm_noread_member NOINHERIT;
+    CREATE TABLE rm_noread_docs (x INT);
+    GRANT SELECT ON rm_noread_docs TO rm_noread_group;
+    GRANT rm_noread_group TO rm_noread_member;
+    SET ROLE rm_noread_member;
+    SELECT x FROM rm_noread_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_noread_docs
+}
+
+test member-reads-through-a-chain-of-roles {
+    CREATE ROLE rm_chain_top;
+    CREATE ROLE rm_chain_middle;
+    CREATE ROLE rm_chain_member;
+    CREATE TABLE rm_chain_docs (x INT);
+    INSERT INTO rm_chain_docs VALUES (2);
+    GRANT SELECT ON rm_chain_docs TO rm_chain_top;
+    GRANT rm_chain_top TO rm_chain_middle;
+    GRANT rm_chain_middle TO rm_chain_member;
+    SET ROLE rm_chain_member;
+    SELECT x FROM rm_chain_docs;
+}
+expect {
+    2
+}
+
+test a-noinherit-role-in-the-chain-stops-the-privileges {
+    CREATE ROLE rm_stop_top;
+    CREATE ROLE rm_stop_middle NOINHERIT;
+    CREATE ROLE rm_stop_member;
+    CREATE TABLE rm_stop_docs (x INT);
+    GRANT SELECT ON rm_stop_docs TO rm_stop_top;
+    GRANT rm_stop_top TO rm_stop_middle;
+    GRANT rm_stop_middle TO rm_stop_member;
+    SET ROLE rm_stop_member;
+    SELECT x FROM rm_stop_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_stop_docs
+}
+
+test member-combines-the-privileges-of-several-roles {
+    CREATE ROLE rm_combined_reader;
+    CREATE ROLE rm_combined_writer;
+    CREATE ROLE rm_combined_member;
+    CREATE TABLE rm_combined_docs (x INT);
+    INSERT INTO rm_combined_docs VALUES (1);
+    GRANT SELECT ON rm_combined_docs TO rm_combined_reader;
+    GRANT UPDATE ON rm_combined_docs TO rm_combined_writer;
+    GRANT rm_combined_reader, rm_combined_writer TO rm_combined_member;
+    SET ROLE rm_combined_member;
+    UPDATE rm_combined_docs SET x = x + 1;
+    SELECT x FROM rm_combined_docs;
+}
+expect {
+    2
+}
+
+test member-loses-the-privileges-when-the-membership-is-revoked {
+    CREATE ROLE rm_lost_group;
+    CREATE ROLE rm_lost_member;
+    CREATE TABLE rm_lost_docs (x INT);
+    GRANT SELECT ON rm_lost_docs TO rm_lost_group;
+    GRANT rm_lost_group TO rm_lost_member;
+    REVOKE rm_lost_group FROM rm_lost_member;
+    SET ROLE rm_lost_member;
+    SELECT x FROM rm_lost_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_lost_docs
+}
+
+test member-uses-a-sequence-granted-to-its-role {
+    CREATE ROLE rm_seq_group;
+    CREATE ROLE rm_seq_member;
+    CREATE SEQUENCE rm_seq_counter;
+    GRANT USAGE ON SEQUENCE rm_seq_counter TO rm_seq_group;
+    GRANT rm_seq_group TO rm_seq_member;
+    SET ROLE rm_seq_member;
+    SELECT nextval('rm_seq_counter');
+}
+expect {
+    1
+}
+
+# A member of the owner acts as the owner.
+
+test member-of-the-owner-reads-and-drops-the-table {
+    CREATE ROLE rm_owner_role;
+    CREATE ROLE rm_owner_role_member;
+    CREATE TABLE rm_owned_docs (x INT);
+    INSERT INTO rm_owned_docs VALUES (3);
+    ALTER TABLE rm_owned_docs OWNER TO rm_owner_role;
+    GRANT rm_owner_role TO rm_owner_role_member;
+    SET ROLE rm_owner_role_member;
+    SELECT x FROM rm_owned_docs;
+    DROP TABLE rm_owned_docs;
+    RESET ROLE;
+    SELECT count(*) FROM pg_class WHERE relname = 'rm_owned_docs';
+}
+expect {
+    3
+    0
+}
+
+test member-of-the-owner-grants-as-the-owner {
+    CREATE ROLE rm_grant_owner;
+    CREATE ROLE rm_grant_owner_member;
+    CREATE ROLE rm_grant_reader;
+    CREATE TABLE rm_granted_docs (x INT);
+    ALTER TABLE rm_granted_docs OWNER TO rm_grant_owner;
+    GRANT rm_grant_owner TO rm_grant_owner_member;
+    SET ROLE rm_grant_owner_member;
+    GRANT SELECT ON rm_granted_docs TO rm_grant_reader;
+    RESET ROLE;
+    SELECT relacl FROM pg_class WHERE relname = 'rm_granted_docs';
+}
+expect {
+    {rm_grant_owner=arwdDxtm/rm_grant_owner,rm_grant_reader=r/rm_grant_owner}
+}
+
+test noinherit-member-of-the-owner-may-not-drop-the-table {
+    CREATE ROLE rm_nodrop_owner;
+    CREATE ROLE rm_nodrop_member NOINHERIT;
+    CREATE TABLE rm_nodrop_docs (x INT);
+    ALTER TABLE rm_nodrop_docs OWNER TO rm_nodrop_owner;
+    GRANT rm_nodrop_owner TO rm_nodrop_member;
+    SET ROLE rm_nodrop_member;
+    DROP TABLE rm_nodrop_docs;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table rm_nodrop_docs
+}
+
+test noinherit-member-of-the-owner-may-not-grant {
+    CREATE ROLE rm_nogrant_owner;
+    CREATE ROLE rm_nogrant_member NOINHERIT;
+    CREATE ROLE rm_nogrant_reader;
+    CREATE TABLE rm_nogrant_docs (x INT);
+    ALTER TABLE rm_nogrant_docs OWNER TO rm_nogrant_owner;
+    GRANT rm_nogrant_owner TO rm_nogrant_member;
+    SET ROLE rm_nogrant_member;
+    GRANT SELECT ON rm_nogrant_docs TO rm_nogrant_reader;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rm_nogrant_docs
+}
+
+# Membership in the superuser role gives its privileges, but does not make a
+# role a superuser.
+test member-of-postgres-reads-its-tables {
+    CREATE ROLE rm_postgres_member;
+    CREATE TABLE rm_postgres_docs (x INT);
+    INSERT INTO rm_postgres_docs VALUES (4);
+    GRANT postgres TO rm_postgres_member;
+    SET ROLE rm_postgres_member;
+    SELECT x FROM rm_postgres_docs;
+    SELECT CAST(rolsuper AS INTEGER) FROM pg_roles WHERE rolname = current_user;
+}
+expect {
+    4
+    0
+}

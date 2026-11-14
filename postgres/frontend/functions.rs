@@ -1936,15 +1936,18 @@ mod tests {
 
     #[test]
     fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
-        let with_alice = RoleCatalog::new(&[vec![
-            Value::from_i64(1),
-            Value::build_text("alice"),
-            Value::from_i64(0),
-            Value::from_i64(1),
-            Value::from_i64(0),
-        ]])
+        let with_alice = RoleCatalog::new(
+            &[vec![
+                Value::from_i64(1),
+                Value::build_text("alice"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+            ]],
+            &[],
+        )
         .unwrap();
-        let without_alice = RoleCatalog::new(&[]).unwrap();
+        let without_alice = RoleCatalog::new(&[], &[]).unwrap();
         let alice = with_alice.get_by_name("alice").unwrap().id;
         assert_eq!(role_name_in(&with_alice, alice).unwrap(), "alice");
 

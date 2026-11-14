@@ -31,6 +31,7 @@ use turso_core::{
 use turso_parser::ast::RoleOptions;
 use turso_pg_parser::sqlstate::SQLSTATE_DUPLICATE_OBJECT;
 
+use crate::auth_members::Memberships;
 use crate::error::sqlstate_error;
 
 /// The table that stores the roles created with `CREATE ROLE`.
@@ -90,26 +91,31 @@ pub(crate) struct Role {
     pub(crate) name: String,
     /// A superuser passes every privilege check.
     pub(crate) superuser: bool,
-    /// A role with `inherit` uses the privileges of the roles it is a member
-    /// of without `SET ROLE`. tursopg has no role membership yet, so nothing
-    /// reads it but `pg_roles`.
+    /// Whether the memberships granted to the role inherit the privileges
+    /// of their roles. GRANT reads it when it stores a membership.
     pub(crate) inherit: bool,
     /// Row-level security does not limit a role with `bypassrls`.
     pub(crate) bypassrls: bool,
 }
 
-/// The roles stored in the roles table of a database, in memory. The
-/// built-in role ids have no entry.
+/// The roles stored in the roles table of a database and their
+/// memberships, in memory. The built-in role ids have no entry.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RoleCatalog {
     roles: BTreeMap<RoleId, Role>,
     ids_by_name: HashMap<String, RoleId>,
+    memberships: Memberships,
 }
 
 impl RoleCatalog {
-    /// Returns a catalog of the rows read from the roles table. Each row is
-    /// `(id, rolname, rolsuper, rolinherit, rolbypassrls)`.
-    pub(crate) fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
+    /// Returns a catalog of the rows read from the roles table and the
+    /// membership table. Each role row is `(id, rolname, rolsuper,
+    /// rolinherit, rolbypassrls)`; the membership rows are those of
+    /// [`crate::auth_members::schema_state_query`].
+    pub(crate) fn new(
+        rows: &[Vec<Value>],
+        membership_rows: &[Vec<Value>],
+    ) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
             let role = role_from_row(row)?;
@@ -120,6 +126,15 @@ impl RoleCatalog {
                 )));
             }
             catalog.add(role);
+        }
+        catalog.memberships = Memberships::new(membership_rows)?;
+        let exists = |id| id == RoleId::SUPERUSER || catalog.roles.contains_key(&id);
+        if let Some(membership) = catalog.memberships.iter().find(|membership| {
+            !exists(membership.role) || !exists(membership.member) || !exists(membership.grantor)
+        }) {
+            return Err(LimboError::Corrupt(format!(
+                "a role membership names a role that does not exist: {membership:?}"
+            )));
         }
         Ok(catalog)
     }
@@ -152,11 +167,51 @@ impl RoleCatalog {
     }
 
     /// Whether a session whose current role is `member` may switch to `role`
-    /// with `SET ROLE`. Role membership does not exist yet, so only a
-    /// superuser may switch to another role. No session may switch to
+    /// with `SET ROLE`: a superuser may switch to any role, and any other
+    /// role to the roles it is a member of, directly or through other roles,
+    /// whether or not it inherits their privileges. No session may switch to
     /// `public`.
     pub(crate) fn can_set_role(&self, member: RoleId, role: RoleId) -> bool {
-        role != RoleId::PUBLIC && (member == role || self.is_superuser(member))
+        role != RoleId::PUBLIC
+            && (member == role
+                || self.is_superuser(member)
+                || self
+                    .memberships
+                    .reached_from(member, |membership| membership.set_option)
+                    .contains(&role))
+    }
+
+    /// Whether `member` has the privileges of `role`, as in PostgreSQL: it
+    /// is `role` or a superuser, or reaches `role` through memberships that
+    /// inherit privileges.
+    pub(crate) fn has_privileges_of(&self, member: RoleId, role: RoleId) -> bool {
+        member == role || self.is_superuser(member) || self.roles_used_by(member).contains(&role)
+    }
+
+    /// `role` and every role whose privileges it has without `SET ROLE`:
+    /// the roles it reaches through memberships that inherit privileges.
+    pub(crate) fn roles_used_by(&self, role: RoleId) -> Vec<RoleId> {
+        self.memberships
+            .reached_from(role, |membership| membership.inherit_option)
+    }
+
+    /// The memberships of the roles.
+    pub(crate) fn memberships(&self) -> &Memberships {
+        &self.memberships
+    }
+
+    /// Applies what `GRANT role TO role` or `REVOKE role FROM role` wrote,
+    /// one membership at a time.
+    pub(crate) fn apply_grant_role(
+        &mut self,
+        revoke: bool,
+        values: &[Value],
+    ) -> turso_core::Result<()> {
+        if revoke {
+            self.memberships.apply_revoke(values)
+        } else {
+            self.memberships.apply_grant(values)
+        }
     }
 
     /// Adds the role that `CREATE ROLE name` stored, under the id that the
@@ -374,7 +429,7 @@ mod tests {
 
     #[test]
     fn superuser_is_a_superuser_without_being_in_the_catalog() {
-        let catalog = RoleCatalog::new(&[]).unwrap();
+        let catalog = RoleCatalog::new(&[], &[]).unwrap();
 
         assert!(catalog.get(RoleId::SUPERUSER).is_none());
         assert!(catalog.is_superuser(RoleId::SUPERUSER));
@@ -384,7 +439,7 @@ mod tests {
     #[test]
     fn new_reads_the_stored_roles() {
         let catalog =
-            RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "Alice", 1)]).unwrap();
+            RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "Alice", 1)], &[]).unwrap();
 
         let names: Vec<_> = catalog.iter().map(|role| role.name.as_str()).collect();
         assert_eq!(names, vec!["alice", "Alice"]);
@@ -397,25 +452,28 @@ mod tests {
     #[test]
     fn new_rejects_a_duplicate_role_name() {
         let error =
-            RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "alice", 0)]).unwrap_err();
+            RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "alice", 0)], &[]).unwrap_err();
 
         assert!(matches!(error, LimboError::Corrupt(_)), "{error}");
     }
 
     #[test]
     fn new_rejects_an_invalid_row() {
-        let error = RoleCatalog::new(&[vec![Value::from_i64(1)]]).unwrap_err();
+        let error = RoleCatalog::new(&[vec![Value::from_i64(1)]], &[]).unwrap_err();
 
         assert!(matches!(error, LimboError::Corrupt(_)), "{error}");
     }
 
     #[test]
     fn superusers_and_bypassrls_roles_bypass_rls() {
-        let catalog = RoleCatalog::new(&[
-            role_row(1, "alice", 0),
-            role_row(2, "admin", 1),
-            bypassrls_role_row(3, "reader"),
-        ])
+        let catalog = RoleCatalog::new(
+            &[
+                role_row(1, "alice", 0),
+                role_row(2, "admin", 1),
+                bypassrls_role_row(3, "reader"),
+            ],
+            &[],
+        )
         .unwrap();
         let id = |name| catalog.get_by_name(name).unwrap().id;
 
@@ -429,16 +487,70 @@ mod tests {
 
     #[test]
     fn a_role_keeps_the_inherit_value_of_its_row() {
-        let catalog =
-            RoleCatalog::new(&[role_row(1, "alice", 0), noinherit_role_row(2, "bob")]).unwrap();
+        let catalog = RoleCatalog::new(
+            &[role_row(1, "alice", 0), noinherit_role_row(2, "bob")],
+            &[],
+        )
+        .unwrap();
 
         assert!(catalog.get_by_name("alice").unwrap().inherit);
         assert!(!catalog.get_by_name("bob").unwrap().inherit);
     }
 
     #[test]
+    fn a_member_may_set_the_roles_it_reaches_through_memberships() {
+        // carol is a member of bob without inheriting, and bob of alice.
+        let catalog = RoleCatalog::new(
+            &[
+                role_row(1, "alice", 0),
+                role_row(2, "bob", 0),
+                noinherit_role_row(3, "carol"),
+                role_row(4, "dave", 0),
+            ],
+            &[membership_row(1, 1, 2, 1), membership_row(2, 2, 3, 0)],
+        )
+        .unwrap();
+        let id = |name| catalog.get_by_name(name).unwrap().id;
+
+        assert!(catalog.can_set_role(id("bob"), id("alice")));
+        assert!(catalog.can_set_role(id("carol"), id("bob")));
+        assert!(catalog.can_set_role(id("carol"), id("alice")));
+        assert!(!catalog.can_set_role(id("alice"), id("bob")));
+        assert!(!catalog.can_set_role(id("dave"), id("alice")));
+        assert!(!catalog.can_set_role(id("carol"), RoleId::PUBLIC));
+    }
+
+    #[test]
+    fn a_member_has_the_privileges_of_the_roles_it_inherits_from() {
+        // carol is a member of bob without inheriting, and bob of alice.
+        let catalog = RoleCatalog::new(
+            &[
+                role_row(1, "alice", 0),
+                role_row(2, "bob", 0),
+                noinherit_role_row(3, "carol"),
+                role_row(4, "admin", 1),
+            ],
+            &[membership_row(1, 1, 2, 1), membership_row(2, 2, 3, 0)],
+        )
+        .unwrap();
+        let id = |name| catalog.get_by_name(name).unwrap().id;
+
+        assert!(catalog.has_privileges_of(id("bob"), id("alice")));
+        assert!(catalog.has_privileges_of(id("carol"), id("carol")));
+        assert!(!catalog.has_privileges_of(id("carol"), id("bob")));
+        assert!(!catalog.has_privileges_of(id("carol"), id("alice")));
+        assert!(!catalog.has_privileges_of(id("alice"), id("bob")));
+        assert!(catalog.has_privileges_of(id("admin"), id("carol")));
+        assert_eq!(
+            catalog.roles_used_by(id("bob")),
+            vec![id("bob"), id("alice")]
+        );
+    }
+
+    #[test]
     fn only_a_superuser_may_set_another_role_and_no_one_may_set_public() {
-        let catalog = RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "bob", 0)]).unwrap();
+        let catalog =
+            RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "bob", 0)], &[]).unwrap();
         let alice = catalog.get_by_name("alice").unwrap().id;
         let bob = catalog.get_by_name("bob").unwrap().id;
 
@@ -465,6 +577,19 @@ mod tests {
             Value::build_text(name.to_string()),
             Value::from_i64(0),
             Value::from_i64(1),
+            Value::from_i64(1),
+        ]
+    }
+
+    /// A membership row of `member` in `role`, granted by the superuser.
+    fn membership_row(id: i64, role: i64, member: i64, inherit: i64) -> Vec<Value> {
+        vec![
+            Value::from_i64(id),
+            Value::from_i64(role),
+            Value::from_i64(member),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(inherit),
             Value::from_i64(1),
         ]
     }

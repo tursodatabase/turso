@@ -532,3 +532,118 @@ test alter-policy-rename-is-not-supported {
 expect error {
     ALTER POLICY ... RENAME is not supported
 }
+
+# A policy for a role applies to the roles that have its privileges, such as
+# a member that inherits them.
+
+test policy-to-a-role-applies-to-its-member {
+    CREATE ROLE rp_member_group;
+    CREATE ROLE rp_member;
+    CREATE TABLE rp_member_docs (id INT PRIMARY KEY);
+    INSERT INTO rp_member_docs VALUES (1), (2), (3);
+    ALTER TABLE rp_member_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY big ON rp_member_docs FOR SELECT TO rp_member_group USING (id > 1);
+    GRANT SELECT ON rp_member_docs TO rp_member_group;
+    GRANT rp_member_group TO rp_member;
+    SET ROLE rp_member;
+    SELECT id FROM rp_member_docs ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+test policy-to-a-role-applies-through-a-chain-of-roles {
+    CREATE ROLE rp_chain_top;
+    CREATE ROLE rp_chain_middle;
+    CREATE ROLE rp_chain_member;
+    CREATE TABLE rp_chain_docs (id INT PRIMARY KEY);
+    INSERT INTO rp_chain_docs VALUES (1), (2);
+    ALTER TABLE rp_chain_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY first ON rp_chain_docs FOR SELECT TO rp_chain_top USING (id = 1);
+    GRANT SELECT ON rp_chain_docs TO rp_chain_member;
+    GRANT rp_chain_top TO rp_chain_middle;
+    GRANT rp_chain_middle TO rp_chain_member;
+    SET ROLE rp_chain_member;
+    SELECT id FROM rp_chain_docs;
+}
+expect {
+    1
+}
+
+test policy-to-a-role-does-not-apply-to-a-noinherit-member {
+    CREATE ROLE rp_noinherit_group;
+    CREATE ROLE rp_noinherit_member NOINHERIT;
+    CREATE TABLE rp_noinherit_docs (id INT PRIMARY KEY);
+    INSERT INTO rp_noinherit_docs VALUES (1), (2);
+    ALTER TABLE rp_noinherit_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON rp_noinherit_docs FOR SELECT TO rp_noinherit_group USING (true);
+    GRANT SELECT ON rp_noinherit_docs TO rp_noinherit_member;
+    GRANT rp_noinherit_group TO rp_noinherit_member;
+    SET ROLE rp_noinherit_member;
+    SELECT count(*) FROM rp_noinherit_docs;
+}
+expect {
+    0
+}
+
+test policy-to-a-role-lets-its-member-insert {
+    CREATE ROLE rp_insert_group;
+    CREATE ROLE rp_insert_member;
+    CREATE TABLE rp_insert_docs (id INT PRIMARY KEY);
+    ALTER TABLE rp_insert_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY positive ON rp_insert_docs FOR INSERT TO rp_insert_group WITH CHECK (id > 0);
+    GRANT INSERT ON rp_insert_docs TO rp_insert_group;
+    GRANT rp_insert_group TO rp_insert_member;
+    SET ROLE rp_insert_member;
+    INSERT INTO rp_insert_docs VALUES (1);
+    RESET ROLE;
+    SELECT id FROM rp_insert_docs;
+}
+expect {
+    1
+}
+
+test member-of-the-tables-owner-reads-every-row {
+    CREATE ROLE rp_owner_group;
+    CREATE ROLE rp_owner_member;
+    CREATE TABLE rp_owner_docs (id INT PRIMARY KEY);
+    INSERT INTO rp_owner_docs VALUES (1), (2);
+    ALTER TABLE rp_owner_docs ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE rp_owner_docs OWNER TO rp_owner_group;
+    GRANT rp_owner_group TO rp_owner_member;
+    SET ROLE rp_owner_member;
+    SELECT count(*) FROM rp_owner_docs;
+}
+expect {
+    2
+}
+
+# A role that cannot read the table itself switches to roles it is a member
+# of, and the policies for each decide which rows it reads.
+test policy-decides-the-rows-after-set-role-to-a-role-of-a-member {
+    CREATE ROLE rp_setrole_guest NOINHERIT;
+    CREATE ROLE rp_setrole_reader NOINHERIT;
+    CREATE ROLE rp_setrole_admin NOINHERIT BYPASSRLS;
+    CREATE ROLE rp_setrole_login NOINHERIT;
+    GRANT rp_setrole_guest, rp_setrole_reader, rp_setrole_admin TO rp_setrole_login;
+    CREATE TABLE rp_setrole_docs (id INT PRIMARY KEY, owner TEXT);
+    INSERT INTO rp_setrole_docs VALUES (1, 'alice'), (2, 'bob'), (3, 'alice');
+    ALTER TABLE rp_setrole_docs ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON rp_setrole_docs TO rp_setrole_guest, rp_setrole_reader, rp_setrole_admin;
+    CREATE POLICY alices ON rp_setrole_docs FOR SELECT TO rp_setrole_reader
+        USING (owner = 'alice');
+    SET ROLE rp_setrole_login;
+    SET ROLE rp_setrole_guest;
+    SELECT count(*) FROM rp_setrole_docs;
+    SET ROLE rp_setrole_reader;
+    SELECT id FROM rp_setrole_docs ORDER BY id;
+    SET ROLE rp_setrole_admin;
+    SELECT count(*) FROM rp_setrole_docs;
+}
+expect {
+    0
+    1
+    3
+    3
+}

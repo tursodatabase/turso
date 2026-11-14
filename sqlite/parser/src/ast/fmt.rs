@@ -704,6 +704,7 @@ impl ToTokens for Stmt {
                 Ok(())
             }
             Self::Grant(grant) => grant.to_tokens(s, context),
+            Self::GrantRole(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -1797,6 +1798,29 @@ impl ToTokens for Grant {
             s.append(TK_ID, Some("SEQUENCE"))?;
         }
         s.comma(&self.relations, context)?;
+        if self.revoke {
+            s.append(TK_FROM, None)?;
+        } else {
+            s.append(TK_TO, None)?;
+        }
+        s.comma(&self.grantees, context)
+    }
+}
+
+impl_display_for_to_tokens!(GrantRole);
+impl ToTokens for GrantRole {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ID, Some(if self.revoke { "REVOKE" } else { "GRANT" }))?;
+        for (i, role) in self.roles.iter().enumerate() {
+            if i > 0 {
+                s.append(TK_COMMA, None)?;
+            }
+            s.append(TK_ID, Some(role))?;
+        }
         if self.revoke {
             s.append(TK_FROM, None)?;
         } else {

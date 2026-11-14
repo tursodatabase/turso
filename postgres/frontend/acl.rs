@@ -264,21 +264,23 @@ impl Acl {
         }
     }
 
-    /// Whether the list gives `role`, by oid or through `PUBLIC`, every
-    /// privilege of `wanted`.
-    pub(crate) fn grants(&self, role: i64, wanted: Privileges) -> bool {
+    /// Whether the list gives `roles` together, by oid or through `PUBLIC`,
+    /// every privilege of `wanted`. A role has the privileges of each role
+    /// it inherits from, so a check names all of them.
+    pub(crate) fn grants(&self, roles: &[i64], wanted: Privileges) -> bool {
         self.items
             .iter()
-            .filter(|item| item.grantee == role || item.grantee == PUBLIC_OID)
+            .filter(|item| roles.contains(&item.grantee) || item.grantee == PUBLIC_OID)
             .fold(Privileges::empty(), |given, item| given | item.privileges)
             .contains(wanted)
     }
 
-    /// Whether the list gives `role`, by oid or through `PUBLIC`, any
-    /// privilege at all.
-    pub(crate) fn gives_anything_to(&self, role: i64) -> bool {
+    /// Whether the list gives any of `roles`, by oid or through `PUBLIC`,
+    /// any privilege at all.
+    pub(crate) fn gives_anything_to(&self, roles: &[i64]) -> bool {
         self.items.iter().any(|item| {
-            (item.grantee == role || item.grantee == PUBLIC_OID) && !item.privileges.is_empty()
+            (roles.contains(&item.grantee) || item.grantee == PUBLIC_OID)
+                && !item.privileges.is_empty()
         })
     }
 
@@ -390,7 +392,7 @@ mod tests {
         let mut acl = Acl::default_for(RelationKind::Table, OWNER);
         acl.revoke(OWNER, Privileges::SELECT, OWNER);
         assert_eq!(acl.stored_text(), "{10=awdDxtm/10}");
-        assert!(!acl.grants(OWNER, Privileges::SELECT));
+        assert!(!acl.grants(&[OWNER], Privileges::SELECT));
     }
 
     #[test]
@@ -427,26 +429,26 @@ mod tests {
         let mut acl = Acl::default_for(RelationKind::Table, OWNER);
         acl.grant(READER, Privileges::SELECT, OWNER);
         acl.grant(PUBLIC_OID, Privileges::INSERT, OWNER);
-        assert!(acl.grants(READER, Privileges::SELECT | Privileges::INSERT));
-        assert!(!acl.grants(READER, Privileges::SELECT | Privileges::UPDATE));
-        assert!(acl.grants(STRANGER, Privileges::INSERT));
-        assert!(!acl.grants(STRANGER, Privileges::SELECT));
+        assert!(acl.grants(&[READER], Privileges::SELECT | Privileges::INSERT));
+        assert!(!acl.grants(&[READER], Privileges::SELECT | Privileges::UPDATE));
+        assert!(acl.grants(&[STRANGER], Privileges::INSERT));
+        assert!(!acl.grants(&[STRANGER], Privileges::SELECT));
     }
 
     #[test]
     fn the_list_says_whom_it_gives_privileges() {
         let mut acl = Acl::default_for(RelationKind::Table, OWNER);
-        assert!(acl.gives_anything_to(OWNER));
-        assert!(acl.grants(OWNER, Privileges::SELECT));
-        assert!(!acl.gives_anything_to(READER));
-        assert!(!acl.grants(READER, Privileges::SELECT));
+        assert!(acl.gives_anything_to(&[OWNER]));
+        assert!(acl.grants(&[OWNER], Privileges::SELECT));
+        assert!(!acl.gives_anything_to(&[READER]));
+        assert!(!acl.grants(&[READER], Privileges::SELECT));
         acl.grant(READER, Privileges::SELECT, OWNER);
-        assert!(acl.gives_anything_to(READER));
-        assert!(acl.grants(READER, Privileges::SELECT));
-        assert!(!acl.gives_anything_to(STRANGER));
+        assert!(acl.gives_anything_to(&[READER]));
+        assert!(acl.grants(&[READER], Privileges::SELECT));
+        assert!(!acl.gives_anything_to(&[STRANGER]));
         acl.grant(PUBLIC_OID, Privileges::SELECT, OWNER);
-        assert!(acl.gives_anything_to(STRANGER));
-        assert!(acl.grants(STRANGER, Privileges::SELECT));
+        assert!(acl.gives_anything_to(&[STRANGER]));
+        assert!(acl.grants(&[STRANGER], Privileges::SELECT));
     }
 
     #[test]
@@ -496,5 +498,17 @@ mod tests {
         ] {
             assert!(Acl::parse(text).is_none(), "{text} parses");
         }
+    }
+
+    #[test]
+    fn grants_combines_the_privileges_of_several_roles() {
+        let mut acl = Acl::default_for(RelationKind::Table, OWNER);
+        acl.grant(READER, Privileges::SELECT, OWNER);
+        acl.grant(STRANGER, Privileges::UPDATE, OWNER);
+
+        assert!(acl.grants(&[READER, STRANGER], Privileges::SELECT | Privileges::UPDATE));
+        assert!(!acl.grants(&[READER], Privileges::SELECT | Privileges::UPDATE));
+        assert!(acl.gives_anything_to(&[OWNER - 1, STRANGER]));
+        assert!(!acl.gives_anything_to(&[]));
     }
 }
