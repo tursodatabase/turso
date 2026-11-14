@@ -4472,6 +4472,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
+    last_sequence_compaction_ts: AtomicU64,
     /// `end_ts` of the most recent tx whose header was written into
     /// `global_header`. Used to gate header writes at both
     /// `EndCommitLogicalLog` and `FinalizeCommit` so an older commit
@@ -4660,6 +4661,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
+            last_sequence_compaction_ts: AtomicU64::new(0),
             last_global_header_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
@@ -7843,7 +7845,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn checkpoint_snapshot_ts(&self) -> u64 {
         let mut snapshot_ts = 0;
         self.clock.get_timestamp(|_now| {
-            let last_committed = self.last_committed_tx_ts.load(Ordering::Acquire);
+            let last_committed = self
+                .last_committed_tx_ts
+                .load(Ordering::Acquire)
+                .max(self.last_sequence_compaction_ts.load(Ordering::Acquire));
             let inflight_floor = self
                 .txs
                 .iter()
@@ -9002,6 +9007,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.mark_checkpoint_dirty_key(&rowid, end_ts).is_err() {
             self.require_checkpoint_full_scan(end_ts);
         }
+        self.last_sequence_compaction_ts
+            .fetch_max(end_ts, Ordering::AcqRel);
     }
 
     fn seqcompact_stamp_delete(&self, rowid: &RowID, end_ts: u64) -> bool {

@@ -22758,6 +22758,188 @@ fn test_descending_sequence_compaction() {
     );
 }
 
+#[test]
+fn test_sequence_snapshot_survives_truncate_busy() {
+    sequence_snapshot_survives_failed_truncate(false);
+}
+
+#[test]
+fn test_sequence_snapshot_survives_truncate_before_pager_commit_failure() {
+    sequence_snapshot_survives_failed_truncate(true);
+}
+
+fn sequence_snapshot_survives_failed_truncate(inject_failure: bool) {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE SEQUENCE s MINVALUE 0 START WITH 0")
+        .unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT nextval('s')")[0][0].as_int(),
+        Some(0)
+    );
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT nextval('s')")[0][0].as_int(),
+        Some(1)
+    );
+
+    let reader = db.connect();
+    let writer = db.connect();
+    let checkpoint = db.connect();
+    let read = "SELECT COALESCE((SELECT value FROM __turso_internal_seq_s ORDER BY value DESC LIMIT 1), 0)";
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(get_rows(&reader, read)[0][0].as_int(), Some(1));
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&writer, "SELECT nextval('s')")[0][0].as_int(),
+        Some(2)
+    );
+    writer.execute("COMMIT").unwrap();
+
+    if inject_failure {
+        let injector = FixedFailureInjector::new([(
+            CheckpointYieldPoint::BeforePagerCommit.point(),
+            LimboError::TxError("sequence checkpoint failure before pager commit".to_string()),
+        )]);
+        checkpoint.set_failure_injector(Some(injector.clone()));
+        let result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+        checkpoint.set_failure_injector(None);
+        assert!(injector.is_empty());
+        assert!(matches!(result, Err(LimboError::TxError(_))));
+    } else {
+        let result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+        assert!(
+            matches!(result, Err(LimboError::Busy)),
+            "expected Busy, got {result:?}"
+        );
+    }
+    assert_eq!(get_rows(&reader, read)[0][0].as_int(), Some(1));
+    reader.execute("ROLLBACK").unwrap();
+
+    checkpoint
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    checkpoint
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert_eq!(get_rows(&setup, read)[0][0].as_int(), Some(2));
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM __turso_internal_seq_s")[0][0].as_int(),
+        Some(1)
+    );
+    assert_eq!(
+        get_rows(&setup, "SELECT nextval('s')")[0][0].as_int(),
+        Some(3)
+    );
+}
+
+#[test]
+fn test_sequence_truncate_reclaims_versions_and_persists_compaction() {
+    for passive in [false, true] {
+        sequence_checkpoint_reclaims_versions_and_persists_compaction(passive, "TRUNCATE");
+    }
+}
+
+#[test]
+fn test_sequence_passive_reclaims_versions_and_persists_compaction() {
+    sequence_checkpoint_reclaims_versions_and_persists_compaction(true, "PASSIVE");
+}
+
+fn sequence_checkpoint_reclaims_versions_and_persists_compaction(passive: bool, mode: &str) {
+    let mut db = if passive {
+        MvccTestDbNoConn::new_with_random_db_passive()
+    } else {
+        MvccTestDbNoConn::new_with_random_db()
+    };
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    setup
+        .execute("CREATE SEQUENCE s MINVALUE 0 START WITH 0")
+        .unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT nextval('s')")[0][0].as_int(),
+        Some(0)
+    );
+    let checkpoint = format!("PRAGMA wal_checkpoint({mode})");
+    setup.execute(&checkpoint).unwrap();
+    for expected in [1, 2, 3, 4] {
+        setup.execute("BEGIN CONCURRENT").unwrap();
+        assert_eq!(
+            get_rows(&setup, "SELECT nextval('s')")[0][0].as_int(),
+            Some(expected)
+        );
+        setup.execute("COMMIT").unwrap();
+    }
+    let store = db.get_mvcc_store();
+    let root = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE name = '__turso_internal_seq_s'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = store.get_table_id_from_root_page(root);
+    let version_count = || -> usize {
+        store
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id == table_id)
+            .map(|entry| entry.value().read().len())
+            .sum()
+    };
+    assert!(version_count() >= 4);
+    for _ in 0..5 {
+        setup.execute(&checkpoint).unwrap();
+    }
+    let remaining_versions = version_count();
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM __turso_internal_seq_s")[0][0].as_int(),
+        Some(1)
+    );
+    assert_eq!(
+        get_rows(&setup, "SELECT max(value) FROM __turso_internal_seq_s")[0][0].as_int(),
+        Some(4)
+    );
+    drop(store);
+    drop(setup);
+    db.restart();
+    let reopened = db.connect();
+    let backing_rows = get_rows(&reopened, "SELECT count(*) FROM __turso_internal_seq_s")[0][0]
+        .as_int()
+        .unwrap();
+    assert_eq!(
+        (remaining_versions, backing_rows),
+        (0, 1),
+        "versions before close and backing rows after reopen: mode={mode}, passive={passive}"
+    );
+    assert_eq!(
+        get_rows(&reopened, "SELECT max(value) FROM __turso_internal_seq_s")[0][0].as_int(),
+        Some(4)
+    );
+}
+
+#[test]
+fn test_sequence_compaction_checkpoint_boundary_waits_for_preparing_transaction() {
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let inflight = store.begin_tx(db.conn.pager.load().clone()).unwrap();
+    store.last_committed_tx_ts.store(1000, Ordering::SeqCst);
+    let tx = store.txs.get(&inflight).unwrap();
+    tx.value().state.store(TransactionState::Preparing(500));
+
+    store.seqcompact_commit_delete(RowID::new(MVTableId::from(-2), RowKey::Int(1)), 1500);
+    assert_eq!(store.checkpoint_snapshot_ts(), 499);
+    tx.value().state.store(TransactionState::Committed(500));
+    assert_eq!(store.checkpoint_snapshot_ts(), 1500);
+    assert_eq!(store.last_committed_tx_ts.load(Ordering::Acquire), 1000);
+}
+
 /// Autoincrement in an ATTACH'd MVCC database must persist across checkpoint + restart.
 ///
 /// Before the fix, dirty_sequences lacked a database_id so flush always targeted main,
