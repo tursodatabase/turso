@@ -182,14 +182,27 @@ pub(crate) fn emit_encoded_default(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    translate_expr_no_constant_opt(
+    // `union_value()` needs the type of the column it is constructing, just
+    // like it does for an explicit INSERT/UPDATE value. Defaults are also
+    // translated when reading rows that predate an added column, so provide
+    // the column context here as well.
+    let union_td = resolver
+        .schema()
+        .get_type_def_unchecked(&column.ty_str)
+        .filter(|td| td.is_union())
+        .cloned();
+    let prev_union = program.target_union_type.take();
+    program.target_union_type = union_td;
+    let result = translate_expr_no_constant_opt(
         program,
         None,
         default_expr,
         target_register,
         resolver,
         NoConstantOptReason::RegisterReuse,
-    )?;
+    );
+    program.target_union_type = prev_union;
+    result?;
     emit_custom_type_encode_columns(
         program,
         resolver,

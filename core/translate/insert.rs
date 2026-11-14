@@ -1946,14 +1946,23 @@ fn emit_notnulls(
                 });
 
                 // Evaluate default expression into the column register.
-                translate_expr_no_constant_opt(
+                let union_td = resolver
+                    .schema()
+                    .get_type_def_unchecked(&column_mapping.column.ty_str)
+                    .filter(|td| td.is_union())
+                    .cloned();
+                let prev_union = program.target_union_type.take();
+                program.target_union_type = union_td;
+                let result = translate_expr_no_constant_opt(
                     program,
                     None,
                     default_expr,
                     column_mapping.register,
                     resolver,
                     NoConstantOptReason::RegisterReuse,
-                )?;
+                );
+                program.target_union_type = prev_union;
+                result?;
 
                 // The statement-level Affinity insn already ran on the
                 // original (NULL) value, so the substituted default needs the
@@ -3069,7 +3078,17 @@ fn translate_column(
             return Ok(());
         };
         let has_custom_encode = resolved.as_ref().is_some_and(|r| r.has_encode_or_coerce());
-        if has_custom_encode {
+        // A DEFAULT is translated as the value for this column even though it
+        // doesn't have an explicit VALUES expression. Give `union_value()` the
+        // same target context as the explicit-value path above.
+        let union_td = resolver
+            .schema()
+            .get_type_def_unchecked(&column.ty_str)
+            .filter(|td| td.is_union())
+            .cloned();
+        let prev_union = program.target_union_type.take();
+        program.target_union_type = union_td;
+        let result = if has_custom_encode {
             translate_expr_no_constant_opt(
                 program,
                 None,
@@ -3077,10 +3096,12 @@ fn translate_column(
                 column_register,
                 resolver,
                 NoConstantOptReason::CustomTypeEncode,
-            )?;
+            )
         } else {
-            translate_expr(program, None, default_expr, column_register, resolver)?;
-        }
+            translate_expr(program, None, default_expr, column_register, resolver)
+        };
+        program.target_union_type = prev_union;
+        result?;
     }
     Ok(())
 }
