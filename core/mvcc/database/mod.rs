@@ -4364,10 +4364,8 @@ pub struct Watermarks {
 }
 
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
-/// Test-only harness data, not part of the public MVCC API.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GcDebugSnapshot {
+pub struct GcDebugSnapshot {
     pub rows_slots: usize,
     pub rows_empty_slots: usize,
     pub rows_versions: usize,
@@ -4381,6 +4379,13 @@ pub(crate) struct GcDebugSnapshot {
     pub logical_log_offset: u64,
     pub logical_log_size: u64,
     pub active_txs: usize,
+    /// Number of removed transactions whose final state the store still remembers.
+    pub finalized_tx_states: usize,
+    /// Whether the incremental GC of table rows stopped part way, so that the next pass
+    /// continues from there instead of from the first row.
+    pub table_sweep_unfinished: bool,
+    /// Like `table_sweep_unfinished`, for index rows.
+    pub index_sweep_unfinished: bool,
     pub min_reader_mark: WalPos,
     pub backfill_floor: WalPos,
 }
@@ -8066,8 +8071,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Debug SkipMap / GC counters. Walks every chain; not for hot paths.
-    #[cfg(test)]
-    pub(crate) fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+    pub fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
         let mut rows_empty_slots = 0;
         let mut rows_versions = 0;
         for entry in self.rows.iter() {
@@ -8106,6 +8110,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             logical_log_offset: self.logical_log_offset(),
             logical_log_size: self.get_logical_log_file().size().unwrap_or(0),
             active_txs: self.txs.len(),
+            finalized_tx_states: self.finalized_tx_states.len(),
+            table_sweep_unfinished: self.gc_table_cursor.lock().is_some(),
+            index_sweep_unfinished: self.gc_index_cursor.lock().is_some(),
             min_reader_mark: self.compute_min_reader_mark(),
             backfill_floor: *self.backfill_floor.read(),
         }

@@ -6542,14 +6542,14 @@ fn test_read_only_commit_does_not_cache_finalized_state() {
 
     // Establish a clean baseline after schema/setup writes.
     mvcc_store.drop_unused_row_versions();
-    let baseline = mvcc_store.finalized_tx_states.len();
+    let baseline = mvcc_store.debug_gc_snapshot().finalized_tx_states;
 
     conn.execute("BEGIN CONCURRENT").unwrap();
     let _ = get_rows(&conn, "SELECT 1");
     conn.execute("COMMIT").unwrap();
 
     assert_eq!(
-        mvcc_store.finalized_tx_states.len(),
+        mvcc_store.debug_gc_snapshot().finalized_tx_states,
         baseline,
         "read-only commit should not add finalized tx cache entries"
     );
@@ -6565,10 +6565,10 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
 
     // Establish a clean baseline after schema/setup writes.
     mvcc_store.drop_unused_row_versions();
-    let baseline = mvcc_store.finalized_tx_states.len();
+    let baseline = mvcc_store.debug_gc_snapshot().finalized_tx_states;
 
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
-    let after_write = mvcc_store.finalized_tx_states.len();
+    let after_write = mvcc_store.debug_gc_snapshot().finalized_tx_states;
     assert!(
         after_write > baseline,
         "write commit should add at least one finalized tx cache entry"
@@ -6577,7 +6577,7 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
     mvcc_store.drop_unused_row_versions();
 
     assert_eq!(
-        mvcc_store.finalized_tx_states.len(),
+        mvcc_store.debug_gc_snapshot().finalized_tx_states,
         baseline,
         "GC scan should prune finalized tx cache entries with no remaining TxID references"
     );
@@ -10778,7 +10778,7 @@ fn test_gc_incremental_reclaims_like_full_sweep() {
         let dropped = db.mvcc_store.gc_incremental(3);
         total += dropped;
         passes += 1;
-        if dropped == 0 && db.mvcc_store.gc_table_cursor.lock().is_none() {
+        if dropped == 0 && !db.mvcc_store.debug_gc_snapshot().table_sweep_unfinished {
             break;
         }
         assert!(passes < 10_000, "incremental GC failed to converge");
@@ -10968,7 +10968,7 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     // the cursor is parked partway through (there are far more than 4 chains).
     db.mvcc_store.gc_incremental(4);
     assert!(
-        db.mvcc_store.gc_index_cursor.lock().is_some(),
+        db.mvcc_store.debug_gc_snapshot().index_sweep_unfinished,
         "index sweep should resume from a saved cursor, not restart each pass"
     );
 
@@ -10978,11 +10978,11 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     loop {
         let dropped = db.mvcc_store.gc_incremental(4);
         passes += 1;
-        if dropped == 0
-            && db.mvcc_store.gc_table_cursor.lock().is_none()
-            && db.mvcc_store.gc_index_cursor.lock().is_none()
-        {
-            break;
+        if dropped == 0 {
+            let sweeps = db.mvcc_store.debug_gc_snapshot();
+            if !sweeps.table_sweep_unfinished && !sweeps.index_sweep_unfinished {
+                break;
+            }
         }
         assert!(passes < 100_000, "incremental GC failed to converge");
     }
