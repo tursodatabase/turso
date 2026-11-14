@@ -828,6 +828,7 @@ impl IoWorker {
         wakers: Arc<Mutex<Vec<Waker>>>,
         client: Client<HttpsConnector<HttpConnector>, ChunkedBody>,
     ) {
+        let open_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while rx.recv().await.is_some() {
             let Some(sync) = sync.upgrade() else {
                 break;
@@ -838,7 +839,12 @@ impl IoWorker {
                 let item = sync.take_io_item();
                 let Some(item) = item else {
                     sync.step_io_callbacks();
-                    IoWorker::notify_progress(&wakers);
+                    // An open HTTP request wakes the waiting futures itself
+                    // when it has progress. Waking them here as well would
+                    // make them poll and kick this loop without pause.
+                    if open_requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        IoWorker::notify_progress(&wakers);
+                    }
                     break;
                 };
 
@@ -862,6 +868,8 @@ impl IoWorker {
                         let auth_token = auth_token.clone();
                         let wakers = wakers.clone();
                         let client = client.clone();
+                        let open_requests = open_requests.clone();
+                        open_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         tokio::spawn(async move {
                             IoWorker::process_http(
                                 &sync,
@@ -877,6 +885,8 @@ impl IoWorker {
                                 completion,
                             )
                             .await;
+                            open_requests.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            IoWorker::notify_progress(&wakers);
                         });
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
@@ -2973,6 +2983,28 @@ mod tests {
         });
 
         (url, captured, notify)
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_open_request_does_not_poll_in_a_loop() {
+        // The first request stays open for 500 ms in the token provider,
+        // then fails.
+        let build = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_auth_token_fn(|| async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Err(crate::Error::Error("no token".to_string()))
+            })
+            .build();
+        let mut build = std::pin::pin!(build);
+        let mut polls = 0;
+        let result = std::future::poll_fn(|cx| {
+            polls += 1;
+            std::future::Future::poll(build.as_mut(), cx)
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(polls < 100, "build was polled {polls} times");
     }
 
     fn extract_bearer_token(headers: &[String]) -> Option<String> {
