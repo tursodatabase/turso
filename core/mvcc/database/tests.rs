@@ -1166,7 +1166,7 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
 
     let mut reached_tail = false;
     for _ in 0..50_000 {
-        match checkpoint_sm.state_for_test() {
+        match checkpoint_sm.state() {
             CheckpointState::TruncateLogicalLog
             | CheckpointState::FsyncLogicalLog
             | CheckpointState::TruncateWal
@@ -2972,7 +2972,7 @@ fn test_checkpoint_truncates_wal_last() {
     let mut saw_truncate_log_state_with_wal = false;
     let mut finished = false;
     for _ in 0..50_000 {
-        let state = checkpoint_sm.state_for_test();
+        let state = checkpoint_sm.state();
 
         if state == CheckpointState::TruncateLogicalLog {
             let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -3155,7 +3155,7 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
         },
     );
 
-    while checkpoint_sm.state_for_test() != CheckpointState::BeginPagerTxn {
+    while checkpoint_sm.state() != CheckpointState::BeginPagerTxn {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
@@ -4393,7 +4393,7 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
         );
 
         for _ in 0..50_000 {
-            if checkpoint_sm.state_for_test() == CheckpointState::CheckpointWal {
+            if checkpoint_sm.state() == CheckpointState::CheckpointWal {
                 break;
             }
             match checkpoint_sm.step(&()).unwrap() {
@@ -5284,7 +5284,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
     let mut reached_truncate = false;
     for _ in 0..50_000 {
-        if checkpoint_sm.state_for_test() == CheckpointState::TruncateLogicalLog {
+        if checkpoint_sm.state() == CheckpointState::TruncateLogicalLog {
             reached_truncate = true;
             break; // Simulate checkpoint aborting before log truncation
         }
@@ -5321,7 +5321,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
             upper_bound_inclusive: None,
         },
     );
-    let (old_boundary, _) = checkpoint_sm2.checkpoint_bounds_for_test();
+    let (old_boundary, _) = checkpoint_sm2.bounds();
     assert!(
         old_boundary.unwrap_or_default() >= ts1,
         "expected retry checkpoint to start from durable boundary: old={old_boundary:?} ts1={ts1}"
@@ -5393,7 +5393,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
             upper_bound_inclusive: None,
         },
     );
-    let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
+    let (old_boundary, _) = delayed_checkpoint.bounds();
     assert_eq!(old_boundary, Some(first_boundary));
 
     let interrupted_conn = db.connect();
@@ -5411,7 +5411,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     );
     let mut reached_wal_checkpoint = false;
     for _ in 0..50_000 {
-        if interrupted_checkpoint.state_for_test() == CheckpointState::CheckpointWal {
+        if interrupted_checkpoint.state() == CheckpointState::CheckpointWal {
             reached_wal_checkpoint = true;
             break;
         }

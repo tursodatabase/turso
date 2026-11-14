@@ -40,7 +40,9 @@ use std::ops::Bound;
 use strum::EnumCount;
 
 use super::lookup_tx_state;
-const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
+/// A checkpoint step that walks rows yields after it has visited this many, so that a large
+/// store does not keep the caller from doing other work.
+pub const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
 
 macro_rules! with_mvcc_checkpoint_allocation_site {
     ($site:ident, $expr:expr) => {{
@@ -1005,17 +1007,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn state_for_test(&self) -> CheckpointState {
+    /// The step the checkpoint is at.
+    pub fn state(&self) -> CheckpointState {
         self.state
     }
 
-    #[cfg(test)]
-    pub(crate) fn checkpoint_bounds_for_test(&self) -> (Option<u64>, u64) {
+    /// The commit timestamps this checkpoint covers: the highest one an earlier checkpoint
+    /// wrote, if any, and the highest one this checkpoint writes.
+    pub fn bounds(&self) -> (Option<u64>, u64) {
         (
             self.durable_txid_max_old.map(u64::from),
             self.durable_txid_max_new,
         )
+    }
+
+    /// The table rows this checkpoint has chosen so far to write to the database file.
+    /// A version with an end timestamp is written as a delete.
+    pub fn collected_table_rows(&self) -> impl Iterator<Item = (&RowID, &RowVersion)> {
+        self.write_set
+            .iter()
+            .map(|(row_id, version, _)| (row_id, version))
+    }
+
+    /// The index rows this checkpoint has chosen so far to write to the database file.
+    /// The table id of each `RowID` is the index id.
+    pub fn collected_index_rows(&self) -> impl Iterator<Item = (&RowID, &RowVersion)> {
+        self.index_write_set
+            .iter()
+            .map(|(row_id, version, _)| (row_id, version))
+    }
+
+    /// Whether this checkpoint has found that `table_id` was dropped.
+    pub fn collected_table_drop(&self, table_id: MVTableId) -> bool {
+        self.destroyed_tables.contains(&table_id)
     }
 
     /// Drop checkpoint locks. Call only after `on_checkpoint_end`.
