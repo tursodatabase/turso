@@ -100,6 +100,7 @@ pub struct Builder {
     client_name: Option<String>,
     // Optional long-poll timeout when waiting for server changes.
     long_poll_timeout: Option<Duration>,
+    http_idle_timeout: Option<Duration>,
     // Whether to bootstrap a database if it's empty (download schema and initial data).
     bootstrap_if_empty: bool,
     // Partial sync configuration (EXPERIMENTAL).
@@ -141,6 +142,7 @@ impl Builder {
             auth_token: None,
             client_name: None,
             long_poll_timeout: None,
+            http_idle_timeout: None,
             bootstrap_if_empty: true,
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
@@ -269,6 +271,17 @@ impl Builder {
     // Set long poll timeout for waiting remote changes.
     pub fn with_long_poll_timeout(mut self, timeout: Duration) -> Self {
         self.long_poll_timeout = Some(timeout);
+        self
+    }
+
+    /// Fail an HTTP request when no response headers, or no further body
+    /// data, arrive for this long. By default a request waits forever.
+    ///
+    /// The wait for response headers includes connecting and sending the
+    /// request body. Set it longer than [`Builder::with_long_poll_timeout`],
+    /// because the server sends nothing while a long poll waits for changes.
+    pub fn with_http_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.http_idle_timeout = Some(timeout);
         self
     }
 
@@ -428,7 +441,13 @@ impl Builder {
                 .map_err(Error::from)?;
 
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
-        let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone()).await?;
+        let io_worker = IoWorker::spawn(
+            sync.clone(),
+            url,
+            self.auth_token.clone(),
+            self.http_idle_timeout,
+        )
+        .await?;
 
         // Create (bootstrap + open) database in one go.
         let op = sync.create();
@@ -725,6 +744,15 @@ impl hyper::body::Body for ChunkedBody {
     }
 }
 
+/// Wait for `fut`, for at most `limit` when one is set. `None` means the
+/// limit passed first.
+async fn within<T>(limit: Option<Duration>, fut: impl Future<Output = T>) -> Option<T> {
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
 // The IO worker owns a dedicated Tokio runtime on a separate thread, and processes
 // the SyncEngine IO queue (HTTP and atomic file operations).
 struct IoWorker {
@@ -739,6 +767,7 @@ impl IoWorker {
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
         auth_token: Option<AuthTokenFn>,
+        http_idle_timeout: Option<Duration>,
     ) -> Result<Arc<Self>> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -785,8 +814,16 @@ impl IoWorker {
                         .build();
                     let client = Client::builder(TokioExecutor::new()).build(https);
                     if ready_tx.send(Ok(())).is_ok() {
-                        IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers, client)
-                            .await;
+                        IoWorker::run_loop(
+                            weak_sync,
+                            base_url,
+                            auth_token,
+                            http_idle_timeout,
+                            rx,
+                            wakers,
+                            client,
+                        )
+                        .await;
                     }
                 });
             })
@@ -824,6 +861,7 @@ impl IoWorker {
         sync: Weak<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
         auth_token: Option<AuthTokenFn>,
+        http_idle_timeout: Option<Duration>,
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
         client: Client<HttpsConnector<HttpConnector>, ChunkedBody>,
@@ -867,6 +905,7 @@ impl IoWorker {
                                 &sync,
                                 base_url.as_deref(),
                                 auth_token.as_ref(),
+                                http_idle_timeout,
                                 &wakers,
                                 &client,
                                 url.as_deref(),
@@ -907,6 +946,7 @@ impl IoWorker {
         sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
         base_url: Option<&str>,
         auth_token: Option<&AuthTokenFn>,
+        idle_timeout: Option<Duration>,
         wakers: &Mutex<Vec<Waker>>,
         client: &Client<HttpsConnector<HttpConnector>, ChunkedBody>,
         url: Option<&str>,
@@ -981,10 +1021,18 @@ impl IoWorker {
             }
         };
 
-        let mut response = match client.request(request).await {
-            Ok(r) => r,
-            Err(err) => {
+        let mut response = match within(idle_timeout, client.request(request)).await {
+            Some(Ok(r)) => r,
+            Some(Err(err)) => {
                 completion.poison(format!("http request failed: {err}"));
+                sync.step_io_callbacks();
+                return;
+            }
+            None => {
+                completion.poison(format!(
+                    "http request failed: no response headers for {:?}",
+                    idle_timeout.unwrap_or_default()
+                ));
                 sync.step_io_callbacks();
                 return;
             }
@@ -997,7 +1045,19 @@ impl IoWorker {
         IoWorker::notify_progress(wakers);
 
         // Stream response body in chunks
-        while let Some(frame_res) = response.body_mut().frame().await {
+        loop {
+            let Some(frame_res) = within(idle_timeout, response.body_mut().frame()).await else {
+                completion.poison(format!(
+                    "error reading response body: no data for {:?}",
+                    idle_timeout.unwrap_or_default()
+                ));
+                sync.step_io_callbacks();
+                IoWorker::notify_progress(wakers);
+                return;
+            };
+            let Some(frame_res) = frame_res else {
+                break;
+            };
             match frame_res {
                 Ok(frame) => {
                     if let Some(chunk) = frame.data_ref() {
@@ -2973,6 +3033,64 @@ mod tests {
         });
 
         (url, captured, notify)
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_http_idle_timeout_without_response_headers() {
+        use tokio::io::AsyncReadExt;
+
+        // A server that reads the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            while socket.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        let build = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(&url)
+            .with_http_idle_timeout(Duration::from_millis(200))
+            .build();
+        let err = tokio::time::timeout(Duration::from_secs(10), build)
+            .await
+            .expect("build did not return within 10 s")
+            .err()
+            .expect("build succeeded against a server that never answers");
+        assert!(
+            err.to_string().contains("no response headers for 200ms"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_http_idle_timeout_with_stalled_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A server that sends headers and 3 of the 100 body bytes it
+        // promised, then nothing more.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            while socket.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        let build = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(&url)
+            .with_http_idle_timeout(Duration::from_millis(200))
+            .build();
+        let err = tokio::time::timeout(Duration::from_secs(10), build)
+            .await
+            .expect("build did not return within 10 s")
+            .err()
+            .expect("build succeeded against a server that stopped sending");
+        assert!(err.to_string().contains("no data for 200ms"), "{err}");
     }
 
     fn extract_bearer_token(headers: &[String]) -> Option<String> {
