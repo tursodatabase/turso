@@ -8,7 +8,7 @@ use crate::database::remove_file_from_database_registry;
 use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
-use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
+use crate::mvcc::database::checkpoint::CheckpointYieldPoint;
 use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
 use crate::mvcc::persistent_storage::logical_log::{
     LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,

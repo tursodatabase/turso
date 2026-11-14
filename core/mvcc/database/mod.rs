@@ -60,12 +60,10 @@ use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
-pub mod checkpoint_state_machine;
+pub mod checkpoint;
 #[cfg(not(nightly))]
 mod version_chain;
-pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
-};
+pub use checkpoint::{sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
