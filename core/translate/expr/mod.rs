@@ -16,7 +16,7 @@ use super::plan::TableReferences;
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
-use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
+use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, SchemaExpr, VectorFunc};
 use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
     ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,

@@ -76,8 +76,8 @@ use crate::{
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    Database, DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
+    TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -85,7 +85,8 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
-    function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    function::{AggFunc, Func, MathFunc, MathFuncArity, ScalarFunc, SchemaExpr, VectorFunc},
+    functions::datetime::DateTimeClock,
     translate::emitter::TransactionMode,
 };
 use branches::{mark_unlikely, unlikely};
@@ -10392,7 +10393,8 @@ pub fn op_function(
             state.registers[*dest].set_null();
         }
         crate::function::Func::Scalar(scalar_func) => {
-            let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+            let clock =
+                StatementClock::new(pager.io.as_ref(), &mut state.current_time, func.schema_expr);
             let context = ScalarFuncContext {
                 connection: &program.connection,
                 io: pager.io.as_ref(),
@@ -10404,6 +10406,7 @@ pub fn op_function(
                 scalar_func,
                 &state.registers[*start_reg..*start_reg + arg_count],
             )?;
+            clock.check_deterministic_use(&func.func)?;
             state.registers[*dest].set_value(value);
         }
         crate::function::Func::Vector(vector_func) => {
@@ -11283,32 +11286,58 @@ pub fn op_function(
 /// The clock seen by the date and time functions. Like SQLite's
 /// `sqlite3StmtCurrentTime`, it reads the wall clock on the first request and
 /// returns that same time until the step that requested it ends.
+///
+/// In a schema expression, reading the current time or the local timezone is
+/// an error, as with SQLite's `sqlite3NotPureFunc`: the value could not be
+/// computed again, so an index entry made from it could never be found.
 struct StatementClock<'a> {
     io: &'a dyn Clock,
     now: &'a Cell<Option<WallClockInstant>>,
+    schema_expr: Option<SchemaExpr>,
+    read_time_or_timezone: Cell<bool>,
 }
 
 impl<'a> StatementClock<'a> {
-    fn new(io: &'a dyn Clock, now: &'a mut Option<WallClockInstant>) -> Self {
+    fn new(
+        io: &'a dyn Clock,
+        now: &'a mut Option<WallClockInstant>,
+        schema_expr: Option<SchemaExpr>,
+    ) -> Self {
         Self {
             io,
             now: Cell::from_mut(now),
+            schema_expr,
+            read_time_or_timezone: Cell::new(false),
+        }
+    }
+
+    /// Fails if `func` read the current time or the local timezone in a
+    /// schema expression.
+    fn check_deterministic_use(&self, func: &Func) -> Result<()> {
+        match self.schema_expr {
+            Some(schema_expr) if self.read_time_or_timezone.get() => {
+                Err(LimboError::InvalidArgument(format!(
+                    "non-deterministic use of {func}() in {schema_expr}"
+                )))
+            }
+            _ => Ok(()),
         }
     }
 }
 
-impl Clock for StatementClock<'_> {
-    fn current_time_monotonic(&self) -> MonotonicInstant {
-        self.io.current_time_monotonic()
-    }
-
-    fn current_time_wall_clock(&self) -> WallClockInstant {
+impl DateTimeClock for StatementClock<'_> {
+    fn now(&self) -> WallClockInstant {
+        self.read_time_or_timezone.set(true);
         let now = self
             .now
             .get()
             .unwrap_or_else(|| self.io.current_time_wall_clock());
         self.now.set(Some(now));
         now
+    }
+
+    fn use_local_timezone(&self) {
+        self.read_time_or_timezone.set(true);
     }
 }
 

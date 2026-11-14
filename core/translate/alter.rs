@@ -1682,6 +1682,7 @@ pub fn translate_alter_table(
                         func: Func::AlterTable(AlterTableFunc::RenameTable),
                         arg_count: 7,
                         collation: CollationSeq::BINARY,
+                        schema_expr: None,
                     },
                 });
 
@@ -2329,6 +2330,7 @@ pub fn translate_alter_table(
                         }),
                         arg_count: 8,
                         collation: CollationSeq::BINARY,
+                        schema_expr: None,
                     },
                 });
 
@@ -3221,6 +3223,7 @@ fn translate_rename_virtual_table(
                 func: Func::AlterTable(AlterTableFunc::RenameTable),
                 arg_count: 7,
                 collation: CollationSeq::BINARY,
+                schema_expr: None,
             },
         });
 

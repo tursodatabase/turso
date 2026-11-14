@@ -1,3 +1,4 @@
+use crate::function::SchemaExpr;
 use crate::schema::{BTreeTable, Column, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
 use crate::translate::expr::{emit_custom_type_encode_columns, translate_expr};
 use crate::vdbe::builder::{DmlColumnContext, DmlRowForm, SelfTableContext};
@@ -69,7 +70,9 @@ fn emit_generated_columns(
                 GeneratedType::Stored { .. } | GeneratedType::NotGenerated => continue,
             };
             let target_reg = dml_ctx.to_column_reg(idx);
-            translate_expr(program, None, expr, target_reg, resolver)?;
+            resolver.with_schema_expr(SchemaExpr::GeneratedColumn, || {
+                translate_expr(program, None, expr, target_reg, resolver)
+            })?;
             if column.is_virtual_generated() && dml_ctx.holds_stored_value(idx) {
                 emit_virtual_column_store(program, resolver, column, target_reg, table)?;
             }
@@ -107,7 +110,9 @@ pub(crate) fn emit_gencol_expr_from_registers(
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, expr, target_reg, resolver)?;
+        resolver.with_schema_expr(SchemaExpr::GeneratedColumn, || {
+            translate_expr(program, None, expr, target_reg, resolver)
+        })?;
         Ok(())
     })?;
     emit_virtual_column_store(program, resolver, column, target_reg, table)?;

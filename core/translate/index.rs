@@ -1,7 +1,7 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::dialect::CatalogChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::Func;
+use crate::function::{Func, SchemaExpr};
 use crate::index_method::IndexMethodConfiguration;
 use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
@@ -518,18 +518,20 @@ pub(crate) fn emit_refill_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
+            resolver.with_schema_expr(SchemaExpr::Index, || {
+                translate_condition_expr(
+                    program,
+                    &table_references,
+                    &where_clause,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_false: label,
+                        jump_target_when_true: condition_true_label,
+                        jump_target_when_null: label,
+                    },
+                    resolver,
+                )
+            })?;
             program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
@@ -618,18 +620,20 @@ pub(crate) fn emit_refill_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
+            resolver.with_schema_expr(SchemaExpr::Index, || {
+                translate_condition_expr(
+                    program,
+                    &table_references,
+                    &where_clause,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_false: label,
+                        jump_target_when_true: condition_true_label,
+                        jump_target_when_null: label,
+                    },
+                    resolver,
+                )
+            })?;
             program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
@@ -1380,7 +1384,9 @@ fn emit_index_column_value_from_cursor(
             referenced_tables: table_references.clone(),
         };
         resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+            resolver.with_schema_expr(SchemaExpr::Index, || {
+                translate_expr(program, Some(table_references), &expr, dest_reg, resolver)
+            })?;
             Ok(())
         })?;
     } else if table.columns()[idx_col.pos_in_table].is_virtual_generated() {
