@@ -1450,12 +1450,9 @@ mod tests {
         )
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
-        conn.execute("SELECT set_config('request.jwt.claim.sub', '11111111-2222-3333-4444-555555555555', false)")
-            .unwrap();
         for (sql, expected_type) in [
             ("SELECT booleq(true, true)", Type::BOOL),
             ("SELECT now()", Type::TIMESTAMPTZ),
-            ("SELECT auth.uid()", Type::UUID),
             ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
             ("SELECT random()", Type::FLOAT8),
             ("SELECT random() * 10", Type::FLOAT8),

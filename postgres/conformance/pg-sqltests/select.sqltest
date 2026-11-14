@@ -1903,6 +1903,14 @@ expect error {
     schema "main" does not exist
 }
 
+test function-in-schema-auth-errors {
+    SELECT auth.uid();
+}
+@sqlstate 3F000
+expect error {
+    schema "auth" does not exist
+}
+
 test recursive-cte-reference-inside-same-operator-group {
     WITH RECURSIVE r(n) AS (SELECT 1 UNION (SELECT 2 UNION SELECT n + 1 FROM r WHERE n < 3)) SELECT n FROM r ORDER BY 1;
 }
