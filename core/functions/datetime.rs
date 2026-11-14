@@ -1,5 +1,6 @@
+use crate::functions::printf::exec_printf_values;
 use crate::io::clock::Clock;
-use crate::numeric::Numeric;
+use crate::numeric::{format_float, Numeric};
 use crate::types::AsValueRef;
 use crate::types::{TextRef, TextSubtype, Value};
 use crate::vdbe::affinity::is_space;
@@ -1043,18 +1044,29 @@ pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
     }
 }
 
+/// `date - days`: the date that many days earlier.
 pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Numeric(Numeric::Integer(days))) => {
             add_days(clock, lhs, days.saturating_neg())
         }
+        _ => Err(crate::LimboError::Constraint(
+            "only an integer number of days can be subtracted from a date".to_string(),
+        )),
+    }
+}
+
+/// `date - date`: the number of days from the second date to the first.
+pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+    match (lhs, rhs) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Text(_)) => {
             let days = julian_day(clock, lhs)? - julian_day(clock, rhs)?;
             Ok(Value::from_i64(days.round() as i64))
         }
         _ => Err(crate::LimboError::Constraint(
-            "only an integer number of days or a date can be subtracted from a date".to_string(),
+            "a date can only be subtracted from a date".to_string(),
         )),
     }
 }
@@ -1274,6 +1286,7 @@ where
     let fmt_str = match arg_as_text(fmt_val.as_value_ref()) {
         ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
         ValueRef::Null => return Value::Null,
+        ValueRef::Numeric(Numeric::Float(f)) => Cow::Owned(format_float(f64::from(f))),
         val => Cow::Owned(val.to_string()),
     };
 
@@ -1412,14 +1425,10 @@ where
                 write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
             }
             Some('J') => {
-                let val = p.i_jd as f64 / 86400000.0;
-                if val.abs() >= 1_000_000.0 && val.abs() < 10_000_000.0 {
-                    let s = format!("{val:.9}");
-                    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-                    write!(res, "{trimmed}").unwrap();
-                } else {
-                    write!(res, "{val}").unwrap();
-                }
+                let val = Value::from_f64(p.i_jd as f64 / 86400000.0);
+                let julian_day = exec_printf_values(&Value::build_text("%.16g"), &[&val])
+                    .expect("%.16g of a float cannot fail");
+                write!(res, "{julian_day}").unwrap();
             }
             Some('k') => write!(res, "{:2}", p.h).unwrap(),
             Some('l') => {

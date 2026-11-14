@@ -30,6 +30,7 @@ DROP INDEX [IF EXISTS] [schema-name.]index-name;
 
 - Only explicitly created indexes can be dropped. Indexes automatically created for PRIMARY KEY and UNIQUE constraints cannot be dropped directly -- drop the table or use ALTER TABLE instead.
 - Dropping an index may degrade query performance for queries that relied on it, but does not affect correctness.
+- `DROP INDEX` fails with `database table is locked` while any other statement on the same connection that reads the database is running. Finish or reset that statement first. While `DROP INDEX` waits for I/O, a statement that starts reading the database on the same connection fails with the same error.
 
 ## Examples
 

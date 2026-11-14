@@ -57,6 +57,28 @@ UPDATE products
 SET (price, updated_at) = (price * 1.10, datetime('now'));
 ```
 
+### DEFAULT Keyword in SET
+
+<Info>
+**Turso extension** -- This feature follows the SQL standard (SQL:2016) but is not supported by SQLite. It is the same extension as [`DEFAULT` in INSERT VALUES](/docs/sql-reference/statements/insert#default-keyword-in-values).
+</Info>
+
+The `DEFAULT` keyword can be used in place of the whole expression of an assignment. It sets the column to its default value as defined in the CREATE TABLE statement, or to NULL if no default is defined. It works in the single-column form and for a column in a parenthesized column list, and also in the `DO UPDATE SET` clause of an `ON CONFLICT` upsert.
+
+```sql
+CREATE TABLE tasks (
+  id INTEGER PRIMARY KEY,
+  status TEXT DEFAULT 'pending',
+  priority INTEGER DEFAULT 0
+);
+
+UPDATE tasks SET status = DEFAULT WHERE id = 1;
+
+UPDATE tasks SET (status, priority) = (DEFAULT, 5) WHERE id = 2;
+```
+
+`DEFAULT` is only accepted as the whole expression. An expression that contains it, such as `priority = DEFAULT + 1`, produces an error.
+
 ### FROM Clause
 
 The `FROM` clause allows the `UPDATE` to reference other tables. Columns from the joined tables can be used in `SET` expressions and the `WHERE` clause. This is useful for updating a table based on matching rows from another table.

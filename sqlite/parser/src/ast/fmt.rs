@@ -275,7 +275,7 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::Begin { typ, name } => {
+            Self::Begin { typ, name, .. } => {
                 s.append(TK_BEGIN, None)?;
                 if let Some(typ) = typ {
                     typ.to_tokens(s, context)?;
@@ -486,6 +486,9 @@ impl ToTokens for Stmt {
                 indexed,
                 where_clause,
                 returning,
+                // Written as the DELETE it runs as: this is SQLite's syntax,
+                // which has no TRUNCATE.
+                truncate: _,
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -688,6 +691,19 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CreateRole { role_name, options } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                s.append(TK_ID, Some(role_name))?;
+                if !options.inherit {
+                    s.append(TK_ID, Some("NOINHERIT"))?;
+                }
+                if options.bypassrls {
+                    s.append(TK_ID, Some("BYPASSRLS"))?;
+                }
+                Ok(())
+            }
+            Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -716,6 +732,7 @@ impl ToTokens for Stmt {
                         params,
                         base,
                         encode,
+                        coerce,
                         decode,
                         operators,
                         default,
@@ -741,6 +758,11 @@ impl ToTokens for Stmt {
                         if let Some(ref encode) = encode {
                             s.append(TK_ID, Some("ENCODE"))?;
                             encode.to_tokens(s, context)?;
+                        }
+                        // COERCE
+                        if let Some(ref coerce) = coerce {
+                            s.append(TK_ID, Some("COERCE"))?;
+                            coerce.to_tokens(s, context)?;
                         }
                         // DECODE
                         if let Some(ref decode) = decode {
@@ -868,6 +890,49 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::AlterSequenceOwnedBy { seq_name, owner } => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_ID, Some("SEQUENCE"))?;
+                seq_name.to_tokens(s, context)?;
+                s.append(TK_ID, Some("OWNED"))?;
+                s.append(TK_BY, None)?;
+                match owner {
+                    Some((table, column)) => {
+                        table.to_tokens(s, context)?;
+                        s.append(TK_DOT, None)?;
+                        column.to_tokens(s, context)
+                    }
+                    None => s.append(TK_ID, Some("NONE")),
+                }
+            }
+            Self::CreateSchema { name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::DropSchema { name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::CreatePolicy(policy) => policy.to_tokens(s, context),
+            Self::DropPolicy {
+                if_exists,
+                policy_name,
+                tbl_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("POLICY"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                policy_name.to_tokens(s, context)?;
+                s.append(TK_ON, None)?;
+                tbl_name.to_tokens(s, context)
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,
@@ -917,7 +982,7 @@ impl ToTokens for Expr {
                 op.to_tokens(s, context)?;
                 rhs.to_tokens(s, context)
             }
-            Self::Register(reg) => {
+            Self::Register { register: reg, .. } => {
                 // This is for internal use only, not part of SQL syntax
                 // Use a special notation that won't conflict with SQL
                 s.append(TK_VARIABLE, Some(&format!("$r{reg}")))
@@ -1692,8 +1757,148 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::OwnerTo { role, .. } => {
+                s.append(TK_ID, Some("OWNER"))?;
+                s.append(TK_TO, None)?;
+                role.to_tokens(s, context)
+            }
+            Self::EnableRowSecurity => row_security_to_tokens(s, "ENABLE"),
+            Self::DisableRowSecurity => row_security_to_tokens(s, "DISABLE"),
         }
     }
+}
+
+impl_display_for_to_tokens!(RoleSpec);
+impl ToTokens for RoleSpec {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Name(name) => s.append(TK_ID, Some(name)),
+            Self::CurrentRole => s.append(TK_ID, Some("CURRENT_ROLE")),
+            Self::SessionUser => s.append(TK_ID, Some("SESSION_USER")),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(Grant);
+impl ToTokens for Grant {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ID, Some(if self.revoke { "REVOKE" } else { "GRANT" }))?;
+        s.comma(&self.privileges, context)?;
+        s.append(TK_ON, None)?;
+        if self.on_sequences {
+            s.append(TK_ID, Some("SEQUENCE"))?;
+        }
+        s.comma(&self.relations, context)?;
+        if self.revoke {
+            s.append(TK_FROM, None)?;
+        } else {
+            s.append(TK_TO, None)?;
+        }
+        s.comma(&self.grantees, context)
+    }
+}
+
+impl_display_for_to_tokens!(Privilege);
+impl ToTokens for Privilege {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Select => s.append(TK_SELECT, None),
+            Self::Insert => s.append(TK_INSERT, None),
+            Self::Update => s.append(TK_UPDATE, None),
+            Self::Delete => s.append(TK_DELETE, None),
+            Self::Truncate => s.append(TK_ID, Some("TRUNCATE")),
+            Self::References => s.append(TK_REFERENCES, None),
+            Self::Trigger => s.append(TK_TRIGGER, None),
+            Self::Maintain => s.append(TK_ID, Some("MAINTAIN")),
+            Self::Usage => s.append(TK_ID, Some("USAGE")),
+            Self::All => s.append(TK_ALL, None),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(Grantee);
+impl ToTokens for Grantee {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Public => s.append(TK_ID, Some("PUBLIC")),
+            Self::Role(role) => role.to_tokens(s, context),
+        }
+    }
+}
+
+impl_display_for_to_tokens!(CreatePolicy);
+impl ToTokens for CreatePolicy {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_CREATE, None)?;
+        s.append(TK_ID, Some("POLICY"))?;
+        self.policy_name.to_tokens(s, context)?;
+        s.append(TK_ON, None)?;
+        self.tbl_name.to_tokens(s, context)?;
+        s.append(TK_AS, None)?;
+        s.append(
+            TK_ID,
+            Some(if self.permissive {
+                "PERMISSIVE"
+            } else {
+                "RESTRICTIVE"
+            }),
+        )?;
+        s.append(TK_FOR, None)?;
+        match self.command {
+            PolicyCommand::All => s.append(TK_ALL, None)?,
+            PolicyCommand::Select => s.append(TK_SELECT, None)?,
+            PolicyCommand::Insert => s.append(TK_INSERT, None)?,
+            PolicyCommand::Update => s.append(TK_UPDATE, None)?,
+            PolicyCommand::Delete => s.append(TK_DELETE, None)?,
+        }
+        s.append(TK_TO, None)?;
+        s.comma(&self.roles, context)?;
+        if let Some(expr) = &self.using_expr {
+            s.append(TK_USING, None)?;
+            s.append(TK_LP, None)?;
+            expr.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
+        }
+        if let Some(expr) = &self.check_expr {
+            s.append(TK_WITH, None)?;
+            s.append(TK_CHECK, None)?;
+            s.append(TK_LP, None)?;
+            expr.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
+        }
+        Ok(())
+    }
+}
+
+/// `ENABLE ROW LEVEL SECURITY` or `DISABLE ROW LEVEL SECURITY`.
+fn row_security_to_tokens<S: TokenStream + ?Sized>(
+    s: &mut S,
+    enable_or_disable: &str,
+) -> Result<(), S::Error> {
+    for word in [enable_or_disable, "ROW", "LEVEL", "SECURITY"] {
+        s.append(TK_ID, Some(word))?;
+    }
+    Ok(())
 }
 
 impl_display_for_to_tokens!(CreateTableBody);
@@ -1726,6 +1931,9 @@ impl ToTokens for CreateTableBody {
                     }
                 }
                 if let Some(ref strict) = options.strict_text {
+                    if options.contains_without_rowid() {
+                        s.append(TK_COMMA, None)?;
+                    }
                     s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())

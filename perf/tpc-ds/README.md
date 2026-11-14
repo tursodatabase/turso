@@ -9,7 +9,7 @@ Performance Council.
 - `schema.sql` - all 24 table definitions, concatenated
 - `queries/01.sql` .. `queries/99.sql` - one query per file
 
-The queries are currently used by `core/benches/prepare_benchmark.rs` to
+The queries are currently used by `benches/prepare_benchmark.rs` to
 track statement preparation (parse + plan + codegen) cost; no data is
 needed for that. Queries that Turso cannot compile yet (ROLLUP,
 stddev_samp, custom window frames, parenthesized compound selects,

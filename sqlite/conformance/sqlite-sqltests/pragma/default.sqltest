@@ -263,6 +263,15 @@ expect {
     count|1|w|1
 }
 
+@skip-if sqlite "sqlite reports -4 as narg for iif and if"
+test pragma-function-list-iif-takes-variable-arg-count {
+    SELECT name, narg FROM pragma_function_list WHERE name IN ('iif', 'if') ORDER BY name;
+}
+expect {
+    if|-1
+    iif|-1
+}
+
 test pragma-function-list-scalar {
     SELECT name, builtin, type, enc, narg, flags FROM pragma_function_list WHERE name = 'upper';
 }

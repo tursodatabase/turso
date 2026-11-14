@@ -569,7 +569,7 @@ public class SqliteCommand : DbCommand
             if (!mapped.TryGetValue(parameterName, out var parameter))
                 throw new InvalidOperationException(Properties.Resources.MissingParameters(parameterName));
 
-            command.Parameters.Add(parameter.ToManagedParameter(parameterName));
+            command.Parameters.Add(parameter.ToManagedParameter(parameterName, Connection!.BinaryGuid));
         }
     }
 
@@ -659,7 +659,7 @@ public class SqliteCommand : DbCommand
             if (parameterIndex == 0)
                 continue;
 
-            TursoBindings.BindParameter(statement, parameterIndex, parameter.ToTursoValue());
+            TursoBindings.BindParameter(statement, parameterIndex, parameter.ToTursoValue(Connection!.BinaryGuid));
             boundParameters[parameterIndex] = true;
         }
 
@@ -939,14 +939,9 @@ public class SqliteCommand : DbCommand
         }
 
         var message = ex.Message;
-        foreach (var prefix in new[] { "Unable to prepare statement: Parse error: ", "Parse error: " })
-        {
-            if (message.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            {
-                message = message[prefix.Length..];
-                break;
-            }
-        }
+        const string preparePrefix = "Unable to prepare statement: ";
+        if (message.StartsWith(preparePrefix, StringComparison.OrdinalIgnoreCase))
+            message = message[preparePrefix.Length..];
         if (message.StartsWith("Extension error: ", StringComparison.OrdinalIgnoreCase))
             message = message["Extension error: ".Length..];
         if (message.StartsWith("Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX", StringComparison.Ordinal))

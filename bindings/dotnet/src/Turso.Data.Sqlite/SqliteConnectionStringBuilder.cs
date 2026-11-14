@@ -342,9 +342,14 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set => SetString("DateTimeFormat", value);
     }
 
+    /// <summary>
+    ///     Binds untyped <see cref="Guid" /> parameters as 16-byte BLOBs (<see cref="Guid.ToByteArray()" />)
+    ///     instead of 36-character TEXT, which is what Microsoft.Data.Sqlite does. Defaults to
+    ///     <see langword="false" />.
+    /// </summary>
     public bool BinaryGUID
     {
-        get => GetBool("BinaryGUID", true);
+        get => GetBool("BinaryGUID", false);
         set => this["BinaryGUID"] = value;
     }
 
@@ -590,7 +595,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Tls" => null!,
             "DateTimeKind" => System.DateTimeKind.Unspecified,
             "DateTimeFormat" => string.Empty,
-            "BinaryGUID" => true,
+            "BinaryGUID" => false,
             "Version" => 3,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };

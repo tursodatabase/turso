@@ -1,12 +1,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use anyhow::Result;
 use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
 
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
+use turso_core::SessionRole;
 
 fn make_io(seed: u64, latency_probability: u8) -> Arc<MemorySimIO> {
     Arc::new(MemorySimIO::new(seed, 4096, latency_probability, 1, 5))
@@ -21,7 +22,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     Ok(conn)
 }
 
@@ -34,8 +35,8 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn1 = db.connect(ConnectOpts::new())?;
-    let conn2 = db.connect(ConnectOpts::new())?;
+    let conn1 = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    let conn2 = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     Ok((conn1, conn2))
 }
 

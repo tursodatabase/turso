@@ -9,7 +9,9 @@ use super::stream::{
     emit_operator_rowid_delta, open_ephemeral_delta, DeltaIdentity, EphemeralDelta,
 };
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -216,7 +218,7 @@ fn emit_presence(program: &mut ProgramBuilder, src: usize, zero_reg: usize, dst:
         rhs: zero_reg,
         target_pc: done,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_int(0, dst);
     program.preassign_label_to_next_insn(done);
@@ -332,13 +334,15 @@ fn emit_deduplicating_set_op(
     );
 
     let state_table_name = operator_state.state_table_name()?.to_string();
-    let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "state table {state_table_name} of materialized view {view_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, &state_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "state table {state_table_name} of materialized view {view_name} not found"
+            ))
+        })?;
     let state_index = schema
-        .get_indices(&state_table_name)
+        .get_indices(NamespaceId::ROOT, &state_table_name)
         .next()
         .cloned()
         .ok_or_else(|| {
@@ -349,16 +353,22 @@ fn emit_deduplicating_set_op(
     // Trailing UNION ALL rows preserve source identity in the auxiliary table.
     let (append_table_name, append_table, append_index) = if materializes_append {
         let name = operator_state.set_op_identity_table_name()?.to_string();
-        let table = schema.get_btree_table(&name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "append table {name} of materialized view {view_name} not found"
-            ))
-        })?;
-        let index = schema.get_indices(&name).next().cloned().ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "append table {name} of materialized view {view_name} has no index"
-            ))
-        })?;
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, &name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "append table {name} of materialized view {view_name} not found"
+                ))
+            })?;
+        let index = schema
+            .get_indices(NamespaceId::ROOT, &name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "append table {name} of materialized view {view_name} has no index"
+                ))
+            })?;
         (name, table, index)
     } else {
         (
@@ -518,7 +528,7 @@ fn emit_deduplicating_set_op(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::NewRowid {
             cursor: state_cursor_id,
@@ -615,7 +625,7 @@ fn emit_deduplicating_set_op(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         // Every count zero: the content row is gone from all branches (and
         // the fold below reads all-absent as invisible).
@@ -701,7 +711,7 @@ fn emit_deduplicating_set_op(
                 rhs: new_exact_reg,
                 target_pc: same_values_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             program.emit_insn(Insn::Copy {
                 src_reg: old_out_start,
@@ -774,7 +784,7 @@ fn emit_deduplicating_set_op(
             rhs: v_new_reg,
             target_pc: publish_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::IfNot {
             reg: v_new_reg,
@@ -788,7 +798,7 @@ fn emit_deduplicating_set_op(
                 rhs: new_exact_reg,
                 target_pc: ret_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
         } else {
             program.emit_insn(Insn::Goto {
@@ -856,7 +866,7 @@ fn emit_deduplicating_set_op(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::NewRowid {
             cursor: append_cursor_id,
@@ -935,14 +945,14 @@ fn emit_deduplicating_set_op(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: new_w_reg,
             rhs: zero_reg,
             target_pc: m_update_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         // Multiplicity reached zero: the row is gone.
         program.emit_insn(Insn::IdxDelete {

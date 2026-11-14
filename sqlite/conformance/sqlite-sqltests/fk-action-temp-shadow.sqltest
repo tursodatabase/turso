@@ -1,0 +1,105 @@
+@database :memory:
+
+# A foreign-key action on a child table in main must change main's child
+# table, even when a TEMP table or TEMP view has the same name. An unqualified
+# name in a top-level statement finds the TEMP object first, but SQLite
+# compiles each action as a trigger in the child table's own database
+# (src/fkey.c, fkActionTrigger), so the TEMP object is never touched.
+
+test fk-set-null-skips-temp-table-with-same-name {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id TEXT PRIMARY KEY);
+    CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES ('p');
+    INSERT INTO child VALUES ('c', 'p');
+    CREATE TEMP TABLE child(id TEXT PRIMARY KEY, parent_id TEXT);
+    INSERT INTO temp.child VALUES ('c', 'p');
+    DELETE FROM main.parent WHERE id = 'p';
+    SELECT 'main', * FROM main.child;
+    SELECT 'temp', * FROM temp.child;
+}
+expect {
+    main|c|
+    temp|c|p
+}
+
+test fk-set-null-skips-empty-temp-table-with-same-name {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id TEXT PRIMARY KEY);
+    CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES ('p');
+    INSERT INTO child VALUES ('c', 'p');
+    CREATE TEMP TABLE child(id TEXT PRIMARY KEY, parent_id TEXT);
+    DELETE FROM main.parent WHERE id = 'p';
+    SELECT 'main', * FROM main.child;
+}
+expect {
+    main|c|
+}
+
+# A TEMP view cannot be the target of an UPDATE, so finding it instead of the
+# child table made the DELETE on the parent fail.
+test fk-set-null-skips-temp-view-with-same-name {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id TEXT PRIMARY KEY);
+    CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES ('p');
+    INSERT INTO child VALUES ('c', 'p');
+    CREATE TEMP VIEW child AS SELECT * FROM main.child;
+    DELETE FROM main.parent WHERE id = 'p';
+    SELECT 'main', * FROM main.child;
+}
+expect {
+    main|c|
+}
+
+test fk-cascade-delete-skips-temp-table-with-same-name {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id TEXT PRIMARY KEY);
+    CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES ('p');
+    INSERT INTO child VALUES ('c', 'p');
+    CREATE TEMP TABLE child(id TEXT PRIMARY KEY, parent_id TEXT);
+    INSERT INTO temp.child VALUES ('c', 'p');
+    DELETE FROM main.parent WHERE id = 'p';
+    SELECT 'main', count(*) FROM main.child;
+    SELECT 'temp', * FROM temp.child;
+}
+expect {
+    main|0
+    temp|c|p
+}
+
+test fk-set-default-skips-temp-table-with-same-name {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id TEXT PRIMARY KEY);
+    CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT DEFAULT 'd' REFERENCES parent(id) ON DELETE SET DEFAULT);
+    INSERT INTO parent VALUES ('p'), ('d');
+    INSERT INTO child VALUES ('c', 'p');
+    CREATE TEMP TABLE child(id TEXT PRIMARY KEY, parent_id TEXT);
+    INSERT INTO temp.child VALUES ('c', 'p');
+    DELETE FROM main.parent WHERE id = 'p';
+    SELECT 'main', * FROM main.child;
+    SELECT 'temp', * FROM temp.child;
+}
+expect {
+    main|c|d
+    temp|c|p
+}
+
+test fk-cascade-update-skips-temp-table-with-same-name {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id TEXT PRIMARY KEY);
+    CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES ('p');
+    INSERT INTO child VALUES ('c', 'p');
+    CREATE TEMP TABLE child(id TEXT PRIMARY KEY, parent_id TEXT);
+    INSERT INTO temp.child VALUES ('c', 'p');
+    UPDATE main.parent SET id = 'q' WHERE id = 'p';
+    SELECT 'main', * FROM main.child;
+    SELECT 'temp', * FROM temp.child;
+}
+expect {
+    main|c|q
+    temp|c|p
+}

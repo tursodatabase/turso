@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, StepResult,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
+use turso_sqlite::SqliteDialect;
 
 use crate::runner::memory::io::MemorySimIO;
+use turso_core::SessionRole;
 
 fn make_io(seed: u64, latency_probability: u8) -> Arc<MemorySimIO> {
     Arc::new(MemorySimIO::new(seed, 4096, latency_probability, 1, 4))
@@ -20,7 +20,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    Ok(db.connect(ConnectOpts::new())?)
+    Ok(db.connect(ConnectOpts::new(SessionRole::Superuser))?)
 }
 
 fn step_done(conn: &Arc<Connection>, io: &MemorySimIO, sql: &str) -> Result<()> {

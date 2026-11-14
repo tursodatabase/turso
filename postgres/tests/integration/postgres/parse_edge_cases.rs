@@ -3,6 +3,7 @@
 //! valid-but-unsupported SQL must produce clear errors (never leak SQLite errors).
 
 use crate::common::TempDatabase;
+use turso_core::StepResult;
 
 /// Helper: switch to PG dialect and execute SQL, returning Ok/Err.
 fn pg_exec(db: &TempDatabase, sql: &str) -> Result<(), String> {
@@ -94,17 +95,24 @@ fn test_pg_parse_empty_create_table_errors(db: TempDatabase) {
 }
 
 #[turso_macros::test]
-fn test_pg_parse_trailing_garbage_after_valid(db: TempDatabase) {
-    // Valid statement followed by garbage — the valid part should work,
-    // the garbage should error.
+fn test_pg_parse_text_with_syntax_error_runs_no_statement(db: TempDatabase) {
+    // PostgreSQL runs none of the statements in a text with a syntax error,
+    // not even the ones before the error.
     let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a INT)").unwrap();
 
-    // First statement valid, second is garbage.
-    let runner = conn.query_runner(b"SELECT 1; selecgt 2;");
-    let results: Vec<_> = runner.collect();
-    assert!(!results.is_empty(), "should get at least one result");
-    // First statement should succeed.
-    assert!(results[0].is_ok(), "first valid statement should succeed");
+    let result = conn.execute("INSERT INTO t VALUES (1); selecgt 2;");
+    assert!(result.is_err(), "the syntax error should be reported");
+
+    let mut rows = conn.query("SELECT a FROM t").unwrap().unwrap();
+    loop {
+        match rows.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO => continue,
+            StepResult::Row => panic!("the INSERT before the syntax error ran"),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
 }
 
 // -------------------------------------------------------------------------

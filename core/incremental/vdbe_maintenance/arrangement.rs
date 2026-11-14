@@ -9,7 +9,9 @@ use super::stream::{
 };
 use super::MaintenanceInput;
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -55,14 +57,14 @@ fn emit_output_arrangement(
     );
 
     let table = schema
-        .get_btree_table(arrangement_table_name)
+        .get_btree_table(NamespaceId::ROOT, arrangement_table_name)
         .ok_or_else(|| {
             LimboError::InternalError(format!(
                 "output arrangement {arrangement_table_name} of materialized view {view_name} not found"
             ))
         })?;
     let index = schema
-        .get_indices(arrangement_table_name)
+        .get_indices(NamespaceId::ROOT, arrangement_table_name)
         .next()
         .cloned()
         .ok_or_else(|| {
@@ -184,7 +186,7 @@ fn emit_output_arrangement(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::NewRowid {
         cursor: table_cursor,
@@ -236,14 +238,14 @@ fn emit_output_arrangement(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Ne {
         lhs: new_mult_reg,
         rhs: zero_reg,
         target_pc: update_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::IdxDelete {
         start_reg: lookup_start,
@@ -309,7 +311,7 @@ fn emit_output_arrangement(
         rhs: zero_reg,
         target_pc: emit_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(lookup_start),

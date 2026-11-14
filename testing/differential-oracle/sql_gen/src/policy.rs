@@ -1712,7 +1712,7 @@ impl Default for CreateTableConfig {
             // Stubs
             foreign_key_probability: 0.0,
             autoincrement_probability: 0.0,
-            generated_column_probability: 0.0,
+            generated_column_probability: 0.15,
             as_select_probability: 0.0,
             array_column_probability: 0.0,
         }

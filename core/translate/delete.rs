@@ -1,4 +1,6 @@
+use crate::namespace::NamespaceRef;
 use crate::schema::Table;
+use crate::security::policy::Command;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -15,10 +17,11 @@ use crate::translate::subquery::{
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
+use crate::translate::{roles, row_security};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{self, Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -27,7 +30,7 @@ fn validate_delete(
     resolver: &Resolver,
     tbl_name: &str,
     qualified_name: &QualifiedName,
-    database_id: usize,
+    namespace: NamespaceRef,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<Arc<Table>> {
@@ -38,7 +41,9 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
-    let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
+    let table = match resolver.with_schema(namespace.database_id, |s| {
+        s.get_table(namespace.id, tbl_name)
+    }) {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",
@@ -55,12 +60,14 @@ fn validate_delete(
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
     // with a materialized view in a different database.
-    if resolver.with_schema(database_id, |s| s.is_materialized_view(tbl_name)) {
+    if resolver.with_schema(namespace.database_id, |s| {
+        s.is_materialized_view(namespace.id, tbl_name)
+    }) {
         crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
     }
 
     // Check if this table has any incompatible dependent views
-    resolver.with_schema(database_id, |s| s.with_incompatible_dependent_views(tbl_name, |views| {
+    resolver.with_schema(namespace.database_id, |s| s.with_incompatible_dependent_views(namespace.id, tbl_name, |views| {
     if !views.is_empty() {
         use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
@@ -86,16 +93,23 @@ pub fn translate_delete(
     returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
+    truncate: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
+    let (privilege, command) = if truncate {
+        (ast::Privilege::Truncate, Command::Truncate)
+    } else {
+        (ast::Privilege::Delete, Command::Delete)
+    };
+    let namespace = resolver.resolve_queried_table(tbl_name)?;
+    let database_id = namespace.database_id;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
         resolver,
         &normalized_table_name,
         tbl_name,
-        database_id,
+        namespace,
         program,
         connection,
     )?;
@@ -113,7 +127,7 @@ pub fn translate_delete(
         indexed,
         with,
         connection,
-        database_id,
+        namespace,
     )?;
 
     // Plan subqueries in the WHERE clause
@@ -131,9 +145,33 @@ pub fn translate_delete(
                 connection,
             )?;
         }
+        let reads_target_columns = delete_reads_target_columns(delete_plan_inner)?;
+        let target = &delete_plan_inner.table_references.joined_tables()[0];
+        roles::check_write_privileges(
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+            privilege,
+            reads_target_columns,
+        )?;
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+        );
+        filter_deleted_rows(
+            delete_plan_inner,
+            command,
+            reads_target_columns,
+            resolver,
+            program,
+        )?;
     }
 
-    optimize_plan(program, &mut delete_plan, resolver)?;
+    optimize_plan(program, &mut delete_plan, resolver, connection)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -170,17 +208,70 @@ pub fn translate_delete(
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
-    super::stmt_journal::set_delete_stmt_journal_flags(
-        program,
-        delete,
-        resolver,
-        connection,
-        database_id,
-    )?;
+    super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
     Ok(())
+}
+
+/// Whether WHERE or RETURNING reads the columns of the target table, which
+/// makes the DELETE need SELECT on it and its SELECT policies apply, as in
+/// PostgreSQL. Subqueries must be planned first, so that only a subquery
+/// that refers to the target table counts as reading it.
+fn delete_reads_target_columns(plan: &DeletePlan) -> Result<bool> {
+    let target = &plan.table_references.joined_tables()[0];
+    let reads_in_where = match &plan.rowset_plan {
+        Some(rowset_plan) => roles::reads_columns_of(
+            target.internal_id,
+            rowset_plan.where_clause.iter().map(|term| &term.expr),
+            &rowset_plan.non_from_clause_subqueries,
+        )?,
+        None => roles::reads_columns_of(
+            target.internal_id,
+            plan.where_clause.iter().map(|term| &term.expr),
+            &plan.non_from_clause_subqueries,
+        )?,
+    };
+    let reads_in_returning = roles::reads_columns_of(
+        target.internal_id,
+        plan.result_columns.iter().map(|column| &column.expr),
+        &plan.non_from_clause_subqueries,
+    )?;
+    Ok(reads_in_where || reads_in_returning)
+}
+
+/// Limits the rows that `command`, DELETE or TRUNCATE, removes to those
+/// its row-level security policies allow, and to those the SELECT policies
+/// allow too when `reads_target_columns`. The filter goes where the WHERE
+/// clause is, in the plan that collects the rowids when there is one.
+fn filter_deleted_rows(
+    plan: &mut DeletePlan,
+    command: Command,
+    reads_target_columns: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let mut commands = vec![command];
+    if reads_target_columns {
+        commands.push(Command::Select);
+    }
+    match &mut plan.rowset_plan {
+        Some(rowset_plan) => row_security::filter_rows(
+            &commands,
+            &mut rowset_plan.table_references,
+            &mut rowset_plan.where_clause,
+            resolver,
+            program,
+        ),
+        None => row_security::filter_rows(
+            &commands,
+            &mut plan.table_references,
+            &mut plan.where_clause,
+            resolver,
+            program,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,8 +286,9 @@ pub fn prepare_delete_plan(
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<Plan> {
+    let database_id = namespace.database_id;
     let btree_table_for_triggers = table.btree();
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table)
@@ -206,21 +298,26 @@ pub fn prepare_delete_plan(
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
     let indexes = resolver.with_schema(database_id, |schema| {
-        schema.get_indices(table.get_name()).cloned().collect()
+        schema
+            .get_indices(namespace.id, table.get_name())
+            .cloned()
+            .collect()
     });
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
         table,
         identifier: qualified_name.identifier(),
+        has_alias: qualified_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
+        row_filter: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
@@ -253,7 +350,6 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         resolver,
     )?;
-
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut non_from_clause_subqueries = vec![];
@@ -275,13 +371,22 @@ pub fn prepare_delete_plan(
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
         .map(|bt| {
-            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
+            has_triggers_including_temp(
+                resolver,
+                namespace,
+                TriggerEvent::Delete,
+                None,
+                bt,
+                connection,
+            )
         })
         .unwrap_or(false);
 
     let has_fk_actions = match btree_table_for_triggers.as_ref() {
         Some(bt) if connection.foreign_keys_enabled() => resolver
-            .with_schema(database_id, |s| s.resolved_fks_referencing(&bt.name))?
+            .with_schema(database_id, |s| {
+                s.resolved_fks_referencing(namespace.id, &bt.name)
+            })?
             .iter()
             .any(|fk_ref| !matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict)),
         _ => false,

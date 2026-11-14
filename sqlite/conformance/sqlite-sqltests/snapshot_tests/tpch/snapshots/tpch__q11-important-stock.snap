@@ -107,9 +107,9 @@ addr  opcode               p1   p2   p3  p4                                     
   51  HashGraceAdvPart      3    0   53                                               0  hash_table_id=3
   52  Goto                  0   44    0                                               0
   53  Integer               0   19    0                                               0  r[19]=0
-  54  SorterOpen            4    1    0  k(1,-Binary)                                 0  cursor=4
+  54  SorterOpen            4    1    0  k(1,-B)                                      0  cursor=4
   55  Null                  0   34    0                                               0  r[34]=NULL
-  56  SorterOpen            5    3    0  k(1,-Binary)                                 0  cursor=5
+  56  SorterOpen            5    3    0  k(1,-B)                                      0  cursor=5
   57  Integer               0   31    0                                               0  r[31]=0; clear group by abort flag
   58  Null                  0   32    0                                               0  r[32]=NULL; initialize group by comparison registers to NULL
   59  Gosub                39  240    0                                               0  ; go to clear accumulator subroutine
@@ -287,7 +287,7 @@ addr  opcode               p1   p2   p3  p4                                     
  231  Return               63    0    1                                               0
  232  Copy                 34  114    0                                               0  r[114]=r[34]
  233  Copy                  1  115    0                                               0  r[115]=r[1]
- 234  Le                  114  115  125                                               0  if r[114]<=r[115] goto 125
+ 234  Le                  114  115  125  Binary                                       0  if r[114]<=r[115] goto 125
  235  Copy                 34  116    0                                               0  r[116]=r[34]
  236  Copy                 33  117    0                                               0  r[117]=r[33]
  237  MakeRecord          116    2   28                                               0  r[28]=mkrec(r[116..117])

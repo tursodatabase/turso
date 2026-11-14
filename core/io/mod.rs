@@ -206,13 +206,17 @@ pub trait File: Send + Sync {
     /// If there is a single byte which is allocated within a given range - method must return false in this case
     // todo: need to add custom completion type?
     fn has_hole(&self, _pos: usize, _len: usize) -> Result<bool> {
-        panic!("has_hole is not supported for the given IO implementation")
+        Err(crate::LimboError::InternalError(
+            "has_hole is not supported for the given IO implementation".into(),
+        ))
     }
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
     // todo: need to add custom completion type?
     fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
-        panic!("punch_hole is not supported for the given IO implementation")
+        Err(crate::LimboError::InternalError(
+            "punch_hole is not supported for the given IO implementation".into(),
+        ))
     }
 
     fn shared_wal_lock_byte(
@@ -449,6 +453,7 @@ impl File for DiskTempFile {
 #[cfg(all(test, feature = "fs", not(target_family = "wasm")))]
 mod temp_file_tests {
     use super::*;
+    use crate::security::roles::SessionRole;
 
     #[test]
     fn creates_the_file_on_first_write_and_removes_it_on_drop() {
@@ -477,10 +482,12 @@ mod temp_file_tests {
         let db = crate::Database::open_file(
             io.clone(),
             "ephemeral-temp-file.db",
-            Arc::new(crate::SqliteDialect),
+            Arc::new(crate::EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let count_union = |rows: i64| -> i64 {
             let sql = format!(
                 "SELECT count(*) FROM (\

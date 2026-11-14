@@ -16,7 +16,6 @@ use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
-use turso_core::SqliteDialect;
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
@@ -25,6 +24,7 @@ use turso_core::{
     IO, LimboError, OpenFlags, Statement, Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
+use turso_sqlite::SqliteDialect;
 
 mod allocation_fault;
 pub mod chaotic_btree;
@@ -39,6 +39,7 @@ pub mod operations;
 pub mod properties;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod protocol;
+pub mod swarm;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod worker;
 pub mod workloads;
@@ -69,6 +70,7 @@ pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
 }
 pub use io::{IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
+use turso_core::SessionRole;
 use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
 
 struct InstalledYieldInjector<'a> {
@@ -778,7 +780,7 @@ impl Whopper {
             }
         };
 
-        let bootstrap_conn = match db.connect(ConnectOpts::new()) {
+        let bootstrap_conn = match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
             Err(e) => {
                 return Err(anyhow::anyhow!("Connection failed: {}", e));
@@ -1725,7 +1727,7 @@ impl Whopper {
 
         for i in 0..self.max_connections {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(SessionRole::Superuser))
                 .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
             let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
             self.context.fibers.push(SimulatorFiber {

@@ -13,6 +13,15 @@ Status legend:
 | 🟡 Partial | Feature works with limitations (see notes) |
 | ❌ Not supported | Feature is not implemented |
 
+## PostgreSQL version
+
+The reference version is PostgreSQL 18. The PostgreSQL conformance tests, the
+SQLSTATE fuzzer and the `pg_dump` differential fuzzer compare Turso against a
+PostgreSQL 18 server, and CI uses PostgreSQL 18 clients. The version is set in
+`postgres/version`. Behavior that differs between PostgreSQL versions follows
+PostgreSQL 18, and a newer release is supported only after the version there
+is changed and the tests pass against it.
+
 ## Architecture
 
 The frontend parses SQL with `pg_query` (libpg_query, the real PostgreSQL
@@ -42,41 +51,48 @@ Basics not enumerated by the official feature matrix.
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
-| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
-| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | Duplicate target columns, DEFAULT without a column list, array-element/field targets and OVERRIDING are rejected |
+| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error; an EXISTS subquery may select no columns (`EXISTS (SELECT FROM t)`), but a SELECT with no columns anywhere else is rejected |
+| INSERT (column lists, multi-row VALUES, DEFAULT, DEFAULT VALUES, INSERT ... SELECT) | ✅ Supported | Without a column list, `INSERT ... SELECT *` must give a value for every column that is not generated; duplicate target columns, array-element/field targets, OVERRIDING and ON CONFLICT with DEFAULT VALUES are rejected |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, OWNER TO, ENABLE/DISABLE ROW LEVEL SECURITY work (RENAME TABLE, like CREATE INDEX, needs CREATE on the schema, which only a superuser has until GRANT exists); one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS (except for OWNER TO) and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE/VIEW/MATERIALIZED VIEW/SEQUENCE/INDEX ... OWNER TO | 🟡 Partial | Changes the stored owner, which may then alter and drop the relation; a table's indexes and serial sequences move with it, ALTER INDEX changes nothing, and a serial column's sequence refuses its own OWNER TO (0A000); superuser-only for now, so an owner cannot transfer ownership |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
+| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
+| ALTER SEQUENCE | 🟡 Partial | OWNED BY { table.column \| NONE } works, which is how a serial column's sequence belongs to its table; the other options are rejected |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE 1 accepted, a larger CACHE rejected (Turso does not cache sequence values); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
-| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE, READ ONLY and AND CHAIN are rejected. SET TRANSACTION gets the same checks, except that READ ONLY is accepted there because pg_dump sends it; it is not enforced |
+| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE and AND CHAIN are rejected. READ ONLY and READ WRITE are enforced, on BEGIN and on SET TRANSACTION; switching a READ ONLY transaction to READ WRITE after its first query is rejected with SQLSTATE 25001 like PostgreSQL. A statement error aborts the transaction but keeps its savepoints, so ROLLBACK TO recovers it; a failed COMMIT rolls the transaction back and returns the connection to idle |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
-| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC, SIMILAR TO ... ESCAPE and non-literal SIMILAR TO patterns are rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
+| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Only search_path (`SET`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
+| SET / SHOW / RESET | 🟡 Partial | Only search_path and custom parameters such as `app.user_id` (`SET [LOCAL]`, `SET ... TO DEFAULT`, `SET ... FROM CURRENT`, `RESET`, `RESET ALL`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
 ## Backend
 
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
-`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
-`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
+`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
+`pg_database`, `pg_roles` (built-in `postgres` superuser and `pg_database_owner`, and roles from `CREATE ROLE`), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
-`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
+`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_description` contains the default `standard public schema` comment for
+`public`, so pg_dump does not emit a command to clear that comment on restore.
+User-defined comments are not persisted. The public schema reports
+`pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
+for PUBLIC. These are catalog defaults; role management is not implemented.
 `pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
@@ -90,10 +106,16 @@ Catalog introspection functions: `format_type`,
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`.
+`transaction_timestamp`/`statement_timestamp`, `age(timestamp[, timestamp])`
+(returns text in PostgreSQL's interval format, since intervals are stored as text;
+string literal arguments are cast to timestamptz, so they follow the timestamp input rules;
+other text arguments, such as text columns, are read as timestamps instead of being
+rejected, because tursopg chooses functions by name and argument count only;
+the `age(xid)` form is not supported).
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
-forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
+(existing schemas in search order, optionally including implicit `pg_catalog`), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 `obj_description()`/`col_description()` always return NULL because COMMENT ON
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
@@ -130,7 +152,9 @@ fails undoes its own changes.
 ## Data Types, Functions, & Operators
 
 Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
-`INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
+`INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
+`<table>_<column>_seq`, or, when a relation of the schema has that name,
+the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
 smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
@@ -204,6 +228,7 @@ INTEGER. Unknown type names pass through as custom types.
 | ORDER BY / LIMIT on a standalone VALUES list | ❌ Not supported | Rejected: "ORDER BY clause is not allowed with VALUES clause" |
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
 | ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; without it, NULLs sort last for ASC and first for DESC, as in PostgreSQL; rejected (matching SQLite) in CREATE INDEX |
+| ORDER BY USING operator | 🟡 Partial | Built-in `<` and `>` (including `pg_catalog` qualification) are translated to ascending and descending order; other operators are rejected |
 | range_agg range type aggregation function | ❌ Not supported | |
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
@@ -212,7 +237,7 @@ INTEGER. Unknown type names pass through as custom types.
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
-| SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
+| SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
@@ -227,7 +252,7 @@ INTEGER. Unknown type names pass through as custom types.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ALTER object IF EXISTS | 🟡 Partial | ALTER TABLE IF EXISTS works when the table exists, but a missing table still errors instead of being skipped |
+| ALTER object IF EXISTS | 🟡 Partial | ALTER TABLE IF EXISTS ... OWNER TO skips a missing table; for the other subcommands it works when the table exists, but a missing table still errors instead of being skipped |
 | ALTER TABLE ... ADD UNIQUE/PRIMARY KEY USING INDEX | ❌ Not supported | ADD CONSTRAINT is rejected |
 | ALTER TABLE ... SET ACCESS METHOD | ❌ Not supported | |
 | ALTER TABLE ... SET LOGGED / UNLOGGED | ❌ Not supported | |
@@ -237,7 +262,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp` or `date`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
@@ -311,6 +336,8 @@ INTEGER. Unknown type names pass through as custom types.
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
+| array_to_json | ✅ Supported | |
+| json_strip_nulls | 🟡 Partial | Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json; `jsonb_strip_nulls` is not supported |
 | json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list; WITH ORDINALITY and ROWS FROM are not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
@@ -363,18 +390,20 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER (one character), NULL string, HEADER (not HEADER MATCH), column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows); other options rejected |
-| COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
+| COPY table TO STDOUT | ✅ Supported | Simple query protocol, text format; column lists, search_path lookup, COPY text escaping; excludes generated columns by default and rejects them in explicit lists; database reads use blocking helpers, rows are sent one at a time |
+| COPY FROM STDIN | ❌ Not supported | Rejected with an error |
 | COPY FROM ... WHERE | ❌ Not supported | Rejected |
 | COPY ... ON_ERROR | ❌ Not supported | Rejected |
-| COPY with arbitrary SELECT | ❌ Not supported | COPY TO is not supported at all |
+| COPY with arbitrary SELECT | ❌ Not supported | COPY TO requires a plain table |
 | CSV support for COPY | ❌ Not supported | `FORMAT csv` and `FORMAT binary` rejected with an error |
 
 ## Configuration Management
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Only search_path; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW above) |
-| Custom configuration parameters (`app.user_id`) | 🟡 Partial | `set_config()` and `current_setting()` only, not SET or SHOW; in server mode, all clients share the values |
+| SET / SHOW configuration parameters | 🟡 Partial | Only search_path and custom parameters; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW / RESET above) |
+| Custom configuration parameters (`app.user_id`) | 🟡 Partial | In server mode, all clients share the values |
+| DISCARD | 🟡 Partial | Only `DISCARD ALL`, which resets every parameter and forgets `currval` values. In server mode it does not drop the client's protocol-level prepared statements, and it resets the parameters of all clients |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |
@@ -394,7 +423,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE not supported at all |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT` and `REVOKE ... ON ALL TABLES IN SCHEMA` and `... ON ALL SEQUENCES IN SCHEMA` change the privileges in each relation's `pg_class.relacl`; functions are not supported |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -408,8 +437,8 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes a single hardcoded `turso` role |
-| Row-level security | ❌ Not supported | |
+| ROLES | 🟡 Partial | `CREATE ROLE name` with the options `BYPASSRLS`, `NOBYPASSRLS`, `INHERIT`, `NOINHERIT` and `NOLOGIN`, `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read and write the tables they own or were granted `SELECT`, `INSERT`, `UPDATE` and `DELETE` on, with SELECT also needed when a write reads the table's columns, and call `nextval` with `USAGE` or `UPDATE` and `setval` with `UPDATE` on the sequence, but not change the schema they do not own; `GRANT` and `REVOKE` of privileges on whole tables and sequences, `ALL` included, change `pg_class.relacl`; `TRUNCATE` needs the `TRUNCATE` privilege, and the `REFERENCES`, `TRIGGER` and `MAINTAIN` privileges let a role do nothing yet; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles; roles belong to one database file, not to the whole server as in PostgreSQL |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY` works and is shown in `pg_class.relrowsecurity`; `CREATE POLICY` and `DROP POLICY` work, with permissive and restrictive `USING` policies limiting what roles read; `UPDATE` and `DELETE` change only the rows the policies of the command allow, with the `SELECT` policies too when the statement reads columns, and new rows of `INSERT` and `UPDATE` must pass `WITH CHECK`, and the `SELECT` policies with `RETURNING`, or the statement fails with 42501; `TRUNCATE` is not subject to policies, as in PostgreSQL; `INSERT ... ON CONFLICT DO UPDATE` checks the conflicting row against the `UPDATE` and `SELECT` policies and fails if it does not pass; a new row is checked after its `NOT NULL` constraints instead of before; `pg_policy` does not show policies; policies cannot use subqueries with `FROM`, and the columns they use cannot be renamed or dropped; `FORCE ROW LEVEL SECURITY` is not supported; views apply it as the view's owner, except that a superuser reading a view sees every row |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |
@@ -471,7 +500,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
+| CREATE FUNCTION | ❌ Not supported | Rejected with an error. A function that PostgreSQL rejects gets PostgreSQL's error; otherwise the error names the first unsupported feature, such as the language, RETURNS SETOF or an option |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
 | Event triggers | ❌ Not supported | |
@@ -501,7 +530,7 @@ Upgrade is not supported.
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
-| Named parameters | ❌ Not supported | |
+| Named parameters | ❌ Not supported | Named arguments in calls, such as `make_interval(days => 1)`, are rejected |
 | Non-superuser language creation | ❌ Not supported | |
 | pl/pgsql installed by default | ❌ Not supported | |
 | Polymorphic functions | ❌ Not supported | |
@@ -611,7 +640,7 @@ Upgrade is not supported.
 | Full SSL support | ❌ Not supported | SSLRequest answered with "SSL not available"; plaintext only |
 | IPv6 support | 🟡 Partial | Server binds whatever address it is given, including IPv6 literals; no dual-stack handling |
 | V2 client protocol | ❌ Not supported | |
-| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); no COPY sub-protocol, CancelRequest, or NotificationResponse |
+| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); text COPY TO STDOUT in simple queries; no COPY FROM STDIN, CancelRequest, or NotificationResponse; a simple query with several statements runs each statement in its own transaction, not in one implicit transaction block |
 
 ## Platforms
 

@@ -9,6 +9,63 @@ expect error {
     cannot store non-array value in INTEGER column tc1.vals
 }
 
+test array-cast-of-non-array-names-no-column {
+    SELECT CAST('x' AS integer[]);
+}
+expect error {
+    cannot cast a non-array value to an array
+}
+
+test array-cast-of-non-array-to-custom-type-names-no-column {
+    CREATE TYPE cast_x(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    SELECT CAST('x' AS cast_x[]);
+}
+expect error {
+    cannot cast a non-array value to an array
+}
+
+test array-cast-to-plain-type-name-uses-its-affinity {
+    SELECT CAST('{1,2}' AS real[]);
+}
+expect {
+    {1.0,2.0}
+}
+
+test array-cast-to-type-missing-its-arguments-skips-encode {
+    -- upper_text takes an argument, so a CAST that doesn't give it runs no
+    -- ENCODE, for an array as for a scalar. The elements are checked against
+    -- its BASE, text, so they stay as they are. With the argument, ENCODE and
+    -- DECODE run.
+    CREATE TYPE upper_text(value text, m integer) BASE text ENCODE upper(value) DECODE lower(value);
+    SELECT CAST('Ab' AS upper_text), CAST('{Ab}' AS upper_text[]), CAST('{Ab}' AS upper_text(3)[]);
+}
+expect {
+    Ab|{Ab}|{ab}
+}
+
+test array-of-more-than-1024-elements-runs-encode-and-decode-on-each {
+    -- d1 has only a DECODE, so the array is written as it is and only reads
+    -- run a step on each element. ci runs ENCODE on each element when written.
+    CREATE TYPE d1(value integer) BASE integer DECODE value - 1;
+    CREATE TYPE ci(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE big(id INTEGER PRIMARY KEY, a d1[], c ci[]) STRICT;
+    INSERT INTO big VALUES (1, (SELECT array_agg(value) FROM generate_series(1, 2000)), (SELECT array_agg(value) FROM generate_series(1, 2000)));
+    SELECT array_length(a), a[1], a[2000], array_length(c), c[1], c[2000] FROM big;
+}
+expect {
+    2000|0|1999|2000|1|2000
+}
+
+test array-empty-stays-empty-through-encode-and-decode {
+    CREATE TYPE ci(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE e(id INTEGER PRIMARY KEY, c ci[]) STRICT;
+    INSERT INTO e VALUES (1, '{}');
+    SELECT c, array_length(c), CAST('{}' AS ci[]) FROM e;
+}
+expect {
+    {}|0|{}
+}
+
 test array-infinity-rejected {
     CREATE TABLE inf1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
     INSERT INTO inf1 VALUES (1, '{1e309}');
@@ -183,4 +240,194 @@ test array-custom-type-decode-next-to-literal {
 }
 expect {
     l|{1,2,3}
+}
+
+@requires strict "uses STRICT tables"
+test array-custom-type-columns-compare-as-arrays {
+    -- Arrays of a custom type compare element by element.
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a test_uint[], b test_uint[]) STRICT;
+    INSERT INTO t VALUES (1, '{1,2}', '{1}'), (2, '{3}', '{3}'), (3, '{2}', '{3}');
+    SELECT id, a = b, a < b FROM t ORDER BY id;
+}
+expect {
+    1|0|0
+    2|1|0
+    3|0|1
+}
+
+test array-cast-null-to-custom-type-array-is-null {
+    CREATE TYPE lower_text_cast BASE text ENCODE value DECODE lower(value);
+    SELECT CAST(NULL AS lower_text_cast[]) IS NULL;
+}
+expect {
+    1
+}
+
+test array-cast-null-in-expression-index-on-custom-type-array {
+    CREATE TYPE lower_text_ix BASE text ENCODE value DECODE lower(value);
+    CREATE TABLE ct(id INTEGER PRIMARY KEY, c lower_text_ix[]) STRICT;
+    INSERT INTO ct VALUES (1, NULL);
+    CREATE INDEX ct_ix ON ct(CAST(c AS lower_text_ix[]));
+    INSERT INTO ct VALUES (2, NULL), (3, '{A,b}');
+    SELECT id, c FROM ct ORDER BY id;
+}
+expect {
+    1|
+    2|
+    3|{a,b}
+}
+
+test array-generated-column-concat-joins-arrays {
+    CREATE TABLE g(id INTEGER PRIMARY KEY, a integer[], b integer[], c integer[] GENERATED ALWAYS AS (a || b)) STRICT;
+    INSERT INTO g(id, a, b) VALUES (1, '{1,2}', '{3}'), (2, '{5}', '{5}');
+    SELECT id, c FROM g ORDER BY id;
+}
+expect {
+    1|{1,2,3}
+    2|{5,5}
+}
+
+# A column stores its number of array dimensions in three bits, so array types
+# have at most 7 dimensions.
+test array-type-with-8-dimensions-rejected-in-create-table {
+    CREATE TABLE d8(a integer[][][][][][][][]) STRICT;
+}
+expect error {
+    array type integer has 8 dimensions, but arrays have at most 7
+}
+
+test array-type-with-8-dimensions-rejected-in-cast {
+    SELECT CAST(1 AS integer[][][][][][][][]);
+}
+expect error {
+    array type integer has 8 dimensions, but arrays have at most 7
+}
+
+test array-agg-over-7-dimensions-rejected-in-subquery {
+    SELECT * FROM (SELECT array_agg(CAST('{1}' AS integer[][][][][][][])));
+}
+expect error {
+    result column 1 is an array with 8 dimensions, but arrays have at most 7
+}
+
+test array-column-primary-key-is-not-rowid-alias {
+    CREATE TABLE apk1 (id INTEGER, c integer[] PRIMARY KEY) STRICT;
+    INSERT INTO apk1 VALUES (1, '{1,2}');
+    INSERT INTO apk1 VALUES (2, '{3}');
+    SELECT rowid, id, c FROM apk1 ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE tbl_name = 'apk1' AND type = 'index';
+    SELECT id FROM apk1 WHERE c = '{1, 2}';
+}
+expect {
+    1|1|{1,2}
+    2|2|{3}
+    sqlite_autoindex_apk1_1
+    1
+}
+
+test array-table-primary-key-is-not-rowid-alias {
+    CREATE TABLE apk2 (id INTEGER, c integer[], PRIMARY KEY(c)) STRICT;
+    INSERT INTO apk2 VALUES (1, '{1,2}');
+    INSERT INTO apk2 VALUES (2, '{3}');
+    SELECT rowid, id, c FROM apk2 ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE tbl_name = 'apk2' AND type = 'index';
+}
+expect {
+    1|1|{1,2}
+    2|2|{3}
+    sqlite_autoindex_apk2_1
+}
+
+test array-primary-key-rejects-duplicates {
+    CREATE TABLE apk3 (id INTEGER, c integer[] PRIMARY KEY) STRICT;
+    INSERT INTO apk3 VALUES (1, '{1,2}');
+    INSERT INTO apk3 VALUES (2, '{1,2}');
+}
+expect error {
+    UNIQUE constraint failed: apk3.c
+}
+
+@skip-if mvcc "rebuilding affected indexes is not supported in MVCC mode"
+test array-primary-key-alter-column-keeps-automatic-index {
+    CREATE TABLE apk5 (id INTEGER, c integer[], PRIMARY KEY(c)) STRICT;
+    ALTER TABLE apk5 ALTER COLUMN c TO d integer[];
+    INSERT INTO apk5 VALUES (1, '{1,2}');
+    SELECT rowid, id, d FROM apk5;
+}
+expect {
+    1|1|{1,2}
+}
+
+# The INTEGER key is a rowid alias and an INTEGER[] key is not, so the change
+# would need an automatic index that the table does not have.
+test integer-primary-key-alter-column-to-array-rejected {
+    CREATE TABLE apk6 (id INTEGER, c integer, PRIMARY KEY(c)) STRICT;
+    ALTER TABLE apk6 ALTER COLUMN c TO d integer[];
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test array-primary-key-autoincrement-rejected {
+    CREATE TABLE apk4 (c integer[] PRIMARY KEY AUTOINCREMENT) STRICT;
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
+}
+
+@requires strict "uses STRICT tables"
+test array-of-encoded-type-holds-element-values {
+    -- An array holds the values of its elements, as a column of the element
+    -- type does. ENCODE runs on each element when the array is stored and
+    -- DECODE runs on each element when it is read, so the stored forms
+    -- (100, 200, ...) never show up in a query.
+    CREATE TYPE ci(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v ci, a ci[], m ci[][]) STRICT;
+    INSERT INTO t VALUES (1, 1, ARRAY[1,2], ARRAY[ARRAY[1,2],ARRAY[3,4]]);
+    INSERT INTO t VALUES (2, 3, '{3,4}', NULL);
+    SELECT 'cast', CAST('{1,2}' AS ci[]);
+    SELECT 'read', id, a, a[1] = v, a = ARRAY[1,2] OR a = ARRAY[3,4] FROM t ORDER BY id;
+    SELECT 'nested', m[1][2], m[2][1], m[2] = ARRAY[3,4] FROM t WHERE id = 1;
+    SELECT 'scan', id FROM t WHERE a = ARRAY[3,4];
+    SELECT 'scan-text', id FROM t WHERE a = '{1,2}';
+    UPDATE t SET a = array_append(a, 9) WHERE id = 1;
+    SELECT 'append', a FROM t WHERE id = 1;
+    -- ci can't be a key, since its DECODE reads 100 and 101 back as 1. A type
+    -- with no DECODE can. Its values read back as stored (3 reads as 300), in
+    -- the array as in the plain column v, and an index lookup finds the rows
+    -- a scan finds.
+    CREATE TYPE cs(value integer) BASE integer ENCODE value * 100;
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a cs[], v cs) STRICT;
+    INSERT INTO s VALUES (1, ARRAY[1,2], 1), (2, '{3,4}', 3);
+    SELECT 'cs-read', id, a, v FROM s ORDER BY id;
+    SELECT 'cs-scan', id FROM s WHERE a = ARRAY[300,400] AND v = 300;
+    SELECT 'cs-scan-text', id FROM s WHERE a = '{100,200}';
+    CREATE INDEX sa ON s(a);
+    SELECT 'cs-seek', id FROM s WHERE a = ARRAY[300,400];
+    SELECT 'cs-seek-text', id FROM s WHERE a = '{100,200}';
+    SELECT 'cs-seek-input', count(*) FROM s WHERE a = ARRAY[3,4];
+    -- In an array of arrays, ENCODE runs on each element of the inner arrays.
+    CREATE TABLE sm(id INTEGER PRIMARY KEY, m cs[][]) STRICT;
+    INSERT INTO sm VALUES (1, ARRAY[ARRAY[1,2],ARRAY[3]]);
+    SELECT 'cs-nested', m[1][2], m[2][1] FROM sm;
+}
+expect {
+    cast|{1,2}
+    read|1|{1,2}|1|1
+    read|2|{3,4}|1|1
+    nested|2|3|1
+    scan|2
+    scan-text|1
+    append|{1,2,9}
+    cs-read|1|{100,200}|100
+    cs-read|2|{300,400}|300
+    cs-scan|2
+    cs-scan-text|1
+    cs-seek|2
+    cs-seek-text|1
+    cs-seek-input|0
+    cs-nested|200|300
 }

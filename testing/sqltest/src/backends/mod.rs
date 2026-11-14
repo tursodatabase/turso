@@ -33,12 +33,18 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
     /// Error message if the query failed
     pub error: Option<String>,
+    /// SQLSTATE of the error, from backends that speak the PostgreSQL wire protocol
+    pub sqlstate: Option<String>,
 }
 
 impl QueryResult {
     /// Create a successful result with rows
     pub fn success(rows: Vec<Vec<String>>) -> Self {
-        Self { rows, error: None }
+        Self {
+            rows,
+            error: None,
+            sqlstate: None,
+        }
     }
 
     /// Create an error result
@@ -46,6 +52,16 @@ impl QueryResult {
         Self {
             rows: Vec::new(),
             error: Some(message.into()),
+            sqlstate: None,
+        }
+    }
+
+    /// Create an error result with the SQLSTATE that the server sent.
+    /// `None` means that the server did not send one.
+    pub fn error_with_sqlstate(message: impl Into<String>, sqlstate: Option<String>) -> Self {
+        Self {
+            sqlstate,
+            ..Self::error(message)
         }
     }
 
@@ -124,6 +140,12 @@ pub trait SqlBackend: Send + Sync {
     /// Whether this backend supports snapshot tests (EXPLAIN output comparison).
     /// Returns false by default; only the Rust backend enables this.
     fn supports_snapshots(&self) -> bool {
+        false
+    }
+
+    /// Whether the errors of this backend have a SQLSTATE. The runner rejects
+    /// a test with `@sqlstate` on a backend whose errors have none.
+    fn reports_sqlstate(&self) -> bool {
         false
     }
 

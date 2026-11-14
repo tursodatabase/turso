@@ -1,10 +1,6 @@
 use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
-use crate::translate::{
-    aggregation::agg_arg_collation,
-    order_by::{custom_type_comparator, EmitOrderBy},
-    window::EmitWindow,
-};
+use crate::translate::{order_by::EmitOrderBy, window::EmitWindow};
 use crate::vdbe::insn::AggStepData;
 
 use super::*;
@@ -260,21 +256,13 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                let arg_collation =
-                    agg_arg_collation(&plan.table_references, &min_max.argument, &t_ctx.resolver);
-                let comparator = custom_type_comparator(
-                    &min_max.argument,
-                    &plan.table_references,
-                    t_ctx.resolver.schema(),
-                );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
                         acc_reg: start_reg,
                         col: expr_reg,
                         delimiter: 0,
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
-                        comparator,
-                        collation: Some(arg_collation),
+                        collation: min_max.collation,
                     }),
                 });
                 program.emit_insn(Insn::Goto {
@@ -405,12 +393,9 @@ fn emit_loop_source<'a>(
                                 reg,
                                 &t_ctx.resolver,
                             )?;
-                            t_ctx.resolver.cache_scalar_expr_reg(
-                                Cow::Owned(expr.clone()),
-                                reg,
-                                false,
-                                &plan.table_references,
-                            )?;
+                            t_ctx
+                                .resolver
+                                .cache_expr_reg(Cow::Owned(expr.clone()), reg, false);
                             Ok(WalkControl::SkipChildren)
                         }
                         _ => {

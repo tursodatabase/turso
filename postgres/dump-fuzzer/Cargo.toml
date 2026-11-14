@@ -1,0 +1,25 @@
+[package]
+name = "turso_pg_dump_fuzzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+indicatif.workspace = true
+comfy-table = "7.1.4"
+pg_query.workspace = true
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tempfile.workspace = true
+url = "2"
+clap = { workspace = true, features = ["derive", "env"] }
+hegeltest = "=0.28.2"
+
+[[bin]]
+name = "pg-dump-fuzzer"
+path = "src/main.rs"
+

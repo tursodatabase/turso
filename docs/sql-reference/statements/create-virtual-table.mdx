@@ -27,7 +27,7 @@ A virtual table delegates row storage and retrieval to a module. The module dete
 | `schema-name` | The name of the attached database in which to create the virtual table. Defaults to `main`. |
 | `table-name` | The name for the new virtual table. |
 | `module-name` | The name of the module that provides the virtual table implementation. |
-| `module-arguments` | Comma-separated arguments passed to the module. The format and meaning of these arguments are module-specific. |
+| `module-arguments` | Comma-separated arguments passed to the module, each as the exact text written in the statement. Empty arguments, as in `(a,,b)`, are skipped. The format and meaning of these arguments are module-specific. |
 
 ## Available Modules
 

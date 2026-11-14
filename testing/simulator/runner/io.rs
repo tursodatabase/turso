@@ -186,9 +186,11 @@ impl IO for SimulatorIO {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::sync::Arc;
+    use turso_core::SessionRole;
 
     use anyhow::Result;
-    use turso_core::{ConnectOpts, Connection, Database, LimboError, OpenOptions, SqliteDialect};
+    use turso_core::{ConnectOpts, Connection, Database, LimboError, OpenOptions};
+    use turso_sqlite::SqliteDialect;
 
     use super::SimulatorIO;
     use crate::runner::{FAULT_ERROR_MSG, SimIO, cli::IoBackend};
@@ -215,8 +217,8 @@ mod tests {
             db_path,
             OpenOptions::new(Arc::new(SqliteDialect)),
         )?;
-        let writer = db.connect(ConnectOpts::new())?;
-        let observer = db.connect(ConnectOpts::new())?;
+        let writer = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        let observer = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
         writer.execute("BEGIN")?;
