@@ -2942,7 +2942,8 @@ pub(crate) enum DroppedWithSequences<'a> {
 /// Describes the first object that still calls a sequence function on one
 /// of `sequences` of `namespace` once `dropped` is gone: a column default,
 /// generated column, CHECK constraint, row security policy, index, view or
-/// trigger.
+/// trigger. Objects of the namespace that the connection is dropping do not
+/// count.
 // FIXME: this walks every expression the schema stores. Replace it with the
 // dependency rows of pg_depend once they are stored.
 pub(crate) fn find_object_using_sequence(
@@ -2955,6 +2956,9 @@ pub(crate) fn find_object_using_sequence(
     if sequences.is_empty() {
         return Ok(None);
     }
+    let namespace_being_dropped = (namespace.database_id == MAIN_DB_ID)
+        .then(|| connection.namespace_being_dropped())
+        .flatten();
     let is_dropped_table = |owner_namespace: NamespaceId, table_name: &str| {
         owner_namespace == namespace.id
             && matches!(dropped, DroppedWithSequences::Table(table) if table == table_name)
@@ -2970,6 +2974,9 @@ pub(crate) fn find_object_using_sequence(
     let is_dropped = |database_id: usize, owner_namespace: NamespaceId, owner: &SchemaExprOwner| {
         if database_id != namespace.database_id {
             return false;
+        }
+        if namespace_being_dropped == Some(owner_namespace) {
+            return true;
         }
         match owner {
             SchemaExprOwner::ColumnDefault { table, column } => {

@@ -385,3 +385,41 @@ fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     conn.execute("DROP TABLE borrower").unwrap();
     conn.execute("DROP TABLE owner").unwrap();
 }
+
+#[test]
+fn refused_drop_schema_cascade_keeps_the_schema_and_its_objects() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.owner (id serial, label text)",
+        "CREATE TABLE app.other (x int)",
+        "CREATE TABLE borrower (n bigint DEFAULT nextval('app.owner_id_seq'), label text)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+
+    let error = conn.execute("DROP SCHEMA app CASCADE").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+
+    for sql in [
+        "INSERT INTO app.other VALUES (7)",
+        "INSERT INTO app.owner (label) VALUES ('a')",
+        "INSERT INTO borrower (label) VALUES ('b')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let rows = conn
+        .query("SELECT (SELECT x FROM app.other), (SELECT id FROM app.owner), (SELECT n FROM borrower)")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows[0].iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["7", "1", "2"]
+    );
+
+    conn.execute("DROP TABLE borrower").unwrap();
+    conn.execute("DROP SCHEMA app CASCADE").unwrap();
+}

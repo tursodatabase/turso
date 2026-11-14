@@ -679,8 +679,13 @@ struct DeferredStatement {
 
 enum CommandContext {
     Default,
-    SchemaElement { schema: String },
-    DropSchema,
+    SchemaElement {
+        schema: String,
+    },
+    /// One statement of `DROP SCHEMA schema`.
+    DropSchema {
+        schema: String,
+    },
 }
 
 enum DeferredWork {
@@ -799,16 +804,21 @@ impl DeferredExecution {
                 set_search_path(&conn, setting.as_deref(), SettingScope::Session)?;
                 result
             }
-            CommandContext::DropSchema => {
+            CommandContext::DropSchema { schema } => {
+                let schema = schema.clone();
                 let foreign_keys_enabled = conn.foreign_keys_enabled();
                 if foreign_keys_enabled {
                     conn.set_foreign_keys_enabled(false);
                 }
+                conn.set_namespace_being_dropped(
+                    conn.qualifier(&schema).map(|namespace| namespace.target.id),
+                );
                 let result = self.run_phase_inner(inner);
+                conn.set_namespace_being_dropped(None);
                 if foreign_keys_enabled {
                     conn.set_foreign_keys_enabled(true);
                 }
-                result
+                result.map_err(|error| unsupported_cascade_to_other_schemas(&schema, error))
             }
         }
     }
@@ -2298,14 +2308,16 @@ fn drop_schema_commands(
         })
         .map(|object| DeferredStatement {
             command: DeferredCommand::Sqlite(object.drop_sql(&name)),
-            context: CommandContext::DropSchema,
+            context: CommandContext::DropSchema {
+                schema: name.clone(),
+            },
         })
         .collect();
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
-            name: ast::Name::exact(name),
+            name: ast::Name::exact(name.clone()),
         }),
-        context: CommandContext::DropSchema,
+        context: CommandContext::DropSchema { schema: name },
     });
     Ok(commands)
 }
@@ -2330,6 +2342,23 @@ fn sequences_owned_by_tables(
             crate::classes::owned_sequences(&current, namespace.target.id, table, None)
         })
         .collect()
+}
+
+/// `DROP SCHEMA schema CASCADE` drops the objects of the schema one statement
+/// at a time. A statement that fails because an object outside the schema
+/// depends on what it drops would need that object dropped too, as
+/// PostgreSQL does, which is not supported (0A000).
+fn unsupported_cascade_to_other_schemas(schema: &str, error: LimboError) -> LimboError {
+    if crate::error::sqlstate(&error) != SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST {
+        return error;
+    }
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!(
+            "DROP SCHEMA \"{schema}\" CASCADE is not supported when an object of another schema \
+             depends on an object of the schema: {error}"
+        ),
+    )
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.
