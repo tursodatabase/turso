@@ -1,0 +1,217 @@
+@database :memory:
+
+# The value and the fraction of percentile_disc(Y, P) and percentile_cont(Y, P)
+# must reach the aggregate in their own registers when Y is an expression.
+
+test percentile-disc-expression-value {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    SELECT percentile_disc(a + 0, 1) FROM t;
+}
+expect {
+    2.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    2
+}
+
+test percentile-disc-function-value {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    SELECT percentile_disc(length(b), 1) FROM t;
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+
+test percentile-cont-expression-value {
+    SELECT percentile_cont('5' + 0, 0.5);
+}
+expect {
+    5.0
+}
+expect @js {
+    5
+}
+
+test percentile-disc-function-value-no-rows-read {
+    SELECT percentile_disc(abs(''), 1);
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test percentile-cont-expression-value-and-fraction {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1), (2), (3), (4);
+    SELECT percentile_cont(a * 10, 0.25 + 0.25) FROM t;
+}
+expect {
+    25.0
+}
+expect @js {
+    25
+}
+
+# Like SQLite's ext/misc/percentile.c, a non-NULL TEXT or BLOB value is an
+# error, also when the text looks like a number. NULL values are skipped.
+
+test percentile-disc-text-value {
+    SELECT percentile_disc('5', 1);
+}
+expect error {
+    input to percentile_disc\(\) is not numeric
+}
+
+test median-text-value {
+    SELECT median('7');
+}
+expect error {
+    input to median\(\) is not numeric
+}
+
+test percentile-cont-text-value {
+    SELECT percentile_cont('abc', 0.5);
+}
+expect error {
+    input to percentile_cont\(\) is not numeric
+}
+
+test percentile-blob-value {
+    SELECT percentile(x'35', 50);
+}
+expect error {
+    input to percentile\(\) is not numeric
+}
+
+test percentile-disc-null-value {
+    SELECT percentile_disc(NULL, 1) IS NULL;
+}
+expect {
+    1
+}
+
+# The fraction must be a number in [0, 1] (in [0, 100] for percentile) and the
+# same on every row, as in SQLite's percentStep. It is checked before the
+# value, also for a row whose value is NULL, but not when there are no rows.
+
+test percentile-disc-fraction-above-range {
+    SELECT percentile_disc(1, 2);
+}
+expect error {
+    the fraction argument to percentile_disc\(\) is not between 0.0 and 1.0
+}
+
+test percentile-disc-fraction-null {
+    SELECT percentile_disc(1, NULL);
+}
+expect error {
+    the fraction argument to percentile_disc\(\) is not between 0.0 and 1.0
+}
+
+test percentile-disc-fraction-text {
+    SELECT percentile_disc(1, 'abc');
+}
+expect error {
+    the fraction argument to percentile_disc\(\) is not between 0.0 and 1.0
+}
+
+test percentile-fraction-above-range {
+    SELECT percentile(1, 101);
+}
+expect error {
+    the fraction argument to percentile\(\) is not between 0.0 and 100.0
+}
+
+test percentile-cont-fraction-below-range {
+    SELECT percentile_cont(1, -0.1);
+}
+expect error {
+    the fraction argument to percentile_cont\(\) is not between 0.0 and 1.0
+}
+
+test percentile-disc-fraction-checked-for-null-value {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(NULL);
+    SELECT percentile_disc(a, 2) FROM t;
+}
+expect error {
+    the fraction argument to percentile_disc\(\) is not between 0.0 and 1.0
+}
+
+test percentile-fraction-not-checked-without-rows {
+    CREATE TABLE t(a);
+    SELECT percentile_disc(a, 2) IS NULL, percentile_disc(a, NULL) IS NULL,
+           percentile_disc(a, 'abc') IS NULL, percentile(a, 101) IS NULL,
+           percentile_cont(a, -0.1) IS NULL FROM t;
+}
+expect {
+    1|1|1|1|1
+}
+
+test percentile-cont-fraction-changes-across-rows {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(1), (2), (3);
+    SELECT percentile_cont(a, a * 0.1) FROM t;
+}
+expect error {
+    the fraction argument to percentile_cont\(\) is not the same for all input rows
+}
+
+# With GROUP BY the arguments are read back from the sorter, so they are not
+# in consecutive registers either. Each call must get its own fraction.
+
+test percentile-disc-group-by-two-calls {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile_disc(x, 0.5), percentile_disc(y, 0.5) FROM t GROUP BY g;
+}
+expect {
+    a|2.0|200.0
+}
+expect @js {
+    a|2|200
+}
+
+test percentile-disc-group-by-three-fractions {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile_disc(x, 0.25), percentile_disc(x, 0.5), percentile_disc(x, 1.0) FROM t GROUP BY g;
+}
+expect {
+    a|1.0|2.0|4.0
+}
+expect @js {
+    a|1|2|4
+}
+
+test percentile-cont-group-by-three-fractions {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile_cont(x, 0.25), percentile_cont(x, 0.5), percentile_cont(x, 1.0) FROM t GROUP BY g;
+}
+expect {
+    a|1.75|2.5|4.0
+}
+expect @js {
+    a|1.75|2.5|4
+}
+
+test percentile-group-by-three-fractions {
+    CREATE TABLE t(g TEXT, x INTEGER, y INTEGER);
+    INSERT INTO t VALUES ('a', 1, 100), ('a', 2, 200), ('a', 3, 300), ('a', 4, 400);
+    SELECT g, percentile(x, 25), percentile(x, 50), percentile(x, 100) FROM t GROUP BY g;
+}
+expect {
+    a|1.75|2.5|4.0
+}
+expect @js {
+    a|1.75|2.5|4
+}
