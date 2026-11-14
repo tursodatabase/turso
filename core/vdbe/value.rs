@@ -1209,7 +1209,14 @@ impl Value {
     /// the result by 1 ulp relative to SQLite's ratio.
     #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
+        // SQLite's logFunc type-checks the base, but reads X of log(B, X) with
+        // sqlite3_value_double(), so log(10, '100abc') and log(10, x'313030') are 2.0.
+        let f = if base.is_some() {
+            Numeric::from_value(self)
+        } else {
+            Numeric::from_value_strict(self)
+        };
+        let Some(f) = f.map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
@@ -1351,7 +1358,7 @@ impl Value {
     pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
         const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
         if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
-            return Err(LimboError::Constraint(
+            return Err(LimboError::SqlError(
                 "LIKE or GLOB pattern too complex".to_string(),
             ));
         }
@@ -1405,8 +1412,8 @@ impl Value {
         const GLOB_CHARS: [char; 3] = ['*', '?', '['];
 
         if pattern.len() > MAX_GLOB_PATTERN_LENGTH {
-            return Err(LimboError::Constraint(
-                "GLOB pattern too complex".to_string(),
+            return Err(LimboError::SqlError(
+                "LIKE or GLOB pattern too complex".to_string(),
             ));
         }
         let pattern = sqlite_text_prefix(pattern);
@@ -1564,12 +1571,12 @@ impl Value {
                     Value::Null => 0,
                 };
                 // Invalid codepoints (negative, surrogates, or > U+10FFFF)
-                // become U+FFFD, matching SQLite.
-                if codepoint >= 0 {
-                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
-                } else {
-                    '\u{FFFD}'
-                }
+                // become U+FFFD, matching SQLite. Range-check the i64 before
+                // narrowing, or 4294967296 would wrap to U+0000.
+                u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}')
             })
             .collect();
         Value::build_text(result)

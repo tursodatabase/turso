@@ -3,11 +3,13 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::namespace::NamespaceRef;
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::security::policy::Command;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::{roles, row_security};
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -19,6 +21,7 @@ use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
+use super::insert::column_default_expr;
 use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
@@ -111,6 +114,7 @@ fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } => {
             if num_regs != target_count {
@@ -124,6 +128,7 @@ fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result
                     query_type: ast::SubqueryType::RowValue {
                         result_reg_start: result_reg_start + offset,
                         num_regs: 1,
+                        row_count_reg,
                     },
                 })
                 .collect())
@@ -192,6 +197,34 @@ fn prepare_and_optimize_update_plan(
         resolver,
         connection,
     )?;
+    // An ALTER that rewrites the schema table has had its own privileges
+    // checked already, and no policy applies to it.
+    if !is_internal_schema_change {
+        let reads_target_columns = update_reads_target_columns(&update_plan)?;
+        let target = &update_plan.target_table;
+        roles::check_write_privileges(
+            resolver,
+            connection,
+            target.namespace,
+            target.table.get_name(),
+            ast::Privilege::Update,
+            reads_target_columns,
+        )?;
+        apply_update_policies(
+            &mut update_plan,
+            &mut read_scope_tables,
+            reads_target_columns,
+            resolver,
+            program,
+        )?;
+        roles::hide_constraint_values_from_role_without_select(
+            program,
+            resolver,
+            connection,
+            update_plan.target_table.namespace,
+            update_plan.target_table.table.get_name(),
+        );
+    }
     mark_shared_cte_materialization_requirements(
         &mut read_scope_tables,
         &mut update_plan.non_from_clause_subqueries,
@@ -200,8 +233,64 @@ fn prepare_and_optimize_update_plan(
     update_plan.from_tables = read_scope_tables;
 
     let mut plan = Plan::Update(Box::new(update_plan));
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     Ok(plan)
+}
+
+/// Whether SET, WHERE or RETURNING reads the columns of the target table,
+/// which makes the UPDATE need SELECT on it and its SELECT policies apply,
+/// as in PostgreSQL. Subqueries must be planned first, so that only a
+/// subquery that refers to the target table counts as reading it.
+fn update_reads_target_columns(plan: &UpdatePlan) -> crate::Result<bool> {
+    roles::reads_columns_of(
+        plan.target_table.internal_id,
+        plan.where_clause
+            .iter()
+            .map(|term| &term.expr)
+            .chain(plan.set_clauses.iter().map(|set| set.expr.as_ref()))
+            .chain(plan.returning.iter().flatten().map(|column| &column.expr)),
+        &plan.non_from_clause_subqueries,
+    )
+}
+
+/// Applies the target table's row-level security policies: the UPDATE
+/// changes only the rows that the UPDATE policies allow, and the SELECT
+/// policies too when `reads_target_columns`, and each new row must pass the
+/// checks in `plan.row_checks`. The target table is the first of
+/// `read_scope_tables`; the FROM tables have their SELECT policies already.
+fn apply_update_policies(
+    plan: &mut UpdatePlan,
+    read_scope_tables: &mut TableReferences,
+    reads_target_columns: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> crate::Result<()> {
+    let commands: &[Command] = if reads_target_columns {
+        &[Command::Update, Command::Select]
+    } else {
+        &[Command::Update]
+    };
+    let target_table = read_scope_tables.joined_tables_mut().remove(0);
+    plan.row_checks = row_security::new_row_checks(
+        resolver,
+        target_table.namespace,
+        target_table.table.get_name(),
+        Command::Update,
+        reads_target_columns,
+    );
+    let mut target_scope = TableReferences::new(vec![target_table], vec![]);
+    row_security::filter_rows(
+        commands,
+        &mut target_scope,
+        &mut plan.where_clause,
+        resolver,
+        program,
+    )?;
+    let target_table = target_scope.joined_tables_mut().remove(0);
+    read_scope_tables
+        .joined_tables_mut()
+        .insert(0, target_table);
+    Ok(())
 }
 
 fn validate_update(
@@ -302,6 +391,7 @@ fn prepare_update_plan(
         namespace,
         indexed,
         plan_estimate: None,
+        row_filter: None,
     };
     let mut table_refs_outside_from = Vec::new();
     for set in &body.sets {
@@ -328,6 +418,13 @@ fn prepare_update_plan(
         &mut vtab_predicates,
         &mut from_tables,
         connection,
+    )?;
+    row_security::filter_rows(
+        &[Command::Select],
+        &mut from_tables,
+        &mut where_clause,
+        resolver,
+        program,
     )?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
@@ -376,12 +473,11 @@ fn prepare_update_plan(
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
-        bind_and_rewrite_expr(
+        bind_set_expr(
             &mut set.expr,
             Some(&mut read_scope_tables),
-            None,
-            resolver,
             BindingBehavior::ResultColumnsNotAllowed,
+            resolver,
         )?;
     }
 
@@ -394,7 +490,7 @@ fn prepare_update_plan(
         connection,
     )?;
 
-    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
+    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name, resolver)?;
 
     let result_columns = if !body.returning.is_empty() {
         // Plan subqueries in RETURNING expressions before processing
@@ -429,17 +525,18 @@ fn prepare_update_plan(
     };
 
     let columns = table.columns();
+    // As in SQLite, WHERE cannot name a RETURNING alias.
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
-        Some(&result_columns),
+        None,
         &mut where_clause,
         resolver,
     )?;
     append_vtab_predicates_to_where_clause(
         &mut vtab_predicates,
         &mut read_scope_tables,
-        &result_columns,
+        &[],
         &mut where_clause,
         resolver,
     )?;
@@ -472,13 +569,41 @@ fn prepare_update_plan(
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
+        row_checks: Vec::new(),
     })
+}
+
+pub(super) fn bind_set_expr(
+    expr: &mut Box<Expr>,
+    mut read_scope_tables: Option<&mut TableReferences>,
+    behavior: BindingBehavior,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    if matches!(expr.as_ref(), Expr::Default) {
+        return Ok(());
+    }
+    if let Expr::Parenthesized(exprs) = expr.as_mut() {
+        if exprs.len() > 1 {
+            for expr in exprs.iter_mut() {
+                bind_set_expr(
+                    expr,
+                    read_scope_tables.as_deref_mut(),
+                    behavior.clone(),
+                    resolver,
+                )?;
+            }
+            return Ok(());
+        }
+    }
+    bind_and_rewrite_expr(expr, read_scope_tables, None, resolver, behavior)?;
+    Ok(())
 }
 
 fn collect_update_set_clauses(
     sets: &mut [ast::Set],
     table: &Table,
     table_name: &str,
+    resolver: &Resolver,
 ) -> crate::Result<Vec<UpdateSetClause>> {
     let column_lookup: HashMap<String, usize> = table
         .columns()
@@ -493,12 +618,16 @@ fn collect_update_set_clauses(
         let values = split_update_set_values(*expr, set.col_names.len())?;
 
         for (col_name, expr) in set.col_names.iter().zip(values.into_iter()) {
-            let expr = Box::new(expr);
+            let mut expr = Box::new(expr);
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
                 Some(idx) => {
-                    table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
+                    let col = &table.columns()[*idx];
+                    col.ensure_not_generated("UPDATE", col_name.as_str())?;
+                    if matches!(expr.as_ref(), Expr::Default) {
+                        expr = column_default_expr(col, table.is_strict(), resolver);
+                    }
                     *idx
                 }
                 None => match rowid_name_column_index(table, &ident) {

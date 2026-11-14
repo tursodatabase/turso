@@ -3,6 +3,7 @@ use crate::alloc::{
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
+use crate::dialect::ScalarFuncContext;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -12,12 +13,11 @@ use crate::mvcc::database::{
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
-use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
+use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
@@ -36,6 +36,7 @@ use crate::types::{
     compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
+use crate::types::{StorageClass, StrictType};
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
@@ -51,7 +52,7 @@ use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
 use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
-use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::metrics::{HashJoinMetrics, StatementMetrics};
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
@@ -80,19 +81,11 @@ use crate::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        LimboError, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
-    functions::{
-        datetime::{
-            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
-            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
-        },
-        printf::exec_printf,
-    },
-    stats::StatAccum,
     translate::emitter::TransactionMode,
 };
 use branches::{mark_unlikely, unlikely};
@@ -101,7 +94,6 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::str::FromStr;
 use std::{
-    borrow::BorrowMut,
     cell::Cell,
     num::NonZero,
     sync::{atomic::Ordering, Arc},
@@ -153,21 +145,17 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compute_array_length, compute_array_length_at_dim,
-        exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
-        exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
-        exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
+        array_values_from_blob, compute_array_length, exec_array_slice, make_array_from_registers,
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
-        AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SorterOpenData,
+        AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
+        IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
 use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
-use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
@@ -192,8 +180,12 @@ use super::{Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
+use crate::security::roles::SessionRole;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{
+    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
+    Pager, Result,
+};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -224,26 +216,6 @@ macro_rules! return_if_io {
             }
         }
     };
-}
-
-use arg_count::check_arg_count;
-mod arg_count {
-    use crate::LimboError;
-
-    macro_rules! check_arg_count {
-        ($actual:expr, $expected:expr) => {
-            if unlikely($actual != $expected) {
-                return Err(arg_count::wrong_arg_count($expected, $actual));
-            }
-        };
-    }
-    pub(super) use check_arg_count;
-
-    #[cold]
-    #[inline(never)]
-    pub(super) fn wrong_arg_count(expected: usize, actual: usize) -> Box<LimboError> {
-        LimboError::InternalError(format!("expected {expected} argument(s), got {actual}")).into()
-    }
 }
 
 /// Errors are boxed so an op's whole return value stays small: a LimboError
@@ -299,6 +271,9 @@ pub enum InsnFunctionStepResult {
     IO,
     Row,
     Step,
+    /// A trigger or foreign key action the instruction runs was interrupted,
+    /// so the statement stops as interrupted too.
+    Interrupt,
 }
 
 pub fn op_init(
@@ -311,6 +286,13 @@ pub fn op_init(
     if unlikely(!target_pc.is_offset()) {
         return Err(unresolved_branch_target(*target_pc));
     }
+    // Each run of a program executes Init once, so it is where SQLITE_STMTSTATUS_RUN counts runs.
+    turso_debug_assert!(
+        state.pc == 0,
+        "Init must be the first instruction of a program",
+        { "pc": state.pc }
+    );
+    state.metrics.runs = state.metrics.runs.wrapping_add(1);
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1557,7 +1539,6 @@ pub fn op_vupdate(
             cursor_id,
             arg_count,
             start_reg,
-            conflict_action,
             ..
         },
         insn
@@ -1618,19 +1599,18 @@ pub fn op_vupdate(
     } else {
         virtual_table.update(&argv, &mut state.extension_state)
     };
+    // Like SQLite's OP_VUpdate, an INSERT (argv[0] is NULL) sets
+    // last_insert_rowid() to the rowid the module returns, and every write
+    // counts in changes() and total_changes().
+    let is_insert = matches!(argv[0], Value::Null);
     match result {
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
-        Ok(IOResult::Done(Some(new_rowid))) => {
+        Ok(IOResult::Done(new_rowid)) => {
             state.record_rows_written(1);
-            if *conflict_action == 5 {
-                // ResolveType::Replace
-                program.connection.update_last_rowid(new_rowid);
+            state.record_statement_change();
+            if is_insert {
+                program.connection.update_last_rowid(new_rowid.unwrap_or(0));
             }
-            state.pc += 1;
-        }
-        Ok(IOResult::Done(None)) => {
-            // no-op or successful update without rowid return
-            state.record_rows_written(1);
             state.pc += 1;
         }
         Err(e) => {
@@ -2572,41 +2552,57 @@ pub fn op_type_check(
             let offset = table_reference.logical_to_physical_column(column_idx);
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
-            // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
-            {
-                bail_constraint_error!(
-                    "NOT NULL constraint failed: {}.{} ({})",
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                )
-            } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
-                // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                return Ok(());
-            } else if matches!(reg.get_value(), Value::Null) {
-                // STRICT only enforces type affinity on non-NULL values.
-                // NULL is valid in any column without NOT NULL constraint.
+            if matches!(reg.get_value(), Value::Null) {
+                // STRICT only checks the type of non-NULL values. A NULL in a NOT NULL
+                // column, a PRIMARY KEY of a STRICT table included, is for the NOT NULL
+                // check, which also applies the statement's OR IGNORE or OR REPLACE.
+                // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
-            if let Some(expected_type) = col.strict_value_type() {
-                let _applied = apply_affinity_char(reg, col.affinity());
-                let value_type = reg.get_value().value_type();
-                if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
-                        value_type,
-                        col.ty_str,
-                        &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+            match col.strict_type(&table_reference.name)? {
+                StrictType::Stores(expected_type) => {
+                    if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
+                        return Err(datatype_violation(format!(
+                            "cannot store {} value in {} column {}.{}",
+                            value_type,
+                            col.ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or("")
+                        )));
+                    }
                 }
+                StrictType::Any => {}
             }
             Ok(())
         },
     )?;
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_convert_to_type(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        ConvertToType {
+            reg,
+            storage_class,
+            description
+        },
+        insn
+    );
+    let reg = &mut state.registers[*reg];
+    if !matches!(reg.get_value(), Value::Null) {
+        if let Err(actual) = convert_to_strict_type(reg, *storage_class) {
+            return Err(
+                datatype_violation(format!("cannot store {actual} value {description}")).into(),
+            );
+        }
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2650,10 +2646,10 @@ pub fn op_array_encode(
     load_insn!(ArrayEncode { data }, insn);
     let ArrayEncodeData {
         reg,
-        element_affinity,
         element_type,
-        table_name,
-        col_name,
+        element_kind,
+        dimensions,
+        target,
     } = data.as_ref();
 
     let val = state.registers[*reg].get_value();
@@ -2662,12 +2658,13 @@ pub fn op_array_encode(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // Fast path: blob input with ANY type — validate it is a well-formed record
-    // before accepting. This avoids the redundant extract→reserialize when MakeArray
-    // output feeds directly into ArrayEncode with ANY affinity, but rejects raw blobs
-    // (e.g. zeroblob, X'DEADBEEF') that would crash on read.
+    // Fast path: blob input to a one-dimensional ANY array — validate it is a
+    // well-formed record before accepting. This avoids the redundant
+    // extract→reserialize when MakeArray output feeds directly into ArrayEncode
+    // with ANY affinity, but rejects raw blobs (e.g. zeroblob, X'DEADBEEF') that
+    // would crash on read.
     if let Value::Blob(b) = val {
-        if element_type.eq_ignore_ascii_case("ANY") {
+        if *element_kind == StrictType::Any && *dimensions == 1 {
             // Validate blob is a well-formed record using streaming iterator
             // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
             let valid = !b.is_empty()
@@ -2675,13 +2672,9 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
-                    element_type,
-                    table_name,
-                    col_name,
-                    SQLITE_CONSTRAINT
-                );
+                return crate::error::cold_return(Err(
+                    non_array_value_error(element_type, target).into()
+                ));
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2695,58 +2688,17 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
-            element_type,
-            table_name,
-            col_name,
-            SQLITE_CONSTRAINT
-        );
+        return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target}"
         );
     }
 
-    let mut coerced_elements: Vec<Value> = Vec::with_capacity(raw_elements.len());
-    for elem in raw_elements {
-        // NULL elements are allowed — same as STRICT allows NULL in columns
-        if matches!(elem, Value::Null) {
-            coerced_elements.push(elem);
-            continue;
-        }
-
-        // Apply affinity coercion — same as STRICT's TypeCheck
-        let mut reg_tmp = Register::Value(elem);
-        apply_affinity_char(&mut reg_tmp, *element_affinity);
-        let coerced = reg_tmp.get_value().clone();
-
-        // Check value type matches the declared element type — same as STRICT's TypeCheck
-        let value_type = coerced.value_type();
-        let ty_bytes = element_type.as_bytes();
-        let type_ok = turso_macros::match_ignore_ascii_case!(match ty_bytes {
-            b"ANY" => true,
-            b"INTEGER" | b"INT" => value_type == ValueType::Integer,
-            b"REAL" => value_type == ValueType::Float,
-            b"TEXT" => value_type == ValueType::Text,
-            b"BLOB" => value_type == ValueType::Blob,
-            _ => true, // custom types validated by their own encode
-        });
-
-        if !type_ok {
-            bail_constraint_error!(
-                "cannot store {} value in {} ({})",
-                value_type,
-                element_type,
-                SQLITE_CONSTRAINT
-            );
-        }
-
-        coerced_elements.push(coerced);
-    }
+    let coerced_elements = convert_array_elements(raw_elements, *dimensions, data)?;
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
@@ -2754,6 +2706,100 @@ pub fn op_array_encode(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The error for a value that is not an array, going to `target`.
+fn non_array_value_error(element_type: &str, target: &ArrayEncodeTarget) -> LimboError {
+    let message = match target {
+        ArrayEncodeTarget::Column {
+            table_name,
+            col_name,
+        } => {
+            format!("cannot store non-array value in {element_type} column {table_name}.{col_name}")
+        }
+        ArrayEncodeTarget::Cast => "cannot cast a non-array value to an array".to_string(),
+        ArrayEncodeTarget::IndexKey => {
+            "cannot use a non-array value as an array index key".to_string()
+        }
+    };
+    datatype_violation(message)
+}
+
+/// Converts the elements of an array with `dimensions` levels: in INTEGER[][]
+/// every element of the outer array must be an array, and every element of
+/// those is converted as a STRICT INTEGER column converts a value. NULL is
+/// allowed at every level, as STRICT allows NULL in a column.
+fn convert_array_elements(
+    elements: Vec<Value>,
+    dimensions: u32,
+    data: &ArrayEncodeData,
+) -> Result<Vec<Value>> {
+    let ArrayEncodeData {
+        element_type,
+        element_kind,
+        target,
+        ..
+    } = data;
+    let not_an_array = || non_array_value_error(element_type, target);
+    let mut converted = Vec::with_capacity(elements.len());
+    for element in elements {
+        let value = match (dimensions, element) {
+            (0, _) => {
+                return Err(LimboError::InternalError(format!(
+                    "array for {target} has no dimensions"
+                )))
+            }
+            (_, Value::Null) => Value::Null,
+            (2.., Value::Blob(sub_array)) => {
+                let sub_elements =
+                    array_values_from_blob(&sub_array).map_err(|_| not_an_array())?;
+                let sub_elements = convert_array_elements(sub_elements, dimensions - 1, data)?;
+                values_to_record_blob(&sub_elements)?
+            }
+            (2.., Value::Numeric(_) | Value::Text(_)) => return Err(not_an_array()),
+            (1, element @ (Value::Numeric(_) | Value::Text(_) | Value::Blob(_))) => {
+                let mut reg = Register::Value(element);
+                match *element_kind {
+                    StrictType::Stores(storage_class) => {
+                        if let Err(value_type) = convert_to_strict_type(&mut reg, storage_class) {
+                            return Err(datatype_violation(format!(
+                                "cannot store {value_type} value in {element_type}"
+                            )));
+                        }
+                    }
+                    StrictType::Any => {}
+                }
+                reg.get_value().clone()
+            }
+        };
+        converted.push(value);
+    }
+    Ok(converted)
+}
+
+/// Converts the non-NULL value in `reg` as a STRICT column storing
+/// `storage_class` does: applies that column's affinity, so '5' becomes 5 for
+/// INTEGER and 5 becomes 5.0 for REAL. Returns the value's kind when it still
+/// isn't of `storage_class`.
+fn convert_to_strict_type(
+    reg: &mut Register,
+    storage_class: StorageClass,
+) -> Result<(), ValueType> {
+    apply_affinity_char(reg, storage_class.affinity());
+    let actual = reg.get_value().value_type();
+    if actual == storage_class.value_type() {
+        Ok(())
+    } else {
+        Err(actual)
+    }
+}
+
+/// A value whose type does not match its column's type.
+fn datatype_violation(message: String) -> LimboError {
+    LimboError::ConstraintViolation(Box::new(ConstraintViolation::new(
+        ConstraintKind::Datatype,
+        message,
+    )))
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.
@@ -2887,50 +2933,6 @@ pub fn op_make_array(
         &state.registers,
         *start_reg,
         *count,
-    )?);
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// Create an array from contiguous registers with dynamic count.
-pub fn op_make_array_dynamic(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        MakeArrayDynamic {
-            start_reg,
-            count_reg,
-            dest
-        },
-        insn
-    );
-
-    let count = match state.registers[*count_reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
-        _ => 0,
-    };
-
-    let end = start_reg.checked_add(count).ok_or_else(|| {
-        LimboError::InternalError("MakeArrayDynamic: register range overflow".into())
-    })?;
-    if end > state.registers.len() {
-        return Err(LimboError::InternalError(format!(
-            "MakeArrayDynamic: register range {}..{} exceeds register file size {}",
-            start_reg,
-            end,
-            state.registers.len()
-        ))
-        .into());
-    }
-
-    state.registers[*dest].set_value(make_array_from_registers(
-        &state.registers,
-        *start_reg,
-        count,
     )?);
 
     state.pc += 1;
@@ -3095,48 +3097,6 @@ pub fn op_union_extract(
         }
         None => state.registers[*dest].set_null(),
     };
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// Copy a register value to a dynamically-computed destination register.
-pub fn op_reg_copy_offset(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        RegCopyOffset {
-            src,
-            base,
-            offset_reg
-        },
-        insn
-    );
-
-    let offset = match state.registers[*offset_reg].get_value() {
-        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
-        _ => 0,
-    };
-    let dest = *base + offset;
-    if dest >= state.registers.len() {
-        return Err(LimboError::InternalError(format!(
-            "RegCopyOffset: destination register {} out of bounds (max {})",
-            dest,
-            state.registers.len()
-        ))
-        .into());
-    }
-    if dest != *src {
-        // try_clone_from reuses the destination register's allocation.
-        let [src, dst] = state
-            .registers
-            .get_disjoint_mut([*src, dest])
-            .expect("RegCopyOffset source and destination registers are distinct");
-        dst.try_clone_from(src)?;
-    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3686,6 +3646,7 @@ pub fn halt(
         | SQLITE_CONSTRAINT_NOTNULL
         | SQLITE_CONSTRAINT_FOREIGNKEY
         | SQLITE_CONSTRAINT_TRIGGER => Some(build_constraint_violation_error(
+            program,
             state,
             constraint_info,
             err_code,
@@ -3707,7 +3668,7 @@ pub fn halt(
         // CONFLICT clause, or a trigger step's OR clause) is embedded in the
         // error, so whichever program aborts applies it instead of its own.
         if let Some(resolve_type) = on_error {
-            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+            return Err(LimboError::Raise(resolve_type, Box::new(error)).into());
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
@@ -3904,12 +3865,12 @@ pub fn halt(
 }
 
 fn build_constraint_violation_error(
+    program: &Program,
     state: &ProgramState,
     info: Option<&ConstraintInfo>,
     err_code: usize,
     description: &str,
 ) -> LimboError {
-    use crate::{ConstraintKind, ConstraintViolation};
     let (kind, message) = match err_code {
         SQLITE_CONSTRAINT_PRIMARYKEY => (
             ConstraintKind::PrimaryKey,
@@ -3928,6 +3889,7 @@ fn build_constraint_violation_error(
             format!("NOT NULL constraint failed: {description}"),
         ),
         SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        SQLITE_CONSTRAINT_TRIGGER => (ConstraintKind::Trigger, description.to_string()),
         _ => (ConstraintKind::Other, description.to_string()),
     };
     let mut violation = ConstraintViolation::new(kind, message);
@@ -3937,12 +3899,14 @@ fn build_constraint_violation_error(
         violation.constraint_name.clone_from(&info.constraint_name);
         violation.index_name.clone_from(&info.index_name);
         violation.column_names.clone_from(&info.column_names);
-        violation.values = info
-            .violation_regs
-            .iter()
-            .map(|&reg| state.registers[reg].get_value().clone())
-            .collect();
-        violation.row_values = !info.row_col_names.is_empty();
+        if !program.hides_constraint_values {
+            violation.values = info
+                .violation_regs
+                .iter()
+                .map(|&reg| state.registers[reg].get_value().clone())
+                .collect();
+            violation.row_values = !info.row_col_names.is_empty();
+        }
         violation.parent_table.clone_from(&info.parent_table);
     }
     LimboError::ConstraintViolation(Box::new(violation))
@@ -4264,6 +4228,16 @@ pub fn op_halt_if_null(
     }
 }
 
+pub fn op_row_security_violation(
+    _program: &Program,
+    _state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(RowSecurityViolation { denial }, insn);
+    Err(LimboError::PermissionDenied(denial.clone()).into())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum OpTransactionState {
     Start,
@@ -4275,7 +4249,7 @@ pub enum OpTransactionState {
 
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum TransactionYieldPoint {
+pub enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
 }
@@ -4308,6 +4282,7 @@ pub fn op_transaction(
         Ok(result) => Ok(result),
         Err(err) => {
             state.active_op_state.clear();
+            state.stop_counting_as_reader(&program.connection);
             Err(err)
         }
     }
@@ -4629,6 +4604,34 @@ pub fn op_transaction_inner(
                     return Err(
                         LimboError::StatementsInProgress("cannot start a write statement").into(),
                     );
+                }
+                // Like SQLite's OP_Destroy, refuse to free a b-tree while another
+                // statement on this connection reads a database: its cursors
+                // would read the freed pages after they are reused. SQLite checks
+                // at the Destroy itself and undoes the statement's earlier writes
+                // with a statement journal. Turso opens none for an autocommit
+                // statement that shares its transaction with a reader, so the
+                // check is made here, before the statement writes anything.
+                // SQLite never returns to the caller in the middle of a Destroy,
+                // but Turso can suspend there for I/O, so a statement must also
+                // not start reading while a DROP is in progress. A nested
+                // statement (an index method dropping its backing tables) is
+                // part of its parent's DROP, which already passed these checks.
+                // The counts are released if this instruction fails or returns
+                // busy, so a DROP waiting on a lock does not block readers.
+                if !conn.is_nested_stmt() && !state.is_active_read {
+                    let other_readers = conn.n_active_read_statements.load(Ordering::SeqCst);
+                    let other_destroyers = conn.n_active_destroy_statements.load(Ordering::SeqCst);
+                    if (program.destroys_btree && other_readers > 0) || other_destroyers > 0 {
+                        return Err(LimboError::TableLocked.into());
+                    }
+                    conn.n_active_read_statements.fetch_add(1, Ordering::SeqCst);
+                    state.is_active_read = true;
+                    if program.destroys_btree {
+                        conn.n_active_destroy_statements
+                            .fetch_add(1, Ordering::SeqCst);
+                        state.is_active_destroy = true;
+                    }
                 }
 
                 // Fast path: if checkpoint root publication already replaced the
@@ -5866,12 +5869,18 @@ impl Default for OpProgramState {
 
 fn finish_subprogram(
     program: &Program,
-    statement: &Statement,
+    parent_metrics: &mut StatementMetrics,
+    statement: &mut Statement,
     is_trigger: bool,
     subprogram_aborted: bool,
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
+    // Add the subprogram's counters to the parent's now, because the parent
+    // drops its cached subprogram statements when it is reset.
+    parent_metrics.merge(&statement.metrics());
+    statement.reset_metrics();
+
     let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
@@ -6010,6 +6019,7 @@ pub fn op_program(
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
+                    statement.set_query_deadline(state.query_deadline);
                     let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
@@ -6027,7 +6037,20 @@ pub fn op_program(
                                 return Ok(state.suspend_on_io(io));
                             }
                             StepResult::Row => continue,
-                            StepResult::Interrupt | StepResult::Busy => {
+                            StepResult::Interrupt => {
+                                // The subprogram already aborted itself when it stopped.
+                                finish_subprogram(
+                                    program,
+                                    &mut state.metrics,
+                                    &mut statement,
+                                    is_trigger,
+                                    true,
+                                    saved_last_insert_rowid,
+                                    saved_last_changes_value,
+                                );
+                                return Ok(InsnFunctionStepResult::Interrupt);
+                            }
+                            StepResult::Busy => {
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
@@ -6045,7 +6068,8 @@ pub fn op_program(
                                 subprogram_aborted = true;
                                 finish_subprogram(
                                     program,
-                                    &statement,
+                                    &mut state.metrics,
+                                    &mut statement,
                                     is_trigger,
                                     subprogram_aborted,
                                     saved_last_insert_rowid,
@@ -6065,7 +6089,8 @@ pub fn op_program(
                             subprogram_aborted = true;
                             finish_subprogram(
                                 program,
-                                &statement,
+                                &mut state.metrics,
+                                &mut statement,
                                 is_trigger,
                                 subprogram_aborted,
                                 saved_last_insert_rowid,
@@ -6077,7 +6102,8 @@ pub fn op_program(
                 }
                 finish_subprogram(
                     program,
-                    &statement,
+                    &mut state.metrics,
+                    &mut statement,
                     is_trigger,
                     subprogram_aborted,
                     saved_last_insert_rowid,
@@ -6125,7 +6151,8 @@ pub(super) fn abort_active_subprogram(
         let result = statement.abort_subprogram(err);
         finish_subprogram(
             program,
-            &statement,
+            &mut state.metrics,
+            &mut statement,
             is_trigger,
             true,
             saved_last_insert_rowid,
@@ -10172,7 +10199,10 @@ pub fn op_function(
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10182,7 +10212,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10192,7 +10225,10 @@ pub fn op_function(
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10202,7 +10238,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10239,7 +10278,10 @@ pub fn op_function(
             }
             JsonFunc::JsonSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10253,7 +10295,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10274,1275 +10319,93 @@ pub fn op_function(
                 }
             }
         },
-        crate::function::Func::Scalar(scalar_func) => match scalar_func {
-            ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
-                unreachable!("desugared to dedicated instructions, not Function")
-            }
-            ScalarFunc::Cast => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
-                let result = {
-                    let Value::Text(cast_type) = state.registers[*start_reg + 1].get_value() else {
-                        unreachable!("Cast with non-text type");
-                    };
-                    state.registers[*start_reg]
-                        .get_value()
-                        .exec_cast(cast_type.as_str())?
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Changes => {
-                let res = &program.connection.changes;
-                let changes = res.load(Ordering::SeqCst);
-                state.registers[*dest].set_int(changes);
-            }
-            ScalarFunc::Char => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest].set_value(Value::exec_char(
-                    reg_values.iter().map(|reg| reg.get_value()),
-                ));
-            }
-            ScalarFunc::Coalesce => {}
-            ScalarFunc::Concat => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result =
-                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::ConcatWs => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Glob => {
-                if arg_count != 2 {
-                    mark_unlikely();
-                    return Err(LimboError::ParseError(
-                        "wrong number of arguments to function GLOB()".to_string(),
-                    )
-                    .into());
-                }
-                let pattern_reg = &state.registers[*start_reg];
-                let match_reg = &state.registers[*start_reg + 1];
-
-                let pattern_value = pattern_reg.get_value();
-                let match_value = match_reg.get_value();
-
-                if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
-                    state.registers[*dest].set_null();
-                } else {
-                    let pattern_cow = match pattern_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
-                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                            _ => unreachable!("Cast to TEXT should yield Text"),
-                        },
-                    };
-
-                    let match_cow = match match_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
-                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                            _ => unreachable!("Cast to TEXT should yield Text"),
-                        },
-                    };
-
-                    let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
-                    state.registers[*dest].set_int(matches as i64);
-                }
-            }
-            ScalarFunc::IfNull => {}
-            ScalarFunc::Iif => {}
-            ScalarFunc::Instr => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = &state.registers[*start_reg + 1];
-                match reg_value.get_value().exec_instr(pattern_value.get_value()) {
-                    Value::Numeric(Numeric::Integer(i)) => state.registers[*dest].set_int(i),
-                    _ => state.registers[*dest].set_null(),
-                };
-            }
-            ScalarFunc::LastInsertRowid => {
-                state.registers[*dest].set_int(program.connection.last_insert_rowid());
-            }
-            ScalarFunc::Like => {
-                let pattern_reg = &state.registers[*start_reg];
-                let match_reg = &state.registers[*start_reg + 1];
-
-                let pattern_value = pattern_reg.get_value();
-                let match_value = match_reg.get_value();
-
-                // 1. Check for NULL inputs
-                if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
-                    state.registers[*dest].set_null();
-                } else {
-                    // 2. Resolve Escape Character (if 3rd arg exists)
-                    let mut escape_char = None;
-                    let mut is_null_result = false;
-
-                    if arg_count == 3 {
-                        let escape_value = state.registers[*start_reg + 2].get_value();
-                        match escape_value {
-                            Value::Null => {
-                                is_null_result = true;
-                            }
-                            _ => {
-                                let escape_cow = match escape_value {
-                                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT")? {
-                                        Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-                                        _ => unreachable!("Cast to TEXT should yield Text"),
-                                    },
-                                };
-
-                                let mut chars = escape_cow.chars();
-                                let c = chars.next();
-                                if c.is_none() || chars.next().is_some() {
-                                    return Err(LimboError::Constraint(
-                                        "ESCAPE expression must be a single character".to_string(),
-                                    )
-                                    .into());
-                                }
-                                escape_char = c;
-                            }
-                        }
-                    }
-
-                    if is_null_result {
-                        state.registers[*dest].set_null();
-                    } else {
-                        // 3. and 4. Prepare Pattern and Text, then execute Like.
-                        let matches = match (pattern_value, match_value) {
-                            (Value::Text(pattern), Value::Text(text)) => {
-                                Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
-                            }
-                            _ => exec_like_converted(pattern_value, match_value, escape_char)?,
-                        };
-                        state.registers[*dest].set_int(matches as i64);
-                    }
-                }
-            }
-            ScalarFunc::NextVal => {
-                // The translator no longer emits `Function NextVal` — nextval
-                // is now handled entirely by the SequenceComputeNext +
-                // SetSequenceCurrval opcode pair plus surrounding cursor ops.
-                // Reaching this handler means stale bytecode somewhere.
-                return Err(crate::LimboError::InternalError(
-                    "ScalarFunc::NextVal handler should be unreachable under \
-                     the disk-only sequence design"
-                        .to_string(),
-                )
-                .into());
-            }
-            ScalarFunc::CurrVal => {
-                let seq_name = match state.registers[*start_reg].get_value() {
-                    Value::Text(t) => t.as_str().to_string(),
-                    _ => {
-                        return Err(crate::LimboError::ParseError(
-                            "currval() requires a text argument".to_string(),
-                        )
-                        .into());
-                    }
-                };
-                // The connection's currval session map persists across
-                // DROP SEQUENCE (the entry is keyed by name with no link
-                // to the schema). Resolve the sequence first so currval
-                // on a dropped sequence reports "does not exist" rather
-                // than silently returning the stale per-session value.
-                let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
-                match program.connection.get_sequence_currval(
-                    namespace.database_id,
-                    &mangle_name(namespace.id, &sequence.name),
-                ) {
-                    Some(val) => {
-                        state.registers[*dest].set_value(Value::from_i64(val));
-                    }
-                    None => {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "currval of sequence \"{}\" is not yet defined in this session",
-                            sequence.name
-                        ))
-                        .into());
-                    }
-                }
-            }
-            ScalarFunc::SetVal => {
-                if program.connection.is_tx_read_only() {
-                    return Err(LimboError::ReadOnly.into());
-                }
-                // Pre-write validation: argument type + range check. The
-                // translator emits this Function call before the inline
-                // DELETE-all + INSERT bytecode, so any error returned here
-                // aborts the statement BEFORE any disk write — which is what
-                // keeps the op_insert "expected integer key" assertion safe
-                // and the user-facing error message intact. After validation
-                // the result value is placed in `dest`; currval bookkeeping
-                // and dirty-marking are emitted by the translator via the
-                // separate SetSequenceCurrval opcode.
-                //
-                // Note: in the disk-only design there is no pending-setval
-                // queue, no in-memory atomic to mutate, and no exclusive-tx
-                // requirement. The autonomous-tx mechanism (planned for MVCC
-                // concurrency in a follow-up) will subsume serialization.
-                let seq_name = match state.registers[*start_reg].get_value() {
-                    Value::Text(t) => t.as_str().to_string(),
-                    _ => {
-                        return Err(crate::LimboError::ParseError(
-                            "setval() requires a text argument".to_string(),
-                        )
-                        .into());
-                    }
-                };
-                let value = match state.registers[*start_reg + 1].get_value().as_int() {
-                    Some(v) => v,
-                    None => {
-                        return Err(crate::LimboError::ParseError(
-                            "setval() requires an integer value".to_string(),
-                        )
-                        .into());
-                    }
-                };
-                if arg_count > 2
-                    && state.registers[*start_reg + 2]
-                        .get_value()
-                        .as_int()
-                        .is_none()
-                {
-                    return Err(crate::LimboError::ParseError(
-                        "setval() requires an integer is_called argument".to_string(),
-                    )
-                    .into());
-                }
-                let (_, seq) = program.connection.find_sequence(&seq_name)?;
-                if value < seq.min_value || value > seq.max_value {
-                    return Err(crate::LimboError::ParseError(format!(
-                        "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
-                        value, seq.name, seq.min_value, seq.max_value
-                    ))
-                    .into());
-                }
-                state.registers[*dest].set_value(Value::from_i64(value));
-            }
-            ScalarFunc::Abs
-            | ScalarFunc::Lower
-            | ScalarFunc::Upper
-            | ScalarFunc::Length
-            | ScalarFunc::OctetLength
-            | ScalarFunc::Subtype
-            | ScalarFunc::Typeof
-            | ScalarFunc::Unicode
-            | ScalarFunc::Unistr
-            | ScalarFunc::UnistrQuote
-            | ScalarFunc::Quote
-            | ScalarFunc::RandomBlob
-            | ScalarFunc::Sign
-            | ScalarFunc::Soundex
-            | ScalarFunc::ZeroBlob => {
-                let reg_value = state.registers[*start_reg].borrow_mut().get_value();
-                let result = match scalar_func {
-                    ScalarFunc::Sign => reg_value.exec_sign(),
-                    ScalarFunc::Abs => Some(reg_value.exec_abs()?),
-                    ScalarFunc::Lower => reg_value.exec_lower(),
-                    ScalarFunc::Upper => reg_value.exec_upper(),
-                    ScalarFunc::Length => Some(reg_value.exec_length()),
-                    ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
-                    ScalarFunc::Subtype => Some(reg_value.exec_subtype()),
-                    ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
-                    ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
-                    ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
-                    ScalarFunc::Quote => Some(reg_value.exec_quote()),
-                    ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),
-                    ScalarFunc::RandomBlob => {
-                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
-                    }
-                    ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
-                    ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
-                    _ => unreachable!(),
-                };
-                // this is a `match` instead of `unwrap_or_else` because on the current pinned
-                // toolchain, it compiles to fewer instructions
-                let value = match result {
-                    Some(value) => value,
-                    None => Value::Null,
-                };
-                state.registers[*dest].set_value(value);
-            }
-            ScalarFunc::Hex => {
-                let reg_value = state.registers[*start_reg].borrow_mut();
-                let result = reg_value.get_value().exec_hex();
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Unhex => {
-                let reg_value = &state.registers[*start_reg];
-                let ignored_chars = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_unhex(ignored_chars.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::GetByte => {
-                let value = state.registers[*start_reg].get_value();
-                let offset = state.registers[*start_reg + 1].get_value();
-                let result = value.exec_get_byte(offset)?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::SetByte => {
-                let value = state.registers[*start_reg].get_value();
-                let offset = state.registers[*start_reg + 1].get_value();
-                let new_value = state.registers[*start_reg + 2].get_value();
-                let result = value.exec_set_byte(offset, new_value)?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Random => {
-                let bits = pager.io.generate_random_number();
-                let value = program.connection.dialect().random_value(bits);
-                state.registers[*dest].set_value(value);
-            }
-            #[cfg(feature = "test_helper")]
-            ScalarFunc::TestNondetCounter => {
-                // Test-only: per-connection counter that increments on every
-                // evaluation. Used in sqltests to verify that the planner does
-                // not deduplicate equivalent SQL calls that contain
-                // nondeterministic functions.
-                let value = program
-                    .connection
-                    .test_nondet_counter
-                    .fetch_add(1, Ordering::Relaxed);
-                state.registers[*dest].set_int(value);
-            }
-            ScalarFunc::Trim => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_trim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::LTrim => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_ltrim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::RTrim => {
-                let reg_value = &state.registers[*start_reg];
-                let pattern_value = if func.arg_count == 2 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_rtrim(pattern_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Round => {
-                let reg_value = &state.registers[*start_reg];
-                assert!(arg_count == 1 || arg_count == 2);
-                let precision_value = if arg_count > 1 {
-                    state.registers.get(*start_reg + 1)
-                } else {
-                    None
-                };
-                let result = reg_value
-                    .get_value()
-                    .exec_round(precision_value.map(|x| x.get_value()));
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Min => {
-                let collation = func.collation;
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
-                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
-                })?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Max => {
-                let collation = func.collation;
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
-                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
-                })?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Nullif => {
-                let collation = func.collation;
-                let first_value = state.registers[*start_reg].get_value();
-                let second_value = state.registers[*start_reg + 1].get_value();
-                let result = first_value.exec_nullif(second_value, |a, b| {
-                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
-                })?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Substr | ScalarFunc::Substring => {
-                let str_value = &state.registers[*start_reg];
-                let start_value = &state.registers[*start_reg + 1];
-                let length_value = if func.arg_count == 3 {
-                    Some(&state.registers[*start_reg + 2])
-                } else {
-                    None
-                };
-                let result = Value::exec_substring(
-                    str_value.get_value(),
-                    start_value.get_value(),
-                    length_value.map(|x| x.get_value()),
-                )?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Date => {
-                let values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_date(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Time => {
-                let values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_time(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TimeDiff => {
-                if arg_count != 2 {
-                    state.registers[*dest].set_null();
-                } else {
-                    let start = state.registers[*start_reg].get_value();
-                    let end = state.registers[*start_reg + 1].get_value();
-
-                    let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                    let result = crate::functions::datetime::exec_timediff(&clock, [start, end]);
-
-                    state.registers[*dest].set_value(result);
-                }
-            }
-            ScalarFunc::TotalChanges => {
-                let res = &program.connection.total_changes;
-                let total_changes = res.load(Ordering::SeqCst);
-                state.registers[*dest].set_int(total_changes);
-            }
-            ScalarFunc::DateTime => {
-                let values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_datetime_full(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::JulianDay => {
-                let values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_julianday(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::UnixEpoch => {
-                let values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_unixepoch(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TursoVersion => {
-                if !program.connection.is_db_initialized() {
-                    state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
-                } else {
-                    let version_integer =
-                        return_if_io!(state, pager.with_header(|header| header.version_number))
-                            .get() as i64;
-                    let version = execute_turso_version(version_integer);
-                    state.registers[*dest].set_text(Text::new(version))?;
-                }
-            }
-            ScalarFunc::SqliteVersion => {
-                let version = execute_sqlite_version();
+        crate::function::Func::Scalar(ScalarFunc::Coalesce) => {}
+        crate::function::Func::Scalar(ScalarFunc::IfNull) => {}
+        crate::function::Func::Scalar(ScalarFunc::Iif) => {}
+        crate::function::Func::Scalar(ScalarFunc::TursoVersion) => {
+            if !program.connection.is_db_initialized() {
+                state.registers[*dest].set_text(Text::new(info::build::PKG_VERSION))?;
+            } else {
+                let version_integer =
+                    return_if_io!(state, pager.with_header(|header| header.version_number)).get()
+                        as i64;
+                let version = execute_turso_version(version_integer);
                 state.registers[*dest].set_text(Text::new(version))?;
             }
-            ScalarFunc::SqliteSourceId => {
-                let src_id = format!(
-                    "{} {}",
-                    info::build::BUILT_TIME_SQLITE,
-                    info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
-                );
-                state.registers[*dest].set_text(Text::new(src_id))?;
+        }
+        #[cfg(feature = "fs")]
+        #[cfg(not(target_family = "wasm"))]
+        crate::function::Func::Scalar(ScalarFunc::LoadExtension) => {
+            if !program.connection.can_load_extensions() {
+                crate::bail_parse_error!("runtime extension loading is disabled");
             }
-            ScalarFunc::Replace => {
-                assert_eq!(arg_count, 3);
-                let source = &state.registers[*start_reg];
-                let pattern = &state.registers[*start_reg + 1];
-                let replacement = &state.registers[*start_reg + 2];
-                state.registers[*dest].set_value(Value::exec_replace(
-                    source.get_value(),
-                    pattern.get_value(),
-                    replacement.get_value(),
-                )?);
-            }
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => {
-                if !program.connection.can_load_extensions() {
-                    crate::bail_parse_error!("runtime extension loading is disabled");
-                }
-                let extension = &state.registers[*start_reg];
-                let ext = resolve_ext_path(&extension.get_value().to_string())?;
-                program.connection.load_extension(ext)?;
-            }
-            ScalarFunc::StrfTime => {
-                let values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_strftime(&clock, values);
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Printf => {
-                let result = exec_printf(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TableColumnsJsonArray => {
-                assert_eq!(arg_count, 1);
-                #[cfg(not(feature = "json"))]
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "table_columns_json_array: turso must be compiled with JSON support"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                #[cfg(feature = "json")]
-                {
-                    use crate::types::TextSubtype;
-
-                    let table = state.registers[*start_reg].get_value();
-                    let Value::Text(table) = table else {
-                        return Err(LimboError::InvalidArgument(
-                            "table_columns_json_array: function argument must be of type TEXT"
-                                .to_string(),
-                        )
-                        .into());
-                    };
-                    let table = {
-                        let schema = program.connection.schema.read();
-                        match schema.get_table(NamespaceId::ROOT, table.as_str()) {
-                            Some(table) => table,
-                            None => {
-                                return Err(LimboError::InvalidArgument(format!(
-                                    "table_columns_json_array: table {table} doesn't exists"
-                                ))
-                                .into());
-                            }
-                        }
-                    };
-
-                    let mut json =
-                        json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10)?;
-                    for column in table.columns() {
-                        use crate::types::TextRef;
-
-                        let name = column.name.as_ref().expect("column should have a name");
-                        let name_json = json::convert_ref_dbtype_to_jsonb(
-                            ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
-                            json::Conv::ToString,
-                        )?;
-                        json.append_jsonb_to_end(name_json.data());
-                    }
-                    json.finalize_unsafe(json::jsonb::ElementType::ARRAY)?;
-                    state.registers[*dest].set_value(json::json_string_to_db_type(
-                        json,
-                        json::jsonb::ElementType::ARRAY,
-                        json::OutputVariant::String,
-                    )?);
-                }
-            }
-            ScalarFunc::BinRecordJsonObject => {
-                assert_eq!(arg_count, 2);
-                #[cfg(not(feature = "json"))]
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "bin_record_json_object: turso must be compiled with JSON support"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                #[cfg(feature = "json")]
-                'outer: {
-                    use crate::types::ValueIterator;
-                    use std::str::FromStr;
-
-                    let columns_str = state.registers[*start_reg].get_value();
-                    let bin_record = state.registers[*start_reg + 1].get_value();
-                    let Value::Text(columns_str) = columns_str else {
-                        return Err(LimboError::InvalidArgument(
-                            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
-                        ).into());
-                    };
-
-                    if let Value::Null = bin_record {
-                        state.registers[*dest].set_null();
-                        break 'outer;
-                    }
-
-                    let Value::Blob(bin_record) = bin_record else {
-                        return Err(LimboError::InvalidArgument(
-                            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
-                        ).into());
-                    };
-                    let mut columns_json_array =
-                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
-                    let columns_len = columns_json_array.array_len()?;
-
-                    let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
-
-                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
-                    for i in 0..columns_len {
-                        let mut op = json::jsonb::SearchOperation::new(0)?;
-                        let path = json::path::JsonPath {
-                            elements: vec![
-                                json::path::PathElement::Root(),
-                                json::path::PathElement::ArrayLocator(Some(i as i32)),
-                            ],
-                        };
-
-                        columns_json_array.operate_on_path(&path, &mut op)?;
-                        let column_name = op.result();
-                        json.append_jsonb_to_end(column_name.data());
-
-                        let val = match payload_iterator.next() {
-                            Some(Ok(v)) => v,
-                            Some(Err(e)) => return Err(e.into()),
-                            None => {
-                                return Err(LimboError::InvalidArgument(
-                                    "bin_record_json_object: binary record has fewer columns than specified in the columns argument".to_string()
-                                ).into());
-                            }
-                        };
-
-                        if let ValueRef::Blob(..) = val {
-                            return Err(LimboError::InvalidArgument(
-                                "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
-                            ).into());
-                        }
-                        let val_json =
-                            json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
-                        json.append_jsonb_to_end(val_json.data());
-                    }
-                    json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
-
-                    state.registers[*dest].set_value(json::json_string_to_db_type(
-                        json,
-                        json::jsonb::ElementType::OBJECT,
-                        json::OutputVariant::String,
-                    )?);
-                }
-            }
-            ScalarFunc::Attach => {
-                assert_eq!(arg_count, 3);
-                let filename = state.registers[*start_reg].get_value();
-                let dbname = state.registers[*start_reg + 1].get_value();
-                let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
-
-                let Value::Text(filename_str) = filename else {
-                    return Err(LimboError::InvalidArgument(
-                        "attach: filename argument must be text".to_string(),
-                    )
-                    .into());
-                };
-
-                let Value::Text(dbname_str) = dbname else {
-                    return Err(LimboError::InvalidArgument(
-                        "attach: database name argument must be text".to_string(),
-                    )
-                    .into());
-                };
-
-                return_if_io!(
-                    state,
-                    program.connection.attach_database(
-                        filename_str.as_str(),
-                        dbname_str.as_str(),
-                        state.active_op_state.attach(),
-                    )
-                );
-                // Sequence descriptors for the attached database are
-                // loaded lazily by `maybe_reparse_schema` on the next
-                // statement (ATTACH bumps the schema cookie, so the
-                // very next prepare reparses). Issuing a SQL load via
-                // `prepare_internal` from inside this opcode handler
-                // would drive `pager.io.step()` synchronously and break
-                // the vdbe async contract.
-
-                state.active_op_state.clear();
-                state.registers[*dest].set_null();
-            }
-            ScalarFunc::Detach => {
-                assert_eq!(arg_count, 1);
-                let dbname = state.registers[*start_reg].get_value();
-
-                let Value::Text(dbname_str) = dbname else {
-                    return Err(LimboError::InvalidArgument(
-                        "detach: database name argument must be text".to_string(),
-                    )
-                    .into());
-                };
-
-                // Call the detach_database method on the connection
-                program.connection.detach_database(dbname_str.as_str())?;
-
-                // Set result to NULL (detach doesn't return a value)
-                state.registers[*dest].set_null();
-            }
-            ScalarFunc::Unlikely | ScalarFunc::Likely | ScalarFunc::Likelihood => {
-                panic!(
-                    "{scalar_func:?} should be stripped during expression translation and never reach VDBE",
+            if !program.connection.current_role_is_superuser() {
+                return Err(
+                    LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
+                        Action::Execute,
+                        Object::Function("load_extension".to_string()),
+                    )))
+                    .into(),
                 );
             }
-            ScalarFunc::StatInit => {
-                // stat_init(n_col): Initialize a statistics accumulator
-                // Returns a blob containing the serialized StatAccum
-                assert!(arg_count >= 1);
-                let n_col = match state.registers[*start_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(n)) => *n as usize,
-                    _ => 0,
-                };
-                let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes())?;
-            }
-            ScalarFunc::StatPush => {
-                // stat_push(accum_blob, i_chng): Push a row into the accumulator
-                // i_chng is the index of the leftmost column that changed from the previous row
-                // Returns the updated accumulator blob
-                assert!(arg_count >= 2);
-                let accum_blob = state.registers[*start_reg].get_value();
-                let i_chng = match state.registers[*start_reg + 1].get_value() {
-                    Value::Numeric(Numeric::Integer(n)) => *n as usize,
-                    _ => 0,
-                };
-                let result = match accum_blob {
-                    Value::Blob(bytes) => {
-                        if let Some(mut accum) = StatAccum::from_bytes(bytes) {
-                            accum.push(i_chng);
-                            Value::Blob(accum.to_bytes())
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StatGet => {
-                // stat_get(accum_blob): Get the stat1 string from the accumulator
-                // Returns the stat string "total avg1 avg2 ..."
-                assert!(arg_count >= 1);
-                let accum_blob = state.registers[*start_reg].get_value();
-                let result = match accum_blob {
-                    Value::Blob(bytes) => {
-                        if let Some(accum) = StatAccum::from_bytes(bytes) {
-                            let stat_str = accum.get_stat1();
-                            if stat_str.is_empty() {
-                                Value::Null
-                            } else {
-                                Value::build_text(stat_str)
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::ConnTxnId => {
-                // conn_txn_id(candidate): get-or-set semantics for CDC transaction ID.
-                // If unset (-1), store the candidate and return it.
-                // If already set, return the existing value, ignoring the candidate.
-                assert_eq!(arg_count, 1);
-                let candidate = match state.registers[*start_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(n)) => *n,
-                    _ => -1,
-                };
-                let current = program.connection.get_cdc_transaction_id();
-                if current == -1 {
-                    program.connection.set_cdc_transaction_id(candidate);
-                    state.registers[*dest].set_int(candidate);
-                } else {
-                    state.registers[*dest].set_int(current);
-                }
-            }
-            ScalarFunc::IsAutocommit => {
-                // is_autocommit(): returns 1 if autocommit, 0 otherwise.
-                let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-                state.registers[*dest].set_int(if auto_commit { 1 } else { 0 });
-            }
-            ScalarFunc::SequenceWatermark => {
-                assert_eq!(arg_count, 1);
-                let sequence_name = match state.registers[*start_reg].get_value() {
-                    Value::Text(text) => text.as_str(),
-                    Value::Null => {
-                        state.registers[*dest].set_value(Value::Null);
-                        return Ok(InsnFunctionStepResult::Step);
-                    }
-                    _ => {
-                        return Err(LimboError::InternalError(
-                            "sequence_watermark_experimental() argument must be TEXT".to_string(),
-                        )
-                        .into());
-                    }
-                };
-                let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
-                let watermark = program
-                    .connection
-                    .mv_store_for_db(namespace.database_id)
-                    .and_then(|mv_store| {
-                        mv_store.sequence_watermark(&mangle_name(namespace.id, &sequence.name))
-                    });
-                match watermark {
-                    Some(watermark) => state.registers[*dest].set_int(watermark),
-                    None => state.registers[*dest].set_value(Value::Null),
-                }
-            }
-            ScalarFunc::TestUintEncode => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Numeric(Numeric::Integer(i)) => {
-                        if *i < 0 {
-                            return Err(LimboError::InternalError(
-                                "test_uint_encode: negative value".to_string(),
-                            )
-                            .into());
-                        }
-                        Value::build_text(i.to_string())
-                    }
-                    Value::Numeric(Numeric::Float(f)) => {
-                        if *f < 0.0 || f.fract() != 0.0 {
-                            return Err(LimboError::InternalError(
-                                "test_uint_encode: not a non-negative integer".to_string(),
-                            )
-                            .into());
-                        }
-                        Value::build_text((f64::from(*f) as u64).to_string())
-                    }
-                    Value::Text(t) => {
-                        let s = t.to_string();
-                        s.parse::<u64>().map_err(|_| {
-                            LimboError::InternalError(format!(
-                                "test_uint_encode: invalid uint: {s}"
-                            ))
-                        })?;
-                        Value::build_text(s)
-                    }
-                    _ => {
-                        return Err(LimboError::InternalError(
-                            "test_uint_encode: unsupported type".to_string(),
-                        )
-                        .into());
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintDecode => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    other => other.clone(),
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StringReverse => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Text(t) => {
-                        let reversed: String = t.to_string().chars().rev().collect();
-                        Value::build_text(reversed)
-                    }
-                    other => {
-                        let s = other.to_string();
-                        let reversed: String = s.chars().rev().collect();
-                        Value::build_text(reversed)
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::Gcd => {
-                check_arg_count!(arg_count, 2);
-                let a = state.registers[*start_reg].get_value();
-                let b = state.registers[*start_reg + 1].get_value();
-                state.registers[*dest].set_value(crate::functions::math::exec_gcd(a, b)?);
-            }
-            ScalarFunc::Lcm => {
-                check_arg_count!(arg_count, 2);
-                let a = state.registers[*start_reg].get_value();
-                let b = state.registers[*start_reg + 1].get_value();
-                state.registers[*dest].set_value(crate::functions::math::exec_lcm(a, b)?);
-            }
-            ScalarFunc::Repeat => {
-                check_arg_count!(arg_count, 2);
-                let input = state.registers[*start_reg].get_value();
-                let count = state.registers[*start_reg + 1].get_value();
-                state.registers[*dest]
-                    .set_value(crate::functions::string::exec_repeat(input, count));
-            }
-            ScalarFunc::Lpad => {
-                let input = state.registers[*start_reg].get_value();
-                let length = state.registers[*start_reg + 1].get_value();
-                let fill = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value())
-                } else {
-                    None
-                };
-                state.registers[*dest]
-                    .set_value(crate::functions::string::exec_lpad(input, length, fill));
-            }
-            ScalarFunc::Rpad => {
-                let input = state.registers[*start_reg].get_value();
-                let length = state.registers[*start_reg + 1].get_value();
-                let fill = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value())
-                } else {
-                    None
-                };
-                state.registers[*dest]
-                    .set_value(crate::functions::string::exec_rpad(input, length, fill));
-            }
-            ScalarFunc::BooleanToInt => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Numeric(Numeric::Integer(i)) => match *i {
-                        0 => Value::from_i64(0),
-                        1 => Value::from_i64(1),
-                        _ => {
-                            return Err(LimboError::Constraint(format!(
-                                "invalid input for type boolean: \"{i}\""
-                            ))
-                            .into());
-                        }
-                    },
-                    Value::Text(t) => {
-                        let v = &t.value;
-                        match v.to_ascii_lowercase().as_str() {
-                            "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
-                            "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
-                            _ => {
-                                return Err(LimboError::Constraint(format!(
-                                    "invalid input for type boolean: \"{v}\""
-                                ))
-                                .into());
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(LimboError::Constraint(format!(
-                            "invalid input for type boolean: \"{other}\""
-                        ))
-                        .into());
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::IntToBoolean => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Numeric(Numeric::Integer(0)) => Value::build_text("false".to_string()),
-                    _ => Value::build_text("true".to_string()),
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::ValidateIpAddr => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Text(t) => {
-                        let v = &t.value;
-                        v.parse::<std::net::IpAddr>().map_err(|_| {
-                            LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
-                        })?;
-                        val.get_value().clone()
-                    }
-                    other => {
-                        return Err(LimboError::Constraint(format!(
-                            "invalid input for type inet: \"{other}\""
-                        ))
-                        .into());
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::NumericEncode => {
-                check_arg_count!(arg_count, 1);
-                let result = match state.registers[*start_reg].get_value() {
-                    Value::Null => Value::Null,
-                    other => {
-                        let bd = numeric_from_value(other)?;
-                        Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&bd))
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::NumericFit => {
-                check_arg_count!(arg_count, 3);
-                let val = &state.registers[*start_reg];
-                let precision_reg = &state.registers[*start_reg + 1];
-                let scale_reg = &state.registers[*start_reg + 2];
-                // COERCE runs on the value ENCODE stored, so the value is a
-                // stored numeric.
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Blob(stored) => {
-                        use crate::numeric::decimal::{
-                            bigdecimal_to_blob, blob_to_bigdecimal, validate_precision_scale,
-                        };
+            let extension = &state.registers[*start_reg];
+            let ext = resolve_ext_path(&extension.get_value().to_string())?;
+            program.connection.load_extension(ext)?;
+        }
+        crate::function::Func::Scalar(ScalarFunc::Attach) => {
+            assert_eq!(arg_count, 3);
+            let filename = state.registers[*start_reg].get_value();
+            let dbname = state.registers[*start_reg + 1].get_value();
+            let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
 
-                        let bd = blob_to_bigdecimal(stored)?;
-                        let (
-                            Value::Numeric(Numeric::Integer(precision)),
-                            Value::Numeric(Numeric::Integer(scale)),
-                        ) = (precision_reg.get_value(), scale_reg.get_value())
-                        else {
-                            return Err(LimboError::Constraint(
-                                "numeric_fit: precision and scale must be integers".to_string(),
-                            )
-                            .into());
-                        };
-                        let fitted = validate_precision_scale(&bd, *precision, *scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&fitted))
-                    }
-                    other => {
-                        return Err(LimboError::InternalError(format!(
-                            "numeric_fit expects a stored numeric, got {}",
-                            other.value_type()
-                        ))
-                        .into());
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::NumericDecode => {
-                check_arg_count!(arg_count, 1);
-                let val = &state.registers[*start_reg];
-                let result = match val.get_value() {
-                    Value::Null => Value::Null,
-                    Value::Blob(b) => {
-                        let bd = crate::numeric::decimal::blob_to_bigdecimal(b)?;
-                        Value::build_text(crate::numeric::decimal::format_numeric(&bd))
-                    }
-                    other => {
-                        return Err(LimboError::Constraint(format!(
-                            "numeric_decode: expected blob, got \"{other}\""
-                        ))
-                        .into());
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::NumericAdd
-            | ScalarFunc::NumericSub
-            | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv
-            | ScalarFunc::NumericMod => {
-                check_arg_count!(arg_count, 2);
-                let lhs_val = state.registers[*start_reg].get_value().clone();
-                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                let result = match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => Value::Null,
-                    _ => {
-                        let a = numeric_from_value(&lhs_val)?;
-                        let b = numeric_from_value(&rhs_val)?;
-                        // The result keeps every decimal of its operands, as in
-                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00. A
-                        // product may have more decimals than a numeric can hold,
-                        // so PostgreSQL rounds it to the most a numeric can hold.
-                        let (a_scale, b_scale) =
-                            (a.fractional_digit_count(), b.fractional_digit_count());
-                        let res = match scalar_func {
-                            ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
-                            ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
-                            ScalarFunc::NumericMul => (a * b).with_scale_round(
-                                (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
-                                bigdecimal::RoundingMode::HalfUp,
-                            ),
-                            ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
-                                use bigdecimal::Zero;
-                                if b.is_zero() {
-                                    return Err(LimboError::Constraint(
-                                        "division by zero".to_string(),
-                                    )
-                                    .into());
-                                }
-                                if matches!(scalar_func, ScalarFunc::NumericDiv) {
-                                    a / b
-                                } else {
-                                    // The remainder has the dividend's sign.
-                                    (a % b).with_scale(a_scale.max(b_scale))
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        crate::numeric::decimal::check_numeric_limits(&res)?;
-                        Value::build_text(crate::numeric::decimal::format_numeric(&res))
-                    }
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::NumericNeg => {
-                check_arg_count!(arg_count, 1);
-                let val = state.registers[*start_reg].get_value().clone();
-                let result = match val {
-                    Value::Null => Value::Null,
-                    // Negating keeps the decimal places: -(1.50) is -1.50.
-                    _ => Value::build_text(crate::numeric::decimal::format_numeric(
-                        &-numeric_from_value(&val)?,
-                    )),
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
-                check_arg_count!(arg_count, 2);
-                let lhs = state.registers[*start_reg].get_value();
-                let rhs = state.registers[*start_reg + 1].get_value();
-                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = match scalar_func {
-                    ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
-                    ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
-                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
-                    _ => unreachable!(),
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::ArrayAppend => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let elem_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_append(&arr_val, &elem_val)?);
-            }
-            ScalarFunc::ArrayPrepend => {
-                check_arg_count!(arg_count, 2);
-                let elem_val = state.registers[*start_reg].get_value().clone();
-                let arr_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_prepend(&arr_val, &elem_val)?);
-            }
-            ScalarFunc::ArrayCat => {
-                check_arg_count!(arg_count, 2);
-                let a_val = state.registers[*start_reg].get_value().clone();
-                let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_cat(&a_val, &b_val)?);
-            }
-            ScalarFunc::ArrayRemove => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_remove(&arr_val, &target)?);
-            }
-            ScalarFunc::ArrayContains => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_contains(&arr_val, &target));
-            }
-            ScalarFunc::ArrayPosition => {
-                check_arg_count!(arg_count, 2);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let target = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_position(&arr_val, &target));
-            }
-            ScalarFunc::ArrayLength => {
-                // 1-arg form: equivalent to `array_length(arr, 1)`. 2-arg form
-                // honors the dimension and walks into nested arrays for dim > 1
-                // (Turso arrays are 1-indexed, so `array_upper(arr, dim)` shares
-                // this code path via its alias and produces the same result).
-                let arr_val = state.registers[*start_reg].get_value();
-                let dim = if arg_count >= 2 {
-                    state.registers[*start_reg + 1]
-                        .get_value()
-                        .as_int()
-                        .unwrap_or(0)
-                } else {
-                    1
-                };
-                match compute_array_length_at_dim(arr_val, dim) {
-                    Some(count) => state.registers[*dest].set_int(count),
-                    None => state.registers[*dest].set_null(),
-                };
-            }
-            ScalarFunc::ArraySlice => {
-                check_arg_count!(arg_count, 3);
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let start_idx = state.registers[*start_reg + 1].get_value().clone();
-                let end_idx = state.registers[*start_reg + 2].get_value().clone();
-                let result = exec_array_slice(&arr_val, &start_idx, &end_idx)?;
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::StringToArray => {
-                let text = state.registers[*start_reg].get_value().clone();
-                let delimiter = state.registers[*start_reg + 1].get_value().clone();
-                let null_str = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value().clone())
-                } else {
-                    None
-                };
-                state.registers[*dest].set_value(exec_string_to_array(
-                    &text,
-                    &delimiter,
-                    null_str.as_ref(),
-                )?);
-            }
-            ScalarFunc::ArrayToString => {
-                let arr_val = state.registers[*start_reg].get_value().clone();
-                let delimiter = state.registers[*start_reg + 1].get_value().clone();
-                let null_str = if arg_count >= 3 {
-                    Some(state.registers[*start_reg + 2].get_value().clone())
-                } else {
-                    None
-                };
-                state.registers[*dest].set_value(exec_array_to_string(
-                    &arr_val,
-                    &delimiter,
-                    null_str.as_ref(),
-                ));
-            }
-            ScalarFunc::ArrayOverlap => {
-                check_arg_count!(arg_count, 2);
-                let a_val = state.registers[*start_reg].get_value().clone();
-                let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_overlap(&a_val, &b_val));
-            }
-            ScalarFunc::ArrayContainsAll => {
-                check_arg_count!(arg_count, 2);
-                let a_val = state.registers[*start_reg].get_value().clone();
-                let b_val = state.registers[*start_reg + 1].get_value().clone();
-                state.registers[*dest].set_value(exec_array_contains_all(&a_val, &b_val));
-            }
-            ScalarFunc::StructPack
-            | ScalarFunc::StructExtractFunc
-            | ScalarFunc::UnionValueFunc
-            | ScalarFunc::UnionTagFunc
-            | ScalarFunc::UnionExtractFunc => {
-                return Err(LimboError::InternalError(format!(
-                    "{scalar_func} should be desugared to a dedicated instruction, not Function"
-                ))
+            let Value::Text(filename_str) = filename else {
+                return Err(LimboError::InvalidArgument(
+                    "attach: filename argument must be text".to_string(),
+                )
                 .into());
-            }
-        },
+            };
+
+            let Value::Text(dbname_str) = dbname else {
+                return Err(LimboError::InvalidArgument(
+                    "attach: database name argument must be text".to_string(),
+                )
+                .into());
+            };
+
+            return_if_io!(
+                state,
+                program.connection.attach_database(
+                    filename_str.as_str(),
+                    dbname_str.as_str(),
+                    state.active_op_state.attach(),
+                )
+            );
+            // Sequence descriptors for the attached database are
+            // loaded lazily by `maybe_reparse_schema` on the next
+            // statement (ATTACH bumps the schema cookie, so the
+            // very next prepare reparses). Issuing a SQL load via
+            // `prepare_internal` from inside this opcode handler
+            // would drive `pager.io.step()` synchronously and break
+            // the vdbe async contract.
+
+            state.active_op_state.clear();
+            state.registers[*dest].set_null();
+        }
+        crate::function::Func::Scalar(scalar_func) => {
+            let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+            let context = ScalarFuncContext {
+                connection: &program.connection,
+                io: pager.io.as_ref(),
+                clock: &clock,
+                collation: func.collation,
+            };
+            let value = program.connection.dialect().call_scalar(
+                &context,
+                scalar_func,
+                &state.registers[*start_reg..*start_reg + arg_count],
+            )?;
+            state.registers[*dest].set_value(value);
+        }
         crate::function::Func::Vector(vector_func) => {
             let args = &state.registers[*start_reg..*start_reg + arg_count];
             match vector_func {
@@ -11731,10 +10594,10 @@ pub fn op_function(
                     let row_namespace =
                         crate::namespace::demangle_name(supports_namespaces, &name).0;
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                    let new_name = if let Some(index_name) =
+                        crate::util::renamed_automatic_index_name(&name, &rename_from, &rename_to)
                     {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
+                        index_name
                     } else if name == rename_from {
                         rename_to.clone()
                     } else {
@@ -12058,7 +10921,7 @@ pub fn op_function(
                     };
 
                     let column_def =
-                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+                        crate::dialect::engine::parse_column_definition(column_def, true)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -12449,31 +11312,7 @@ impl Clock for StatementClock<'_> {
     }
 }
 
-pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
-
-/// LIKE with an operand that is not TEXT: both are converted to TEXT first.
-#[inline(never)]
-fn exec_like_converted(
-    pattern_value: &Value,
-    match_value: &Value,
-    escape_char: Option<char>,
-) -> Result<bool> {
-    let pattern_cow = match pattern_value {
-        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
-            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-            _ => unreachable!("Cast to TEXT should yield Text"),
-        },
-    };
-    let match_cow = match match_value {
-        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
-            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
-            _ => unreachable!("Cast to TEXT should yield Text"),
-        },
-    };
-    Value::exec_like(&pattern_cow, &match_cow, escape_char)
-}
+pub(crate) type OpAttachState = crate::attach::AttachDatabaseState;
 
 pub fn op_sequence(
     _program: &Program,
@@ -15120,7 +13959,36 @@ pub fn op_add_type(
 ) -> InsnResult {
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
-    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
+    let syms = conn.syms.read();
+    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql, &syms))??;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_catalog_change(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        CatalogChange {
+            db,
+            change,
+            value_regs
+        },
+        insn
+    );
+    let values = value_regs
+        .iter()
+        .map(|reg| state.registers[*reg].get_value().clone())
+        .collect::<Vec<Value>>();
+    let dialect = program.connection.dialect();
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| {
+            dialect.apply_catalog_change(schema, change, &values)
+        })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -17611,12 +16479,15 @@ pub fn op_rename_table(
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
             let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
-            let autoindex_prefix = format!("sqlite_autoindex_{mangled_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
-                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
-                    index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
+                if let Some(name) = crate::util::renamed_automatic_index_name(
+                    &index.name,
+                    &mangled_from,
+                    &mangled_to,
+                ) {
+                    index.name = name;
                 }
             });
 
@@ -18103,7 +16974,7 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
+    let (old_column_name, is_strict, new_column) = conn.with_schema(*db, |schema| {
         let table = schema
             .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
@@ -18114,12 +16985,13 @@ pub fn op_alter_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone();
-        (old_column_name, table.is_strict())
+        let new_column = table
+            .btree()
+            .expect("only btree tables can be altered")
+            .column_for_alter(*column_index, definition);
+        (old_column_name, table.is_strict(), new_column)
     });
-    let new_column = crate::schema::Column::from_definition(
-        definition,
-        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
-    )?;
+    let new_column = new_column?;
     let new_name = definition.col_name.as_str().to_owned();
     let (domain_not_null, domain_checks) = if is_strict && !*rename {
         conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
@@ -18201,13 +17073,6 @@ pub fn op_alter_column(
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
-        let clears_autoincrement_sequence = !*rename
-            && btree.has_autoincrement
-            && btree
-                .columns()
-                .get(*column_index)
-                .is_some_and(|column| column.is_rowid_alias())
-            && !new_column.is_rowid_alias();
 
         // Rename the key column before columns_mut(), whose drop rebuilds the
         // WITHOUT ROWID key order from primary_key_columns by name.
@@ -18274,14 +17139,8 @@ pub fn op_alter_column(
             }
         }
 
-        // Update unique_sets to reflect the renamed column
-        for unique_set in &mut btree.unique_sets {
-            for unique_column in &mut unique_set.columns {
-                if unique_column.name.eq_ignore_ascii_case(&old_column_name) {
-                    unique_column.name.clone_from(&new_name);
-                }
-            }
-        }
+        // Update the UNIQUE/PRIMARY KEY lists and this table's FOREIGN KEY child columns
+        btree.rename_column_in_keys(&old_column_name, &new_name);
 
         // Update CHECK constraint expressions to reference the new column name
         let old_col_normalized = normalize_ident(&old_column_name);
@@ -18301,9 +17160,6 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
-            if clears_autoincrement_sequence {
-                btree.has_autoincrement = false;
-            }
 
             btree
                 .check_constraints
@@ -18326,23 +17182,18 @@ pub fn op_alter_column(
             }
         }
 
-        // Update this table's OWN foreign keys
+        // Update this table's OWN foreign keys: if self-referencing, rename the
+        // parent column too (child columns were renamed above)
         for fk_arc in &mut btree.foreign_keys {
-            let fk = Arc::make_mut(fk_arc);
-            // child side: rename child column if it matches
-            for cc in &mut fk.child_columns {
-                if cc.eq_ignore_ascii_case(&old_column_name) {
-                    cc.clone_from(&new_name);
-                }
-            }
-            // parent side: if self-referencing, rename parent column too
-            if fk.parent_namespace == *namespace
-                && normalize_ident(&fk.parent_table) == normalized_table_name
+            if fk_arc.parent_namespace != *namespace
+                || normalize_ident(&fk_arc.parent_table) != normalized_table_name
             {
-                for pc in &mut fk.parent_columns {
-                    if pc.eq_ignore_ascii_case(&old_column_name) {
-                        pc.clone_from(&new_name);
-                    }
+                continue;
+            }
+            let fk = Arc::make_mut(fk_arc);
+            for pc in &mut fk.parent_columns {
+                if pc.eq_ignore_ascii_case(&old_column_name) {
+                    pc.clone_from(&new_name);
                 }
             }
         }
@@ -18427,13 +17278,12 @@ fn replace_trigger_sql(
     trigger_name: &str,
     sql: &str,
 ) -> Result<()> {
-    let mut parser = Parser::new(sql.as_bytes());
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         event,
         when_clause,
         commands,
         ..
-    })) = parser.next_cmd()?
+    })) = crate::dialect::engine::parse_statement(sql)?
     else {
         return Err(LimboError::ParseError(format!(
             "invalid trigger sql: {sql}"
@@ -18490,17 +17340,19 @@ fn handle_text_sum(
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
+                sum_state.ovrfl = false;
                 sum_state.approx = true;
                 match acc {
                     Value::Null => {
                         *acc = Value::from_f64(i as f64);
                     }
                     Value::Numeric(Numeric::Integer(acc_i)) => {
-                        *acc = Value::from_f64(*acc_i as f64);
-                        apply_kbn_step_int(acc, i, sum_state);
+                        let prev = *acc_i;
+                        kbn_init_from_int(acc, prev, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     _ => unreachable!(),
                 }
@@ -18512,10 +17364,10 @@ fn handle_text_sum(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc = Value::from_i64(sum),
                         None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
+                            let prev = *acc_i;
                             sum_state.approx = true;
                             sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, sum_state);
                             apply_kbn_step_int(acc, i, sum_state);
                         }
                     },
@@ -18527,9 +17379,10 @@ fn handle_text_sum(
             }
         }
         ParsedNumber::Float(f) => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -18538,9 +17391,10 @@ fn handle_text_sum(
             apply_kbn_step(acc, f, sum_state);
         }
         ParsedNumber::None => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -18571,6 +17425,7 @@ pub fn op_fk_counter(
         } else if *increment_value > 0 {
             if let Some(info) = constraint_info.as_deref() {
                 state.fk_immediate_violation = Some(build_constraint_violation_error(
+                    program,
                     state,
                     Some(info),
                     SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -19596,11 +18451,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
-// Compat for applications that test for SQLite.
-fn execute_sqlite_version() -> String {
-    crate::dialect::sqlite::SQLITE_VERSION.to_string()
-}
-
 fn execute_turso_version(version_integer: i64) -> String {
     let major = version_integer / 1_000_000;
     let minor = (version_integer % 1_000_000) / 1_000;
@@ -20238,7 +19088,11 @@ pub fn op_vacuum_into(
             // Waiting for I/O, keep state for resumption
             Ok(InsnFunctionStepResult::IO)
         }
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+        Ok(
+            InsnFunctionStepResult::Done
+            | InsnFunctionStepResult::Row
+            | InsnFunctionStepResult::Interrupt,
+        ) => {
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
@@ -20485,8 +19339,9 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
-                    None => output_db.connect(ConnectOpts::new())?,
+                    Some(codec) => output_db
+                        .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))?,
+                    None => output_db.connect(ConnectOpts::new(SessionRole::Superuser))?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
@@ -20689,9 +19544,10 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::security::roles::SessionRole;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     /// A weighted step must leave the same exact total as the weighted sum
@@ -20766,10 +19622,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -20827,10 +19685,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -20892,10 +19752,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -20954,10 +19816,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -20979,10 +19843,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -21024,10 +19890,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -21220,14 +20088,6 @@ mod tests {
         assert!(
             matches!(*err, LimboError::InternalError(ref message) if message.contains("content register")),
             "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_execute_sqlite_version() {
-        assert_eq!(
-            execute_sqlite_version(),
-            crate::dialect::sqlite::SQLITE_VERSION
         );
     }
 
@@ -21695,10 +20555,12 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")

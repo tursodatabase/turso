@@ -51,7 +51,7 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::HashMap as StdHashMap;
+use std::collections::{BTreeMap, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -60,12 +60,10 @@ use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
-pub mod checkpoint_state_machine;
+pub mod checkpoint;
 #[cfg(not(nightly))]
 mod version_chain;
-pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
-};
+pub use checkpoint::{sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -1555,7 +1553,7 @@ pub enum WriteRowState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CommitYieldPoint {
+pub enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     /// Fires once on the first entry into `step_build_log_record` (cursor=0,
@@ -1585,7 +1583,7 @@ pub(crate) enum CommitYieldPoint {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum ExclusiveTxYieldPoint {
+pub enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 
@@ -1951,6 +1949,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         mvcc_store.rewrite_live_versions_for_committed_tx(owner_tx, end_ts);
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             mvcc_store.unlock_commit_lock_if_held(tx.value());
+            mvcc_store.publish_committed_tx(tx.value(), end_ts);
         }
         crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx));
         Ok(())
@@ -3673,23 +3672,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                let tx_header = *tx_unlocked.header.read();
-                {
-                    // Hold the header lock across the watermark update and header
-                    // publish so the guard decision and replacement are serialized.
-                    let mut global_header = mvcc_store.global_header.write();
-                    // Since we assign a commit timestamp and then we drive the commit to completion,
-                    // it is totally possible for so an older transaction can finish after a newer one.
-                    // In such case, we should not let older commit to set lower value than previous.
-                    // This value is used in checkpointing as a watermark boundary, and an incorrect
-                    // lower value can cause data loss / corruption.
-                    let last_committed_ts = mvcc_store
-                        .last_committed_tx_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
-                        global_header.replace(tx_header);
-                    }
-                }
+                mvcc_store.publish_committed_tx(tx_unlocked, *end_ts);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
@@ -4241,6 +4224,17 @@ pub enum RecoverLogicalLogState {
         stmt: Option<Box<crate::Statement>>,
         schema_rows: HashMap<i64, ImmutableRecord>,
     },
+    /// Reading the CREATE TYPE statements already in the types table, so that
+    /// schemas rebuilt during replay give indexes their columns' type orders.
+    QueryTypes {
+        reader: Box<StreamingLogicalLogReader>,
+        preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
+        persistent_tx_ts_max: u64,
+        cookie: u32,
+        schema_rows: HashMap<i64, ImmutableRecord>,
+        stmt: Option<Box<crate::Statement>>,
+        type_sqls: BTreeMap<i64, String>,
+    },
     Replay {
         ctx: Box<RecoverCtx>,
     },
@@ -4259,6 +4253,8 @@ pub struct RecoverCtx {
     replay_cutoff_ts: u64,
     max_commit_ts_seen: u64,
     schema_rows: HashMap<i64, ImmutableRecord>,
+    /// CREATE TYPE statements in the types table, by rowid.
+    type_sqls: BTreeMap<i64, String>,
     dropped_root_pages: HashSet<i64>,
     current_schema: Arc<Schema>,
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
@@ -4396,6 +4392,11 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// [`crate::mvcc::cursor::IndexShadowScan`] on a mismatch (#7578), and
     /// `MvccLazyCursor` seeks its next MVCC index entry again.
     index_rows_epoch: AtomicU64,
+    /// Bumped whenever a table version is inserted or deleted, including the
+    /// undo at `ROLLBACK TO`. Table cursors compare it on each step and seek
+    /// their next MVCC row again on a mismatch, like index cursors do with
+    /// [`Self::index_rows_epoch`].
+    table_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -4631,6 +4632,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
+            table_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
@@ -4902,10 +4904,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
-    /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
-    /// be checkpointed first.
-    pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
-        Ok(self.get_logical_log_file().size()? != 0)
+    /// VACUUM copies the physical DB image, so any transaction frames in the
+    /// MVCC logical log must be checkpointed first.
+    ///
+    /// This reads the log's write offset, not its file size: the offset ends
+    /// after the last frame written or found by recovery. Bytes past it are a
+    /// torn tail that recovery skips and the next commit overwrites.
+    pub(crate) fn has_uncheckpointed_log(&self) -> bool {
+        self.logical_log_offset() > LOG_HDR_SIZE as u64
     }
 
     /// Rebuild MVCC's physical root-page metadata after in-place VACUUM
@@ -5276,6 +5282,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // blocking). A failure here cannot be downgraded: it would
                     // leave the next AUTOINCREMENT INSERT able to re-emit a rowid
                     // already on disk, so it propagates as a bootstrap failure.
+                    // Rows whose name is not text name no table and are logged
+                    // and skipped inside the sync, as WAL mode does.
                     return_if_io!(bootstrap_conn
                         .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
                     *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
@@ -5741,6 +5749,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let version_id = rv.id;
                     rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
                     drop(locked_row_versions);
+                    self.bump_table_rows_epoch();
                     if !chain_in_write_set {
                         tx.add_to_write_set(id.clone(), row_versions);
                     }
@@ -5762,6 +5771,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let version_id =
                     self.insert_tombstone(tx_id, Some(data), &mut locked_row_versions)?;
                 drop(locked_row_versions);
+                self.bump_table_rows_epoch();
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -7309,6 +7319,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if let Some(tx) = self.txs.get(&tx_id) {
                     self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
+                    self.publish_committed_tx(tx.value(), end_ts);
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
@@ -7325,6 +7336,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.release_exclusive_tx(&tx_id);
                 }
             }
+        }
+    }
+
+    /// Raises `last_committed_tx_ts` to `end_ts` and publishes the transaction's
+    /// header as the global header, unless a newer commit already did.
+    fn publish_committed_tx(&self, tx: &Transaction<A>, end_ts: u64) {
+        let tx_header = *tx.header.read();
+        // Hold the header lock across the watermark update and header
+        // publish so the guard decision and replacement are serialized.
+        let mut global_header = self.global_header.write();
+        // Since we assign a commit timestamp and then we drive the commit to completion,
+        // it is totally possible for so an older transaction can finish after a newer one.
+        // In such case, we should not let older commit to set lower value than previous.
+        // This value is used in checkpointing as a watermark boundary, and an incorrect
+        // lower value can cause data loss / corruption.
+        let last_committed_ts = self
+            .last_committed_tx_ts
+            .fetch_max(end_ts, Ordering::AcqRel);
+        if last_committed_ts <= end_ts {
+            global_header.replace(tx_header);
         }
     }
 
@@ -7493,6 +7524,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             deleted_index_versions.len()
         );
 
+        let undoes_table_versions =
+            !created_table_versions.is_empty() || !deleted_table_versions.is_empty();
         let undoes_index_versions =
             !created_index_versions.is_empty() || !deleted_index_versions.is_empty();
 
@@ -7575,6 +7608,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
         }
+        if undoes_table_versions {
+            self.bump_table_rows_epoch();
+        }
         if undoes_index_versions {
             self.bump_index_rows_epoch();
         }
@@ -7654,10 +7690,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             && tx.header.read().schema_cookie.get() != global_schema_cookie
     }
 
-    fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
+    /// Whether a transaction other than `tx_id` is `Preparing` (it will eventually
+    /// commit), or is `Committed` after `tx_id`'s begin timestamp but may not have
+    /// raised `last_committed_tx_ts` yet.
+    fn has_committing_tx_other_than(&self, tx_id: TxID) -> bool {
+        let begin_ts = self.txs.get(&tx_id).map(|tx| tx.value().begin_ts);
         self.txs.iter().any(|entry| {
             *entry.key() != tx_id
-                && matches!(entry.value().state.load(), TransactionState::Preparing(_))
+                && match entry.value().state.load() {
+                    TransactionState::Preparing(_) => true,
+                    TransactionState::Committed(end_ts) => {
+                        begin_ts.is_some_and(|begin_ts| end_ts > begin_ts)
+                    }
+                    _ => false,
+                }
         })
     }
 
@@ -7673,9 +7719,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
         }
-        // if some other transaction is in preparing state, then we cannot let this tx to
-        // continue, as the preparing txn will eventually commit
-        if self.has_preparing_tx_other_than(*tx_id) {
+        // if some other transaction is preparing, or committed after our begin_ts, then we
+        // cannot let this tx continue
+        if self.has_committing_tx_other_than(*tx_id) {
             return Err(LimboError::Busy);
         }
         // after we acquired begin_ts, we will check if some other txn committed in the meantime.
@@ -7713,7 +7759,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                if self.has_preparing_tx_other_than(*tx_id) {
+                if self.has_committing_tx_other_than(*tx_id) {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
                 }
@@ -8691,6 +8737,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
+            self.bump_table_rows_epoch();
             return Ok((row_versions, chain_in_write_set));
         }
     }
@@ -8781,6 +8828,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
         #[cfg(shuttle)]
         crate::thread::yield_now();
+    }
+
+    /// Current epoch of table version changes; see the field docs.
+    pub(crate) fn table_rows_epoch(&self) -> u64 {
+        self.table_rows_epoch.load(Ordering::SeqCst)
+    }
+
+    /// A table version was inserted, deleted or rolled back; see field docs.
+    fn bump_table_rows_epoch(&self) {
+        self.table_rows_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
@@ -9414,13 +9471,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(root_page)
     }
 
-    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid).
-    /// Shared by recovery (replayed rows) and the checkpoint's snapshot-consistent
-    /// `BuildLocalSchemaView` (btree + MVCC-delta merge at snapshot_ts).
+    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid)
+    /// and the CREATE TYPE statements `type_sqls`. Used by the checkpoint's
+    /// snapshot-consistent `BuildLocalSchemaView` (btree + MVCC-delta merge at
+    /// snapshot_ts).
     pub(crate) fn build_schema_from_rows(
         &self,
         connection: &Arc<Connection>,
         schema_rows: &HashMap<i64, ImmutableRecordRef<'static>>,
+        type_sqls: &[String],
         preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) -> Result<Arc<Schema>> {
         let pager = connection.pager.load().clone();
@@ -9527,7 +9586,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         fresh.populate_types_views_then_indices(
             &syms,
-            &[],
+            type_sqls,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -9694,6 +9753,58 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     else {
                         unreachable!("state is QuerySchema");
                     };
+                    // Types created after the last checkpoint have their rows
+                    // only in the log; replay reads them from there.
+                    let types_table_in_btree = connection.experimental_custom_types_enabled()
+                        && connection
+                            .schema
+                            .read()
+                            .get_btree_table(
+                                NamespaceId::ROOT,
+                                crate::schema::TURSO_TYPES_TABLE_NAME,
+                            )
+                            .is_some_and(|table| table.root_page > 0);
+                    let stmt = if types_table_in_btree {
+                        connection
+                            .query(format!(
+                                "SELECT rowid, sql FROM {}",
+                                crate::schema::TURSO_TYPES_TABLE_NAME
+                            ))?
+                            .map(Box::new)
+                    } else {
+                        None
+                    };
+                    *st = RecoverLogicalLogState::QueryTypes {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                        cookie,
+                        schema_rows,
+                        stmt,
+                        type_sqls: BTreeMap::new(),
+                    };
+                }
+                RecoverLogicalLogState::QueryTypes {
+                    stmt, type_sqls, ..
+                } => {
+                    if let Some(stmt) = stmt {
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            type_sqls.insert(row.get::<i64>(0)?, row.get::<&str>(1)?.to_string());
+                            Ok(())
+                        }));
+                    }
+                    let RecoverLogicalLogState::QueryTypes {
+                        reader,
+                        preserved_tvfs,
+                        persistent_tx_ts_max,
+                        cookie,
+                        schema_rows,
+                        type_sqls,
+                        ..
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is QueryTypes");
+                    };
                     let current_schema = connection.schema.read().clone();
                     *st = RecoverLogicalLogState::Replay {
                         ctx: Box::new(RecoverCtx {
@@ -9704,6 +9815,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             replay_cutoff_ts: persistent_tx_ts_max,
                             max_commit_ts_seen: persistent_tx_ts_max,
                             schema_rows,
+                            type_sqls,
                             dropped_root_pages: HashSet::default(),
                             current_schema,
                             index_infos: HashMap::default(),
@@ -9774,6 +9886,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let replay_cutoff_ts = ctx.replay_cutoff_ts;
         let cookie = ctx.cookie;
         let mut schema_rows = std::mem::take(&mut ctx.schema_rows);
+        let mut type_sqls = std::mem::take(&mut ctx.type_sqls);
         let mut dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
         let mut current_schema = ctx.current_schema.clone();
         let mut index_infos = std::mem::take(&mut ctx.index_infos);
@@ -9879,16 +9992,61 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     _ => {}
                 }
             }
+            // CREATE TYPE and DROP TYPE write the types table. The rebuilt
+            // schema needs those types to give indexes their columns' type
+            // orders, so stage the types table the same way.
+            let types_table_id = if connection.experimental_custom_types_enabled() {
+                schema_rows_after
+                    .as_ref()
+                    .unwrap_or(&schema_rows)
+                    .values()
+                    .find_map(|record| types_table_root_page(&record.as_record_ref()))
+                    .map(|root_page| self.get_table_id_from_root_page(root_page))
+            } else {
+                None
+            };
+            let mut type_sqls_after: Option<BTreeMap<i64, String>> = None;
+            for parsed_op in &frame {
+                match parsed_op {
+                    ParsedOp::UpsertTable {
+                        rowid,
+                        record_bytes,
+                        ..
+                    } if Some(rowid.table_id) == types_table_id => {
+                        let sql = Schema::type_sql_from_record(
+                            &ImmutableRecordRef::from_bin_record(record_bytes),
+                        )?;
+                        type_sqls_after
+                            .get_or_insert_with(|| type_sqls.clone())
+                            .insert(rowid.row_id.to_int_or_panic(), sql);
+                    }
+                    ParsedOp::DeleteTable { rowid, .. }
+                        if Some(rowid.table_id) == types_table_id =>
+                    {
+                        type_sqls_after
+                            .get_or_insert_with(|| type_sqls.clone())
+                            .remove(&rowid.row_id.to_int_or_panic());
+                    }
+                    _ => {}
+                }
+            }
+            if type_sqls_after.is_some() && schema_rows_after.is_none() {
+                schema_rows_after = Some(schema_rows.clone());
+            }
             // schema_rows_after is Some if the frame changes the schema
             let schema_rows_after = schema_rows_after;
 
             let schema_after = match schema_rows_after.as_ref() {
-                Some(schema_rows_after) => Some(self.recover_build_schema(
-                    connection,
-                    schema_rows_after,
-                    cookie,
-                    &ctx.preserved_table_valued_functions,
-                )?),
+                Some(schema_rows_after) => {
+                    let type_sqls_after = type_sqls_after.as_ref().unwrap_or(&type_sqls);
+                    Some(self.recover_build_schema(
+                        connection,
+                        schema_rows_after,
+                        &type_sqls_after.values().cloned().collect::<Vec<_>>(),
+                        cookie,
+                        &ctx.preserved_table_valued_functions,
+                    )?)
+                }
                 None => None,
             };
 
@@ -10338,6 +10496,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let schema_after = schema_after
                     .expect("schema_after must exist when frame_changes_schema is true");
                 schema_rows = schema_rows_after;
+                if let Some(type_sqls_after) = type_sqls_after {
+                    type_sqls = type_sqls_after;
+                }
                 install_schema(schema_after.clone());
                 current_schema = schema_after;
                 // The frame may have decoded DROP INDEX entries using the
@@ -10349,19 +10510,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         ctx.max_commit_ts_seen = max_commit_ts_seen;
         ctx.schema_rows = schema_rows;
+        ctx.type_sqls = type_sqls;
         ctx.dropped_root_pages = dropped_root_pages;
         ctx.current_schema = current_schema;
         ctx.index_infos = index_infos;
         Ok(())
     }
 
-    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows. Sync: the
-    /// schema cookie comes from `global_header` (in-memory) or `fallback_cookie`
-    /// (pre-read by the caller); no IO here.
+    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
+    /// CREATE TYPE statements `type_sqls`. Sync: the schema cookie comes from
+    /// `global_header` (in-memory) or `fallback_cookie` (pre-read by the
+    /// caller); no IO here.
     fn recover_build_schema(
         &self,
         connection: &Arc<Connection>,
         schema_rows: &HashMap<i64, ImmutableRecord>,
+        type_sqls: &[String],
         fallback_cookie: u32,
         preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) -> Result<Arc<Schema>> {
@@ -10465,7 +10629,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         fresh.populate_types_views_then_indices(
             &syms,
-            &[],
+            type_sqls,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -10579,6 +10743,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             false
         }
+    }
+}
+
+/// The root page of the types table, if `record` is its sqlite_schema row.
+pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> {
+    let is_types_table = matches!(record.get_value_opt(0), Some(ValueRef::Text(ty)) if ty.as_str() == "table")
+        && matches!(record.get_value_opt(1), Some(ValueRef::Text(name)) if name.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME);
+    match record.get_value_opt(3) {
+        Some(ValueRef::Numeric(Numeric::Integer(root_page))) if is_types_table => Some(root_page),
+        _ => None,
     }
 }
 

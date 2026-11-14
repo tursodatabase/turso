@@ -9,9 +9,9 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, emit_table_column,
-        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
-        WalkControl,
+        bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
+        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
+        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -29,8 +29,9 @@ use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
+    Table,
 };
+use crate::security::roles::RoleId;
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
@@ -46,7 +47,9 @@ use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
-    util::{check_expr_references_column, exprs_are_equivalent, parse_numeric_literal},
+    util::{
+        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
     CaptureDataChangesExt, Connection, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -150,7 +153,10 @@ pub struct Resolver<'a> {
     /// redirecting column reads at codegen time.
     pub register_columns: HashMap<usize, RegisterColumn>,
     /// Each planned subquery that gives one row, keyed by its internal ID.
-    pub(crate) row_value_subqueries: Rc<RowValueSubqueries>,
+    pub(crate) row_value_subqueries: Rc<SubqueryMap<RowValueSubquery>>,
+    /// The types of the result columns of each planned IN subquery, keyed by its
+    /// internal ID.
+    pub(crate) in_subquery_column_types: Rc<SubqueryMap<Vec<ExprType>>>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -167,6 +173,7 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Foreign-key action programs currently being compiled by this resolver.
@@ -176,6 +183,15 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// The statement is compiled for a role that is not a superuser, which may
+    /// not use a sequence or a PRAGMA anywhere, including inside a view.
+    pub(crate) role_is_not_superuser: bool,
+    /// The role whose access row-level security limits in the statement being
+    /// compiled. Every caller of [`Resolver::new`] says which role it is, so
+    /// that compiling a statement as the superuser is a visible choice: the
+    /// engine makes it for the statements it runs on its own behalf and
+    /// inside [`Resolver::as_superuser`].
+    pub(crate) row_security_role: RoleId,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -196,6 +212,15 @@ impl RegisterColumn {
             affinity: column.affinity(),
             collation: crate::translate::collate::column_collation(column),
             column_type: column_type(column, is_strict, schema),
+        }
+    }
+
+    /// A column of the table being written whose register holds the value
+    /// DECODE gave, so comparisons use the affinity of that value's kind.
+    pub fn decoded_table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
+        Self {
+            affinity: column.comparison_affinity(),
+            ..Self::table_column(column, is_strict, schema)
         }
     }
 
@@ -223,24 +248,32 @@ impl RegisterColumn {
     }
 }
 
-/// The subqueries that give one row which a resolver has planned. A forked
-/// resolver starts a new, empty layer on top of its parent's layer instead of
-/// copying it: deeply nested subqueries fork thousands of times, and copying
+/// The planned subqueries of one kind in a resolver, such as the ones that give
+/// one row or the ones on the right of IN. A forked resolver starts a
+/// new, empty layer on top of its parent's layer instead of copying it: deeply nested subqueries fork thousands of times, and copying
 /// every entry on each fork made planning them quadratic. What a fork adds
 /// stays out of its parent, because a fork can compile a separate program
 /// (a trigger or a foreign key action) whose internal IDs repeat the parent's.
-#[derive(Default)]
-pub(crate) struct RowValueSubqueries {
-    parent: Option<Rc<RowValueSubqueries>>,
-    own: RefCell<HashMap<TableInternalId, Rc<RowValueSubquery>>>,
+pub(crate) struct SubqueryMap<T> {
+    parent: Option<Rc<SubqueryMap<T>>>,
+    own: RefCell<HashMap<TableInternalId, Rc<T>>>,
 }
 
-impl RowValueSubqueries {
-    pub(crate) fn insert(&self, subquery_id: TableInternalId, subquery: RowValueSubquery) {
+impl<T> Default for SubqueryMap<T> {
+    fn default() -> Self {
+        Self {
+            parent: None,
+            own: RefCell::default(),
+        }
+    }
+}
+
+impl<T> SubqueryMap<T> {
+    pub(crate) fn insert(&self, subquery_id: TableInternalId, subquery: T) {
         self.own.borrow_mut().insert(subquery_id, Rc::new(subquery));
     }
 
-    pub(crate) fn get(&self, subquery_id: TableInternalId) -> Option<Rc<RowValueSubquery>> {
+    pub(crate) fn get(&self, subquery_id: TableInternalId) -> Option<Rc<T>> {
         if let Some(subquery) = self.own.borrow().get(&subquery_id) {
             return Some(subquery.clone());
         }
@@ -290,16 +323,26 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => {
-                Some(table.columns().iter().map(|c| c.affinity()).collect())
-            }
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.comparison_affinity())
+                    .collect(),
+            ),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.comparison_affinity())
+                        .collect()
+                }),
         };
 
         Self {
@@ -344,13 +387,25 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::dialect::SqliteDialect),
+            Arc::new(crate::EngineDialect),
             None,
+            RoleId::SUPERUSER,
         )
     }
 }
 
 impl<'a> Resolver<'a> {
+    /// Compiles `f` as for the superuser, so neither privileges nor
+    /// row-level security limit anything, and then restores the role.
+    pub(crate) fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
+        let role_is_not_superuser = std::mem::replace(&mut self.role_is_not_superuser, false);
+        let result = f(self);
+        self.row_security_role = role;
+        self.role_is_not_superuser = role_is_not_superuser;
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
@@ -363,6 +418,7 @@ impl<'a> Resolver<'a> {
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
         search_path: Option<&[String]>,
+        row_security_role: RoleId,
     ) -> Self {
         Self {
             catalog: CatalogContext::new(
@@ -380,12 +436,16 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
             row_value_subqueries: Rc::default(),
+            in_subquery_column_types: Rc::default(),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
+            automatic_index: true,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            role_is_not_superuser: false,
+            row_security_role,
         }
     }
 
@@ -414,12 +474,16 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
             row_value_subqueries: self.row_value_subqueries.fork(),
+            in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role,
         }
     }
 
@@ -430,12 +494,16 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_columns: self.register_columns.clone(),
             row_value_subqueries: self.row_value_subqueries.fork(),
+            in_subquery_column_types: self.in_subquery_column_types.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role,
         }
     }
 
@@ -715,13 +783,6 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
     ) -> Result<NamespaceRef> {
         self.catalog.resolve_existing_trigger(qualified_name)
-    }
-
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.catalog.resolve_existing_sequence(seq_name)
     }
 
     /// The namespace and bare name of the sequence whose mangled name is
@@ -1957,8 +2018,8 @@ pub(crate) fn init_limit(
 /// DML row context. This takes into account stored columns, and any stored columns
 /// required by virtual columns in `target_columns`.
 ///
-/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
-/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
+/// Non-rowid target columns are allocated in target order, once per distinct column.
+/// Rowid-alias columns resolve to `rowid_reg`, so callers that need an unpacked contiguous key or record must
 /// materialize one from `DmlColumnContext::to_column_reg`.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
@@ -1968,7 +2029,13 @@ pub(crate) fn emit_columns_and_dependencies(
     target_columns: impl IntoIterator<Item = usize>,
     resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
-    let targets: Vec<usize> = target_columns.into_iter().collect();
+    // A foreign key may name the same column twice, e.g. FOREIGN KEY(a,a).
+    let mut targets: Vec<usize> = Vec::new();
+    for idx in target_columns {
+        if !targets.contains(&idx) {
+            targets.push(idx);
+        }
+    }
     let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
     let non_rowid_targets: Vec<usize> = targets
         .iter()
@@ -2058,8 +2125,8 @@ pub(crate) fn emit_index_column_value_old_image(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -2083,16 +2150,6 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
-                let column = &table.columns()[idx_col.pos_in_table];
-                if column.is_virtual_generated() {
-                    program.emit_column_affinity(dest_reg, column.affinity());
-                }
-            }
-        }
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
@@ -2179,8 +2236,8 @@ fn emit_index_column_value_new_image(
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let expr = expr.clone();
         let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
@@ -2206,10 +2263,10 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
+            GeneratedType::Virtual { .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    expr,
+                    col_in_table,
                     dest_reg,
                     columns_start_reg,
                     columns,
@@ -2219,6 +2276,14 @@ fn emit_index_column_value_new_image(
                     table,
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::Stored { .. } => {
+                let src_reg = layout.to_register(columns_start_reg, idx_col.pos_in_table);
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
             }
             GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {
@@ -2319,13 +2384,24 @@ fn emit_check_constraint_bytecode(
                 let col_regs: Vec<usize> = column_mappings.iter().map(|(_, r)| *r).collect();
                 let col_names: Vec<String> =
                     column_mappings.iter().map(|(n, _)| n.to_string()).collect();
+                let mut constraint_info = ConstraintInfo::check(
+                    table_name,
+                    check_constraint.name.clone(),
+                    col_regs,
+                    col_names,
+                );
+                if let Some(table) = referenced_tables
+                    .and_then(|tables| tables.joined_tables().first())
+                    .and_then(|joined_table| joined_table.table.btree())
+                {
+                    // Turn off the column register cache, or a column named
+                    // `value` would replace the `value` that DECODE reads.
+                    resolver.expr_to_reg_cache_enabled = false;
+                    emit_constraint_values_decode(program, resolver, &table, &mut constraint_info)?;
+                    resolver.enable_expr_to_reg_cache();
+                }
                 program.emit_insn(Insn::Halt {
-                    constraint_info: Some(Box::new(ConstraintInfo::check(
-                        table_name,
-                        check_constraint.name.clone(),
-                        col_regs,
-                        col_names,
-                    ))),
+                    constraint_info: Some(Box::new(constraint_info)),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: halt_on_error,
@@ -2350,16 +2426,17 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
-/// Takes column-to-register mappings as an iterator to avoid heap allocation.
+/// `stored_columns` gives each column's register, holding the row's stored
+/// value, after ENCODE.
 /// `halt_on_error` is the resolve type carried by the Halt of a failed CHECK.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
-    table_name: &str,
+    table: &BTreeTable,
     rowid_reg: usize,
-    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
     halt_on_error: Option<ResolveType>,
@@ -2369,8 +2446,80 @@ pub(crate) fn emit_check_constraints<'a>(
     if connection.check_constraints_ignored() || check_constraints.is_empty() {
         return Ok(());
     }
+    with_columns_in_registers(
+        program,
+        resolver,
+        table,
+        rowid_reg,
+        stored_columns,
+        referenced_tables,
+        |col_name| {
+            let normalized_name = normalize_ident(col_name);
+            check_constraints
+                .iter()
+                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
+        },
+        |program, resolver, stored_column_mappings| {
+            emit_check_constraint_bytecode(
+                program,
+                check_constraints,
+                resolver,
+                or_conflict,
+                halt_on_error,
+                skip_row_label,
+                referenced_tables,
+                table.name.as_str(),
+                stored_column_mappings,
+            )
+        },
+    )
+}
 
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
+/// Runs `emit` with the resolver reading the columns of a row of `table`
+/// from registers instead of a cursor: the rowid from `rowid_reg`, and each
+/// column from the register `stored_columns` gives, which holds its stored
+/// value, after ENCODE. A custom-type column that `is_read` names is DECODEd
+/// into a new register first, so that expressions see the value a SELECT
+/// reads. `emit` gets each column's name and stored register.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn with_columns_in_registers<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table: &BTreeTable,
+    rowid_reg: usize,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
+    referenced_tables: Option<&TableReferences>,
+    is_read: impl Fn(&str) -> bool,
+    emit: impl FnOnce(&mut ProgramBuilder, &mut Resolver, &[(&'a str, usize)]) -> Result<()>,
+) -> Result<()> {
+    let table_name = table.name.as_str();
+    let mut stored_column_mappings = Vec::new();
+    // An expression sees the values a SELECT reads, so it reads a custom-type
+    // column after DECODE, as `ceil(n)` on a numeric must compute from 4.50,
+    // not from the stored blob. Only the columns it reads are decoded.
+    let mut column_mappings = Vec::new();
+    for (column, stored_reg) in stored_columns {
+        let Some(col_name) = column.name.as_deref() else {
+            continue;
+        };
+        stored_column_mappings.push((col_name, stored_reg));
+        let register =
+            if resolver.schema().column_has_decode(column, table.is_strict) && is_read(col_name) {
+                let decoded_reg = program.alloc_register();
+                emit_user_facing_column_value(
+                    program,
+                    stored_reg,
+                    decoded_reg,
+                    column,
+                    table.is_strict,
+                    resolver,
+                )?;
+                decoded_reg
+            } else {
+                stored_reg
+            };
+        column_mappings.push((col_name, register));
+    }
     let initial_cache_size = resolver.expr_to_reg_cache.len();
     let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
 
@@ -2430,17 +2579,7 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        halt_on_error,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-        &column_mappings,
-    );
+    let result = emit(program, resolver, &stored_column_mappings);
 
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);

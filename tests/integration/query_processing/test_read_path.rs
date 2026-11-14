@@ -3,7 +3,7 @@ use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, LimboError, StepResult, Value};
+use turso_core::{ConnectOpts, LimboError, SessionRole, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -1282,7 +1282,8 @@ fn test_parameters_count_includes_parameters_without_bytecode(tmp_db: TempDataba
 fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     use crate::queued_io::QueuedIo;
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+    use turso_core::{Database, DatabaseOpts};
+    use turso_sqlite::SqliteDialect;
 
     const ROWS: i64 = 4;
     // ~100KB of TEXT per row spans dozens of overflow pages, so reading one
@@ -1304,7 +1305,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
         for i in 0..ROWS {
             conn.execute(
@@ -1321,7 +1322,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     // A fresh Database over the same backing file starts with a cold page
     // cache, so every record (and its overflow chain) must be read back.
     let db = open(io.clone())?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
     let mut io_yields = 0usize;
     let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();
@@ -1373,7 +1374,8 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Result<()> {
     use crate::queued_io::{QueuedIo, QueuedIoOpKind};
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+    use turso_core::{Database, DatabaseOpts};
+    use turso_sqlite::SqliteDialect;
 
     const ROWS: i64 = 8;
     // A 100KB value fills about 25 overflow pages of 4096 bytes.
@@ -1395,7 +1397,7 @@ fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Re
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute(
             "CREATE TABLE revisions(doc_id TEXT, rev INTEGER, saved_at INTEGER, body TEXT, tail TEXT)",
         )?;
@@ -1415,7 +1417,7 @@ fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Re
     // cache, so every page the query needs is read again.
     let scan = |sql: &str| -> anyhow::Result<(Vec<Vec<Value>>, usize)> {
         let db = open(io.clone())?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         let mut stmt = conn.prepare(sql)?;
         let mut rows = Vec::new();
         let mut page_reads = 0;

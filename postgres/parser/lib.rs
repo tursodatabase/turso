@@ -1,5 +1,8 @@
 pub mod cmdtag;
 pub mod copy;
+mod create_function;
+pub mod functions;
+mod names;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
@@ -22,11 +25,83 @@ pub enum ParseError {
     /// missing schema. Only a caller with a connection can find that out.
     #[error("a schema-qualified {kind} name is not supported")]
     SchemaQualifiedName { kind: String, schema: String },
+    /// A type of a function's parameter or result that is not built in. It
+    /// is a relation or a custom type, which tursopg does not support in a
+    /// function, or it does not exist. Only a caller with a connection can
+    /// find that out.
+    #[error("{} is not supported", .used_as.unsupported_feature(.full_name))]
+    UnresolvedFunctionType {
+        schema: Option<String>,
+        name: String,
+        /// The type as PostgreSQL writes it in errors, such as `public.t[]`.
+        full_name: String,
+        used_as: FunctionTypeUse,
+    },
+}
+
+impl ParseError {
+    /// PostgreSQL's `feature_not_supported` error, reading "`what` is not supported".
+    pub(crate) fn not_supported(what: impl std::fmt::Display) -> Self {
+        Self::Sqlstate {
+            sqlstate: sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            message: format!("{what} is not supported"),
+        }
+    }
+}
+
+/// Where a type appears in the signature of a function.
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionTypeUse {
+    Parameter,
+    Result,
+    SetofResult,
+}
+
+impl FunctionTypeUse {
+    /// PostgreSQL's error when the type does not exist. PostgreSQL quotes
+    /// the name only in the error for a result.
+    pub fn missing_message(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("type {full_name} does not exist"),
+            Self::Result | Self::SetofResult => format!("type \"{full_name}\" does not exist"),
+        }
+    }
+
+    fn unsupported_feature(self, full_name: &str) -> String {
+        match self {
+            Self::Parameter => format!("a function parameter of type {full_name}"),
+            Self::Result => format!("a function result of type {full_name}"),
+            Self::SetofResult => format!("a function result of type SETOF {full_name}"),
+        }
+    }
 }
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::parse(sql).map_err(parse_error)
+}
+
+/// The error for SQL that pg_query refuses. pg_query gives only the message
+/// of PostgreSQL's error, not its SQLSTATE, so the errors that PostgreSQL
+/// does not report as syntax errors are recognized by their message.
+fn parse_error(error: pg_query::Error) -> ParseError {
+    match &error {
+        pg_query::Error::Parse(message) if is_reserved_role_name_error(message) => {
+            ParseError::Sqlstate {
+                sqlstate: sqlstate::SQLSTATE_RESERVED_NAME,
+                message: message.clone(),
+            }
+        }
+        _ => ParseError::ParseError(error.to_string()),
+    }
+}
+
+/// Whether the message is PostgreSQL's error for a role name that the
+/// grammar refuses, such as `role name "none" is reserved` or
+/// `CURRENT_USER cannot be used as a role name here`.
+fn is_reserved_role_name_error(message: &str) -> bool {
+    (message.starts_with("role name \"") && message.ends_with("\" is reserved"))
+        || message.ends_with(" cannot be used as a role name here")
 }
 
 /// Whether the first statement in `parsed` sends rows to the client.
@@ -47,12 +122,14 @@ fn first_statement(parsed: &ParseResult) -> Option<&NodeEnum> {
 }
 
 /// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
+///
+/// The parser knows that the semicolons in the BEGIN ATOMIC body of CREATE
+/// FUNCTION do not end the statement. Text with a syntax error is an error,
+/// because PostgreSQL runs none of the statements in it.
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     let parts =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     Ok(parts
         .into_iter()
         .map(|s| s.trim().to_string())
@@ -111,6 +188,60 @@ pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
     sql
 }
 
+/// `sql`, a CREATE TABLE statement, with its serial column `column` written
+/// out as what `serial` stands for: the integer type, NOT NULL and a
+/// DEFAULT of `nextval` of `sequence`, the string the stored text passes to
+/// `nextval`. A table is loaded from its stored text, so the text has to
+/// name the sequence when the sequence is not named `<table>_<column>_seq`.
+pub fn write_out_serial_column(
+    sql: &str,
+    column: &str,
+    sequence: &str,
+) -> Result<String, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let parse_result = parse(sql)?;
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateStmt(create), ..)) = nodes.first() else {
+        return Err(ParseError::ParseError(
+            "not a CREATE TABLE statement".to_string(),
+        ));
+    };
+    let type_name = create
+        .table_elts
+        .iter()
+        .find_map(|element| match &element.node {
+            Some(Node::ColumnDef(col_def)) if col_def.colname == column => {
+                col_def.type_name.as_ref()
+            }
+            _ => None,
+        })
+        .ok_or_else(|| ParseError::ParseError(format!("no column \"{column}\"")))?;
+    let type_word = type_name.names.last().and_then(|name| match &name.node {
+        Some(Node::String(word)) => Some(word.sval.to_lowercase()),
+        _ => None,
+    });
+    let integer_type = match type_word.as_deref() {
+        Some("serial" | "serial4") => "integer",
+        Some("bigserial" | "serial8") => "bigint",
+        Some("smallserial" | "serial2") => "smallint",
+        _ => {
+            return Err(ParseError::ParseError(format!(
+                "column \"{column}\" is not a serial column"
+            )))
+        }
+    };
+    let location = type_name.location as usize;
+    let end = qualified_name_end(sql, location)?;
+    let sequence = sequence.replace('\'', "''");
+    Ok(format!(
+        "{}{integer_type} NOT NULL DEFAULT nextval('{sequence}'){}",
+        &sql[..location],
+        &sql[end..]
+    ))
+}
+
 /// `sql`, a CREATE TABLE statement, with its table named `name` and no
 /// schema. `sql` is returned as it is when the table is already called
 /// `name` or when `sql` is not a CREATE TABLE statement.
@@ -138,6 +269,53 @@ pub fn create_table_name(parse_result: &ParseResult) -> Option<(Option<String>, 
         return None;
     };
     let relation = create.relation.as_ref()?;
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// The schema, if the statement names one, and name of the table being
+/// altered, when the statement is `ALTER TABLE t ADD COLUMN`. Returns None
+/// for all other statements.
+pub fn alter_table_add_column_table(
+    parse_result: &ParseResult,
+) -> Option<(Option<String>, String)> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::AlterTableType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::AlterTableStmt(alter), ..) = nodes.first()? else {
+        return None;
+    };
+    let relation = alter.relation.as_ref()?;
+    let cmd = alter.cmds.first()?;
+    let Some(Node::AlterTableCmd(cmd)) = &cmd.node else {
+        return None;
+    };
+    if AlterTableType::try_from(cmd.subtype).ok()? != AlterTableType::AtAddColumn {
+        return None;
+    }
+    Some((
+        (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        relation.relname.clone(),
+    ))
+}
+
+/// Returns the (schema, table) of a positional VALUES INSERT (no explicit column list).
+/// Returns None for any other statement, for INSERT with a column list, or for DEFAULT VALUES.
+pub fn positional_insert_table(parse_result: &ParseResult) -> Option<(Option<String>, String)> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let (NodeRef::InsertStmt(insert), ..) = nodes.first()? else {
+        return None;
+    };
+    if !insert.cols.is_empty() || insert.select_stmt.is_none() {
+        return None;
+    }
+    let relation = insert.relation.as_ref()?;
     Some((
         (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
         relation.relname.clone(),
@@ -195,6 +373,18 @@ fn collect_foreign_key_tables(node: &pg_query::protobuf::Node, tables: &mut Vec<
 /// `sql` with the name that starts at byte offset `location`, which may
 /// have a schema in front of it, replaced by `name` alone.
 pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseError> {
+    let end = qualified_name_end(sql, location)?;
+    Ok(format!(
+        "{}{}{}",
+        &sql[..location],
+        quote_identifier(name),
+        &sql[end..]
+    ))
+}
+
+/// The byte offset just past the name that starts at byte offset
+/// `location` of `sql`, with the schema that may be in front of it.
+fn qualified_name_end(sql: &str, location: usize) -> Result<usize, ParseError> {
     use pg_query::protobuf::Token;
 
     let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
@@ -216,12 +406,7 @@ pub fn name_at(sql: &str, location: usize, name: &str) -> Result<String, ParseEr
             end = ident.end as usize;
         }
     }
-    Ok(format!(
-        "{}{}{}",
-        &sql[..location],
-        quote_identifier(name),
-        &sql[end..]
-    ))
+    Ok(end)
 }
 
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its

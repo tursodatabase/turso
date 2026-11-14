@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::common::TempDatabase;
-use turso_core::{Connection, NamespaceId, Qualifier, Value};
+use turso_core::{Connection, NamespaceId, Qualifier, SessionRole, Value};
 
 /// Runs `sql`, which returns one integer, to its end, so that what it
 /// writes is committed, and returns the integer.
@@ -289,7 +289,8 @@ fn open_without_mvcc(path: &Path) -> Arc<Connection> {
             .db_opts(turso_core::DatabaseOpts::new().with_views(true)),
     )
     .unwrap();
-    db.connect(turso_core::ConnectOpts::new()).unwrap()
+    db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap()
 }
 
 /// Opens `path` with the PostgreSQL dialect through the engine alone, as a
@@ -302,7 +303,8 @@ fn open_through_the_engine(path: &Path, mvcc: bool) -> Arc<Connection> {
             .db_opts(turso_core::DatabaseOpts::new().with_mvcc(mvcc)),
     )
     .unwrap();
-    db.connect(turso_core::ConnectOpts::new()).unwrap()
+    db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap()
 }
 
 fn has_namespaces_table(conn: &Arc<Connection>) -> bool {
@@ -490,6 +492,32 @@ fn serial_tables_of_two_schemas_keep_their_sequences(db: TempDatabase) {
             2
         );
     }
+}
+
+#[turso_macros::test(mvcc)]
+fn vacuum_keeps_the_sequences_of_bigserial_columns_of_a_namespace(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE t (id bigserial, v text)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.t (id smallserial, v text)")
+        .unwrap();
+    conn.execute("INSERT INTO t (v) VALUES ('a'), ('b')")
+        .unwrap();
+    conn.execute("INSERT INTO app.t (v) VALUES ('c')").unwrap();
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().execute("VACUUM").unwrap();
+
+    assert_eq!(
+        pg_query_i64(&conn, "INSERT INTO t (v) VALUES ('d') RETURNING id"),
+        3
+    );
+    assert_eq!(
+        pg_query_i64(&conn, "INSERT INTO app.t (v) VALUES ('e') RETURNING id"),
+        2
+    );
 }
 
 /// VACUUM INTO copies the indexes of the tables of every schema, public

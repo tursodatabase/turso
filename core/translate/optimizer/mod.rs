@@ -1,6 +1,6 @@
 use super::{
     emitter::Resolver,
-    expr_context::ExprContext,
+    expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
         JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
@@ -625,12 +625,13 @@ pub fn optimize_plan(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
     resolver: &Resolver,
+    connection: &crate::Connection,
 ) -> Result<()> {
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, resolver)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, resolver)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, resolver, connection)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -677,10 +678,14 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
                 SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 } => {
                     resources
                         .register_ranges
                         .insert((*result_reg_start, *num_regs));
+                    if let Some(row_count_reg) = row_count_reg {
+                        resources.register_ranges.insert((*row_count_reg, 1));
+                    }
                 }
                 SubqueryType::In { cursor_id, .. } => {
                     resources.cursor_ids.insert(*cursor_id);
@@ -882,6 +887,9 @@ fn detect_simple_aggregate(
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
         || !plan.aggregates.first().unwrap().order_by().is_empty()
+        // The fast paths read the table without the loop that checks its
+        // row-level security filter.
+        || plan.table_references.joined_tables()[0].row_filter.is_some()
     {
         return Ok(None);
     }
@@ -906,7 +914,10 @@ fn detect_simple_aggregate(
         AggFunc::Count
             if is_unfiltered_btree_count
                 && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
-                && agg.args[0].is_nonnull(&plan.table_references, resolver) =>
+                && agg.args[0].is_nonnull(
+                    &TableMetadata::new(Some(&plan.table_references)),
+                    &TypeEnv::new(Some(&plan.table_references), resolver),
+                ) =>
         {
             Some(SimpleAggregate::Count)
         }
@@ -1067,6 +1078,62 @@ fn optimize_select_plan_form(
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
+/// SQLite removes DISTINCT in the same cases.
+fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool> {
+    let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
+        [] if plan.distinctness.is_distinct() && plan.group_by.is_none() => {
+            plan.result_columns.iter().map(|col| &col.expr).collect()
+        }
+        [agg] if agg.is_distinct() => plan
+            .group_by
+            .iter()
+            .flat_map(|group_by| &group_by.exprs)
+            .chain(&agg.args)
+            .collect(),
+        _ => return Ok(false),
+    };
+    let [table] = plan.table_references.joined_tables() else {
+        return Ok(false);
+    };
+    let Some(btree) = table.btree() else {
+        return Ok(false);
+    };
+    let ctx = ExprContext::new(Some(&plan.table_references), resolver);
+    let mut selected = Vec::new();
+    for expr in exprs {
+        match expr {
+            ast::Expr::RowId { table: t, .. } if *t == table.internal_id => return Ok(true),
+            ast::Expr::Column {
+                table: t,
+                column,
+                is_rowid_alias,
+                ..
+            } if *t == table.internal_id => {
+                if *is_rowid_alias {
+                    return Ok(true);
+                }
+                selected.push((*column, ctx.expr_collation(expr)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(resolver.with_schema(table.namespace.database_id, |schema| {
+        schema
+            .indices_including_backing(table.namespace.id, table.table.get_name())
+            .any(|index| {
+                index.unique
+                    && index.where_clause.is_none()
+                    && index.columns.iter().all(|ic| {
+                        ic.expr.is_none()
+                            && btree.columns()[ic.pos_in_table].notnull()
+                            && selected.iter().any(|(pos, collation)| {
+                                *pos == ic.pos_in_table && *collation == ic.collation
+                            })
+                    })
+            })
+    }))
+}
+
 /// Find the table reads for one version of a query.
 fn find_select_plan_form(
     plan: &mut SelectPlan,
@@ -1082,6 +1149,13 @@ fn find_select_plan_form(
     let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
+
+    if distinct_is_redundant(plan, resolver)? {
+        match plan.aggregates.first_mut() {
+            Some(agg) => agg.distinctness = super::plan::Distinctness::NonDistinct,
+            None => plan.distinctness = super::plan::Distinctness::NonDistinct,
+        }
+    }
 
     // A rewrite can move MATCH terms out of a subquery, so do this after the
     // query form has been chosen.
@@ -1337,16 +1411,15 @@ fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
     resolver: &Resolver,
+    connection: &crate::Connection,
 ) -> Result<()> {
     let schema = resolver.schema();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
-    let mut target_tables = TableReferences::new(
-        vec![plan.target_table.clone()],
-        plan.from_tables.outer_query_refs().to_vec(),
-    );
+    let mut target_tables =
+        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
@@ -1398,7 +1471,7 @@ fn optimize_update_plan(
         .expect("UPDATE must optimize exactly one target table")
         .clone();
 
-    if let Some(reason) = update_write_set_reason(plan, resolver)? {
+    if let Some(reason) = update_write_set_reason(plan, resolver, connection)? {
         plan.safety.require(reason);
     }
 
@@ -1420,6 +1493,7 @@ fn optimize_update_plan(
 fn update_write_set_reason(
     plan: &UpdatePlan,
     resolver: &Resolver,
+    connection: &crate::Connection,
 ) -> Result<Option<DmlSafetyReason>> {
     let table_ref = &plan.target_table;
     let reason = 'requires: {
@@ -1464,6 +1538,7 @@ fn update_write_set_reason(
             TriggerEvent::Update,
             Some(&updated_col_names),
             btree_table,
+            connection,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
         }
@@ -1648,10 +1723,7 @@ fn build_update_write_set_plan(
         from_tables.add_joined_table(target_table);
         from_tables
     } else {
-        TableReferences::new(
-            vec![plan.target_table.clone()],
-            plan.from_tables.outer_query_refs().to_vec(),
-        )
+        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables)
     };
     let rowid_internal_id = plan.target_table.internal_id;
 
@@ -2720,7 +2792,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: true,
+        allow_automatic_index: resolver.automatic_index,
         resolver,
     };
 
@@ -3985,7 +4057,7 @@ pub trait Optimizable {
         Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
     }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
-    fn is_nonnull(&self, tables: &TableReferences, resolver: &Resolver<'_>) -> bool;
+    fn is_nonnull(&self, properties: &impl ExprProperties, types: &TypeEnv) -> bool;
 }
 
 impl Optimizable for ast::Expr {
@@ -3995,24 +4067,24 @@ impl Optimizable for ast::Expr {
     /// This function is currently very conservative, and will return false
     /// for any expression where we aren't sure and didn't bother to find out
     /// by writing more complex code.
-    fn is_nonnull(&self, tables: &TableReferences, resolver: &Resolver<'_>) -> bool {
+    fn is_nonnull(&self, properties: &impl ExprProperties, types: &TypeEnv) -> bool {
         match self {
             Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => {
-                lhs.is_nonnull(tables, resolver)
-                    && start.is_nonnull(tables, resolver)
-                    && end.is_nonnull(tables, resolver)
+                lhs.is_nonnull(properties, types)
+                    && start.is_nonnull(properties, types)
+                    && end.is_nonnull(properties, types)
             }
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
             Expr::Binary(_, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, _) => false, // JSON path may be absent, yielding NULL
             Expr::Binary(_, ast::Operator::ArrayContains | ast::Operator::ArrayOverlap, _) => false,
             Expr::Binary(lhs, _, rhs) => {
                 // A custom type's function may return NULL for any operands.
-                !runs_custom_type_function(self, &TypeEnv::new(Some(tables), resolver))
-                    && lhs.is_nonnull(tables, resolver)
-                    && rhs.is_nonnull(tables, resolver)
+                !runs_custom_type_function(self, types)
+                    && lhs.is_nonnull(properties, types)
+                    && rhs.is_nonnull(properties, types)
             }
             Expr::Case {
                 when_then_pairs,
@@ -4026,13 +4098,13 @@ impl Optimizable for ast::Expr {
                 // result, so its nullability does not matter.
                 when_then_pairs
                     .iter()
-                    .all(|(_, then)| then.is_nonnull(tables, resolver))
+                    .all(|(_, then)| then.is_nonnull(properties, types))
                     && else_expr
                         .as_ref()
-                        .is_some_and(|else_expr| else_expr.is_nonnull(tables, resolver))
+                        .is_some_and(|else_expr| else_expr.is_nonnull(properties, types))
             }
-            Expr::Cast { expr, .. } => expr.is_nonnull(tables, resolver),
-            Expr::Collate(expr, _) => expr.is_nonnull(tables, resolver),
+            Expr::Cast { expr, .. } => expr.is_nonnull(properties, types),
+            Expr::Collate(expr, _) => expr.is_nonnull(properties, types),
             Expr::DoublyQualified(..) => {
                 panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
             }
@@ -4042,36 +4114,17 @@ impl Optimizable for ast::Expr {
             // A merged USING column is NULL when all of its source columns are NULL.
             Expr::MergedColumn(_) => false,
             Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
+            // A rowid alias column reads the rowid itself.
             Expr::Column {
                 table,
-                column,
-                is_rowid_alias,
+                is_rowid_alias: true,
                 ..
-            } => {
-                // SQLite marks columns from the nullable side of an outer join
-                // as nullable, even when the table schema says NOT NULL.
-                if tables.outer_join_may_null_extend(*table) {
-                    return false;
-                }
-                if *is_rowid_alias {
-                    return true;
-                }
-
-                let (_, table_ref) = tables
-                    .find_table_by_internal_id(*table)
-                    .expect("table not found");
-                let columns = table_ref.columns();
-                let column = &columns[*column];
-                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
-                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
-            }
-            // A rowid is not NULL for a real table row. An outer join can
-            // replace that row with a synthetic row whose rowid is NULL.
-            Expr::RowId { table, .. } => !tables.outer_join_may_null_extend(*table),
+            } => properties.rowid_is_nonnull(*table),
+            Expr::Column { table, column, .. } => properties.column_is_nonnull(*table, *column),
+            Expr::RowId { table, .. } => properties.rowid_is_nonnull(*table),
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_nonnull(tables, resolver)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables, resolver)))
+                lhs.is_nonnull(properties, types)
+                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(properties, types)))
             }
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
@@ -4083,11 +4136,11 @@ impl Optimizable for ast::Expr {
             Expr::Like {
                 lhs, rhs, escape, ..
             } => {
-                lhs.is_nonnull(tables, resolver)
-                    && rhs.is_nonnull(tables, resolver)
+                lhs.is_nonnull(properties, types)
+                    && rhs.is_nonnull(properties, types)
                     && escape
                         .as_ref()
-                        .is_none_or(|escape| escape.is_nonnull(tables, resolver))
+                        .is_none_or(|escape| escape.is_nonnull(properties, types))
             }
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(_) => true,
@@ -4104,7 +4157,7 @@ impl Optimizable for ast::Expr {
             Expr::Name(..) => false,
             Expr::NotNull(..) => true,
             Expr::Parenthesized(exprs) => {
-                exprs.iter().all(|expr| expr.is_nonnull(tables, resolver))
+                exprs.iter().all(|expr| expr.is_nonnull(properties, types))
             }
             Expr::Qualified(..) => {
                 panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
@@ -4113,8 +4166,7 @@ impl Optimizable for ast::Expr {
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => {
-                !runs_custom_type_function(self, &TypeEnv::new(Some(tables), resolver))
-                    && expr.is_nonnull(tables, resolver)
+                !runs_custom_type_function(self, types) && expr.is_nonnull(properties, types)
             }
             Expr::Variable(..) => false,
             Expr::Register { .. } => false, // Register values can be null
@@ -4342,7 +4394,7 @@ fn ephemeral_index_build(
         .map(|(i, c)| {
             let expr = match c.generated_type() {
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
-                GeneratedType::NotGenerated => None,
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
             };
             IndexColumn {
                 name: c.name.clone().unwrap(),
@@ -4948,8 +5000,9 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::dialect::SqliteDialect),
+            crate::sync::Arc::new(crate::EngineDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         )
     }
 

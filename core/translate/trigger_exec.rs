@@ -15,6 +15,7 @@ use crate::translate::{
 };
 use crate::turso_assert;
 use crate::util::normalize_ident;
+use crate::vdbe::builder::DmlRowForm;
 use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
@@ -37,16 +38,18 @@ pub struct TriggerContext {
     /// This is needed for UPSERT DO UPDATE triggers where SQLite requires
     /// that nested OR IGNORE/REPLACE clauses do not suppress errors.
     pub override_conflict: Option<ast::ResolveType>,
-    /// Whether NEW registers contain encoded custom type values that need decoding.
-    /// True for AFTER triggers (values have been encoded for storage).
-    /// False for BEFORE triggers (values are still user-facing).
-    pub new_encoded: bool,
+    /// Which NEW registers hold stored values that the trigger must see
+    /// decoded. A BEFORE UPDATE row has the SET columns' values as written and
+    /// the other columns' stored values, so this is per column. OLD registers
+    /// are always read from the table and so always hold stored values.
+    pub new_form: DmlRowForm,
 }
 
 impl TriggerContext {
     pub fn new(
         table: Arc<BTreeTable>,
         new_registers: Option<Vec<usize>>,
+        new_form: DmlRowForm,
         old_registers: Option<Vec<usize>>,
     ) -> Self {
         Self {
@@ -54,56 +57,17 @@ impl TriggerContext {
             new_registers,
             old_registers,
             override_conflict: None,
-            new_encoded: false,
+            new_form,
         }
     }
 
-    /// Create a trigger context for AFTER triggers where NEW values are encoded.
-    pub fn new_after(
-        table: Arc<BTreeTable>,
-        new_registers: Option<Vec<usize>>,
-        old_registers: Option<Vec<usize>>,
-    ) -> Self {
+    /// The same context with a conflict resolution override. Used for UPSERT
+    /// DO UPDATE triggers where nested OR IGNORE/REPLACE clauses should not
+    /// suppress errors.
+    pub fn with_override_conflict(self, override_conflict: ast::ResolveType) -> Self {
         Self {
-            table,
-            new_registers,
-            old_registers,
-            override_conflict: None,
-            new_encoded: true,
-        }
-    }
-
-    /// Create a trigger context with a conflict resolution override.
-    /// Used for UPSERT DO UPDATE triggers where nested OR IGNORE/REPLACE
-    /// clauses should not suppress errors.
-    pub fn new_with_override_conflict(
-        table: Arc<BTreeTable>,
-        new_registers: Option<Vec<usize>>,
-        old_registers: Option<Vec<usize>>,
-        override_conflict: ast::ResolveType,
-    ) -> Self {
-        Self {
-            table,
-            new_registers,
-            old_registers,
             override_conflict: Some(override_conflict),
-            new_encoded: false,
-        }
-    }
-
-    /// Create a trigger context with a conflict resolution override for AFTER triggers.
-    pub fn new_after_with_override_conflict(
-        table: Arc<BTreeTable>,
-        new_registers: Option<Vec<usize>>,
-        old_registers: Option<Vec<usize>>,
-        override_conflict: ast::ResolveType,
-    ) -> Self {
-        Self {
-            table,
-            new_registers,
-            old_registers,
-            override_conflict: Some(override_conflict),
-            new_encoded: true,
+            ..self
         }
     }
 }
@@ -401,6 +365,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 returning: vec![],
                 indexed: None,
                 with: None,
+                truncate: false,
             })
         }
         ast::TriggerCmd::Select(select) => {
@@ -619,10 +584,10 @@ fn execute_trigger_commands(
     // below (`translate_inner` needs it), so the scope closure takes
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
+    subprogram_builder.prologue();
     resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
-            subprogram_builder.prologue();
             translate_inner(
                 stmt,
                 resolver,
@@ -799,27 +764,37 @@ pub fn get_triggers_including_temp(
     time: TriggerTime,
     updated_column_names: Option<&[ast::Name]>,
     table: &BTreeTable,
+    connection: &crate::Connection,
 ) -> Vec<Arc<Trigger>> {
     let database_id = namespace.database_id;
-    let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            namespace.id,
-            event.clone(),
-            time,
-            updated_column_names,
-            table,
-        )
-        .filter(|trigger| {
-            // In the temp schema, triggers may target a different database.
-            // Only include triggers whose target matches this database.
-            match trigger.target_database_id {
-                Some(target_db) => target_db == database_id,
-                None => true, // unqualified → targets this schema's own table
-            }
-        })
-        .collect()
-    });
+    // Non-TEMP triggers are dropped entirely when triggers are off, same as
+    // SQLite's SQLITE_DBCONFIG_ENABLE_TRIGGER=0 (trigger.c, triggersReallyExist).
+    // Triggers that live in the TEMP schema (database_id == TEMP_DB_ID) always
+    // fire; they are collected below, separately from this table's own schema.
+    let mut triggers: Vec<Arc<Trigger>> =
+        if database_id != crate::TEMP_DB_ID && !connection.triggers_enabled() {
+            Vec::new()
+        } else {
+            resolver.with_schema(database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    namespace.id,
+                    event.clone(),
+                    time,
+                    updated_column_names,
+                    table,
+                )
+                .filter(|trigger| {
+                    // In the temp schema, triggers may target a different database.
+                    // Only include triggers whose target matches this database.
+                    match trigger.target_database_id {
+                        Some(target_db) => target_db == database_id,
+                        None => true, // unqualified → targets this schema's own table
+                    }
+                })
+                .collect()
+            })
+        };
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             get_relevant_triggers_type_and_time(
@@ -860,17 +835,31 @@ pub fn get_triggers_including_temp(
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
+/// Gated on `connection.triggers_enabled()` the same way as
+/// [`get_triggers_including_temp`], so the two agree on whether a table has
+/// triggers that will actually fire.
 pub fn has_triggers_including_temp(
     resolver: &Resolver,
     namespace: NamespaceRef,
     event: TriggerEvent,
     updated_column_names: Option<&[ast::Name]>,
     table: &BTreeTable,
+    connection: &crate::Connection,
 ) -> bool {
     let database_id = namespace.database_id;
-    let found = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, namespace.id, event.clone(), updated_column_names, table)
-    });
+    let found = if database_id != crate::TEMP_DB_ID && !connection.triggers_enabled() {
+        false
+    } else {
+        resolver.with_schema(database_id, |s| {
+            has_relevant_triggers_type_only(
+                s,
+                namespace.id,
+                event.clone(),
+                updated_column_names,
+                table,
+            )
+        })
+    };
     if found {
         return true;
     }
@@ -905,7 +894,7 @@ pub fn fire_trigger(
     // Decode custom type registers so trigger bodies see user-facing values,
     // not raw encoded blobs from disk.
     // - OLD registers always come from cursor reads → always encoded → always decode
-    // - NEW registers are only encoded for AFTER triggers (post-encode) → decode when new_encoded
+    // - NEW registers → decode the columns that `new_form` says hold stored values
     //
     // Column affinity for NEW registers is handled by the parent statement:
     // - Non-STRICT tables: INSERT/UPDATE emit Insn::Affinity before any trigger fires
@@ -1029,7 +1018,7 @@ fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
 
 /// Decode encoded custom type registers in a TriggerContext.
 /// OLD registers are always decoded (they always come from cursor reads on disk).
-/// NEW registers are decoded only when `ctx.new_encoded` is true (AFTER triggers).
+/// NEW registers are decoded where `ctx.new_form` says they hold stored values.
 fn decode_trigger_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1042,28 +1031,25 @@ fn decode_trigger_registers(
             new_registers: ctx.new_registers.clone(),
             old_registers: ctx.old_registers.clone(),
             override_conflict: ctx.override_conflict,
-            new_encoded: false,
+            new_form: DmlRowForm::UserFacing,
         });
     }
 
     let columns = ctx.table.columns();
 
-    let decoded_new = if ctx.new_encoded {
-        if let Some(new_regs) = &ctx.new_registers {
-            let rowid_reg = *new_regs.last().expect("NEW registers must include rowid");
-            Some(expr::emit_trigger_decode_registers(
-                program,
-                resolver,
-                columns,
-                &|i| new_regs[i],
-                rowid_reg,
-                true, // is_strict
-            )?)
-        } else {
-            None
-        }
+    let decoded_new = if let Some(new_regs) = &ctx.new_registers {
+        let rowid_reg = *new_regs.last().expect("NEW registers must include rowid");
+        Some(expr::emit_trigger_decode_registers(
+            program,
+            resolver,
+            columns,
+            &|i| new_regs[i],
+            &|i| ctx.new_form.holds_stored_value(i),
+            rowid_reg,
+            true, // is_strict
+        )?)
     } else {
-        ctx.new_registers.clone()
+        None
     };
 
     let decoded_old = if let Some(old_regs) = &ctx.old_registers {
@@ -1073,6 +1059,7 @@ fn decode_trigger_registers(
             resolver,
             columns,
             &|i| old_regs[i],
+            &|_| true,
             rowid_reg,
             true, // is_strict
         )?)
@@ -1085,7 +1072,7 @@ fn decode_trigger_registers(
         new_registers: decoded_new,
         old_registers: decoded_old,
         override_conflict: ctx.override_conflict,
-        new_encoded: false, // decoded now
+        new_form: DmlRowForm::UserFacing, // decoded now
     })
 }
 

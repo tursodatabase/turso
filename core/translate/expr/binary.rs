@@ -68,8 +68,15 @@ fn emit_row_valued_binary_expr(
 
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_compared_pair(
+        program,
+        referenced_tables,
+        e1,
+        e2,
+        lhs_reg,
+        rhs_reg,
+        resolver,
+    )?;
 
     emit_binary_expr_row_valued(
         program,
@@ -88,6 +95,27 @@ fn emit_row_valued_binary_expr(
         emit_cond_jump(program, metadata, target_register);
     }
     Ok(target_register)
+}
+
+/// Function instructions read contiguous registers start_reg..start_reg+arg_count.
+/// When both operands are equivalent the compiler reuses a single shared register,
+/// so copy it into a contiguous pair.
+fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> usize {
+    if lhs != rhs {
+        return lhs;
+    }
+    let regs = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs,
+        dst_reg: regs,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs,
+        dst_reg: regs + 1,
+        extra_amount: 0,
+    });
+    regs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -138,8 +166,12 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        if op.is_comparison() {
+            translate_compared_pair(program, referenced_tables, e1, e2, e1_reg, e2_reg, resolver)?;
+        } else {
+            translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
+            translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        }
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -395,7 +427,7 @@ pub(super) fn row_component_affinity_collation(
 /// row subquery's result, so each component compares with its own type. A
 /// subquery column does not bring its text collation. Any other expression
 /// stands for itself.
-fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
     match unwrap_parens(expr)? {
         Expr::Parenthesized(exprs) if exprs.len() > 1 => {
             Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {
@@ -410,6 +442,7 @@ fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 },
         } if *num_regs > 1 && idx < *num_regs => Ok(Cow::Owned(Expr::SubqueryResult {
             subquery_id: *subquery_id,
@@ -418,10 +451,82 @@ fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
             query_type: ast::SubqueryType::RowValue {
                 result_reg_start: result_reg_start + idx,
                 num_regs: 1,
+                row_count_reg: *row_count_reg,
             },
         })),
         _ => Ok(Cow::Borrowed(expr)),
     }
+}
+
+/// Writes the `len` components of the row value `expr` into the registers
+/// starting at `start_reg`. Each component is translated as one value, so a
+/// row value nested inside another is "row value misused", as in SQLite.
+pub(super) fn translate_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &Expr,
+    len: usize,
+    start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for idx in 0..len {
+        let component = row_value_component_expr(expr, idx)?;
+        translate_expr(
+            program,
+            referenced_tables,
+            &component,
+            start_reg + idx,
+            resolver,
+        )?;
+    }
+    Ok(())
+}
+
+/// The number of components [row_value_component_expr] splits `expr` into.
+/// As in SQLite's `sqlite3ExprVectorSize`, only `(a, b)` and a planned row
+/// subquery have more than one; every other expression is one value.
+pub(crate) fn row_value_len(expr: &Expr) -> Result<usize> {
+    Ok(match unwrap_parens(expr)? {
+        Expr::Parenthesized(exprs) => exprs.len(),
+        Expr::SubqueryResult { query_type, .. } => match query_type {
+            ast::SubqueryType::RowValue { num_regs, .. } => *num_regs,
+            ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. } => 1,
+        },
+        // Its width is known once it is planned, when the expression holding
+        // it is checked again.
+        Expr::Subquery(_) => 1,
+        Expr::Between { .. }
+        | Expr::Binary(..)
+        | Expr::Case { .. }
+        | Expr::Cast { .. }
+        | Expr::Collate(..)
+        | Expr::Column { .. }
+        | Expr::Default
+        | Expr::DoublyQualified(..)
+        | Expr::Exists(_)
+        | Expr::FieldAccess { .. }
+        | Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Id(_)
+        | Expr::InList { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::MergedColumn(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Qualified(..)
+        | Expr::Raise(..)
+        | Expr::Register { .. }
+        | Expr::RowId { .. }
+        | Expr::Unary(..)
+        | Expr::Variable(_) => 1,
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -661,10 +766,11 @@ pub(super) fn emit_binary_insn(
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
                 _ => unreachable!(),
             };
+            let start = contiguous_operands(program, lhs, rhs);
 
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
-                start_reg: lhs,
+                start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
                     func: Func::Json(json_func),
@@ -692,25 +798,7 @@ pub(super) fn emit_binary_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
-            // Function instructions read contiguous registers start_reg..start_reg+arg_count.
-            // When both operands are equivalent the compiler reuses a single shared register,
-            // so we must copy it into a contiguous pair.
-            let start = if lhs == rhs {
-                let regs = program.alloc_registers(2);
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs + 1,
-                    extra_amount: 0,
-                });
-                regs
-            } else {
-                lhs
-            };
+            let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
                 ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
@@ -983,10 +1071,11 @@ pub(super) fn emit_binary_condition_insn(
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
                 _ => unreachable!(),
             };
+            let start = contiguous_operands(program, lhs, rhs);
 
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
-                start_reg: lhs,
+                start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
                     func: Func::Json(json_func),
@@ -1016,22 +1105,7 @@ pub(super) fn emit_binary_condition_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
-            let start = if lhs == rhs {
-                let regs = program.alloc_registers(2);
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs + 1,
-                    extra_amount: 0,
-                });
-                regs
-            } else {
-                lhs
-            };
+            let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
                 ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,

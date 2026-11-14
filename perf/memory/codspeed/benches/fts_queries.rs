@@ -23,7 +23,7 @@ fn main() {
 
 macro_rules! query_bench {
     ($name:ident, $case:ident) => {
-        #[turso_macros::divan_bench(args = CONFIGURATIONS, sample_size = 1)]
+        #[turso_macros::divan_bench_single_call(args = CONFIGURATIONS, sample_size = 1)]
         fn $name(bencher: Bencher, configuration: &(QueryState, usize, usize)) {
             let &(state, documents, queries) = configuration;
             benchmark(bencher, QueryCase::$case, state, documents, queries);
@@ -50,7 +50,7 @@ mod transactions {
 
     macro_rules! transaction_bench {
         ($name:ident, $case:ident) => {
-            #[turso_macros::divan_bench(args = CONFIGURATIONS, sample_size = 1)]
+            #[turso_macros::divan_bench_single_call(args = CONFIGURATIONS, sample_size = 1)]
             fn $name(bencher: Bencher, configuration: &(JournalMode, usize, usize, usize)) {
                 let &(mode, connections, per_connection, queries_per_transaction) = configuration;
                 benchmark_workload(
@@ -81,7 +81,7 @@ mod transactions {
 }
 
 #[cfg(feature = "fts-stress")]
-#[turso_macros::divan_bench(args = [1, 2], sample_size = 1, sample_count = 1)]
+#[turso_macros::divan_bench_single_call(args = [1, 2], sample_size = 1, sample_count = 1)]
 fn oversized_index(bencher: Bencher, connections: usize) {
     benchmark_workload(
         bencher,

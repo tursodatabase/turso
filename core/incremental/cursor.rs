@@ -258,11 +258,12 @@ fn read_only_error() -> Box<LimboError> {
 mod tests {
     use super::*;
     use crate::namespace::NamespaceId;
+    use crate::security::roles::SessionRole;
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::{ConnectOpts, Connection, Database, OpenFlags};
-    use crate::{Result, SqliteDialect};
+    use crate::{EngineDialect, Result};
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -288,9 +289,9 @@ mod tests {
                 unsafe_testing: false,
             },
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, value INTEGER)")?;

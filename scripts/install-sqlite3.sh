@@ -5,14 +5,21 @@
 
 set -e
 
-# Keep in sync with SQLITE_VERSION in core/dialect/sqlite.rs (3.50.4).
-SQLITE_VERSION="${SQLITE_VERSION:-3500400}"
-SQLITE_YEAR="${SQLITE_YEAR:-2025}"
-
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 INSTALL_DIR="${INSTALL_DIR:-$PROJECT_ROOT/.sqlite3}"
+
+# The version comes from sqlite/version. SQLITE_VERSION is the number form that
+# sqlite.org uses in file names: 3.50.4 becomes 3500400.
+if [ -z "${SQLITE_VERSION:-}" ]; then
+    version=$(cat "$PROJECT_ROOT/sqlite/version")
+    IFS=. read -r major minor patch <<< "$version"
+    SQLITE_VERSION=$(printf '%d%02d%02d00' "$major" "$minor" "$patch")
+fi
+# sqlite.org keeps each release in a folder named after its release year.
+# Change this when sqlite/version moves to a release from another year.
+SQLITE_YEAR="${SQLITE_YEAR:-2025}"
 
 # Detect OS and architecture
 detect_platform() {

@@ -107,6 +107,10 @@ PRAGMA user_version = 3;
 
 Returns one row for each column in the named table.
 
+The table-valued form, `pragma_table_info('table-name')`, takes the table name as
+its first argument. Constraining only its hidden `schema` column does not supply
+a table name and returns no rows.
+
 ```sql
 PRAGMA table_info(table-name);
 ```
@@ -211,6 +215,27 @@ foreign keys, and a missing table argument, return no rows rather than an error.
 ```sql
 PRAGMA main.foreign_key_list(child);
 SELECT * FROM pragma_foreign_key_list('child');
+```
+
+### collation_list
+
+Returns one row for each collating sequence available on the connection.
+
+```sql
+PRAGMA collation_list;
+-- seq | name
+-- 0   | RTRIM
+-- 1   | NOCASE
+-- 2   | BINARY
+```
+
+`seq` numbers the rows from 0. Collations registered on the connection come first, sorted by
+name, followed by the built-in `RTRIM`, `NOCASE` and `BINARY`. A registered collation with the
+name of a built-in one replaces it, so that name is listed once. The same rows are available as
+the `pragma_collation_list` table-valued function:
+
+```sql
+SELECT name FROM pragma_collation_list;
 ```
 
 ### function_list
@@ -402,6 +427,7 @@ PRAGMA foreign_keys = OFF;
 ```
 
 Foreign key enforcement is off by default for SQLite compatibility.
+Changing this setting is a no-op while a transaction or savepoint is open.
 
 ### legacy_file_format
 
@@ -433,6 +459,15 @@ When enabled, CHECK constraints are not enforced.
 ```sql
 PRAGMA ignore_check_constraints = 1;   -- disable CHECK constraints
 PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
+```
+
+### automatic_index
+
+Turso can by default build a temporary index for tables to join faster.
+
+```sql
+PRAGMA automatic_index = 0;   -- off
+PRAGMA automatic_index = 1;   -- on (default)
 ```
 
 ### data_sync_retry
@@ -513,7 +548,7 @@ SQLite's default value `NORMAL` is rejected:
 
 ```sql
 PRAGMA locking_mode = normal;
--- Parse error: locking_mode must be EXCLUSIVE
+-- locking_mode must be EXCLUSIVE
 ```
 
 Writing the pragma does not change how Turso locks the database file. It only checks the

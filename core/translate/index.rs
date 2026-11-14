@@ -1,4 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
+use crate::dialect::CatalogChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -10,15 +11,15 @@ use crate::schema::{
 use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
-    collate::{CollationSeq, TextCollation},
+    collate::{key_collation, CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::expr_type::{type_of, type_ordering, TypeEnv},
+    expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
+        translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -44,7 +45,7 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -162,6 +163,9 @@ pub fn translate_create_index(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
+    if schema::relation_name_is_taken(resolver, namespace, &idx_name, if_not_exists)? {
+        return Ok(());
+    }
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
     let schema_unique = resolver.with_schema(database_id, |s| {
@@ -223,10 +227,12 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
+    // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
@@ -246,6 +252,9 @@ pub fn translate_create_index(
                         );
                     }
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
         }
     }
@@ -349,6 +358,20 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Create {
+                namespace: namespace.id,
+                name: idx_name.clone(),
+                kind: crate::schema::RelationKind::Index,
+                table: Some(tbl_name),
+            }],
+        )?;
+    }
+
     emit_refill_index(
         program,
         resolver,
@@ -450,7 +473,7 @@ pub(crate) fn emit_refill_index(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name,
             has_alias: false,
             internal_id: table_ref,
             join_info: None,
@@ -460,6 +483,7 @@ pub(crate) fn emit_refill_index(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
@@ -689,7 +713,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::Halt {
                 constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                description: format_unique_violation_desc(tbl, idx),
                 on_error: None,
                 description_reg: None,
             });
@@ -1067,11 +1091,12 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = index_collation(explicit_collation, column.type_ordering())?
+            let ty = column_type(column, table.is_strict, schema);
+            let collation = key_collation(explicit_collation, &ty, schema)?
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
-                GeneratedType::NotGenerated => None,
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
             };
             IndexColumn {
                 name: column_name,
@@ -1087,8 +1112,8 @@ fn resolve_sorted_columns_with_catalog(
             if !validate_index_expression(unwrapped_expr, table) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
-            let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
-            let collation = index_collation(explicit_collation, ordering)?;
+            let ty = expression_type(unwrapped_expr, table, schema, syms)?;
+            let collation = key_collation(explicit_collation, &ty, schema)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,
@@ -1140,21 +1165,6 @@ fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crat
     Ok(has_qualified_column)
 }
 
-/// The collation of an index column: the order of its type when it has one,
-/// otherwise the explicit COLLATE, if any.
-fn index_collation(
-    explicit_collation: Option<TextCollation>,
-    ordering: Option<TypeOrdering>,
-) -> crate::Result<Option<CollationSeq>> {
-    match (ordering, explicit_collation) {
-        (Some(ordering), Some(_)) => {
-            bail_parse_error!("collations are not supported by type {}", ordering.name())
-        }
-        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
-        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
-    }
-}
-
 /// The order of the type of an index expression over `table`'s columns, such
 /// as numeric's order for `n * 2` when n is numeric.
 pub(crate) fn expression_type_ordering(
@@ -1163,10 +1173,20 @@ pub(crate) fn expression_type_ordering(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<Option<TypeOrdering>> {
+    let ty = expression_type(expr, table, schema, syms)?;
+    Ok(type_ordering(&ty, schema))
+}
+
+/// The type of an index expression over `table`'s columns.
+pub(crate) fn expression_type(
+    expr: &Expr,
+    table: &BTreeTable,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> crate::Result<ExprType> {
     let mut expr = expr.clone();
     crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
-    let ty = type_of(&expr, &TypeEnv::over_table(table, schema, syms));
-    Ok(type_ordering(&ty, schema))
+    Ok(type_of(&expr, &TypeEnv::over_table(table, schema, syms)))
 }
 
 /// Extracts collation sequence from an expression if it is a Collate expression.
@@ -1341,8 +1361,13 @@ fn emit_index_column_value_from_cursor(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+    let table_ref_id = table_references
+        .joined_tables()
+        .first()
+        .expect("CREATE INDEX reads one table")
+        .internal_id;
+    if let Some(expr) = idx_col.expression() {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -1350,26 +1375,25 @@ fn emit_index_column_value_from_cursor(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
+        let self_table_context = SelfTableContext::ForSelect {
+            table_ref_id,
+            referenced_tables: table_references.clone(),
+        };
+        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
+    } else if table.columns()[idx_col.pos_in_table].is_virtual_generated() {
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_ref_id,
+            table_references,
+            &table.columns()[idx_col.pos_in_table],
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     } else {
         emit_stored_column(
             program,
@@ -1411,6 +1435,7 @@ pub fn translate_drop_index(
     qualified_name: &QualifiedName,
     resolver: &Resolver,
     if_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let idx_name = normalize_ident(qualified_name.name.as_str());
@@ -1474,6 +1499,18 @@ pub fn translate_drop_index(
         database_id,
         Some(SQLITE_TABLEID),
     )?;
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Drop {
+                namespace: namespace.id,
+                name: idx_name.clone(),
+            }],
+        )?;
+    }
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -1713,15 +1750,18 @@ pub fn translate_optimize(
 #[cfg(test)]
 mod tests {
     use super::canonical_create_index_sql;
-    use turso_parser::{ast, parser::Parser};
+    use turso_parser::ast;
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-        let mut parser = Parser::new(b"CREATE INDEX aux.idx1 ON t1(name);");
-        let stmt = match parser.next_cmd().unwrap().unwrap() {
-            ast::Cmd::Stmt(stmt) => stmt,
-            other => panic!("expected statement, got {other:?}"),
-        };
+        let stmt =
+            match crate::dialect::engine::parse_statement("CREATE INDEX aux.idx1 ON t1(name);")
+                .unwrap()
+                .unwrap()
+            {
+                ast::Cmd::Stmt(stmt) => stmt,
+                other => panic!("expected statement, got {other:?}"),
+            };
 
         // let's confirm that the stmt does carry `aux`
         let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {

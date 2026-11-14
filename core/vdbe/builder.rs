@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
@@ -41,8 +41,9 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
-    PrepareContext, PreparedProgram, Program,
+    affinity::{apply_integer_affinity, Affinity},
+    explain::ExplainInfo,
+    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
 };
 use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
@@ -137,7 +138,7 @@ enum DmlColumnRegisters {
 /// holds either the value the user sees or the value ENCODE produced, and an
 /// expression that reads the column, such as a generated column `val * 2`,
 /// must see the user's value. Reading a stored value therefore runs DECODE.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DmlRowForm {
     /// Every column holds the user's value, as before ENCODE in INSERT.
     UserFacing,
@@ -147,6 +148,18 @@ pub enum DmlRowForm {
     /// UPDATE before ENCODE: the SET columns hold the user's values and the
     /// other columns hold the stored values read from the table.
     StoredExceptUpdated(ColumnMask),
+}
+
+impl DmlRowForm {
+    /// Whether column `col_idx` holds the value ENCODE stored rather than the
+    /// user's value.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        match self {
+            DmlRowForm::UserFacing => false,
+            DmlRowForm::Stored => true,
+            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -205,17 +218,11 @@ impl DmlColumnContext {
     }
 
     /// Whether the register of column `col_idx` holds the value ENCODE
-    /// stored rather than the user's value. A virtual generated column's
-    /// register holds the result of its expression, which is the user's value.
-    pub fn holds_stored_value(&self, col_idx: usize, column: &Column) -> bool {
-        if column.is_virtual_generated() || self.rowid_alias_col == Some(col_idx) {
-            return false;
-        }
-        match &self.form {
-            DmlRowForm::UserFacing => false,
-            DmlRowForm::Stored => true,
-            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
-        }
+    /// stored rather than the user's value. A virtual generated column
+    /// follows the row's form like any other column: in a row of stored
+    /// values, its expression's value is ENCODEd too.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        self.rowid_alias_col != Some(col_idx) && self.form.holds_stored_value(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
@@ -400,7 +407,9 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
-    const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
+    const READS_STORED_VALUES: u16 = 1 << 9;
+    const WRITES_STORED_VALUES: u16 = 1 << 10;
+    const HIDES_CONSTRAINT_VALUES: u16 = 1 << 11;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -496,9 +505,9 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
+    /// When set, a custom-type column is read in its stored form, without
+    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
+    /// compares stored values.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }
@@ -508,16 +517,47 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, array result columns are returned as their stored record
-    /// blobs instead of being converted to display text. Engine-internal
-    /// statements (e.g. VACUUM's table copy) write these values back to
-    /// storage, and the text form does not keep element types.
-    pub const fn keep_array_results_as_blobs(self) -> bool {
-        self.get(Self::KEEP_ARRAY_RESULTS_AS_BLOBS)
+    /// When set, a custom-type column is read as its stored value, without
+    /// DECODE, and an array result stays a record blob instead of becoming
+    /// display text. Engine-internal statements (e.g. VACUUM's table copy)
+    /// write these values back to storage as they are.
+    pub const fn reads_stored_values(self) -> bool {
+        self.get(Self::READS_STORED_VALUES)
     }
     #[inline]
-    pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
-        self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
+    pub const fn set_reads_stored_values(&mut self, v: bool) {
+        self.set(Self::READS_STORED_VALUES, v)
+    }
+
+    #[inline]
+    /// When set, the errors of the statement's constraints do not show the
+    /// values of the row that broke them. Set for a statement that writes a
+    /// table for a role that may not read it.
+    pub const fn hides_constraint_values(self) -> bool {
+        self.get(Self::HIDES_CONSTRAINT_VALUES)
+    }
+    #[inline]
+    pub const fn set_hides_constraint_values(&mut self, v: bool) {
+        self.set(Self::HIDES_CONSTRAINT_VALUES, v)
+    }
+
+    #[inline]
+    /// Whether reading a custom-type column runs its DECODE.
+    pub const fn decodes_custom_type_columns(self) -> bool {
+        !self.suppress_custom_type_decode() && !self.reads_stored_values()
+    }
+
+    #[inline]
+    /// When set, the values INSERT and UPDATE write to custom-type columns
+    /// are already stored values, so they are written without ENCODE. Set
+    /// for statements that copy rows, such as VACUUM's table copy and an
+    /// ON UPDATE CASCADE action.
+    pub const fn writes_stored_values(self) -> bool {
+        self.get(Self::WRITES_STORED_VALUES)
+    }
+    #[inline]
+    pub const fn set_writes_stored_values(&mut self, v: bool) {
+        self.set(Self::WRITES_STORED_VALUES, v)
     }
 
     #[inline]
@@ -1134,6 +1174,31 @@ impl ProgramBuilder {
                 span.1 = self.insns.len().saturating_sub(1);
             }
         }
+    }
+
+    /// Moves the instructions that `emit` emits to the end of the program,
+    /// where Init jumps before the first row is read, so they run once per
+    /// statement. Unlike a constant expression, they do not have to be
+    /// constant: `random()` emitted here is called once and every row sees
+    /// the same value. They must not read a cursor, because none is open yet.
+    pub fn emit_once_per_statement<T>(
+        &mut self,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        turso_assert!(
+            !self.constant_span_is_open(),
+            "code that runs once per statement is emitted outside constant code"
+        );
+        let first_span_of_emit = self.constant_spans.len();
+        let first_insn = self.insns.len();
+        let result = emit(self)?;
+        // One span over everything `emit` emitted replaces the spans of the
+        // constant expressions inside it.
+        self.constant_spans.truncate(first_span_of_emit);
+        if self.insns.len() > first_insn {
+            self.constant_spans.push((first_insn, self.insns.len() - 1));
+        }
+        Ok(result)
     }
 
     /// Check if there is a constant span that is currently open.
@@ -2459,6 +2524,14 @@ impl ProgramBuilder {
                 };
             }
 
+            if matches!(affinity, Affinity::Integer | Affinity::Numeric) {
+                if let Some(ValueRef::Numeric(integer)) =
+                    apply_integer_affinity(value.as_value_ref())
+                {
+                    value = Value::from(integer);
+                }
+            }
+
             Some(value)
         };
 
@@ -2509,6 +2582,9 @@ impl ProgramBuilder {
         self.parameters.list.dedup();
 
         self.explain.build_ephemeral_cursors(&self.insns);
+        let destroys_btree = self.insns.iter().any(|(insn, _)| {
+            matches!(insn, Insn::Destroy { .. } | Insn::IndexMethodDestroy { .. })
+        });
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
@@ -2540,6 +2616,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             is_multi_write: self.flags.is_multi_write(),
+            hides_constraint_values: self.flags.hides_constraint_values(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,
@@ -2548,6 +2625,7 @@ impl ProgramBuilder {
             custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            destroys_btree,
         };
         Ok(prepared)
     }

@@ -5,8 +5,10 @@ use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use std::sync::Arc;
-use turso_core::SqliteDialect;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags};
+use turso_core::{
+    ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, SessionRole,
+};
+use turso_sqlite::SqliteDialect;
 
 struct TursoDB {
     db: Arc<Database>,
@@ -211,7 +213,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_connect0<'local>(
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = match db
         .db
-        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key))
     {
         Ok(conn) => conn,
         Err(e) => {

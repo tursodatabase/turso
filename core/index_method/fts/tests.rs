@@ -1,4 +1,5 @@
 use super::*;
+use crate::security::roles::SessionRole;
 use crate::{
     alloc::TursoVecInExt,
     index_method::{
@@ -1106,7 +1107,7 @@ mod allocation_failures {
         let db = crate::Database::open(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
                 .db_opts(crate::DatabaseOpts::default().with_index_method(true))
                 .allocators(DatabaseAllocators {
                     fts: DynAllocator::new(allocator.clone()),
@@ -1195,11 +1196,13 @@ fn documents_in_categories() -> Arc<Connection> {
     let db = crate::Database::open(
         Arc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
     )
     .unwrap();
-    let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, cat INTEGER)")
         .unwrap();
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
@@ -1253,11 +1256,13 @@ fn scored_documents() -> Arc<Connection> {
     let db = crate::Database::open(
         Arc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
     )
     .unwrap();
-    let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
     conn.execute("CREATE INDEX notes_fts ON notes USING fts(body)")

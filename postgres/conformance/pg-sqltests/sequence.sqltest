@@ -1,0 +1,93 @@
+# CREATE SEQUENCE through the PostgreSQL frontend.
+
+@database :memory:
+
+# Turso sequences do not cache values: each nextval writes the sequence state.
+# Thus tursopg accepts only CACHE 1. PostgreSQL accepts every CACHE that is
+# greater than zero.
+
+test create-sequence-with-cache-1 {
+    CREATE SEQUENCE cache_one CACHE 1;
+    SELECT nextval('cache_one'), nextval('cache_one');
+    SELECT cache_size, last_value FROM pg_sequences WHERE sequencename = 'cache_one';
+}
+expect {
+    1|2
+    1|2
+}
+
+test create-sequence-with-cache-10 {
+    CREATE SEQUENCE cache_ten CACHE 10;
+    SELECT nextval('cache_ten');
+    SELECT cache_size, last_value FROM pg_sequences WHERE sequencename = 'cache_ten';
+}
+expect {
+    1
+    10|10
+}
+@sqlstate 0A000
+expect @tursopg error {
+    CACHE 10 \(Turso sequences do not cache values, so CACHE must be 1\) is not supported
+}
+
+test create-sequence-with-cache-too-large-for-int4 {
+    CREATE SEQUENCE cache_large CACHE 9999999999;
+    SELECT cache_size FROM pg_sequences WHERE sequencename = 'cache_large';
+}
+expect {
+    9999999999
+}
+@sqlstate 0A000
+expect @tursopg error {
+    CACHE 9999999999 \(Turso sequences do not cache values, so CACHE must be 1\) is not supported
+}
+
+test create-sequence-with-cache-0 {
+    CREATE SEQUENCE cache_zero CACHE 0;
+}
+@sqlstate 22023
+expect error {
+    CACHE \(0\) must be greater than zero
+}
+
+test create-sequence-with-negative-cache {
+    CREATE SEQUENCE cache_negative CACHE -1;
+}
+@sqlstate 22023
+expect error {
+    CACHE \(-1\) must be greater than zero
+}
+
+test create-sequence-with-fractional-cache {
+    CREATE SEQUENCE cache_fraction CACHE 1.5;
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "1.5"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this CACHE value in CREATE SEQUENCE is not supported
+}
+
+test create-sequence-with-cache-too-large-for-bigint {
+    CREATE SEQUENCE cache_huge CACHE 99999999999999999999;
+}
+@sqlstate 22003
+expect error {
+    value "99999999999999999999" is out of range for type bigint
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this CACHE value in CREATE SEQUENCE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER SEQUENCE ... RENAME"
+test alter-sequence-rename-is-not-supported {
+    CREATE SEQUENCE rn_sequence;
+    ALTER SEQUENCE rn_sequence RENAME TO rn_sequence_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER SEQUENCE ... RENAME is not supported
+}

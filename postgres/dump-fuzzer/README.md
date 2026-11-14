@@ -13,7 +13,7 @@ From the repository root:
 
 ```sh
 cargo build -p tursopg -p turso_pg_dump_fuzzer
-POSTGRES_TEST_USER=turso POSTGRES_VERSION=18 postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer fuzz --cases 1000 --seed 42
+postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer fuzz --cases 1000 --seed 42
 ```
 
 `with-postgres.sh` uses `PG_DSN` if set, otherwise starts disposable PostgreSQL
@@ -21,8 +21,8 @@ in Docker. The reference role needs CREATEDB permission; the compatible profile 
 name to be `turso` (the table profile accepts other names). Each case creates a
 uniquely named database and drops only that database. The provided database
 is used only as an administrative connection. Use a disposable server.
-PostgreSQL clients must support `pg_dump --restrict-key` (including current
-patched PostgreSQL 17 and PostgreSQL 18 clients).
+PostgreSQL clients must support `pg_dump --restrict-key` and be at least as new
+as the server: `pg_dump` refuses to dump a newer server.
 
 ```sh
 # Replay saved SQL against both servers (PG_DSN required).
@@ -54,9 +54,10 @@ panic and cannot run the `fuzz` subcommand. Debug builds also support unwinding.
 The SQL Tests workflow runs the `PostgreSQL dump differential fuzzer` job on
 pull requests, pushes to main, and manual workflow dispatches. It checks the
 fuzzer and comparator, then runs 100 cases with an automatic seed, the compatible profile,
-and `--fail-fast` against PostgreSQL 18. Known failing opt-in features remain
-disabled. CI builds and checks the fuzzer with the `pg-dump-fuzzer` Cargo profile;
-the database server still uses the release profile.
+and `--fail-fast` against PostgreSQL 18, the version in `postgres/version`. Known
+failing opt-in features remain disabled. CI builds and checks the fuzzer with
+the `pg-dump-fuzzer` Cargo profile; the database server still uses the release
+profile.
 
 The job uploads `pg-dump-fuzzer-results` for one day, including the JSON
 generation summary and any failed cases with their SQL, dumps, and logs.
@@ -277,10 +278,10 @@ SQL statement ordering outside those data blocks is significant.
 The dump command uses `--no-owner` to exclude deployment-specific ownership.
 The default `--profile compatible` retains privileges. `--profile tables` additionally
 uses `--no-privileges` to focus on table/data dumps. Default privileges can name
-the creating role even with `--no-owner`; use a reference role named `turso`
-when comparing those against Turso's fixed role name. The CLI enforces this for
-the compatible profile. The dump Makefile targets request this role from the disposable Docker
-helper; an existing `PG_DSN` must already use that role. Other differences, including SET commands
+the creating role even with `--no-owner`; use the reference role `postgres`
+when comparing those against Turso's superuser, which is also named `postgres`.
+The CLI enforces this for the compatible profile. The disposable Docker helper
+connects as `postgres`; an existing `PG_DSN` must already use that role. Other differences, including SET commands
 from different server versions, are retained. Use compatible PostgreSQL/client
 versions when interpreting failures. The comparator does not restore dumps.
 Offline comparison accepts wrapper-free SQL or the fixed
@@ -343,8 +344,8 @@ progress, and database campaigns. Generation modules do not launch databases.
 ## Generated workloads
 
 The generator covers simple tables, indexes, data, and optional access-control
-statements. Use PostgreSQL 18 as the reference server:
-set `POSTGRES_VERSION=18` when using `with-postgres.sh`.
+statements. The reference server is PostgreSQL 18, the version in
+`postgres/version`, which `with-postgres.sh` starts by default.
 
 | SQL surface | Generator coverage |
 | --- | --- |
@@ -363,7 +364,7 @@ listed above. Any rejection of an enabled feature remains a failure. `tables`
 uses the same table/data generator without access-control statements:
 
 ```sh
-POSTGRES_TEST_USER=turso POSTGRES_VERSION=18 postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer --profile compatible fuzz --cases 1000 --seed 42
+postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer --profile compatible fuzz --cases 1000 --seed 42
 postgres/conformance/with-postgres.sh target/debug/pg-dump-fuzzer --profile tables fuzz --cases 1000 --seed 42
 ```
 

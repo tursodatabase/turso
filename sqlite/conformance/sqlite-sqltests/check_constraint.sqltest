@@ -266,6 +266,28 @@ test check_constraint_strict_check_violation_after_coercion {
 expect error {
 }
 
+@cross-check-integrity
+test check_constraint_strict_substr_of_integer_is_text {
+    -- substr() of a number returns text.
+    CREATE TABLE a (t TEXT, i INTEGER, CHECK (t = substr(i, 1))) STRICT;
+    INSERT INTO a VALUES ('12', 12);
+    SELECT * FROM a;
+}
+expect {
+    12|12
+}
+
+@cross-check-integrity
+test check_constraint_strict_ceil_of_text_is_a_number {
+    -- ceil() converts a text argument to a number.
+    CREATE TABLE a (x INTEGER, s TEXT, CHECK (x = ceil(s))) STRICT;
+    INSERT INTO a VALUES (12, '12');
+    SELECT * FROM a;
+}
+expect {
+    12|12
+}
+
 # Regular (non-STRICT) tables with type affinity
 @cross-check-integrity
 test check_constraint_regular_table_numeric_string {

@@ -1,6 +1,7 @@
 use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
+use crate::security::roles::SessionRole;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::{ConnectOpts, Connection, Database, LimboError, StepResult, SyncMode, Value};
 use std::sync::{Arc, Barrier};
@@ -59,8 +60,10 @@ fn group_commit_pragma_is_store_wide() {
 #[test]
 fn group_commit_pragma_needs_mvcc() {
     let io = Arc::new(crate::io::MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     let err = conn
         .execute("PRAGMA mvcc_group_commit = yes")
@@ -225,7 +228,9 @@ fn batched_records_survive_a_restart() {
                 let shared = shared.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let conn = shared.connect(ConnectOpts::new()).unwrap();
+                    let conn = shared
+                        .connect(ConnectOpts::new(SessionRole::Superuser))
+                        .unwrap();
                     for round in 0..rounds {
                         let pk = (round * WRITERS + writer) as i64;
                         conn.execute("BEGIN CONCURRENT").unwrap();
@@ -567,6 +572,10 @@ fn dropped_waiter_after_log_tx_still_commits() {
         step_until_yield_or_done(&mut commit_a),
         StepResult::Yield
     ));
+    // Begins after conn_a's commit timestamp and before conn_b's.
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    get_rows(&ddl, "SELECT COUNT(*) FROM t");
     assert!(matches!(
         step_until_yield_or_done(&mut commit_b),
         StepResult::Yield
@@ -606,6 +615,12 @@ fn dropped_waiter_after_log_tx_still_commits() {
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
         "waiter dropped after log_tx must still commit"
     );
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "transaction older than the dropped waiter's commit should get Busy: {result:?}"
+    );
+    ddl.execute("ROLLBACK").unwrap();
 
     db.restart();
     let reader = db.connect();

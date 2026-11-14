@@ -22,17 +22,21 @@ pub struct PostgresBackend {
 impl PostgresBackend {
     /// Connects to the server at `dsn`.
     ///
-    /// The role in the DSN must be able to create databases.
+    /// The role in the DSN must be able to create databases. The tests of
+    /// roles expect it to be the bootstrap superuser `postgres`, as the
+    /// clients of tursopg are.
     pub async fn connect(dsn: &str, timeout: Duration) -> Result<Self, BackendError> {
         let params =
             ConnParams::parse(dsn).map_err(|e| BackendError::NotAvailable(e.to_string()))?;
         let role = params.user.clone();
-        let server = PostgresServer {
+        let mut server = PostgresServer {
             params,
             database_prefix: format!("sqltest_{:08x}", rand::random::<u32>()),
             next_database: AtomicUsize::new(0),
             admin_statements: Semaphore::new(MAX_ADMIN_STATEMENTS),
             idle_admin_conns: Mutex::new(Vec::new()),
+            roles_before_the_run: HashSet::new(),
+            created_roles: Mutex::new(HashSet::new()),
             timeout,
         };
         let rows = server
@@ -47,10 +51,50 @@ impl PostgresBackend {
                 "role {role} cannot create databases: ALTER ROLE {role} CREATEDB"
             )));
         }
+        server.roles_before_the_run = server
+            .role_names()
+            .await
+            .map_err(|e| BackendError::NotAvailable(format!("cannot use {dsn}: {e}")))?;
         Ok(Self {
             server: Arc::new(server),
             timeout,
         })
+    }
+
+    /// Returns what drops the roles that the tests create. Roles belong to
+    /// the whole server, not to the databases of the tests, so without it a
+    /// later run on the same server fails to create them again. A role is
+    /// dropped only after the run, because the tests that run in parallel
+    /// may still use the roles they created. Only roles that the tests
+    /// created with CREATE ROLE are dropped, so roles that someone else
+    /// creates on the server during the run are kept. A role that existed
+    /// before the run is kept too, since a test can try to create a role that
+    /// exists, such as `postgres`, to check that it fails.
+    pub fn role_cleanup(&self) -> PostgresRoleCleanup {
+        PostgresRoleCleanup {
+            server: Arc::clone(&self.server),
+        }
+    }
+}
+
+/// Drops the roles that the tests of the run created and that did not exist
+/// when the run started.
+pub struct PostgresRoleCleanup {
+    server: Arc<PostgresServer>,
+}
+
+impl PostgresRoleCleanup {
+    pub async fn drop_roles_created_by_the_run(self) -> Result<(), String> {
+        let names = std::mem::take(&mut *self.server.created_roles.lock().unwrap());
+        for name in names.difference(&self.server.roles_before_the_run) {
+            self.server
+                .run_admin_query(&format!(
+                    "DROP ROLE IF EXISTS \"{}\"",
+                    name.replace('"', "\"\"")
+                ))
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -113,6 +157,7 @@ pub struct PostgresDatabaseInstance {
 #[async_trait]
 impl DatabaseInstance for PostgresDatabaseInstance {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
+        self.server.remember_created_roles(sql);
         self.conn.execute(sql).await
     }
 
@@ -137,6 +182,10 @@ struct PostgresServer {
     next_database: AtomicUsize,
     admin_statements: Semaphore,
     idle_admin_conns: Mutex<Vec<PgConn>>,
+    /// The roles on the server when the run started.
+    roles_before_the_run: HashSet<String>,
+    /// The roles that the tests of the run created with CREATE ROLE.
+    created_roles: Mutex<HashSet<String>>,
     timeout: Duration,
 }
 
@@ -155,6 +204,25 @@ impl PostgresServer {
         self.run_admin_query(&format!("DROP DATABASE {name} WITH (FORCE)"))
             .await?;
         Ok(())
+    }
+
+    async fn role_names(&self) -> Result<HashSet<String>, String> {
+        let rows = self.run_admin_query("SELECT rolname FROM pg_roles").await?;
+        Ok(rows.into_iter().map(|mut row| row.remove(0)).collect())
+    }
+
+    /// Remembers the roles that `sql` creates, so that they are dropped
+    /// after the run. SQL that does not parse creates no role.
+    fn remember_created_roles(&self, sql: &str) {
+        let Ok(parsed) = pg_query::parse(sql) else {
+            return;
+        };
+        let mut created_roles = self.created_roles.lock().unwrap();
+        for (node, ..) in parsed.protobuf.nodes() {
+            if let pg_query::NodeRef::CreateRoleStmt(stmt) = node {
+                created_roles.insert(stmt.role.clone());
+            }
+        }
     }
 
     /// Runs `sql` on the maintenance database of the server and returns the

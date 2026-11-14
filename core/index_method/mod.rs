@@ -178,7 +178,7 @@ pub enum IndexMethodSnapshotIdentity {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum IndexMethodYieldPoint {
+pub enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -774,8 +774,7 @@ pub(crate) fn open_table_cursor(
 pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
     let mut parsed = Vec::new();
     for pattern in patterns {
-        let mut parser = turso_parser::parser::Parser::new(pattern.as_bytes());
-        let Some(ast) = parser.next() else {
+        let Some(ast) = crate::dialect::engine::parse_statement(pattern).transpose() else {
             return Err(LimboError::ParseError(format!(
                 "unable to parse pattern statement: {pattern}",
             )));

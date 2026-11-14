@@ -425,6 +425,8 @@ fn rewrite_as_semi_or_anti_join(
         }
         plan.table_references.add_joined_table(table);
     }
+    plan.table_references
+        .take_scalar_subquery_affinities_from(&mut inner_plan.table_references);
 
     // The terms now run in the outer plan, so prior access choices do not apply.
     for mut term in inner_plan.where_clause {
@@ -610,6 +612,7 @@ fn try_rewrite_single_value_aggregate(
         nulls_order: vec![None; column_count],
         sort_elided: false,
         having: None,
+        columns_read_by_group_subqueries: Vec::new(),
     });
 
     let mut grouped_table = JoinedTable::new_subquery(
@@ -807,6 +810,7 @@ fn rewrite_aggregate_as_join_then_group(
         nulls_order: vec![None],
         sort_elided: false,
         having: Some(vec![having]),
+        columns_read_by_group_subqueries: Vec::new(),
     });
     plan.non_from_clause_subqueries.remove(subquery_index);
     Ok(Some(AggregateRewrite::Joined))

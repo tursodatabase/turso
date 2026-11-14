@@ -78,6 +78,8 @@ export class Database {
   private _connected = false;
   private _closed = false;
   private _execLock: AsyncLock;
+  // The sync engine runs one operation at a time, so push/pull/stats/checkpoint calls take turns
+  private _syncLock: AsyncLock;
   private _extraIo?: () => Promise<void>;
   private _ioContext?: {
     authToken?: string | (() => string | Promise<string> | null);
@@ -93,6 +95,7 @@ export class Database {
     this._opts = opts;
     this._isSync = isSyncConfig(opts);
     this._execLock = new AsyncLock();
+    this._syncLock = new AsyncLock();
   }
 
   /**
@@ -348,8 +351,13 @@ export class Database {
       throw new Error('push() is only available for sync databases');
     }
 
-    const operation = this._nativeSyncDb.pushChanges();
-    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      const operation = this._nativeSyncDb.pushChanges();
+      await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    } finally {
+      this._syncLock.release();
+    }
   }
 
   /**
@@ -362,20 +370,25 @@ export class Database {
       throw new Error('pull() is only available for sync databases');
     }
 
-    // Wait for changes
-    const waitOperation = this._nativeSyncDb.waitChanges();
-    const changes = await driveChangesOperation(waitOperation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      // Wait for changes
+      const waitOperation = this._nativeSyncDb.waitChanges();
+      const changes = await driveChangesOperation(waitOperation, this._nativeSyncDb, this._ioContext);
 
-    // If no changes, return false
-    if (!changes) {
-      return false;
+      // If no changes, return false
+      if (!changes) {
+        return false;
+      }
+
+      // Apply changes
+      const applyOperation = this._nativeSyncDb.applyChanges(changes);
+      await driveVoidOperation(applyOperation, this._nativeSyncDb, this._ioContext);
+
+      return true;
+    } finally {
+      this._syncLock.release();
     }
-
-    // Apply changes
-    const applyOperation = this._nativeSyncDb.applyChanges(changes);
-    await driveVoidOperation(applyOperation, this._nativeSyncDb, this._ioContext);
-
-    return true;
   }
 
   /**
@@ -388,8 +401,13 @@ export class Database {
       throw new Error('stats() is only available for sync databases');
     }
 
-    const operation = this._nativeSyncDb.stats();
-    return driveStatsOperation(operation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      const operation = this._nativeSyncDb.stats();
+      return await driveStatsOperation(operation, this._nativeSyncDb, this._ioContext);
+    } finally {
+      this._syncLock.release();
+    }
   }
 
   /**
@@ -400,8 +418,13 @@ export class Database {
       throw new Error('checkpoint() is only available for sync databases');
     }
 
-    const operation = this._nativeSyncDb.checkpoint();
-    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    await this._syncLock.acquire();
+    try {
+      const operation = this._nativeSyncDb.checkpoint();
+      await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
+    } finally {
+      this._syncLock.release();
+    }
   }
 
   /**

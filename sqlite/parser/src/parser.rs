@@ -1008,6 +1008,9 @@ impl<'a> Parser<'a> {
 
     fn parse_vtab_arg(&mut self) -> Result<String> {
         let start_idx = self.offset();
+        // Like SQLite, an argument ends at its last token, so whitespace and
+        // comments before the next comma or `)` are not part of it.
+        let mut end_idx = start_idx;
 
         loop {
             match self.peek_no_eof()?.token_type {
@@ -1034,12 +1037,7 @@ impl<'a> Parser<'a> {
                     self.eat_no_eof()?;
                 }
             }
-        }
-
-        // minus 1 because lexer already consumed TK_COMMA or TK_RP
-        let end_idx = self.offset();
-        if start_idx == end_idx {
-            return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
+            end_idx = self.offset();
         }
 
         Ok(from_bytes(&self.lexer.input[start_idx..end_idx]))
@@ -1058,18 +1056,13 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_LP);
                     let mut result = vec![];
                     loop {
-                        if self.peek_no_eof()?.token_type == TK_RP {
-                            break; // handle empty args case
-                        }
-
-                        result.push(self.parse_vtab_arg()?);
-                        let tok = peek_expect!(self, TK_COMMA, TK_RP);
-                        match tok.token_type {
+                        // Like SQLite, an argument with no tokens, as in `(a,,b)`, is skipped.
+                        match self.peek_no_eof()?.token_type {
                             TK_COMMA => {
                                 eat_assert!(self, TK_COMMA);
                             }
                             TK_RP => break,
-                            _ => unreachable!(),
+                            _ => result.push(self.parse_vtab_arg()?),
                         }
                     }
 
@@ -3665,6 +3658,8 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
+                    // Only the first option may be missing; a comma always needs an option after it.
+                    peek_expect!(self, TK_WITHOUT, TK_ID);
                     self.parse_table_option(&mut result)?;
                 }
                 _ => break,
@@ -4897,6 +4892,7 @@ impl<'a> Parser<'a> {
             indexed,
             where_clause,
             returning,
+            truncate: false,
         })
     }
 
@@ -12861,6 +12857,46 @@ mod tests {
                     ],
                 }))],
             ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar(, a,, ,b,)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec!["a".to_owned(), "b".to_owned()],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar( alpha , 73 /* c */, f( x ) -- c\n)"
+                    .as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec!["alpha".to_owned(), "73".to_owned(), "f( x )".to_owned()],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar(,)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec![],
+                }))],
+            ),
             // parse delete
             (
                 b"DELETE FROM foo".as_slice(),
@@ -12874,6 +12910,7 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
+                    truncate: false,
                 })],
             ),
             (
@@ -12921,6 +12958,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    truncate: false,
                 })],
             ),
             // parse drop index

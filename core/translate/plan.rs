@@ -193,6 +193,10 @@ pub struct GroupBy {
     pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
+    /// Columns of this query's tables that are read by subqueries running once
+    /// per group. The table scan has moved on by then, so each group saves
+    /// these values, like the columns of its result row.
+    pub columns_read_by_group_subqueries: Vec<ast::Expr>,
 }
 
 /// The JOIN that supplied a term and whether that JOIN keeps unmatched rows.
@@ -585,10 +589,21 @@ impl Plan {
     /// SELECTs. DELETE and UPDATE plans have no outer-query references and
     /// always return an empty vector.
     pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
-        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
+        self.used_outer_query_refs()
+            .iter()
+            .map(|outer_ref| outer_ref.internal_id)
+            .collect()
+    }
+
+    /// Returns every outer-query reference that this plan actually uses. For a
+    /// compound SELECT, the result spans all of its component SELECTs. DELETE
+    /// and UPDATE plans have no outer-query references and always return an
+    /// empty vector.
+    pub fn used_outer_query_refs(&self) -> Vec<&OuterQueryReference> {
+        fn collect_from_select<'a>(plan: &'a SelectPlan, out: &mut Vec<&'a OuterQueryReference>) {
             for outer_ref in plan.table_references.outer_query_refs().iter() {
                 if outer_ref.is_used() {
-                    out.push(outer_ref.internal_id);
+                    out.push(outer_ref);
                 }
             }
         }
@@ -604,8 +619,8 @@ impl Plan {
                 collect_from_select(right_most, &mut ids);
             }
             Plan::RecursiveCte(plan) => {
-                ids.extend(plan.initial_query.used_outer_query_ref_ids());
-                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
+                ids.extend(plan.initial_query.used_outer_query_refs());
+                ids.extend(plan.recursive_query.used_outer_query_refs());
             }
             Plan::Delete(_) | Plan::Update(_) => {}
         }
@@ -700,6 +715,9 @@ pub enum QueryDestination {
         result_reg_start: usize,
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
+        /// The register that counts the stored rows, when a second row is an
+        /// error (see [ast::SubqueryType::RowValue]).
+        row_count_reg: Option<usize>,
     },
     /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
     /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.
@@ -1061,6 +1079,8 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// The checks of row-level security that each new row must pass.
+    pub(crate) row_checks: Vec<crate::translate::row_security::RowCheck>,
 }
 
 impl UpdatePlan {
@@ -1811,6 +1831,10 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
+    /// The condition that row-level security puts on the rows of the table.
+    /// It is checked as soon as the loop reads a row, before any other
+    /// condition, so no expression of the query sees a row it fails.
+    pub row_filter: Option<ast::Expr>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -1923,6 +1947,8 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// The affinity of each single-column scalar subquery in this query scope.
+    scalar_subquery_affinities: Vec<(TableInternalId, Affinity)>,
 }
 
 impl Default for TableReferences {
@@ -1944,6 +1970,20 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            scalar_subquery_affinities: Vec::new(),
+        }
+    }
+
+    /// The scope that an UPDATE reads its target table in. The WHERE terms were
+    /// planned against `from_tables`, so their scalar subqueries are recorded there.
+    pub(crate) fn for_update_target(
+        target_table: JoinedTable,
+        from_tables: &TableReferences,
+    ) -> Self {
+        Self {
+            joined_tables: vec![target_table],
+            outer_query_refs: from_tables.outer_query_refs.to_vec(),
+            scalar_subquery_affinities: from_tables.scalar_subquery_affinities.clone(),
         }
     }
 
@@ -1951,6 +1991,7 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            scalar_subquery_affinities: Vec::new(),
         }
     }
 
@@ -1966,6 +2007,32 @@ impl TableReferences {
     /// Add a new [OuterQueryReference] to the query plan.
     pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
         self.outer_query_refs.push(outer_query_reference);
+    }
+
+    /// Record the affinity of the column that a single-column scalar subquery selects.
+    pub(crate) fn add_scalar_subquery_affinity(
+        &mut self,
+        subquery_id: TableInternalId,
+        affinity: Affinity,
+    ) {
+        self.scalar_subquery_affinities
+            .push((subquery_id, affinity));
+    }
+
+    /// Take the recorded affinities of `other`, for when its WHERE terms move into this query.
+    pub(crate) fn take_scalar_subquery_affinities_from(&mut self, other: &mut TableReferences) {
+        self.scalar_subquery_affinities
+            .append(&mut other.scalar_subquery_affinities);
+    }
+
+    pub(crate) fn scalar_subquery_affinity(
+        &self,
+        subquery_id: TableInternalId,
+    ) -> Option<Affinity> {
+        self.scalar_subquery_affinities
+            .iter()
+            .find(|(id, _)| *id == subquery_id)
+            .map(|(_, affinity)| *affinity)
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -2183,13 +2250,18 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Returns the CTE with the given name from the nearest enclosing scope.
+    /// Within one scope, a query's own WITH clause comes after the references
+    /// it inherits, so the last match wins.
     pub fn find_cte_outer_query_ref_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .rev()
+            .filter(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .min_by_key(|t| t.scope_depth)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -2307,6 +2379,7 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
+            scalar_subquery_affinities,
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2315,6 +2388,10 @@ impl TableReferences {
         // and copying every element into a fresh buffer.
         take_or_append(&mut self.joined_tables, joined_tables);
         take_or_append(&mut self.outer_query_refs, outer_query_refs);
+        take_or_append(
+            &mut self.scalar_subquery_affinities,
+            scalar_subquery_affinities,
+        );
     }
 }
 
@@ -3256,6 +3333,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3309,6 +3387,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3347,6 +3426,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 

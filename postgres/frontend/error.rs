@@ -1,3 +1,4 @@
+use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
 
@@ -61,6 +62,17 @@ pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>)
     }))
 }
 
+/// The engine error for SQL that `turso_pg_parser::parse` refuses, which
+/// keeps the SQLSTATE that the parser gave it.
+pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
+    match error {
+        turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
+            sqlstate_error(sqlstate, message)
+        }
+        other => LimboError::ParseError(other.to_string()),
+    }
+}
+
 /// The error PostgreSQL returns for every statement in an aborted
 /// transaction block, until COMMIT, ROLLBACK, or ROLLBACK TO SAVEPOINT
 /// ends it.
@@ -105,6 +117,9 @@ impl From<&LimboError> for ErrorReport {
                 report.detail = constraint_detail(violation);
             }
         }
+        if let LimboError::PermissionDenied(denial) = error {
+            report.message = permission_denied_message(denial);
+        }
         report
     }
 }
@@ -133,7 +148,10 @@ fn constraint_name(violation: &ConstraintViolation, table: &str) -> Option<Strin
             violation.column_names.join("_")
         )),
         ConstraintKind::Check => Some(format!("{table}_check")),
-        ConstraintKind::NotNull | ConstraintKind::Other => None,
+        ConstraintKind::NotNull
+        | ConstraintKind::Trigger
+        | ConstraintKind::Datatype
+        | ConstraintKind::Other => None,
     }
 }
 
@@ -154,7 +172,9 @@ fn constraint_message(violation: &ConstraintViolation, report: &ErrorReport) -> 
         ConstraintKind::Check => {
             format!("new row for relation \"{table}\" violates check constraint \"{constraint}\"")
         }
-        ConstraintKind::Other => violation.message.clone(),
+        ConstraintKind::Trigger | ConstraintKind::Datatype | ConstraintKind::Other => {
+            violation.message.clone()
+        }
     }
 }
 
@@ -215,7 +235,9 @@ fn sqlstate(error: &LimboError) -> &'static str {
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
             ConstraintKind::NotNull => SQLSTATE_NOT_NULL_VIOLATION,
             ConstraintKind::Check => SQLSTATE_CHECK_VIOLATION,
-            ConstraintKind::Other => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
+            ConstraintKind::Trigger | ConstraintKind::Datatype | ConstraintKind::Other => {
+                SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION
+            }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
@@ -257,10 +279,11 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::OutOfMemory => SQLSTATE_OUT_OF_MEMORY,
         LimboError::TableLocked | LimboError::Busy => SQLSTATE_LOCK_NOT_AVAILABLE,
         LimboError::Interrupt => SQLSTATE_QUERY_CANCELED,
-        LimboError::Raise(_, msg) => raise_sqlstate(msg),
+        LimboError::Raise(_, error) => raise_sqlstate(&error.to_string()),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,
+        LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
@@ -271,14 +294,24 @@ fn sqlstate(error: &LimboError) -> &'static str {
 /// come first, because their messages end with the error that the dependent
 /// object gives, for example "no such column". A duplicate object is checked
 /// before the "no such ..." rules, because its name sits inside the message, for
-/// example a table named "no such table".
+/// example a table named "no such table". A role is not a relation, so a
+/// duplicate role has its own SQLSTATE.
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
+        || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
+        || (msg.starts_with("error in table ")
+            && msg.contains(" after drop column: no such column"))
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
+    } else if msg.starts_with("cannot INSERT into generated column ")
+        || msg.starts_with("cannot UPDATE generated column ")
+    {
+        SQLSTATE_GENERATED_ALWAYS
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
+        SQLSTATE_DUPLICATE_OBJECT
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
@@ -296,14 +329,36 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("aggregate functions are not allowed")
     {
         SQLSTATE_GROUPING_ERROR
-    } else if msg.starts_with("misuse of window function") {
+    } else if msg.starts_with("misuse of window function")
+        || msg.starts_with("window functions are not allowed")
+    {
         SQLSTATE_WINDOWING_ERROR
     } else if msg.starts_with("invalid reference to FROM-clause entry") {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+    } else if (msg.starts_with("sequence \"") || msg.starts_with("relation \""))
+        && msg.ends_with("\" does not exist")
+    {
         SQLSTATE_UNDEFINED_TABLE
+    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_OBJECT
+    } else if msg.starts_with('"')
+        && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
+    {
+        SQLSTATE_WRONG_OBJECT_TYPE
+    } else if msg.starts_with("cannot change owner of sequence \"") {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_COLUMN
+    } else if msg.starts_with("function ") && msg.ends_with(" does not exist") {
+        SQLSTATE_UNDEFINED_FUNCTION
+    } else if msg.starts_with("there is no parameter $") {
+        SQLSTATE_UNDEFINED_PARAMETER
+    } else if msg == "subqueries in policies are not supported" {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
+    } else if msg == "sequence must have same owner as table it is linked to" {
+        SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
         || msg == "no schema has been selected to create in"
     {
@@ -347,8 +402,12 @@ fn invalid_argument_sqlstate(msg: &str) -> &'static str {
 
 /// The SQLSTATE of an error that a statement of the engine raised when it ran.
 fn sql_error_sqlstate(msg: &str) -> &'static str {
-    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time") {
+    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time")
+        || msg.contains("more than one row returned by a subquery used as an expression")
+    {
         SQLSTATE_CARDINALITY_VIOLATION
+    } else if msg == "NOT NULL constraint failed" {
+        SQLSTATE_NOT_NULL_VIOLATION
     } else {
         SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
     }
@@ -361,6 +420,10 @@ fn raise_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_DATETIME_FORMAT
     } else if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg == "integer out of range for smallint" {
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
+    } else if msg == "value too long for varchar" {
+        SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
     } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else {
@@ -373,6 +436,60 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION
     } else {
         SQLSTATE_INVALID_TRANSACTION_STATE
+    }
+}
+
+fn permission_denied_message(denial: &PermissionDenied) -> String {
+    match (&denial.reason, &denial.object) {
+        (Reason::Owner, object) => return format!("must be owner of {}", object_name(object)),
+        (
+            Reason::Policy {
+                policy,
+                using_condition,
+            },
+            Object::Table(name),
+        ) => {
+            let policy = policy
+                .as_ref()
+                .map_or(String::new(), |policy| format!(" \"{policy}\""));
+            let condition = if *using_condition {
+                " (USING expression)"
+            } else {
+                ""
+            };
+            return format!(
+                "new row violates row-level security policy{policy}{condition} for table \"{name}\""
+            );
+        }
+        _ => {}
+    }
+    match (denial.action, &denial.object) {
+        (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),
+        (Action::Create, Object::Role(_)) => "permission denied to create role".into(),
+        (Action::Write, Object::Setting(name)) => {
+            format!("permission denied to set parameter \"{name}\"")
+        }
+        (Action::Read, Object::Setting(name)) => format!("permission denied to examine \"{name}\""),
+        (Action::Analyze, _) => "permission denied to run ANALYZE".into(),
+        (Action::Vacuum, _) => "permission denied to run VACUUM".into(),
+        (Action::Reindex, _) => "permission denied to run REINDEX".into(),
+        (Action::Optimize, _) => "permission denied to run OPTIMIZE".into(),
+        (Action::Attach, _) => "permission denied to attach a database".into(),
+        (Action::Detach, _) => "permission denied to detach a database".into(),
+        (Action::SetRole, Object::Role(name)) => {
+            format!("permission denied to set role \"{name}\"")
+        }
+        (_, Object::File(_)) => "permission denied to COPY from a file".into(),
+        (_, object) => format!("permission denied for {}", object_name(object)),
+    }
+}
+
+/// Names an object the way PostgreSQL does in its errors. Core's main
+/// database is PostgreSQL's `public` schema.
+fn object_name(object: &Object) -> String {
+    match object {
+        Object::Schema(name) if name == "main" => "schema public".to_string(),
+        object => object.to_string(),
     }
 }
 
@@ -444,6 +561,42 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
+            ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),
+            (
+                "role \"no such table\" already exists",
+                SQLSTATE_DUPLICATE_OBJECT,
+            ),
+            ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
+            ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
+            (
+                "cannot change owner of sequence \"s\"",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "column \"c\" of relation \"t\" does not exist",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            ("column \"c\" does not exist", SQLSTATE_UNDEFINED_COLUMN),
+            ("function f does not exist", SQLSTATE_UNDEFINED_FUNCTION),
+            ("there is no parameter $1", SQLSTATE_UNDEFINED_PARAMETER),
+            (
+                "window functions are not allowed in policy expressions",
+                SQLSTATE_WINDOWING_ERROR,
+            ),
+            (
+                "subqueries in policies are not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "cannot change column \"c\" of table \"t\" because policy \"p\" uses it",
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            ),
+            (
+                "sequence must have same owner as table it is linked to",
+                SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+            ),
             (
                 "table no such table already exists",
                 SQLSTATE_DUPLICATE_TABLE,
@@ -466,6 +619,18 @@ mod tests {
                 SQLSTATE_UNDEFINED_COLUMN,
             ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            (
+                "error in table t after drop column: no such column: a",
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            ),
+            (
+                "cannot INSERT into generated column \"b\"",
+                SQLSTATE_GENERATED_ALWAYS,
+            ),
+            (
+                "cannot UPDATE generated column \"b\"",
+                SQLSTATE_GENERATED_ALWAYS,
+            ),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
             (

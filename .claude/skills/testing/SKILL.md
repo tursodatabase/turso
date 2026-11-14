@@ -9,6 +9,7 @@ description: How to write tests, when to use each type of test, and how to run t
 | Type | Location | Use Case |
 |------|----------|----------|
 | `.sqltest` | `sqlite/conformance/sqlite-sqltests/` | SQL compatibility. **Preferred for new tests** |
+| `.sqltest` | `testing/shared-sqltests/` | SQL that both the SQLite and the PostgreSQL frontends run |
 | TCL `.test` | `testing/` | Legacy SQL compat (being phased out) |
 | Rust integration | `tests/integration/` | Regression tests, complex scenarios |
 | Fuzz | `tests/fuzz/` | Complex features, edge case discovery |
