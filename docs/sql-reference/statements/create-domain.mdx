@@ -210,7 +210,7 @@ SELECT CAST(NULL AS notnull_int);
 -- Error: domain notnull_int does not allow null values
 ```
 
-In the PostgreSQL frontend, casting an integer to a domain over `boolean` gives true for any nonzero integer and false for 0, as in PostgreSQL. With SQLite syntax the cast accepts only 0 and 1, the values the `boolean` type stores.
+In the PostgreSQL frontend, casting an integer to `boolean` or to a domain over it gives true for any nonzero integer and false for 0, as in PostgreSQL. With SQLite syntax the cast accepts only 0 and 1, the values the `boolean` type stores.
 
 ## CHECK Constraints with Table-Level Checks
 
