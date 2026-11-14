@@ -10,6 +10,30 @@ use turso_core::StatementStatusCounter;
 use turso_core::{vdbe::StepResult, SessionRole};
 use turso_core::{ConnectOpts, Database, LimboError};
 
+#[turso_macros::test]
+fn reprepare_after_savepoint_rollback_keeps_read_schema(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let a = tmp_db.connect_limbo();
+    let b = tmp_db.connect_limbo();
+    a.execute("CREATE TABLE t0(a)")?;
+    a.execute("CREATE TABLE t1(a)")?;
+    a.execute("INSERT INTO t1 VALUES (1)")?;
+    a.execute("BEGIN")?;
+    a.execute("SAVEPOINT s0")?;
+    let mut select = a.prepare("SELECT a FROM t1")?;
+    b.execute("CREATE INDEX i ON t0(a)")?;
+    a.execute("ROLLBACK TO s0")?;
+    assert!(matches!(step_blocking(&mut select)?, StepResult::Row));
+    assert_eq!(
+        select.row().unwrap().get_value(0),
+        &turso_core::Value::from_i64(1)
+    );
+    drop(select);
+    a.execute("ROLLBACK")?;
+    Ok(())
+}
+
 /// Helper: step a statement through IO until it returns Row or Done.
 fn step_blocking(stmt: &mut turso_core::Statement) -> turso_core::Result<StepResult> {
     loop {
