@@ -461,6 +461,10 @@ impl Limbo {
         self.opts.sync_server_address.is_some()
     }
 
+    pub fn get_io(&self) -> Arc<dyn turso_core::IO> {
+        self.io.clone()
+    }
+
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
         self.interrupt_count.clone()
     }

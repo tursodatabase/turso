@@ -102,6 +102,10 @@ impl IO for MemoryYieldIO {
         false
     }
 
+    fn is_memory(&self) -> bool {
+        true
+    }
+
     /// Signal every completion that was deferred since the last `step()`.
     ///
     /// We snapshot the queue and release the lock before signalling so that a

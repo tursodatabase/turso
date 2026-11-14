@@ -582,6 +582,11 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Whether this backend keeps its files in process memory, so nothing reaches the filesystem.
+    fn is_memory(&self) -> bool {
+        false
+    }
+
     fn step(&self) -> Result<()> {
         Ok(())
     }

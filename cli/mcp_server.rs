@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SessionRole,
-    Value as DbValue,
+    Value as DbValue, IO,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
@@ -202,16 +202,21 @@ fn parse_request_line(line: &str) -> Result<JsonRpcRequest, Box<JsonRpcResponse>
 pub struct TursoMcpServer {
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
-    current_db_path: Arc<Mutex<Option<String>>>,
+    current_db_path: Arc<Mutex<String>>,
 }
 
 impl TursoMcpServer {
-    pub fn new(conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+    pub fn new(
+        conn: Arc<Connection>,
+        io: &dyn IO,
+        db_path: String,
+        interrupt_count: Arc<AtomicUsize>,
+    ) -> Self {
         conn.set_load_extension_enabled(false);
         Self {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
-            current_db_path: Arc::new(Mutex::new(None)),
+            current_db_path: Arc::new(Mutex::new(reported_db_path(io, db_path))),
         }
     }
 
@@ -559,8 +564,9 @@ impl TursoMcpServer {
             None => return Err("Missing path parameter".to_string()),
         };
 
-        // Create parent directories if needed
-        if path != ":memory:" {
+        // Create parent directories if needed. A `file:` URI is not a file system path,
+        // so its parent is not a directory to create.
+        if path != ":memory:" && !path.starts_with("file:") {
             let db_path = PathBuf::from(&path);
             if let Some(parent) = db_path.parent() {
                 if !parent.exists() {
@@ -572,9 +578,9 @@ impl TursoMcpServer {
         }
 
         // Open the new database connection
-        let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
+        let (io, conn) = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
             match Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect)) {
-                Ok((_io, c)) => c,
+                Ok(opened) => opened,
                 Err(e) => return Err(format!("Failed to open database '{path}': {e}")),
             }
         } else {
@@ -586,8 +592,8 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
-                    Ok(c) => c,
+                Ok((io, db)) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
+                    Ok(c) => (io, c),
                     Err(e) => return Err(format!("Failed to connect to database '{path}': {e}")),
                 },
                 Err(e) => return Err(format!("Failed to open database '{path}': {e}")),
@@ -596,16 +602,16 @@ impl TursoMcpServer {
 
         // Update the connection and path
         *self.conn.lock().unwrap() = conn;
-        *self.current_db_path.lock().unwrap() = Some(path.clone());
+        *self.current_db_path.lock().unwrap() = reported_db_path(io.as_ref(), path.clone());
 
         Ok(format!("Successfully opened database: {path}"))
     }
 
     fn current_database(&self) -> Result<String, String> {
-        Ok(match &*self.current_db_path.lock().unwrap() {
-            Some(path) => format!("Current database: {path}"),
-            None => "Current database: :memory: (default)".to_string(),
-        })
+        Ok(format!(
+            "Current database: {}",
+            self.current_db_path.lock().unwrap()
+        ))
     }
 
     fn list_tables(&self) -> Result<String, String> {
@@ -817,15 +823,31 @@ impl TursoMcpServer {
     }
 }
 
+/// The path to show for a database: `:memory:` when its IO keeps the data in memory
+/// (`--vfs memory`, `?mode=memory`, `?vfs=memory`), so a file name is never shown for
+/// a database that does not use that file.
+fn reported_db_path(io: &dyn IO, path: String) -> String {
+    if io.is_memory() {
+        ":memory:".to_string()
+    } else {
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn memory_server() -> TursoMcpServer {
-        let (_io, conn) =
+        let (io, conn) =
             Connection::from_uri(":memory:", DatabaseOpts::default(), Arc::new(SqliteDialect))
                 .expect("open memory database");
-        TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)))
+        TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            ":memory:".to_string(),
+            Arc::new(AtomicUsize::new(0)),
+        )
     }
 
     fn query_arg(sql: &str) -> Option<Value> {
@@ -929,14 +951,98 @@ mod tests {
     }
 
     #[test]
+    fn current_database_reports_path_opened_at_startup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("startup.db").to_string_lossy().to_string();
+        let (io, conn) =
+            Connection::from_uri(&path, DatabaseOpts::default(), Arc::new(SqliteDialect)).unwrap();
+        let server = TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            path.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        assert_eq!(
+            server.current_database(),
+            Ok(format!("Current database: {path}"))
+        );
+
+        server
+            .open_database(&Some(json!({ "path": ":memory:" })))
+            .unwrap();
+        assert_eq!(
+            server.current_database(),
+            Ok("Current database: :memory:".to_string())
+        );
+    }
+
+    #[test]
+    fn current_database_reports_memory_when_the_file_is_not_used() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("real.db").to_string_lossy().to_string();
+        let memory = Ok("Current database: :memory:".to_string());
+
+        let (io, db) = Database::open_new(
+            &path,
+            Some("memory"),
+            OpenFlags::default(),
+            DatabaseOpts::default(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let server = TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            path.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        assert_eq!(server.current_database(), memory, "--vfs memory");
+
+        for uri in [
+            format!("file:{path}?mode=memory"),
+            format!("file:{path}?vfs=memory"),
+        ] {
+            let (io, conn) =
+                Connection::from_uri(&uri, DatabaseOpts::default(), Arc::new(SqliteDialect))
+                    .unwrap();
+            let server = TursoMcpServer::new(
+                conn,
+                io.as_ref(),
+                uri.clone(),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            assert_eq!(server.current_database(), memory, "startup {uri}");
+
+            let server = memory_server();
+            server.open_database(&Some(json!({ "path": uri }))).unwrap();
+            assert_eq!(server.current_database(), memory, "open_database {uri}");
+            let uri_parent = PathBuf::from(&uri).parent().unwrap().to_path_buf();
+            assert!(
+                !uri_parent.exists(),
+                "open_database {uri} created {uri_parent:?}"
+            );
+        }
+    }
+
+    #[test]
     fn execute_query_cannot_load_extensions() {
-        let (_io, conn) = Connection::from_uri(
+        let (io, conn) = Connection::from_uri(
             ":memory:",
             DatabaseOpts::new().turso_cli(),
             Arc::new(SqliteDialect),
         )
         .expect("open memory database");
-        let server = TursoMcpServer::new(conn, Arc::new(AtomicUsize::new(0)));
+        let server = TursoMcpServer::new(
+            conn,
+            io.as_ref(),
+            ":memory:".to_string(),
+            Arc::new(AtomicUsize::new(0)),
+        );
 
         let result = server
             .execute_query(&query_arg("SELECT load_extension('nonexistent')"))
