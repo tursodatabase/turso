@@ -3369,6 +3369,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
+    pull_parallel_requests: Option<usize>,
 ) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
@@ -3382,7 +3383,15 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             Ok((revision, RemotePullProtocol::Pages))
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, pull_bytes_threshold).await
+            bootstrap_db_file_v1(
+                ctx,
+                io,
+                main_db_path,
+                partial_sync,
+                pull_bytes_threshold,
+                pull_parallel_requests,
+            )
+            .await
         }
     }
 }
@@ -3401,20 +3410,12 @@ fn page_range_bitmap(start_inclusive: u32, end_exclusive: u32) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-/// Send a single `/pull-updates` request and stream every returned page into
-/// `file`. Returns the response header for the caller to inspect (db_size,
-/// server_revision). When `truncate_on_first_response` is set, the file is
-/// resized to `header.db_size * PAGE_SIZE` between reading the header and the
-/// first page — used by the first chunk of a chunked bootstrap.
-#[allow(clippy::too_many_arguments)]
-async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
+fn send_pull_chunk_request<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    file: &Arc<dyn turso_core::File>,
     server_revision: &str,
     server_pages_selector: Vec<u8>,
     server_query_selector: String,
-    truncate_on_first_response: bool,
-) -> Result<PullUpdatesRespProtoBody> {
+) -> Result<IO::DataCompletionBytes> {
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
         stream_kind: PullUpdatesStreamKind::Pages as i32,
@@ -3427,7 +3428,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     };
     let request = request.encode_to_vec();
     ctx.io.network_stats.write(request.len());
-    let completion = ctx.http(
+    ctx.http(
         "POST",
         "/pull-updates",
         Some(request),
@@ -3435,33 +3436,89 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
             ("content-type", "application/protobuf"),
             ("accept-encoding", "application/protobuf"),
         ],
-    )?;
-    let mut bytes = BytesMut::new();
-    let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
-        ctx.coro,
-        &completion,
-        &ctx.io.network_stats,
-        &mut bytes,
     )
-    .await?
-    else {
+}
+
+async fn write_bootstrap_page<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    buffer: &Arc<Buffer>,
+    header: &PullUpdatesRespProtoBody,
+    page_data: PageData,
+) -> Result<()> {
+    tracing::debug!(
+        "bootstrap_db_file: received page page_id={}",
+        page_data.page_id
+    );
+    let offset = page_data.page_id * PAGE_SIZE as u64;
+    let page = decode_page(header, page_data)?;
+    if page.len() != PAGE_SIZE {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "page has unexpected size: {} != {}",
+            page.len(),
+            PAGE_SIZE
+        )));
+    }
+    buffer.as_mut_slice().copy_from_slice(&page);
+    let c = Completion::new_write(move |result| {
+        // todo(sivukhin): we need to error out in case of partial read
+        let Ok(size) = result else {
+            return;
+        };
+        assert!(size as usize == PAGE_SIZE);
+    });
+    let c = file.pwrite(offset, buffer.clone(), c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    Ok(())
+}
+
+/// Check the first message of a bootstrap chunk response: it must exist and
+/// announce a page stream.
+fn bootstrap_chunk_header(
+    header: Option<PullUpdatesRespProtoBody>,
+) -> Result<PullUpdatesRespProtoBody> {
+    let Some(header) = header else {
         return Err(Error::DatabaseSyncEngineError(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
     tracing::info!("bootstrap_db_file: got header={:?}", header);
-    ensure_page_stream(&header, "pull_chunk_into_file")?;
-    if truncate_on_first_response {
-        let c = Completion::new_trunc(move |result| {
-            let Ok(rc) = result else {
-                return;
-            };
-            assert!(rc as usize == 0);
-        });
-        let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-        while !c.succeeded() {
-            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-        }
+    ensure_page_stream(&header, "bootstrap_db_file")?;
+    Ok(header)
+}
+
+/// Send the first `/pull-updates` request of a bootstrap and stream every
+/// returned page into `file`. The file is resized to `header.db_size *
+/// PAGE_SIZE` between reading the header and the first page. Returns the
+/// response header for the caller to inspect (db_size, server_revision).
+async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    server_pages_selector: Vec<u8>,
+    server_query_selector: String,
+) -> Result<PullUpdatesRespProtoBody> {
+    let completion =
+        send_pull_chunk_request(ctx, "", server_pages_selector, server_query_selector)?;
+    let mut bytes = BytesMut::new();
+    let header = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
+        ctx.coro,
+        &completion,
+        &ctx.io.network_stats,
+        &mut bytes,
+    )
+    .await?;
+    let header = bootstrap_chunk_header(header)?;
+    let c = Completion::new_trunc(move |result| {
+        let Ok(rc) = result else {
+            return;
+        };
+        assert!(rc as usize == 0);
+    });
+    let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
+    while !c.succeeded() {
+        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
@@ -3473,33 +3530,89 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     )
     .await?
     {
-        tracing::debug!(
-            "bootstrap_db_file: received page page_id={}",
-            page_data.page_id
-        );
-        let offset = page_data.page_id * PAGE_SIZE as u64;
-        let page = decode_page(&header, page_data)?;
-        if page.len() != PAGE_SIZE {
-            return Err(Error::DatabaseSyncEngineError(format!(
-                "page has unexpected size: {} != {}",
-                page.len(),
-                PAGE_SIZE
-            )));
+        write_bootstrap_page(ctx.coro, file, &buffer, &header, page_data).await?;
+    }
+    Ok(header)
+}
+
+/// Stream pages `[start, last_page_id)` into `file` in chunks of `chunk_pages`
+/// pages, with up to `parallel_requests` chunk requests in flight. Every
+/// request is pinned to `server_revision`.
+async fn pull_chunks_into_file<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    server_revision: &str,
+    chunk_pages: u64,
+    mut start: u64,
+    last_page_id: u64,
+    parallel_requests: usize,
+) -> Result<()> {
+    #[allow(clippy::arc_with_non_send_sync)]
+    let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+    // Each in-flight request: its completion, the bytes received but not yet
+    // decoded, and the response header once it has been read.
+    let mut in_flight: Vec<(
+        IO::DataCompletionBytes,
+        BytesMut,
+        Option<PullUpdatesRespProtoBody>,
+    )> = Vec::new();
+    loop {
+        while in_flight.len() < parallel_requests && start < last_page_id {
+            let end = std::cmp::min(start + chunk_pages, last_page_id);
+            let selector = page_range_bitmap(start as u32, end as u32)?;
+            let completion =
+                send_pull_chunk_request(ctx, server_revision, selector, String::new())?;
+            in_flight.push((completion, BytesMut::new(), None));
+            start = end;
         }
-        buffer.as_mut_slice().copy_from_slice(&page);
-        let c = Completion::new_write(move |result| {
-            // todo(sivukhin): we need to error out in case of partial read
-            let Ok(size) = result else {
-                return;
+        if in_flight.is_empty() {
+            return Ok(());
+        }
+        let mut progress = false;
+        let mut i = 0;
+        while i < in_flight.len() {
+            let (completion, bytes, header) = &mut in_flight[i];
+            if header.is_none() {
+                match poll_proto_message::<PullUpdatesRespProtoBody>(
+                    completion,
+                    &ctx.io.network_stats,
+                    bytes,
+                )? {
+                    ProtoPoll::Message(h) => {
+                        *header = Some(bootstrap_chunk_header(Some(h))?);
+                        progress = true;
+                    }
+                    ProtoPoll::Pending => {
+                        i += 1;
+                        continue;
+                    }
+                    ProtoPoll::End => {
+                        bootstrap_chunk_header(None)?;
+                    }
+                }
+            }
+            let header = header.as_ref().expect("header was read above");
+            let finished = loop {
+                match poll_proto_message::<PageData>(completion, &ctx.io.network_stats, bytes)? {
+                    ProtoPoll::Message(page_data) => {
+                        write_bootstrap_page(ctx.coro, file, &buffer, header, page_data).await?;
+                        progress = true;
+                    }
+                    ProtoPoll::Pending => break false,
+                    ProtoPoll::End => break true,
+                }
             };
-            assert!(size as usize == PAGE_SIZE);
-        });
-        let c = file.pwrite(offset, buffer.clone(), c)?;
-        while !c.succeeded() {
+            if finished {
+                in_flight.swap_remove(i);
+                progress = true;
+            } else {
+                i += 1;
+            }
+        }
+        if !progress {
             ctx.coro.yield_(SyncEngineIoResult::IO).await?;
         }
     }
-    Ok(header)
 }
 
 pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
@@ -3508,6 +3621,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
+    pull_parallel_requests: Option<usize>,
 ) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     if let Some(PartialSyncOpts {
         bootstrap_strategy: None,
@@ -3564,8 +3678,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     } else {
         Vec::new()
     };
-    let header =
-        pull_chunk_into_file(ctx, &file, "", first_selector, server_query_selector, true).await?;
+    let header = pull_chunk_into_file(ctx, &file, first_selector, server_query_selector).await?;
 
     // Subsequent chunks (if any). Pin every chunk to the same `server_revision`
     // so the page set stays consistent across HTTP round-trips, and never go
@@ -3575,21 +3688,16 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             Some(l) => std::cmp::min(l as u64, header.db_size),
             None => header.db_size,
         };
-        let mut start = n as u64;
-        while start < last_page_id {
-            let end = std::cmp::min(start + n as u64, last_page_id);
-            let selector = page_range_bitmap(start as u32, end as u32)?;
-            pull_chunk_into_file(
-                ctx,
-                &file,
-                &header.server_revision,
-                selector,
-                String::new(),
-                false,
-            )
-            .await?;
-            start = end;
-        }
+        pull_chunks_into_file(
+            ctx,
+            &file,
+            &header.server_revision,
+            n as u64,
+            n as u64,
+            last_page_id,
+            pull_parallel_requests.unwrap_or(1).max(1),
+        )
+        .await?;
     }
 
     // Persist the bootstrapped DB file before the caller records this revision
@@ -3931,13 +4039,44 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
     network_stats: &DataStats,
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
-    while completion.status()?.is_none() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
+    loop {
+        match poll_proto_message(completion, network_stats, bytes)? {
+            ProtoPoll::Message(message) => return Ok(Some(message)),
+            ProtoPoll::End => return Ok(None),
+            ProtoPoll::Pending => coro.yield_(SyncEngineIoResult::IO).await?,
+        }
     }
-    let status = completion.status()?.expect("status must be set");
+}
+
+enum ProtoPoll<T> {
+    Message(T),
+    /// More data must arrive before the next message can be read.
+    Pending,
+    /// The response ended cleanly after the last message.
+    End,
+}
+
+/// Non-blocking form of [wait_proto_message]: reads the next message from the
+/// data the completion has received so far, without yielding.
+fn poll_proto_message<T: prost::Message + Default>(
+    completion: &impl DataCompletion<u8>,
+    network_stats: &DataStats,
+    bytes: &mut BytesMut,
+) -> Result<ProtoPoll<T>> {
+    let Some(status) = completion.status()? else {
+        return Ok(ProtoPoll::Pending);
+    };
     if status != 200 {
-        let body = wait_all_results(coro, completion, Some(network_stats)).await?;
-        return match std::str::from_utf8(body.as_slice()) {
+        // Collect the whole error body into `bytes` before failing.
+        let done = completion.is_done()?;
+        while let Some(poll) = completion.poll_data()? {
+            network_stats.read(poll.data().len());
+            bytes.extend_from_slice(poll.data());
+        }
+        if !done {
+            return Ok(ProtoPoll::Pending);
+        }
+        return match std::str::from_utf8(bytes) {
             Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
                 "remote server returned an error: status={status}, body={body}"
             ))),
@@ -3958,9 +4097,9 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
                 network_stats.read(poll.data().len());
                 bytes.extend_from_slice(poll.data());
             } else if !done {
-                coro.yield_(SyncEngineIoResult::IO).await?;
+                return Ok(ProtoPoll::Pending);
             } else if bytes.is_empty() {
-                return Ok(None);
+                return Ok(ProtoPoll::End);
             } else {
                 return Err(Error::DatabaseSyncEngineError(
                     "unexpected end of protobuf message".to_string(),
@@ -3974,7 +4113,7 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
         })?;
         let _ = bytes.split_to(message_length + prefix_length);
         tracing::trace!("wait_proto_message: got message");
-        return Ok(Some(message));
+        return Ok(ProtoPoll::Message(message));
     }
 }
 
@@ -5854,6 +5993,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             logical_mvcc_pull: Some(true),
         }
     }
@@ -6102,6 +6242,284 @@ mod tests {
             fn data(&self) -> &[u8] {
                 &self.0
             }
+        }
+    }
+
+    mod chunked_bootstrap {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        use bytes::Bytes;
+        use prost::Message;
+        use roaring::RoaringBitmap;
+        use tempfile::NamedTempFile;
+
+        use super::{TestPollResult, TestTransformCompletion};
+        use crate::database_sync_engine_io::{DataCompletion, SyncEngineIo};
+        use crate::database_sync_operations::{
+            bootstrap_db_file_v1, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
+        };
+        use crate::server_proto::{
+            PageData, PageSetRawEncodingProto, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+        };
+        use crate::types::{Coro, DatabasePullRevision, DatabaseRowMutation};
+        use crate::Result;
+
+        const DB_PAGES: u32 = 10;
+        const REVISION: &str = "rev-1";
+
+        /// Serves a `DB_PAGES`-page database whose page `i` is filled with byte
+        /// `i + 1`, honouring the page selector of each request.
+        #[derive(Default)]
+        struct BootstrapServer {
+            requests: Mutex<Vec<PullUpdatesReqProtoBody>>,
+            open: Arc<AtomicUsize>,
+            max_open: AtomicUsize,
+            // Index of the request that gets a 500 response.
+            fail_request: Option<usize>,
+        }
+
+        /// Hands out its body 1000 bytes at a time, and only on every second
+        /// poll, so the engine has to wait for data part way through a response.
+        struct Response {
+            status: u16,
+            rest: Mutex<(Bytes, bool)>,
+            open: Arc<AtomicUsize>,
+        }
+
+        impl DataCompletion<u8> for Response {
+            type DataPollResult = TestPollResult;
+
+            fn status(&self) -> Result<Option<u16>> {
+                Ok(Some(self.status))
+            }
+
+            fn poll_data(&self) -> Result<Option<TestPollResult>> {
+                let mut rest = self.rest.lock().unwrap();
+                let (data, skip) = &mut *rest;
+                if data.is_empty() {
+                    return Ok(None);
+                }
+                *skip = !*skip;
+                if *skip {
+                    return Ok(None);
+                }
+                let chunk = data.split_to(data.len().min(1000));
+                if data.is_empty() {
+                    self.open.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(Some(TestPollResult(chunk.to_vec())))
+            }
+
+            fn is_done(&self) -> Result<bool> {
+                Ok(self.rest.lock().unwrap().0.is_empty())
+            }
+        }
+
+        impl SyncEngineIo for BootstrapServer {
+            type DataCompletionBytes = Response;
+            type DataCompletionTransform = TestTransformCompletion;
+
+            fn full_read(&self, _path: &str) -> Result<Response> {
+                panic!("full_read is not used in this test")
+            }
+
+            fn full_write(&self, _path: &str, _content: Vec<u8>) -> Result<Response> {
+                panic!("full_write is not used in this test")
+            }
+
+            fn transform(
+                &self,
+                _mutations: Vec<DatabaseRowMutation>,
+            ) -> Result<TestTransformCompletion> {
+                panic!("transform is not used in this test")
+            }
+
+            fn http(
+                &self,
+                _url: Option<&str>,
+                _method: &str,
+                _path: &str,
+                body: Option<Vec<u8>>,
+                _headers: &[(&str, &str)],
+            ) -> Result<Response> {
+                let request = PullUpdatesReqProtoBody::decode(body.unwrap().as_slice()).unwrap();
+                let pages: Vec<u32> = if request.server_pages_selector.is_empty() {
+                    (0..DB_PAGES).collect()
+                } else {
+                    RoaringBitmap::deserialize_from(&request.server_pages_selector[..])
+                        .unwrap()
+                        .iter()
+                        .filter(|page| *page < DB_PAGES)
+                        .collect()
+                };
+                let mut requests = self.requests.lock().unwrap();
+                let fail = self.fail_request == Some(requests.len());
+                requests.push(request);
+                let open = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_open.fetch_max(open, Ordering::SeqCst);
+
+                if fail {
+                    return Ok(Response {
+                        status: 500,
+                        rest: Mutex::new((Bytes::from_static(b"boom"), false)),
+                        open: self.open.clone(),
+                    });
+                }
+                let header = PullUpdatesRespProtoBody {
+                    server_revision: REVISION.to_string(),
+                    db_size: DB_PAGES as u64,
+                    raw_encoding: Some(PageSetRawEncodingProto {}),
+                    ..Default::default()
+                };
+                let mut body = header.encode_length_delimited_to_vec();
+                for page in pages {
+                    let page_data = PageData {
+                        page_id: page as u64,
+                        encoded_page: vec![page as u8 + 1; PAGE_SIZE].into(),
+                    };
+                    body.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+                }
+                Ok(Response {
+                    status: 200,
+                    rest: Mutex::new((body.into(), false)),
+                    open: self.open.clone(),
+                })
+            }
+
+            fn add_io_callback(&self, _callback: Box<dyn FnMut() -> bool + Send>) {}
+
+            fn step_io_callbacks(&self) {}
+        }
+
+        /// Runs a bootstrap against `server` and returns the revision it
+        /// reported along with the bytes of the bootstrapped file.
+        fn bootstrap(
+            server: Arc<BootstrapServer>,
+            pull_bytes_threshold: Option<usize>,
+            pull_parallel_requests: Option<usize>,
+        ) -> (Result<String>, Vec<u8>) {
+            let temp = NamedTempFile::new().unwrap();
+            let path = temp.path().to_str().unwrap().to_string();
+            let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let mut gen = genawaiter::sync::Gen::new({
+                let path = path.clone();
+                move |coro| async move {
+                    let coro: Coro<()> = coro.into();
+                    let stats = SyncEngineIoStats::new(server);
+                    let ctx = SyncOperationCtx::new(
+                        &coro,
+                        &stats,
+                        Some("https://example.com".to_string()),
+                        None,
+                    );
+                    let (revision, _) = bootstrap_db_file_v1(
+                        &ctx,
+                        &core_io,
+                        &path,
+                        None,
+                        pull_bytes_threshold,
+                        pull_parallel_requests,
+                    )
+                    .await?;
+                    let DatabasePullRevision::V1 { revision } = revision else {
+                        panic!("expected V1 revision");
+                    };
+                    Result::Ok(revision)
+                }
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => {}
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            (result, std::fs::read(&path).unwrap())
+        }
+
+        fn selected_pages(request: &PullUpdatesReqProtoBody) -> Vec<u32> {
+            RoaringBitmap::deserialize_from(&request.server_pages_selector[..])
+                .unwrap()
+                .iter()
+                .collect()
+        }
+
+        #[test]
+        fn parallel_bootstrap_writes_the_same_file_as_a_single_request() {
+            let (single_revision, single_file) =
+                bootstrap(Arc::new(BootstrapServer::default()), None, None);
+            let (parallel_revision, parallel_file) = bootstrap(
+                Arc::new(BootstrapServer::default()),
+                Some(2 * PAGE_SIZE),
+                Some(3),
+            );
+
+            assert_eq!(single_revision.unwrap(), REVISION);
+            assert_eq!(parallel_revision.unwrap(), REVISION);
+            assert_eq!(single_file.len(), DB_PAGES as usize * PAGE_SIZE);
+            for (i, page) in single_file.chunks(PAGE_SIZE).enumerate() {
+                assert!(page.iter().all(|b| *b == i as u8 + 1), "page {i}");
+            }
+            assert!(single_file == parallel_file);
+        }
+
+        #[test]
+        fn parallel_chunks_are_pinned_to_the_first_revision_and_run_together() {
+            let server = Arc::new(BootstrapServer::default());
+            let (revision, _) = bootstrap(server.clone(), Some(2 * PAGE_SIZE), Some(3));
+            assert_eq!(revision.unwrap(), REVISION);
+
+            let requests = server.requests.lock().unwrap();
+            let revisions: Vec<&str> = requests
+                .iter()
+                .map(|r| r.server_revision.as_str())
+                .collect();
+            assert_eq!(revisions, vec!["", REVISION, REVISION, REVISION, REVISION]);
+            let pages: Vec<Vec<u32>> = requests.iter().map(selected_pages).collect();
+            assert_eq!(
+                pages,
+                vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7], vec![8, 9]]
+            );
+            assert_eq!(server.max_open.load(Ordering::SeqCst), 3);
+        }
+
+        #[test]
+        fn one_parallel_request_issues_the_requests_one_after_another() {
+            for parallel in [None, Some(1)] {
+                let server = Arc::new(BootstrapServer::default());
+                let (revision, _) = bootstrap(server.clone(), Some(3 * PAGE_SIZE), parallel);
+                assert_eq!(revision.unwrap(), REVISION);
+
+                let requests = server.requests.lock().unwrap();
+                let revisions: Vec<&str> = requests
+                    .iter()
+                    .map(|r| r.server_revision.as_str())
+                    .collect();
+                assert_eq!(revisions, vec!["", REVISION, REVISION, REVISION]);
+                let pages: Vec<Vec<u32>> = requests.iter().map(selected_pages).collect();
+                assert_eq!(
+                    pages,
+                    vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9]]
+                );
+                assert_eq!(server.max_open.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn an_error_on_one_parallel_request_fails_the_bootstrap() {
+            let server = Arc::new(BootstrapServer {
+                fail_request: Some(2),
+                ..Default::default()
+            });
+            let (revision, _) = bootstrap(server.clone(), Some(2 * PAGE_SIZE), Some(3));
+
+            let error = revision.unwrap_err().to_string();
+            assert!(
+                error.contains("status=500, body=boom"),
+                "unexpected error: {error}"
+            );
         }
     }
 }
