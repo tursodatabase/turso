@@ -337,6 +337,18 @@ func (c *tursoDbConnection) GetBusyTimeout() int {
 	return c.busyTimeout
 }
 
+// IsAutocommit reports whether the connection is in autocommit mode, i.e. no
+// transaction is open. The engine can end a transaction on its own, for
+// example after a write-write conflict under BEGIN CONCURRENT.
+func (c *tursoDbConnection) IsAutocommit() (bool, error) {
+	if err := c.checkOpen(); err != nil {
+		return false, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return turso_connection_get_autocommit(c.conn), nil
+}
+
 // --- Connector Pattern ---
 
 // ConnectorOption configures a TursoConnector.
