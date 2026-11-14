@@ -1238,3 +1238,42 @@ fn materialized_view_column_list_survives_reopen(tmp_db: TempDatabase) -> anyhow
     assert_eq!(run_integrity_check(&conn), "ok");
     Ok(())
 }
+
+/// IVM must keep the low bits of an integer total after its internal 64-bit
+/// accumulator wraps. Converting the wrapped high and low parts separately
+/// can lose those bits through floating-point cancellation in AVG, TOTAL, and
+/// mixed-input SUM.
+#[turso_macros::test(views)]
+fn materialized_view_large_integer_totals_preserve_precision(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (9223372036854775807), (1026)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW mv AS SELECT AVG(x) AS avg_x, TOTAL(x) AS total_x FROM t",
+    )?;
+
+    let expected_avg = 4.611_686_018_427_389e18_f64;
+    let expected_total = 9.223_372_036_854_778e18_f64;
+    let fresh: Vec<(f64, f64)> = conn.exec_rows("SELECT AVG(x), TOTAL(x) FROM t");
+    let materialized: Vec<(f64, f64)> = conn.exec_rows("SELECT avg_x, total_x FROM mv");
+    assert_eq!(fresh, vec![(expected_avg, expected_total)]);
+    assert_eq!(materialized, fresh);
+
+    conn.execute("INSERT INTO t VALUES (1027)")?;
+    let fresh_after_insert: Vec<(f64, f64)> = conn.exec_rows("SELECT AVG(x), TOTAL(x) FROM t");
+    let materialized_after_insert: Vec<(f64, f64)> =
+        conn.exec_rows("SELECT avg_x, total_x FROM mv");
+    assert_eq!(materialized_after_insert, fresh_after_insert);
+
+    conn.execute("CREATE TABLE mixed (x)")?;
+    conn.execute("INSERT INTO mixed VALUES (9223372036854775807), (1026), (0.0)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mixed_mv AS SELECT SUM(x) AS sum_x FROM mixed")?;
+    let mixed_fresh: Vec<(f64,)> = conn.exec_rows("SELECT SUM(x) FROM mixed");
+    let mixed_materialized: Vec<(f64,)> = conn.exec_rows("SELECT sum_x FROM mixed_mv");
+    assert_eq!(mixed_fresh, vec![(expected_total,)]);
+    assert_eq!(mixed_materialized, mixed_fresh);
+
+    Ok(())
+}
