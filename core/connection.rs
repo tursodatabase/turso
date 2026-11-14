@@ -475,6 +475,7 @@ pub struct Connection {
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
+    pub(super) attached_read_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -3437,6 +3438,9 @@ impl Connection {
                 // cause SchemaUpdated mismatches).
                 let mut schemas = self.database_schemas.write();
                 let schema_arc = schemas.entry(database_id).or_insert_with(|| {
+                    if let Some(schema) = self.attached_read_schemas.read().get(&database_id) {
+                        return schema.clone();
+                    }
                     let attached_dbs = self.attached_databases.read();
                     let entry = attached_dbs
                         .index_to_data
@@ -3561,6 +3565,10 @@ impl Connection {
         &self.database_schemas
     }
 
+    pub(crate) fn attached_read_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
+        &self.attached_read_schemas
+    }
+
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
         turso_assert_ne!(database_id, crate::MAIN_DB_ID);
         // TEMP is the sole source-of-truth path: writes go directly to
@@ -3576,6 +3584,9 @@ impl Connection {
                 .unwrap_or_else(|| self.empty_temp_schema());
         }
         if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+            return schema;
+        }
+        if let Some(schema) = self.attached_read_schemas.read().get(&database_id).cloned() {
             return schema;
         }
 
@@ -5032,6 +5043,7 @@ impl Connection {
     /// their connection-local schema caches.  MVCC-enabled attached databases
     /// are skipped — those are handled by `rollback_attached_mvcc_txs`.
     pub(crate) fn rollback_attached_wal_txns(&self) {
+        self.attached_read_schemas.write().clear();
         self.with_all_attached_pagers_with_index(|pagers| {
             // Record indices of WAL-mode entries so we can batch the schema
             // removal under a single write lock and avoid calling

@@ -681,6 +681,7 @@ impl Connection {
         // Invalidate the cached schema for this database index so that a future
         // ATTACH reusing the same index won't see stale schema entries.
         self.database_schemas.write().remove(&database_id);
+        self.attached_read_schemas().write().remove(&database_id);
         self.bump_prepare_context_generation();
 
         Ok(())

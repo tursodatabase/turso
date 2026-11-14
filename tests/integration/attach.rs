@@ -281,6 +281,131 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_attached_schema_stays_on_read_snapshot(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("schema_snapshot_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+    a.execute("BEGIN")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT x FROM aux.t")).is_equal_to(vec![row![1]]);
+    b.execute("ALTER TABLE aux.t ADD COLUMN y")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT x FROM aux.t")).is_equal_to(vec![row![1]]);
+    assert_that!(limbo_exec_rows(&a, "SELECT * FROM aux.t")).is_equal_to(vec![row![1]]);
+    assert_that!(limbo_exec_rows(
+        &a,
+        "SELECT name FROM aux.sqlite_schema WHERE name = 't'"
+    ))
+    .is_equal_to(vec![row!["t"]]);
+    a.execute("COMMIT")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT count(y) FROM aux.t")).is_equal_to(vec![row![0]]);
+    assert_that!(limbo_exec_rows(&b, "SELECT count(y) FROM aux.t")).is_equal_to(vec![row![0]]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_schema_snapshot_is_released_on_rollback(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("schema_snapshot_rollback_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+    a.execute("BEGIN")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT * FROM aux.t")).is_equal_to(vec![row![1]]);
+    b.execute("ALTER TABLE aux.t ADD COLUMN y")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT * FROM aux.t")).is_equal_to(vec![row![1]]);
+    a.execute("ROLLBACK")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT count(y) FROM aux.t")).is_equal_to(vec![row![0]]);
+    assert_that!(limbo_exec_rows(&b, "SELECT count(y) FROM aux.t")).is_equal_to(vec![row![0]]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_schema_snapshot_survives_rollback_to_savepoint(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("schema_snapshot_savepoint_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+    a.execute("BEGIN")?;
+    a.execute("SAVEPOINT s")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT * FROM aux.t")).is_equal_to(vec![row![1]]);
+    b.execute("ALTER TABLE aux.t ADD COLUMN y")?;
+    a.execute("ROLLBACK TO s")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT * FROM aux.t")).is_equal_to(vec![row![1]]);
+    a.execute("RELEASE s")?;
+    a.execute("COMMIT")?;
+    assert_that!(limbo_exec_rows(&a, "SELECT count(y) FROM aux.t")).is_equal_to(vec![row![0]]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_empty_schema_stays_on_read_snapshot(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("schema_snapshot_empty_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("BEGIN")?;
+    assert_that!(limbo_exec_rows(
+        &a,
+        "SELECT count(*) FROM aux.sqlite_schema"
+    ))
+    .is_equal_to(vec![row![0]]);
+    b.execute("CREATE TABLE aux.t(x)")?;
+    assert_that!(limbo_exec_rows(
+        &a,
+        "SELECT count(*) FROM aux.sqlite_schema"
+    ))
+    .is_equal_to(vec![row![0]]);
+    a.execute("COMMIT")?;
+    assert_that!(limbo_exec_rows(
+        &a,
+        "SELECT count(*) FROM aux.sqlite_schema"
+    ))
+    .is_equal_to(vec![row![1]]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_schema_reprepares_before_first_read(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let aux_path = db.path.with_extension("schema_snapshot_reprepare_aux.db");
+    let a = db.connect_limbo();
+    let b = db.connect_limbo();
+    a.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    b.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    a.execute("CREATE TABLE aux.t(x)")?;
+    a.execute("INSERT INTO aux.t VALUES (1)")?;
+    let mut stmt = a.prepare("SELECT * FROM aux.t")?;
+    b.execute("ALTER TABLE aux.t ADD COLUMN y")?;
+    a.execute("BEGIN")?;
+    let mut column_count = 0;
+    stmt.run_with_row_callback(|row| {
+        column_count = row.get_values().count();
+        Ok(())
+    })?;
+    assert_eq!(column_count, 2);
+    drop(stmt);
+    a.execute("COMMIT")?;
+    Ok(())
+}
+
 /// VACUUM INTO an empty file that is attached on the same connection must
 /// leave the attached schema usable, with or without tables in the copy.
 #[turso_macros::test]
