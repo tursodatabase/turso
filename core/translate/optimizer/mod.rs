@@ -2,11 +2,11 @@ use super::{
     emitter::Resolver,
     expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
-        JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
-        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
-        TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan, WhereTerm,
-        WhereTermOrigin,
+        DeletePlan, GroupBy, InSeekPrefix, InSeekSource, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
+        SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan,
+        WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -3121,10 +3121,29 @@ fn operation_for_unmatched_right_rows(
             index,
             affinity,
             where_term_idx,
+            prefix_refs,
         } => {
             let source = in_seek_source(&original_where_clause[where_term_idx].expr, affinity)?;
+            let prefix = in_seek_prefix(
+                &table_constraints.constraints,
+                &prefix_refs,
+                original_where_clause,
+                table_references,
+                resolver,
+            );
+            mark_seek_constraints_consumed(
+                &table_constraints.constraints,
+                &prefix_refs,
+                where_clause_for_unmatched_rows,
+                false,
+                false,
+            );
             where_clause_for_unmatched_rows[where_term_idx].consumed = true;
-            Ok(Operation::Search(Search::InSeek { index, source }))
+            Ok(Operation::Search(Search::InSeek {
+                index,
+                source,
+                prefix,
+            }))
         }
         AccessMethodParams::MultiIndexScan {
             branches,
@@ -3588,12 +3607,27 @@ fn apply_table_access_plan(
                 index,
                 affinity,
                 where_term_idx,
+                prefix_refs,
             } => {
                 let source = in_seek_source(&where_clause[*where_term_idx].expr, *affinity)?;
                 let is_outer_join = table_references.joined_tables()[table_idx]
                     .join_info
                     .as_ref()
                     .is_some_and(|join_info| join_info.is_outer());
+                let prefix = in_seek_prefix(
+                    &constraints_per_table[table_idx].constraints,
+                    prefix_refs,
+                    where_clause,
+                    table_references,
+                    resolver,
+                );
+                mark_seek_constraints_consumed(
+                    &constraints_per_table[table_idx].constraints,
+                    prefix_refs,
+                    where_clause,
+                    is_outer_join,
+                    hash_join_build_only_tables.get(table_idx),
+                );
                 if let Some(index) = partial_index(index.as_ref()) {
                     mark_partial_index_predicate_terms_consumed(
                         index,
@@ -3607,6 +3641,7 @@ fn apply_table_access_plan(
                     Operation::Search(Search::InSeek {
                         index: index.clone(),
                         source,
+                        prefix,
                     });
             }
         }
@@ -3788,6 +3823,32 @@ fn btree_search_operation(
             Some(resolver),
         )?,
     }))
+}
+
+/// The equalities an IN seek holds fixed, as the expressions that fix them.
+fn in_seek_prefix(
+    constraints: &[Constraint],
+    prefix_refs: &[RangeConstraintRef],
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Vec<InSeekPrefix> {
+    prefix_refs
+        .iter()
+        .map(|cref| {
+            // `in_seek_eq_prefix` only returns references that have an equality.
+            let eq = cref
+                .eq
+                .as_ref()
+                .expect("an IN seek prefix column has an equality");
+            let (_, expr, affinity) = constraints[eq.constraint_pos].get_constraining_expr(
+                where_clause,
+                Some(table_references),
+                Some(resolver),
+            );
+            InSeekPrefix { expr, affinity }
+        })
+        .collect()
 }
 
 fn in_seek_source(in_expr: &Expr, affinity: Affinity) -> Result<InSeekSource> {
