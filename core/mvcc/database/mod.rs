@@ -1536,7 +1536,7 @@ pub struct RewriteLiveVersionsCtx {
 /// How many rowids `BuildLogRecord` / `RewriteLiveVersions` process before
 /// yielding to the executor. Picked to amortize state-machine overhead
 /// while keeping a CREATE INDEX on a 2M-row table responsive.
-const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
+pub const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub enum WriteRowState {
