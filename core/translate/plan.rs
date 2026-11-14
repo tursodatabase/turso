@@ -12,7 +12,7 @@ use crate::{
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
-            lookup_unqualified_column, StorageClassMask,
+            lookup_unqualified_column, unwrap_parens, StorageClassMask,
         },
         expr_context::{ExprContext, TableMetadata},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
@@ -125,7 +125,16 @@ impl ResultSetColumn {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        match &self.expr {
+        self.resolved_column_name(&self.expr, tables)
+            .or(self.implicit_column_name.as_deref())
+    }
+
+    fn resolved_column_name<'a>(
+        &'a self,
+        expr: &'a ast::Expr,
+        tables: &'a TableReferences,
+    ) -> Option<&'a str> {
+        match expr {
             ast::Expr::Column { table, column, .. } => {
                 if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
                     if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
@@ -159,7 +168,7 @@ impl ResultSetColumn {
                 // If there is no rowid alias, use "rowid".
                 Some("rowid")
             }
-            _ => self.implicit_column_name.as_deref(),
+            _ => None,
         }
     }
 
@@ -170,10 +179,59 @@ impl ResultSetColumn {
             .unwrap_or_else(|| self.expr.to_string())
     }
 
+    /// Returns the column name SQLite derives for a CREATE TABLE AS SELECT
+    /// result. SQLite looks through parentheses, COLLATE, and the likelihood
+    /// hint functions when the wrapped expression is a direct column reference.
+    /// Keep the original expression for query result headers and for computed
+    /// expressions whose names are derived from their SQL text.
+    pub fn name_or_expr_for_ctas(&self, tables: &TableReferences) -> String {
+        if let Some(alias) = &self.alias {
+            return alias.clone();
+        }
+
+        let expr = ctas_column_name_expr(&self.expr);
+        self.resolved_column_name(expr, tables)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.name_or_expr(tables))
+    }
+
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
     pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
         get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables))).short_type_name()
+    }
+}
+
+/// Looks through the syntax SQLite ignores when it derives a column name for
+/// a direct column reference in a CTAS result.
+fn ctas_column_name_expr(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        match expr {
+            ast::Expr::Parenthesized(_) => {
+                let unwrapped = unwrap_parens(expr).unwrap_or(expr);
+                if std::ptr::eq(unwrapped, expr) {
+                    return expr;
+                }
+                expr = unwrapped;
+            }
+            ast::Expr::Collate(inner, _) => expr = inner,
+            ast::Expr::FunctionCall { name, args, .. } => {
+                let arity = if name.as_str().eq_ignore_ascii_case("likely")
+                    || name.as_str().eq_ignore_ascii_case("unlikely")
+                {
+                    1
+                } else if name.as_str().eq_ignore_ascii_case("likelihood") {
+                    2
+                } else {
+                    return expr;
+                };
+                if args.len() != arity {
+                    return expr;
+                }
+                expr = &args[0];
+            }
+            _ => return expr,
+        }
     }
 }
 

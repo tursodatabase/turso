@@ -647,3 +647,56 @@ expect {
     2.5|real
     '3.5'|text
 }
+
+# SQLite looks through parentheses, COLLATE and likelihood hint functions when
+# deriving a column name from a direct reference in a CTAS result.
+@cross-check-integrity
+test ctas_direct_column_name_ignores_sqlite_wrappers {
+    CREATE TABLE wrapper_source(x INTEGER, y INTEGER);
+    INSERT INTO wrapper_source VALUES (41, 1);
+
+    CREATE TABLE ctas_parenthesized AS SELECT ((x)) FROM wrapper_source;
+    CREATE TABLE ctas_collated AS SELECT x COLLATE NOCASE FROM wrapper_source;
+    CREATE TABLE ctas_likely AS SELECT likely(x) FROM wrapper_source;
+    CREATE TABLE ctas_unlikely AS SELECT unlikely((x)) FROM wrapper_source;
+    CREATE TABLE ctas_likelihood AS
+        SELECT likelihood((x) COLLATE NOCASE, 0.5) FROM wrapper_source;
+    CREATE TABLE ctas_collated_parenthesized AS
+        SELECT ((x) COLLATE NOCASE) FROM wrapper_source;
+    CREATE TABLE ctas_expression_keeps_name AS SELECT (x + y) FROM wrapper_source;
+    CREATE TABLE ctas_alias_keeps_precedence AS
+        SELECT likely(x) AS renamed FROM wrapper_source;
+
+    SELECT name FROM pragma_table_info('ctas_parenthesized');
+    SELECT x FROM ctas_parenthesized;
+    SELECT name FROM pragma_table_info('ctas_collated');
+    SELECT x FROM ctas_collated;
+    SELECT name FROM pragma_table_info('ctas_likely');
+    SELECT x FROM ctas_likely;
+    SELECT name FROM pragma_table_info('ctas_unlikely');
+    SELECT x FROM ctas_unlikely;
+    SELECT name FROM pragma_table_info('ctas_likelihood');
+    SELECT x FROM ctas_likelihood;
+    SELECT name FROM pragma_table_info('ctas_collated_parenthesized');
+    SELECT x FROM ctas_collated_parenthesized;
+    SELECT name FROM pragma_table_info('ctas_expression_keeps_name');
+    SELECT name FROM pragma_table_info('ctas_alias_keeps_precedence');
+    SELECT renamed FROM ctas_alias_keeps_precedence;
+}
+expect {
+    x
+    41
+    x
+    41
+    x
+    41
+    x
+    41
+    x
+    41
+    x
+    41
+    (x + y)
+    renamed
+    41
+}
