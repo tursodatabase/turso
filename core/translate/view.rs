@@ -75,7 +75,6 @@ pub fn translate_create_materialized_view(
     let namespace = resolver.resolve_namespace_for_create(view_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     if schema::relation_name_is_taken(resolver, namespace, &normalized_view_name, if_not_exists)? {
@@ -88,8 +87,10 @@ pub fn translate_create_materialized_view(
                 || s.is_broken_view(namespace.id, &normalized_view_name)
         })
     {
+        program.begin_noop_ddl(database_id, schema_cookie)?;
         return Ok(());
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
@@ -392,7 +393,6 @@ pub fn translate_create_view(
     };
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     if schema::relation_name_is_taken(resolver, namespace, &normalized_view_name, if_not_exists)? {
@@ -405,6 +405,7 @@ pub fn translate_create_view(
                 || s.is_broken_view(namespace.id, &normalized_view_name)
         })
     {
+        program.begin_noop_ddl(database_id, schema_cookie)?;
         return Ok(());
     }
 
@@ -428,6 +429,7 @@ pub fn translate_create_view(
                 SchemaObjectType::Table | SchemaObjectType::View
             )
         {
+            program.begin_noop_ddl(database_id, schema_cookie)?;
             return Ok(());
         }
         // SQLite echoes the new view's name token as written, except when the
@@ -442,6 +444,7 @@ pub fn translate_create_view(
             ),
         }));
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
@@ -544,6 +547,8 @@ pub fn translate_drop_view(
     let normalized_view_name = normalize_ident(view_name.name.as_str());
     let Some(namespace) = resolver.find_existing_table(view_name)? else {
         if if_exists {
+            let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+            program.begin_noop_ddl(MAIN_DB_ID, schema_cookie)?;
             return Ok(());
         }
         return Err(crate::LimboError::ParseError(format!(
@@ -552,7 +557,6 @@ pub fn translate_drop_view(
     };
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Check if view exists: regular, materialized, or a broken sqlite_schema
     // row whose stored SQL failed to parse at load time. Broken views have no
@@ -576,8 +580,10 @@ pub fn translate_drop_view(
 
     if !view_exists && if_exists {
         // View doesn't exist but IF EXISTS was specified, nothing to do
+        program.begin_noop_ddl(database_id, schema_cookie)?;
         return Ok(());
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     if is_materialized_view || is_regular_view {
         let dependent_views = resolver.with_schema(database_id, |s| {

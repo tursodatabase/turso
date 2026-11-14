@@ -330,6 +330,8 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
+    /// Set by a CREATE ... IF NOT EXISTS / DROP ... IF EXISTS that has nothing to do.
+    noop_ddl: bool,
     /// Temporary cursor mappings for code that reads a source through a second cursor.
     /// A later mapping takes priority, which permits nested translation scopes.
     cursor_overrides: Vec<(CursorKey, CursorID)>,
@@ -879,6 +881,7 @@ impl ProgramBuilder {
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
+            noop_ddl: false,
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
@@ -2261,6 +2264,25 @@ impl ProgramBuilder {
         self.read_database_cookies
             .insert(database_id, schema_cookie);
         Ok(())
+    }
+
+    /// For a CREATE ... IF NOT EXISTS whose object exists, or a DROP ... IF EXISTS
+    /// whose object is missing. Like SQLite (sqlite3CodeVerifySchema plus
+    /// sqlite3ForceNotReadOnly), the statement only reads the schema of
+    /// `database_id`, so it does not take the write lock, but it is still not
+    /// reported as read-only.
+    pub fn begin_noop_ddl(
+        &mut self,
+        database_id: usize,
+        schema_cookie: u32,
+    ) -> Result<(), alloc::TryReserveError> {
+        self.noop_ddl = true;
+        self.flags.set_readonly(false);
+        self.begin_read_on_database(database_id, schema_cookie)
+    }
+
+    pub const fn is_noop_ddl(&self) -> bool {
+        self.noop_ddl
     }
 
     pub const fn begin_concurrent_operation(&mut self) {

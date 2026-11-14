@@ -610,11 +610,12 @@ fn translate_statement(
     };
 
     if is_write {
-        if is_dml {
+        if is_dml || program.is_noop_ddl() {
             // DML translators register their actual write database. Keep a
             // main read transaction to coordinate connection-level autocommit,
             // without upgrading an unrelated main snapshot for attached-only
-            // writes.
+            // writes. A no-op CREATE/DROP has already opened a read on the
+            // database it checked and needs no write at all.
             program.begin_read_operation()?;
         } else {
             program.begin_write_operation()?;
