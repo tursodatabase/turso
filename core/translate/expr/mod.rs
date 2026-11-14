@@ -29,7 +29,7 @@ use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::vdbe::{
-    builder::ProgramBuilder,
+    builder::{ConstantSpanPlacement, ProgramBuilder},
     insn::{CmpInsFlags, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };

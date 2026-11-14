@@ -29,3 +29,132 @@ test constant_overflowing_projection_still_errors_when_where_is_true {
 expect error {
     integer overflow
 }
+
+# A constant that calls a function runs the first time a row needs it, not
+# before the scan starts, so an empty scan raises no error from it.
+setup empty_table {
+    CREATE TABLE t(a);
+}
+
+setup one_row {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+}
+
+@setup empty_table
+test constant_function_projection_skipped_for_empty_table {
+    SELECT abs(-9223372036854775807-1), json('x'), 'x' -> '$' FROM t;
+}
+expect {
+}
+
+@setup empty_table
+test constant_like_with_bad_escape_skipped_for_empty_table {
+    SELECT 'a' LIKE 'b' ESCAPE 'xx' FROM t;
+}
+expect {
+}
+
+@setup empty_table
+test constant_function_inside_expression_skipped_for_empty_table {
+    SELECT NOT ABS(~CAST(HEX(1738.6573123836424) AS REAL)) >= 1 FROM t;
+}
+expect {
+}
+
+@setup empty_table
+test constant_function_in_where_skipped_for_empty_table {
+    SELECT 1 FROM t WHERE a = abs(-9223372036854775807-1);
+}
+expect {
+}
+
+@setup empty_table
+test constant_function_in_order_by_and_group_by_skipped_for_empty_table {
+    SELECT count(*) FROM t GROUP BY json('x') ORDER BY abs(-9223372036854775807-1);
+}
+expect {
+}
+
+@setup one_row
+test constant_function_projection_skipped_when_where_filters_all_rows {
+    SELECT ABS(~CAST(HEX(1738.6573123836424) AS REAL)) FROM t WHERE ZEROBLOB(795);
+}
+expect {
+}
+
+@setup one_row
+test constant_function_projection_still_errors_for_a_row {
+    SELECT json('x') FROM t;
+}
+expect error {
+    malformed JSON
+}
+
+test constant_function_projection_keeps_value_for_every_row {
+    SELECT value, json('[1]'), abs(-2) FROM generate_series(1, 3);
+}
+expect {
+    1|[1]|2
+    2|[1]|2
+    3|[1]|2
+}
+
+# An inner-join ON term that reads no table runs before the loops, like a
+# constant WHERE term, so its error is raised even when no row pair exists.
+setup one_row_and_empty_table {
+    CREATE TABLE t(a);
+    CREATE TABLE e(a);
+    INSERT INTO t VALUES (1);
+}
+
+@setup one_row_and_empty_table
+test constant_function_in_inner_join_on_errors_for_empty_right_table {
+    SELECT 1 FROM t JOIN e ON abs(-9223372036854775807-1);
+}
+expect error {
+    integer overflow
+}
+
+@setup one_row_and_empty_table
+test constant_function_in_cross_join_on_errors_for_empty_right_table {
+    SELECT 1 FROM t CROSS JOIN e ON json('x');
+}
+expect error {
+    malformed JSON
+}
+
+@setup one_row
+test constant_function_in_inner_join_on_errors_when_other_on_term_rejects_all_rows {
+    SELECT 1 FROM t JOIN t AS u ON u.a = 99 AND json('x');
+}
+expect error {
+    malformed JSON
+}
+
+@setup one_row
+test constant_function_in_inner_join_on_errors_through_view {
+    CREATE VIEW v AS SELECT t.a FROM t JOIN t AS u ON u.a = 99 AND json('x');
+    SELECT * FROM v;
+}
+expect error {
+    malformed JSON
+}
+
+# With a RIGHT JOIN in the FROM clause, the inner-join ON term stays in its
+# loop, so the unmatched right rows are still returned.
+@setup one_row_and_empty_table
+test constant_function_in_inner_join_on_before_right_join_runs_in_its_loop {
+    SELECT u.a FROM t JOIN e ON abs(-9223372036854775807-1) RIGHT JOIN t AS u ON 1;
+}
+expect {
+    1
+}
+
+@setup one_row_and_empty_table
+test constant_false_inner_join_on_before_right_join_keeps_unmatched_rows {
+    SELECT t.a, u.a FROM t JOIN e ON 0 RIGHT JOIN t AS u ON 1;
+}
+expect {
+    |1
+}

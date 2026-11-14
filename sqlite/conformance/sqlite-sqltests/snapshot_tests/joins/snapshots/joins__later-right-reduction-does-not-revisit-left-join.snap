@@ -35,8 +35,8 @@ addr  opcode             p1  p2  p3  p4      p5  comment
    2  OpenRead            1   3   0  k(2,B)   0  table=reduction_chain_b, root=3, iDb=0
    3  OpenRead            2   4   0  k(2,B)   0  table=reduction_chain_c, root=4, iDb=0
    4  OpenRead            3   5   0  k(2,B)   0  table=reduction_chain_d, root=5, iDb=0
-   5  Rewind              2  32   0           0  Rewind table reduction_chain_c
-   6    IfNot             6  31   1           0  if !r[6] goto 31
+   5  IfNot               6  32   1           0  if !r[6] goto 32
+   6  Rewind              2  32   0           0  Rewind table reduction_chain_c
    7    Column            2   0   8           0  r[8]=reduction_chain_c.id
    8    Le                8   9  31  Binary   0  if r[8]<=r[9] goto 31
    9    Rewind            0  31   0           0  Rewind table reduction_chain_a
@@ -61,7 +61,7 @@ addr  opcode             p1  p2  p3  p4      p5  comment
   28      NullRow         1   0   0           0  Set cursor 1 to a (pseudo) NULL row
   29      Goto            0  15   0           0
   30    Next              0  10   0           1
-  31  Next                2   6   0           1
+  31  Next                2   7   0           1
   32  Halt                0   0   0           0
   33  Transaction         0   1   4           0  iDb=0 tx_mode=Read
   34  Integer             1   6   0           0  r[6]=1
