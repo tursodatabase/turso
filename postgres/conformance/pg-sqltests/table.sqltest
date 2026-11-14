@@ -948,3 +948,9 @@ test update-set-default-without-column-default-sets-null {
 expect {
     1|x
 }
+
+# A double-quoted name is always an identifier in PostgreSQL, never a string as in SQLite.
+test table-check-double-quoted-name-is-not-a-string {
+    CREATE TABLE t (c text CHECK (c <> "q"));
+}
+expect error {}
