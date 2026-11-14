@@ -307,6 +307,7 @@ expect {
 }
 
 @backend rust
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
 test unqualified-rowid-without-rowid-and-table {
     CREATE TABLE t1(a PRIMARY KEY) WITHOUT ROWID;
     CREATE TABLE t2(b);
