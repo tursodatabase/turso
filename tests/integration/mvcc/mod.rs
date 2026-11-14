@@ -1,4 +1,5 @@
 mod checkpoint;
+mod database;
 mod test_db;
 
 use crate::common::{ExecRows, TempDatabase};

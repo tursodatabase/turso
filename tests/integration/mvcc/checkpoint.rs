@@ -4335,7 +4335,7 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
     );
 }
 
-fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
+pub(super) fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
     stmt.run_with_row_callback(|row| {
@@ -4347,7 +4347,7 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     rows
 }
 
-fn assert_integrity_ok(conn: &Arc<Connection>) {
+pub(super) fn assert_integrity_ok(conn: &Arc<Connection>) {
     let rows = get_rows(conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1, "integrity_check rows: {rows:?}");
     assert_eq!(rows[0][0].to_string(), "ok");
@@ -4444,22 +4444,22 @@ fn assert_table_counts(conn: &Arc<Connection>, expected_t: i64, expected_u: i64)
 }
 
 #[derive(Debug)]
-struct FixedYieldInjector {
+pub(super) struct FixedYieldInjector {
     remaining: Mutex<HashSet<YieldPoint>>,
 }
 
 impl FixedYieldInjector {
-    fn new(points: impl IntoIterator<Item = YieldPoint>) -> Arc<Self> {
+    pub(super) fn new(points: impl IntoIterator<Item = YieldPoint>) -> Arc<Self> {
         Arc::new(Self {
             remaining: Mutex::new(points.into_iter().collect()),
         })
     }
 
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.remaining.lock().is_empty()
     }
 
-    fn remaining_len(&self) -> usize {
+    pub(super) fn remaining_len(&self) -> usize {
         self.remaining.lock().len()
     }
 }
@@ -4561,12 +4561,12 @@ impl YieldInjector for CheckpointingInsertAtMvccBeginInjector {
 }
 
 #[derive(Debug)]
-struct FixedFailureInjector {
+pub(super) struct FixedFailureInjector {
     remaining: Mutex<std::collections::HashMap<YieldPoint, LimboError>>,
 }
 
 impl FixedFailureInjector {
-    fn new(points: impl IntoIterator<Item = (YieldPoint, LimboError)>) -> Arc<Self> {
+    pub(super) fn new(points: impl IntoIterator<Item = (YieldPoint, LimboError)>) -> Arc<Self> {
         Arc::new(Self {
             remaining: Mutex::new(points.into_iter().collect()),
         })
@@ -4588,7 +4588,7 @@ impl FailureInjector for FixedFailureInjector {
     }
 }
 
-fn wal_path_for_db(path: &str) -> std::path::PathBuf {
+pub(super) fn wal_path_for_db(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{path}-wal"))
 }
 

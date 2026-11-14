@@ -3296,6 +3296,11 @@ impl Pager {
         self.wal.as_ref().map(|wal| wal.backfill_frame())
     }
 
+    /// Number of the last frame in the WAL, or `None` if there is no WAL.
+    pub fn wal_max_frame(&self) -> Option<u64> {
+        self.wal.as_ref().map(|wal| wal.get_max_frame_in_wal())
+    }
+
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {

@@ -4670,7 +4670,7 @@ mod tests {
         let conn = db.connect();
         let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
-        let schema = conn.schema.read();
+        let schema = conn.current_schema();
         let table = schema
             .get_table(NamespaceId::ROOT, "test")
             .expect("table test should exist");
