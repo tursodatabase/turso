@@ -8,6 +8,7 @@ use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
 use crate::storage::{
     buffer_pool::BufferPool,
+    checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
     database::DatabaseStorage,
     sqlite3_ondisk::{
         self, parse_wal_frame_header, DatabaseHeader, OverflowCell, PageSize, PageType,
@@ -1578,6 +1579,13 @@ pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
     page_size: AtomicU32,
+    /// Set while this process writes page 1 of a new database, from the moment the
+    /// write is issued until it is published. The main database file is non-empty
+    /// in that window without the database being initialized for this process yet.
+    allocating_page1: AtomicBool,
+    /// The database's WAL is shared with other processes (experimental multiprocess
+    /// WAL), so an empty database seen at open can be created behind our back.
+    multiprocess_wal: bool,
 }
 
 impl SharedPagerState {
@@ -1592,7 +1600,14 @@ impl SharedPagerState {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
+            allocating_page1: AtomicBool::new(false),
+            multiprocess_wal: false,
         }
+    }
+
+    pub(crate) fn with_multiprocess_wal(mut self, enabled: bool) -> Self {
+        self.multiprocess_wal = enabled;
+        self
     }
 
     pub(crate) fn initialized(&self) -> bool {
@@ -3309,7 +3324,80 @@ impl Pager {
             // Invalidate cached schema cookie to force re-read on next access
             self.set_schema_cookie(None);
         }
+        if !self.db_initialized() {
+            if let Err(err) = self.adopt_database_initialized_elsewhere() {
+                wal.end_read_tx();
+                return Err(err);
+            }
+        }
         Ok(())
+    }
+
+    /// Whether the main database file has been written although this pager still
+    /// holds the in-memory page 1 of the empty database it was opened on. Only
+    /// another process sharing the WAL can do that: this process publishes its own
+    /// page 1 through `allocating_page1` and `init_page_1` together. Always false
+    /// without the multiprocess WAL, where no other process can write the file.
+    fn database_initialized_elsewhere(&self) -> Result<bool> {
+        if !self.shared.multiprocess_wal
+            || self.wal.is_none()
+            || self.ephemeral.load(Ordering::Relaxed)
+            || self.db_initialized()
+            || self.shared.allocating_page1.load(Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+        Ok(self.db_file.size()? > 0)
+    }
+
+    /// Drop the in-memory page 1 of an empty database that another process has
+    /// initialized since this process opened it, so that this process neither
+    /// reads its empty header nor allocates a second page 1 over the committed one.
+    /// Returns true if the database was adopted. The caller must hold a WAL read
+    /// transaction, and for a write the WAL write lock.
+    ///
+    /// Statements prepared against the empty schema notice the foreign schema
+    /// cookie in `Transaction` and reprepare, like after any cross-process schema
+    /// change.
+    fn adopt_database_initialized_elsewhere(&self) -> Result<bool> {
+        if !self.database_initialized_elsewhere()? {
+            return Ok(false);
+        }
+        let _lock = self.shared.init_lock.lock();
+        // Re-check under the lock: a connection of this process may have just
+        // finished (or started) allocating page 1.
+        if !self.database_initialized_elsewhere()? {
+            return Ok(false);
+        }
+        let encrypted = self.is_encryption_ctx_set() || self.has_external_page_codec();
+        if !encrypted {
+            // Page 1 is always written to the main file first (see allocate_page1),
+            // so its header gives the page size and reserved space the creator chose.
+            // They may differ from what this process assumed for an empty database
+            // (PRAGMA page_size before the first write, a different default).
+            let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
+            let c = self
+                .db_file
+                .read_header(crate::database::new_header_read_completion(buf.clone()))?;
+            self.io.wait_for_completion(c)?;
+            let (reserved, page_size) = crate::Database::plain_header_page_info(
+                &crate::database::DbHeaderRead::Full(buf),
+                false,
+            )?;
+            self.set_page_size(page_size);
+            self.set_reserved_space_bytes(reserved);
+            if reserved != CHECKSUM_REQUIRED_RESERVED_BYTES {
+                self.reset_checksum_context();
+            }
+        }
+        self.buffer_pool
+            .finalize_with_page_size(self.get_page_size_unchecked().get() as usize)?;
+        self.shared.init_page_1.store(None);
+        *self.allocate_page1_state.write() = AllocatePage1State::Done;
+        // Anything cached so far was read against the empty database.
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(true)
     }
 
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
@@ -3347,15 +3435,36 @@ impl Pager {
     pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> IOResultOr<()> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
-        return_if_io!(self.maybe_allocate_page1());
+        if !self.shared.multiprocess_wal {
+            return_if_io!(self.maybe_allocate_page1());
+        }
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        if self.shared.multiprocess_wal && !self.db_initialized() {
+            // Page 1 of a new database is created under the write lock: another
+            // process may have created it since our read snapshot, and writing a
+            // fresh page 1 over theirs would lose their commits. The write lock
+            // also keeps every other process out while the allocation runs, so it
+            // is driven to completion here instead of yielding with the lock held.
+            // Blocking is fine: the multiprocess WAL only runs on host IO backends.
+            if let Err(err) = self.init_database_under_write_lock() {
+                wal.end_write_tx();
+                return Err(err.into());
+            }
+        }
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
         Ok(IOResult::Done(()))
+    }
+
+    fn init_database_under_write_lock(&self) -> Result<()> {
+        if self.adopt_database_initialized_elsewhere()? {
+            return Ok(());
+        }
+        self.io.block(|| self.maybe_allocate_page1())
     }
 
     /// Fill in the WAL position of savepoints opened before this write
@@ -5767,6 +5876,7 @@ impl Pager {
 
                 // Pin page1 to prevent eviction while stored in state machine
                 page1.pin();
+                self.shared.allocating_page1.store(true, Ordering::SeqCst);
                 *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
                 io_yield_one!(c);
             }
@@ -5812,6 +5922,7 @@ impl Pager {
         })?;
         // After we wrote the header page, we may now set this None, to signify we initialized
         self.shared.init_page_1.store(None);
+        self.shared.allocating_page1.store(false, Ordering::SeqCst);
         page.unpin();
         *self.allocate_page1_state.write() = AllocatePage1State::Done;
         Ok(IOResult::Done(page))

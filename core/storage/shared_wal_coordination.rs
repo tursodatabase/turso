@@ -34,6 +34,7 @@ use crate::{
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::time::Duration;
 
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
@@ -41,6 +42,9 @@ const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
+/// How long an open waits for the init lock before failing with `Busy`.
+const INIT_LOCK_WAIT: Duration = Duration::from_secs(5);
+const INIT_LOCK_POLL: Duration = Duration::from_millis(1);
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
 const UNUSED_READER_FRAME: u64 = u64::MAX;
 /// Frame stored in the reader slot of readers that read only the database
@@ -59,6 +63,17 @@ const WRITER_LOCK_OFFSET: u64 = 1;
 const CHECKPOINT_LOCK_OFFSET: u64 = 2;
 /// Byte range starting at 3: one reader-byte lock per shared reader slot.
 const READER_LOCK_START_OFFSET: u64 = 3;
+/// Init lock: serializes opens of the coordination file. It is held from
+/// before the lifetime byte is probed until the open mode is decided and, for
+/// an opener that may create the file, until the file is sized, initialized or
+/// validated, and published. Openers that may create the file take it
+/// exclusively, read-only openers shared. It is not held after open.
+///
+/// Bytes 0..3 and the reader range are all taken, so this byte sits far
+/// beyond them (like SQLite's pending byte) instead of shifting the reader
+/// bytes, which other builds still lock at their current offsets. Byte-range
+/// locks may lie beyond the end of the file.
+const INIT_LOCK_OFFSET: u64 = 0x4000_0000;
 /// Entries per frame-index block in the append-only shared page->frame index.
 const FRAME_INDEX_BLOCK_CAPACITY: u32 = 4096;
 /// Open-addressing hash slots per frame-index block.
@@ -613,6 +628,64 @@ pub(crate) enum SharedWalCoordinationOpenMode {
     MultiProcess,
 }
 
+/// Result of locking the lifetime byte and mapping the coordination header.
+struct OpenedHeader {
+    open_mode: SharedWalCoordinationOpenMode,
+    metadata_len: usize,
+    /// The file was short and no other process holds it: initialize it.
+    initialize: bool,
+    base_mapping: Box<dyn SharedWalMappedRegion>,
+    /// Held until the caller has finished initializing or validating the file.
+    init_lock: InitLock,
+}
+
+/// Guard for the byte lock at `INIT_LOCK_OFFSET`.
+struct InitLock {
+    file: Arc<dyn File>,
+    lock_kind: SharedWalLockKind,
+    held: bool,
+}
+
+impl InitLock {
+    /// Take the init lock, waiting at most `INIT_LOCK_WAIT` for another opener
+    /// to finish. A holder that died has released it, so the wait ends.
+    fn acquire(
+        io: &Arc<dyn IO>,
+        file: &Arc<dyn File>,
+        lock_kind: SharedWalLockKind,
+        exclusive: bool,
+    ) -> Result<Self> {
+        let deadline = io.current_time_monotonic() + INIT_LOCK_WAIT;
+        while !file.shared_wal_try_lock_byte(INIT_LOCK_OFFSET, exclusive, lock_kind)? {
+            if io.current_time_monotonic() >= deadline {
+                return Err(LimboError::Busy);
+            }
+            io.sleep(INIT_LOCK_POLL);
+        }
+        Ok(Self {
+            file: file.clone(),
+            lock_kind,
+            held: true,
+        })
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.held = false;
+        self.file
+            .shared_wal_unlock_byte(INIT_LOCK_OFFSET, self.lock_kind)
+    }
+}
+
+impl Drop for InitLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = self
+                .file
+                .shared_wal_unlock_byte(INIT_LOCK_OFFSET, self.lock_kind);
+        }
+    }
+}
+
 /// Which locking primitive is used for cross-process slot ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SharedWalOwnershipMode {
@@ -874,7 +947,8 @@ impl MappedSharedWalCoordination {
     /// initialized. Subsequent opens in other processes mmap the existing
     /// file. The open-mode (Exclusive vs MultiProcess) is determined by
     /// attempting an exclusive lock on byte 0: if it succeeds no other
-    /// process has the file open, so we are exclusive.
+    /// process has the file open, so we are exclusive. The init lock keeps
+    /// two openers from deciding that at the same time.
     pub(crate) fn create_or_open(
         io: &Arc<dyn IO>,
         path: &Path,
@@ -927,6 +1001,40 @@ impl MappedSharedWalCoordination {
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
     ) -> Result<Self> {
+        Self::create_or_open_with_hook(io, path, reader_slot_count, ownership_mode, &|| {}, &|| {})
+    }
+
+    /// Like `create_or_open`, with two pause points for tests:
+    /// `after_probe` runs with the init lock held, after the lifetime byte was
+    /// probed and before it is taken; `before_initialize` runs while this
+    /// process is the creator of a new file: sized, init and lifetime locks
+    /// held, header not yet published.
+    #[cfg(test)]
+    pub(crate) fn create_or_open_paused_for_tests(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+        after_probe: &dyn Fn(),
+        before_initialize: &dyn Fn(),
+    ) -> Result<Self> {
+        Self::create_or_open_with_hook(
+            io,
+            path,
+            reader_slot_count,
+            Self::default_ownership_mode(),
+            after_probe,
+            before_initialize,
+        )
+    }
+
+    fn create_or_open_with_hook(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+        after_probe: &dyn Fn(),
+        before_initialize: &dyn Fn(),
+    ) -> Result<Self> {
         turso_assert!(
             reader_slot_count >= 64 && reader_slot_count % 64 == 0,
             "reader_slot_count must be a non-zero multiple of 64"
@@ -939,21 +1047,20 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
-        let metadata_len = file.size()? as usize;
-        let initialize = metadata_len == 0
-            || (open_mode == SharedWalCoordinationOpenMode::Exclusive && metadata_len < base_len);
-        if open_mode == SharedWalCoordinationOpenMode::MultiProcess && metadata_len < base_len {
-            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
-            )));
-        }
-        if initialize {
-            file.shared_wal_set_len(initial_file_len as u64)?;
-        }
-
-        let base_mapping = file.shared_wal_map(0, base_len)?;
+        let OpenedHeader {
+            open_mode,
+            metadata_len,
+            initialize,
+            base_mapping,
+            init_lock,
+        } = Self::lock_and_map_header(
+            io,
+            &file,
+            lock_kind,
+            base_len,
+            Some(initial_file_len),
+            after_probe,
+        )?;
         let base_ptr = base_mapping.ptr();
 
         let mut region = Self::new_region(
@@ -966,6 +1073,7 @@ impl MappedSharedWalCoordination {
             open_mode,
         );
         if initialize {
+            before_initialize();
             region.initialize(reader_slot_count);
         } else if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
             if open_mode == SharedWalCoordinationOpenMode::Exclusive {
@@ -979,6 +1087,7 @@ impl MappedSharedWalCoordination {
             region.sanitized_backfill_proof_on_open =
                 region.sanitize_backfill_proof_for_exclusive_open();
         }
+        init_lock.release()?;
         let (registry_path, frame_index_publish_lock, process_local_ownership) =
             Self::register_process_mapping(
                 path,
@@ -1019,16 +1128,13 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
-        let metadata_len = file.size()? as usize;
-        if metadata_len < base_len {
-            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-            return Err(LimboError::Corrupt(format!(
-                "shared WAL coordination file is smaller than the coordination header: got {metadata_len}, minimum {base_len}"
-            )));
-        }
-
-        let base_mapping = file.shared_wal_map(0, base_len)?;
+        let OpenedHeader {
+            open_mode,
+            metadata_len,
+            base_mapping,
+            init_lock,
+            ..
+        } = Self::lock_and_map_header(io, &file, lock_kind, base_len, None, &|| {})?;
         let base_ptr = base_mapping.ptr();
         let mut region = Self::new_region(
             file,
@@ -1045,6 +1151,7 @@ impl MappedSharedWalCoordination {
                 .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
             return Err(err);
         }
+        init_lock.release()?;
         let (registry_path, frame_index_publish_lock, process_local_ownership) =
             Self::register_process_mapping(
                 path,
@@ -1062,27 +1169,96 @@ impl MappedSharedWalCoordination {
         READER_LOCK_START_OFFSET + slot_index as u64
     }
 
-    fn detect_open_mode(
+    /// Take the init lock and the lifetime lock, decide the open mode and map
+    /// the header.
+    ///
+    /// The init lock is held from before the lifetime byte is probed, so two
+    /// first openers cannot both find it free and both initialize the file. A
+    /// new coordination file is created, sized and initialized by one process
+    /// that holds the init lock throughout, and publishes the magic last, so
+    /// an opener that gets the init lock afterwards sees a published header.
+    /// The caller keeps the returned `init_lock` until it has finished
+    /// initializing or validating the file. A creator that died holds no lock,
+    /// so the next opener becomes the exclusive owner and re-initializes. If
+    /// the init lock is still held after `INIT_LOCK_WAIT` the open fails with
+    /// `Busy`, which callers may retry.
+    ///
+    /// `initial_file_len` is `Some` for openers that may create the file; they
+    /// take the init lock exclusively. With `None` the lock is shared, the
+    /// file is never resized or initialized, and a short file or an
+    /// unpublished header with no live creator is reported as `Busy`: a
+    /// writable opener will repair it.
+    ///
+    /// `after_probe` runs after the lifetime byte was probed and before it is
+    /// taken; tests use it to pause an opener there.
+    fn lock_and_map_header(
+        io: &Arc<dyn IO>,
         file: &Arc<dyn File>,
         lock_kind: SharedWalLockKind,
         base_len: usize,
-    ) -> Result<SharedWalCoordinationOpenMode> {
-        let metadata_len_before_probe = file.size()? as usize;
-        match file.shared_wal_probe_exclusive_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)? {
-            true => {
-                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-                let metadata_len_after_probe = file.size()? as usize;
-                if metadata_len_before_probe < base_len && metadata_len_after_probe >= base_len {
-                    Ok(SharedWalCoordinationOpenMode::MultiProcess)
-                } else {
-                    Ok(SharedWalCoordinationOpenMode::Exclusive)
-                }
-            }
-            false => {
-                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-                Ok(SharedWalCoordinationOpenMode::MultiProcess)
-            }
+        initial_file_len: Option<usize>,
+        after_probe: &dyn Fn(),
+    ) -> Result<OpenedHeader> {
+        let init_lock = InitLock::acquire(io, file, lock_kind, initial_file_len.is_some())?;
+        let open_mode = Self::detect_open_mode(file, lock_kind, after_probe)?;
+        let metadata_len = file.size()? as usize;
+        let multi_process = open_mode == SharedWalCoordinationOpenMode::MultiProcess;
+        let mut initialize = false;
+        if !multi_process && metadata_len < base_len {
+            let Some(initial_file_len) = initial_file_len else {
+                // A creator makes the file empty before it takes the init
+                // lock, so a short file with no lifetime holder is a creator
+                // that has not started or one that died. Neither is
+                // corruption; a writable opener repairs the file, so the
+                // read-only opener retries.
+                file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+                return Err(LimboError::Busy);
+            };
+            file.shared_wal_set_len(initial_file_len as u64)?;
+            initialize = true;
         }
+        if multi_process && metadata_len < base_len {
+            // A creator holds the init lock from before it takes the lifetime
+            // lock until the header is published, so with the init lock held
+            // here a holder of the lifetime lock has already sized the file.
+            // One that has not does not follow that protocol: let the caller
+            // retry.
+            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+            return Err(LimboError::Busy);
+        }
+        let base_mapping = file.shared_wal_map(0, base_len)?;
+        // Only an opener that may create the file can finish an unpublished
+        // header in exclusive mode; a read-only one waits for a writer.
+        if (multi_process || initial_file_len.is_none()) && !Self::header_published(&*base_mapping)
+        {
+            file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+            return Err(LimboError::Busy);
+        }
+        Ok(OpenedHeader {
+            open_mode,
+            metadata_len,
+            initialize,
+            base_mapping,
+            init_lock,
+        })
+    }
+
+    /// Probe the lifetime byte, then take it shared. Callers hold the init
+    /// lock, so no other opener can take the byte between the two steps.
+    fn detect_open_mode(
+        file: &Arc<dyn File>,
+        lock_kind: SharedWalLockKind,
+        after_probe: &dyn Fn(),
+    ) -> Result<SharedWalCoordinationOpenMode> {
+        let alone =
+            file.shared_wal_probe_exclusive_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+        after_probe();
+        file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+        Ok(if alone {
+            SharedWalCoordinationOpenMode::Exclusive
+        } else {
+            SharedWalCoordinationOpenMode::MultiProcess
+        })
     }
 
     /// Return whether dropping this mapping would leave no other process with
@@ -1309,16 +1485,22 @@ impl MappedSharedWalCoordination {
     /// probes here is weaker and can misclassify recycled PIDs as live.
     pub(crate) fn repair_transient_state_for_exclusive_open(&self) {
         let header = self.header();
-        header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
-        header
-            .checkpoint_owner
-            .store(UNOWNED_LOCK, Ordering::Release);
+        let local = self.local_lock_state.lock();
+        // A lock this mapping holds itself keeps its owner record: the caller
+        // may hold the writer and checkpoint locks while it repairs.
+        if !local.writer_lock_held {
+            header.writer_owner.store(UNOWNED_LOCK, Ordering::Release);
+        }
+        if !local.checkpoint_lock_held {
+            header
+                .checkpoint_owner
+                .store(UNOWNED_LOCK, Ordering::Release);
+        }
 
         // For reader slots, we must check byte-range locks before
         // clearing: another live process may hold a slot. Blindly clearing
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
-        let local = self.local_lock_state.lock();
         let process_local = self.process_local_ownership.lock();
         for slot_index in 0..header.reader_slot_count {
             if local.reader_locks[slot_index as usize] > 0 {
@@ -2895,7 +3077,6 @@ impl MappedSharedWalCoordination {
             .as_ptr()
             .cast::<SharedWalCoordinationMapHeader>();
         unsafe {
-            std::ptr::addr_of_mut!((*header).magic).write(SHARED_WAL_COORDINATION_MAGIC);
             std::ptr::addr_of_mut!((*header).version).write(SHARED_WAL_COORDINATION_VERSION);
             std::ptr::addr_of_mut!((*header).reader_slot_count).write(reader_slot_count);
             std::ptr::addr_of_mut!((*header).reader_bitmap_word_count)
@@ -2941,6 +3122,26 @@ impl MappedSharedWalCoordination {
         for owner in self.reader_owners() {
             owner.store(UNOWNED_LOCK, Ordering::Release);
         }
+        // Written last: a zero magic means initialization is unfinished.
+        unsafe {
+            Self::magic_word(self.base_ptr.as_ptr()).store(
+                u64::from_ne_bytes(SHARED_WAL_COORDINATION_MAGIC),
+                Ordering::Release,
+            );
+        }
+    }
+
+    fn header_published(mapping: &dyn SharedWalMappedRegion) -> bool {
+        // SAFETY: the mapping is at least one header long and page aligned.
+        let magic = unsafe { Self::magic_word(mapping.ptr().as_ptr()) };
+        magic.load(Ordering::Acquire) != 0
+    }
+
+    /// SAFETY: `base` must point to a live, 8-byte aligned header mapping.
+    // std atomic, not crate::sync: shuttle's AtomicU64 has no `from_ptr`, and
+    // this word is shared with other processes, which shuttle cannot model.
+    unsafe fn magic_word<'a>(base: *mut u8) -> &'a std::sync::atomic::AtomicU64 {
+        unsafe { std::sync::atomic::AtomicU64::from_ptr(base.cast::<u64>()) }
     }
 
     fn validate_existing(
