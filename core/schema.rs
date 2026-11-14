@@ -5950,11 +5950,15 @@ impl BTreeTable {
         &self,
         column_index: usize,
         definition: &ColumnDefinition,
+        schema: &Schema,
     ) -> Result<Column> {
         let mut column = Column::from_definition(
             definition,
             FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, self.is_strict),
         )?;
+        if self.is_strict {
+            column.resolve_custom_type(schema)?;
+        }
         if self.columns()[column_index].primary_key() && !self.primary_key_is_inline {
             if column.is_generated() {
                 bail_parse_error!(
