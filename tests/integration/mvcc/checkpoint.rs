@@ -398,6 +398,73 @@ fn clearing_the_marks_yields_on_many_rows() {
     assert!(store.checkpoint_dirty_table_keys.is_empty());
 }
 
+#[test]
+fn removing_written_table_versions_yields_on_many_rows() {
+    let db = TempDatabase::new_with_mvcc("gc_many_table_rows");
+    let conn = connect_without_auto_checkpoint(&db);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    insert_rows(&conn, "t", 1, MANY_ROWS);
+    let table = btree_id(&conn, "t");
+    let store = store(&conn);
+    assert_eq!(table_version_count(&store, table), MANY_ROWS);
+
+    let mut checkpoint = SteppedCheckpoint::start(&db, &conn, TRUNCATE);
+    checkpoint.step_until_state(|state| matches!(state, CheckpointState::GcTableRows { .. }));
+    assert_eq!(
+        checkpoint.step(),
+        Step::Yielded,
+        "removing the versions of more than COLLECT_PREEMPTION_THRESHOLD rows must yield"
+    );
+    assert!(matches!(
+        checkpoint.state(),
+        CheckpointState::GcTableRows { .. }
+    ));
+    checkpoint.finish();
+
+    assert_eq!(
+        table_version_count(&store, table),
+        0,
+        "the versions the checkpoint wrote to the database file are removed"
+    );
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(MANY_ROWS as i64,)]);
+}
+
+#[test]
+fn removing_written_index_versions_yields_on_many_rows() {
+    let db = TempDatabase::new_with_mvcc("gc_many_index_rows");
+    let conn = connect_without_auto_checkpoint(&db);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    insert_rows(&conn, "t", 1, MANY_ROWS);
+    let index = btree_id(&conn, "t_v");
+    let store = store(&conn);
+    assert_eq!(index_version_count(&store, index), MANY_ROWS);
+
+    let mut checkpoint = SteppedCheckpoint::start(&db, &conn, TRUNCATE);
+    checkpoint.step_until_state(|state| matches!(state, CheckpointState::GcIndexRows { .. }));
+    assert_eq!(
+        checkpoint.step(),
+        Step::Yielded,
+        "removing the versions of more than COLLECT_PREEMPTION_THRESHOLD index rows must yield"
+    );
+    assert!(matches!(
+        checkpoint.state(),
+        CheckpointState::GcIndexRows { .. }
+    ));
+    checkpoint.finish();
+
+    assert_eq!(
+        index_version_count(&store, index),
+        0,
+        "the index versions the checkpoint wrote to the database file are removed"
+    );
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t INDEXED BY t_v WHERE v > ''");
+    assert_eq!(rows, vec![(MANY_ROWS as i64,)]);
+}
+
 type Store = MvStore<turso_core::mvcc::MvccClock, turso_core::alloc::DynAllocator>;
 
 const TRUNCATE: CheckpointMode = CheckpointMode::Truncate {
@@ -574,4 +641,22 @@ fn is_marked(store: &Store, table: MVTableId, rowid: i64) -> bool {
     store
         .checkpoint_dirty_table_keys
         .contains_key(&RowID::new(table, RowKey::Int(rowid)))
+}
+
+fn table_version_count(store: &Store, table: MVTableId) -> usize {
+    store
+        .rows
+        .iter()
+        .filter(|entry| entry.key().table_id == table)
+        .map(|entry| entry.value().read().len())
+        .sum()
+}
+
+fn index_version_count(store: &Store, index: MVTableId) -> usize {
+    store.index_rows.get(&index).map_or(0, |rows| {
+        rows.value()
+            .iter()
+            .map(|entry| entry.value().read().len())
+            .sum()
+    })
 }
