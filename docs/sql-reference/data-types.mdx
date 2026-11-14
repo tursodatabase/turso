@@ -140,7 +140,7 @@ Turso provides several built-in custom types available in STRICT tables:
 | `smallint` | INTEGER | Integer constrained to -32768..32767 |
 | `boolean` | INTEGER | Integer constrained to 0 or 1 |
 | `uuid` | BLOB | UUID stored as 16-byte blob, displayed as string |
-| `bytea` | BLOB | Binary data (PostgreSQL-compatible alias) |
+| `bytea` | BLOB | Binary data; text is read as PostgreSQL bytea input (`'\x0aff'`) |
 | `inet` | TEXT | IP address |
 | `json` | TEXT | Validated JSON text |
 | `jsonb` | BLOB | JSON in binary format |

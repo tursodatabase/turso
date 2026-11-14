@@ -2610,3 +2610,29 @@ expect {
     in|1
     subquery|2
 }
+
+# A text cast to bytea is read as PostgreSQL reads bytea input: `\x` starts
+# the hex format, where whitespace may separate the bytes, and other text is
+# the escape format, where `\\` is a backslash and `\nnn` an octal byte.
+test cast-text-to-bytea-reads-bytea-input {
+    SELECT length('\x0aff'::bytea), get_byte('\x0aff'::bytea, 0), get_byte('\x0aff'::bytea, 1);
+    SELECT length(CAST('\x0aff' AS bytea));
+    SELECT length('\x de AD '::bytea), get_byte('\x de AD '::bytea, 1);
+    SELECT length('\x'::bytea), length(''::bytea), length('abc'::bytea);
+    SELECT length('a\\\\b'::bytea), get_byte('a\\\\b'::bytea, 1);
+    SELECT length('\001\377'::bytea), get_byte('\001\377'::bytea, 1);
+    SELECT CASE WHEN pg_input_is_valid('\x0aff', 'bytea') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('\x0aF', 'bytea') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('a\b', 'bytea') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    2|10|255
+    2
+    2|173
+    0|0|3
+    3|92
+    2|255
+    valid
+    invalid
+    invalid
+}

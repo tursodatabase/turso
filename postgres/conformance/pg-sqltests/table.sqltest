@@ -857,6 +857,21 @@ expect {
     1
 }
 
+# A text stored in a bytea column is read as bytea input, as a cast to bytea
+# reads it.
+test insert-text-into-bytea-column-reads-bytea-input {
+    CREATE TABLE bytea_input (x bytea);
+    INSERT INTO bytea_input VALUES ('\x0aff'), ('a\\\\b'), (NULL);
+    SELECT length(x), get_byte(x, 1) FROM bytea_input WHERE x IS NOT NULL ORDER BY length(x);
+    SELECT count(*) FROM bytea_input WHERE x = '\x0aff';
+    DROP TABLE bytea_input;
+}
+expect {
+    2|255
+    3|92
+    1
+}
+
 test table-insert-values-shorter-row-with-column-list {
     CREATE TABLE u (id int, a int, b int);
     INSERT INTO u (id, a) VALUES (1, 2), (3);

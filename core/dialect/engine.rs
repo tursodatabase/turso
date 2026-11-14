@@ -579,6 +579,7 @@ pub(crate) fn resolve_builtin_function_name(
         "boolean_to_int" => Ok(Some(Func::Scalar(ScalarFunc::BooleanToInt))),
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
+        "bytea_encode" => Ok(Some(Func::Scalar(ScalarFunc::ByteaEncode))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
         "numeric_fit" => Ok(Some(Func::Scalar(ScalarFunc::NumericFit))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
@@ -1290,6 +1291,19 @@ pub fn call_builtin_scalar(
                         "invalid input for type inet: \"{other}\""
                     )));
                 }
+            })
+        }
+        ScalarFunc::ByteaEncode => {
+            // Text is PostgreSQL bytea input. Other values are stored as
+            // they are, so a blob keeps its bytes and the column's type check
+            // still refuses a number.
+            check_arg_count(args, 1)?;
+            Ok(match args[0].get_value() {
+                Value::Text(t) => Value::from_blob(
+                    crate::bytea_from_text(t.as_str())
+                        .map_err(|e| LimboError::InvalidArgument(e.to_string()))?,
+                ),
+                other => other.clone(),
             })
         }
         ScalarFunc::NumericEncode => {
