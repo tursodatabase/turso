@@ -2986,8 +2986,8 @@ pub(crate) enum DroppedWithSequences<'a> {
 
 /// Describes the first object that still calls a sequence function on one
 /// of `sequences` of `namespace` once `dropped` is gone: a column default,
-/// generated column, CHECK constraint, index, view, trigger or row security
-/// policy. Objects of the namespace that the connection is dropping do not
+/// generated column, CHECK constraint, row security policy, index, view or
+/// trigger. Objects of the namespace that the connection is dropping do not
 /// count.
 // FIXME: this walks every expression the schema stores. Replace it with the
 // dependency rows of pg_depend once they are stored.
@@ -3008,6 +3008,14 @@ pub(crate) fn find_object_using_sequence(
         owner_namespace == namespace.id
             && matches!(dropped, DroppedWithSequences::Table(table) if table == table_name)
     };
+    let is_dropped_column = |owner_namespace: NamespaceId, table_name: &str, column: &str| {
+        owner_namespace == namespace.id
+            && matches!(
+                dropped,
+                DroppedWithSequences::Column { table: dropped_table, column: dropped_column }
+                    if dropped_table == table_name && dropped_column.eq_ignore_ascii_case(column)
+            )
+    };
     let is_dropped = |owner_namespace: NamespaceId, owner: &SchemaExprOwner| {
         if namespace_being_dropped == Some(owner_namespace) {
             return true;
@@ -3015,18 +3023,18 @@ pub(crate) fn find_object_using_sequence(
         match owner {
             SchemaExprOwner::ColumnDefault { table, column } => {
                 is_dropped_table(owner_namespace, table.get_name())
-                    || owner_namespace == namespace.id
-                        && matches!(
-                            dropped,
-                            DroppedWithSequences::Column { table: dropped_table, column: dropped_column }
-                                if dropped_table == table.get_name()
-                                    && column.name.as_deref().is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(dropped_column)
-                                    })
-                        )
+                    || column.name.as_deref().is_some_and(|column| {
+                        is_dropped_column(owner_namespace, table.get_name(), column)
+                    })
+            }
+            SchemaExprOwner::CheckConstraint { table, constraint } => {
+                is_dropped_table(owner_namespace, table.get_name())
+                    || constraint.column.as_deref().is_some_and(|column| {
+                        is_dropped_column(owner_namespace, table.get_name(), column)
+                    })
             }
             SchemaExprOwner::GeneratedColumn { table, .. }
-            | SchemaExprOwner::CheckConstraint { table } => {
+            | SchemaExprOwner::Policy { table, .. } => {
                 is_dropped_table(owner_namespace, table.get_name())
             }
             SchemaExprOwner::Index(index) => is_dropped_table(owner_namespace, &index.table_name),
@@ -3047,7 +3055,8 @@ pub(crate) fn find_object_using_sequence(
     };
     resolver.with_schema(namespace.database_id, |schema| {
         let mut usage = None;
-        walk_schema_expressions(schema, &mut |owner_namespace, owner, expr| {
+        let dialect = resolver.catalog.dialect.as_ref();
+        walk_schema_expressions(schema, dialect, &mut |owner_namespace, owner, expr| {
             if usage.is_none() && !is_dropped(owner_namespace, &owner) {
                 usage = checked_sequence_called_by(expr)
                     .map(|sequence| format!("{owner} depends on sequence {sequence}"));
@@ -3058,43 +3067,6 @@ pub(crate) fn find_object_using_sequence(
                 WalkControl::Continue
             })
         })?;
-        if usage.is_some() || namespace.database_id != MAIN_DB_ID {
-            return Ok(usage);
-        }
-        for policy_namespace in schema.namespace_ids() {
-            if namespace_being_dropped == Some(policy_namespace) {
-                continue;
-            }
-            for table in schema.tables(policy_namespace) {
-                if is_dropped_table(policy_namespace, table.get_name()) {
-                    continue;
-                }
-                let policies = resolver.catalog.dialect.row_security_policies(
-                    schema,
-                    policy_namespace,
-                    table.get_name(),
-                );
-                for policy in policies {
-                    for policy_expr in [&policy.using_expr, &policy.check_expr]
-                        .into_iter()
-                        .flatten()
-                    {
-                        walk_expr_with_subqueries(policy_expr, &mut |expr| {
-                            if usage.is_none() {
-                                usage = checked_sequence_called_by(expr).map(|sequence| {
-                                    format!(
-                                        "policy {} on table {} depends on sequence {sequence}",
-                                        policy.name,
-                                        table.get_name()
-                                    )
-                                });
-                            }
-                            Ok(WalkControl::Continue)
-                        })?;
-                    }
-                }
-            }
-        }
         Ok(usage)
     })
 }
@@ -3667,9 +3639,9 @@ fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver
              create {normalized_name} before {name}"
         );
     }
-    if let Some(owner) =
-        find_in_any_database(resolver, |schema| find_cast_to_type(schema, &registry_key))?
-    {
+    if let Some(owner) = find_in_any_database(resolver, |schema| {
+        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+    })? {
         bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
     }
     Ok(())
@@ -3712,9 +3684,9 @@ pub fn translate_drop_type(
 
     // Check if anything in any database uses this type
     let registry_key = type_registry_key(type_name);
-    if let Some(type_use) =
-        find_in_any_database(resolver, |schema| find_type_use(schema, &registry_key))?
-    {
+    if let Some(type_use) = find_in_any_database(resolver, |schema| {
+        find_type_use(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+    })? {
         bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
     }
 
@@ -3823,7 +3795,11 @@ fn find_in_any_database(
 
 /// Describes the first object in `schema` that uses the type: a column of
 /// that type, or any stored expression that casts to it.
-fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_type_use(
+    schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
+    registry_key: &str,
+) -> Result<Option<String>> {
     for namespace in schema.namespace_ids() {
         for table in schema.tables(namespace) {
             for column in table.columns() {
@@ -3837,13 +3813,17 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
             }
         }
     }
-    find_cast_to_type(schema, registry_key)
+    find_cast_to_type(schema, dialect, registry_key)
 }
 
 /// Describes the first stored expression in `schema` that casts to the type.
-fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_cast_to_type(
+    schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
+    registry_key: &str,
+) -> Result<Option<String>> {
     let mut type_use = None;
-    walk_schema_expressions(schema, &mut |_, owner, expr| {
+    walk_schema_expressions(schema, dialect, &mut |_, owner, expr| {
         if type_use.is_none() && is_cast_to_type(expr, registry_key) {
             type_use = Some(owner.to_string());
         }
