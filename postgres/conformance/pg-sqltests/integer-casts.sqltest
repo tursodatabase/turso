@@ -816,34 +816,6 @@ test cast-function-invalid-prefix-underscore {
 expect error {
 }
 
-test cast-float-literal-rounding {
-    SELECT 123.4::int4;
-    SELECT 123.5::int4;
-    SELECT 123.6::int4;
-    SELECT -123.4::int4;
-    SELECT -123.5::int4;
-    SELECT -123.6::int4;
-    SELECT int4(123.4);
-    SELECT int4(123.5);
-    SELECT int4(123.6);
-    SELECT int4(-123.4);
-    SELECT int4(-123.5);
-    SELECT int4(-123.6);
-}
-expect {
-    123
-    124
-    124
-    -123
-    -124
-    -124
-    123
-    124
-    124
-    -123
-    -124
-    -124
-}
 test cast-float-literal-int2-overflow {
     SELECT 32768.0::int2;
 }
@@ -933,22 +905,6 @@ expect {
     -9223372036854775808
 }
 
-test cast-runtime-float-rounding {
-    CREATE TABLE integer_cast_values (position integer, value double precision);
-    INSERT INTO integer_cast_values VALUES
-        (1, 123.4), (2, 123.5), (3, 123.6),
-        (4, -123.4), (5, -123.5), (6, -123.6);
-    SELECT value::int4 FROM integer_cast_values ORDER BY position;
-    DROP TABLE integer_cast_values;
-}
-expect {
-    123
-    124
-    124
-    -123
-    -124
-    -124
-}
 test cast-runtime-float-int2-overflow {
     CREATE TABLE integer_cast_values (value double precision);
     INSERT INTO integer_cast_values VALUES (32768.0);

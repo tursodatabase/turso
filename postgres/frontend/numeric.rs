@@ -38,21 +38,11 @@ pub fn cast_value_to_integer(value: &Value, width: IntegerWidth) -> Result<Value
             if let Some(integer) = value.as_int() {
                 Ok(Value::from_i64(check_integer_bounds(integer, width)?))
             } else {
-                match width {
-                    IntegerWidth::Int16 | IntegerWidth::Int32 => {
-                        let rounded = value.as_float().round();
-
-                        if !rounded.is_finite() {
-                            return Err(integer_out_of_range_error(width));
-                        }
-
-                        Ok(Value::from_i64(check_integer_bounds(
-                            rounded as i64,
-                            width,
-                        )?))
-                    }
-                    IntegerWidth::Int64 => Ok(value.exec_cast("INTEGER")?),
-                }
+                let integer = value.exec_cast("INTEGER")?;
+                Ok(Value::from_i64(check_integer_bounds(
+                    integer.as_int().unwrap(),
+                    width,
+                )?))
             }
         }
 
