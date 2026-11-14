@@ -7,7 +7,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::util::renamed_automatic_index_name;
-use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
+use crate::{turso_assert_eq, SymbolTable};
 use turso_parser::ast::{self, TableInternalId};
 
 use super::{
@@ -946,18 +946,17 @@ pub fn translate_alter_table(
                 column_name,
             )?;
 
-            // Tables always have at least one column.
-            turso_assert_ne!(btree.columns().len(), 0);
+            // The column must exist before anything else is checked, as in
+            // SQLite: a PostgreSQL table can have no columns at all.
+            let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
+                LimboError::ParseError(format!("no such column: \"{column_name}\""))
+            })?;
 
             if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"
                 )));
             }
-
-            let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
-                LimboError::ParseError(format!("no such column: \"{column_name}\""))
-            })?;
 
             // Column cannot be dropped if:
             // The column is a PRIMARY KEY or part of one.

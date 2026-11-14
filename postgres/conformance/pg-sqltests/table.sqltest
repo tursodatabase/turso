@@ -857,6 +857,20 @@ expect {
     1
 }
 
+test table-drop-missing-column-from-table-without-columns {
+    CREATE TABLE t_no_columns (CONSTRAINT x CHECK (1 > 0));
+    ALTER TABLE t_no_columns DROP c;
+}
+@sqlstate 42703
+expect error {}
+
+test table-drop-missing-column-from-one-column-table {
+    CREATE TABLE t_one_column (a int);
+    ALTER TABLE t_one_column DROP c;
+}
+@sqlstate 42703
+expect error {}
+
 test table-insert-values-shorter-row-with-column-list {
     CREATE TABLE u (id int, a int, b int);
     INSERT INTO u (id, a) VALUES (1, 2), (3);
