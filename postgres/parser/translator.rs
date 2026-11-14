@@ -6410,6 +6410,137 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     })
 }
 
+/// PostgreSQL's built-in types (`pg_catalog` in PostgreSQL 18), other than
+/// the row types of its catalogs and the array types, whose names are an
+/// element type's with a leading `_`, and the domains of
+/// `information_schema`. A type name is read without its schema, so these
+/// are found unqualified too, which PostgreSQL refuses.
+const BUILTIN_TYPES: &[&str] = &[
+    "cardinal_number",
+    "character_data",
+    "sql_identifier",
+    "time_stamp",
+    "yes_or_no",
+    "aclitem",
+    "any",
+    "anyarray",
+    "anycompatible",
+    "anycompatiblearray",
+    "anycompatiblemultirange",
+    "anycompatiblenonarray",
+    "anycompatiblerange",
+    "anyelement",
+    "anyenum",
+    "anymultirange",
+    "anynonarray",
+    "anyrange",
+    "bit",
+    "bool",
+    "box",
+    "bpchar",
+    "bytea",
+    "char",
+    "cid",
+    "cidr",
+    "circle",
+    "cstring",
+    "date",
+    "datemultirange",
+    "daterange",
+    "event_trigger",
+    "fdw_handler",
+    "float4",
+    "float8",
+    "gtsvector",
+    "index_am_handler",
+    "inet",
+    "int2",
+    "int2vector",
+    "int4",
+    "int4multirange",
+    "int4range",
+    "int8",
+    "int8multirange",
+    "int8range",
+    "internal",
+    "interval",
+    "json",
+    "jsonb",
+    "jsonpath",
+    "language_handler",
+    "line",
+    "lseg",
+    "macaddr",
+    "macaddr8",
+    "money",
+    "name",
+    "numeric",
+    "nummultirange",
+    "numrange",
+    "oid",
+    "oidvector",
+    "path",
+    "pg_brin_bloom_summary",
+    "pg_brin_minmax_multi_summary",
+    "pg_ddl_command",
+    "pg_dependencies",
+    "pg_lsn",
+    "pg_mcv_list",
+    "pg_ndistinct",
+    "pg_node_tree",
+    "pg_snapshot",
+    "point",
+    "polygon",
+    "record",
+    "refcursor",
+    "regclass",
+    "regcollation",
+    "regconfig",
+    "regdictionary",
+    "regnamespace",
+    "regoper",
+    "regoperator",
+    "regproc",
+    "regprocedure",
+    "regrole",
+    "regtype",
+    "table_am_handler",
+    "text",
+    "tid",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timetz",
+    "trigger",
+    "tsm_handler",
+    "tsmultirange",
+    "tsquery",
+    "tsrange",
+    "tstzmultirange",
+    "tstzrange",
+    "tsvector",
+    "txid_snapshot",
+    "unknown",
+    "uuid",
+    "varbit",
+    "varchar",
+    "void",
+    "xid",
+    "xid8",
+    "xml",
+];
+
+/// Whether `name` is a built-in PostgreSQL type or an array of one
+/// (`_xid`). Pseudo-types such as `any` and `record` count, though
+/// PostgreSQL refuses a cast to most of them.
+///
+/// Names are matched as written: PostgreSQL folds an unquoted name to lower
+/// case, and a quoted `"Xid"` is no type.
+pub fn is_builtin_type(name: &str) -> bool {
+    let element = name.strip_prefix('_').unwrap_or(name);
+    BUILTIN_TYPES.contains(&element)
+}
+
 /// Internal DDL plan for FK constraints — used during CREATE TABLE translation.
 struct PgForeignKey {
     name: Option<String>,
@@ -6891,6 +7022,45 @@ fn pg_type_name_to_ast_type(
 ) -> Result<ast::Type, ParseError> {
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
+    let (name, element_of_array) = match cast_storage_type(&pg_type) {
+        Some(name) => (name, 0),
+        None => match pg_type.strip_prefix('_') {
+            // `_int4` is PostgreSQL's name for int4[], and `_mood` for mood[]:
+            // an `_` name is taken as an array type's, so a type that is
+            // itself named `_x` can't be cast to. PostgreSQL has no arrays of
+            // arrays, so `_int4[]` is kept as written.
+            Some(element) if !element.is_empty() && type_name.array_bounds.is_empty() => {
+                if BUILTIN_TYPES.contains(&element) {
+                    match cast_storage_type(element) {
+                        Some(name) => (name, 1),
+                        // A built-in type tursopg has no type for, as `_xid`.
+                        None => (pg_type.as_str(), 0),
+                    }
+                } else if cast_storage_type(element).is_some() {
+                    // `_integer`: `integer` is a name of int4, not a type.
+                    (pg_type.as_str(), 0)
+                } else {
+                    (element, 1)
+                }
+            }
+            // Kept as written: an enum or domain, another built-in type, or
+            // no type, which the dialect tells apart (`is_builtin_type`).
+            _ => (pg_type.as_str(), 0),
+        },
+    };
+
+    let array_dimensions = type_name.array_bounds.len() as u32 + element_of_array;
+    check_array_dimensions(array_dimensions)?;
+    Ok(ast::Type {
+        name: name.to_string(),
+        size: None,
+        array_dimensions,
+    })
+}
+
+/// The type a CAST to the PostgreSQL type `pg_type` gives its value, for the
+/// types CAST maps to a base SQLite storage type or a Turso type.
+fn cast_storage_type(pg_type: &str) -> Option<&'static str> {
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
         | "REGCLASS" | "REGTYPE" => "INTEGER",
@@ -6911,16 +7081,9 @@ fn pg_type_name_to_ast_type(
             "TEXT"
         }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => &pg_type,
+        _ => return None,
     };
-
-    let array_dimensions = type_name.array_bounds.len() as u32;
-    check_array_dimensions(array_dimensions)?;
-    Ok(ast::Type {
-        name: name.to_string(),
-        size: None,
-        array_dimensions,
-    })
+    Some(name)
 }
 
 fn extract_type_name_from_typename(

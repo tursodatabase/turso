@@ -353,6 +353,10 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    fn cast_type_exists(&self, name: &str) -> bool {
+        turso_pg_parser::translator::is_builtin_type(name)
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

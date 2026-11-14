@@ -594,6 +594,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a CAST may name `name`, a name that is neither a STRICT type
+    /// nor a custom type of the schema.
+    ///
+    /// SQLite takes any name and gives the value the affinity the name
+    /// implies. PostgreSQL takes only its built-in types, and refuses
+    /// `CAST(x AS nosuch)` with `type "nosuch" does not exist`.
+    fn cast_type_exists(&self, _name: &str) -> bool {
+        true
+    }
+
     /// Whether constraint errors report the values that broke the constraint.
     ///
     /// PostgreSQL shows them in the error DETAIL, so custom type and array

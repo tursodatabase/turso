@@ -89,3 +89,32 @@ test error-drop-domain-used-by-table-in-other-schema {
 }
 @sqlstate 2BP01
 expect error {}
+
+test error-cast-to-unknown-type {
+    SELECT 'q'::nosuch;
+}
+@sqlstate 42704
+expect error {}
+
+test error-cast-to-unknown-type-in-cast-syntax {
+    CREATE TABLE cast_unknown (a int);
+    SELECT CAST(a AS nosuch) FROM cast_unknown;
+}
+@sqlstate 42704
+expect error {}
+
+test error-cast-to-array-of-unknown-type {
+    SELECT '{1}'::nosuch[];
+}
+@sqlstate 42704
+expect error {
+    type "nosuch\[\]" does not exist
+}
+
+test error-cast-to-underscore-name-of-a-type-alias {
+    SELECT '{1}'::_integer;
+}
+@sqlstate 42704
+expect error {
+    type "_integer" does not exist
+}
