@@ -1321,7 +1321,7 @@ impl<A: RowVersionAllocator> std::fmt::Display for Transaction<A> {
 
 /// Transaction state.
 #[derive(Debug, Clone, PartialEq, Copy)]
-enum TransactionState {
+pub enum TransactionState {
     Active,
     /// Preparing state includes the end_ts so other transactions can compare
     /// timestamps during validation to resolve races (first-committer-wins).
@@ -4339,6 +4339,19 @@ impl RootEntry {
     pub fn covers(&self, ts: u64) -> bool {
         self.begin <= ts && (self.end == u64::MAX || ts < self.end)
     }
+}
+
+/// What a transaction looked like when [`MvStore::tx_snapshot`] read it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TxSnapshot {
+    pub state: TransactionState,
+    pub begin_ts: u64,
+    /// Number of transactions this one waits for before it can commit.
+    pub commit_dep_count: u64,
+    /// Whether a transaction this one waited for aborted, so that this one has to abort too.
+    pub abort_now: bool,
+    /// Whether the commit record of this transaction is in the logical log.
+    pub log_appended: bool,
 }
 
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
@@ -7456,6 +7469,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// the set, so comparing two reads from that connection is race-free.
     pub fn tx_write_set_len(&self, tx_id: TxID) -> Option<usize> {
         Some(self.txs.get(&tx_id)?.value().write_set.lock().len())
+    }
+
+    /// What the transaction looks like now, or None when the store no longer tracks it.
+    pub fn tx_snapshot(&self, tx_id: TxID) -> Option<TxSnapshot> {
+        let tx = self.txs.get(&tx_id)?;
+        let tx = tx.value();
+        Some(TxSnapshot {
+            state: tx.state.load(),
+            begin_ts: tx.begin_ts,
+            commit_dep_count: tx.commit_dep_counter.load(Ordering::Acquire),
+            abort_now: tx.abort_now.load(Ordering::Acquire),
+            log_appended: tx.log_appended.load(Ordering::Acquire),
+        })
     }
 
     /// Rolls back a savepoint within a transaction.

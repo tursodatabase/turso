@@ -2268,11 +2268,9 @@ fn test_recovery_clock_monotonicity() {
     let pager = conn.pager.load().clone();
     let mvcc_store = db.get_mvcc_store();
     let tx_id = mvcc_store.begin_tx(pager).unwrap();
-    let tx_entry = mvcc_store
-        .txs
-        .get(&tx_id)
+    let tx = mvcc_store
+        .tx_snapshot(tx_id)
         .expect("transaction should exist");
-    let tx = tx_entry.value();
     assert!(
         tx.begin_ts > max_commit_ts,
         "expected begin_ts {} to be > max_commit_ts {}",
@@ -3243,14 +3241,13 @@ fn test_empty_log_recovery_loads_checkpoint_watermark() {
     let pager = conn.pager.load().clone();
     let mvcc_store = db.get_mvcc_store();
     let tx_id = mvcc_store.begin_tx(pager).unwrap();
-    let tx_entry = mvcc_store
-        .txs
-        .get(&tx_id)
+    let tx = mvcc_store
+        .tx_snapshot(tx_id)
         .expect("transaction should exist");
     assert!(
-        tx_entry.value().begin_ts > persistent_tx_ts_max,
+        tx.begin_ts > persistent_tx_ts_max,
         "expected begin_ts {} > persistent_tx_ts_max {}",
-        tx_entry.value().begin_ts,
+        tx.begin_ts,
         persistent_tx_ts_max
     );
 }
@@ -7514,12 +7511,9 @@ fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
         "tx_a should yield after getting its commit timestamp"
     );
     let tx_a_end_ts = match mvcc_store
-        .txs
-        .get(&tx_a_id)
+        .tx_snapshot(tx_a_id)
         .expect("tx_a should still be tracked")
-        .value()
         .state
-        .load()
     {
         TransactionState::Preparing(ts) => ts,
         state => panic!("expected tx_a to be Preparing, got {state:?}"),
@@ -8037,7 +8031,7 @@ fn test_integrity_check_in_middle_commit_of_drop_index_and_delete() {
     }
     conn_a.set_yield_injector(None);
     assert!(matches!(
-        store.txs.get(&tx_a).unwrap().value().state.load(),
+        store.tx_snapshot(tx_a).unwrap().state,
         TransactionState::Preparing(_)
     ));
 
@@ -10572,7 +10566,7 @@ fn test_gc_active_reader_pins_lwm() {
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
-    let tx2_begin_ts = db.mvcc_store.txs.get(&tx2).unwrap().value().begin_ts;
+    let tx2_begin_ts = db.mvcc_store.tx_snapshot(tx2).unwrap().begin_ts;
 
     // T3 updates the row and commits, creating a superseded version.
     let conn3 = db
@@ -13511,7 +13505,7 @@ fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
     let tx_id = conn.get_mv_tx_id().expect("tx should be open after BEGIN");
     let mv_store = db.get_mvcc_store();
     assert!(
-        mv_store.txs.get(&tx_id).is_some(),
+        mv_store.tx_snapshot(tx_id).is_some(),
         "precondition: tx must be live in txs before COMMIT"
     );
 
@@ -13531,7 +13525,7 @@ fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
     // The pairing invariant: `finish_committed_tx` clears both atomically, so
     // after the injected Err we see them gone together — no half-state.
     assert!(
-        mv_store.txs.get(&tx_id).is_none(),
+        mv_store.tx_snapshot(tx_id).is_none(),
         "fix: tx must be gone from txs (finish_committed_tx ran before the \
          injection point)"
     );
@@ -18345,7 +18339,7 @@ fn dropped_concurrent_commit_does_not_strand_connection() {
     // transaction_state is reset to None so the next op_transaction takes
     // the fresh-tx path instead of inheriting stale Write state.
     assert!(
-        !mv_store.txs.contains_key(&tx_id),
+        mv_store.tx_snapshot(tx_id).is_none(),
         "orphan tx must be rolled back by abort-side cleanup"
     );
     assert!(
@@ -18469,7 +18463,7 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
         "attached MVCC tx slot must be cleared when abandoned COMMIT is rolled back"
     );
     assert!(
-        !aux_mv_store.txs.contains_key(&aux_tx_id),
+        aux_mv_store.tx_snapshot(aux_tx_id).is_none(),
         "attached MVCC tx must be removed from txs"
     );
     assert!(
@@ -18572,7 +18566,7 @@ fn dropped_attached_commit_releases_attached_read_lock() {
         "attached MVCC tx slot must be cleared"
     );
     assert!(
-        !aux_mv_store.txs.contains_key(&aux_tx_id),
+        aux_mv_store.tx_snapshot(aux_tx_id).is_none(),
         "attached MVCC tx must be removed from txs"
     );
     assert!(
@@ -18642,11 +18636,11 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
         "attached aux2 MVCC tx slot must be cleared"
     );
     assert!(
-        !aux1_mv_store.txs.contains_key(&aux1_tx_id),
+        aux1_mv_store.tx_snapshot(aux1_tx_id).is_none(),
         "attached aux1 MVCC tx must be removed from txs"
     );
     assert!(
-        !aux2_mv_store.txs.contains_key(&aux2_tx_id),
+        aux2_mv_store.tx_snapshot(aux2_tx_id).is_none(),
         "attached aux2 MVCC tx must be removed from txs"
     );
     assert!(
@@ -19231,7 +19225,7 @@ fn abandoned_committed_writer_notifies_dependents() {
             assert!(prepared.is_empty());
             writer.set_yield_injector(None);
             assert!(matches!(
-                store.txs.get(&writer_id).unwrap().value().state.load(),
+                store.tx_snapshot(writer_id).unwrap().state,
                 TransactionState::Preparing(_)
             ));
 
@@ -19241,11 +19235,7 @@ fn abandoned_committed_writer_notifies_dependents() {
                 Some(n_rows as i64)
             );
             let reader_id = reader.get_mv_tx_id().unwrap();
-            let reader_tx = store.txs.get(&reader_id).unwrap();
-            assert_eq!(
-                reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
-                1
-            );
+            assert_eq!(store.tx_snapshot(reader_id).unwrap().commit_dep_count, 1);
             let mut reader_commit = reader.prepare("COMMIT").unwrap();
             assert!(matches!(reader_commit.step().unwrap(), StepResult::Yield));
 
@@ -19259,55 +19249,35 @@ fn abandoned_committed_writer_notifies_dependents() {
                     commit.step().unwrap(),
                     StepResult::Yield | StepResult::IO
                 ));
-                if n_rows == 1
-                    && store
-                        .txs
-                        .get(&writer_id)
-                        .unwrap()
-                        .value()
-                        .log_appended
-                        .load(Ordering::Acquire)
-                    || matches!(
-                        store.txs.get(&writer_id).unwrap().value().state.load(),
-                        TransactionState::Committed(_)
-                    )
+                let writer_tx = store.tx_snapshot(writer_id).unwrap();
+                if n_rows == 1 && writer_tx.log_appended
+                    || matches!(writer_tx.state, TransactionState::Committed(_))
                 {
                     break;
                 }
             }
-            let writer_tx = store.txs.get(&writer_id).unwrap();
-            assert!(writer_tx.value().log_appended.load(Ordering::Acquire));
+            let writer_tx = store.tx_snapshot(writer_id).unwrap();
+            assert!(writer_tx.log_appended);
             if n_rows == 1 {
                 writer.set_yield_injector(None);
-                assert!(matches!(
-                    writer_tx.value().state.load(),
-                    TransactionState::Preparing(_)
-                ));
+                assert!(matches!(writer_tx.state, TransactionState::Preparing(_)));
             } else {
-                assert!(matches!(
-                    writer_tx.value().state.load(),
-                    TransactionState::Committed(_)
-                ));
+                assert!(matches!(writer_tx.state, TransactionState::Committed(_)));
             }
-            assert_eq!(
-                reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
-                1
-            );
+            assert_eq!(store.tx_snapshot(reader_id).unwrap().commit_dep_count, 1);
             if reset {
                 commit.reset().unwrap();
             }
             drop(commit);
 
-            assert_eq!(
-                reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
-                0
-            );
-            assert!(!reader_tx.value().abort_now.load(Ordering::Acquire));
-            assert!(store.txs.get(&writer_id).is_none());
+            let reader_tx = store.tx_snapshot(reader_id).unwrap();
+            assert_eq!(reader_tx.commit_dep_count, 0);
+            assert!(!reader_tx.abort_now);
+            assert!(store.tx_snapshot(writer_id).is_none());
             assert!(writer.get_mv_tx_id().is_none());
             assert!(matches!(reader_commit.step().unwrap(), StepResult::Done));
             drop(reader_commit);
-            assert!(store.txs.get(&reader_id).is_none());
+            assert!(store.tx_snapshot(reader_id).is_none());
             assert!(reader.get_mv_tx_id().is_none());
             reader.execute("INSERT INTO t VALUES (0)").unwrap();
             reader.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -19315,7 +19285,7 @@ fn abandoned_committed_writer_notifies_dependents() {
             assert_eq!(rows[0][0].as_int(), Some(n_rows as i64 + 1));
             assert_eq!(rows[0][1].as_int(), Some(0));
             assert_eq!(rows[0][2].as_int(), Some(n_rows as i64));
-            assert!(store.txs.is_empty());
+            assert_eq!(store.debug_gc_snapshot().active_txs, 0);
         }
     }
 }
@@ -20177,12 +20147,9 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
     assert!(
         matches!(
             mvcc_store
-                .txs
-                .get(&tx_a_id)
+                .tx_snapshot(tx_a_id)
                 .expect("tx_a should be tracked")
-                .value()
-                .state
-                .load(),
+                .state,
             TransactionState::Committed(_)
         ),
         "tx_a should be Committed (set by CommitEnd) by the time we yield in FinalizeCommit"
@@ -20321,10 +20288,8 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
         .get_mv_tx_id()
         .expect("DDL connection should have an active MVCC transaction");
     let ddl_begin_ts = mvcc_store
-        .txs
-        .get(&ddl_tx_id)
+        .tx_snapshot(ddl_tx_id)
         .expect("DDL transaction should be tracked")
-        .value()
         .begin_ts;
     assert!(
         ddl_begin_ts >= mvcc_store.last_committed_tx_ts.load(Ordering::Acquire),
@@ -21320,11 +21285,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
                 other => panic!("COMMIT ended before LogRecordMarkedWritten: {other:?}"),
             }
         }
-        let preparing_end_ts = || match mvstore
-            .txs
-            .get(&update_tx)
-            .map(|tx| tx.value().state.load())
-        {
+        let preparing_end_ts = || match mvstore.tx_snapshot(update_tx).map(|tx| tx.state) {
             Some(TransactionState::Preparing(end_ts)) => end_ts,
             other => panic!("the UPDATE must still be Preparing, got {other:?}"),
         };
