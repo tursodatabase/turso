@@ -6906,7 +6906,8 @@ fn pg_type_name_to_ast_type(
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        "UUID" => "uuid",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "INTERVAL" | "INET" | "JSON"
         | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
             "TEXT"
         }
