@@ -6,12 +6,15 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{
+        identity_table_sql_marker, split_identity_table_sql_marker, POSTGRES_TABLE_SQL_PREFIX,
+        PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER,
+    },
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
-        AUTOINCREMENT_SEQ_PREFIX,
+        AUTOINCREMENT_SEQ_PREFIX, TURSO_INTERNAL_PREFIX,
     },
     security::roles::RoleId,
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
@@ -85,8 +88,20 @@ impl Dialect for PostgresDialect {
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
+        let primary_key_is_not_rowid_alias = has_primary_key_column_marker(sql);
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
+            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
+                canonical_table_sql_ast(sql)?
+            else {
+                unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
+            };
+            let table = BTreeTable::from_create_table_ast(
+                &tbl_name,
+                &body,
+                root_page,
+                true,
+                primary_key_is_not_rowid_alias,
+            )?;
             if !table.has_rowid {
                 return Err(LimboError::ParseError(format!(
                     "PostgreSQL does not support WITHOUT ROWID table '{}'",
@@ -104,7 +119,13 @@ impl Dialect for PostgresDialect {
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
+                BTreeTable::from_create_table_ast(
+                    &tbl_name,
+                    &body,
+                    root_page,
+                    true,
+                    primary_key_is_not_rowid_alias,
+                )
             }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
@@ -116,7 +137,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::parse_table_sql_ast(sql);
+            return canonical_table_sql_ast(sql);
         };
 
         let parse_result =
@@ -135,7 +156,9 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::table_sql_for_replay(sql);
+            return turso_core::dialect::engine::table_sql_for_replay(
+                strip_primary_key_column_marker(sql),
+            );
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -175,16 +198,38 @@ impl Dialect for PostgresDialect {
     ) -> Result<String> {
         let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
             .unwrap_or_else(|_| input.to_string());
-        Ok(encode_pg_schema_sql(&sql))
+        let primary_key_is_not_rowid_alias =
+            self.primary_key_is_not_rowid_alias(tbl_name.name.as_str());
+        Ok(encode_pg_schema_sql(&sql, primary_key_is_not_rowid_alias))
     }
 
-    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
-        let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+    fn format_rewritten_table_sql(
+        &self,
+        stmt: &turso_parser::ast::Stmt,
+        previous_sql: Option<&str>,
+    ) -> Result<String> {
+        let ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
             return Err(LimboError::InternalError(
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        turso_core::dialect::engine::format_table_sql(tbl_name, body)
+        let sql = turso_core::dialect::engine::format_table_sql(tbl_name, body)?;
+        let marked = match previous_sql {
+            Some(previous_sql) => has_primary_key_column_marker(previous_sql),
+            None => self.primary_key_is_not_rowid_alias(tbl_name.name.as_str()),
+        };
+        let primary_key_marker = if marked {
+            PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER
+        } else {
+            ""
+        };
+        let identity_marker = identity_table_sql_marker(
+            table_columns(body)
+                .iter()
+                .enumerate()
+                .filter_map(|(position, column)| Some((position, identity_kind(column)?))),
+        );
+        Ok(format!("{primary_key_marker}{identity_marker}{sql}"))
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -294,6 +339,19 @@ impl Dialect for PostgresDialect {
         crate::classes::relation_owner(schema, namespace, name)
     }
 
+    fn sequences_owned_by_table(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Vec<String> {
+        crate::classes::sequences_owned_by_table(schema, namespace, name)
+    }
+
+    fn refuses_dropping_used_sequences(&self) -> bool {
+        true
+    }
+
     fn role_has_privilege(
         &self,
         schema: &Schema,
@@ -334,6 +392,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn primary_key_is_not_rowid_alias(&self, table_name: &str) -> bool {
+        !table_name.starts_with(TURSO_INTERNAL_PREFIX)
+    }
+
     fn constraint_errors_show_values(&self) -> bool {
         true
     }
@@ -355,12 +417,70 @@ impl Dialect for PostgresDialect {
     }
 }
 
-pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
+pub fn encode_pg_schema_sql(sql: &str, primary_key_is_not_rowid_alias: bool) -> String {
+    let marker = if primary_key_is_not_rowid_alias {
+        PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER
+    } else {
+        ""
+    };
+    format!("{POSTGRES_TABLE_SQL_PREFIX}{marker}{sql}")
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
     sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
+        .map(strip_primary_key_column_marker)
+}
+
+fn has_primary_key_column_marker(sql: &str) -> bool {
+    let sql = sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX).unwrap_or(sql);
+    sql.starts_with(PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER)
+}
+
+fn strip_primary_key_column_marker(sql: &str) -> &str {
+    sql.strip_prefix(PRIMARY_KEY_COLUMN_TABLE_SQL_MARKER)
+        .unwrap_or(sql)
+}
+
+/// The `CREATE TABLE` of stored table SQL that is SQLite text, with its
+/// identity columns marked as the SQL says.
+fn canonical_table_sql_ast(sql: &str) -> Result<ast::Stmt> {
+    let (identity_columns, sql) =
+        split_identity_table_sql_marker(strip_primary_key_column_marker(sql))?;
+    let mut stmt = turso_core::dialect::engine::parse_table_sql_ast(sql)?;
+    let ast::Stmt::CreateTable { body, .. } = &mut stmt else {
+        unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+    };
+    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return Err(LimboError::Corrupt(format!(
+            "stored table SQL has no column definitions: {sql}"
+        )));
+    };
+    for (position, kind) in identity_columns {
+        let column = columns.get_mut(position).ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "identity column {position} is not in table SQL: {sql}"
+            ))
+        })?;
+        column.constraints.push(ast::NamedColumnConstraint {
+            name: None,
+            constraint: ast::ColumnConstraint::Identity(kind),
+        });
+    }
+    Ok(stmt)
+}
+
+fn table_columns(body: &ast::CreateTableBody) -> &[ast::ColumnDefinition] {
+    match body {
+        ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns,
+        ast::CreateTableBody::AsSelect(_) => &[],
+    }
+}
+
+fn identity_kind(column: &ast::ColumnDefinition) -> Option<ast::IdentityKind> {
+    column.constraints.iter().find_map(|c| match c.constraint {
+        ast::ColumnConstraint::Identity(kind) => Some(kind),
+        _ => None,
+    })
 }
 
 /// Returns the user tables of every namespace as (namespace, name, table)
@@ -912,8 +1032,15 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = i64::from(col.default.is_some() || col.is_stored_generated());
+                let has_def = i64::from(
+                    (col.default.is_some() && col.identity.is_none()) || col.is_stored_generated(),
+                );
                 let generated = if col.is_stored_generated() { "s" } else { "" };
+                let identity = match col.identity {
+                    Some(ast::IdentityKind::Always) => "a",
+                    Some(ast::IdentityKind::ByDefault) => "d",
+                    None => "",
+                };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -932,7 +1059,7 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(notnull),      // attnotnull
                     Value::from_i64(has_def),      // atthasdef
                     Value::from_i64(0),            // atthasmissing
-                    Value::Text("".into()),        // attidentity
+                    Value::Text(identity.into()),  // attidentity
                     Value::Text(generated.into()), // attgenerated
                     Value::from_i64(0),            // attisdropped
                     Value::from_i64(1),            // attislocal
@@ -2352,6 +2479,9 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
+                if col.identity.is_some() {
+                    continue;
+                }
                 let adbin = match (&col.default, col.generated_type()) {
                     (Some(default_expr), _) => render_expr(default_expr),
                     (None, GeneratedType::Stored { expr, .. }) => {
@@ -3172,8 +3302,45 @@ impl SnapshotRows for PgDependTable {
                 DependencyKind::Auto,
             ));
         }
+
+        // The sequence of an identity column belongs to the column.
+        let schema = conn.current_schema();
+        for (namespace, _, table, table_oid) in user_tables_with_oids(&schema) {
+            for (index, column) in table.columns().iter().enumerate() {
+                if column.identity.is_none() {
+                    continue;
+                }
+                let Some(sequence_name) = column.default.as_deref().and_then(nextval_sequence_name)
+                else {
+                    continue;
+                };
+                let Some(sequence_oid) = stored_relation_oid(&schema, namespace, &sequence_name)
+                else {
+                    continue;
+                };
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgClassTable>(sequence_oid),
+                    ObjectAddress::column(table_oid, index as i64 + 1),
+                    DependencyKind::Internal,
+                ));
+            }
+        }
         rows
     }
+}
+
+/// The bare name of the sequence that `nextval('name')` draws from, for a
+/// sequence in the namespace of the table the default belongs to.
+fn nextval_sequence_name(default: &ast::Expr) -> Option<String> {
+    let qualified = turso_core::nextval_sequence_argument(default)?;
+    let mangled = qualified
+        .split_once('.')
+        .map_or(qualified.as_str(), |(_, name)| name);
+    Some(
+        turso_core::namespace::demangle_name(true, mangled)
+            .1
+            .to_string(),
+    )
 }
 
 fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
@@ -3711,6 +3878,9 @@ impl PgGetTableDefCursor {
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
+        let sqlite_ddl = strip_primary_key_column_marker(sqlite_ddl);
+        let sqlite_ddl =
+            split_identity_table_sql_marker(sqlite_ddl).map_or(sqlite_ddl, |(_, sql)| sql);
         let mut postgres_ddl = sqlite_ddl.to_string();
 
         // Basic SQLite to PostgreSQL type conversions

@@ -765,7 +765,13 @@ fn validate(
             }
         }
 
-        let mut table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+        let mut table = create_table(
+            table_name,
+            body,
+            0,
+            resolver.dialect.supports_namespaces(),
+            resolver.dialect.primary_key_is_not_rowid_alias(table_name),
+        )?;
         // Rules for new tables only: VACUUM creates the tables the database
         // already has as nested statements, and those may break these rules.
         if !is_nested {
@@ -1064,6 +1070,10 @@ fn emit_ctas_insert(
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
+        resolver
+            .catalog
+            .dialect
+            .primary_key_is_not_rowid_alias(table_name),
     )?);
     // SQLite applies the derived CTAS affinity in MakeRecord. This keeps each
     // stored value consistent with the declared type of the CTAS column.
@@ -1387,15 +1397,15 @@ pub fn translate_create_table(
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else if bound_sequence_names {
-        resolver
-            .catalog
-            .dialect
-            .format_rewritten_table_sql(&ast::Stmt::CreateTable {
+        resolver.catalog.dialect.format_rewritten_table_sql(
+            &ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
                 tbl_name: tbl_name_in_sql,
                 body: body.clone(),
-            })?
+            },
+            None,
+        )?
     } else {
         resolver
             .catalog
@@ -1958,6 +1968,10 @@ fn collect_autoindexes(
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
+        resolver
+            .catalog
+            .dialect
+            .primary_key_is_not_rowid_alias(tbl_name),
     )?;
 
     let mut regs: Vec<usize> = Vec::new();
@@ -2232,6 +2246,23 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
+    let owned_sequences = if table.btree().is_some() {
+        resolver.catalog.dialect.sequences_owned_by_table(
+            resolver.schema(),
+            namespace.id,
+            &normalize_ident(name),
+        )
+    } else {
+        Vec::new()
+    };
+    if let Some(usage) =
+        find_object_using_sequence(resolver, namespace, &owned_sequences, name, None)
+    {
+        bail_parse_error!(
+            "cannot drop table {} because other objects depend on it: {usage}",
+            normalize_ident(name)
+        );
+    }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
@@ -2480,10 +2511,17 @@ pub fn translate_drop_table(
     // Dropping a table also drops its indexes, the automatic ones among
     // them, so the dialect hears about all of them.
     if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![CatalogChange::Drop {
+        let mut changes: Vec<_> = owned_sequences
+            .iter()
+            .map(|sequence| CatalogChange::Drop {
+                namespace: namespace.id,
+                name: sequence.clone(),
+            })
+            .collect();
+        changes.push(CatalogChange::Drop {
             namespace: namespace.id,
             name: normalize_ident(name),
-        }];
+        });
         changes.extend(indices.iter().map(|index| CatalogChange::Drop {
             namespace: namespace.id,
             name: index.name.clone(),
@@ -2907,6 +2945,12 @@ pub fn translate_drop_table(
         )?;
     }
 
+    for sequence in &owned_sequences {
+        crate::translate::sequence::emit_drop_sequence_cleanup(
+            program, resolver, namespace, sequence,
+        )?;
+    }
+
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
@@ -2916,6 +2960,104 @@ pub fn translate_drop_table(
     });
 
     Ok(())
+}
+
+/// Describes the first object that still uses one of `sequences`: a column
+/// default that calls `nextval`, in the columns that stay after
+/// `dropped_table` is dropped (or after only `dropped_column` of it is
+/// dropped), or a view that calls a sequence function.
+// FIXME: this walks every column of every table and every view. It is slow
+// but it does the job. Replace it with the dependency rows of pg_depend once
+// they are stored.
+pub(crate) fn find_object_using_sequence(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    sequences: &[String],
+    dropped_table: &str,
+    dropped_column: Option<&str>,
+) -> Option<String> {
+    if sequences.is_empty() {
+        return None;
+    }
+    let dropped_table = normalize_ident(dropped_table);
+    let in_namespace = |(sequence_namespace, sequence): &(NamespaceRef, String)| {
+        sequence_namespace.database_id == namespace.database_id
+            && sequence_namespace.id == namespace.id
+            && sequences.contains(sequence)
+    };
+    let (tables, views): (Vec<_>, Vec<_>) = resolver.with_schema(namespace.database_id, |schema| {
+        let tables = schema
+            .namespace_ids()
+            .flat_map(|id| {
+                schema
+                    .tables(id)
+                    .filter_map(move |table| table.btree())
+                    .map(move |table| (id, table))
+            })
+            .collect();
+        let views = schema
+            .namespace_ids()
+            .flat_map(|id| schema.views(id).map(|(_, view)| view.clone()))
+            .collect();
+        (tables, views)
+    });
+    for (table_namespace, table) in tables {
+        let is_dropped_table = table_namespace == namespace.id && table.name == dropped_table;
+        if is_dropped_table && dropped_column.is_none() {
+            continue;
+        }
+        for column in table.columns() {
+            let column_name = column.name.as_deref().unwrap_or_default();
+            if is_dropped_table
+                && dropped_column.is_some_and(|dropped| dropped.eq_ignore_ascii_case(column_name))
+            {
+                continue;
+            }
+            let Some(default) = column.default.as_deref() else {
+                continue;
+            };
+            let mut used_sequence = None;
+            let _ = walk_expr(default, &mut |expr| {
+                used_sequence = used_sequence
+                    .take()
+                    .or_else(|| sequence_called_in(expr, resolver, &in_namespace));
+                Ok(WalkControl::Continue)
+            });
+            if let Some(sequence) = used_sequence {
+                return Some(format!(
+                    "default value for column {column_name} of table {} depends on sequence {sequence}",
+                    table.name
+                ));
+            }
+        }
+    }
+    for view in views {
+        let mut used_sequence = None;
+        let walked = crate::util::walk_select_expressions(&view.select_stmt, &mut |expr| {
+            used_sequence = used_sequence
+                .take()
+                .or_else(|| sequence_called_in(expr, resolver, &in_namespace));
+            Ok(WalkControl::Continue)
+        });
+        if walked.is_ok() {
+            if let Some(sequence) = used_sequence {
+                return Some(format!("view {} depends on sequence {sequence}", view.name));
+            }
+        }
+    }
+    None
+}
+
+/// The sequence that `expr` calls a sequence function on, when `wanted`
+/// accepts it.
+fn sequence_called_in(
+    expr: &ast::Expr,
+    resolver: &Resolver,
+    wanted: &dyn Fn(&(NamespaceRef, String)) -> bool,
+) -> Option<String> {
+    crate::translate::sequence::sequence_called_by(expr, resolver)
+        .filter(wanted)
+        .map(|(_, sequence)| sequence)
 }
 
 /// Validate an encode or decode expression for safety.

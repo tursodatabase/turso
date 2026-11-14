@@ -1227,7 +1227,29 @@ pub fn translate_alter_table(
                 None
             };
 
+            let owned_sequence = owned_sequence_of_column(
+                &original_btree.columns()[dropped_index],
+                namespace,
+                &table_name_norm,
+                resolver,
+            );
+            if let Some(sequence) = &owned_sequence {
+                if let Some(usage) = crate::translate::schema::find_object_using_sequence(
+                    resolver,
+                    namespace,
+                    std::slice::from_ref(sequence),
+                    &table_name_norm,
+                    Some(column_name_norm.as_str()),
+                ) {
+                    crate::bail_parse_error!(
+                        "cannot drop column {} of table {} because other objects depend on it: {usage}",
+                        column_name_norm,
+                        table_name_norm
+                    );
+                }
+            }
             let mut rewrite_rows_result = Ok(());
+            let mut owned_sequence_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1248,6 +1270,11 @@ pub fn translate_alter_table(
                             database_id,
                         );
                     }
+                    if let Some(sequence) = &owned_sequence {
+                        owned_sequence_result = emit_drop_owned_sequence(
+                            program, resolver, connection, namespace, sequence,
+                        );
+                    }
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1264,7 +1291,8 @@ pub fn translate_alter_table(
                     })
                 },
             )?;
-            rewrite_rows_result?
+            rewrite_rows_result?;
+            owned_sequence_result?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def
@@ -2966,6 +2994,54 @@ fn emit_rewrite_table_indexes(
             index_cursor_id,
             RegisterOrLiteral::Literal(index.root_page),
             Some(index.root_page),
+        )?;
+    }
+    Ok(())
+}
+
+/// The sequence that `column` draws its values from, when the table owns
+/// it, so dropping the column drops it too.
+// FIXME: ownership is stored per table, so a column that only uses the sequence
+// of another column of its table is treated as the owner. Use the column
+// ownership of pg_depend once it is stored.
+fn owned_sequence_of_column(
+    column: &crate::schema::Column,
+    namespace: NamespaceRef,
+    table_name: &str,
+    resolver: &Resolver,
+) -> Option<String> {
+    let (sequence_namespace, sequence) =
+        crate::translate::expr::functions::nextval_sequence(column.default.as_deref()?, resolver)?;
+    if sequence_namespace.database_id != namespace.database_id
+        || sequence_namespace.id != namespace.id
+    {
+        return None;
+    }
+    resolver
+        .catalog
+        .dialect
+        .sequences_owned_by_table(resolver.schema(), namespace.id, table_name)
+        .contains(&sequence)
+        .then_some(sequence)
+}
+
+fn emit_drop_owned_sequence(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
+    sequence: &str,
+) -> Result<()> {
+    crate::translate::sequence::emit_drop_sequence_cleanup(program, resolver, namespace, sequence)?;
+    if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Drop {
+                namespace: namespace.id,
+                name: sequence.to_string(),
+            }],
         )?;
     }
     Ok(())

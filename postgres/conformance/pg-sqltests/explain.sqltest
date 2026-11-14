@@ -40,7 +40,7 @@ test explain-update-does-not-execute {
     SELECT id, value FROM items;
 }
 expect {
-    2|0|0|SEARCH items USING INTEGER PRIMARY KEY (rowid=?)
+    3|0|0|SEARCH items USING COVERING INDEX sqlite_autoindex___turso_ns1_items_1 (id=?)
     1|10
 }
 
@@ -50,7 +50,7 @@ test explain-delete-does-not-execute {
     SELECT id, value FROM items;
 }
 expect {
-    2|0|0|SEARCH items USING INTEGER PRIMARY KEY (rowid=?)
+    3|0|0|SEARCH items USING COVERING INDEX sqlite_autoindex___turso_ns1_items_1 (id=?)
     1|10
 }
 
@@ -136,5 +136,5 @@ test explain-select-seeks-index-with-subquery-of-policy {
     EXPLAIN SELECT id FROM explain_policy_subquery_docs;
 }
 expect {
-    1|0|0|SEARCH explain_policy_subquery_docs USING COVERING INDEX explain_policy_subquery_docs_owner (owner=?)
+    1|0|0|SEARCH explain_policy_subquery_docs USING INDEX explain_policy_subquery_docs_owner (owner=?)
 }

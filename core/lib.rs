@@ -182,6 +182,7 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::collate::CollationSeq;
+pub use translate::expr::functions::nextval_sequence_argument;
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use translate::sequence::{emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write};
 pub use turso_ext::ContextDestructor;

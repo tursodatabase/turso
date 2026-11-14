@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
@@ -1328,7 +1329,7 @@ impl CopyState {
         conn: &Arc<Connection>,
         sql: &str,
     ) -> Result<Option<crate::Statement>> {
-        let mut stmt = crate::Statement::new(conn.prepare_sqlite(sql)?);
+        let mut stmt = crate::Statement::new(prepare_copy_insert(conn, sql)?);
         if self.rows.is_empty() {
             return Ok(None);
         }
@@ -2364,10 +2365,14 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
             tables.push(name.to_string());
         }
     }
+    let owned_sequences: HashSet<String> = tables
+        .iter()
+        .flat_map(|table| crate::classes::sequences_owned_by_table(&current, namespace, table))
+        .collect();
     let mut sequences: Vec<String> = current
         .sequences_by_name(namespace)
         .keys()
-        .filter(|name| is_user_object(name))
+        .filter(|name| is_user_object(name) && !owned_sequences.contains(*name))
         .cloned()
         .collect();
     views.sort();
@@ -2431,6 +2436,29 @@ fn prepare_copy_rows(
 
     let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
     Ok((insert_sql, rows))
+}
+
+fn prepare_copy_insert(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let cmd = parser
+        .next_cmd()
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let Some(ast::Cmd::Stmt(mut stmt)) = cmd else {
+        return Err(LimboError::InternalError(
+            "COPY FROM builds no INSERT".into(),
+        ));
+    };
+    let ast::Stmt::Insert {
+        overriding_system_value,
+        ..
+    } = &mut stmt
+    else {
+        return Err(LimboError::InternalError(
+            "COPY FROM builds no INSERT".into(),
+        ));
+    };
+    *overriding_system_value = true;
+    conn.prepare_ast_stmt(stmt)
 }
 
 fn bind_copy_row(stmt: &mut crate::Statement, row: &[Option<String>]) -> Result<()> {

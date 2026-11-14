@@ -213,7 +213,7 @@ fn objects_of_a_namespace_survive_reopening_and_renaming(db: TempDatabase) {
             &conn,
             "SELECT count(*) FROM sqlite_schema WHERE tbl_name = '__turso_ns2_u'"
         ),
-        3
+        4
     );
     conn.execute("DROP INDEX app.t_y").unwrap();
     conn.execute("DROP TRIGGER app.trg").unwrap();

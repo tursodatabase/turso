@@ -5492,6 +5492,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Stmt::Insert {
+            overriding_system_value: false,
             with,
             or_conflict: resolve_type,
             tbl_name,
@@ -13057,6 +13058,7 @@ mod tests {
             (
                 b"INSERT INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: None,
                     tbl_name: QualifiedName {
@@ -13085,6 +13087,7 @@ mod tests {
             (
                 b"REPLACE INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
@@ -13113,6 +13116,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) INSERT INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13161,6 +13165,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) REPLACE INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
