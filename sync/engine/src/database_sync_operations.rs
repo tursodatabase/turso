@@ -3474,6 +3474,21 @@ async fn write_bootstrap_page<Ctx>(
     Ok(())
 }
 
+/// Check the first message of a bootstrap chunk response: it must exist and
+/// announce a page stream.
+fn bootstrap_chunk_header(
+    header: Option<PullUpdatesRespProtoBody>,
+) -> Result<PullUpdatesRespProtoBody> {
+    let Some(header) = header else {
+        return Err(Error::DatabaseSyncEngineError(
+            "no header returned in the pull-updates protobuf call".to_string(),
+        ));
+    };
+    tracing::info!("bootstrap_db_file: got header={:?}", header);
+    ensure_page_stream(&header, "bootstrap_db_file")?;
+    Ok(header)
+}
+
 /// Send the first `/pull-updates` request of a bootstrap and stream every
 /// returned page into `file`. The file is resized to `header.db_size *
 /// PAGE_SIZE` between reading the header and the first page. Returns the
@@ -3487,20 +3502,14 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     let completion =
         send_pull_chunk_request(ctx, "", server_pages_selector, server_query_selector)?;
     let mut bytes = BytesMut::new();
-    let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
+    let header = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
         ctx.coro,
         &completion,
         &ctx.io.network_stats,
         &mut bytes,
     )
-    .await?
-    else {
-        return Err(Error::DatabaseSyncEngineError(
-            "no header returned in the pull-updates protobuf call".to_string(),
-        ));
-    };
-    tracing::info!("bootstrap_db_file: got header={:?}", header);
-    ensure_page_stream(&header, "pull_chunk_into_file")?;
+    .await?;
+    let header = bootstrap_chunk_header(header)?;
     let c = Completion::new_trunc(move |result| {
         let Ok(rc) = result else {
             return;
@@ -3570,9 +3579,7 @@ async fn pull_chunks_into_file<IO: SyncEngineIo, Ctx>(
                     bytes,
                 )? {
                     ProtoPoll::Message(h) => {
-                        tracing::info!("bootstrap_db_file: got header={:?}", h);
-                        ensure_page_stream(&h, "pull_chunks_into_file")?;
-                        *header = Some(h);
+                        *header = Some(bootstrap_chunk_header(Some(h))?);
                         progress = true;
                     }
                     ProtoPoll::Pending => {
@@ -3580,9 +3587,7 @@ async fn pull_chunks_into_file<IO: SyncEngineIo, Ctx>(
                         continue;
                     }
                     ProtoPoll::End => {
-                        return Err(Error::DatabaseSyncEngineError(
-                            "no header returned in the pull-updates protobuf call".to_string(),
-                        ));
+                        bootstrap_chunk_header(None)?;
                     }
                 }
             }

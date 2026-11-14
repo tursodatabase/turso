@@ -1874,13 +1874,33 @@ mod tests {
             .db_sql("INSERT INTO t SELECT value, randomblob(1024) FROM generate_series(1, 200)")
             .await
             .unwrap();
+        // The token provider runs at the start of every HTTP request. It
+        // stays open for 20 ms and records how many calls were open together.
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let db = crate::sync::Builder::new_remote(":memory:")
             .with_remote_url(server.db_url())
             .with_pull_bytes_threshold(8192)
             .with_pull_parallel_requests(4)
+            .with_auth_token_fn({
+                let open = open.clone();
+                let max_open = max_open.clone();
+                move || {
+                    let open = open.clone();
+                    let max_open = max_open.clone();
+                    async move {
+                        let now = open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_open.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        open.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok("token".to_string())
+                    }
+                }
+            })
             .build()
             .await
             .unwrap();
+        assert_eq!(max_open.load(std::sync::atomic::Ordering::SeqCst), 4);
         let conn = db.connect().await.unwrap();
         let rows = conn
             .query("SELECT COUNT(*), SUM(x), SUM(length(y)) FROM t", ())
