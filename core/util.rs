@@ -1691,12 +1691,12 @@ impl std::fmt::Display for SchemaExprOwner<'_> {
 }
 
 /// Call `func` on every expression the schema stores, with the object it
-/// belongs to: column defaults, generated columns, CHECK constraints, index
+/// belongs to and that object's namespace: column defaults, generated columns, CHECK constraints, index
 /// keys and WHERE clauses, view and materialized view bodies, and trigger
 /// WHEN clauses and bodies, subqueries included.
 pub fn walk_schema_expressions<F>(schema: &Schema, func: &mut F) -> Result<()>
 where
-    F: FnMut(SchemaExprOwner<'_>, &ast::Expr) -> Result<WalkControl>,
+    F: FnMut(NamespaceId, SchemaExprOwner<'_>, &ast::Expr) -> Result<WalkControl>,
 {
     for namespace in schema.namespace_ids() {
         for table in schema.tables(namespace) {
@@ -1704,25 +1704,37 @@ where
             for column in table.columns() {
                 if let Some(default) = &column.default {
                     walk_expr_with_subqueries(default, &mut |expr| {
-                        func(SchemaExprOwner::ColumnDefault { table, column }, expr)
+                        func(
+                            namespace,
+                            SchemaExprOwner::ColumnDefault { table, column },
+                            expr,
+                        )
                     })?;
                 }
                 if let Some(expr) = column.generated_expr() {
                     walk_expr_with_subqueries(expr, &mut |expr| {
-                        func(SchemaExprOwner::GeneratedColumn { table, column }, expr)
+                        func(
+                            namespace,
+                            SchemaExprOwner::GeneratedColumn { table, column },
+                            expr,
+                        )
                     })?;
                 }
             }
             if let Table::BTree(btree) = table {
                 for check in &btree.check_constraints {
                     walk_expr_with_subqueries(&check.expr, &mut |expr| {
-                        func(SchemaExprOwner::CheckConstraint { table }, expr)
+                        func(namespace, SchemaExprOwner::CheckConstraint { table }, expr)
                     })?;
                 }
             }
             if let Some(view) = schema.get_materialized_view(namespace, table.get_name()) {
                 walk_select_expressions(&view.lock().select_stmt, &mut |expr| {
-                    func(SchemaExprOwner::MaterializedView(table.get_name()), expr)
+                    func(
+                        namespace,
+                        SchemaExprOwner::MaterializedView(table.get_name()),
+                        expr,
+                    )
                 })?;
             }
         }
@@ -1734,18 +1746,18 @@ where
                 .chain(index.where_clause.as_deref());
             for expr in index_exprs {
                 walk_expr_with_subqueries(expr, &mut |expr| {
-                    func(SchemaExprOwner::Index(index), expr)
+                    func(namespace, SchemaExprOwner::Index(index), expr)
                 })?;
             }
         }
         for (name, view) in schema.views(namespace) {
             walk_select_expressions(&view.select_stmt, &mut |expr| {
-                func(SchemaExprOwner::View(name), expr)
+                func(namespace, SchemaExprOwner::View(name), expr)
             })?;
         }
         for trigger in schema.triggers(namespace) {
             visit_trigger(trigger, &mut |expr: &ast::Expr| {
-                func(SchemaExprOwner::Trigger(trigger), expr)
+                func(namespace, SchemaExprOwner::Trigger(trigger), expr)
             })?;
         }
     }

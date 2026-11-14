@@ -303,6 +303,16 @@ impl Dialect for PostgresDialect {
         crate::classes::sequences_owned_by_table(schema, namespace, name)
     }
 
+    fn sequences_owned_by_column(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: &str,
+    ) -> turso_core::Result<Vec<String>> {
+        crate::classes::sequences_owned_by_column(schema, namespace, table, column)
+    }
+
     fn refuses_dropping_used_sequences(&self) -> bool {
         true
     }

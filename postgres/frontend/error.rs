@@ -228,7 +228,7 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-fn sqlstate(error: &LimboError) -> &'static str {
+pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,

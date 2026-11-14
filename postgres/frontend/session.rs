@@ -679,8 +679,13 @@ struct DeferredStatement {
 
 enum CommandContext {
     Default,
-    SchemaElement { schema: String },
-    DropSchema,
+    SchemaElement {
+        schema: String,
+    },
+    /// One statement of `DROP SCHEMA schema`.
+    DropSchema {
+        schema: String,
+    },
 }
 
 enum DeferredWork {
@@ -799,16 +804,21 @@ impl DeferredExecution {
                 set_search_path(&conn, setting.as_deref(), SettingScope::Session)?;
                 result
             }
-            CommandContext::DropSchema => {
+            CommandContext::DropSchema { schema } => {
+                let schema = schema.clone();
                 let foreign_keys_enabled = conn.foreign_keys_enabled();
                 if foreign_keys_enabled {
                     conn.set_foreign_keys_enabled(false);
                 }
+                conn.set_namespace_being_dropped(
+                    conn.qualifier(&schema).map(|namespace| namespace.target.id),
+                );
                 let result = self.run_phase_inner(inner);
+                conn.set_namespace_being_dropped(None);
                 if foreign_keys_enabled {
                     conn.set_foreign_keys_enabled(true);
                 }
-                result
+                result.map_err(|error| unsupported_cascade_to_other_schemas(&schema, error))
             }
         }
     }
@@ -2290,20 +2300,65 @@ fn drop_schema_commands(
         ));
     }
 
+    let dropped_with_a_table = sequences_owned_by_tables(conn, &name, &objects);
     let mut commands: Vec<_> = objects
         .iter()
+        .filter(|object| {
+            !matches!(object, SchemaObject::Sequence(sequence) if dropped_with_a_table.contains(sequence))
+        })
         .map(|object| DeferredStatement {
             command: DeferredCommand::Sqlite(object.drop_sql(&name)),
-            context: CommandContext::DropSchema,
+            context: CommandContext::DropSchema {
+                schema: name.clone(),
+            },
         })
         .collect();
     commands.push(DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::DropSchema {
-            name: ast::Name::exact(name),
+            name: ast::Name::exact(name.clone()),
         }),
-        context: CommandContext::DropSchema,
+        context: CommandContext::DropSchema { schema: name },
     });
     Ok(commands)
+}
+
+/// The sequences that the tables among `objects` of schema `schema` own.
+fn sequences_owned_by_tables(
+    conn: &Arc<Connection>,
+    schema: &str,
+    objects: &[SchemaObject],
+) -> HashSet<String> {
+    let Some(namespace) = conn.qualifier(schema) else {
+        return HashSet::new();
+    };
+    let current = conn.current_schema();
+    objects
+        .iter()
+        .filter_map(|object| match object {
+            SchemaObject::Table(table) => Some(table),
+            SchemaObject::View(_) | SchemaObject::Sequence(_) => None,
+        })
+        .flat_map(|table| {
+            crate::classes::sequences_owned_by_table(&current, namespace.target.id, table)
+        })
+        .collect()
+}
+
+/// `DROP SCHEMA schema CASCADE` drops the objects of the schema one statement
+/// at a time. A statement that fails because an object outside the schema
+/// depends on what it drops would need that object dropped too, as
+/// PostgreSQL does, which is not supported (0A000).
+fn unsupported_cascade_to_other_schemas(schema: &str, error: LimboError) -> LimboError {
+    if crate::error::sqlstate(&error) != SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST {
+        return error;
+    }
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!(
+            "DROP SCHEMA \"{schema}\" CASCADE is not supported when an object of another schema \
+             depends on an object of the schema: {error}"
+        ),
+    )
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.
@@ -2365,14 +2420,10 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
             tables.push(name.to_string());
         }
     }
-    let owned_sequences: HashSet<String> = tables
-        .iter()
-        .flat_map(|table| crate::classes::sequences_owned_by_table(&current, namespace, table))
-        .collect();
     let mut sequences: Vec<String> = current
         .sequences_by_name(namespace)
         .keys()
-        .filter(|name| is_user_object(name) && !owned_sequences.contains(*name))
+        .filter(|name| is_user_object(name))
         .cloned()
         .collect();
     views.sort();

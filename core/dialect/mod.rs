@@ -65,6 +65,13 @@ pub enum CatalogChange {
         name: String,
         owner: NewOwner,
     },
+    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
+    RenameColumn {
+        namespace: NamespaceId,
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
     /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
     /// relation FROM grantees` when `revoke` is set.
     Grant {
@@ -105,12 +112,19 @@ pub enum CatalogChange {
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
 #[derive(Debug, Clone)]
 pub enum NewOwner {
-    /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
-    /// table.column` names one for a sequence, or no table. What a table
-    /// owns changes owner with it, and not on its own.
-    Table(Option<String>),
+    /// A column of a table of the same namespace, as `ALTER SEQUENCE ...
+    /// OWNED BY table.column` names one for a sequence, or no column. What a
+    /// table owns changes owner with it, and not on its own.
+    Column(Option<OwnerColumn>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// The column that owns a sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerColumn {
+    pub table: String,
+    pub column: String,
 }
 
 /// What a built-in scalar function may read besides its arguments.
@@ -388,7 +402,7 @@ pub trait Dialect: Send + Sync + 'static {
                     ));
                 }
                 CatalogChange::ChangeOwner {
-                    owner: NewOwner::Table(_),
+                    owner: NewOwner::Column(_),
                     ..
                 } => {
                     return Err(LimboError::ParseError(
@@ -494,8 +508,22 @@ pub trait Dialect: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// Whether DROP SEQUENCE refuses a sequence that a column default or a
-    /// view still uses.
+    /// The sequences of `namespace` that column `column` of table `table`
+    /// owns, which are dropped with the column. Fails when the dialect
+    /// cannot tell which column owns a sequence of the table.
+    fn sequences_owned_by_column(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: &str,
+    ) -> Result<Vec<String>> {
+        let _ = (schema, namespace, table, column);
+        Ok(Vec::new())
+    }
+
+    /// Whether DROP SEQUENCE refuses a sequence that another object still
+    /// uses.
     fn refuses_dropping_used_sequences(&self) -> bool {
         false
     }
