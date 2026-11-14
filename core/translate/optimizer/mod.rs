@@ -1078,6 +1078,62 @@ fn optimize_select_plan_form(
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
+/// SQLite removes DISTINCT in the same cases.
+fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool> {
+    let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
+        [] if plan.distinctness.is_distinct() && plan.group_by.is_none() => {
+            plan.result_columns.iter().map(|col| &col.expr).collect()
+        }
+        [agg] if agg.is_distinct() => plan
+            .group_by
+            .iter()
+            .flat_map(|group_by| &group_by.exprs)
+            .chain(&agg.args)
+            .collect(),
+        _ => return Ok(false),
+    };
+    let [table] = plan.table_references.joined_tables() else {
+        return Ok(false);
+    };
+    let Some(btree) = table.btree() else {
+        return Ok(false);
+    };
+    let ctx = ExprContext::new(Some(&plan.table_references), resolver);
+    let mut selected = Vec::new();
+    for expr in exprs {
+        match expr {
+            ast::Expr::RowId { table: t, .. } if *t == table.internal_id => return Ok(true),
+            ast::Expr::Column {
+                table: t,
+                column,
+                is_rowid_alias,
+                ..
+            } if *t == table.internal_id => {
+                if *is_rowid_alias {
+                    return Ok(true);
+                }
+                selected.push((*column, ctx.expr_collation(expr)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(resolver.with_schema(table.namespace.database_id, |schema| {
+        schema
+            .indices_including_backing(table.namespace.id, table.table.get_name())
+            .any(|index| {
+                index.unique
+                    && index.where_clause.is_none()
+                    && index.columns.iter().all(|ic| {
+                        ic.expr.is_none()
+                            && btree.columns()[ic.pos_in_table].notnull()
+                            && selected.iter().any(|(pos, collation)| {
+                                *pos == ic.pos_in_table && *collation == ic.collation
+                            })
+                    })
+            })
+    }))
+}
+
 /// Find the table reads for one version of a query.
 fn find_select_plan_form(
     plan: &mut SelectPlan,
@@ -1093,6 +1149,13 @@ fn find_select_plan_form(
     let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
+
+    if distinct_is_redundant(plan, resolver)? {
+        match plan.aggregates.first_mut() {
+            Some(agg) => agg.distinctness = super::plan::Distinctness::NonDistinct,
+            None => plan.distinctness = super::plan::Distinctness::NonDistinct,
+        }
+    }
 
     // A rewrite can move MATCH terms out of a subquery, so do this after the
     // query form has been chosen.
