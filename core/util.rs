@@ -2,6 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
+use crate::schema::CheckConstraint;
 use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::security::policy::RowPolicy;
 use crate::translate::emitter::{Resolver, TransactionMode};
@@ -1658,6 +1659,7 @@ pub enum SchemaExprOwner<'a> {
     },
     CheckConstraint {
         table: &'a Table,
+        constraint: &'a CheckConstraint,
     },
     Policy {
         table: &'a Table,
@@ -1685,7 +1687,7 @@ impl std::fmt::Display for SchemaExprOwner<'_> {
                 column_name(column),
                 table.get_name()
             ),
-            Self::CheckConstraint { table } => {
+            Self::CheckConstraint { table, .. } => {
                 write!(f, "a CHECK constraint in table {}", table.get_name())
             }
             Self::Policy { table, policy } => {
@@ -1736,9 +1738,13 @@ where
                 }
             }
             if let Table::BTree(btree) = table {
-                for check in &btree.check_constraints {
-                    walk_expr_with_subqueries(&check.expr, &mut |expr| {
-                        func(namespace, SchemaExprOwner::CheckConstraint { table }, expr)
+                for constraint in &btree.check_constraints {
+                    walk_expr_with_subqueries(&constraint.expr, &mut |expr| {
+                        func(
+                            namespace,
+                            SchemaExprOwner::CheckConstraint { table, constraint },
+                            expr,
+                        )
                     })?;
                 }
             }

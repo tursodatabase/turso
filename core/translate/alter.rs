@@ -1227,7 +1227,34 @@ pub fn translate_alter_table(
                 None
             };
 
+            let owned_sequences = if database_id == crate::MAIN_DB_ID {
+                resolver.catalog.dialect.owned_sequences(
+                    resolver.schema(),
+                    namespace.id,
+                    &table_name_norm,
+                    Some(&column_name_norm),
+                )
+            } else {
+                Vec::new()
+            };
+            if let Some(usage) = schema::find_object_using_sequence(
+                resolver,
+                connection,
+                namespace,
+                &owned_sequences,
+                schema::DroppedWithSequences::Column {
+                    table: &table_name_norm,
+                    column: &column_name_norm,
+                },
+            )? {
+                crate::bail_parse_error!(
+                    "cannot drop column {} of table {} because other objects depend on it: {usage}",
+                    column_name_norm,
+                    table_name_norm
+                );
+            }
             let mut rewrite_rows_result = Ok(());
+            let mut owned_sequences_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1248,6 +1275,12 @@ pub fn translate_alter_table(
                             database_id,
                         );
                     }
+                    owned_sequences_result = owned_sequences.iter().try_for_each(|sequence| {
+                        crate::translate::sequence::emit_drop_sequence(
+                            program, resolver, connection, namespace, sequence,
+                        )
+                        .map(|_| ())
+                    });
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1264,7 +1297,8 @@ pub fn translate_alter_table(
                     })
                 },
             )?;
-            rewrite_rows_result?
+            rewrite_rows_result?;
+            owned_sequences_result?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def

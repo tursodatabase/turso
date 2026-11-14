@@ -299,6 +299,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
+        || (msg.starts_with("cannot drop ") && msg.contains(" because other objects depend on it"))
         || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
         || (msg.starts_with("error in table ")
             && msg.contains(" after drop column: no such column"))

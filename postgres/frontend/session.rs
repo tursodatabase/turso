@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
@@ -2289,8 +2290,12 @@ fn drop_schema_commands(
         ));
     }
 
+    let dropped_with_a_table = sequences_owned_by_tables(conn, &name, &objects);
     let mut commands: Vec<_> = objects
         .iter()
+        .filter(|object| {
+            !matches!(object, SchemaObject::Sequence(sequence) if dropped_with_a_table.contains(sequence))
+        })
         .map(|object| DeferredStatement {
             command: DeferredCommand::Sqlite(object.drop_sql(&name)),
             context: CommandContext::DropSchema,
@@ -2303,6 +2308,28 @@ fn drop_schema_commands(
         context: CommandContext::DropSchema,
     });
     Ok(commands)
+}
+
+/// The sequences that the tables among `objects` of schema `schema` own.
+fn sequences_owned_by_tables(
+    conn: &Arc<Connection>,
+    schema: &str,
+    objects: &[SchemaObject],
+) -> HashSet<String> {
+    let Some(namespace) = conn.qualifier(schema) else {
+        return HashSet::new();
+    };
+    let current = conn.current_schema();
+    objects
+        .iter()
+        .filter_map(|object| match object {
+            SchemaObject::Table(table) => Some(table),
+            SchemaObject::View(_) | SchemaObject::Sequence(_) => None,
+        })
+        .flat_map(|table| {
+            crate::classes::owned_sequences(&current, namespace.target.id, table, None)
+        })
+        .collect()
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.

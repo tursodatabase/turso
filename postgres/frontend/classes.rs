@@ -245,15 +245,7 @@ impl ClassCatalog {
                 });
             }
             CatalogChange::Drop { namespace, name } => {
-                // What the dropped relation owned is nobody's now.
-                if let Some(dropped) = self.remove(*namespace, name) {
-                    for class in self.by_oid.values_mut() {
-                        if class.relownedby == dropped.oid {
-                            class.relownedby = 0;
-                            class.relownedbycolumn = None;
-                        }
-                    }
-                }
+                self.remove(*namespace, name);
             }
             CatalogChange::ChangeOwner {
                 namespace,
@@ -488,6 +480,27 @@ pub(crate) fn relation_owner(
     )
 }
 
+/// [`turso_core::Dialect::owned_sequences`] for the PostgreSQL frontend.
+pub(crate) fn owned_sequences(
+    schema: &Schema,
+    namespace: NamespaceId,
+    table_name: &str,
+    column: Option<&str>,
+) -> Vec<String> {
+    let Some(catalog) = class_catalog(schema) else {
+        return Vec::new();
+    };
+    let Some(table) = catalog.get_by_name(namespace, table_name) else {
+        return Vec::new();
+    };
+    catalog
+        .owned_by(table.oid)
+        .filter(|owned| owned.relkind == RelationKind::Sequence)
+        .filter(|owned| column.is_none_or(|column| owned.is_owned_by_column(column)))
+        .map(|owned| owned.relname.clone())
+        .collect()
+}
+
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// a role has the privileges the relation's list gives it, by oid or through
 /// PUBLIC. A relation without a list has the default one, which gives the
@@ -664,28 +677,11 @@ pub(crate) fn translate_catalog_changes(
             }
             CatalogChange::Drop { namespace, name } => {
                 // An engine relation has no row and nothing to do.
-                let Some(owned) = class_catalog(schema).and_then(|catalog| {
-                    let class = catalog.get_by_name(*namespace, name)?;
-                    Some(
-                        catalog
-                            .owned_by(class.oid)
-                            .map(|owned| (owned.relnamespace, owned.relname.clone()))
-                            .collect::<Vec<_>>(),
-                    )
-                }) else {
+                if class_catalog(schema)
+                    .and_then(|catalog| catalog.get_by_name(*namespace, name))
+                    .is_none()
+                {
                     continue;
-                };
-                // What the dropped relation owned, such as the sequences of
-                // a table's serial columns, stays and is nobody's now.
-                for (owned_namespace, owned_name) in owned {
-                    emit_class_row_set_owned_by(
-                        program,
-                        &cursors,
-                        owned_namespace,
-                        &owned_name,
-                        0,
-                        None,
-                    );
                 }
                 emit_class_row_delete(program, &cursors, *namespace, name)
             }

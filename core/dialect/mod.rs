@@ -492,6 +492,22 @@ pub trait Dialect: Send + Sync + 'static {
         None
     }
 
+    /// The sequences of `namespace` that `column` of table `table` owns, or
+    /// that any column of the table owns when `column` is None.
+    ///
+    /// Which column owns a sequence has to be stored in a table of its own,
+    /// so only a dialect that keeps one has owned sequences. SQLite has none.
+    fn owned_sequences(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: Option<&str>,
+    ) -> Vec<String> {
+        let _ = (schema, namespace, table, column);
+        Vec::new()
+    }
+
     /// Whether `role` has `privilege` on relation `name` of `namespace`,
     /// from the privileges the dialect stores. A dialect without privileges
     /// gives every role every privilege.
