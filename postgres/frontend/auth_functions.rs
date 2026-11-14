@@ -10,6 +10,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "auth.uid",
             FunctionArity::Exact(0),
             false,
+            &[],
             |connection, _| {
                 claim(connection, "request.jwt.claim.sub", "sub")?
                     .map(|sub| canonical_uuid(&sub).map(Uuid))
@@ -20,12 +21,14 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "auth.email",
             FunctionArity::Exact(0),
             false,
+            &[],
             |connection, _| claim(connection, "request.jwt.claim.email", "email"),
         ))
         .extension_function(pg_scalar_function(
             "auth.jwt",
             FunctionArity::Exact(0),
             false,
+            &[],
             |connection, _| jwt(connection),
         ))
 }

@@ -351,6 +351,254 @@ expect {
     invalid
 }
 
+test strict-functions-return-null-for-a-null-argument {
+    CREATE TABLE formats (f text);
+    INSERT INTO formats VALUES (NULL);
+    SELECT CASE WHEN to_char(1, NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN to_char(NULL::integer, '999') IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN to_char(1, f) IS NULL THEN 'null' ELSE 'not null' END FROM formats;
+    SELECT CASE WHEN pg_input_is_valid('1', NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN pg_input_is_valid(NULL, 'int4') IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN pg_input_is_valid('1', f) IS NULL THEN 'null' ELSE 'not null' END FROM formats;
+}
+expect {
+    null
+    null
+    null
+    null
+    null
+    null
+}
+
+test pg-encoding-to-char-booleq-and-boolne-return-null-for-a-null-argument {
+    SELECT CASE WHEN pg_encoding_to_char(NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN booleq(NULL, true) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN boolne(true, NULL) IS NULL THEN 'null' ELSE 'not null' END;
+}
+expect {
+    null
+    null
+    null
+}
+
+test unmarked-functions-return-null-for-a-null-argument {
+    CREATE TABLE ct (a int CHECK (a > 0));
+    SELECT CASE WHEN pg_get_constraintdef(oid, NULL) IS NULL THEN 'null' ELSE 'not null' END
+    FROM pg_constraint WHERE conname = 'ct_a_check';
+}
+expect {
+    null
+}
+
+test functions-called-on-null-input-run-with-a-null-argument {
+    SELECT format_type(23, NULL);
+}
+expect {
+    integer
+}
+
+test to-char-integer-format-errors {
+    SELECT to_char(1, 5);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, integer\) does not exist
+}
+
+test pg-input-is-valid-integer-type-name-errors {
+    SELECT pg_input_is_valid('1', 5);
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(.*, integer\) does not exist
+}
+
+test pg-input-is-valid-integer-input-errors {
+    SELECT pg_input_is_valid(1, 'int4');
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(integer, .*\) does not exist
+}
+
+test pg-input-is-valid-integer-input-errors-with-a-null-type-name {
+    SELECT pg_input_is_valid(1, NULL);
+}
+@sqlstate 42883
+expect error {
+    function pg_input_is_valid\(integer, .*\) does not exist
+}
+
+test to-char-integer-format-errors-with-a-null-value {
+    SELECT to_char(NULL, 5);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(.*, integer\) does not exist
+}
+
+test current-setting-numeric-parameter-name-errors-with-a-null-missing-ok {
+    SELECT current_setting(5.5, NULL);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(numeric, .*\) does not exist
+}
+
+test age-integer-errors-with-a-null-argument {
+    SELECT age(5, NULL);
+}
+expect error {
+    function age\(integer, unknown\) does not exist
+}
+
+test quote-ident-integer-errors {
+    SELECT quote_ident(5);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(integer\) does not exist
+}
+
+test like-escape-integer-pattern-errors {
+    SELECT like_escape(5, '\');
+}
+@sqlstate 42883
+expect error {
+    function like_escape\(integer, .*\) does not exist
+}
+
+test similar-to-escape-integer-pattern-errors {
+    SELECT similar_to_escape(5);
+}
+@sqlstate 42883
+expect error {
+    function similar_to_escape\(integer\) does not exist
+}
+
+test acldefault-integer-object-kind-errors {
+    SELECT acldefault(5, 10);
+}
+@sqlstate 42883
+expect error {
+    function acldefault\(integer, integer\) does not exist
+}
+
+test oid-argument-type-errors-with-a-null-argument {
+    SELECT pg_get_constraintdef(1.5, NULL);
+}
+@sqlstate 42883
+expect error {
+    function pg_get_constraintdef\(numeric, unknown\) does not exist
+}
+
+test boolean-argument-type-errors-with-a-null-argument {
+    SELECT current_setting(NULL, 1.5);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(unknown, numeric\) does not exist
+}
+
+test booleq-and-boolne-read-boolean-text {
+    SELECT CASE WHEN booleq('t', true) THEN 'equal' ELSE 'different' END,
+           CASE WHEN boolne('f', true) THEN 'different' ELSE 'equal' END;
+}
+expect {
+    equal|different
+}
+
+test integer-arguments-read-untyped-number-literals {
+    SELECT pg_encoding_to_char('6'), format_type(1043, '20');
+}
+expect {
+    UTF8|character varying(16)
+}
+
+test pg-encoding-to-char-names-every-encoding {
+    SELECT pg_encoding_to_char(1), pg_encoding_to_char(7), pg_encoding_to_char(41),
+           CASE WHEN pg_encoding_to_char(42) = '' THEN 'empty' ELSE 'not empty' END;
+}
+expect {
+    EUC_JP|MULE_INTERNAL|SHIFT_JIS_2004|empty
+}
+
+test oid-arguments-read-untyped-oid-literals {
+    SELECT acldefault('r', '4294967294');
+}
+expect {
+    {4294967294=arwdDxtm/4294967294}
+}
+
+test to-char-bytea-value-errors {
+    SELECT to_char('\x41'::bytea, '9');
+}
+@sqlstate 42883
+expect error {
+    function to_char\(bytea, .*\) does not exist
+}
+
+test boolean-arguments-read-untyped-boolean-literals {
+    SELECT CASE WHEN current_setting('no_such.setting', 'on') IS NULL THEN 'null' ELSE 'not null' END,
+           CASE WHEN current_schemas('t') = current_schemas(true) THEN 'same' ELSE 'different' END;
+}
+expect {
+    null|same
+}
+
+test pg-get-expr-integer-expression-errors-with-every-argument-type {
+    SELECT pg_get_expr(5, 1259);
+}
+@sqlstate 42883
+expect error {
+    function pg_get_expr\(integer, integer\) does not exist
+}
+
+test current-setting-integer-missing-ok-errors {
+    SELECT current_setting('search_path', 2);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(.*, integer\) does not exist
+}
+
+test integer-argument-untyped-literal-must-be-an-integer {
+    SELECT format_type(23, 'abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "abc"
+}
+
+test integer-argument-untyped-literal-must-fit-an-integer {
+    SELECT format_type(23, '3000000000');
+}
+@sqlstate 22003
+expect error {
+    value "3000000000" is out of range for type integer
+}
+
+test integer-argument-bigint-errors {
+    SELECT format_type(23, 3000000000);
+}
+@sqlstate 42883
+expect error {
+    function format_type\(integer, .*\) does not exist
+}
+
+test oid-argument-numeric-errors {
+    SELECT format_type(1.5, 1);
+}
+@sqlstate 42883
+expect error {
+    function format_type\(numeric, integer\) does not exist
+}
+
+test timestamp-argument-untyped-literal-must-be-a-timestamp {
+    SELECT age(NULL, 'garbage');
+}
+expect error {}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
