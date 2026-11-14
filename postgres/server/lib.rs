@@ -171,6 +171,7 @@ impl SimpleQueryHandler for TursoPgHandler {
     async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
@@ -210,6 +211,7 @@ impl TursoPgHandler {
     async fn run_simple_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
@@ -240,8 +242,8 @@ impl TursoPgHandler {
                 None => {
                     for response in SimpleQueryHandler::do_query(self, client, &sql).await? {
                         match response {
-                            Response::Query(mut result) => {
-                                send_query_response(client, &mut result, true).await?
+                            Response::Query(result) => {
+                                send_query_response(client, result, true).await?
                             }
                             Response::Execution(tag) => {
                                 send_execution_response(client, tag).await?
@@ -527,7 +529,7 @@ fn execute_query(
                 .unwrap_or((Type::TEXT, FieldFormat::Text));
             encode_value(&mut encoder, val, &pg_type, format)?;
         }
-        rows.push(encoder.finish());
+        rows.push(Ok(encoder.take_row()));
         Ok(())
     })
     .map_err(pg_error)?;

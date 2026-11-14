@@ -14,7 +14,7 @@ path = "lib.rs"
 anyhow.workspace = true
 async-trait = "0.1"
 futures = { workspace = true }
-pgwire = "0.36"
+pgwire = "0.42.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 tracing = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
