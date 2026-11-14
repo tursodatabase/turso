@@ -204,6 +204,13 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
         ),
+        ForeignKeyCheck => Pragma::new(
+            PragmaFlags::NeedSchema
+                | PragmaFlags::Result0
+                | PragmaFlags::Result1
+                | PragmaFlags::SchemaOpt,
+            &["table", "rowid", "parent", "fkid"],
+        ),
         ForeignKeyList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &[
@@ -457,7 +464,8 @@ impl PragmaVirtualTableCursor {
     fn namespace_of_object(&self, name: &str) -> Option<String> {
         let names_an_index = match self.pragma_name.as_str() {
             "index_info" | "index_xinfo" => true,
-            "table_info" | "table_xinfo" | "index_list" | "foreign_key_list" => false,
+            "table_info" | "table_xinfo" | "index_list" | "foreign_key_list"
+            | "foreign_key_check" => false,
             _ => return None,
         };
         let name = normalize_ident(name);

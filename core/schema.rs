@@ -4673,6 +4673,56 @@ impl Schema {
         Ok(out)
     }
 
+    pub fn resolved_fks_for_check(
+        &self,
+        namespace: NamespaceId,
+        child: &Arc<BTreeTable>,
+    ) -> Result<Vec<FkCheckItem>> {
+        let mut foreign_keys: Vec<&Arc<ForeignKey>> = child.foreign_keys.iter().try_collect()?;
+        foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
+
+        let mut out = Vec::try_with_capacity_ext(foreign_keys.len())?;
+        for (fkid, fk) in foreign_keys.into_iter().enumerate() {
+            let parent_name = normalize_ident(&fk.parent_table);
+            let Some(parent_tbl) = self.get_btree_table(fk.parent_namespace, &parent_name) else {
+                if self.get_table(fk.parent_namespace, &parent_name).is_some()
+                    || self.get_view(fk.parent_namespace, &parent_name).is_some()
+                    || self
+                        .get_materialized_view(fk.parent_namespace, &parent_name)
+                        .is_some()
+                {
+                    return Err(fk_mismatch_err(&child.name, &parent_name));
+                }
+                let mut child_pos = Vec::try_with_capacity_ext(fk.child_columns.len())?;
+                for column_name in fk.child_columns.iter() {
+                    let (pos, _) = child
+                        .get_column(column_name)
+                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+                    child_pos.try_push(pos)?;
+                }
+                out.try_push(FkCheckItem {
+                    fkid,
+                    parent_table: fk.parent_table.clone(),
+                    child_pos: child_pos.into_boxed_slice(),
+                    parent: FkCheckParent::Missing,
+                })?;
+                continue;
+            };
+            let resolved = self.resolve_fk(namespace, fk, child, &parent_tbl, true)?;
+            let parent = match resolved.parent_unique_index {
+                Some(index) => FkCheckParent::Index { parent_tbl, index },
+                None => FkCheckParent::Rowid { parent_tbl },
+            };
+            out.try_push(FkCheckItem {
+                fkid,
+                parent_table: fk.parent_table.clone(),
+                child_pos: resolved.child_pos,
+                parent,
+            })?;
+        }
+        Ok(out)
+    }
+
     /// Resolve a single FK declared on `child` referencing `parent_tbl`.
     /// When `require_unique` is set, a non-rowid parent key must be backed by
     /// a non-partial UNIQUE index on exactly those columns.
@@ -7918,6 +7968,26 @@ pub struct ResolvedFkRef {
     /// For non-rowid parents: the UNIQUE index that enforces the parent key.
     /// (None when `parent_uses_rowid == true`.)
     pub parent_unique_index: Option<Arc<Index>>,
+}
+
+#[derive(Debug)]
+pub struct FkCheckItem {
+    pub fkid: usize,
+    pub parent_table: String,
+    pub child_pos: BoxedSlice<usize>,
+    pub parent: FkCheckParent,
+}
+
+#[derive(Debug)]
+pub enum FkCheckParent {
+    Missing,
+    Rowid {
+        parent_tbl: Arc<BTreeTable>,
+    },
+    Index {
+        parent_tbl: Arc<BTreeTable>,
+        index: Arc<Index>,
+    },
 }
 
 impl ResolvedFkRef {

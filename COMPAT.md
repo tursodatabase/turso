@@ -237,7 +237,7 @@ avoid this window.
 | PRAGMA defer_foreign_keys        | ❌ No         |                                              |
 | PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                         |
 | PRAGMA encoding                  | ✅ Yes        |                                              |
-| PRAGMA foreign_key_check         | ❌ No         |                                              |
+| PRAGMA foreign_key_check         | ✅ Yes        |                                              |
 | PRAGMA foreign_key_list          | ✅ Yes        |                                              |
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
