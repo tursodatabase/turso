@@ -1295,7 +1295,11 @@ pub(crate) fn emit_remember_written_rowid(
         cursor: cursor_id,
         key_reg: rowid_reg,
         record_reg: empty_record_reg,
-        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        // The rowid comes from the row, not from NewRowid, so the insert has to
+        // seek to keep the table's cells in order for the NotExists lookup.
+        flag: InsertFlags::new()
+            .require_seek()
+            .is_ephemeral_table_insert(),
         table_name: ctx.table.name.clone(),
     });
 }
