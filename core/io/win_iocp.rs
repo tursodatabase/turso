@@ -393,6 +393,14 @@ impl IO for WindowsIOCP {
         std::fs::remove_file(file_path).map_err(|e| io_error(e, "remove-file"))
     }
 
+    fn supports_rename(&self) -> bool {
+        true
+    }
+
+    fn rename_file(&self, from: &str, to: &str) -> Result<()> {
+        crate::io::rename_file_durably(from, to)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         for cmpl in completions {
