@@ -1132,6 +1132,74 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
     );
 }
 
+/// A reader begins before the checkpoint that creates the B-tree of its table,
+/// so its read mark is below the frame of the new root page binding. The reader
+/// then reads the table from the version store, and GC must keep those rows.
+#[test]
+fn passive_gc_keeps_rows_of_btree_created_after_reader_began() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    for i in 0..20 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM t WHERE id = 5").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(19)]]
+    );
+
+    db.connect()
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(root > 0, "the checkpoint must create the B-tree of t");
+    let binding = mv
+        .table_id_to_rootpage
+        .get(&mv.get_table_id_from_root_page(root))
+        .unwrap()
+        .value()
+        .materialized_at;
+    let reader_tx = reader.get_mv_tx_id().unwrap();
+    let read_mark = mv.txs.get(&reader_tx).unwrap().value().read_mark;
+    assert!(
+        binding > read_mark,
+        "the reader must begin below the frame of the new B-tree"
+    );
+
+    mv.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    mv.drop_unused_row_versions();
+
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(19)]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT v FROM t WHERE id = 7"),
+        vec![vec![Value::build_text("v7")]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT id FROM t WHERE v = 'v7'"),
+        vec![vec![Value::from_i64(7)]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT id FROM t WHERE v = 'v5'"),
+        Vec::<Vec<Value>>::new()
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
 /// After Passive WAL backfill + DB fsync, `BEGIN CONCURRENT` on another
 /// connection must not Busy. Publishing `nbackfills == max_frame` while
 /// exclusive `read_locks[0]` is still held forces every new begin onto slot 0.
@@ -24908,6 +24976,9 @@ mod group_commit_tests;
 
 #[path = "group_commit_sync_mode_tests.rs"]
 mod group_commit_sync_mode_tests;
+
+#[path = "mbt_tests/mod.rs"]
+mod mbt_tests;
 
 /// Drive a statement until it yields or finishes; IO is pumped, an explicit
 /// yield is handed back so the test can observe it.
