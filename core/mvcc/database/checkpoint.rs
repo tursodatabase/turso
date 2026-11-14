@@ -4152,53 +4152,6 @@ mod tests {
         (key_arc, row_version)
     }
 
-    #[test]
-    fn checkpoint_retry_does_not_replay_checkpointed_btree_resident_delete() {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore.clone(),
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-        checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
-        checkpoint.durable_txid_max_new = 10;
-
-        let index_id = MVTableId::from(-42);
-        let (garbage_key, garbage_version) =
-            index_row_version("blue_river_906", 75, 1, None, None, true);
-        let (_, tombstone_version) =
-            index_row_version("blue_river_906", 75, 2, None, Some(10), true);
-
-        insert_dirty_index_version(&mvstore, index_id, garbage_key, garbage_version);
-        let entry = mvstore
-            .index_rows
-            .get(&index_id)
-            .expect("index entry should exist after first insert");
-        let tombstone_key = entry
-            .value()
-            .front()
-            .expect("key bucket should exist after first insert")
-            .key()
-            .clone();
-        insert_dirty_index_version(&mvstore, index_id, tombstone_key, tombstone_version);
-
-        while checkpoint.collect_index_rows().unwrap().is_some() {}
-
-        assert!(
-            checkpoint.index_write_set.is_empty(),
-            "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
-        );
-    }
-
     fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> (RowID, RowVersion) {
         table_row_version(table_id, rowid, 1, Some(5), None, false)
     }
@@ -4252,7 +4205,7 @@ mod tests {
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, replacement) = table_row_version(table_id, 1, 2, Some(5), None, false);
 
-        let checkpointable = versions_to_write(&[btree_tombstone, replacement], table_id);
+        let checkpointable = versions_to_write(&[btree_tombstone, replacement], table_id, 2);
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4265,7 +4218,8 @@ mod tests {
         let (_, btree_tombstone) = table_row_version(table_id, 1, 1, None, Some(5), true);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable = versions_to_write(&[btree_tombstone, deleted_replacement], table_id);
+        let checkpointable =
+            versions_to_write(&[btree_tombstone, deleted_replacement], table_id, 2);
 
         assert_eq!(checkpointable.len(), 1);
         assert_eq!(checkpointable[0].id, 2);
@@ -4277,23 +4231,43 @@ mod tests {
         let table_id = MVTableId::from(-2);
         let (_, deleted_replacement) = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
 
-        let checkpointable = versions_to_write(&[deleted_replacement], table_id);
+        let checkpointable = versions_to_write(&[deleted_replacement], table_id, 2);
 
         assert!(checkpointable.is_empty());
     }
 
+    #[test]
+    fn retry_checkpoint_does_not_replay_checkpointed_btree_resident_delete() {
+        let index_id = MVTableId::from(-42);
+        let (_, garbage_version) = index_row_version("blue_river_906", 75, 1, None, None, true);
+        let (_, tombstone_version) =
+            index_row_version("blue_river_906", 75, 2, None, Some(10), true);
+
+        let to_write = versions_to_write(&[garbage_version, tombstone_version], index_id, 10);
+
+        assert!(
+            to_write.is_empty(),
+            "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
+        );
+    }
+
     /// The versions a checkpoint writes when an earlier checkpoint wrote everything up to
-    /// timestamp 2.
+    /// `last_checkpoint_ts`.
     fn versions_to_write(
         versions: &[RowVersion],
         table_id: MVTableId,
+        last_checkpoint_ts: u64,
     ) -> smallvec::SmallVec<[RowVersion; 1]> {
-        checkpointable_versions(versions, table_id, NonZeroU64::new(2), u64::MAX, |marker| {
-            match marker {
+        checkpointable_versions(
+            versions,
+            table_id,
+            NonZeroU64::new(last_checkpoint_ts),
+            u64::MAX,
+            |marker| match marker {
                 Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
                 _ => None,
-            }
-        })
+            },
+        )
     }
 
     fn insert_row_version(
@@ -4339,23 +4313,6 @@ mod tests {
             >>::new_in(crate::alloc::DynAllocator::default());
         versions.push(version);
         mvstore.rows.insert(key, Arc::new(RwLock::new(versions)));
-    }
-
-    fn insert_dirty_index_version(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        index_id: MVTableId,
-        key: Arc<SortableIndexKey>,
-        version: RowVersion,
-    ) {
-        let stamp = version_stamp(&version);
-        let (key, _, _) = mvstore
-            .insert_index_version(index_id, key, version)
-            .unwrap();
-        mvstore
-            .mark_checkpoint_dirty_key(&RowID::new(index_id, RowKey::Record(key)), stamp)
-            .unwrap();
     }
 
     fn dirty_table_key(
