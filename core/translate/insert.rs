@@ -944,13 +944,11 @@ pub fn translate_insert(
     // invalid index entries before we hit a conflict down the line.
     //
     // REPLACE (whether statement-level OR REPLACE or constraint-level ON CONFLICT REPLACE)
-    // inserts eagerly in preflight because it needs to delete-then-insert per index.
-    // When there's no statement-level override (e.g. INSERT OR ...) and no UPSERT,
-    // individual constraints keep their DDL modes. If some use REPLACE and others
-    // don't, the preflight eagerly handles REPLACE indexes (delete+reinsert) while
-    // deferring non-REPLACE indexes to the commit phase (skip_replace_indexes).
-    // This mixed-mode detection is unnecessary when a statement override exists,
-    // because the override applies uniformly to all constraints.
+    // deletes conflicting rows in preflight; the new index entries are still inserted
+    // in the commit phase. When there's no statement-level override (e.g. INSERT OR ...)
+    // and no UPSERT, individual constraints keep their DDL modes, so some of them can
+    // use REPLACE while others don't. This mixed-mode detection is unnecessary when a
+    // statement override exists, because the override applies uniformly to all constraints.
     let has_ddl_replace = ctx.statement_on_conflict.is_none()
         && upsert_actions.is_empty()
         && resolver.with_schema(ctx.namespace.database_id, |schema| {
@@ -963,10 +961,19 @@ pub fn translate_insert(
         });
     let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
         || has_ddl_replace;
+    let recheck_after_replace_reg = (on_replace && has_fks).then(|| {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg,
+        });
+        reg
+    });
     let mut preflight_ctx = PreflightCtx {
         upsert_actions: &upsert_actions,
         on_replace,
         effective_on_conflict: ctx.on_conflict,
+        recheck_after_replace_reg,
         connection,
         table_references: &mut table_references,
     };
@@ -1028,23 +1035,7 @@ pub fn translate_insert(
         )?;
     }
 
-    // Emit deferred index inserts for cases where preflight only checked constraints
-    // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
-    // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
-    // to delete-then-insert per index.
-    //
-    // When statement-level REPLACE is active, ALL indexes use REPLACE and are eagerly
-    // inserted in preflight, so the commit phase can be skipped entirely. But when only
-    // some constraints have REPLACE (mixed mode via DDL), non-REPLACE indexes still need
-    // their entries committed here.
-    // Pure statement-level REPLACE (no upsert). When upsert actions exist,
-    // ON CONFLICT DO UPDATE takes precedence over REPLACE for matching
-    // constraints, so we can't skip the commit phase.
-    let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
-    let skip_replace_indexes = has_ddl_replace && !statement_replace;
-    if has_upsert || !statement_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
-    }
+    emit_commit_phase(program, resolver, &insertion, &ctx)?;
 
     resolver.register_columns.clear();
 
@@ -1514,7 +1505,6 @@ fn emit_commit_phase(
     resolver: &Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
-    skip_replace_indexes: bool,
 ) -> Result<()> {
     let indices: Vec<_> = resolver.with_schema(ctx.namespace.database_id, |s| {
         s.get_indices(ctx.namespace.id, ctx.table.name.as_str())
@@ -1522,12 +1512,6 @@ fn emit_commit_phase(
             .collect()
     });
     for index in &indices {
-        // In mixed mode (some constraints REPLACE, some not), REPLACE indexes
-        // were already eagerly inserted in the preflight phase. Skip them here
-        // to avoid double-insertion.
-        if skip_replace_indexes && index.on_conflict == Some(ResolveType::Replace) {
-            continue;
-        }
         let idx_cursor_id = ctx
             .idx_cursors
             .iter()
@@ -3192,13 +3176,7 @@ fn emit_pk_uniqueness_check(
                 dst_reg: ctx.conflict_rowid_reg,
                 extra_amount: 0,
             });
-            emit_replace_delete_conflicting_row(
-                program,
-                resolver,
-                preflight.connection,
-                ctx,
-                preflight.table_references,
-            )?;
+            emit_replace_delete_conflicting_row(program, resolver, ctx, preflight)?;
             program.emit_insn(Insn::Goto {
                 target_pc: make_record_label,
             });
@@ -3243,7 +3221,7 @@ fn emit_pk_uniqueness_check(
 }
 
 /// Emit bytecode to check index uniqueness constraint.
-/// Handles partial index predicates, ON REPLACE, UPSERT routing, and non-unique indexes.
+/// Handles partial index predicates, ON REPLACE and UPSERT routing.
 #[allow(clippy::too_many_arguments)]
 fn emit_index_uniqueness_check(
     program: &mut ProgramBuilder,
@@ -3255,6 +3233,9 @@ fn emit_index_uniqueness_check(
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    if !index.unique {
+        return Ok(());
+    }
     // find which cursor we opened earlier for this index
     let idx_cursor_id = ctx
         .idx_cursors
@@ -3290,40 +3271,18 @@ fn emit_index_uniqueness_check(
         extra_amount: 0,
     });
 
-    if index.unique {
-        emit_unique_index_check(
-            program,
-            ctx,
-            resolver,
-            index,
-            idx_cursor_id,
-            idx_start_reg,
-            num_cols,
-            position,
-            upsert_catch_all,
-            preflight,
-        )?;
-    } else {
-        // Non-unique index: insert eagerly only for REPLACE (which doesn't use commit phase).
-        // For UPSERT and ABORT/FAIL/IGNORE/ROLLBACK, defer to commit phase.
-        if preflight.on_replace {
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(idx_start_reg),
-                count: to_u32(num_cols + 1),
-                dest_reg: to_u32(record_reg),
-                index_name: Some(index.name.clone()),
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: idx_cursor_id,
-                record_reg,
-                unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u32),
-                flags: IdxInsertFlags::new().nchange(true),
-            });
-        }
-    }
+    emit_unique_index_check(
+        program,
+        ctx,
+        resolver,
+        index,
+        idx_cursor_id,
+        idx_start_reg,
+        num_cols,
+        position,
+        upsert_catch_all,
+        preflight,
+    )?;
 
     // Close the partial-index skip (preflight)
     if let Some(lbl) = maybe_skip_probe_label {
@@ -3427,13 +3386,7 @@ fn emit_unique_index_check(
                 cursor_id: idx_cursor_id,
                 dest: ctx.conflict_rowid_reg,
             });
-            emit_replace_delete_conflicting_row(
-                program,
-                resolver,
-                preflight.connection,
-                ctx,
-                preflight.table_references,
-            )?;
+            emit_replace_delete_conflicting_row(program, resolver, ctx, preflight)?;
             program.emit_insn(Insn::Goto { target_pc: ok });
         } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
             // IGNORE: skip this row entirely on unique conflict.
@@ -3459,29 +3412,6 @@ fn emit_unique_index_check(
             });
         }
         program.preassign_label_to_next_insn(ok);
-
-        if preflight.on_replace {
-            // REPLACE: insert index entry eagerly (right after delete).
-            // IdxDelete repositions the cursor, so we must NOT use USE_SEEK.
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(idx_start_reg),
-                count: to_u32(num_cols + 1),
-                dest_reg: to_u32(record_reg),
-                index_name: Some(index.name.clone()),
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: idx_cursor_id,
-                record_reg,
-                unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u32),
-                flags: IdxInsertFlags::new().nchange(true),
-            });
-        }
-        // For non-REPLACE cases (ABORT/FAIL/IGNORE/ROLLBACK), index inserts are
-        // deferred to the commit phase after all constraint checks pass.
-        // This prevents stale index entries when a later constraint check fails.
     }
     Ok(())
 }
@@ -3564,6 +3494,33 @@ fn emit_preflight_constraint_checks(
             }
             ResolvedUpsertTarget::CatchAll => unreachable!(),
         }
+    }
+    // Foreign key actions run by a REPLACE delete can insert a row that
+    // conflicts with the new row again. When any REPLACE delete ran, check the
+    // rowid and every UNIQUE index once more, failing with ABORT on a conflict,
+    // like SQLite's `sqlite3GenerateConstraintChecks`.
+    if let Some(recheck_reg) = preflight.recheck_after_replace_reg {
+        turso_assert!(
+            preflight.upsert_actions.is_empty(),
+            "REPLACE deletes never run together with UPSERT"
+        );
+        let recheck_done = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: recheck_reg,
+            target_pc: recheck_done,
+            jump_if_null: true,
+        });
+        preflight.on_replace = false;
+        preflight.effective_on_conflict = ResolveType::Abort;
+        emit_pk_uniqueness_check(program, ctx, resolver, insertion, None, None, preflight)?;
+        for (constraint, _) in &constraints.constraints_to_check {
+            if let ResolvedUpsertTarget::Index(index) = constraint {
+                emit_index_uniqueness_check(
+                    program, ctx, resolver, insertion, index, None, None, preflight,
+                )?;
+            }
+        }
+        program.preassign_label_to_next_insn(recheck_done);
     }
     Ok(())
 }
@@ -3735,6 +3692,9 @@ struct PreflightCtx<'a, 'b> {
     /// The effective conflict resolution for the current constraint being checked.
     /// Updated per-constraint in emit_preflight_constraint_checks.
     effective_on_conflict: ResolveType,
+    /// Set to 1 by a REPLACE delete in a table with foreign keys, whose
+    /// actions may have inserted rows, so the uniqueness checks run again.
+    recheck_after_replace_reg: Option<usize>,
     /// Database connection for FK checks
     connection: &'a Arc<Connection>,
     /// Table references for expression evaluation
@@ -3926,10 +3886,11 @@ pub(crate) fn autoincrement_bookkeeping_insert_flags() -> InsertFlags {
 fn emit_replace_delete_conflicting_row(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
-    connection: &Arc<Connection>,
     ctx: &mut InsertEmitCtx,
-    table_references: &mut TableReferences,
+    preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    let connection = preflight.connection;
+    let table_references = &mut *preflight.table_references;
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
         src_reg: ctx.conflict_rowid_reg,
@@ -4065,6 +4026,12 @@ fn emit_replace_delete_conflicting_row(
         connection,
         ctx.namespace.database_id,
     )?;
+    if let Some(recheck_reg) = preflight.recheck_after_replace_reg {
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: recheck_reg,
+        });
+    }
 
     Ok(())
 }
