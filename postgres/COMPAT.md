@@ -389,7 +389,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER (one character), NULL string, HEADER (not HEADER MATCH), column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows); other options rejected |
+| COPY table FROM 'file' (text format) | 🟡 Partial | DELIMITER (one character), NULL string, HEADER (not HEADER MATCH), column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows); other options rejected. Files up to 1 GiB are read; a directory is rejected. The `tursopg --server` listener rejects it, because it does not authenticate clients and every session starts as the superuser |
 | COPY table TO STDOUT | ✅ Supported | Simple query protocol, text format; column lists, search_path lookup, COPY text escaping; excludes generated columns by default and rejects them in explicit lists; database reads use blocking helpers, rows are sent one at a time |
 | COPY FROM STDIN | ❌ Not supported | Rejected with an error |
 | COPY FROM ... WHERE | ❌ Not supported | Rejected |
