@@ -6023,6 +6023,31 @@ impl BTreeTable {
         })
     }
 
+    /// The collations a WITHOUT ROWID table compares its primary key columns
+    /// with: the collation of each column definition. SQLite uses the
+    /// collation of the PRIMARY KEY constraint instead (see
+    /// [Self::primary_key_constraint_collations]), but tables Turso already
+    /// wrote are ordered by the column collation.
+    pub(crate) fn without_rowid_key_collations(&self) -> impl Iterator<Item = CollationSeq> + '_ {
+        self.primary_key_columns.iter().map(|(name, _)| {
+            let (_, column) = self
+                .get_column(name)
+                .expect("WITHOUT ROWID primary key column should exist");
+            column.collation()
+        })
+    }
+
+    /// The collations that `PRIMARY KEY(a COLLATE x, ...)` names, for the
+    /// primary key columns that name one.
+    pub(crate) fn primary_key_constraint_collations(
+        &self,
+    ) -> impl Iterator<Item = CollationSeq> + '_ {
+        self.primary_key_columns
+            .iter()
+            .filter_map(|(name, _)| self.primary_key_constraint_collation(name))
+            .map(CollationSeq::Text)
+    }
+
     /// Builds a table from the SQLite text of its `CREATE TABLE`, as a
     /// database that does not support namespaces holds it.
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -6567,7 +6592,7 @@ fn push_collation(sql: &mut String, collation: Option<TextCollation>) {
         TextCollation::Binary => sql.push_str(" COLLATE BINARY"),
         TextCollation::NoCase => sql.push_str(" COLLATE NOCASE"),
         TextCollation::Rtrim => sql.push_str(" COLLATE RTRIM"),
-        TextCollation::Locale(_) => {
+        TextCollation::Locale(_) | TextCollation::Unknown(_) => {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
@@ -7126,15 +7151,10 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 /// inner expression and the resolved collation.
 fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<TextCollation>)> {
     match expr {
-        Expr::Collate(inner, collation_name) => {
-            let collation_seq = TextCollation::new(collation_name.as_str())?;
-            if collation_seq.is_custom() {
-                crate::bail_parse_error!(
-                    "custom collations are not supported in schema definitions"
-                );
-            }
-            Ok((inner.as_ref(), Some(collation_seq)))
-        }
+        Expr::Collate(inner, collation_name) => Ok((
+            inner.as_ref(),
+            Some(TextCollation::from_schema(collation_name.as_str())),
+        )),
         _ => Ok((expr, None)),
     }
 }
@@ -7485,13 +7505,7 @@ pub fn create_table(
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            let collation_seq = TextCollation::new(collation_name.as_str())?;
-                            if collation_seq.is_custom() {
-                                crate::bail_parse_error!(
-                                    "custom collations are not supported in schema definitions"
-                                );
-                            }
-                            collation = Some(collation_seq);
+                            collation = Some(TextCollation::from_schema(collation_name.as_str()));
                         }
                         ast::ColumnConstraint::ForeignKey { .. } => {
                             let fk = ForeignKey::from_column_constraint(
@@ -8842,6 +8856,22 @@ impl Index {
     /// Check if this is an expression index.
     pub fn is_expression_index(&self) -> bool {
         self.columns.iter().any(|c| c.expr.is_some())
+    }
+
+    /// Whether a key column compares with a collation the schema names but
+    /// Turso does not know (see [TextCollation::Unknown]). A b-tree cannot
+    /// compare with such a collation.
+    pub(crate) fn has_unknown_collation(&self) -> bool {
+        self.unknown_collation().is_some()
+    }
+
+    /// The first unknown collation a key column compares with (see
+    /// [Self::has_unknown_collation]).
+    pub(crate) fn unknown_collation(&self) -> Option<CollationSeq> {
+        self.columns
+            .iter()
+            .map(|column| column.collation)
+            .find(|collation| collation.is_unknown())
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method
