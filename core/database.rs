@@ -317,6 +317,61 @@ pub fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
 
+/// SQLite rollback journal magic bytes found at offset 0 of an active/hot rollback journal header.
+pub(crate) const SQLITE_JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+/// Checks whether a hot SQLite rollback journal (`<path>-journal`) exists.
+///
+/// An SQLite rollback journal is only "hot" (meaning it contains uncommitted
+/// transactions that must be rolled back by SQLite) if:
+/// 1. The path is not in-memory (`:memory:`, etc.).
+/// 2. The `<path>-journal` file exists and has a size of at least 8 bytes.
+/// 3. The first 8 bytes match the SQLite rollback journal magic header
+///    (`SQLITE_JOURNAL_MAGIC`). If the file does not exist, is 0 bytes, or
+///    its first 8 bytes are zeroed (e.g. SQLite committed with
+///    `PRAGMA journal_mode = PERSIST`), the journal is not hot and the database
+///    can be safely opened.
+pub(crate) fn is_hot_rollback_journal(io: &Arc<dyn IO>, path: &str) -> bool {
+    if is_memory_like(path) {
+        return false;
+    }
+    let journal_path = format!("{path}-journal");
+
+    let Ok(file) = io.open_file(&journal_path, OpenFlags::None, false) else {
+        return false;
+    };
+
+    if file.size().unwrap_or(0) < 8 {
+        return false;
+    }
+
+    let buf = Arc::new(Buffer::new(vec![0u8; 8]));
+    let completion = Completion::new_read(buf.clone(), |res| match res {
+        Ok((_buf, bytes_read)) => {
+            if (bytes_read as usize) < 8 {
+                Some(CompletionError::ShortRead {
+                    page_idx: 0,
+                    expected: 8,
+                    actual: bytes_read as usize,
+                })
+            } else {
+                None
+            }
+        }
+        Err(e) => Some(e),
+    });
+
+    let Ok(completion) = file.pread(0, completion) else {
+        return false;
+    };
+
+    if io.wait_for_completion(completion).is_err() {
+        return false;
+    }
+
+    buf.as_slice() == SQLITE_JOURNAL_MAGIC
+}
+
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
 fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
@@ -2237,6 +2292,13 @@ impl Database {
                     // Track if header was modified so we can write it to disk
                     let header_modified = match read_version {
                         Version::Legacy => {
+                            if is_hot_rollback_journal(&self.io, &self.path) {
+                                return Err(LimboError::Corrupt(format!(
+                                    "cannot open database '{}': hot rollback journal '{}-journal' must be recovered by SQLite first",
+                                    self.path, self.path
+                                ))
+                                .into());
+                            }
                             if is_readonly {
                                 tracing::warn!(
                                     "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
