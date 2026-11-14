@@ -386,3 +386,70 @@ test drop-table-drops-a-sequence-that-only-its-own-check-constraint-uses {
 expect {
     0
 }
+
+test check-constraint-keeps-the-sequence-it-was-created-with-after-search-path-changes {
+    CREATE SCHEMA zz_bind_check;
+    CREATE SEQUENCE zz_bind_check.q;
+    CREATE SEQUENCE q;
+    SET search_path TO zz_bind_check, public;
+    CREATE TABLE public.zz_bind_check_t (
+        n bigint CHECK (n <= nextval('q')),
+        m bigint,
+        CHECK (m <= nextval('q') + 100)
+    );
+    RESET search_path;
+    DROP SEQUENCE public.q;
+    INSERT INTO zz_bind_check_t VALUES (1, 2);
+    SELECT last_value FROM pg_sequences WHERE sequencename = 'q';
+}
+expect {
+    2
+}
+
+test drop-sequence-refuses-the-sequence-a-check-constraint-was-created-with {
+    CREATE SCHEMA zz_bind_refuse;
+    CREATE SEQUENCE zz_bind_refuse.q;
+    CREATE SEQUENCE q;
+    SET search_path TO zz_bind_refuse, public;
+    CREATE TABLE public.zz_bind_refuse_t (n bigint CHECK (n <= nextval('q')));
+    RESET search_path;
+    DROP SEQUENCE zz_bind_refuse.q;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence
+}
+
+test policy-keeps-the-sequence-it-was-created-with-after-search-path-changes {
+    CREATE SCHEMA zz_bind_policy;
+    CREATE SEQUENCE zz_bind_policy.q;
+    CREATE SEQUENCE q;
+    CREATE TABLE zz_bind_policy_t (n bigint);
+    SET search_path TO zz_bind_policy, public;
+    CREATE POLICY zz_bind_policy_p ON public.zz_bind_policy_t USING (n <= nextval('q'));
+    RESET search_path;
+    DROP SEQUENCE public.q;
+    DROP SEQUENCE zz_bind_policy.q;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence
+}
+
+test added-column-default-keeps-the-sequence-it-was-created-with-after-search-path-changes {
+    CREATE SCHEMA zz_bind_add;
+    CREATE SEQUENCE zz_bind_add.q;
+    CREATE SEQUENCE q;
+    CREATE TABLE zz_bind_add_t (a int);
+    SET search_path TO zz_bind_add, public;
+    ALTER TABLE public.zz_bind_add_t ADD COLUMN n bigint DEFAULT nextval('q');
+    RESET search_path;
+    DROP SEQUENCE public.q;
+    INSERT INTO zz_bind_add_t (a) VALUES (1);
+    SELECT a, n FROM zz_bind_add_t;
+    DROP SEQUENCE zz_bind_add.q;
+}
+@sqlstate 2BP01
+expect error {
+    cannot drop sequence
+}
