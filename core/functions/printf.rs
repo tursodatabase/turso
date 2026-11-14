@@ -1621,12 +1621,11 @@ mod tests {
                 vec![text("character: %c"), float(42.5)],
                 text("character: 4"),
             ),
-            // Empty string → NUL char → no output (matches SQLite)
-            (vec![text("character: %c"), text("")], text("character: ")),
-            // NULL → coerces to empty string → NUL → no output
+            // Empty strings and NULL produce a NUL character.
+            (vec![text("character: %c"), text("")], text("character: \0")),
             (
                 vec![text("character: %c"), Register::Value(Value::Null)],
-                text("character: "),
+                text("character: \0"),
             ),
         ];
         for (input, expected) in test_cases {
