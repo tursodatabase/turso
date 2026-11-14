@@ -10699,6 +10699,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.storage.checkpoint_threshold()
     }
 
+    /// Whether the logical log has reached the checkpoint threshold, so that the next commit
+    /// starts a checkpoint.
+    pub fn should_checkpoint(&self) -> bool {
+        self.storage.should_checkpoint()
+    }
+
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {
         self.current_root_page(&MVTableId::from(table_id))
             .map_or(table_id, |root_page| root_page as i64)

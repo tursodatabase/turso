@@ -8195,9 +8195,9 @@ fn transaction_display() {
 fn test_should_checkpoint() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv_store = db.get_mvcc_store();
-    assert!(!mv_store.storage.should_checkpoint());
+    assert!(!mv_store.should_checkpoint());
     mv_store.set_checkpoint_threshold(0);
-    assert!(mv_store.storage.should_checkpoint());
+    assert!(mv_store.should_checkpoint());
 }
 
 /// What this test checks: After restart recovery, checkpoint-threshold checks use the recovered log offset.
@@ -8221,7 +8221,7 @@ fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
     // in should_checkpoint() when the threshold is set very low.
     mv_store.set_checkpoint_threshold(1);
     assert!(
-        mv_store.storage.should_checkpoint(),
+        mv_store.should_checkpoint(),
         "expected should_checkpoint() to reflect the recovered logical-log offset"
     );
 }
