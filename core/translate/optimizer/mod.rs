@@ -3827,8 +3827,8 @@ fn build_vtab_scan_op(
         )));
     }
 
-    let mut constraints = vec![None; constraint_usages.len()];
-    let mut arg_count = 0;
+    let mut constraints: Vec<Option<Vec<Expr>>> = vec![None; constraint_usages.len()];
+    let mut used_argv_count = 0;
 
     for (i, vtab_constraint) in vtab_constraints.iter().enumerate() {
         let usage = constraint_usages[i];
@@ -3862,30 +3862,42 @@ fn build_vtab_scan_op(
         {
             where_term.consumed = true;
         }
-        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables, None);
-        constraints[zero_based_argv_index] = Some(expr);
-        arg_count += 1;
+
+        if vtab_constraint.op == turso_ext::ConstraintOp::In {
+            if let ast::Expr::InList { rhs, .. } = &where_term.expr {
+                let exprs: Vec<Expr> = rhs.iter().map(|e| *e.clone()).collect();
+                constraints[zero_based_argv_index] = Some(exprs);
+            } else {
+                return Err(LimboError::InternalError(
+                    "ConstraintOp::In where term is not an InList expression".into(),
+                ));
+            }
+        } else {
+            let (_, expr, _) =
+                constraint.get_constraining_expr(where_clause, referenced_tables, None);
+            constraints[zero_based_argv_index] = Some(vec![expr]);
+        }
+        used_argv_count += 1;
     }
 
     // Verify that used indices form a contiguous sequence starting from 1
-    let constraints = constraints
-        .into_iter()
-        .take(arg_count)
-        .enumerate()
-        .map(|(i, c)| {
-            c.ok_or_else(|| {
-                LimboError::ExtensionError(format!(
+    let mut final_constraints = Vec::new();
+    for (i, constraint) in constraints.into_iter().take(used_argv_count).enumerate() {
+        match constraint {
+            Some(exprs) => final_constraints.extend(exprs),
+            None => {
+                return Err(LimboError::ExtensionError(format!(
                     "argv_index values must form contiguous sequence starting from 1, missing index {}",
                     i + 1
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+                )));
+            }
+        }
+    }
 
     Ok(Operation::Scan(Scan::VirtualTable {
         idx_num: *idx_num,
         idx_str: idx_str.clone(),
-        constraints,
+        constraints: final_constraints,
     }))
 }
 

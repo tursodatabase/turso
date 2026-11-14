@@ -2091,16 +2091,16 @@ pub fn is_equality_operator(op: ConstraintOperator) -> bool {
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
-    let ConstraintOperator::AstNativeOperator(op) = op else {
-        return None;
-    };
     match op {
-        ast::Operator::Equals => Some(ConstraintOp::Eq),
-        ast::Operator::Less => Some(ConstraintOp::Lt),
-        ast::Operator::LessEquals => Some(ConstraintOp::Le),
-        ast::Operator::Greater => Some(ConstraintOp::Gt),
-        ast::Operator::GreaterEquals => Some(ConstraintOp::Ge),
-        ast::Operator::NotEquals => Some(ConstraintOp::Ne),
+        ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => Some(ConstraintOp::Eq),
+        ConstraintOperator::AstNativeOperator(ast::Operator::Less) => Some(ConstraintOp::Lt),
+        ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals) => Some(ConstraintOp::Le),
+        ConstraintOperator::AstNativeOperator(ast::Operator::Greater) => Some(ConstraintOp::Gt),
+        ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals) => {
+            Some(ConstraintOp::Ge)
+        }
+        ConstraintOperator::AstNativeOperator(ast::Operator::NotEquals) => Some(ConstraintOp::Ne),
+        ConstraintOperator::In { not: false, .. } => Some(ConstraintOp::In),
         _ => None,
     }
 }
