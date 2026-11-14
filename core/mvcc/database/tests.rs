@@ -17088,6 +17088,48 @@ fn test_close_persists_drop_index() {
 }
 
 #[test]
+fn test_close_of_last_connection_does_not_fsync_wal() {
+    let syncs = syncs_during_last_close(
+        "close-sync-count.db",
+        DatabaseOpts::new(),
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+    );
+    assert_eq!(syncs, 0);
+}
+
+#[test]
+fn test_close_of_last_connection_fsyncs_wal_with_passive_checkpoint() {
+    let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+    let syncs = syncs_during_last_close(
+        "close-sync-count-passive.db",
+        opts,
+        "PRAGMA wal_checkpoint(PASSIVE)",
+    );
+    assert_eq!(syncs, 1);
+}
+
+/// Writes to an MVCC database, runs `checkpoint` so the WAL has been written, writes
+/// again, and returns how many file syncs closing the last connection made.
+fn syncs_during_last_close(path: &str, opts: DatabaseOpts, checkpoint: &str) -> usize {
+    let io = Arc::new(group_commit_sync_mode_tests::SyncCountingIo::default());
+    let db = Database::open(
+        io.clone(),
+        path,
+        crate::OpenOptions::new(Arc::new(EngineDialect)).db_opts(opts),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute(checkpoint).unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    let before = io.syncs.load(Ordering::Acquire);
+    conn.close().unwrap();
+    io.syncs.load(Ordering::Acquire) - before
+}
+
+#[test]
 fn test_partial_commit_visibility_bug() {
     use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use crate::sync::Arc;

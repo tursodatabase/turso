@@ -2706,10 +2706,21 @@ impl Connection {
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
+        // In MVCC mode only the MVCC checkpoint writes to the WAL, and a non-passive
+        // checkpoint fsyncs the database file before it truncates the logical log, so
+        // the WAL never holds the only copy of a commit and the shutdown checkpoint
+        // (which only fsyncs the WAL for MVCC) has nothing to do. A passive checkpoint
+        // that gets Busy truncates the logical log while its WAL frames may be unsynced.
+        let wal_needs_shutdown_checkpoint = self
+            .db
+            .get_mv_store()
+            .as_ref()
+            .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
             && should_checkpoint_on_close
+            && wal_needs_shutdown_checkpoint
         {
             self.pager
                 .load()
