@@ -126,6 +126,81 @@ expect {
     E'a\\\\b'
 }
 
+test format-quotes-identifiers-and-literals {
+    SELECT format('INSERT INTO %I VALUES(%L)', 'mytab', 'x');
+    SELECT format('%s|%I|%L', 'a b', 'a b', 'it''s');
+    SELECT format('%I.%I', 'Abc', 'select');
+}
+expect {
+    INSERT INTO mytab VALUES('x')
+    a b|"a b"|'it''s'
+    "Abc"."select"
+}
+
+test format-empty-format-is-empty-text {
+    SELECT '[' || format('') || ']';
+}
+expect {
+    []
+}
+
+test format-null-arguments {
+    SELECT format('%s|%L|', NULL, NULL);
+}
+expect {
+    |NULL|
+}
+
+test format-null-format-is-null {
+    SELECT coalesce(format(NULL, 'a'), 'null');
+}
+expect {
+    null
+}
+
+test format-argument-positions-and-widths {
+    SELECT format('%1$s %1$I %2$L', 'ab', 3);
+    SELECT format('[%5s][%-5s][%*s][%-*s][%*s]', 'x', 'y', 3, 'z', 3, 'w', -3, 'v');
+    SELECT format('100%% %s', 'x');
+}
+expect {
+    ab ab '3'
+    [    x][y    ][  z][w  ][v  ]
+    100% x
+}
+
+test format-null-identifier {
+    SELECT format('%I', NULL);
+}
+@sqlstate 22004
+expect error {
+    null values cannot be formatted as an SQL identifier
+}
+
+test format-too-few-arguments {
+    SELECT format('%s %s', 'a');
+}
+@sqlstate 22023
+expect error {
+    too few arguments for format\(\)
+}
+
+test format-unknown-type-specifier {
+    SELECT format('%x', 1);
+}
+@sqlstate 22023
+expect error {
+    unrecognized format\(\) type specifier "x"
+}
+
+test format-unterminated-width-position {
+    SELECT format('%*2');
+}
+@sqlstate 22023
+expect error {
+    unterminated format\(\) type specifier
+}
+
 test current-schema-default {
     SELECT current_schema();
 }

@@ -3,6 +3,8 @@ use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
+use std::iter::Peekable;
+use std::str::Chars;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
@@ -13,11 +15,11 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NULL_VALUE_NOT_ALLOWED,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -81,6 +83,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
         },
+        "format"(FunctionArity::Variadic, true) => exec_format(args)?,
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
@@ -665,6 +668,211 @@ fn exec_quote_literal(value: &Value) -> Option<String> {
         format!("'{}'", text.replace('\'', "''"))
     };
     Some(quoted)
+}
+
+/// PostgreSQL's format(): `%s`, `%I` and `%L` with optional `n$` argument
+/// positions, `-` flags and widths, as in PostgreSQL's text_format().
+fn exec_format(args: &[Register]) -> Result<Option<String>> {
+    let format = match args.first().map(Register::get_value) {
+        None => return Err(undefined_function("format", &[])),
+        Some(Value::Null) => return Ok(None),
+        Some(Value::Text(t)) => t.as_str().to_string(),
+        Some(other) => return Err(undefined_function("format", &[pg_type_name(other)])),
+    };
+    let mut out = String::new();
+    let mut chars = format.chars().peekable();
+    // Index into `args` of the argument used last; 0 is the format itself.
+    let mut arg = 0;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(spec) = parse_format_spec(&mut chars)? else {
+            out.push('%');
+            continue;
+        };
+        let conversion = match spec.conversion {
+            c @ ('s' | 'I' | 'L') => c,
+            other => {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("unrecognized format() type specifier \"{other}\""),
+                ))
+            }
+        };
+        let mut left_align = spec.left_align;
+        let mut width = spec.width;
+        if let Some(width_position) = spec.width_position {
+            arg = width_position.unwrap_or(arg + 1);
+            let signed_width = format_width(format_arg(args, arg)?)?;
+            left_align |= signed_width < 0;
+            width = signed_width.unsigned_abs() as usize;
+        }
+        arg = spec.position.unwrap_or(arg + 1);
+        let text = match (conversion, format_arg(args, arg)?) {
+            ('s', Value::Null) => String::new(),
+            ('L', Value::Null) => "NULL".to_string(),
+            ('I', Value::Null) => {
+                return Err(sqlstate_error(
+                    SQLSTATE_NULL_VALUE_NOT_ALLOWED,
+                    "null values cannot be formatted as an SQL identifier",
+                ))
+            }
+            ('I', value) => turso_pg_parser::quote_identifier(&value_text(value)),
+            ('L', value) => exec_quote_literal(value).expect("a non-NULL value has a literal"),
+            (_, value) => value_text(value),
+        };
+        let padding = width.saturating_sub(text.chars().count());
+        if left_align {
+            out.push_str(&text);
+            out.extend(std::iter::repeat_n(' ', padding));
+        } else {
+            out.extend(std::iter::repeat_n(' ', padding));
+            out.push_str(&text);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// One `%` specification of a format() string, after the `%`.
+struct FormatSpec {
+    /// The argument given as `n$`.
+    position: Option<usize>,
+    left_align: bool,
+    width: usize,
+    /// `*` takes the width from the next argument (`None`) or from `*n$`.
+    width_position: Option<Option<usize>>,
+    conversion: char,
+}
+
+/// Returns `None` for `%%`.
+fn parse_format_spec(chars: &mut Peekable<Chars>) -> Result<Option<FormatSpec>> {
+    if chars.peek() == Some(&'%') {
+        chars.next();
+        return Ok(None);
+    }
+    let mut spec = FormatSpec {
+        position: None,
+        left_align: false,
+        width: 0,
+        width_position: None,
+        conversion: '%',
+    };
+    if let Some(n) = parse_format_digits(chars)? {
+        if chars.peek() != Some(&'$') {
+            spec.width = n;
+            spec.conversion = next_format_char(chars)?;
+            return Ok(Some(spec));
+        }
+        chars.next();
+        spec.position = Some(argument_position(n)?);
+    }
+    while chars.peek() == Some(&'-') {
+        chars.next();
+        spec.left_align = true;
+    }
+    if chars.peek() == Some(&'*') {
+        chars.next();
+        match parse_format_digits(chars)? {
+            Some(n) => {
+                if chars.peek() != Some(&'$') {
+                    return Err(sqlstate_error(
+                        SQLSTATE_INVALID_PARAMETER_VALUE,
+                        "width argument position must be ended by \"$\"",
+                    ));
+                }
+                chars.next();
+                spec.width_position = Some(Some(argument_position(n)?));
+            }
+            None => spec.width_position = Some(None),
+        }
+    } else if let Some(n) = parse_format_digits(chars)? {
+        spec.width = n;
+    }
+    spec.conversion = next_format_char(chars)?;
+    Ok(Some(spec))
+}
+
+fn parse_format_digits(chars: &mut Peekable<Chars>) -> Result<Option<usize>> {
+    let mut number: Option<usize> = None;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        chars.next();
+        number = Some(
+            number
+                .unwrap_or(0)
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(digit as usize))
+                .filter(|n| *n <= i32::MAX as usize)
+                .ok_or_else(|| {
+                    sqlstate_error(
+                        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                        "number is out of range",
+                    )
+                })?,
+        );
+    }
+    // A specification cannot end inside a number, even before the `$`.
+    if number.is_some() && chars.peek().is_none() {
+        return Err(unterminated_format_spec());
+    }
+    Ok(number)
+}
+
+fn next_format_char(chars: &mut Peekable<Chars>) -> Result<char> {
+    chars.next().ok_or_else(unterminated_format_spec)
+}
+
+fn unterminated_format_spec() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INVALID_PARAMETER_VALUE,
+        "unterminated format() type specifier",
+    )
+}
+
+fn argument_position(n: usize) -> Result<usize> {
+    if n == 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "format specifies argument 0, but arguments are numbered from 1",
+        ));
+    }
+    Ok(n)
+}
+
+fn format_arg(args: &[Register], i: usize) -> Result<&Value> {
+    args.get(i).map(Register::get_value).ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "too few arguments for format()",
+        )
+    })
+}
+
+/// The width that a `*` argument gives; NULL means no width.
+fn format_width(value: &Value) -> Result<i32> {
+    let text = match value {
+        Value::Null => return Ok(0),
+        Value::Numeric(Numeric::Integer(i)) => {
+            return i32::try_from(*i).map_err(|_| {
+                sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range")
+            })
+        }
+        other => value_text(other),
+    };
+    text.trim().parse::<i32>().map_err(|_| {
+        sqlstate_error(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            format!("invalid input syntax for type integer: \"{text}\""),
+        )
+    })
+}
+
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::Text(t) => t.as_str().to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
