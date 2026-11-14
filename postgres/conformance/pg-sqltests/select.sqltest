@@ -662,6 +662,20 @@ expect {
     2147483648|4294967295|9223372036854775807|-2147483648
 }
 
+test select-cast-text-with-non-decimal-prefix-to-integer {
+    SELECT '0o20000000000'::int8, '0o17'::int4, '0x10'::int8, '0b101'::int2, '-0x10'::int8, '+0o17'::int4, ' 0x10 '::int2;
+}
+expect {
+    2147483648|15|16|5|-16|15|16
+}
+
+test select-cast-text-function-syntax-with-non-decimal-prefix {
+    SELECT int8('0x10'), int4('0o17'), int2('0b101');
+}
+expect {
+    16|15|5
+}
+
 test select-hex-literals-above-int8-range-do-not-wrap {
     SELECT -0x8000000000000000 WHERE 0x8000000000000000 = 9223372036854775808 AND 0xFFFFFFFFFFFFFFFF > 0;
 }
