@@ -370,7 +370,12 @@ fn rewrite_terminal_expr(
                 | Expr::Exists(..)
                 | Expr::InSelect { .. }
                 | Expr::Subquery(..) => {
-                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                    // The whole expression moves into the source subquery. If an
+                    // aggregate of this query appears in it, e.g. as the left operand
+                    // of `max(x) IN (SELECT ...)`, the new column must be evaluated
+                    // after aggregation there, like any other aggregate expression.
+                    let contains_aggregates = expr_contains_aggregate(expr, aggregates)?;
+                    rewrite_expr_as_subquery_column(expr, ctx, contains_aggregates);
                     return Ok(WalkControl::SkipChildren);
                 }
                 _ => {}
@@ -379,6 +384,23 @@ fn rewrite_terminal_expr(
             Ok(WalkControl::Continue)
         },
     )
+}
+
+/// Whether `expr` contains one of `aggregates`, the aggregates of the query
+/// being rewritten. The bodies of subqueries are not searched.
+fn expr_contains_aggregate(expr: &Expr, aggregates: &[Aggregate]) -> crate::Result<bool> {
+    let mut found = false;
+    walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if aggregates
+            .iter()
+            .any(|a| exprs_are_equivalent(&a.original_expr, e))
+        {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 /// Find the `WindowFunction` entry that this expression corresponds to.
