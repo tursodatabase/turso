@@ -90,6 +90,14 @@ test quote-ident-null-is-null {
 expect {
 }
 
+test quote-ident-bytea-errors {
+    SELECT quote_ident('\x01'::bytea);
+}
+@sqlstate 42883
+expect error {
+    function quote_ident\(bytea\) does not exist
+}
+
 test quote-literal-plain {
     SELECT quote_literal('abc');
 }
@@ -349,6 +357,42 @@ expect {
     valid
     valid
     invalid
+}
+
+test pg-input-is-valid-null-argument-is-null {
+    SELECT CASE WHEN pg_input_is_valid('1', NULL) IS NULL THEN 'null' ELSE 'not null' END;
+    SELECT CASE WHEN pg_input_is_valid(NULL, 'int4') IS NULL THEN 'null' ELSE 'not null' END;
+}
+expect {
+    null
+    null
+}
+
+test pg-input-is-valid-bytea-type-name-errors {
+    SELECT pg_input_is_valid('1', '\x01'::bytea);
+}
+@sqlstate 42883
+expect error {}
+
+test pg-input-is-valid-bytea-input-errors {
+    SELECT pg_input_is_valid('\x01'::bytea, 'int4');
+}
+@sqlstate 42883
+expect error {}
+
+test to-char-null-format-is-null {
+    SELECT CASE WHEN to_char(1, NULL) IS NULL THEN 'null' ELSE 'not null' END;
+}
+expect {
+    null
+}
+
+test to-char-bytea-format-errors {
+    SELECT to_char(1, '\x01'::bytea);
+}
+@sqlstate 42883
+expect error {
+    function to_char\(integer, bytea\) does not exist
 }
 
 test current-setting-numeric-parameter-name-errors {

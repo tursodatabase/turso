@@ -3,7 +3,7 @@ use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
-use std::{fmt, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
@@ -74,9 +74,8 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         | "pg_get_function_arguments"
         | "pg_get_statisticsobjdef_columns"(FunctionArity::Exact(1), true) => None::<String>,
         "pg_relation_is_publishable"(FunctionArity::Exact(1), true) => None::<Boolean>,
-        "quote_ident"(FunctionArity::Exact(1), true) => match args[0].get_value() {
-            Value::Null => None,
-            _ => Some(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
+        "quote_ident"(FunctionArity::Exact(1), true) => {
+            text_arg("quote_ident", args, 0)?.map(|name| turso_pg_parser::quote_identifier(&name))
         },
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
@@ -93,13 +92,10 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_triggerdef"(FunctionArity::OneOf(&[1, 2]), false) => None::<String>,
         "obj_description"(FunctionArity::OneOf(&[1, 2]), true) => None::<String>,
         "pg_get_expr"(FunctionArity::OneOf(&[2, 3]), true) => exec_pg_get_expr(args)?,
-        "to_char"(FunctionArity::Exact(2), true) => {
-            exec_to_char(args[0].get_value(), &text_arg(args, 1))
-        },
+        "to_char"(FunctionArity::Exact(2), true) => text_arg("to_char", args, 1)?
+            .and_then(|format| exec_to_char(args[0].get_value(), &format)),
         "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
-        "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
-            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
-        },
+        "pg_input_is_valid"(FunctionArity::Exact(2), true) => exec_pg_input_is_valid(args)?,
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range",
@@ -458,10 +454,20 @@ fn parse_oid(text: &str) -> Result<i64> {
     Ok(i64::from(oid))
 }
 
-fn text_arg(args: &[Register], i: usize) -> String {
-    match args.get(i).map(Register::get_value) {
-        Some(Value::Text(t)) => t.as_str().to_string(),
-        _ => String::new(),
+/// A text argument of the function `name`, or `None` for NULL. A number is
+/// read as its text, because the server binds an untyped parameter whose text
+/// looks like a number as a number. A blob is an error, as PostgreSQL has no
+/// function of that name for bytea.
+fn text_arg<'a>(name: &str, args: &'a [Register], i: usize) -> Result<Option<Cow<'a, str>>> {
+    match args[i].get_value() {
+        Value::Blob(_) => {
+            let arg_types: Vec<_> = args
+                .iter()
+                .map(|arg| pg_type_name(arg.get_value()))
+                .collect();
+            Err(undefined_function(name, &arg_types))
+        }
+        value => Ok(value.cast_text_ref()),
     }
 }
 
@@ -595,7 +601,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
     };
     if value < 0 {
-        let clause = text_arg(args, 1);
+        let clause = args[1].get_value().to_string();
         let sqlstate = if clause == "OFFSET" {
             SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
         } else {
@@ -1373,13 +1379,12 @@ fn format_interval(months: i64, days: i64, micros: i64) -> String {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
-    let s = match input {
-        Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return None,
-        v => v.to_string(),
-    };
-    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
+fn exec_pg_input_is_valid(args: &[Register]) -> Result<Option<Boolean>> {
+    let input = text_arg("pg_input_is_valid", args, 0)?;
+    let type_name = text_arg("pg_input_is_valid", args, 1)?;
+    Ok(input
+        .zip(type_name)
+        .map(|(input, type_name)| Boolean(validate_pg_input(&input, &type_name).is_none())))
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
