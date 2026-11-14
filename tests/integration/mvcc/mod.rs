@@ -1,5 +1,8 @@
 mod checkpoint;
 mod database;
+mod group_commit;
+mod hermitage;
+mod store;
 mod test_db;
 
 use crate::common::{ExecRows, TempDatabase};

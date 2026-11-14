@@ -9,24 +9,63 @@ use super::checkpoint::{
     assert_integrity_ok, get_rows, wal_path_for_db, FixedFailureInjector, FixedYieldInjector,
 };
 use super::test_db::MvccTestDbNoConn;
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rustc_hash::FxHashSet as HashSet;
+use std::fmt::Debug;
 use std::sync::Arc;
 use turso_core::alloc::DynAllocator;
+use turso_core::io::PlatformIO;
 use turso_core::io::IO;
 use turso_core::mvcc::clock::MvccClock;
+use turso_core::mvcc::cursor::CursorYieldPoint;
 use turso_core::mvcc::database::checkpoint::{
     CheckpointState, CheckpointStateMachine, CheckpointYieldPoint,
 };
+use turso_core::mvcc::database::CommitYieldPoint;
+use turso_core::mvcc::database::CommitYieldPoint::LogRecordPrepared;
+use turso_core::mvcc::database::ExclusiveTxYieldPoint;
+use turso_core::mvcc::database::MvStore;
+use turso_core::mvcc::database::RowID;
 use turso_core::mvcc::database::*;
+#[cfg(feature = "conn_raw_api")]
+use turso_core::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
 use turso_core::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::namespace::NamespaceId;
 use turso_core::state_machine::{StateTransition, TransitionResult};
+use turso_core::storage::sqlite3_ondisk::checksum_wal;
+use turso_core::storage::sqlite3_ondisk::read_varint;
+use turso_core::storage::sqlite3_ondisk::write_varint;
+use turso_core::storage::sqlite3_ondisk::WalHeader;
+use turso_core::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+use turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE;
+use turso_core::sync::atomic::AtomicU64;
 use turso_core::sync::atomic::{AtomicBool, Ordering};
 use turso_core::sync::Mutex;
+use turso_core::types::ImmutableRecord;
+use turso_core::types::ImmutableRecordRef;
+use turso_core::types::Text;
+use turso_core::vdbe::execute::TransactionYieldPoint;
+use turso_core::Buffer;
+use turso_core::Completion;
+use turso_core::Database;
+use turso_core::DatabaseOpts;
+use turso_core::EncryptionKey;
+use turso_core::IOExt;
+use turso_core::MemoryIO;
+use turso_core::Numeric;
+use turso_core::OpenFlags;
+use turso_core::Result;
+use turso_core::Statement;
+use turso_core::StatementStatusCounter;
+use turso_core::ValueRef;
 use turso_core::{
     CheckpointMode, ConnectOpts, Connection, LimboError, SessionRole, StepResult, Value,
 };
+use turso_sqlite::SqliteDialect;
 
 /// Auto passive checkpoint retries publish when a reader holds the checkpoint lock.
 #[test]
@@ -1820,3 +1859,10371 @@ fn step_until_yield_or_done_pumping_io(
 }
 
 type Store = MvStore<MvccClock, DynAllocator>;
+
+pub(crate) struct MvccTestDb {
+    pub(crate) mvcc_store: Arc<Store>,
+    pub(crate) db: Arc<Database>,
+    pub(crate) conn: Arc<Connection>,
+}
+
+impl MvccTestDb {
+    pub fn new() -> Self {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        // Enable MVCC via PRAGMA
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let mvcc_store = db.get_mv_store().clone().unwrap();
+        Self {
+            mvcc_store,
+            db,
+            conn,
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn new_with_portable_logical_changes() -> Self {
+        let db = Self::new();
+        db.conn.set_portable_logical_changes_enabled(true);
+        db
+    }
+}
+
+#[test]
+fn mvcc_pragma_page_size_propagates_to_global_header() {
+    // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
+    // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
+    // pager but leaves global_header at the default 4 KiB. Ephemeral paths that derive the
+    // working page size from MvStore would then disagree with the pager's actual buffer size.
+    let db = MvccTestDb::new();
+
+    let initial = db
+        .mvcc_store
+        .with_header(|h| h.page_size.get(), None)
+        .unwrap();
+    assert_eq!(
+        initial,
+        turso_core::BufferPool::DEFAULT_PAGE_SIZE as u32,
+        "global_header should start at the default page size"
+    );
+
+    db.conn.execute("PRAGMA page_size = 512").unwrap();
+
+    let after = db
+        .mvcc_store
+        .with_header(|h| h.page_size.get(), None)
+        .unwrap();
+    assert_eq!(
+        after, 512,
+        "PRAGMA page_size must propagate to MvStore.global_header"
+    );
+}
+
+/// A passive checkpoint that publishes an UNRELATED object's physical roots must NOT invalidate
+/// an open transaction reading a different table. Invalidation is per-root and snapshot-scoped
+/// (see `MvccLazyCursor::new`): a reader is only re-prepared when the specific root it opens was
+/// dropped/reused at its snapshot — not whenever any concurrent checkpoint publishes some root.
+#[test]
+fn mvcc_passive_unrelated_root_publication_does_not_invalidate_open_txn() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    let reader = db.connect();
+
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    // `u` is created and checkpointed AFTER the reader's snapshot; it is irrelevant to `t`.
+    writer
+        .execute("CREATE TABLE u(y INTEGER PRIMARY KEY)")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    assert!(
+        reader.execute("SELECT * FROM t").is_ok(),
+        "reader of table t must not be invalidated by an unrelated table's passive checkpoint",
+    );
+    reader.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn mvcc_passive_drop_index_then_reuse_page_integrity() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = &db.connect();
+    let assert_ok = |conn: &Arc<Connection>, label: &str| {
+        let rows = get_rows(conn, "PRAGMA integrity_check");
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_text("ok".to_string())]],
+            "integrity_check not ok ({label}): {rows:?}"
+        );
+    };
+
+    for i in 0..6 {
+        conn.execute(format!(
+            "CREATE TABLE t{i}(id INTEGER PRIMARY KEY, a TEXT, b TEXT)"
+        ))
+        .unwrap();
+        conn.execute(format!("CREATE INDEX idx{i}_a ON t{i}(a)"))
+            .unwrap();
+        conn.execute(format!("INSERT INTO t{i} VALUES ({i}, 'a{i}', 'b{i}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_ok(conn, "after initial build");
+
+    for round in 0..6 {
+        for i in 0..6 {
+            conn.execute(format!("DROP INDEX idx{i}_a")).unwrap();
+        }
+        for i in 0..6 {
+            conn.execute(format!("CREATE INDEX idx{i}_a ON t{i}(a, b)"))
+                .unwrap();
+            conn.execute(format!(
+                "CREATE TABLE r{round}_{i}(id INTEGER PRIMARY KEY, v TEXT)"
+            ))
+            .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        assert_ok(conn, &format!("round {round}"));
+    }
+}
+
+#[test]
+fn mvcc_btree_read_dual_gate() {
+    use turso_core::mvcc::database::WalPos;
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+
+    let old_id = MVTableId::from(-50_i64);
+    let new_id = MVTableId::from(-900_i64);
+    let root: u64 = 286;
+    let c_ts = 100u64; // checkpoint snapshot (logical begin)
+    let drop = 300u64;
+    // The materialization lands at WAL (epoch 2, frame 40). A reader's mark is also a WalPos.
+    let mat = WalPos {
+        checkpoint_seq: 2,
+        frame: 40,
+    };
+    let mark = |seq, frame| WalPos {
+        checkpoint_seq: seq,
+        frame,
+    };
+
+    // Uncheckpointed: not readable at any snapshot/mark.
+    store.insert_table_id_to_rootpage(old_id, None);
+    assert!(!store.is_btree_readable_at(&old_id, 200, WalPos::STAGED));
+
+    // STAGED at btree_create: the checkpoint can resolve the root, but NO transaction may read it,
+    // not even one whose mark is maximal (STAGED is the not-committed sentinel).
+    store.record_rootpage_alloc(old_id, root, c_ts, WalPos::STAGED);
+    assert_eq!(store.current_root_page(&old_id), Some(root));
+    assert!(!store.is_btree_readable_at(&old_id, c_ts + 50, WalPos::STAGED));
+
+    // PUBLISH (post-CommitPagerTxn): materialized_at set to the WAL position of the frames.
+    store.publish_rootpage_visible(old_id, mat);
+
+    // Hazard tx: begin_ts > c_ts (logical OK) but its mark is in the same epoch at a LOWER frame
+    // (frame 39 < 40) -> can't reach the frames -> NOT readable; stays version-store-only.
+    assert!(!store.is_btree_readable_at(&old_id, c_ts + 50, mark(2, 39)));
+    // Mark in the same epoch covering the frames -> readable.
+    assert!(store.is_btree_readable_at(&old_id, c_ts + 50, mark(2, 40)));
+    // Mark in a LATER epoch -> the frames were backfilled into the DB file before the epoch bumped
+    // -> reachable via the base regardless of frame.
+    assert!(store.is_btree_readable_at(&old_id, c_ts + 50, mark(3, 0)));
+    // Logical gate still required: a snapshot predating c_ts never reads it.
+    assert!(!store.is_btree_readable_at(&old_id, c_ts - 1, WalPos::STAGED));
+
+    // Drop + reuse: reverse lookup is end-gated; a pre-drop snapshot still resolves the old owner.
+    store.retire_rootpage(old_id, drop);
+    store.record_rootpage_alloc(new_id, root, drop + 5, mark(3, 10));
+    store.publish_rootpage_visible(new_id, mark(3, 10));
+    assert_eq!(
+        store.get_table_id_from_root_page_at(root as i64, drop - 1),
+        old_id
+    );
+    assert!(!store.is_btree_readable_at(&old_id, drop + 1, WalPos::STAGED)); // past its end
+    assert!(store.is_btree_readable_at(&new_id, drop + 20, mark(3, 10))); // new owner reachable
+
+    // Once lwm passes the drop, the retired old binding is reclaimed; the live owner remains.
+    assert_eq!(store.gc_rootpage_entries(drop), 1);
+    assert_eq!(store.get_table_id_from_root_page(root as i64), new_id);
+}
+
+#[test]
+fn mvcc_try_get_table_id_stale_schema_read_returns_none() {
+    // Regression: under PASSIVE checkpointing a reader can capture a schema cookie older than a
+    // DROP that committed within its own snapshot (the drop publishes its cookie after the reader
+    // read the header, even though the drop's commit ts precedes the reader's begin ts). The
+    // compiled cursor then references a positive root page the reader's snapshot already sees
+    // dropped. The fallible lookup must report this (None -> SchemaUpdated reprepare) instead of
+    // the panicking variant firing. See `try_get_table_id_from_root_page_at`.
+    use turso_core::mvcc::database::WalPos;
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+
+    let table_id = MVTableId::from(-26_i64);
+    let root: u64 = 26;
+    let begin = 34u64;
+    let drop = 4007u64;
+
+    store.record_rootpage_alloc(table_id, root, begin, WalPos::STAGED);
+    store.publish_rootpage_visible(
+        table_id,
+        WalPos {
+            checkpoint_seq: 2,
+            frame: 952,
+        },
+    );
+
+    // Live (not yet dropped): both variants resolve the owner.
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(root as i64, 4000),
+        Some(table_id)
+    );
+
+    store.retire_rootpage(table_id, drop);
+
+    // A snapshot predating the drop still resolves the owner.
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(root as i64, drop - 1),
+        Some(table_id)
+    );
+    // A snapshot at/after the drop sees no covering binding -> None (would have panicked before).
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(root as i64, drop + 1),
+        None
+    );
+
+    // Negative (uncheckpointed) roots always resolve to themselves regardless of snapshot.
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(-12, 0),
+        Some(MVTableId::from(-12_i64))
+    );
+}
+
+fn overwrite_file_with_junk(path: &std::path::Path, size: usize, byte: u8) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap();
+    let portable_changes = vec![byte; size];
+    use std::io::Write;
+    file.write_all(&portable_changes).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn force_close_for_artifact_tamper(db: &mut MvccTestDbNoConn) {
+    db.close();
+}
+
+fn read_db_page_size(path: &str) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+    let mut header = [0u8; 100];
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.read_exact(&mut header).unwrap();
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    if raw == 1 {
+        65536
+    } else {
+        raw as usize
+    }
+}
+
+fn page_file_offset(page_no: u32, page_size: usize) -> u64 {
+    (page_no as u64 - 1) * page_size as u64
+}
+
+fn page_header_offset(page_no: u32) -> usize {
+    if page_no == 1 {
+        100
+    } else {
+        0
+    }
+}
+
+fn read_db_page(path: &str, page_no: u32, page_size: usize) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+    let mut page = vec![0u8; page_size];
+    file.seek(SeekFrom::Start(page_file_offset(page_no, page_size)))
+        .unwrap();
+    file.read_exact(&mut page).unwrap();
+    page
+}
+
+fn write_db_page(path: &str, page_no: u32, page_size: usize, page: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(page_file_offset(page_no, page_size)))
+        .unwrap();
+    file.write_all(page).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TableLeafCellLoc {
+    cell_offset: usize,
+    payload_varint_len: usize,
+    payload_len: usize,
+    payload_offset: usize,
+}
+
+fn table_leaf_cell_locs(page: &[u8], page_no: u32) -> Vec<TableLeafCellLoc> {
+    let hdr_off = page_header_offset(page_no);
+    assert_eq!(page[hdr_off], 0x0D, "expected table-leaf page type");
+    let cell_count = u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
+    let ptr_base = hdr_off + 8;
+    let mut locs = Vec::with_capacity(cell_count);
+    for i in 0..cell_count {
+        let ptr_off = ptr_base + i * 2;
+        let cell_ptr = u16::from_be_bytes([page[ptr_off], page[ptr_off + 1]]) as usize;
+        let (payload_len_u64, payload_varint_len) = read_varint(&page[cell_ptr..]).unwrap();
+        let payload_len = payload_len_u64 as usize;
+        let (_, rowid_varint_len) = read_varint(&page[cell_ptr + payload_varint_len..]).unwrap();
+        let payload_offset = cell_ptr + payload_varint_len + rowid_varint_len;
+        locs.push(TableLeafCellLoc {
+            cell_offset: cell_ptr,
+            payload_varint_len,
+            payload_len,
+            payload_offset,
+        });
+    }
+    locs
+}
+
+fn table_leaf_first_cell_loc(page: &[u8], page_no: u32) -> TableLeafCellLoc {
+    let locs = table_leaf_cell_locs(page, page_no);
+    let cell_count = locs.len();
+    assert!(
+        cell_count > 0,
+        "expected at least one cell in metadata page"
+    );
+    locs[0]
+}
+
+fn rewrite_table_leaf_cell_payload(page: &mut [u8], loc: TableLeafCellLoc, new_payload: &[u8]) {
+    assert!(
+        new_payload.len() <= loc.payload_len,
+        "new payload {} exceeds existing payload {}",
+        new_payload.len(),
+        loc.payload_len
+    );
+    let mut varint_buf = [0u8; 9];
+    let n = write_varint(&mut varint_buf, new_payload.len() as u64);
+    assert_eq!(
+        n, loc.payload_varint_len,
+        "payload varint length changed; in-place rewrite is unsafe"
+    );
+    page[loc.cell_offset..loc.cell_offset + n].copy_from_slice(&varint_buf[..n]);
+    page[loc.payload_offset..loc.payload_offset + new_payload.len()].copy_from_slice(new_payload);
+    if new_payload.len() < loc.payload_len {
+        page[loc.payload_offset + new_payload.len()..loc.payload_offset + loc.payload_len].fill(0);
+    }
+}
+
+fn tamper_table_leaf_value_serial_type(page: &mut [u8], page_no: u32, new_serial_type: u8) -> bool {
+    let loc = table_leaf_first_cell_loc(page, page_no);
+    let portable_changes = &mut page[loc.payload_offset..loc.payload_offset + loc.payload_len];
+
+    let (header_size, hs_len) = read_varint(portable_changes).unwrap();
+    let header_size = header_size as usize;
+    if header_size < hs_len + 2 || header_size > portable_changes.len() {
+        return false;
+    }
+
+    let mut idx = hs_len;
+    let (_serial_type0, n0) = read_varint(&portable_changes[idx..header_size]).unwrap();
+    idx += n0;
+    if idx >= header_size {
+        return false;
+    }
+    portable_changes[idx] = new_serial_type;
+    true
+}
+
+fn wipe_table_leaf_cells(page: &mut [u8], page_no: u32) -> bool {
+    let hdr_off = page_header_offset(page_no);
+    if page.len() <= hdr_off + 8 || page[hdr_off] != 0x0D {
+        return false;
+    }
+    let page_size = page.len();
+    page[hdr_off + 3..hdr_off + 5].copy_from_slice(&0u16.to_be_bytes()); // number of cells
+    page[hdr_off + 5..hdr_off + 7].copy_from_slice(&(page_size as u16).to_be_bytes()); // cell content area start
+    page[hdr_off + 7] = 0; // fragmented free bytes
+    true
+}
+
+fn metadata_root_page(conn: &Arc<Connection>) -> u32 {
+    let rows = get_rows(
+        conn,
+        "SELECT rootpage FROM sqlite_schema
+         WHERE type = 'table' AND name = '__turso_internal_mvcc_meta'",
+    );
+    assert_eq!(rows.len(), 1, "expected exactly one metadata table row");
+    rows[0][0].as_int().unwrap() as u32
+}
+
+fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_value: i64) {
+    let page_size = read_db_page_size(db_path);
+    let mut page = read_db_page(db_path, metadata_root_page, page_size);
+    let loc = table_leaf_first_cell_loc(&page, metadata_root_page);
+    let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
+    let record = ImmutableRecordRef::from_bin_record(payload);
+    let key = record
+        .get_value_opt(0)
+        .expect("metadata key column missing");
+    let ValueRef::Text(key) = key else {
+        panic!("metadata key must be text");
+    };
+    let new_record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new(key.as_str().to_string())),
+            Value::from_i64(new_value),
+        ],
+        2,
+    )
+    .unwrap();
+    rewrite_table_leaf_cell_payload(&mut page, loc, new_record.as_blob());
+    write_db_page(db_path, metadata_root_page, page_size, &page);
+}
+
+fn tamper_db_metadata_value_serial_type(
+    db_path: &str,
+    metadata_root_page: u32,
+    new_serial_type: u8,
+) {
+    let page_size = read_db_page_size(db_path);
+    let mut page = read_db_page(db_path, metadata_root_page, page_size);
+    assert!(
+        tamper_table_leaf_value_serial_type(&mut page, metadata_root_page, new_serial_type),
+        "expected metadata serial-type tamper to succeed"
+    );
+    write_db_page(db_path, metadata_root_page, page_size, &page);
+}
+
+fn tamper_db_metadata_row_key(db_path: &str, metadata_root_page: u32, new_key: &str) {
+    let page_size = read_db_page_size(db_path);
+    let mut page = read_db_page(db_path, metadata_root_page, page_size);
+    let loc = table_leaf_first_cell_loc(&page, metadata_root_page);
+    let payload = &page[loc.payload_offset..loc.payload_offset + loc.payload_len];
+    let record = ImmutableRecordRef::from_bin_record(payload);
+    let value = record
+        .get_value_opt(1)
+        .expect("metadata value column missing");
+    let ValueRef::Numeric(Numeric::Integer(value)) = value else {
+        panic!("metadata value must be integer");
+    };
+    let new_record = ImmutableRecord::from_values(
+        &[
+            Value::Text(Text::new(new_key.to_string())),
+            Value::from_i64(value),
+        ],
+        2,
+    )
+    .unwrap();
+    rewrite_table_leaf_cell_payload(&mut page, loc, new_record.as_blob());
+    write_db_page(db_path, metadata_root_page, page_size, &page);
+}
+
+fn tamper_wal_metadata_value_serial_type(
+    wal_path: &std::path::Path,
+    metadata_root_page: u32,
+    new_serial_type: u8,
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(wal_path)
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    if bytes.len() < WAL_HEADER_SIZE {
+        return false;
+    }
+
+    let header = WalHeader {
+        magic: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        file_format: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        page_size: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+        checkpoint_seq: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+        salt_1: u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+        salt_2: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        checksum_1: u32::from_be_bytes(bytes[24..28].try_into().unwrap()),
+        checksum_2: u32::from_be_bytes(bytes[28..32].try_into().unwrap()),
+    };
+    let use_native_endian = cfg!(target_endian = "big") == ((header.magic & 1) != 0);
+    let frame_size = WAL_FRAME_HEADER_SIZE + header.page_size as usize;
+    let mut frame_offset = WAL_HEADER_SIZE;
+    let mut prev_checksums = (header.checksum_1, header.checksum_2);
+    let mut mutated = false;
+
+    while frame_offset + frame_size <= bytes.len() {
+        let frame = &mut bytes[frame_offset..frame_offset + frame_size];
+        let page_no = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+        if page_no == metadata_root_page {
+            let page_image = &mut frame
+                [WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + header.page_size as usize];
+            let hdr_off = page_header_offset(metadata_root_page);
+            if page_image.len() > hdr_off + 5 && page_image[hdr_off] == 0x0D {
+                let cell_count =
+                    u16::from_be_bytes([page_image[hdr_off + 3], page_image[hdr_off + 4]]);
+                if cell_count > 0
+                    && tamper_table_leaf_value_serial_type(
+                        page_image,
+                        metadata_root_page,
+                        new_serial_type,
+                    )
+                {
+                    mutated = true;
+                }
+            }
+        }
+
+        let header_checksum =
+            checksum_wal(&frame[0..8], &header, prev_checksums, use_native_endian);
+        let final_checksum = checksum_wal(
+            &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + header.page_size as usize],
+            &header,
+            header_checksum,
+            use_native_endian,
+        );
+        frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
+        prev_checksums = final_checksum;
+        frame_offset += frame_size;
+    }
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    mutated
+}
+
+fn tamper_wal_metadata_page_empty(wal_path: &std::path::Path, metadata_root_page: u32) -> bool {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(wal_path)
+        .unwrap();
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    if bytes.len() < WAL_HEADER_SIZE {
+        return false;
+    }
+
+    let header = WalHeader {
+        magic: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        file_format: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        page_size: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+        checkpoint_seq: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+        salt_1: u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+        salt_2: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        checksum_1: u32::from_be_bytes(bytes[24..28].try_into().unwrap()),
+        checksum_2: u32::from_be_bytes(bytes[28..32].try_into().unwrap()),
+    };
+    let use_native_endian = cfg!(target_endian = "big") == ((header.magic & 1) != 0);
+    let frame_size = WAL_FRAME_HEADER_SIZE + header.page_size as usize;
+    let mut frame_offset = WAL_HEADER_SIZE;
+    let mut prev_checksums = (header.checksum_1, header.checksum_2);
+    let mut mutated = false;
+
+    while frame_offset + frame_size <= bytes.len() {
+        let frame = &mut bytes[frame_offset..frame_offset + frame_size];
+        let page_no = u32::from_be_bytes(frame[0..4].try_into().unwrap());
+        if page_no == metadata_root_page {
+            let page_image = &mut frame
+                [WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + header.page_size as usize];
+            if wipe_table_leaf_cells(page_image, metadata_root_page) {
+                mutated = true;
+            }
+        }
+
+        let header_checksum =
+            checksum_wal(&frame[0..8], &header, prev_checksums, use_native_endian);
+        let final_checksum = checksum_wal(
+            &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + header.page_size as usize],
+            &header,
+            header_checksum,
+            use_native_endian,
+        );
+        frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
+        frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
+        prev_checksums = final_checksum;
+        frame_offset += frame_size;
+    }
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    mutated
+}
+
+/// What this test checks: Recovery stops cleanly at a torn/incomplete tail and keeps all previously validated frames.
+/// Why this matters: Crashes can leave partial writes at EOF; we need durable-prefix recovery, not all-or-nothing failure.
+#[test]
+fn test_recover_logical_log_short_file_ignored() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    let file = mvcc_store.get_logical_log_file();
+
+    let c = file.truncate(1, Completion::new_write(|_| {})).unwrap();
+    conn.db.io.wait_for_completion(c).unwrap();
+
+    let c = file
+        .pwrite(
+            0,
+            Arc::new(Buffer::new(vec![0xAB])),
+            Completion::new_write(|_| {}),
+        )
+        .unwrap();
+    conn.db.io.wait_for_completion(c).unwrap();
+    assert_eq!(file.size().unwrap(), 1);
+
+    use turso_core::IOExt as _;
+    let io = conn.db.io.clone();
+    let mut st = RecoverLogicalLogState::default();
+    let recovered = io
+        .block(|| mvcc_store.maybe_recover_logical_log(&conn, &mut st))
+        .unwrap();
+    assert!(!recovered);
+}
+
+/// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
+/// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
+#[test]
+fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
+    let db = MvccTestDb::new();
+    let rows = get_rows(&db.conn, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string().to_lowercase(), "wal");
+}
+
+/// This test checks that after MVCC restart, the auto-indexes for PRIMARY KEY and UNIQUE
+/// constraints stay associated with the columns they were created for.
+#[test]
+fn test_restart_preserves_autoindex_to_column_mapping() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        // The dummy table exposes the bug because of the implementation of the HashMap used to
+        // store schema rows. This test is not perfect, because it may not catch a regression if
+        // the implementation changes. But until we patch the simulator to reproduce the bug,
+        // this'll do.
+        conn.execute("CREATE TABLE dummy(x)").unwrap();
+        conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES('aa', 'bb')").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let a_rows = get_rows(&conn, "SELECT a FROM t");
+    assert_eq!(a_rows.len(), 1);
+    assert_eq!(a_rows[0][0].to_string(), "aa");
+    let b_rows = get_rows(&conn, "SELECT b FROM t");
+    assert_eq!(b_rows.len(), 1);
+    assert_eq!(b_rows[0][0].to_string(), "bb");
+}
+
+/// What this test checks: when transaction A updates a row and a concurrent
+/// transaction B (later begin_ts) speculatively tombstones that row while A
+/// is in `Preparing`, A's commit must serialize its OWN writes — not the
+/// DELETEs that B's tombstone TxID, still pinned to the versions' `end`
+/// fields, would imply.
+///
+/// References: Hekaton paper (https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf)
+/// §2.5 Table 1 (speculative read of preparing writer), §2.7 (commit deps).
+#[test]
+fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t(id, v) VALUES (1, 'initial')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a
+            .execute("UPDATE t SET v = 'a_value' WHERE id = 1")
+            .unwrap();
+
+        conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::CommitValidation.point(),
+        ])));
+
+        let mut commit_stmt = conn_a.prepare("COMMIT").unwrap();
+        let mut yielded = false;
+        for _ in 0..100 {
+            match commit_stmt.step().unwrap() {
+                StepResult::Yield => {
+                    yielded = true;
+                    break;
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+        assert!(
+            yielded,
+            "tx_a's COMMIT should yield at CommitYieldPoint::CommitValidation"
+        );
+
+        // tx_b begins *after* tx_a's prepare so tx_b.begin_ts > tx_a's
+        // prepared end_ts; its DELETE plants a speculative tombstone whose
+        // TxID(tx_b) lands in the `end` field of tx_a's new versions.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+        commit_stmt.run_collect_rows().unwrap();
+        drop(commit_stmt);
+
+        let rows = get_rows(&conn_a, "SELECT id, v FROM t");
+        assert_eq!(rows.len(), 1);
+
+        conn_b.execute("ROLLBACK").unwrap();
+
+        conn_a.close().unwrap();
+        conn_b.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(
+        rows.len(),
+        1,
+        "tx_a's committed row must survive recovery, got {rows:?}"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a_value");
+}
+
+/// What this test checks: MVCC restart handles sqlite_schema rows with rootpage=0 (triggers).
+/// Why this matters: Trigger definitions are stored without btrees and should not break recovery.
+#[test]
+fn test_restart_with_trigger_rootpage_zero() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, action TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_del AFTER DELETE ON t1 \
+             BEGIN INSERT INTO audit VALUES (NULL, 'deleted'); END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'x')").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute("DELETE FROM t1 WHERE id = 1").unwrap();
+        let rows = get_rows(&conn, "SELECT action FROM audit ORDER BY id");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_string(), "deleted");
+    }
+}
+
+/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
+/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
+#[test]
+fn test_recovery_overwrites_torn_tail_on_next_append() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    }
+
+    // Corrupt only the tail of the latest frame.
+    {
+        let conn = db.connect();
+        let mvcc_store = db.get_mvcc_store();
+        let file = mvcc_store.get_logical_log_file();
+        let size = file.size().unwrap();
+        assert!(size > 1);
+        let c = file
+            .truncate(size - 1, Completion::new_trunc(|_| {}))
+            .unwrap();
+        conn.db.io.wait_for_completion(c).unwrap();
+    }
+
+    // First restart: recovery should stop at torn tail and reset log write offset.
+    db.restart();
+    {
+        let conn = db.connect();
+        let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    }
+
+    // Second restart: row 3 must be recoverable, proving it was appended at last_valid_offset.
+    db.restart();
+    {
+        let conn = db.connect();
+        let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        assert_eq!(rows[0][1].to_string(), "a");
+        assert_eq!(rows[1][0].as_int().unwrap(), 3);
+        assert_eq!(rows[1][1].to_string(), "c");
+    }
+}
+
+/// First-time MVCC bootstrap repairs a torn short `.db-log` header before metadata writes commit.
+#[test]
+#[ignore = "Needs a dedicated bootstrap harness that can create header=MVCC + missing metadata + torn short log atomically"]
+fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join(format!("bootstrap_torn_{}", rand::random::<u64>()));
+    let db_path_str = db_path.to_str().unwrap().to_string();
+
+    {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_path = std::path::Path::new(&db_path_str).with_extension("db-log");
+    overwrite_file_with_junk(&log_path, LOG_HDR_SIZE / 2, 0xAB);
+    {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let meta = get_rows(
+        &conn,
+        "SELECT v FROM __turso_internal_mvcc_meta WHERE k = 'persistent_tx_ts_max'",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].as_int().unwrap(), 0);
+
+    let log_len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        log_len >= LOG_HDR_SIZE as u64,
+        "expected bootstrap to rewrite durable logical-log header"
+    );
+}
+
+#[test]
+fn test_bootstrap_recovers_committed_wal_without_log_file() {
+    // A Passive checkpoint truncates the logical log to 0 but leaves the WAL non-empty,
+    // so reopen sees NoLog + committed WAL — the normal steady state, not corruption.
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
+    }
+
+    let log_path = std::path::Path::new(&db_path).with_extension("db-log");
+    std::fs::remove_file(&log_path).unwrap();
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("open should recover, not fail closed");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should recover the committed WAL");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1, "committed row must survive recovery");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
+}
+
+/// MVCC supports only Passive and Truncate, so a requested FULL checkpoint maps to
+/// Truncate (resets the WAL). The reopen then recovers cleanly. Regression for whopper
+/// `--enable-mvcc` (no passive flag) hitting "WAL has committed frames but logical log
+/// header is missing" back when FULL kept the WAL while truncating the logical log.
+#[test]
+fn test_full_checkpoint_reopen_recovers_truncate_mode() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
+    }
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+        .expect("FULL checkpoint reopen should recover");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should recover after FULL checkpoint");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        1,
+        "committed row must survive FULL-checkpoint reopen"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
+}
+
+/// In default (flag-off) mode an explicit TRUNCATE that loses the blocking-checkpoint lock to a
+/// concurrent reader/writer must report `Busy` (the pre-feature contract), never a false-success
+/// no-op. An open transaction holds the checkpoint lock for its lifetime.
+#[test]
+fn test_flag_off_truncate_busy_when_lock_contended() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    // Open transaction on c1 pins the blocking checkpoint lock.
+    c1.execute("BEGIN").unwrap();
+    c1.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let c2 = db.connect();
+    let res = c2.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "contended flag-off TRUNCATE must return Busy, got {res:?}"
+    );
+
+    c1.execute("COMMIT").unwrap();
+}
+
+/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
+/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
+#[test]
+fn test_bootstrap_handles_committed_wal_when_log_truncated() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store.clone(), &conn);
+
+        let log_file = mvcc_store.get_logical_log_file();
+        let c = log_file
+            .truncate(LOG_HDR_SIZE as u64, Completion::new_trunc(|_| {}))
+            .unwrap();
+        conn.db.io.wait_for_completion(c).unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+
+    let log_size = db.get_mvcc_store().get_logical_log_file().size().unwrap();
+    assert_eq!(log_size, LOG_HDR_SIZE as u64);
+    let wal_path = wal_path_for_db(&db_path);
+    let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+    assert_eq!(wal_len, 0);
+}
+
+/// TDD recovery/checkpoint matrix for metadata-table source of truth.
+///
+/// Proposed semantics under test:
+/// - Source of truth for replay boundary is internal SQLite table
+///   `turso_internal_mvcc_meta` with `persistent_tx_ts_max`.
+/// - Logical-log header carries no replay timestamps.
+/// - On startup with committed WAL frames, recovery must reconcile WAL first, then read metadata.
+///
+/// Enumerated cases:
+/// 1. No committed WAL + no logical-log frames + metadata row present.
+/// 2. No committed WAL + logical-log frames + metadata row present -> replay `ts > persistent_tx_ts_max`.
+/// 3. No committed WAL + logical-log frames + metadata row missing/corrupt -> fail closed.
+/// 4. Committed WAL + metadata row present -> reconcile WAL first, then replay above metadata boundary.
+/// 5. Committed WAL + metadata row missing -> fail closed.
+/// 6. Committed WAL + metadata row malformed/corrupt -> fail closed.
+/// 7. Metadata table exists but has duplicate rows/invalid key shape -> fail closed.
+/// 8. User tampered metadata row downward -> detect and fail closed.
+/// 9. User deleted metadata row -> detect and fail closed.
+/// 10. Checkpoint pager commit atomically upserts metadata row in same WAL txn.
+/// 11. Auto-checkpoint failure after pager commit keeps COMMIT result stable and recoverable.
+/// 12. Replay gate correctness: never apply `commit_ts <= persistent_tx_ts_max`.
+#[test]
+fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let wal_path = wal_path_for_db(&db_path);
+    let log_path = std::path::Path::new(&db_path).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        let rows = get_rows(
+            &conn,
+            "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_string(), "persistent_tx_ts_max");
+        assert_eq!(rows[0][1].as_int().unwrap(), 0);
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "persistent_tx_ts_max");
+    assert_eq!(rows[0][1].as_int().unwrap(), 0);
+
+    let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len, 0,
+        "expected no committed WAL tail after clean boot"
+    );
+    let log_len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        log_len, LOG_HDR_SIZE as u64,
+        "expected logical log to be {LOG_HDR_SIZE} bytes (bootstrap header) on clean boot"
+    );
+}
+
+/// With no committed WAL and metadata present, replay includes only frames above `persistent_tx_ts_max`.
+#[turso_macros::test(encryption)]
+fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        let meta = get_rows(
+            &conn,
+            "SELECT v FROM __turso_internal_mvcc_meta WHERE k = 'persistent_tx_ts_max'",
+        );
+        assert_eq!(meta.len(), 1);
+        let boundary = meta[0][0].as_int().unwrap();
+        assert!(
+            boundary >= 2,
+            "expected metadata boundary >= 2 after checkpoint, got {boundary}"
+        );
+
+        conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "b");
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+    assert_eq!(rows[2][1].to_string(), "c");
+}
+
+/// What this test checks: Header PRAGMAs in MVCC run under an exclusive transaction. A
+/// BEGIN CONCURRENT transaction is upgraded to exclusive in place.
+/// Why this matters: Header updates have no row-level conflict keys, so they must not run under
+/// optimistic concurrent write mode.
+#[test]
+fn test_mvcc_header_updates_upgrade_concurrent_tx_to_exclusive() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("PRAGMA user_version = 42").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        0,
+        "rolled-back header update must not stick"
+    );
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("PRAGMA user_version = 7").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+}
+
+/// What this test checks: BEGIN CONCURRENT is deferred like SQLite's
+/// begin-concurrent: the snapshot is taken at the first statement, not at
+/// BEGIN, so a commit that lands in between is visible.
+#[test]
+fn test_begin_concurrent_snapshot_starts_at_first_statement() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "a commit between BEGIN CONCURRENT and the first statement must be visible"
+    );
+
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "a commit after the snapshot was taken must not be visible"
+    );
+
+    holder.execute("COMMIT").unwrap();
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// What this test checks: the lazily materialized transaction really is
+/// concurrent — two BEGIN CONCURRENT transactions whose first action is a
+/// write to different rows both commit. If materialization fell back to the
+/// statement's Write mode, the first write would take the exclusive slot and
+/// the second transaction's commit would abort.
+#[test]
+fn test_begin_concurrent_write_stays_concurrent_after_lazy_begin() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn_a.execute("COMMIT").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+
+    let reader = db.connect();
+    let rows = get_rows(&reader, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// What this test checks: when SAVEPOINT is the first statement after BEGIN
+/// CONCURRENT, it materializes the transaction in concurrent mode. If it
+/// materialized a read transaction instead, the first write would upgrade to
+/// exclusive and the other connection's commit would abort.
+#[test]
+fn test_savepoint_first_statement_materializes_concurrent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("SAVEPOINT sp").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn_a.execute("ROLLBACK TO sp").unwrap();
+
+    let conn_b = db.connect();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn_b
+        .execute("COMMIT")
+        .expect("a concurrent writer must not abort against a savepoint-only transaction");
+
+    conn_a.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn_a.execute("COMMIT").unwrap();
+
+    let reader = db.connect();
+    let rows = get_rows(&reader, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][0].as_int().unwrap(), 3);
+}
+
+/// What this test checks: BEGIN CONCURRENT works on a read-only connection —
+/// reads proceed on a snapshot and only a write fails. Before BEGIN
+/// CONCURRENT became deferred it was rejected at BEGIN on read-only
+/// connections.
+#[test]
+fn test_begin_concurrent_on_readonly_connection_reads() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("ro_concurrent.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    {
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (7)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default() | OpenFlags::ReadOnly,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+    let err = conn
+        .execute("INSERT INTO t VALUES (8)")
+        .expect_err("writes must fail on a read-only connection");
+    assert!(
+        matches!(err, LimboError::ReadOnly),
+        "expected ReadOnly, got {err:?}"
+    );
+    // The failed write rolled the transaction back (ReadOnly is not in the
+    // keep-transaction-open error class); reads keep working in autocommit.
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 7);
+}
+
+#[test]
+fn test_begin_concurrent_first_statement_retry_after_busy_exclusive_upgrade() {
+    use turso_core::StepResult;
+
+    fn step_until_not_io(
+        stmt: &mut turso_core::Statement,
+        io: &Arc<dyn IO>,
+    ) -> Result<StepResult, LimboError> {
+        loop {
+            match stmt.step() {
+                Ok(StepResult::IO | StepResult::Yield) => io.step().unwrap(),
+                other => return other,
+            }
+        }
+    }
+
+    for (statement, holder_end, check_query, expected) in [
+        (
+            "CREATE TABLE u(x)",
+            "ROLLBACK",
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'u'",
+            1,
+        ),
+        (
+            "CREATE TABLE u(x)",
+            "COMMIT",
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'u'",
+            1,
+        ),
+        (
+            "PRAGMA user_version = 7",
+            "ROLLBACK",
+            "PRAGMA user_version",
+            7,
+        ),
+        (
+            "PRAGMA user_version = 7",
+            "COMMIT",
+            "PRAGMA user_version",
+            7,
+        ),
+    ] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup.close().unwrap();
+
+        let holder = db.connect();
+        holder.execute("BEGIN").unwrap();
+        holder.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let conn = db.connect();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut stmt = conn.prepare(statement).unwrap();
+        let io = stmt.get_pager().io.clone();
+        let first = step_until_not_io(&mut stmt, &io);
+        assert!(
+            matches!(first, Ok(StepResult::Busy) | Err(LimboError::Busy)),
+            "{statement}: first step must be Busy while another connection holds the exclusive transaction, got {first:?}"
+        );
+
+        holder.execute(holder_end).unwrap();
+
+        let retry = step_until_not_io(&mut stmt, &io);
+        drop(stmt);
+        match (holder_end, retry) {
+            (_, Ok(StepResult::Done)) => {
+                conn.execute("COMMIT").unwrap();
+                let rows = get_rows(&db.connect(), check_query);
+                assert_eq!(
+                    rows[0][0].as_int().unwrap(),
+                    expected,
+                    "{statement} after {holder_end}: committed change must be visible"
+                );
+            }
+            ("COMMIT", Ok(StepResult::Busy) | Err(LimboError::Busy)) => {
+                conn.execute("ROLLBACK").unwrap();
+            }
+            (_, other) => {
+                panic!("{statement} after {holder_end}: retry must not fail, got {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_begin_concurrent_failed_first_statement_takes_snapshot() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup.close().unwrap();
+
+    let holder = db.connect();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    let err = holder
+        .execute("INSERT INTO t VALUES (1)")
+        .expect_err("duplicate primary key must fail");
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected a constraint error, got {err:?}"
+    );
+    assert!(
+        !holder.get_auto_commit(),
+        "a constraint error must not end the explicit transaction"
+    );
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let rows = get_rows(&holder, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "a commit after the failed first statement must not be visible"
+    );
+    holder.execute("COMMIT").unwrap();
+}
+
+/// What this test checks: Header PRAGMAs in MVCC succeed in autocommit mode, where the VM
+/// opens an implicit single-statement write transaction.
+#[test]
+fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("PRAGMA user_version = 19").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 19);
+}
+
+/// Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
+#[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
+fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_closed() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let metadata_root_page = {
+        let conn = db.connect();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        metadata_root_page(&conn)
+    };
+    force_close_for_artifact_tamper(&mut db);
+    tamper_db_metadata_row_value(&db_path, metadata_root_page, -1);
+    let wal_path = wal_path_for_db(&db_path);
+    let _ = std::fs::remove_file(&wal_path);
+    overwrite_file_with_junk(&wal_path, 0, 0);
+
+    // Ensure cold open after artifact tamper.
+    let io = Arc::new(PlatformIO::new().unwrap());
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+        Ok(db2) => match db2.connect(ConnectOpts::new(SessionRole::Superuser)) {
+            Ok(_) => panic!("expected connect to fail with Corrupt"),
+            Err(err) => assert!(
+                matches!(err, LimboError::Corrupt(_)),
+                "unexpected connect error: {err:?}"
+            ),
+        },
+        Err(err) => assert!(
+            matches!(err, LimboError::Corrupt(_)),
+            "unexpected open error: {err:?}"
+        ),
+    }
+}
+
+/// What this test checks: Recovery reconciles committed WAL first, then applies logical-log replay boundary from metadata.
+/// Why this matters: Ordering prevents double-apply and loss when WAL and logical log both exist.
+#[test]
+fn test_meta_recovery_case_4_committed_wal_reconcile_before_metadata_boundary_replay() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let wal_path = wal_path_for_db(&db_path);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+
+    let meta = get_rows(
+        &conn,
+        "SELECT v FROM __turso_internal_mvcc_meta WHERE k = 'persistent_tx_ts_max'",
+    );
+    assert_eq!(meta.len(), 1);
+    assert!(
+        meta[0][0].as_int().unwrap() >= 2,
+        "expected replay boundary to advance after committed-WAL reconciliation",
+    );
+
+    let wal_len = wal_path.metadata().map(|m| m.len()).unwrap_or(0);
+    assert_eq!(wal_len, 0, "reconciliation must truncate WAL at the end");
+}
+
+/// Committed WAL with missing metadata row fails closed.
+#[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
+fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let wal_path = wal_path_for_db(&db_path);
+    let metadata_root_page = {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        let root_page = metadata_root_page(&conn);
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
+        root_page
+    };
+    force_close_for_artifact_tamper(&mut db);
+    let mutated = tamper_wal_metadata_page_empty(&wal_path, metadata_root_page);
+    assert!(
+        mutated,
+        "expected metadata WAL frame to be mutated into missing-row shape"
+    );
+    let io = Arc::new(PlatformIO::new().unwrap());
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+        Ok(db2) => match db2.connect(ConnectOpts::new(SessionRole::Superuser)) {
+            Ok(_) => panic!("expected connect to fail closed"),
+            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        },
+        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+    }
+}
+
+/// What this test checks: Committed WAL with malformed metadata row fails closed.
+/// Why this matters: Corrupt internal metadata must never be interpreted best-effort.
+#[test]
+fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let wal_path = wal_path_for_db(&db_path);
+    let metadata_root_page = {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        let mvcc_store = db.get_mvcc_store();
+        let root_page = metadata_root_page(&conn);
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
+        root_page
+    };
+    force_close_for_artifact_tamper(&mut db);
+    let mutated = tamper_wal_metadata_value_serial_type(&wal_path, metadata_root_page, 0);
+    assert!(
+        mutated,
+        "expected at least one metadata WAL frame to be mutated"
+    );
+
+    // Ensure cold open after artifact tamper.
+    let io = Arc::new(PlatformIO::new().unwrap());
+    if Database::open_file(io, &db_path, Arc::new(SqliteDialect)).is_ok_and(|db2| {
+        db2.connect(ConnectOpts::new(SessionRole::Superuser))
+            .is_ok()
+    }) {
+        panic!("expected connect to fail closed")
+    }
+}
+
+/// What this test checks: Invalid metadata-table shape (duplicates or bad key domain) fails closed.
+/// Why this matters: Schema/shape corruption in internal state must not be silently tolerated.
+#[test]
+fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let metadata_root_page = {
+        let conn = db.connect();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        metadata_root_page(&conn)
+    };
+    force_close_for_artifact_tamper(&mut db);
+    tamper_db_metadata_value_serial_type(&db_path, metadata_root_page, 0);
+    let wal_path = wal_path_for_db(&db_path);
+    let _ = std::fs::remove_file(&wal_path);
+    overwrite_file_with_junk(&wal_path, 0, 0);
+
+    // Ensure cold open after artifact tamper.
+    let io = Arc::new(PlatformIO::new().unwrap());
+    if Database::open_file(io, &db_path, Arc::new(SqliteDialect)).is_ok_and(|db2| {
+        db2.connect(ConnectOpts::new(SessionRole::Superuser))
+            .is_ok()
+    }) {
+        panic!("expected connect to fail closed")
+    }
+}
+
+/// Deletion of metadata row is detected and rejected.
+#[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
+fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let metadata_root_page = {
+        let conn = db.connect();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        metadata_root_page(&conn)
+    };
+    force_close_for_artifact_tamper(&mut db);
+    tamper_db_metadata_row_key(&db_path, metadata_root_page, "persistent_tx_ts_may");
+    let wal_path = wal_path_for_db(&db_path);
+    let _ = std::fs::remove_file(&wal_path);
+    overwrite_file_with_junk(&wal_path, 0, 0);
+    let io = Arc::new(PlatformIO::new().unwrap());
+    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+        Ok(db2) => match db2.connect(ConnectOpts::new(SessionRole::Superuser)) {
+            Ok(_) => panic!("expected connect to fail closed"),
+            Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+        },
+        Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
+    }
+}
+
+/// Steps:
+/// 1. Create an MVCC database with a table and unique index whose roots are still logical MVCC roots.
+/// 2. Prepare `PRAGMA integrity_check` on a second connection and record that it has not reprepared yet.
+/// 3. Record `PRAGMA schema_version` before the checkpoint.
+/// 4. Start stepping the stale statement, then yield immediately before `OP_Transaction` opens the read transaction.
+/// 5. On the writer connection, insert a row and run `wal_checkpoint(TRUNCATE)` so checkpoint publishes physical roots.
+/// 6. Assert the checkpoint did not bump SQLite's schema cookie.
+/// 7. Resume the stale statement; it must force one reprepare and then report `ok`.
+#[test]
+fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    let stale_conn = db.connect();
+    let injector = FixedYieldInjector::new([TransactionYieldPoint::BeforeStart.point()]);
+    stale_conn.set_yield_injector(Some(injector.clone()));
+    let mut stale_integrity_check = stale_conn.prepare("PRAGMA integrity_check").unwrap();
+    assert_eq!(
+        stale_integrity_check.stmt_status(StatementStatusCounter::Reprepare),
+        0
+    );
+
+    let schema_version_before = get_rows(&writer, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        matches!(
+            stale_integrity_check.step().unwrap(),
+            turso_core::StepResult::Yield
+        ) && injector.is_empty(),
+        "integrity_check should yield before opening its read transaction"
+    );
+
+    writer.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let schema_version_after = get_rows(&writer, "PRAGMA schema_version")[0][0]
+        .as_int()
+        .unwrap();
+    assert_eq!(
+        schema_version_after, schema_version_before,
+        "checkpoint root publication must not change SQLite's schema cookie"
+    );
+
+    stale_conn.set_yield_injector(None);
+    let rows = stale_integrity_check.run_collect_rows().unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+    assert_eq!(
+        stale_integrity_check.stmt_status(StatementStatusCounter::Reprepare),
+        1
+    );
+}
+
+#[test]
+fn test_reader_consistent_during_large_indexed_commit_rewrite() {
+    use turso_core::StepResult;
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(pk INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    // > 1024 rows so the commit's RewriteLiveVersions spans multiple batches.
+    c1.execute("BEGIN").unwrap();
+    for i in 0..1500i64 {
+        c1.execute(format!("INSERT INTO t VALUES ({i}, {})", i + 1_000_000))
+            .unwrap();
+    }
+    c1.execute("COMMIT").unwrap();
+    c1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let c2 = db.connect();
+
+    // Large UPDATE of the indexed column in one tx; drive its COMMIT step-by-step.
+    c1.execute("BEGIN CONCURRENT").unwrap();
+    c1.execute("UPDATE t SET v = v + 5_000_000").unwrap();
+    let mut commit = c1.prepare("COMMIT").unwrap();
+    // Co-drive c1's COMMIT and a c2 integrity_check non-blocking against the shared IO.
+    // A blocking read on c2 would deadlock: it can't finish while c1's commit is parked
+    // mid-RewriteLiveVersions, and c1 only advances when stepped. Stepping both keeps
+    // progress flowing while still exercising c2 reads across the rewrite window.
+    let io = c1.get_pager().io.clone();
+    let mut check = c2.prepare("PRAGMA integrity_check").unwrap();
+    let mut last_row: Option<Vec<Value>> = None;
+    let mut commit_done = false;
+    let mut checks = 0u32;
+    loop {
+        if !commit_done {
+            match commit.step().unwrap() {
+                StepResult::Done => commit_done = true,
+                StepResult::IO | StepResult::Yield => {}
+                other => panic!("unexpected commit step: {other:?}"),
+            }
+        }
+        match check.step().unwrap() {
+            StepResult::Row => {
+                last_row = Some(check.row().unwrap().get_values().cloned().collect());
+            }
+            StepResult::Done => {
+                let row = last_row.take().expect("integrity_check returns a row");
+                assert_eq!(
+                    &row[0].to_string(),
+                    "ok",
+                    "integrity failed mid-rewrite: {row:?}"
+                );
+                checks += 1;
+                if commit_done {
+                    break;
+                }
+                check = c2.prepare("PRAGMA integrity_check").unwrap();
+            }
+            StepResult::IO | StepResult::Yield => {}
+            other => panic!("unexpected check step: {other:?}"),
+        }
+        io.step().unwrap();
+    }
+    assert!(
+        checks >= 1,
+        "expected at least one concurrent integrity_check"
+    );
+    let integ = get_rows(&c1, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "final integrity: {integ:?}");
+}
+
+/// Content correctness under the passive checkpoint: `integrity_check` proves rows agree with
+/// their indexes but not that values are right. A concurrent writer shuffles a fixed total
+/// between accounts (each transfer sum-preserving and atomic) while passive checkpoints run on
+/// every commit, so every reader snapshot must see the exact unchanged SUM and row COUNT.
+#[test]
+fn test_passive_concurrent_transfer_preserves_sum_and_count() {
+    const N: i64 = 50;
+    const INIT: i64 = 1000;
+    const TOTAL: i64 = N * INIT;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE accounts(id INTEGER PRIMARY KEY, bal INTEGER NOT NULL)")
+        .unwrap();
+    for i in 0..N {
+        setup
+            .execute(format!("INSERT INTO accounts VALUES ({i}, {INIT})"))
+            .unwrap();
+    }
+    // Materialize the seed rows, then passive auto-checkpoint on every commit.
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    fn is_transient(e: &LimboError) -> bool {
+        matches!(
+            e,
+            LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::CommitDependencyAborted
+                | LimboError::WriteWriteConflict
+        )
+    }
+    fn as_i64(v: &Value) -> i64 {
+        v.to_string().parse().unwrap()
+    }
+
+    let db_arc = db.get_db();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Reader: COUNT and SUM in ONE statement => one consistent snapshot. Both must be exact.
+    let reader_stop = stop.clone();
+    let reader_db = db_arc.clone();
+    let reader = std::thread::spawn(move || {
+        let conn = reader_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let mut iters = 0u64;
+        while !reader_stop.load(Ordering::Acquire) {
+            let mut stmt = match conn.prepare("SELECT COUNT(*), SUM(bal) FROM accounts") {
+                Ok(s) => s,
+                Err(ref e) if is_transient(e) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => panic!("reader prepare: {e:?}"),
+            };
+            let mut got: Option<(i64, i64)> = None;
+            let res = stmt.run_with_row_callback(|row| {
+                let vals: Vec<Value> = row.get_values().cloned().collect();
+                got = Some((as_i64(&vals[0]), as_i64(&vals[1])));
+                Ok(())
+            });
+            match res {
+                Ok(()) => {
+                    let (count, sum) = got.expect("aggregate yields one row");
+                    assert_eq!(
+                        count, N,
+                        "reader iter {iters}: row count changed ({count} != {N})"
+                    );
+                    assert_eq!(
+                        sum, TOTAL,
+                        "reader iter {iters}: total balance changed ({sum} != {TOTAL}) — content corruption"
+                    );
+                }
+                Err(ref e) if is_transient(e) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => panic!("reader run: {e:?}"),
+            }
+            iters += 1;
+        }
+    });
+
+    // Writer: sum-preserving transfers between accounts, atomic per txn.
+    let writer_db = db_arc;
+    let writer = std::thread::spawn(move || {
+        let conn = writer_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as i64
+        };
+        for _ in 0..1500i64 {
+            let a = next().rem_euclid(N);
+            let mut b = next().rem_euclid(N);
+            if b == a {
+                b = (b + 1).rem_euclid(N);
+            }
+            let amt = next().rem_euclid(50) + 1;
+            if conn.execute("BEGIN CONCURRENT").is_err() {
+                continue;
+            }
+            let moved = conn
+                .execute(format!(
+                    "UPDATE accounts SET bal = bal - {amt} WHERE id = {a}"
+                ))
+                .is_ok()
+                && conn
+                    .execute(format!(
+                        "UPDATE accounts SET bal = bal + {amt} WHERE id = {b}"
+                    ))
+                    .is_ok();
+            if !moved {
+                let _ = conn.execute("ROLLBACK");
+                continue;
+            }
+            // Atomic commit: both updates apply or neither does, so the total is preserved.
+            if conn.execute("COMMIT").is_err() {
+                let _ = conn.execute("ROLLBACK");
+            }
+        }
+    });
+
+    writer.join().unwrap();
+    stop.store(true, Ordering::Release);
+    reader.join().unwrap();
+
+    // Final exact content check on a fresh snapshot: every id present once, total preserved.
+    let check = db.connect();
+    let rows = get_rows(&check, "SELECT id, bal FROM accounts ORDER BY id");
+    assert_eq!(rows.len() as i64, N, "final row count");
+    let mut total = 0i64;
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(
+            as_i64(&r[0]),
+            i as i64,
+            "id {i} must be present exactly once, in order"
+        );
+        total += as_i64(&r[1]);
+    }
+    assert_eq!(total, TOTAL, "final total balance must be unchanged");
+}
+
+#[test]
+fn test_reader_does_not_see_inflight_index_tombstone() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    c1.execute("INSERT INTO t VALUES (1, 719)").unwrap();
+    c1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap(); // 719 btree-resident
+
+    let c2 = db.connect();
+    // c2 updates the indexed column but does NOT commit (in-flight tombstone of 719).
+    c2.execute("BEGIN CONCURRENT").unwrap();
+    c2.execute("UPDATE t SET v = 743 WHERE pk = 1").unwrap();
+
+    // c1 reads in its own snapshot (auto-commit) — must still see v=719 via the index.
+    let via_idx_719 = get_rows(&c1, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(
+        via_idx_719.len(),
+        1,
+        "concurrent reader must still see v=719 via the index while c2's UPDATE is in flight: {via_idx_719:?}"
+    );
+    let integ = get_rows(&c1, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
+
+    // c2 aborts; 719 must remain.
+    c2.execute("ROLLBACK").unwrap();
+    let after = get_rows(&c1, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(after.len(), 1, "v=719 must survive c2 rollback: {after:?}");
+}
+
+/// An UPDATE of an indexed UNIQUE column inside a tx that cleanly ROLLs BACK must not
+/// leave the pre-update index entry tombstoned (regression guard; this path is correct).
+#[test]
+fn test_rollback_of_indexed_update_keeps_btree_resident_index_entry() {
+    // Repro for the turso_stress "row missing from index" bug: an UPDATE of an indexed
+    // UNIQUE column inside a tx that ROLLS BACK must not leave the pre-update index entry
+    // tombstoned — especially when it's already btree-resident (the UPDATE then creates a
+    // synthetic tombstone over the btree entry).
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 719)").unwrap();
+    // Make value 719's index entry btree-resident (and drop MVCC-store versions).
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Update the indexed column, then abort the transaction.
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 743 WHERE pk = 1").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // The row's original indexed value (719) must still be reachable via the index,
+    // and 743 (never committed) must not be.
+    let via_idx_719 = get_rows(&conn, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(
+        via_idx_719.len(),
+        1,
+        "row must remain in autoindex under v=719 after rollback: {via_idx_719:?}"
+    );
+    let via_idx_743 = get_rows(&conn, "SELECT pk FROM t WHERE v = 743");
+    assert!(
+        via_idx_743.is_empty(),
+        "aborted UPDATE's v=743 must not be in the index: {via_idx_743:?}"
+    );
+    let integ = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
+}
+
+#[test]
+fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let c1 = db.connect();
+    c1.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
+        .unwrap();
+    c1.execute("INSERT INTO t VALUES (1, 719)").unwrap();
+    c1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap(); // 719 btree-resident
+
+    let c2 = db.connect();
+
+    // c1 updates the indexed column of pk=1 to 743 (tombstones the btree-resident 719
+    // entry, stages a 743 entry) — but does not commit yet.
+    c1.execute("BEGIN CONCURRENT").unwrap();
+    c1.execute("UPDATE t SET v = 743 WHERE pk = 1").unwrap();
+
+    // c2 commits the SAME index key (743) on a different row, so c1's commit must
+    // write-write-conflict on the unique index and abort.
+    c2.execute("BEGIN CONCURRENT").unwrap();
+    c2.execute("INSERT INTO t VALUES (2, 743)").unwrap();
+    c2.execute("COMMIT").unwrap();
+
+    let c1_commit = c1.execute("COMMIT");
+    assert!(
+        c1_commit.is_err(),
+        "c1 commit should write-write conflict on index key 743, got {c1_commit:?}"
+    );
+
+    // pk=1 is unchanged (719) and must still be reachable via the index; pk=2 has 743.
+    let via_idx_719 = get_rows(&c1, "SELECT pk FROM t WHERE v = 719");
+    assert_eq!(
+        via_idx_719.len(),
+        1,
+        "pk=1 must remain in autoindex under v=719 after c1's conflict-abort: {via_idx_719:?}"
+    );
+    let integ = get_rows(&c1, "PRAGMA integrity_check");
+    assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
+}
+
+/// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
+/// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
+#[test]
+fn test_mvcc_memory_keeps_builtin_table_valued_functions() {
+    let db = MvccTestDb::new();
+    let rows = get_rows(&db.conn, "SELECT value FROM generate_series(1,3)");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+}
+
+#[test]
+fn test_sequence_watermark_tracks_nextval_allocations() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+
+    let rows = get_rows(&setup, "SELECT sequence_watermark_experimental('s')");
+    assert!(matches!(rows[0][0], Value::Null));
+
+    let rows = get_rows(&setup, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&setup, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(&writer, "SELECT nextval('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    writer.execute("COMMIT").unwrap();
+    let rows = get_rows(&observer, "SELECT sequence_watermark_experimental('s')");
+    assert_eq!(rows[0][0].as_int().unwrap(), 3);
+}
+
+/// What this test checks: a sync-style cursor that bounds its scan by
+/// `sequence_watermark_experimental()` (read *outside* a transaction, as the
+/// contract requires) never skips a committed row, even while many writers
+/// concurrently allocate sequence ids in overlapping `BEGIN CONCURRENT`
+/// transactions and commit/abort them at random.
+///
+/// Why this matters: this is the exact hazard the watermark exists to prevent.
+/// A writer can allocate a low sequence id, stay open, and commit *after*
+/// another transaction publishes a higher id. A cursor that only advances on
+/// `id > last_seen` would step over the lower id and lose it forever. The
+/// watermark is the first id that is *not* safe to pass, so a reader that
+/// claims "everything below the watermark is final" must be correct: every
+/// committed row whose id is below the highest watermark the reader ever
+/// passed must have been observed by the reader.
+///
+/// The reader collects ids it sees and tracks `last` = the highest
+/// `watermark - 1` it has advanced to. After the workload drains, we read the
+/// authoritative committed set and assert no committed id `<= last` is missing
+/// from what the reader collected — i.e. the watermark never let the reader
+/// advance past a row it had not yet seen.
+#[test]
+fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, who INTEGER)")
+            .unwrap();
+        setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        setup.close().unwrap();
+    }
+
+    const N_WRITERS: u64 = 4;
+    const INSERTS_PER_WRITER: u64 = 25;
+    // Per-row commit retry budget: the only contention is the autonomous inner
+    // tx that advances the sequence backing table, which is transient, so a
+    // generous budget lets every row eventually commit without the test
+    // wedging.
+    const COMMIT_ATTEMPTS: u64 = 200;
+
+    let done = Arc::new(AtomicU64::new(0));
+
+    let mut writers = Vec::new();
+    for who in 0..N_WRITERS {
+        let db_arc = db.get_db();
+        let done = done.clone();
+        writers.push(std::thread::spawn(move || {
+            let conn = db_arc
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            // Seed each writer differently so jitter (and thus the
+            // commit/abort interleaving) varies between threads but stays
+            // reproducible across runs.
+            let mut rng = ChaCha8Rng::seed_from_u64(0x5EED_0000 + who);
+            for _ in 0..INSERTS_PER_WRITER {
+                for _ in 0..COMMIT_ATTEMPTS {
+                    let txn = (|| -> turso_core::Result<bool> {
+                        conn.execute("BEGIN CONCURRENT")?;
+                        conn.execute(format!(
+                            "INSERT INTO t(id, who) VALUES (nextval('s'), {who})"
+                        ))?;
+                        // Widen the window in which the row is allocated but
+                        // uncommitted, so other writers publish higher ids
+                        // while this low id is still in flight — the precise
+                        // ordering the watermark must defend against. Roughly
+                        // 1-in-6 transactions abort instead of commit, leaving
+                        // sequence "holes" the reader must also tolerate.
+                        std::thread::sleep(Duration::from_micros(rng.random_range(0..200)));
+                        if rng.random_range(0..6) == 0 {
+                            conn.execute("ROLLBACK")?;
+                            Ok(false)
+                        } else {
+                            conn.execute("COMMIT")?;
+                            Ok(true)
+                        }
+                    })();
+                    match txn {
+                        Ok(_) => break,
+                        Err(_) => {
+                            // Transient conflict (e.g. Busy on the sequence
+                            // inner tx). Abandon this attempt's tx and retry.
+                            let _ = conn.execute("ROLLBACK");
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                    }
+                }
+            }
+            conn.close().unwrap();
+            done.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+
+    let reader = db.connect();
+
+    // Read ids strictly below the watermark, advancing `last` to `watermark-1`.
+    // Returns false only when the watermark is not yet published (NULL), so the
+    // caller can tell a poll apart from a no-op.
+    let poll = |last: &mut i64, collected: &mut BTreeSet<i64>| -> bool {
+        let mut wm_stmt = match reader.prepare("SELECT sequence_watermark_experimental('s')") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut watermark = None;
+        if wm_stmt
+            .run_with_row_callback(|row| {
+                watermark = row.get_values().next().and_then(|v| v.as_int());
+                Ok(())
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let Some(watermark) = watermark else {
+            return false;
+        };
+        // The watermark is the first *unsafe* id, so it is an exclusive upper
+        // bound on what the reader may claim as final.
+        let query = format!("SELECT id FROM t WHERE id > {last} AND id < {watermark} ORDER BY id");
+        if let Ok(mut stmt) = reader.prepare(&query) {
+            let _ = stmt.run_with_row_callback(|row| {
+                if let Some(id) = row.get_values().next().and_then(|v| v.as_int()) {
+                    collected.insert(id);
+                }
+                Ok(())
+            });
+        }
+        let new_last = watermark - 1;
+        if new_last > *last {
+            *last = new_last;
+        }
+        true
+    };
+
+    let mut last: i64 = 0;
+    let mut collected: BTreeSet<i64> = BTreeSet::new();
+
+    // Poll concurrently with the writers.
+    while done.load(Ordering::SeqCst) < N_WRITERS {
+        poll(&mut last, &mut collected);
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    // Drain: with no active allocations left, the watermark is the sequence
+    // boundary, so `last` advances to cover every committed row. Loop until it
+    // stops moving (bounded, so a bug cannot hang the test).
+    for _ in 0..1000 {
+        let prev = last;
+        poll(&mut last, &mut collected);
+        if last == prev {
+            break;
+        }
+    }
+
+    // Authoritative committed set, read outside any transaction.
+    let mut committed: BTreeSet<i64> = BTreeSet::new();
+    {
+        let mut stmt = reader.prepare("SELECT id FROM t ORDER BY id").unwrap();
+        stmt.run_with_row_callback(|row| {
+            if let Some(id) = row.get_values().next().and_then(|v| v.as_int()) {
+                committed.insert(id);
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // Sanity: the workload actually committed rows and the reader actually
+    // advanced — otherwise the invariant below is vacuous.
+    assert!(
+        !committed.is_empty(),
+        "no rows committed; workload did not exercise the watermark"
+    );
+    assert!(last > 0, "reader never advanced past any watermark");
+
+    // The invariant: every committed id the reader claimed as safe (id <= last)
+    // must have actually been observed. A skipped row is a watermark failure.
+    for id in &committed {
+        if *id <= last {
+            assert!(
+                collected.contains(id),
+                "watermark reader skipped committed id {id} (advanced last to {last}); \
+                 collected={collected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    conn_a
+        .execute("CREATE TABLE t (key TEXT PRIMARY KEY, value BLOB)")
+        .unwrap();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("INSERT INTO t VALUES ('a', zeroblob(16))")
+        .unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(commit_a.step().unwrap(), StepResult::Yield),
+        "first commit must pause after publishing Preparing and before taking the log lock",
+    );
+
+    let conn_b = db.connect();
+    let mut insert_b = conn_b
+        .prepare("INSERT INTO t VALUES ('b', zeroblob(16))")
+        .unwrap();
+    let mut saw_busy = false;
+    for _ in 0..64 {
+        match insert_b.step() {
+            Ok(StepResult::IO | StepResult::Yield) => continue,
+            Ok(StepResult::Busy) | Err(LimboError::Busy) => {
+                saw_busy = true;
+                break;
+            }
+            Ok(StepResult::Done) => {
+                panic!("exclusive insert started while another tx was Preparing")
+            }
+            Ok(other) => panic!("unexpected insert step result: {other:?}"),
+            Err(err) => panic!("unexpected insert error: {err:?}"),
+        }
+    }
+    assert!(
+        saw_busy,
+        "exclusive insert should return Busy instead of waiting while holding the log lock",
+    );
+    insert_b.reset().unwrap();
+
+    let mut committed = false;
+    for _ in 0..1024 {
+        match commit_a.step().unwrap() {
+            StepResult::Done => {
+                committed = true;
+                break;
+            }
+            StepResult::IO | StepResult::Yield => {}
+            other => panic!("unexpected commit step result: {other:?}"),
+        }
+    }
+    assert!(
+        committed,
+        "paused concurrent commit should finish after Busy"
+    );
+
+    conn_a.set_yield_injector(None);
+
+    let rows = get_rows(&conn_a, "SELECT key FROM t ORDER BY key");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_text().unwrap(), "a");
+
+    conn_a.close().unwrap();
+    conn_b.close().unwrap();
+}
+
+/// What this test checks: The implementation maintains the intended invariant for this scenario.
+/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
+#[test]
+fn test_connection_sees_other_connection_changes() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    conn0
+        .execute("INSERT INTO test_table (id, text) VALUES (965, 'text_877')")
+        .unwrap();
+    let mut stmt = conn1.query("SELECT * FROM test_table").unwrap().unwrap();
+    stmt.run_with_row_callback(|row| {
+        let text = row.get_value(1).to_text().unwrap();
+        assert_eq!(text, "text_877");
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
+/// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
+#[test]
+fn test_delete_with_conn() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE test(t)").unwrap();
+
+    let mut inserts = vec![1, 2, 3, 4, 5, 6, 7];
+
+    for t in &inserts {
+        conn0
+            .execute(format!("INSERT INTO test(t) VALUES ({t})"))
+            .unwrap();
+    }
+
+    conn0.execute("DELETE FROM test WHERE t = 5").unwrap();
+    inserts.remove(4);
+
+    let mut stmt = conn0.prepare("SELECT * FROM test").unwrap();
+    let mut pos = 0;
+    stmt.run_with_row_callback(|row| {
+        let t = row.get_value(0).as_int().unwrap();
+        assert_eq!(t, inserts[pos]);
+        pos += 1;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// What this test checks: The implementation maintains the intended invariant for this scenario.
+/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
+#[test]
+fn test_interactive_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // do some transaction
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE test (x)").unwrap();
+    conn.execute("INSERT INTO test (x) VALUES (1)").unwrap();
+    conn.execute("INSERT INTO test (x) VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // expect other transaction to see the changes
+    let rows = get_rows(&conn, "SELECT * FROM test");
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+/// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
+/// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
+#[test]
+fn test_commit_without_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    // do not start interactive transaction
+    conn.execute("CREATE TABLE test (x)").unwrap();
+    conn.execute("INSERT INTO test (x) VALUES (1)").unwrap();
+
+    // expect error on trying to commit a non-existent interactive transaction
+    let err = conn.execute("COMMIT").unwrap_err();
+    assert!(
+        matches!(err, LimboError::NoActiveTransaction { .. }),
+        "expected NoActiveTransaction, got: {err:?}"
+    );
+}
+
+/// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
+/// we shouldn't commit an insert without inserting rows to this new index that is being created.
+/// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
+/// regular concurrent insert that will not take into account new index.
+#[test]
+fn test_insert_in_middle_commit_of_create_index_returns_err() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    // T1 (conn_a): CREATE INDEX, yielding at `LogRecordPrepared` — the
+    // point in the commit pipeline where `end_ts` has been assigned and the
+    // log record is built, but the global header and
+    // `last_committed_schema_change_ts` haven't been published yet.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut create_idx = conn_a.prepare("CREATE INDEX i ON t(c)").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match create_idx.step().unwrap() {
+            StepResult::Yield => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
+    );
+
+    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
+    // but the global schema view still doesn't know about the new index `i`.
+    // The INSERT compiles its bytecode against the stale schema and emits
+    // IdxInsert ops only for the indexes the stale schema knows about.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    // T1 finishes finalizing the CREATE INDEX. After this point, the global
+    // header carries the new schema_cookie and `last_committed_schema_change_ts`
+    // is bumped to T1's `end_ts`.
+    create_idx.run_ignore_rows().unwrap();
+    drop(create_idx);
+
+    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
+    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
+    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
+    // though its writes never touched the new index.
+
+    let commit_result = conn_b.execute("COMMIT");
+
+    assert!(
+        matches!(
+            commit_result,
+            Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
+        ),
+        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
+         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
+         schema (missing index `i`), so its INSERT silently skipped writing \
+         to that index. Allowing the commit leaves `i` permanently short the \
+         row tx_b wrote."
+    );
+}
+
+#[test]
+#[ignore]
+fn test_concurrent_writes() {
+    struct ConnectionState {
+        conn: Arc<Connection>,
+        inserts: Vec<i64>,
+        current_statement: Option<Statement>,
+    }
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mut connections = Vec::new();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE test (x)").unwrap();
+        conn.close().unwrap();
+    }
+    let num_connections = 20;
+    let num_inserts_per_connection = 10000;
+    for i in 0..num_connections {
+        let conn = db.connect();
+        let mut inserts = ((num_inserts_per_connection * i)
+            ..(num_inserts_per_connection * (i + 1)))
+            .collect::<Vec<i64>>();
+        inserts.reverse();
+        connections.push(ConnectionState {
+            conn,
+            inserts,
+            current_statement: None,
+        });
+    }
+
+    loop {
+        let mut all_finished = true;
+        for conn in &mut connections {
+            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
+                all_finished = false;
+                break;
+            }
+        }
+        for (conn_id, conn) in connections.iter_mut().enumerate() {
+            // println!("connection {conn_id} inserts: {:?}", conn.inserts);
+            if conn.current_statement.is_none() && !conn.inserts.is_empty() {
+                let write = conn.inserts.pop().unwrap();
+                println!("inserting row {write} from connection {conn_id}");
+                conn.current_statement = Some(
+                    conn.conn
+                        .prepare(format!("INSERT INTO test (x) VALUES ({write})"))
+                        .unwrap(),
+                );
+            }
+            if conn.current_statement.is_none() {
+                continue;
+            }
+            println!("connection step {conn_id}");
+            let stmt = conn.current_statement.as_mut().unwrap();
+            match stmt.step().unwrap() {
+                // These you be only possible cases in write concurrency.
+                // No rows because insert doesn't return
+                // No interrupt because insert doesn't interrupt
+                // No busy because insert in mvcc should be multi concurrent write
+                StepResult::Done => {
+                    println!("connection {conn_id} done");
+                    conn.current_statement = None;
+                }
+                StepResult::IO | StepResult::Yield => {
+                    // let's skip doing I/O here, we want to perform io only after all the statements are stepped
+                }
+                StepResult::Busy => {
+                    println!("connection {conn_id} busy");
+                    // stmt.reprepare().unwrap();
+                    unreachable!();
+                }
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+        db.get_db().io.step().unwrap();
+
+        if all_finished {
+            println!("all finished");
+            break;
+        }
+    }
+
+    // Now let's find out if we wrote everything we intended to write.
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT * FROM test ORDER BY x ASC");
+    assert_eq!(
+        rows.len() as i64,
+        num_connections * num_inserts_per_connection
+    );
+    for (row_id, row) in rows.iter().enumerate() {
+        assert_eq!(row[0].as_int().unwrap(), row_id as i64);
+    }
+    conn.close().unwrap();
+}
+
+/// What this test checks: The implementation maintains the intended invariant for this scenario.
+/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
+#[test]
+fn test_select_empty_table() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    // force checkpoint on every transaction
+    mv_store.set_checkpoint_threshold(0);
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x integer primary key)")
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t where x > 100");
+    assert!(rows.is_empty());
+}
+
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
+#[turso_macros::test(encryption)]
+fn test_cursor_with_btree_and_mvcc() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    println!("getting rows");
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![Value::from_i64(1)]);
+    assert_eq!(rows[1], vec![Value::from_i64(2)]);
+}
+
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
+#[turso_macros::test(encryption)]
+fn test_cursor_with_btree_and_mvcc_2() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    println!("getting rows");
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![Value::from_i64(1)]);
+    assert_eq!(rows[1], vec![Value::from_i64(2)]);
+    assert_eq!(rows[2], vec![Value::from_i64(3)]);
+}
+
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
+#[turso_macros::test(encryption)]
+fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t order by x desc");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![Value::from_i64(3)]);
+    assert_eq!(rows[1], vec![Value::from_i64(2)]);
+    assert_eq!(rows[2], vec![Value::from_i64(1)]);
+}
+
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
+#[turso_macros::test(encryption)]
+fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("INSERT INTO t VALUES (4)").unwrap();
+        conn.execute("INSERT INTO t VALUES (5)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 2").unwrap();
+    println!("getting rows");
+    let rows = get_rows(&conn, "SELECT * FROM t order by x desc");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], vec![Value::from_i64(5)]);
+    assert_eq!(rows[1], vec![Value::from_i64(4)]);
+    assert_eq!(rows[2], vec![Value::from_i64(3)]);
+    assert_eq!(rows[3], vec![Value::from_i64(1)]);
+}
+
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
+#[turso_macros::test(encryption)]
+#[ignore] // FIXME: This fails constantly on main and is really annoying, disabling for now :]
+fn test_cursor_with_btree_and_mvcc_fuzz() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    let mut rows_in_db = sorted_vec::SortedVec::new();
+    let mut seen = HashSet::default();
+    let (mut rng, _seed) = rng_from_time_or_env();
+    println!("seed: {_seed}");
+
+    let mut maybe_conn = Some(db.connect());
+    {
+        maybe_conn
+            .as_mut()
+            .unwrap()
+            .execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+    }
+
+    #[repr(u8)]
+    #[derive(Debug)]
+    enum Op {
+        Insert = 0,
+        Delete = 1,
+        SelectForward = 2,
+        SelectBackward = 3,
+        SeekForward = 4,
+        SeekBackward = 5,
+        Checkpoint = 6,
+    }
+
+    impl From<u8> for Op {
+        fn from(value: u8) -> Self {
+            match value {
+                0 => Op::Insert,
+                1 => Op::Delete,
+                2 => Op::SelectForward,
+                3 => Op::SelectBackward,
+                4 => Op::SeekForward,
+                5 => Op::SeekBackward,
+                6 => Op::Checkpoint,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    for i in 0..10000 {
+        let conn = maybe_conn.as_mut().unwrap();
+        let op = rng.random_range(0..=Op::Checkpoint as usize);
+        let op = Op::from(op as u8);
+        println!("tick: {i} op: {op:?} ");
+        match op {
+            Op::Insert => {
+                let value = loop {
+                    let value = rng.random_range(0..10000);
+                    if !seen.contains(&value) {
+                        seen.insert(value);
+                        break value;
+                    }
+                };
+                let query = format!("INSERT INTO t VALUES ({value})");
+                println!("inserting: {query}");
+                conn.execute(query.as_str()).unwrap();
+                rows_in_db.push(value);
+            }
+            Op::Delete => {
+                if rows_in_db.is_empty() {
+                    continue;
+                }
+                let index = rng.random_range(0..rows_in_db.len());
+                let value = rows_in_db[index];
+                let query = format!("DELETE FROM t WHERE x = {value}");
+                println!("deleting: {query}");
+                conn.execute(query.as_str()).unwrap();
+                rows_in_db.remove_index(index);
+                seen.remove(&value);
+            }
+            Op::SelectForward => {
+                let rows = get_rows(conn, "SELECT * FROM t order by x asc");
+                assert_eq!(
+                    rows.len(),
+                    rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    rows_in_db.len(),
+                    rows.len()
+                );
+                for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter()) {
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
+                }
+            }
+            Op::SelectBackward => {
+                let rows = get_rows(conn, "SELECT * FROM t order by x desc");
+                assert_eq!(
+                    rows.len(),
+                    rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    rows_in_db.len(),
+                    rows.len()
+                );
+                for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter().rev()) {
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
+                }
+            }
+            Op::SeekForward => {
+                let value = rng.random_range(0..10000);
+                let rows = get_rows(
+                    conn,
+                    format!("SELECT * FROM t where x > {value} order by x asc").as_str(),
+                );
+                let filtered_rows_in_db = rows_in_db
+                    .iter()
+                    .filter(|&id| *id > value)
+                    .cloned()
+                    .collect::<Vec<i64>>();
+
+                assert_eq!(
+                    rows.len(),
+                    filtered_rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    filtered_rows_in_db.len(),
+                    rows.len()
+                );
+                for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter()) {
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
+                }
+            }
+            Op::SeekBackward => {
+                let value = rng.random_range(0..10000);
+                let rows = get_rows(
+                    conn,
+                    format!("SELECT * FROM t where x > {value} order by x desc").as_str(),
+                );
+                let filtered_rows_in_db = rows_in_db
+                    .iter()
+                    .filter(|&id| *id > value)
+                    .cloned()
+                    .collect::<Vec<i64>>();
+
+                assert_eq!(
+                    rows.len(),
+                    filtered_rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    filtered_rows_in_db.len(),
+                    rows.len()
+                );
+                for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter().rev()) {
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
+                }
+            }
+            Op::Checkpoint => {
+                // This forces things to move to the BTree file (.db)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                // This forces MVCC to be cleared
+                db.restart();
+                maybe_conn = Some(db.connect());
+            }
+        }
+    }
+}
+
+pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
+    let seed = std::env::var("SEED").map_or(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        |v| {
+            v.parse()
+                .expect("Failed to parse SEED environment variable as u64")
+        },
+    );
+    let rng = ChaCha8Rng::seed_from_u64(seed as u64);
+    (rng, seed as u64)
+}
+
+/// Counts the B-tree steps MVCC cursors take to seek and to advance forward, and never yields.
+#[derive(Debug, Default)]
+struct SeekBtreeSteps(AtomicU64);
+
+impl YieldInjector for SeekBtreeSteps {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CursorYieldPoint::SeekBtreeProgress.point()
+            || point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
+        {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+}
+
+/// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow
+/// returns each row's newest version, or nothing for a deleted or missing row, in a few B-tree
+/// steps however many shadowed rows follow its target.
+/// Why this matters: A seek that steps through the shadowed rows after its target makes point
+/// lookups over an updated table quadratic.
+#[test]
+fn test_exact_rowid_seek_over_shadowed_btree_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 1..=200 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Newer versions shadow the first 150 B-tree rows and every deleted one.
+    conn.execute("UPDATE t SET v = v + 1000 WHERE id <= 150")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id % 3 = 0").unwrap();
+
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    for i in 1..=201 {
+        steps.0.store(0, Ordering::Relaxed);
+        let rows = get_rows(&conn, &format!("SELECT v FROM t WHERE id = {i}"));
+        let expected = if i > 200 || i % 3 == 0 {
+            None
+        } else if i <= 150 {
+            Some(i + 1000)
+        } else {
+            Some(i)
+        };
+        assert_eq!(
+            rows.first().map(|row| row[0].as_int().unwrap()),
+            expected,
+            "id {i}"
+        );
+        let taken = steps.0.load(Ordering::Relaxed);
+        assert!(taken <= 2, "the seek for id {i} took {taken} B-tree steps");
+    }
+}
+
+/// Core MVCC read/write semantics for AUTOINCREMENT with rowid update.
+/// After INSERT (rowid 1), UPDATE rowid 1→2, and a second INSERT,
+/// the second insert must get rowid 3 (never reuse 1 or 2).
+#[test]
+#[ignore = "MVCC RowidAllocator does not yet track rowid changes from UPDATE"]
+fn test_skips_updated_rowid() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+
+    // First insert gets rowid 1
+    conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    // Update rowid 1 → 2
+    conn.execute("UPDATE t SET a = a + 1").unwrap();
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    // Second insert must get rowid > 2 (sequence tracks the high-water mark)
+    conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[1][0].as_int().unwrap() > 2,
+        "second insert rowid should be > 2, got {}",
+        rows[1][0].as_int().unwrap()
+    );
+}
+
+/// What this test checks: The implementation maintains the intended invariant for this scenario.
+/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
+#[test]
+fn test_mvcc_integrity_check() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // we insert with default values
+    conn.execute("INSERT INTO t values(1)").unwrap();
+
+    let ensure_integrity = || {
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].cast_text().unwrap(), "ok");
+    };
+
+    ensure_integrity();
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    ensure_integrity();
+}
+
+#[test]
+fn test_mvcc_cached_insert_reprepared_after_index_create() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT, rev INTEGER, portable_changes TEXT)",
+    )
+    .unwrap();
+    let mut insert = conn
+        .prepare(
+            "INSERT INTO t(id, owner, rev, portable_changes) VALUES (1, 'a', 1, 'before') \
+             ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, rev = excluded.rev, portable_changes = excluded.portable_changes",
+        )
+        .unwrap();
+    insert.run_ignore_rows().unwrap();
+
+    conn.execute("CREATE INDEX t_owner_rev_idx ON t(owner, rev)")
+        .unwrap();
+
+    insert.reset().unwrap();
+    insert.run_ignore_rows().unwrap();
+    conn.execute("INSERT INTO t(id, owner, rev, portable_changes) VALUES (2, 'b', 1, 'after')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(\
+            id INTEGER PRIMARY KEY,\
+            owner TEXT NOT NULL,\
+            portable_changes TEXT NOT NULL,\
+            rev INTEGER NOT NULL DEFAULT 0,\
+            note TEXT,\
+            bucket INTEGER NOT NULL DEFAULT 0,\
+            tag TEXT,\
+            status INTEGER NOT NULL DEFAULT 0\
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX t_owner_rev_idx ON t(owner, rev)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_note_idx ON t(note)").unwrap();
+    conn.execute("CREATE INDEX t_bucket_idx ON t(bucket)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_tag_idx ON t(tag)").unwrap();
+    conn.execute("CREATE INDEX t_status_idx ON t(status)")
+        .unwrap();
+    for id in 1..=13 {
+        conn.execute(format!(
+            "INSERT INTO t(id, owner, portable_changes, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'portable_changes-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status})",
+            bucket = id % 17,
+            tag = id % 7,
+            status = id % 9,
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("UPDATE t SET portable_changes = 'local-mixed-portable_changes', rev = rev + 1 WHERE id = 1")
+        .unwrap();
+    conn.execute("CREATE INDEX \"t local mixed idx\" ON t(portable_changes)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t(id, owner, portable_changes, rev, note, bucket, tag, status) \
+         VALUES (20006, 'replica-1', 'replica-1-mixed-insert', 1, 'replica-1-note-20006', 1, 'tag-0', 1)",
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
+    let io = Arc::new(MemoryIO::new());
+    let path = ":memory:interrupted-drop-table-schema-rollback";
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    conn.execute("CREATE TABLE repro_target(c0 INTEGER, c1 REAL)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_repro_target_c0 \
+         ON repro_target (c0) WHERE c1 IS NULL",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let target_schema_rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 'repro_target' ORDER BY rowid",
+    );
+    assert_eq!(target_schema_rows.len(), 2);
+    assert_eq!(target_schema_rows[0][0].to_string(), "table");
+    assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
+    assert_eq!(target_schema_rows[1][0].to_string(), "index");
+    assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+
+    let mut drop_stmt = conn.prepare("DROP TABLE repro_target").unwrap();
+    match drop_stmt.step().unwrap() {
+        turso_core::StepResult::Yield => {}
+        other => panic!("expected injected yield while dropping repro_target; got {other:?}"),
+    }
+    conn.set_yield_injector(None);
+
+    let rows = get_rows(&conn, "SELECT 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "1");
+
+    drop(drop_stmt);
+    drop(conn);
+    drop(db);
+
+    // Reopening used to fail here because the same-connection SELECT could
+    // commit the interrupted DROP TABLE's partial sqlite_schema delete.
+    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let target_schema_rows = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 'repro_target' ORDER BY rowid",
+    );
+    assert_eq!(target_schema_rows.len(), 2);
+    assert_eq!(target_schema_rows[0][0].to_string(), "table");
+    assert_eq!(target_schema_rows[0][1].to_string(), "repro_target");
+    assert_eq!(target_schema_rows[1][0].to_string(), "index");
+    assert_eq!(target_schema_rows[1][1].to_string(), "idx_repro_target_c0");
+}
+
+/// What this test checks: Rollback/savepoint behavior restores exactly the intended state when statements or transactions fail.
+/// Why this matters: Partial rollback mistakes leave data in impossible intermediate states.
+#[test]
+fn test_rollback_with_index() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE)")
+        .unwrap();
+
+    // we insert with default values
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t values (1, 1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // This query will try to use index to find the row, if we rollback correctly it shouldn't panic
+    let rows = get_rows(&conn, "SELECT * FROM t where b = 1");
+    assert_eq!(rows.len(), 0);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_stale_update_of_deleted_row_is_refused_before_it_can_corrupt_indexes() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA page_size = 512").unwrap();
+    setup
+        .execute(
+            "CREATE TABLE t(
+                a NUMERIC NOT NULL,
+                b REAL UNIQUE,
+                blob BLOB NOT NULL,
+                id INTEGER PRIMARY KEY,
+                c NUMERIC,
+                u TEXT UNIQUE,
+                d REAL
+            )",
+        )
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO t VALUES(784, 9.99, zeroblob(8192), 322, 627, 'small_leaf_292', 2.24)",
+        )
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(440, 8.25, zeroblob(8192), 502, 962, 'fast_sun_915', 3.31)")
+        .unwrap();
+    for filler in 1..=64i64 {
+        let rowid = 10_000 + filler;
+        setup
+            .execute(format!(
+                "INSERT INTO t VALUES({}, {}, zeroblob(512), {}, {}, 'seed_{filler}', {})",
+                10_000 + filler,
+                100_000.0 + filler as f64,
+                rowid,
+                20_000 + filler,
+                (filler % 97) as f64 + 0.01
+            ))
+            .unwrap();
+    }
+    setup.execute("PRAGMA data_sync_retry = 1").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup.close().unwrap();
+
+    let old = db.connect();
+    let deleter = db.connect();
+
+    old.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&old, "SELECT COUNT(*) FROM t WHERE id = 322");
+
+    deleter.execute("DELETE FROM t WHERE id = 322").unwrap();
+
+    for filler in 1..=64i64 {
+        let rowid = 10_000 + filler;
+        old.execute(format!(
+            "UPDATE t SET a = {}, b = {}, blob = zeroblob(512), c = {}, u = 'old_{rowid}', d = {} WHERE id = {rowid}",
+            30_000 + filler,
+            300_000.0 + filler as f64,
+            40_000 + filler,
+            (filler % 101) as f64 + 0.02,
+        ))
+        .unwrap();
+    }
+    let stale_update = old.execute(
+        "UPDATE t SET a = 179, b = 7.75, blob = zeroblob(4194304), c = 453, u = 'hot_hill_935', d = 5.05 WHERE id = 322",
+    );
+    assert!(
+        matches!(stale_update, Err(LimboError::WriteWriteConflict)),
+        "stale updater must lose to the committed delete at the statement, got {stale_update:?}"
+    );
+    assert!(old.get_auto_commit());
+
+    let victim = db.connect();
+    victim.execute("BEGIN CONCURRENT").unwrap();
+    let victim_delete = victim.execute("DELETE FROM t WHERE id = 322");
+    assert!(
+        victim_delete.is_ok(),
+        "a delete of an already deleted row matches nothing, got {victim_delete:?}"
+    );
+    victim.execute("COMMIT").unwrap();
+
+    assert_integrity_ok(&db.connect());
+}
+
+/// 1. BEGIN CONCURRENT (start interactive transaction)
+/// 2. UPDATE modifies col_a's index, then fails constraint check on col_b
+/// 3. The partial index changes are NOT rolled back (this is the bug!)
+/// 4. COMMIT succeeds, persisting the inconsistent state
+/// 5. Later UPDATE on same row fails: "IdxDelete: no matching index entry found"
+///    because table row has old value but index has new value
+#[test]
+fn test_update_multiple_unique_columns_partial_rollback() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Create table with multiple unique columns (like blue_sun_77 in the bug)
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            col_a TEXT UNIQUE,
+            col_b REAL UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert two rows - one to update, one to cause conflict
+    conn.execute("INSERT INTO t VALUES (1, 'original_a', 1.0)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'other_a', 2.0)")
+        .unwrap();
+
+    // Start an INTERACTIVE transaction - this is KEY to reproducing the bug!
+    // In auto-commit mode, the entire transaction is rolled back on error.
+    // In interactive mode, only the statement should be rolled back.
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Try to UPDATE row 1 with:
+    // - col_a = 'new_a' (index modification happens first)
+    // - col_b = 2.0 (should FAIL - conflicts with row 2)
+    //
+    // The UPDATE bytecode does:
+    // 1. Delete old index entry for col_a ('original_a', 1)
+    // 2. Insert new index entry for col_a ('new_a', 1)
+    // 3. Delete old index entry for col_b (1.0, 1)
+    // 4. Check constraint for col_b (2.0) - FAIL with Halt err_code=1555!
+    //
+    // BUG: Without proper statement rollback, steps 1-3 are committed!
+    let result = conn.execute("UPDATE t SET col_a = 'new_a', col_b = 2.0 WHERE id = 1");
+    assert!(
+        result.is_err(),
+        "Expected unique constraint violation on col_b"
+    );
+
+    // COMMIT the transaction - this is what the stress test does after the error!
+    // In the buggy case, this commits the partial index changes from the failed UPDATE.
+    conn.execute("COMMIT").unwrap();
+
+    // Now in a NEW transaction, try to UPDATE the same row.
+    // If the previous statement's partial changes were committed:
+    // - Table row still has col_a = 'original_a' (UPDATE didn't complete)
+    // - But index for col_a now has 'new_a' instead of 'original_a'!
+    // - This UPDATE reads 'original_a' from table, tries to delete that index entry
+    // - CRASH: "IdxDelete: no matching index entry found for key ['original_a', 1]"
+    conn.execute("UPDATE t SET col_a = 'updated_a', col_b = 3.0 WHERE id = 1")
+        .unwrap();
+
+    // Verify the update worked
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].cast_text().unwrap(), "updated_a");
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+fn skipmap_version_count(mv: &Store) -> usize {
+    mv.rows.iter().map(|e| e.value().read().len()).sum()
+}
+
+#[test]
+fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    // Nothing else may reclaim slots: disable the checkpoint and inline GC.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..100 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let index_slots = || -> usize {
+        db.mvcc_store
+            .index_rows
+            .iter()
+            .map(|index| index.value().len())
+            .sum()
+    };
+    let table_slots = || -> usize {
+        db.mvcc_store
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .count()
+    };
+    let index_slots_before = index_slots();
+    let table_slots_before = table_slots();
+
+    // A retried CREATE INDEX gets a new index id every attempt. Before the fix, each
+    // rolled-back attempt left one slot per indexed row behind.
+    for _ in 0..5 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        assert_eq!(index_slots(), index_slots_before + 100);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(index_slots(), index_slots_before);
+    }
+
+    // The same for a table created and filled in the rolled-back transaction.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO u VALUES ({i}, 'u{i}')"))
+            .unwrap();
+    }
+    assert_eq!(table_slots(), table_slots_before + 50);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(table_slots(), table_slots_before);
+
+    // A committed CREATE INDEX keeps its rows.
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    assert_eq!(index_slots(), index_slots_before + 100);
+}
+
+#[test]
+fn rollback_of_created_index_keeps_open_reader_valid() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let mut read = conn
+        .prepare("SELECT id FROM t INDEXED BY idx_v ORDER BY v")
+        .unwrap();
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    conn.execute("ROLLBACK").unwrap();
+
+    // Each rolled-back CREATE INDEX frees and reallocates per-index maps, so a
+    // reader pointing into a freed map would see memory reused by a new one.
+    for i in 0..200 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    assert!(matches!(read.step().unwrap(), StepResult::Done));
+}
+
+#[test]
+fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1, 'v1'), (2, 'v2'), (3, 'v3')")
+        .unwrap();
+    let mut insert = conn
+        .prepare("INSERT OR ROLLBACK INTO u VALUES (1000, 'v2')")
+        .unwrap();
+    assert!(insert.step().is_err());
+
+    for i in 0..200 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute(format!("CREATE INDEX idx_churn_{i} ON t(v)"))
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    insert.reset().unwrap();
+}
+
+#[test]
+fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
+    for (begin, end_transaction) in [
+        (None, "INSERT OR ROLLBACK INTO other VALUES (6)"),
+        (Some("BEGIN"), "ROLLBACK"),
+    ] {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO other VALUES (6)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+
+        if let Some(begin) = begin {
+            conn.execute(begin).unwrap();
+        }
+        let mut read = conn.prepare("SELECT id FROM t").unwrap();
+        let mut ids = Vec::new();
+        assert!(matches!(read.step().unwrap(), StepResult::Row));
+        ids.push(read.row().unwrap().get::<i64>(0).unwrap());
+        let _ = conn.execute(end_transaction);
+
+        let err = loop {
+            match read.step() {
+                Ok(StepResult::Row) => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
+                Ok(StepResult::IO) => read.get_pager().io.step().unwrap(),
+                Ok(other) => panic!("{end_transaction}: expected an error, got {other:?}"),
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            matches!(err, LimboError::NoSuchTransactionID(_)),
+            "{end_transaction}: expected NoSuchTransactionID, got {err:?}"
+        );
+        assert_eq!(ids, vec![1, 2], "{end_transaction}");
+        drop(read);
+
+        assert_eq!(
+            get_rows(conn, "SELECT id, v FROM t"),
+            vec![
+                vec![Value::from_i64(1), Value::from_text("a".to_string())],
+                vec![Value::from_i64(2), Value::from_text("b".to_string())],
+                vec![Value::from_i64(3), Value::from_text("z".to_string())],
+            ],
+            "{end_transaction}"
+        );
+    }
+}
+
+/// A tombstone over a B-tree row keeps a copy of the deleted row only for the
+/// readers that use it: the checkpoint reads `sqlite_schema` rows, and the
+/// commit reads the primary key for portable logical changes.
+#[test]
+fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE TABLE dropped(x)").unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'deleted row')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let schema_rowid = get_rows(
+        &db.conn,
+        "SELECT rowid FROM sqlite_schema WHERE name = 'dropped'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let user_row = RowID::new(
+        db.mvcc_store.get_table_id_from_root_page(root_page),
+        RowKey::Int(1),
+    );
+    let schema_row = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(schema_rowid));
+    assert!(db.mvcc_store.rows.get(&user_row).is_none());
+    assert!(db.mvcc_store.rows.get(&schema_row).is_none());
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    db.conn.execute("DROP TABLE dropped").unwrap();
+    let tombstone_payload_len = |row_id: &RowID| {
+        let entry = db.mvcc_store.rows.get(row_id).unwrap();
+        let versions = entry.value().read();
+        let [tombstone] = versions.as_slice() else {
+            panic!("expected one tombstone, got {versions:?}");
+        };
+        assert!(tombstone.begin().is_none());
+        assert!(tombstone.btree_resident);
+        tombstone.payload(row_id).len()
+    };
+    assert_eq!(tombstone_payload_len(&user_row), 0);
+    assert!(tombstone_payload_len(&schema_row) > 0);
+    db.conn.execute("COMMIT").unwrap();
+
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert!(get_rows(
+        &db.conn,
+        "SELECT name FROM sqlite_schema WHERE name = 'dropped'"
+    )
+    .is_empty());
+}
+
+/// The `mvcc_gc_threshold` PRAGMA reads back the configured value and feeds
+/// `set_gc_threshold`, mirroring `mvcc_checkpoint_threshold`.
+#[test]
+fn test_mvcc_gc_threshold_pragma_roundtrip() {
+    let db = MvccTestDb::new();
+
+    // Default reads back the engine default.
+    let rows = get_rows(&db.conn, "PRAGMA mvcc_gc_threshold");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        MvStore::<MvccClock>::DEFAULT_GC_VERSION_THRESHOLD
+    );
+
+    // Setting it updates the store and reads back.
+    db.conn.execute("PRAGMA mvcc_gc_threshold = 1000").unwrap();
+    assert_eq!(db.mvcc_store.gc_threshold(), 1000);
+    let rows = get_rows(&db.conn, "PRAGMA mvcc_gc_threshold");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1000);
+
+    // -1 disables inline GC.
+    db.conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    assert_eq!(db.mvcc_store.gc_threshold(), -1);
+    assert!(!db.mvcc_store.should_gc());
+
+    // Values below -1 are rejected.
+    assert!(db.conn.execute("PRAGMA mvcc_gc_threshold = -2").is_err());
+}
+
+/// An older `BEGIN CONCURRENT` reader keeps seeing a row after GC. A newer
+/// connection reads the same value from the B-tree. After the older transaction
+/// ends, a later sweep reclaims the SkipMap copies.
+#[test]
+fn test_gc_current_serves_older_reader_then_reclaims() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let older = db.connect();
+    older.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&older, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]]
+    );
+
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(
+        skipmap_version_count(&mv) > 0,
+        "versions an open transaction can see are not removed"
+    );
+    assert_eq!(
+        get_rows(&older, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]],
+        "older reader keeps seeing row 1"
+    );
+
+    let newer = db.connect();
+    assert_eq!(
+        get_rows(&newer, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]],
+        "newer connection reads the same value from the B-tree"
+    );
+
+    older.execute("COMMIT").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        skipmap_version_count(&mv),
+        0,
+        "SkipMap copies are reclaimed once nobody can see them"
+    );
+    assert_eq!(
+        get_rows(&newer, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+            vec![Value::from_i64(3), Value::from_i64(30)],
+            vec![Value::from_i64(4), Value::from_i64(40)],
+        ]
+    );
+}
+
+#[test]
+fn test_same_txn_first_unique_lookup_after_aborted_seek_still_sees_reclaimed_key() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(key TEXT PRIMARY KEY, vals TEXT NOT NULL DEFAULT '')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('k0', '76')").unwrap();
+    conn.execute("INSERT INTO t VALUES ('k5', '1')").unwrap();
+    conn.execute("INSERT INTO t VALUES ('k7', '155')").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT vals FROM t WHERE key = 'k5'"),
+        vec![vec![Value::from_text("1")]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let first_k7 = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k7'");
+    let k0 = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k0'");
+    let k5 = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k5'");
+    let k0_again = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k0'");
+    let last_k7 = get_rows(&conn, "SELECT vals FROM t WHERE key = 'k7'");
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(k0, vec![vec![Value::from_text("76")]]);
+    assert_eq!(k0_again, k0);
+    assert_eq!(k5, vec![vec![Value::from_text("1")]]);
+    assert_eq!(
+        first_k7, last_k7,
+        "same snapshot must not see k7 appear after other unique seeks, first={first_k7:?} last={last_k7:?}"
+    );
+    assert_eq!(
+        first_k7,
+        vec![vec![Value::from_text("155")]],
+        "first unique seek of reclaimed k7 must see the row, got {first_k7:?}"
+    );
+}
+
+/// Two overlapping writers plus GC while a third connection holds a snapshot.
+/// Truncate is Busy with the reader open; incremental GC must not change the
+/// snapshot values.
+#[test]
+fn test_gc_retire_snapshot_stable_with_overlapping_writers() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let snap = get_rows(&reader, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        snap,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
+            vec![Value::from_i64(3), Value::from_i64(30)],
+        ]
+    );
+
+    let w1 = db.connect();
+    let w2 = db.connect();
+    w1.execute("BEGIN CONCURRENT").unwrap();
+    w2.execute("BEGIN CONCURRENT").unwrap();
+    w1.execute("UPDATE t SET v = 21 WHERE id = 2").unwrap();
+    w2.execute("UPDATE t SET v = 31 WHERE id = 3").unwrap();
+    w1.execute("COMMIT").unwrap();
+    w2.execute("COMMIT").unwrap();
+
+    assert!(
+        matches!(
+            setup.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+            Err(LimboError::Busy)
+        ),
+        "Truncate cannot run while the snapshot is held"
+    );
+    for _ in 0..4 {
+        mv.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
+    }
+    mv.drop_unused_row_versions();
+
+    let again = get_rows(&reader, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(again, snap, "held snapshot must stay stable across GC");
+    reader.execute("COMMIT").unwrap();
+}
+
+/// Test that a transaction cannot see uncommitted changes from another transaction.
+/// This verifies snapshot isolation.
+#[test]
+fn test_mvcc_snapshot_isolation() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)")
+        .unwrap();
+
+    // Start tx1 and read initial values
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let rows1 = get_rows(&conn1, "SELECT value FROM t WHERE id = 2");
+    assert_eq!(rows1[0][0].to_string(), "200");
+
+    // Start tx2 and modify the same row
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE t SET value = 999 WHERE id = 2")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Tx1 should still see the old value (snapshot isolation)
+    let rows1_again = get_rows(&conn1, "SELECT value FROM t WHERE id = 2");
+    assert_eq!(
+        rows1_again[0][0].to_string(),
+        "200",
+        "Tx1 should not see tx2's committed changes"
+    );
+
+    conn1.execute("COMMIT").unwrap();
+
+    // After tx1 commits, new reads should see tx2's changes
+    let rows_after = get_rows(&conn1, "SELECT value FROM t WHERE id = 2");
+    assert_eq!(rows_after[0][0].to_string(), "999");
+}
+
+/// Similar test but with the constraint error happening on the third unique column.
+/// This tests that ALL previous index modifications are rolled back.
+/// Uses interactive transaction (BEGIN CONCURRENT) to reproduce the bug.
+#[test]
+fn test_update_three_unique_columns_partial_rollback() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Create table with three unique columns
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            col_a TEXT UNIQUE,
+            col_b REAL UNIQUE,
+            col_c INTEGER UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert two rows
+    conn.execute("INSERT INTO t VALUES (1, 'a1', 1.0, 100)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'a2', 2.0, 200)")
+        .unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Try to UPDATE row 1 with:
+    // - col_a = 'new_a' (index modified)
+    // - col_b = 3.0 (index modified)
+    // - col_c = 200 (FAIL - conflicts with row 2)
+    // BUG: col_a and col_b index changes are NOT rolled back!
+    let result =
+        conn.execute("UPDATE t SET col_a = 'new_a', col_b = 3.0, col_c = 200 WHERE id = 1");
+    assert!(
+        result.is_err(),
+        "Expected unique constraint violation on col_c"
+    );
+
+    // COMMIT - in buggy case, this commits partial index changes
+    conn.execute("COMMIT").unwrap();
+
+    // Now try to UPDATE the same row - this should work but may crash
+    // if col_a or col_b index entries are inconsistent
+    conn.execute("UPDATE t SET col_a = 'updated_a', col_b = 5.0, col_c = 500 WHERE id = 1")
+        .unwrap();
+
+    // Verify index lookups work
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE col_a = 'updated_a'");
+    assert_eq!(rows.len(), 1);
+
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE col_b = 5.0");
+    assert_eq!(rows.len(), 1);
+
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE col_c = 500");
+    assert_eq!(rows.len(), 1);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that simulates the exact sequence from the stress test bug:
+/// Multiple interactive transactions updating the same row, with constraint errors.
+///
+/// From the log:
+/// - tx 248: UPDATE row with pk=1.37, sets unique_col='sweet_wind_280' -> COMMIT
+/// - tx 1149: BEGIN, UPDATE same row (modifies unique_col index, fails on other_unique), COMMIT
+///   BUG: partial index changes from failed UPDATE are committed!
+/// - tx 1324: UPDATE same row -> CRASH "IdxDelete: no matching index entry found"
+#[test]
+fn test_sequential_updates_with_constraint_errors() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(
+            pk REAL PRIMARY KEY,
+            unique_col TEXT UNIQUE,
+            other_unique REAL UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert initial rows (simulating the stress test setup)
+    conn.execute("INSERT INTO t VALUES (1.37, 'sweet_wind_280', 9.05)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2.13, 'other_value', 2.13)")
+        .unwrap();
+
+    // First successful update (like tx 248 in the bug)
+    conn.execute("UPDATE t SET unique_col = 'cold_grass_813', other_unique = 3.90 WHERE pk = 1.37")
+        .unwrap();
+
+    // Verify the update
+    let rows = get_rows(&conn, "SELECT unique_col FROM t WHERE pk = 1.37");
+    assert_eq!(rows[0][0].cast_text().unwrap(), "cold_grass_813");
+
+    // Like tx 1149: Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Try an update that will fail on other_unique (conflicts with row 2)
+    // The UPDATE will:
+    // 1. Delete old index entry for unique_col ('cold_grass_813')
+    // 2. Insert new index entry for unique_col ('new_value')
+    // 3. Delete old index entry for other_unique (3.90)
+    // 4. Check constraint for other_unique (2.13) -> FAIL!
+    // BUG: Steps 1-3 are NOT rolled back!
+    let result =
+        conn.execute("UPDATE t SET unique_col = 'new_value', other_unique = 2.13 WHERE pk = 1.37");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    // COMMIT the transaction (like the stress test does after the error)
+    // BUG: This commits the partial index changes!
+    conn.execute("COMMIT").unwrap();
+
+    // Like tx 1324: Try another update on the same row
+    // If partial changes were committed:
+    // - Table row has unique_col = 'cold_grass_813'
+    // - But unique_col index has 'new_value' (not 'cold_grass_813')!
+    // - This UPDATE reads 'cold_grass_813' from table, tries to delete that index entry
+    // - CRASH: "IdxDelete: no matching index entry found"
+    conn.execute("UPDATE t SET unique_col = 'fresh_sun_348', other_unique = 5.0 WHERE pk = 1.37")
+        .unwrap();
+
+    // Verify final state
+    let rows = get_rows(
+        &conn,
+        "SELECT unique_col, other_unique FROM t WHERE pk = 1.37",
+    );
+    assert_eq!(rows[0][0].cast_text().unwrap(), "fresh_sun_348");
+
+    // Verify index lookups work
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE unique_col = 'fresh_sun_348'");
+    assert_eq!(rows.len(), 1);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that multiple successful statements in an interactive transaction
+/// have their changes preserved when a subsequent statement fails.
+/// This tests the statement-level savepoint functionality.
+#[test]
+fn test_savepoint_multiple_statements_last_fails() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Insert row 1 - success
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // Statement 2: Insert row 2 - success
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    // Statement 3: Insert row 1 again - fails with PK violation
+    let result = conn.execute("INSERT INTO t VALUES (1)");
+    assert!(result.is_err(), "Expected primary key violation");
+
+    // COMMIT - should preserve statements 1 and 2
+    conn.execute("COMMIT").unwrap();
+
+    // Verify rows 1 and 2 exist
+    let rows = get_rows(&conn, "SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that when the same row is modified by multiple statements,
+/// and the second modification fails, the first modification is preserved.
+#[test]
+fn test_savepoint_same_row_multiple_statements() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, other_unique INTEGER UNIQUE)")
+        .unwrap();
+
+    // Insert initial row and a row to cause conflict
+    conn.execute("INSERT INTO t VALUES (1, 100, 1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 200, 2)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Update row 1's value to 150 - success
+    conn.execute("UPDATE t SET v = 150 WHERE id = 1").unwrap();
+
+    // Statement 2: Try to update row 1 with conflicting other_unique - fails
+    let result = conn.execute("UPDATE t SET v = 175, other_unique = 2 WHERE id = 1");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    // COMMIT - should preserve statement 1's change (v = 150)
+    conn.execute("COMMIT").unwrap();
+
+    // Verify row 1 has v = 150 (from statement 1), not 175 (from failed statement 2)
+    let rows = get_rows(&conn, "SELECT v, other_unique FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 150);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1); // other_unique unchanged
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that index operations are properly tracked per-statement.
+/// When a statement fails after partially modifying indexes,
+/// only that statement's index changes are rolled back.
+#[test]
+fn test_savepoint_index_multiple_statements() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            value INTEGER UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert rows
+    conn.execute("INSERT INTO t VALUES (1, 'a', 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b', 20)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Successfully change name for row 1
+    conn.execute("UPDATE t SET name = 'c' WHERE id = 1")
+        .unwrap();
+
+    // Statement 2: Try to change name to 'b' (conflict with row 2) - fails
+    let result = conn.execute("UPDATE t SET name = 'b' WHERE id = 1");
+    assert!(
+        result.is_err(),
+        "Expected unique constraint violation on name"
+    );
+
+    // COMMIT
+    conn.execute("COMMIT").unwrap();
+
+    // Verify row 1 has name 'c' from statement 1
+    let rows = get_rows(&conn, "SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].cast_text().unwrap(), "c");
+
+    // Verify index lookups work correctly
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE name = 'c'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    // 'a' should no longer be in the index
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE name = 'a'");
+    assert_eq!(rows.len(), 0);
+
+    // 'b' should still point to row 2
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE name = 'b'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test INSERT followed by DELETE of same row, then another statement fails.
+/// The insert+delete should be preserved (row shouldn't exist).
+#[test]
+fn test_savepoint_insert_delete_then_fail() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Insert row 1
+    conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+    // Statement 2: Delete row 1
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    // Statement 3: Try to insert with conflicting unique value - fails
+    let result = conn.execute("INSERT INTO t VALUES (3, 200)");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    // COMMIT
+    conn.execute("COMMIT").unwrap();
+
+    // Verify row 1 does not exist (was deleted in statement 2)
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 0);
+
+    // Row 2 should still exist
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE id = 2");
+    assert_eq!(rows.len(), 1);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_delete_row_is_hidden_from_desc_unique_index_scan() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (42, 46)").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 42").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_delete_row_is_skipped_by_desc_explicit_index_scan() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_val ON t(val)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 10);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_delete_btree_resident_row_is_skipped_by_desc_unique_index_scan() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY val DESC");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 10);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Regression test for issue #5935: a reverse (DESC) index scan inside a
+/// `BEGIN CONCURRENT` snapshot must not observe rows inserted and committed
+/// by another transaction after the snapshot started. The same root cause
+/// also produced phantom NULL results from `MAX()` on an indexed column.
+#[test]
+fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    setup.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    setup.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    setup.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(
+        &reader,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(
+        &reader,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "DESC scan must still see 2 rows from snapshot"
+    );
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+
+    let rows = get_rows(&reader, "SELECT MAX(val) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        30,
+        "MAX must still be 30 from snapshot"
+    );
+}
+
+/// An index scan must return a row that its own transaction inserts ahead of
+/// the scan position, whether the other index entries are in the B-tree (after
+/// a checkpoint) or in MVCC versions, and in both scan directions. A row that
+/// another connection inserts and commits there must stay hidden.
+#[test]
+fn test_index_scan_sees_its_own_insert_ahead_of_the_scan() {
+    for checkpoint in [true, false] {
+        for update in [false, true] {
+            for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+                for (insert_from_other_connection, asc, desc) in [
+                    (false, "a,b,c,d,e,f,g,h,i", "i,h,g,f,e,d,c,b,a"),
+                    (true, "a,b,c,d,f,g,h,i", "i,h,g,f,d,c,b,a"),
+                ] {
+                    let case = format!(
+                        "checkpoint={checkpoint} update={update} {begin} \
+                         other_connection={insert_from_other_connection}"
+                    );
+                    for (scan_sql, expected) in [
+                        ("SELECT v FROM t WHERE v > ''", asc),
+                        ("SELECT v FROM t WHERE v < 'z' ORDER BY v DESC", desc),
+                    ] {
+                        let db = MvccTestDb::new();
+                        let conn = &db.conn;
+                        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                            .unwrap();
+                        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                            .unwrap();
+                        conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                        conn.execute(
+                            "INSERT INTO t VALUES \
+                             (1,'a'),(2,'b'),(3,'c'),(4,'d'),(6,'f'),(7,'g'),(8,'h'),(9,'i')",
+                        )
+                        .unwrap();
+                        if checkpoint {
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                        }
+                        if update {
+                            // Puts 'b' and 'h' in MVCC versions, so the MVCC peek is not exhausted.
+                            conn.execute("UPDATE t SET v = v WHERE id IN (2, 8)")
+                                .unwrap();
+                        }
+                        conn.execute(begin).unwrap();
+                        let writer = if insert_from_other_connection {
+                            db.db
+                                .connect(ConnectOpts::new(SessionRole::Superuser))
+                                .unwrap()
+                        } else {
+                            conn.clone()
+                        };
+                        assert_eq!(
+                            scan_with_write_after_rows(
+                                conn,
+                                scan_sql,
+                                3,
+                                &writer,
+                                "INSERT INTO t VALUES (5, 'e')"
+                            ),
+                            expected,
+                            "{case} {scan_sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An index scan must not return a row that its own transaction deletes ahead
+/// of the scan position, after a checkpoint, while the scan holds that row as
+/// its next MVCC index entry.
+#[test]
+fn test_index_scan_skips_its_own_delete_ahead_of_the_scan() {
+    for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+        // How the deleted row gets its MVCC versions, if at all.
+        for deleted_row_versions in ["none", "update", "insert in transaction"] {
+            for (scan_sql, (deleted_id, deleted_v), expected) in [
+                (
+                    "SELECT quote(v), id FROM t WHERE v > ''",
+                    (3, "c"),
+                    "'a'|1,'b'|2,'d'|4",
+                ),
+                (
+                    "SELECT quote(w), id FROM t WHERE v > ''",
+                    (3, "c"),
+                    "'aa'|1,'bb'|2,'dd'|4",
+                ),
+                (
+                    "SELECT quote(v), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    (2, "b"),
+                    "'d'|4,'c'|3,'a'|1",
+                ),
+                (
+                    "SELECT quote(w), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    (2, "b"),
+                    "'dd'|4,'cc'|3,'aa'|1",
+                ),
+            ] {
+                let db = MvccTestDb::new();
+                let conn = &db.conn;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT)")
+                    .unwrap();
+                conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                let insert_deleted_row = format!(
+                    "INSERT INTO t VALUES ({deleted_id}, '{deleted_v}', '{deleted_v}{deleted_v}')"
+                );
+                for (id, v) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+                    if id != deleted_id {
+                        conn.execute(format!("INSERT INTO t VALUES ({id}, '{v}', '{v}{v}')"))
+                            .unwrap();
+                    }
+                }
+                if deleted_row_versions != "insert in transaction" {
+                    conn.execute(&insert_deleted_row).unwrap();
+                }
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                if deleted_row_versions == "update" {
+                    conn.execute(format!("UPDATE t SET v = v WHERE id = {deleted_id}"))
+                        .unwrap();
+                }
+                conn.execute(begin).unwrap();
+                if deleted_row_versions == "insert in transaction" {
+                    conn.execute(&insert_deleted_row).unwrap();
+                }
+                assert_eq!(
+                    scan_with_write_after_rows(
+                        conn,
+                        scan_sql,
+                        1,
+                        conn,
+                        &format!("DELETE FROM t WHERE id = {deleted_id}")
+                    ),
+                    expected,
+                    "{begin} deleted_row_versions={deleted_row_versions} {scan_sql}"
+                );
+            }
+        }
+    }
+}
+
+/// A table or index scan must not return a B-tree row or index entry that its
+/// own transaction deletes, or changes the indexed value of, ahead of the scan
+/// position while the scan holds it as its next B-tree entry. The same write
+/// made and committed by another connection must stay hidden.
+#[test]
+fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
+    for write_from_other_connection in [false, true] {
+        for checkpoint in [true, false] {
+            for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+                // Row 1 or 5 gets MVCC versions, so the scan's first row comes from
+                // MVCC and the B-tree row or entry after it has already been read.
+                for (scan_sql, updated_id, all_rows, writes) in [
+                    (
+                        "SELECT v FROM t WHERE v > ''",
+                        1,
+                        "a,b,c,d,e",
+                        [
+                            ("DELETE FROM t WHERE id = 2", "a,c,d,e"),
+                            ("UPDATE t SET v = 'bb' WHERE id = 2", "a,bb,c,d,e"),
+                        ],
+                    ),
+                    (
+                        "SELECT v FROM t WHERE v < 'z' ORDER BY v DESC",
+                        5,
+                        "e,d,c,b,a",
+                        [
+                            ("DELETE FROM t WHERE id = 4", "e,c,b,a"),
+                            ("UPDATE t SET v = 'dd' WHERE id = 4", "e,dd,c,b,a"),
+                        ],
+                    ),
+                    (
+                        "SELECT id FROM t NOT INDEXED",
+                        1,
+                        "1,2,3,4,5",
+                        [
+                            ("DELETE FROM t WHERE id = 2", "1,3,4,5"),
+                            ("UPDATE t SET v = 'bb' WHERE id = 2", "1,2,3,4,5"),
+                        ],
+                    ),
+                    (
+                        "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+                        5,
+                        "5,4,3,2,1",
+                        [
+                            ("DELETE FROM t WHERE id = 4", "5,3,2,1"),
+                            ("UPDATE t SET v = 'dd' WHERE id = 4", "5,4,3,2,1"),
+                        ],
+                    ),
+                ] {
+                    for (write, expected) in writes {
+                        let db = MvccTestDb::new();
+                        let conn = &db.conn;
+                        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                            .unwrap();
+                        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                            .unwrap();
+                        conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                        conn.execute(
+                            "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+                        )
+                        .unwrap();
+                        if checkpoint {
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                        }
+                        conn.execute(format!("UPDATE t SET v = v WHERE id = {updated_id}"))
+                            .unwrap();
+                        conn.execute(begin).unwrap();
+                        let (writer, expected) = if write_from_other_connection {
+                            (
+                                db.db
+                                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                                    .unwrap(),
+                                all_rows,
+                            )
+                        } else {
+                            (conn.clone(), expected)
+                        };
+                        assert_eq!(
+                            scan_with_write_after_rows(conn, scan_sql, 1, &writer, write),
+                            expected,
+                            "checkpoint={checkpoint} {begin} {write} \
+                             other_connection={write_from_other_connection} {scan_sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A table scan must return a row that its own transaction writes between the
+/// scan position and the next MVCC row the scan holds: a new or re-inserted
+/// rowid, or a new version of a B-tree row. It must not return that next MVCC
+/// row once the same transaction deletes it.
+#[test]
+fn test_table_scan_returns_its_own_write_before_the_next_mvcc_row() {
+    for checkpoint in [true, false] {
+        for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+            // After the checkpoint the scan's first row comes from the B-tree,
+            // and the MVCC rows left by `setup` are ahead of it.
+            for (scan_sql, setup, write, expected) in [
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "UPDATE t SET v = v WHERE id = 4",
+                    "UPDATE t SET v = 'bb' WHERE id = 2",
+                    "1a,2bb,3c,4d,5e",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "UPDATE t SET v = v WHERE id = 4",
+                    "DELETE FROM t WHERE id = 4",
+                    "1a,2b,3c,5e",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "DELETE FROM t WHERE id IN (2, 4)",
+                    "INSERT INTO t VALUES (2, 'x')",
+                    "1a,2x,3c,5e",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "DELETE FROM t WHERE id IN (2, 4)",
+                    "INSERT INTO t VALUES (6, 'f')",
+                    "1a,3c,5e,6f",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
+                    "UPDATE t SET v = v WHERE id = 2",
+                    "UPDATE t SET v = 'dd' WHERE id = 4",
+                    "5e,4dd,3c,2b,1a",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
+                    "UPDATE t SET v = v WHERE id = 2",
+                    "DELETE FROM t WHERE id = 2",
+                    "5e,4d,3c,1a",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
+                    "DELETE FROM t WHERE id IN (2, 4)",
+                    "INSERT INTO t VALUES (4, 'x')",
+                    "5e,4x,3c,1a",
+                ),
+            ] {
+                let db = MvccTestDb::new();
+                let conn = &db.conn;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+                    .unwrap();
+                if checkpoint {
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                }
+                conn.execute(setup).unwrap();
+                conn.execute(begin).unwrap();
+                assert_eq!(
+                    scan_with_write_after_rows(conn, scan_sql, 1, conn, write),
+                    expected,
+                    "checkpoint={checkpoint} {begin} {setup}; {write}; {scan_sql}"
+                );
+            }
+        }
+    }
+}
+
+/// A table or index scan must follow `ROLLBACK TO` of its own transaction's
+/// writes ahead of the scan position, after a checkpoint: a rolled-back insert
+/// is not returned, and a row whose delete was rolled back is returned.
+#[test]
+fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
+    for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+        for (write_in_savepoint, asc, desc) in [
+            (
+                "INSERT INTO t VALUES (3, 'c')",
+                "'a'|1,'b'|2,'d'|4,'e'|5",
+                "'e'|5,'d'|4,'b'|2,'a'|1",
+            ),
+            (
+                "DELETE FROM t WHERE id = 3",
+                "'a'|1,'b'|2,'c'|3,'d'|4,'e'|5",
+                "'e'|5,'d'|4,'c'|3,'b'|2,'a'|1",
+            ),
+        ] {
+            // MVCC versions on 'c' and on the row after it in scan order, so the
+            // scan's first row comes from the B-tree and the next MVCC entry it
+            // holds is 'c' or past it.
+            for (scan_sql, rows_with_versions, expected) in [
+                ("SELECT quote(v), id FROM t WHERE v > ''", "3, 5", asc),
+                (
+                    "SELECT quote(v), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    "1, 3",
+                    desc,
+                ),
+                ("SELECT quote(v), id FROM t NOT INDEXED", "3, 5", asc),
+                (
+                    "SELECT quote(v), id FROM t NOT INDEXED ORDER BY id DESC",
+                    "1, 3",
+                    desc,
+                ),
+            ] {
+                let db = MvccTestDb::new();
+                let conn = &db.conn;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                    .unwrap();
+                conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(4,'d'),(5,'e')")
+                    .unwrap();
+                if write_in_savepoint.starts_with("DELETE") {
+                    conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+                }
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                conn.execute(format!(
+                    "UPDATE t SET v = v WHERE id IN ({rows_with_versions})"
+                ))
+                .unwrap();
+                conn.execute(begin).unwrap();
+                conn.execute("SAVEPOINT s").unwrap();
+                conn.execute(write_in_savepoint).unwrap();
+                assert_eq!(
+                    scan_with_write_after_rows(conn, scan_sql, 1, conn, "ROLLBACK TO s"),
+                    expected,
+                    "{begin} {write_in_savepoint} {scan_sql}"
+                );
+            }
+        }
+    }
+}
+
+/// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
+/// returned `rows_before_write` rows. Returns the rows, with columns joined by `|`.
+fn scan_with_write_after_rows(
+    conn: &Arc<Connection>,
+    scan_sql: &str,
+    rows_before_write: usize,
+    writer: &Arc<Connection>,
+    write_sql: &str,
+) -> String {
+    let mut scan = conn.prepare(scan_sql).unwrap();
+    let mut rows: Vec<String> = Vec::new();
+    let mut written = false;
+    loop {
+        if !written && rows.len() == rows_before_write {
+            writer.execute(write_sql).unwrap();
+            written = true;
+        }
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                let row = scan.row().unwrap();
+                let columns: Vec<String> = row.get_values().map(|v| v.to_string()).collect();
+                rows.push(columns.join("|"));
+            }
+            StepResult::IO => scan.get_pager().io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    rows.join(",")
+}
+
+/// Test DELETE all B-tree rows and re-insert with same IDs in MVCC.
+/// Verifies tombstones correctly shadow B-tree and new rows are visible.
+///
+/// This test was initially failing with "UNIQUE constraint failed: t.id"
+/// Fixed by implementing dual-peek in the exists() method to check MVCC tombstones.
+#[test]
+fn test_mvcc_dual_cursor_delete_all_btree_reinsert() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'old1')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'old2')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    // Delete all B-tree rows
+    conn.execute("DELETE FROM t WHERE id IN (1, 2)").unwrap();
+    // Re-insert with new values
+    conn.execute("INSERT INTO t VALUES (1, 'new1')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'new2')").unwrap();
+
+    // Should see new values, not old B-tree values
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].to_string(), "new1");
+    assert_eq!(rows[1][1].to_string(), "new2");
+}
+
+#[test]
+fn test_checkpoint_drop_table_removes_stale_rootpage_mapping() {
+    let db = MvccTestDb::new();
+
+    db.conn
+        .execute("CREATE TABLE stale_root(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO stale_root VALUES(1, 'old')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'stale_root'",
+    );
+    let rootpage = rows[0][0].as_int().unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
+    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+
+    db.conn.execute("DROP TABLE stale_root").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(
+        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        "dropped checkpointed table mapping must not survive rootpage reuse"
+    );
+}
+
+#[test]
+fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mapping() {
+    let db = MvccTestDb::new();
+
+    db.conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE stale_root(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO stale_root VALUES(1, 'old')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'stale_root'",
+    );
+    let rootpage = rows[0][0].as_int().unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
+    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+
+    db.conn.execute("DROP TABLE stale_root").unwrap();
+    db.conn
+        .set_failure_injector(Some(FixedFailureInjector::new([(
+            CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        )])));
+    db.conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("checkpoint should fail after pager commit");
+    db.conn.set_failure_injector(None);
+
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(
+        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        "dropped checkpointed table mapping must be removed after retry"
+    );
+}
+
+/// Test that inserting a duplicate primary key fails when the existing row
+/// was committed before this transaction started (and thus is visible).
+#[test]
+fn test_mvcc_same_primary_key() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn2 = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (666)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // conn2 starts AFTER conn1 committed, so conn2 can see the committed row.
+    // INSERT should fail with UNIQUE constraint because the row is visible.
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t VALUES (666)")
+        .expect_err("duplicate key - visible committed row");
+}
+
+/// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
+/// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
+#[test]
+fn test_mvcc_same_primary_key_concurrent() {
+    // Pure optimistic concurrency: both transactions can INSERT the same rowid,
+    // but only one can commit (first-committer-wins based on end_ts comparison).
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn2 = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    // With pure optimistic CC, INSERT succeeds - conflict detected at commit time
+    conn2.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    // First transaction commits successfully (gets lower end_ts)
+    conn.execute("COMMIT").unwrap();
+
+    // Second transaction fails at commit time (first-committer-wins)
+    conn2
+        .execute("COMMIT")
+        .expect_err("duplicate key - first committer wins");
+}
+
+/// After deleting a B-tree row and checkpointing, the tombstone is removed
+/// by GC. The deleted row must stay invisible (B-tree no longer has it).
+#[turso_macros::test(encryption)]
+fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'delete_me')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Restart so rows are only in B-tree.
+    db.restart();
+    let conn = db.connect();
+
+    // Delete row 2 in MVCC (creates tombstone over B-tree row).
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    // Checkpoint writes the deletion to B-tree and GC removes the tombstone.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Row 2 must remain invisible.
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "keep");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// After updating a B-tree row and checkpointing, GC removes old versions.
+/// The updated value must be visible (from B-tree after GC).
+#[turso_macros::test(encryption)]
+fn test_gc_e2e_updated_row_correct_after_gc() {
+    let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'original')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+
+    // Update in MVCC.
+    conn.execute("UPDATE t SET val = 'updated' WHERE id = 1")
+        .unwrap();
+
+    // Checkpoint + GC.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Must see updated value.
+    let rows = get_rows(&conn, "SELECT val FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "updated");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_mvcc_unique_constraint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id UNIQUE)").unwrap();
+    let conn2 = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    conn.execute("COMMIT").unwrap();
+    // conn2 should see conflict with conn1's row where first conneciton changed `begin` to a Timestamp that is < than conn2's end_ts
+    conn2
+        .execute("COMMIT")
+        .expect_err("duplicate unique - first committer wins");
+}
+
+#[test]
+fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    assert!(
+        matches!(stmt.step().unwrap(), turso_core::StepResult::Yield),
+        "MVCC commit should yield before completion",
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
+    assert!(
+        rows.is_empty(),
+        "row from abandoned INSERT commit remained visible: {rows:?}",
+    );
+    observer.close().unwrap();
+}
+
+/// `PRAGMA journal_mode=mvcc` installs the shared `MvStore` and demotes the
+/// connection in `Finalize`, then yields repeatedly while the store bootstraps
+/// (reparse, checkpoint, log recovery). If the statement is dropped while
+/// parked at one of those bootstrap yields, the abandonment guard must
+/// re-promote the connection and uninstall the un-bootstrapped store. Without
+/// the guard, `is_mvcc_bootstrap_connection` would stay set forever (silently
+/// bypassing MVCC) and other connections on the same `Database` could trip an
+/// assertion on the un-bootstrapped store (`global_header = None`) at commit.
+///
+/// Gated on `io_memory_yield`: the test needs [`turso_core::MemoryYieldIO`] to defer
+/// completions so the bootstrap yields are observable. CI exercises it via the
+/// `--all-features` test job.
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    // `MemoryYieldIO` defers every completion until the next `io.step()`, so
+    // each bootstrap read/write surfaces as a real `StepResult::IO` between
+    // `stmt.step()` calls and we can abandon the statement precisely while it
+    // is parked at a bootstrap yield (with `PlatformIO` the completions finish
+    // synchronously and the whole PRAGMA runs in a single step).
+    let io = Arc::new(turso_core::MemoryYieldIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    // Give the bootstrap real schema/WAL work to span several yields.
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    assert!(
+        db.get_mv_store().is_none(),
+        "database should start in WAL mode"
+    );
+    assert!(!conn.is_mvcc_bootstrap_connection());
+
+    let mut stmt = conn.prepare("PRAGMA journal_mode=mvcc").unwrap();
+    let mut reached_bootstrap_window = false;
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            StepResult::IO => {
+                // Once `Finalize` has run, the connection is demoted and the
+                // store is installed: we are now parked at a bootstrap yield.
+                // Abandon here, leaving the IO completion undriven.
+                if conn.is_mvcc_bootstrap_connection() {
+                    reached_bootstrap_window = true;
+                    break;
+                }
+                db.io.step().unwrap();
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        reached_bootstrap_window,
+        "expected to observe the demoted mid-bootstrap window",
+    );
+    assert!(
+        db.get_mv_store().is_some(),
+        "store should be installed during bootstrap",
+    );
+
+    // Abandon the statement mid-bootstrap; dropping it drops the
+    // `MvccBootstrapGuard` held in its `active_op_state`.
+    drop(stmt);
+
+    assert!(
+        !conn.is_mvcc_bootstrap_connection(),
+        "abandonment guard must re-promote the connection",
+    );
+    assert!(
+        db.get_mv_store().is_none(),
+        "abandonment guard must uninstall the un-bootstrapped store",
+    );
+}
+
+/// `step_build_log_record` chunks the commit's write_set into batches of
+/// `MVCC_COMMIT_BATCH_SIZE` rowids and yields between batches so that a
+/// large commit (e.g. CREATE INDEX over millions of rows) can't monopolize
+/// the executor.
+///
+/// We bracket the chunked yields with two injected yield points:
+/// `BuildLogRecordStart` (fires once on first entry into BuildLogRecord) and
+/// `LogRecordPrepared` (fires once after both passes complete). The IOs
+/// observed strictly between these two are the chunked yields, so the count
+/// is exact.
+///
+/// With `n_rows = 3 * BATCH_SIZE`, both passes (schema-row + data-row) walk
+/// the full write_set, each yielding twice and then transitioning without a
+/// final yield. Expected: 4 chunked yields between Start and Prepared.
+#[test]
+fn test_build_log_record_yields_for_large_write_set() {
+    use turso_core::mvcc::database::MVCC_COMMIT_BATCH_SIZE;
+
+    /// Yields once at each of the bracketing points and toggles the
+    /// corresponding flag so the test can detect when the bracket opens
+    /// and closes.
+    #[derive(Debug)]
+    struct BracketingYieldInjector {
+        start: YieldPoint,
+        end: YieldPoint,
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+    impl YieldInjector for BracketingYieldInjector {
+        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+            if point == self.start && !self.started.load(Ordering::SeqCst) {
+                self.started.store(true, Ordering::SeqCst);
+                return true;
+            }
+            if point == self.end && !self.finished.load(Ordering::SeqCst) {
+                self.finished.store(true, Ordering::SeqCst);
+                return true;
+            }
+            false
+        }
+    }
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = 3 * MVCC_COMMIT_BATCH_SIZE;
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 1..=n_rows {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'val')"))
+            .unwrap();
+    }
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    conn.set_yield_injector(Some(Arc::new(BracketingYieldInjector {
+        start: CommitYieldPoint::BuildLogRecordStart.point(),
+        end: CommitYieldPoint::LogRecordPrepared.point(),
+        started: started.clone(),
+        finished: finished.clone(),
+    })));
+
+    let mut stmt = conn.prepare("COMMIT").unwrap();
+    let mut chunked_io_yields = 0;
+    let mut saw_start = false;
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Yield => {
+                if !saw_start {
+                    // Wait for the BuildLogRecordStart yield to open the bracket.
+                    // IOs before this came from earlier states (Initial → Commit
+                    // → WaitForDependencies); they don't count.
+                    if started.load(Ordering::SeqCst) {
+                        saw_start = true;
+                    }
+                    continue;
+                }
+                if finished.load(Ordering::SeqCst) {
+                    // The IO we just popped is the LogRecordPrepared injection
+                    // closing the bracket. Don't count it.
+                    break;
+                }
+                // Strictly between Start and Prepared: a chunked yield from
+                // `Completion::new_yield()` in step_build_log_record's loop.
+                chunked_io_yields += 1;
+            }
+            turso_core::StepResult::IO => continue,
+            turso_core::StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+
+    assert!(
+        saw_start,
+        "BuildLogRecordStart yield never fired — BuildLogRecord state never reached"
+    );
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "LogRecordPrepared yield never fired — BuildLogRecord did not complete"
+    );
+    // n_rows = 3 * BATCH_SIZE → 2 yields per pass × 2 passes = 4 chunked yields.
+    assert_eq!(
+        chunked_io_yields, 4,
+        "with {n_rows} rows, expected exactly 4 chunked IO yields between \
+         BuildLogRecordStart and LogRecordPrepared, got {chunked_io_yields}"
+    );
+
+    drop(stmt);
+    conn.close().unwrap();
+}
+
+/// ALTER TABLE RENAME TO on a table with a CREATE INDEX panics on the next
+/// session open. Reproduces the issue with 3 separate sessions (DB restarts).
+#[test]
+fn test_alter_table_rename_with_index_panics_on_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // Session 1: Create indexed table + checkpoint
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("CREATE TABLE old_name(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_val ON old_name(val)")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (1, 'a')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 2: Rename table
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 3: PANIC
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let rows = get_rows(&conn, "SELECT * FROM new_name");
+        assert_eq!(rows.len(), 1);
+    }
+}
+
+/// Same as above but with a UNIQUE constraint (autoindex).
+#[test]
+fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // Session 1
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("CREATE TABLE old_name(id INTEGER PRIMARY KEY, val TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO old_name VALUES (1, 'a')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 2
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Session 3: PANIC
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let rows = get_rows(&conn, "SELECT * FROM new_name");
+        assert_eq!(rows.len(), 1);
+    }
+}
+
+/// Reproducer for "sqlite_schema contains index for missing table 't'".
+///
+/// A single transaction deletes a row from t and then runs
+/// `ALTER TABLE t ADD COLUMN`. The deleted row already exists in the db file,
+/// and idx already has an entry for it. The log therefore contains a
+/// DELETE_INDEX op for that one idx entry; it is not deleting idx itself.
+/// ADD COLUMN is used because it is a small way to get the general shape that
+/// matters here: a schema-row DELETE plus a replacement schema-row UPSERT in the
+/// same transaction as table/index row changes.
+///
+/// The old BuildLogRecord path inserted every committed version into one log
+/// vector with `insert_version_raw`. That helper is only valid for one entry in
+/// the MVCC maps, but the log vector is replayed in serialized order. Since the
+/// old sqlite_schema row for t is already in the db file, ALTER TABLE logs its
+/// DELETE with `begin=None` and its replacement UPSERT with `begin=end_ts`.
+/// Sorting every touched entry together could replay the schema DELETE, row
+/// DELETE, and index-entry DELETE before the schema UPSERT for t's new CREATE
+/// TABLE text.
+///
+/// During replay, the table schema DELETE removes t from `schema_rows` and sets
+/// `needs_schema_rebuild=true`. The following DELETE_INDEX op calls
+/// `get_index_info` to resolve idx's key format before the table schema UPSERT
+/// has been decoded. `get_index_info` sees `needs_schema_rebuild=true` and calls
+/// `rebuild_schema(&schema_rows)`, so `populate_indices` sees t missing while
+/// the btree-loaded idx schema row is still present and reports
+/// "sqlite_schema contains index for missing table".
+///
+/// Recovery must decode index ops with schema metadata chosen for the whole
+/// transaction frame, not with a schema rebuilt halfway through the frame.
+#[test]
+fn test_alter_add_column_with_index_dml_does_not_corrupt_on_reopen() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM t").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN x INTEGER").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        names.contains(&"t".to_string()),
+        "'t' table missing from sqlite_schema after reopen; got {names:?}"
+    );
+    assert!(
+        names.contains(&"idx".to_string()),
+        "index missing from sqlite_schema after reopen; got {names:?}"
+    );
+}
+
+/// Reproducer for `Index with root page ... not found in schema`.
+///
+/// A single transaction deletes a row from t and then drops idx. The deleted row
+/// already exists in the db file, and idx already has an entry for it. The log
+/// therefore contains a DELETE_INDEX op for that one idx entry, plus a
+/// sqlite_schema DELETE for idx itself.
+///
+/// This is the opposite side of the ALTER TABLE ADD COLUMN case above. The
+/// index-entry DELETE needs the old idx schema row in order to decode the index
+/// key. If BuildLogRecord writes the sqlite_schema DELETE before the
+/// DELETE_INDEX op, recovery removes idx from `schema_rows`, rebuilds
+/// `connection.schema`, then cannot resolve idx's root page when decoding the
+/// later DELETE_INDEX op.
+///
+/// This is why frame recovery chooses schema metadata from the whole frame.
+/// CREATE INDEX insert ops need the final schema; DROP INDEX delete ops need
+/// the old schema for entries that existed before the transaction.
+#[test]
+fn test_delete_then_drop_index_with_index_dml_replays_on_reopen() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM t").unwrap();
+        conn.execute("DROP INDEX idx").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        names.contains(&"t".to_string()),
+        "'t' table missing from sqlite_schema after reopen; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx".to_string()),
+        "dropped index still present in sqlite_schema after reopen; got {names:?}"
+    );
+    let rows = get_rows(&conn, "SELECT v FROM t");
+    assert!(
+        rows.is_empty(),
+        "deleted row should stay deleted after reopen; got {rows:?}"
+    );
+}
+
+/// A transient index created and dropped in one transaction should leave no
+/// logical-log index work behind.
+///
+/// CREATE INDEX writes sqlite_schema and index entries with `begin=tx_id`.
+/// DROP INDEX ends those same versions before commit. Those entries never
+/// reached the db file, so recovery cannot depend on their schema existing
+/// before or after the frame. The writer must omit them instead of logging a
+/// log op for an index that has no durable schema row.
+#[test]
+fn test_create_then_drop_index_in_one_tx_replays_on_reopen() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx ON t(v)").unwrap();
+        conn.execute("DROP INDEX idx").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let names: Vec<String> = get_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY rowid")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        names.contains(&"t".to_string()),
+        "'t' table missing from sqlite_schema after reopen; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"idx".to_string()),
+        "transient index should not remain in sqlite_schema after reopen; got {names:?}"
+    );
+    let rows = get_rows(&conn, "SELECT v FROM t ORDER BY v");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_schema_frame_recovery_create_index_with_mixed_dml_matrix() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 10, 100)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 20, 200)").unwrap();
+            conn.execute("INSERT INTO t VALUES (3, 30, 300)").unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("UPDATE t SET a = 21 WHERE id = 2").unwrap();
+            conn.execute("INSERT INTO t VALUES (4, 40, 400)").unwrap();
+            conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("UPDATE t SET b = 333 WHERE id = 3").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let names: Vec<String> = get_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY rowid",
+        )
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+        assert!(
+            names.contains(&"idx_a".to_string()),
+            "idx_a missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"idx_b".to_string()),
+            "idx_b missing: {names:?}"
+        );
+        let rows = get_rows(
+            &conn,
+            "SELECT id, b FROM t INDEXED BY idx_b WHERE b >= 200 ORDER BY b",
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0].as_int().unwrap(), 2);
+        assert_eq!(rows[0][1].as_int().unwrap(), 200);
+        assert_eq!(rows[1][0].as_int().unwrap(), 3);
+        assert_eq!(rows[1][1].as_int().unwrap(), 333);
+        assert_eq!(rows[2][0].as_int().unwrap(), 4);
+        assert_eq!(rows[2][1].as_int().unwrap(), 400);
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].to_string(), "ok");
+    }
+}
+
+#[test]
+fn test_schema_frame_recovery_drop_recreate_table_indexes_matrix() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+            conn.execute("DROP TABLE t").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT, c INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'new', 30)").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'next', 40)")
+                .unwrap();
+            conn.execute("UPDATE t SET c = 45 WHERE id = 2").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let names: Vec<String> = get_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY rowid",
+        )
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+        assert!(names.contains(&"t".to_string()), "table missing: {names:?}");
+        assert!(
+            !names.contains(&"idx_a".to_string()),
+            "old idx_a still present after recreate: {names:?}"
+        );
+        assert!(
+            names.contains(&"idx_c".to_string()),
+            "new idx_c missing after recreate: {names:?}"
+        );
+        let rows = get_rows(&conn, "SELECT id, b, c FROM t INDEXED BY idx_c ORDER BY c");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_int().unwrap(), 1);
+        assert_eq!(rows[0][1].to_string(), "new");
+        assert_eq!(rows[0][2].as_int().unwrap(), 30);
+        assert_eq!(rows[1][0].as_int().unwrap(), 2);
+        assert_eq!(rows[1][1].to_string(), "next");
+        assert_eq!(rows[1][2].as_int().unwrap(), 45);
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].to_string(), "ok");
+    }
+}
+
+#[test]
+fn test_schema_frame_recovery_same_name_partial_index_redefinition() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_common ON t(a) WHERE a >= 20")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10, 100)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20, 200)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 30, 300)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    {
+        db.get_mvcc_store().set_checkpoint_threshold(-1);
+        let conn = db.connect();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE t SET a = 25 WHERE id = 2").unwrap();
+        conn.execute("DROP INDEX idx_common").unwrap();
+        conn.execute("CREATE INDEX idx_common ON t(b) WHERE b >= 250")
+            .unwrap();
+        conn.execute("UPDATE t SET b = 275 WHERE id = 2").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 40, 400)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let sql_rows = get_rows(
+        &conn,
+        "SELECT sql FROM sqlite_schema WHERE name = 'idx_common'",
+    );
+    assert_eq!(sql_rows.len(), 1);
+    let index_sql = sql_rows[0][0].to_string();
+    assert!(
+        index_sql.contains("ON t (b)") && index_sql.contains("WHERE b >= 250"),
+        "idx_common should be recreated on b with the partial predicate; got {index_sql}"
+    );
+    let rows = get_rows(
+        &conn,
+        "SELECT id, b FROM t INDEXED BY idx_common WHERE b >= 250 ORDER BY b",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 275);
+    assert_eq!(rows[1][0].as_int().unwrap(), 3);
+    assert_eq!(rows[1][1].as_int().unwrap(), 300);
+    assert_eq!(rows[2][0].as_int().unwrap(), 4);
+    assert_eq!(rows[2][1].as_int().unwrap(), 400);
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_schema_rewrites_do_not_drop_table_versions_from_recovery_log() {
+    for checkpoint_base in [false, true] {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, note TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("CREATE UNIQUE INDEX idx_note ON t(note)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1, 10, 100, 'n1')")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(2, 20, 200, 'n2')")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(3, 30, 300, 'n3')")
+                .unwrap();
+            if checkpoint_base {
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        {
+            db.get_mvcc_store().set_checkpoint_threshold(-1);
+            let conn = db.connect();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("ALTER TABLE t RENAME TO tt").unwrap();
+            conn.execute("ALTER TABLE tt RENAME COLUMN note TO label")
+                .unwrap();
+            conn.execute("UPDATE tt SET a = a + 12 WHERE id = 1")
+                .unwrap();
+            conn.execute("ALTER TABLE tt ADD COLUMN c INTEGER DEFAULT 5")
+                .unwrap();
+            conn.execute("UPDATE tt SET c = a + b WHERE id = 2")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_label ON tt(label)").unwrap();
+            conn.execute(
+                "INSERT INTO tt(id,a,b,label,c) VALUES(4, 40, 472, 'n4', 912)
+                 ON CONFLICT(id) DO UPDATE
+                 SET a = excluded.a, b = excluded.b, label = excluded.label, c = excluded.c",
+            )
+            .unwrap();
+            conn.execute("DROP INDEX idx_b").unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
+        }
+
+        db.restart();
+        let conn = db.connect();
+        let table_rows = get_rows(&conn, "SELECT id, a, b, label, c FROM tt ORDER BY id");
+        assert_eq!(table_rows.len(), 4, "checkpoint_base={checkpoint_base}");
+        assert_eq!(table_rows[0][0].as_int().unwrap(), 1);
+        assert_eq!(table_rows[0][1].as_int().unwrap(), 22);
+        assert_eq!(table_rows[0][4].as_int().unwrap(), 5);
+        assert_eq!(table_rows[1][0].as_int().unwrap(), 2);
+        assert_eq!(table_rows[1][2].as_int().unwrap(), 200);
+        assert_eq!(table_rows[1][4].as_int().unwrap(), 220);
+        assert_eq!(table_rows[2][0].as_int().unwrap(), 3);
+        assert_eq!(table_rows[2][4].as_int().unwrap(), 5);
+        assert_eq!(table_rows[3][0].as_int().unwrap(), 4);
+        assert_eq!(table_rows[3][1].as_int().unwrap(), 40);
+        assert_eq!(table_rows[3][3].to_string(), "n4");
+        assert_eq!(table_rows[3][4].as_int().unwrap(), 912);
+
+        let indexed_rows = get_rows(
+            &conn,
+            "SELECT id, label FROM tt INDEXED BY idx_label WHERE label >= 'n1' ORDER BY label, id",
+        );
+        assert_eq!(indexed_rows.len(), 4, "checkpoint_base={checkpoint_base}");
+        assert_eq!(indexed_rows[3][0].as_int().unwrap(), 4);
+        assert_eq!(indexed_rows[3][1].to_string(), "n4");
+
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1, "checkpoint_base={checkpoint_base}");
+        assert_eq!(&rows[0][0].to_string(), "ok");
+    }
+}
+
+#[test]
+fn test_abandoned_drop() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let io = Arc::new(MemoryIO::new());
+    let path = ":memory:";
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, row_number INTEGER, ts INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS t_index \
+         ON t (row_number) WHERE ts IS NULL",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(conn.get_auto_commit());
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::NextStart.point()
+    ])));
+    conn.execute("BEGIN").unwrap();
+    let mut drop_stmt = conn.prepare("DROP TABLE t").unwrap();
+    match drop_stmt.step().unwrap() {
+        turso_core::StepResult::Yield => {}
+        other => panic!("expected injected yield mid-DROP TABLE; got {other:?}"),
+    }
+    conn.set_yield_injector(None);
+
+    drop_stmt.reset().unwrap();
+    drop(drop_stmt);
+
+    conn.execute("COMMIT").unwrap();
+
+    drop(conn);
+    drop(db);
+
+    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
+        "reopen should not fail; abandoned DROP must not have committed its partial Delete",
+    );
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let after = get_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema \
+         WHERE tbl_name = 't' ORDER BY rowid",
+    );
+    assert!(
+        after.len() == 2,
+        "schema must not be half-dropped; got rows: {after:?}",
+    );
+}
+
+#[test]
+fn test_partial_commit_visibility_bug() {
+    use std::collections::HashMap;
+    use std::thread;
+    use std::time::Duration;
+    use turso_core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use turso_core::sync::Arc;
+    for _ in 0..10 {
+        // Setup: Create a table with batch_id and row_num columns
+        let db = Arc::new(MvccTestDbNoConn::new_with_random_db());
+        {
+            let conn = db.connect();
+            conn.execute("CREATE TABLE consistency_test (batch_id INTEGER, row_num INTEGER)")
+                .unwrap();
+        }
+
+        const ROWS_PER_BATCH: i64 = 50; // Large enough to increase race window
+        const NUM_BATCHES: u64 = 100;
+        const NUM_READER_THREADS: usize = 4;
+
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let violation_detected = Arc::new(AtomicBool::new(false));
+        let current_batch = Arc::new(AtomicU64::new(0));
+
+        // Writer thread: Insert batches of rows
+        let writer_handle = {
+            let db = db.clone();
+            let writer_done = writer_done.clone();
+            let current_batch = current_batch.clone();
+            thread::spawn(move || {
+                let conn = db.connect();
+
+                for batch_id in 0..NUM_BATCHES {
+                    // Start a transaction
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+
+                    // Insert ROWS_PER_BATCH rows with the same batch_id
+                    // This simulates a multi-row operation like a bank transfer
+                    for row_num in 0..ROWS_PER_BATCH {
+                        conn.execute(format!(
+                            "INSERT INTO consistency_test VALUES ({batch_id}, {row_num})",
+                        ))
+                        .unwrap();
+                    }
+
+                    // Update current batch before committing to allow readers to check
+                    current_batch.store(batch_id, Ordering::Release);
+
+                    // Commit the transaction
+                    // BUG LOCATION: During commit, the loop at mod.rs:912-984 updates
+                    // row timestamps one-by-one while state remains Preparing.
+                    // Concurrent readers can see partial updates.
+                    conn.execute("COMMIT").unwrap();
+
+                    // Small delay to allow readers to observe the race window
+                    thread::sleep(Duration::from_micros(100));
+                }
+
+                writer_done.store(true, Ordering::Release);
+            })
+        };
+
+        // Reader threads: Continuously read and verify batch consistency
+        let mut reader_handles = Vec::new();
+        for reader_id in 0..NUM_READER_THREADS {
+            let db = db.clone();
+            let writer_done = writer_done.clone();
+            let violation_detected = violation_detected.clone();
+            let current_batch = current_batch.clone();
+
+            let handle = thread::spawn(move || {
+                let conn = db.connect();
+                let mut iteration = 0u64;
+
+                loop {
+                    iteration += 1;
+
+                    // Start a new transaction to get a fresh snapshot
+                    // Snapshot isolation: This snapshot should see a consistent state
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+
+                    // Read all rows grouped by batch_id
+                    let rows = get_rows(
+                        &conn,
+                        "SELECT batch_id, row_num FROM consistency_test ORDER BY batch_id, row_num",
+                    );
+
+                    // Group rows by batch_id
+                    let mut batches: HashMap<i64, Vec<i64>> = HashMap::new();
+                    for row in rows {
+                        let batch_id = row[0].as_int().unwrap();
+                        let row_num = row[1].as_int().unwrap();
+                        batches.entry(batch_id).or_default().push(row_num);
+                    }
+
+                    // Check consistency: Each batch must have EITHER all rows OR no rows
+                    for (batch_id, row_nums) in &batches {
+                        let count = row_nums.len() as i64;
+
+                        // CRITICAL ASSERTION: Snapshot isolation guarantees atomic visibility
+                        // A batch is either fully committed (all 50 rows) or not yet committed (0 rows)
+                        //
+                        // If we see a partial batch (e.g., 23 rows), it means:
+                        // 1. The commit loop updated timestamps for rows 0-22 (visible)
+                        // 2. Transaction still in Preparing state
+                        // 3. Rows 23-49 still have TxID (invisible to us)
+                        // 4. We started our snapshot DURING the commit loop
+                        //
+                        // This is a SNAPSHOT ISOLATION VIOLATION.
+                        if count != 0 && count != ROWS_PER_BATCH {
+                            eprintln!(
+                                "[Reader {reader_id}] VIOLATION DETECTED at iteration {iteration}!",
+                            );
+                            eprintln!(
+                                "  Batch {batch_id} has {count} rows (expected {ROWS_PER_BATCH} or 0)",
+                            );
+                            eprintln!("  Visible row_nums: {row_nums:?}");
+                            eprintln!();
+                            eprintln!("  EXPLANATION:");
+                            eprintln!(
+                                "  - This reader started a snapshot during batch {batch_id}'s commit",
+                            );
+                            eprintln!(
+                                "  - The commit loop (mod.rs:912-984) was updating timestamps"
+                            );
+                            eprintln!("  - Transaction state was still Preparing(ts)");
+                            eprintln!("  - Rows with updated Timestamps became visible");
+                            eprintln!("  - Rows with TxID timestamps remained invisible");
+                            eprintln!("  - Result: Partial batch visibility (atomicity violation)");
+                            eprintln!();
+                            eprintln!("  RACE TIMELINE:");
+                            eprintln!("  1. Writer: state = Preparing(end_ts)");
+                            eprintln!("  2. Writer: Update row 0's timestamp");
+                            eprintln!("  3. Writer: Update row 1's timestamp");
+                            eprintln!("  ...");
+                            eprintln!("  N. Reader: BEGIN (snapshot)");
+                            eprintln!(
+                                "  N+1. Reader: Read rows 0-{} (visible via Timestamp)",
+                                count - 1
+                            );
+                            eprintln!(
+                                "  N+2. Reader: Read rows {}-{} (invisible, still TxID)",
+                                count,
+                                ROWS_PER_BATCH - 1
+                            );
+                            eprintln!("  N+3. Writer: Continue updating remaining timestamps...");
+
+                            violation_detected.store(true, Ordering::Release);
+
+                            // Continue to accumulate more evidence
+                        }
+                    }
+
+                    conn.execute("COMMIT").unwrap();
+
+                    // Exit if writer is done and we've checked a few more times
+                    if writer_done.load(Ordering::Acquire) {
+                        let final_batch = current_batch.load(Ordering::Acquire);
+                        if iteration > final_batch + 10 {
+                            break;
+                        }
+                    }
+
+                    // Small delay to vary timing
+                    thread::sleep(Duration::from_micros(50));
+                }
+
+                eprintln!("[Reader {reader_id}] Completed {iteration} iterations");
+            });
+
+            reader_handles.push(handle);
+        }
+
+        // Wait for writer to complete
+        writer_handle.join().unwrap();
+
+        // Wait for readers to complete
+        for handle in reader_handles {
+            handle.join().unwrap();
+        }
+
+        // ASSERTION: No violations should be detected
+        // With the current bug, this will FAIL because readers observe partial commits
+        assert!(
+            !violation_detected.load(Ordering::Acquire),
+            "Partial commit visibility detected! Transaction atomicity violated.\n\
+         \n\
+         ROOT CAUSE: Commit loop (mod.rs:912-984) updates row timestamps non-atomically\n\
+         while transaction state remains Preparing. Concurrent readers see inconsistent\n\
+         snapshots with partial transaction visibility.\n\
+         \n\
+         FIX REQUIRED: Make timestamp updates atomic, or change visibility logic to\n\
+         always dereference transaction state instead of reading row timestamps directly."
+        );
+    }
+}
+
+#[test]
+fn test_double_delete_btree_resident_row_with_unique_index() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, uniq TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 10, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 20, 'b')").unwrap();
+
+    // Checkpoint so rows are only in B-tree, not in MVCC store
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+
+    // Two transactions both try to delete the same B-tree-resident row
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+
+    // T1 deletes row 1 — creates tombstone (begin: None, end: TxID(T1))
+    conn1.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let err = conn2
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("T2's DELETE must fail while T1 holds a tombstone for the same row");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "{err:?}");
+
+    // T1 commits first — stamps its tombstones with Timestamp
+    conn1.execute("COMMIT").unwrap();
+    drop(conn1);
+    drop(conn2);
+
+    // Checkpoint: only T1's delete should have gone through
+    let conn = db.connect();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "Index corruption after concurrent double-delete of B-tree-resident row"
+    );
+}
+
+/// AUTOINCREMENT is not supported in MVCC mode due to sqlite_sequence
+/// AUTOINCREMENT is supported in MVCC mode via atomic sequences.
+/// Verify that CREATE TABLE with AUTOINCREMENT and INSERT work.
+#[test]
+fn test_autoincrement_works_in_mvcc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // CREATE TABLE with AUTOINCREMENT should succeed in MVCC mode
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // INSERT should succeed and auto-generate rowids
+    conn.execute("INSERT INTO t(b) VALUES ('hello')").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('world')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    let id1 = rows[0][0].as_int().unwrap();
+    let id2 = rows[1][0].as_int().unwrap();
+    assert!(
+        id1 < id2,
+        "rowids must be strictly increasing: {id1}, {id2}"
+    );
+}
+
+/// If a table with AUTOINCREMENT was created before MVCC was enabled,
+/// INSERT into that table should work in MVCC mode using sequences.
+#[test]
+fn test_autoincrement_insert_works_for_preexisting_table() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+
+    // Phase 1: Open in WAL mode, create AUTOINCREMENT table
+    {
+        let db = turso_core::Database::open_file_with_flags(
+            io.clone(),
+            path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t(b) VALUES ('before_mvcc')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    // Clear the database manager to force a fresh open
+
+    // Phase 2: Reopen in MVCC mode — INSERT should work
+    {
+        let db = turso_core::Database::open_file_with_flags(
+            io,
+            path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        // Should succeed
+        conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')").unwrap();
+
+        let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+        assert_eq!(rows.len(), 2);
+        // The new rowid must be > the previous max (1)
+        let new_id = rows[1][0].as_int().unwrap();
+        assert!(new_id > 1, "new rowid {new_id} should be > 1");
+    }
+}
+
+/// Concurrent MVCC transactions inserting into an AUTOINCREMENT table write
+/// distinct rowids, so they must not conflict with each other.
+#[test]
+fn test_concurrent_autoincrement_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Tx1: begin and insert
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(b) VALUES ('from_tx1')")
+        .unwrap();
+
+    // Tx2: begin and insert (while tx1 is still open)
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(b) VALUES ('from_tx2')")
+        .unwrap();
+
+    // Both commits must succeed
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Verify both rows are present with distinct, increasing rowids
+    let rows = get_rows(&conn1, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2, "both inserts should be visible");
+    let rowid1 = rows[0][0].as_int().unwrap();
+    let rowid2 = rows[1][0].as_int().unwrap();
+    assert!(rowid1 < rowid2, "rowids must be strictly increasing");
+    assert_eq!(rows[0][1].to_string(), "from_tx1");
+    assert_eq!(rows[1][1].to_string(), "from_tx2");
+}
+
+/// Three concurrent transactions all inserting into the same AUTOINCREMENT table
+/// must all succeed and produce unique, increasing rowids.
+#[test]
+fn test_three_concurrent_autoincrement_inserts() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+    let conn3 = db.connect();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO t(b) VALUES ('tx1')").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(b) VALUES ('tx2')").unwrap();
+
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+    conn3.execute("INSERT INTO t(b) VALUES ('tx3')").unwrap();
+
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn3.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 3, "all three inserts should be visible");
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert!(
+        ids[0] < ids[1] && ids[1] < ids[2],
+        "rowids must be strictly increasing: {ids:?}"
+    );
+}
+
+/// Regression: an error between `SequenceBeginInnerTx` and the matching
+/// `SequenceCommitInnerTx` (here: sequence exhaustion raised by
+/// `SequenceComputeNext`) must not leak the inner tx into
+/// `mv_store.txs` or leave the connection's mv_tx pointing at the
+/// dead inner. Otherwise the next statement on the same connection
+/// inherits the orphaned inner as its outer, and any commit through
+/// `WaitForDependencies` may wait forever on the dead tx's deps.
+///
+/// Whopper reproduces this as a `parse_schema_rows → SELECT →
+/// commit_txn → CommitStateMachine::WaitForDependencies` deadlock
+/// after a sequence exhaustion error in some prior in-tx nextval.
+/// `Statement::cleanup_orphaned_seq_inner_tx` plus the new
+/// `ProgramState::sequence_inner_tx_pending` field together close
+/// the leak.
+#[test]
+fn test_inner_tx_cleanup_after_sequence_exhaustion() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // MAXVALUE = 2: nextval can return 1 and 2, the third call hits
+    // SequenceComputeNext's SequenceExhausted bail.
+    conn.execute("CREATE SEQUENCE tiny START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 2")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn, "SELECT nextval('tiny')");
+    let _ = get_rows(&conn, "SELECT nextval('tiny')");
+    // Third nextval fails mid-bytecode AFTER SequenceBeginInnerTx
+    // swapped conn.mv_tx to the inner, BEFORE SequenceCommitInnerTx
+    // could clean it up. Statement reset must roll back the inner
+    // and restore the outer mv_tx.
+    let exhaust = conn.execute("SELECT nextval('tiny')");
+    assert!(exhaust.is_err(), "third nextval must exhaust the sequence");
+
+    // After the abort, the connection must still be usable. Before
+    // the fix, this SELECT would inherit the orphaned inner as its
+    // outer mv_tx and hang in WaitForDependencies (or worse).
+    // Best-effort ROLLBACK — the failing nextval may have already
+    // cleared the outer; either way the connection should accept
+    // subsequent autocommit statements without hanging.
+    let _ = conn.execute("ROLLBACK");
+    let rows = get_rows(&conn, "SELECT 1");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Regression: sequence exhaustion inside an explicit outer transaction must
+/// leave the connection's `auto_commit` and `mv_tx` coherent.
+///
+/// Reproduces a whopper-discovered "row disappeared" failure: an
+/// `INSERT … DEFAULT VALUES` with a SERIAL-defaulted column whose sequence is
+/// exhausted hits `SequenceExhausted` inside `SequenceComputeNext`, AFTER
+/// `SequenceBeginInnerTx` has swapped `conn.mv_tx` from the outer (Concurrent
+/// tx) to the inner. The vdbe abort path's catch-all for unmatched errors
+/// (`vdbe/mod.rs`) calls `rollback_current_txn_state`, which rolls back the
+/// inner (currently held in `mv_tx`) and sets `auto_commit = true`.
+/// `cleanup_orphaned_seq_inner_tx` then restores `mv_tx` to the outer — but
+/// without also restoring `auto_commit = false`, the connection ends up in
+/// an inconsistent state where `auto_commit = true` yet `mv_tx = Some(outer)`.
+/// Subsequent BEGINs on the connection no-op (the engine sees `mv_tx`
+/// already set), so the next "fresh" transaction reuses the outer's stale
+/// snapshot and cannot observe rows committed by other connections after
+/// the outer's begin timestamp.
+#[test]
+fn test_auto_commit_coherent_after_sequence_exhaustion_in_outer_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    // Sequence exhausted after just two emissions, plus a SERIAL-style
+    // table whose default invokes nextval.
+    conn1
+        .execute("CREATE SEQUENCE tiny START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 2")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE seq_tbl (id INTEGER DEFAULT (nextval('tiny')), payload TEXT)")
+        .unwrap();
+    conn1
+        .execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    // Open the outer tx on conn1 and consume the sequence to exhaustion.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn1, "SELECT nextval('tiny')");
+    let _ = get_rows(&conn1, "SELECT nextval('tiny')");
+
+    // Sanity: the outer is alive before the failing op.
+    assert!(!conn1.get_auto_commit(), "outer tx must be active");
+    let outer_mv_tx = conn1
+        .get_mv_tx()
+        .map(|(tx_id, _)| tx_id)
+        .expect("outer tx must have an mv_tx_id");
+
+    // The INSERT … DEFAULT VALUES path invokes nextval on the exhausted
+    // sequence and bails with SequenceExhausted mid-bytecode, AFTER
+    // SequenceBeginInnerTx swapped mv_tx to the inner.
+    let exhaust = conn1.execute("INSERT INTO seq_tbl DEFAULT VALUES");
+    assert!(
+        exhaust.is_err(),
+        "INSERT with exhausted sequence default must fail"
+    );
+
+    // INVARIANT: auto_commit and mv_tx must agree. Either the connection
+    // is back to autocommit (mv_tx = None) or it's still in the outer
+    // tx (mv_tx = Some(outer)). Half-states break subsequent BEGINs.
+    let auto_commit = conn1.get_auto_commit();
+    let mv_tx = conn1.get_mv_tx().map(|(tx_id, _)| tx_id);
+    assert_eq!(
+        auto_commit,
+        mv_tx.is_none(),
+        "post-exhaustion state must be coherent: auto_commit={auto_commit}, mv_tx={mv_tx:?}"
+    );
+
+    // The outer tx must still be the one mv_tx points to — sequence
+    // exhaustion is a per-statement error, not a tx-level abort. The
+    // outer survives so the application can decide whether to COMMIT
+    // partial work or ROLLBACK.
+    assert_eq!(
+        mv_tx,
+        Some(outer_mv_tx),
+        "outer tx should survive sequence exhaustion"
+    );
+
+    // Now have a different connection commit a row in autocommit.
+    conn2.execute("INSERT INTO kv VALUES ('k1', 'v1')").unwrap();
+
+    // Roll back the outer on conn1 and start a fresh tx. The new tx's
+    // snapshot must see conn2's commit. If the bug were present,
+    // ROLLBACK would not actually end the outer (because the outer
+    // didn't really survive in a usable form), or — more directly —
+    // a subsequent BEGIN+SELECT would observe an empty `kv` table
+    // because the connection was pinned to the outer's stale snapshot.
+    conn1.execute("ROLLBACK").unwrap();
+    assert!(conn1.get_auto_commit(), "ROLLBACK must end the outer tx");
+    assert_eq!(
+        conn1.get_mv_tx().map(|(tx_id, _)| tx_id),
+        None,
+        "ROLLBACK must clear mv_tx"
+    );
+
+    conn1.execute("BEGIN").unwrap();
+    let rows = get_rows(&conn1, "SELECT v FROM kv WHERE k = 'k1'");
+    assert_eq!(
+        rows.len(),
+        1,
+        "fresh BEGIN+SELECT must see conn2's committed row \
+         (if 0 rows: the connection was pinned to a stale snapshot \
+         because the BEGIN no-op'd into the orphaned outer)"
+    );
+    conn1.execute("COMMIT").unwrap();
+}
+
+/// Deterministic reproduction of the sqlite_sequence pollution bug.
+///
+/// Two concurrent transactions insert into an AUTOINCREMENT table.
+/// Tx1 gets data rowid 1, tx2 gets data rowid 2. Tx1 commits first,
+/// so its sqlite_sequence row (name='t', seq=1) gets sqlite_sequence
+/// rowid 1. Tx2 commits second, so its sqlite_sequence row (name='t',
+/// seq=2) gets sqlite_sequence rowid 2.
+///
+/// After DELETE + checkpoint + restart, the table is empty (btree max = 0).
+/// init_autoincrement scans sqlite_sequence by rowid order, finds the FIRST
+/// match at sqlite_sequence rowid 1 with seq=1, and uses that.
+/// New rowid = max(1, 0) + 1 = 2, which REUSES the previously-used rowid 2.
+///
+/// This violates AUTOINCREMENT's contract that rowids must never decrease.
+#[test]
+fn test_autoincrement_no_reuse_after_delete_and_restart() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
+        .unwrap();
+
+    // Two concurrent transactions: tx1 commits first, tx2 commits second.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(b) VALUES ('from_tx1')")
+        .unwrap();
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(b) VALUES ('from_tx2')")
+        .unwrap();
+
+    // Commit tx1 first: its sqlite_sequence row gets the lower rowid
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Verify: data rowids are 1 and 2
+    let rows = get_rows(&conn1, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    let max_data_rowid = rows[1][0].as_int().unwrap();
+    assert_eq!(max_data_rowid, 2);
+
+    // sqlite_sequence should have duplicate rows (the bug):
+    // rowid=1: name=t, seq=1  (from tx1, committed first)
+    // rowid=2: name=t, seq=2  (from tx2, committed second)
+    let seq_rows = get_rows(
+        &conn1,
+        "SELECT rowid, seq FROM sqlite_sequence WHERE name = 't' ORDER BY rowid",
+    );
+    // If there's only 1 row with the correct max, the fix is applied.
+    // If there are 2 rows, the bug is present and init_autoincrement will
+    // pick the wrong one after restart.
+    let seq_count = seq_rows.len();
+
+    // Delete all data rows so btree max becomes 0 after restart
+    conn1.execute("DELETE FROM t").unwrap();
+
+    // Checkpoint to flush everything to disk
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Drop connections and restart
+    drop(conn1);
+    drop(conn2);
+    db.restart();
+
+    let conn = db.connect();
+
+    // Verify table is empty
+    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+
+    // Insert after restart. The new rowid MUST be > max_data_rowid (2).
+    conn.execute("INSERT INTO t(b) VALUES ('after_restart')")
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT a FROM t");
+    let new_rowid = rows[0][0].as_int().unwrap();
+
+    if seq_count > 1 {
+        // Bug present: sqlite_sequence has duplicate rows.
+        // init_autoincrement picked the first match (seq=1), so new rowid = 2,
+        // which reuses a previously-issued rowid.
+        eprintln!(
+            "sqlite_sequence had {seq_count} rows for 't'. \
+             After restart, new rowid = {new_rowid} (previous max was {max_data_rowid})"
+        );
+    }
+
+    assert!(
+        new_rowid > max_data_rowid,
+        "AUTOINCREMENT rowid reuse! Previous max was {max_data_rowid}, \
+         but new rowid after delete+restart is {new_rowid}. \
+         sqlite_sequence had {seq_count} duplicate rows; \
+         init_autoincrement picked the stale one (seq=1 instead of seq=2)."
+    );
+}
+
+/// Same bug as `test_elle_lost_update_exclusive_concurrent` but with simplified SQLs.
+/// For this bug to happen, we need deferred conflict detection done at
+/// `check_version_conflicts`.
+/// Requires UPSERT (INSERT ... ON CONFLICT DO UPDATE) — to hit `insert_btree_resident`
+/// and then `check_version_conflicts`.
+/// (Note: plain UPDATE eagerly detects conflicts via `delete_from_table_or_index`)
+///
+/// We need three txns for this bug to happen:
+/// Initial state: some row btree resident
+/// tx2: starts
+/// tx1: upserts the row, commits
+/// tx3: upserts the same row, which sets end=TxID(T3) on tx1's version (speculative delete)
+/// tx2: upserts the same row, should get WriteWriteConflict at commit time because tx1 committed previously
+#[test]
+fn test_speculative_delete_hides_committed_version_sql() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (key TEXT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('k1', 'a')").unwrap();
+        conn.close().unwrap();
+    }
+    // lets do this so that row becomes b tree resident
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    let upsert = |val: &str| {
+        format!(
+            "INSERT INTO t VALUES ('k1', '{val}') \
+             ON CONFLICT(key) DO UPDATE SET val = excluded.val"
+        )
+    };
+
+    // T2: begin early so T1's future commit is invisible under SI. BEGIN
+    // CONCURRENT is deferred, so pin the snapshot with a read.
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn2, "SELECT count(*) FROM t");
+
+    // T1: auto-commit UPSERT → insert_btree_resident, commits.
+    let conn1 = db.connect();
+    conn1.execute(upsert("b")).unwrap();
+    conn1.close().unwrap();
+
+    // T3: UPSERT → sets end=TxID(T3) on T1's version.
+    let conn3 = db.connect();
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+    conn3.execute(upsert("d")).unwrap();
+
+    // T2: UPSERT → insert_btree_resident (T1 invisible, T3 invisible).
+    conn2.execute(upsert("c")).unwrap();
+
+    // T2: COMMIT → must detect conflict with T1.
+    let result = conn2.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {result:?}."
+    );
+}
+
+/// Regression test for Elle bug (https://github.com/tursodatabase/turso/actions/runs/22855976911/job/66296309873?pr=5819#logs)
+/// Previously, `check_version_conflicts` skipped any version with `end.is_some()`,
+/// so a speculative delete by T3 (setting end=TxID(T3)) hid T1's committed version
+/// from T2's conflict check, allowing a lost update.
+///
+/// The SQL statements resemble the ones in Elle. For simplified variant, check
+/// `test_speculative_delete_hides_committed_version_sql` test
+///
+/// 1. Row for key "k8" exists in B-tree (B-tree-resident, no MVCC version)
+/// 2. T2 starts via BEGIN CONCURRENT
+/// 3. T1 does auto-commit UPSERT on "k8" → insert_btree_resident, commits
+/// 4. T3 starts via BEGIN CONCURRENT, does UPSERT on "k8" → update path sets
+///    end=TxID(T3) on T1's committed version
+/// 5. T2 does UPSERT on "k8" → insert_btree_resident (T1's version invisible, T3's invisible)
+/// 6. T2 COMMIT → check_version_conflicts SKIPS T1's version because end.is_some()
+///    → no WriteWriteConflict detected → lost update!
+/// 7. T3 eventually aborts, restoring T1's version, but T2 already committed.
+#[test]
+fn test_elle_lost_update_exclusive_concurrent() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    // Setup: create the elle-style table and seed initial data into the B-tree
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE elle_lists (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1")
+            .unwrap();
+        conn.execute("INSERT INTO elle_lists (key, vals) VALUES ('k8', '100')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    // Restart: data is only in B-tree, MVCC store is empty.
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    // T2: start concurrent transaction (begin_ts established early — BEGIN
+    // CONCURRENT is deferred, so pin the snapshot with a read)
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&conn2, "SELECT count(*) FROM elle_lists");
+
+    // T1: auto-commit UPSERT on k8 → insert_btree_resident, commits immediately
+    let conn1 = db.connect();
+    conn1
+        .execute(
+            "INSERT INTO elle_lists (key, vals) VALUES ('k8', '200') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE WHEN vals = '' THEN '200' ELSE vals || ',' || '200' END",
+        )
+        .unwrap();
+    conn1.close().unwrap();
+
+    // T3: start concurrent transaction (begin_ts > T1.end_ts, so T1's version IS visible to T3)
+    let conn3 = db.connect();
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+
+    // T3: UPSERT on k8 → update path: deletes T1's version (sets end=TxID(T3))
+    // and creates T3's own version. This speculatively hides T1's version.
+    conn3
+        .execute(
+            "INSERT INTO elle_lists (key, vals) VALUES ('k8', '400') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE WHEN vals = '' THEN '400' ELSE vals || ',' || '400' END",
+        )
+        .unwrap();
+
+    // T2: UPSERT on k8 → insert_btree_resident (T1's version invisible under SI,
+    // T3's version invisible as Active)
+    conn2
+        .execute(
+            "INSERT INTO elle_lists (key, vals) VALUES ('k8', '300') \
+             ON CONFLICT(key) DO UPDATE SET vals = CASE WHEN vals = '' THEN '300' ELSE vals || ',' || '300' END",
+        )
+        .unwrap();
+
+    // T2: COMMIT → should detect write-write conflict with T1's committed version.
+    // BUG: T1's version has end=TxID(T3), and the old code skips versions with
+    // end.is_some() → conflict missed → lost update.
+    let commit_result = conn2.execute("COMMIT");
+    assert!(
+        matches!(&commit_result, Err(LimboError::WriteWriteConflict)),
+        "Expected WriteWriteConflict, got: {commit_result:?}. \
+         T1's committed version was hidden by T3's speculative delete (end=TxID), \
+         causing check_version_conflicts to skip it."
+    );
+}
+
+/// Enabling MVCC on a file-backed database must still bootstrap durable MVCC
+/// metadata even if encryption has only been opted-in and no key/cipher exists yet.
+#[test]
+fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("test.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let db = Database::open_file_with_flags(
+        io,
+        path.as_os_str().to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    // Reproduce the deferred-key flow: encryption is enabled as a feature, but
+    // the session has not configured any key/cipher when MVCC bootstrap runs.
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    let metadata_root = metadata_root_page(&conn);
+    assert!(
+        metadata_root > 0,
+        "metadata table must be present after enabling MVCC on a file-backed db",
+    );
+
+    let meta = get_rows(
+        &conn,
+        "SELECT k, v FROM __turso_internal_mvcc_meta ORDER BY rowid",
+    );
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0][0].to_string(), "persistent_tx_ts_max");
+    assert_eq!(meta[0][1].as_int().unwrap(), 0);
+}
+
+/// Reopening an encrypted MVCC database without any key material must fail before
+/// logical-log recovery, even if there is an outstanding MVCC log tail on disk.
+#[test]
+fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'secret')").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_bytes = std::fs::read(&log_path).expect("db-log should exist after MVCC writes");
+    assert!(
+        log_bytes.len() > LOG_HDR_SIZE,
+        "db-log should contain at least one frame before restart"
+    );
+
+    db.set_encryption(None);
+    assert!(
+        matches!(db.restart_result(), Err(LimboError::NotADB)),
+        "reopening an encrypted MVCC database without a key must fail during db open, before recovery",
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+
+    let mut portable_changes = Vec::new();
+    while let Some(frame) = io.block(|| reader.next_portable_changes()).unwrap() {
+        portable_changes.extend_from_slice(&frame.payload);
+    }
+    portable_changes
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_portable_change_bytes_with_encryption(
+    conn: &Arc<Connection>,
+    encryption_ctx: turso_core::EncryptionContext,
+) -> Vec<u8> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader =
+        StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), Some(encryption_ctx));
+    reader.read_header(&io).unwrap();
+
+    let mut portable_changes = Vec::new();
+    while let Some(frame) = io.block(|| reader.next_portable_changes()).unwrap() {
+        portable_changes.extend_from_slice(&frame.payload);
+    }
+    portable_changes
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0;
+    loop {
+        let byte = bytes[*offset];
+        *offset += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_proto_sint64(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ (-((value & 1) as i64))
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
+    match wire_type {
+        0 => {
+            let _ = read_proto_varint(bytes, offset);
+        }
+        2 => {
+            let len = read_proto_varint(bytes, offset) as usize;
+            *offset += len;
+        }
+        other => panic!("unsupported protobuf wire type in test decoder: {other}"),
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[derive(Clone, Debug)]
+struct DecodedObjectMap {
+    mv_table_id: i64,
+    name: String,
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[derive(Clone, Debug, Default)]
+struct DecodedPortableTxn {
+    objects: Vec<DecodedObjectMap>,
+    metadata: std::collections::HashMap<String, String>,
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_object_map(bytes: &[u8], strings: &[String]) -> Option<DecodedObjectMap> {
+    let mut offset = 0usize;
+    let mut mv_table_id = None;
+    let mut name = String::new();
+    while offset < bytes.len() {
+        let key = read_proto_varint(bytes, &mut offset);
+        let field = key >> 3;
+        let wire_type = key & 7;
+        match (field, wire_type) {
+            (1, 0) => {
+                mv_table_id = Some(decode_proto_sint64(read_proto_varint(bytes, &mut offset)))
+            }
+            (2, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                name = strings.get(idx).cloned().unwrap_or_default();
+            }
+            _ => skip_proto_field(bytes, &mut offset, wire_type),
+        }
+    }
+    Some(DecodedObjectMap {
+        mv_table_id: mv_table_id?,
+        name,
+    })
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_metadata(bytes: &[u8], strings: &[String]) -> Option<(String, String)> {
+    let mut offset = 0usize;
+    let mut key = None;
+    let mut value = None;
+    while offset < bytes.len() {
+        let field_key = read_proto_varint(bytes, &mut offset);
+        let field = field_key >> 3;
+        let wire_type = field_key & 7;
+        match (field, wire_type) {
+            (1, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                key = strings.get(idx).cloned();
+            }
+            (2, 0) => {
+                let idx = read_proto_varint(bytes, &mut offset) as usize;
+                value = strings.get(idx).cloned();
+            }
+            _ => skip_proto_field(bytes, &mut offset, wire_type),
+        }
+    }
+    Some((key?, value?))
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decode_portable_change_txns(portable_changes: &[u8]) -> Vec<DecodedPortableTxn> {
+    let mut txns = Vec::new();
+    let mut offset = 0usize;
+    while offset < portable_changes.len() {
+        let txn_len = read_proto_varint(portable_changes, &mut offset) as usize;
+        let txn_end = offset + txn_len;
+        let txn = &portable_changes[offset..txn_end];
+        offset = txn_end;
+
+        let mut strings = Vec::new();
+        let mut object_blobs = Vec::new();
+        let mut meta_blobs = Vec::new();
+        let mut txn_offset = 0usize;
+        while txn_offset < txn.len() {
+            let key = read_proto_varint(txn, &mut txn_offset);
+            let field = key >> 3;
+            let wire_type = key & 7;
+            match (field, wire_type) {
+                (12, 2) => {
+                    let len = read_proto_varint(txn, &mut txn_offset) as usize;
+                    strings.push(
+                        String::from_utf8(txn[txn_offset..txn_offset + len].to_vec()).unwrap(),
+                    );
+                    txn_offset += len;
+                }
+                (13, 2) => {
+                    let len = read_proto_varint(txn, &mut txn_offset) as usize;
+                    object_blobs.push(txn[txn_offset..txn_offset + len].to_vec());
+                    txn_offset += len;
+                }
+                (14, 2) => {
+                    let len = read_proto_varint(txn, &mut txn_offset) as usize;
+                    meta_blobs.push(txn[txn_offset..txn_offset + len].to_vec());
+                    txn_offset += len;
+                }
+                _ => skip_proto_field(txn, &mut txn_offset, wire_type),
+            }
+        }
+        let objects = object_blobs
+            .iter()
+            .filter_map(|object| decode_object_map(object, &strings))
+            .collect();
+        let mut metadata = std::collections::HashMap::new();
+        for meta in &meta_blobs {
+            if let Some((key, value)) = decode_metadata(meta, &strings) {
+                metadata.insert(key, value);
+            }
+        }
+        txns.push(DecodedPortableTxn { objects, metadata });
+    }
+    txns
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn decoded_object_maps(txns: &[DecodedPortableTxn]) -> Vec<&DecodedObjectMap> {
+    txns.iter().flat_map(|txn| txn.objects.iter()).collect()
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_disabled_by_default() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+
+    assert!(portable_changes.is_empty());
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects
+        .iter()
+        .any(|object| object.name == "items" && object.mv_table_id < 0));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_updates_name_mapping_across_rename() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'before')")
+        .unwrap();
+    db.conn
+        .execute("ALTER TABLE items RENAME TO things")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO things VALUES (2, 'after')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(objects.iter().any(|object| object.name == "things"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_refresh_for_same_rowid_schema_update() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "items"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_drop_and_create_for_drop_recreate_same_name() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'old')")
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DROP TABLE items").unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (2, 'new')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    let item_table_ids = objects
+        .iter()
+        .filter(|object| object.name == "items")
+        .map(|object| object.mv_table_id)
+        .collect::<HashSet<_>>();
+
+    assert!(
+        item_table_ids.len() >= 2,
+        "drop/recreate should expose old and new table identities"
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    let object = objects
+        .iter()
+        .find(|object| object.name == "items")
+        .expect("object map should resolve same-transaction table writes");
+
+    assert!(object.mv_table_id < 0);
+}
+
+#[test]
+fn test_mvcc_mode_supports_cdc_for_client_push() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
+        .unwrap();
+
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+    conn.execute("UPDATE items SET payload = 'beta' WHERE id = 1")
+        .unwrap();
+    conn.execute("DELETE FROM items WHERE id = 1").unwrap();
+
+    let item_rows = get_rows(
+        &conn,
+        "SELECT change_id, change_txn_id, change_type
+         FROM turso_cdc
+         WHERE table_name = 'items'
+         ORDER BY change_id",
+    );
+    let item_change_types = item_rows
+        .iter()
+        .map(|row| row[2].as_int().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(item_change_types, vec![1, 0, -1]);
+    assert!(item_rows.iter().all(|row| row[1].as_int().unwrap() > 0));
+
+    let all_rows = get_rows(
+        &conn,
+        "SELECT change_id, change_type
+         FROM turso_cdc
+         ORDER BY change_id",
+    );
+    let change_ids = all_rows
+        .iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect::<Vec<_>>();
+    let commit_count = all_rows
+        .iter()
+        .filter(|row| row[1].as_int() == Some(2))
+        .count();
+
+    assert_eq!(change_ids, (1..=all_rows.len() as i64).collect::<Vec<_>>());
+    assert_eq!(commit_count, 4);
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_payload_idx ON items(portable_changes)")
+        .unwrap();
+    db.conn.execute("DROP TABLE items").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_index_trigger_and_view_schema_ops() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_payload_idx ON items(portable_changes)")
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW items_view AS SELECT id, portable_changes FROM items")
+        .unwrap();
+    db.conn
+        .execute(
+            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET portable_changes = NEW.portable_changes WHERE id = NEW.id; END",
+        )
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "items"));
+    assert!(!bytes_contain(&portable_changes, b"items_payload_idx"));
+    assert!(!bytes_contain(&portable_changes, b"CREATE VIEW items_view"));
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"CREATE TRIGGER items_ai"
+    ));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_trigger_and_view_lifecycle_ops() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW items_view AS SELECT id, portable_changes FROM items")
+        .unwrap();
+    db.conn
+        .execute(
+            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET portable_changes = NEW.portable_changes WHERE id = NEW.id; END",
+        )
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DROP VIEW items_view").unwrap();
+    db.conn.execute("DROP TRIGGER items_ai").unwrap();
+    db.conn
+        .execute("CREATE VIEW items_view AS SELECT id FROM items")
+        .unwrap();
+    db.conn
+        .execute("CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN SELECT NEW.id; END")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+
+    assert!(!bytes_contain(&portable_changes, b"items_view"));
+    assert!(!bytes_contain(&portable_changes, b"items_ai"));
+}
+
+#[test]
+#[cfg(feature = "conn_raw_api")]
+fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.set_portable_logical_changes_enabled(true);
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'before')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.set_portable_logical_changes_enabled(true);
+        conn.execute("INSERT INTO items VALUES (2, 'after')")
+            .unwrap();
+        conn.execute("ALTER TABLE items ADD COLUMN note TEXT")
+            .unwrap();
+        conn.execute("UPDATE items SET note = 'backfill' WHERE id = 2")
+            .unwrap();
+
+        let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+        let txns = decode_portable_change_txns(&portable_changes);
+        let objects = decoded_object_maps(&txns);
+
+        assert!(objects.iter().any(|object| object.name == "items"));
+        conn.close().unwrap();
+    }
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_table_after_alter_backfill() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE items(
+                id INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                rev INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_owner_rev_idx ON items(owner, rev)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)")
+        .unwrap();
+
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+    db.conn
+        .execute("UPDATE items SET note = 'schema-note'")
+        .unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO items (id, owner, payload, rev, note)
+             VALUES (1000000, 'remote-owner', 'remote-bootstrap-5', 1, 'remote-owner-note-1000000')",
+        )
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert!(
+        txns.len() >= 6,
+        "expected every portable-enabled commit to be encoded, got {} txns",
+        txns.len()
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta')")
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+    db.conn
+        .execute("UPDATE items SET note = 'backfilled'")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "items"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
+        .unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("INSERT INTO turso_sync_last_change_id VALUES ('client-a', 1, 10)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'visible')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"turso_sync_last_change_id"
+    ));
+    assert!(txns.iter().all(|txn| !txn.metadata.contains_key("client")));
+    assert!(objects.iter().any(|object| object.name == "items"));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_mark_internal_only_commits_explicitly() {
+    // A push whose user statements match no row commits only the sync
+    // bookkeeping upsert. That transaction has recovery ops but no user-visible
+    // change, and it must still be written as an extension frame: a plain frame
+    // is indistinguishable from pre-portable history, so a sync server planning
+    // a logical pull has to refuse the range, which wedges the database into a
+    // replace-base loop (no fresh replica can bootstrap again).
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, change_id INTEGER)",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let before = decode_portable_change_txns(&collect_mvcc_portable_change_bytes(&db.conn)).len();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE payload = 'no-such-row'")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO turso_sync_last_change_id VALUES ('client-a', 7)")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+
+    assert_eq!(
+        txns.len(),
+        before + 1,
+        "internal-only commit must still emit a portable extension frame"
+    );
+    let internal_only = txns.last().unwrap();
+    assert!(internal_only.objects.is_empty());
+    assert!(!bytes_contain(
+        &portable_changes,
+        b"turso_sync_last_change_id"
+    ));
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.set_mvcc_log_meta("client".to_string(), Some("client-a".to_string()));
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+    assert!(portable_changes.is_empty());
+
+    conn.set_portable_logical_changes_enabled(true);
+    conn.execute("INSERT INTO items VALUES (2, 'beta')")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (3, 'gamma')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let clients = txns
+        .iter()
+        .filter_map(|txn| txn.metadata.get("client").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        clients,
+        vec!["client-a".to_string(), "client-a".to_string()]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_are_encrypted_with_log_body() {
+    use turso_core::{CipherMode, EncryptionContext};
+
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let db = MvccTestDbNoConn::new_encrypted(hex_key);
+    let conn = db.connect();
+    conn.set_portable_logical_changes_enabled(true);
+    conn.execute("CREATE TABLE secret_items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO secret_items VALUES (1, 'secret-alpha')")
+        .unwrap();
+
+    let log_path = std::path::PathBuf::from(db.path()).with_extension("db-log");
+    let log_bytes = std::fs::read(log_path).unwrap();
+    assert!(!bytes_contain(&log_bytes, b"secret_items"));
+    assert!(!bytes_contain(&log_bytes, b"secret-alpha"));
+
+    let key = EncryptionKey::from_hex_string(hex_key).unwrap();
+    let enc_ctx = EncryptionContext::new(CipherMode::Aes256Gcm, &key, 4096).unwrap();
+    let portable_changes = collect_mvcc_portable_change_bytes_with_encryption(&conn, enc_ctx);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(objects.iter().any(|object| object.name == "secret_items"));
+}
+
+/// After a checkpoint, log records reference tables by the canonical
+/// -(root_page) id, but `table_id_to_rootpage` keeps entries keyed by the
+/// original in-memory counter ids. Root pages drift away from the
+/// -(counter id) alignment as `sqlite_schema` page splits interleave with
+/// btree creation (the fat multi-column DDL below forces those splits), so a
+/// canonical id aliases the still-live counter-id entry of an unrelated
+/// object (typically an autoindex). Resolving portable object-map names
+/// through the map first then followed the wrong root page, failing the
+/// commit with "portable changes cannot resolve user data table id ...".
+/// Post-checkpoint inserts must resolve every table to its own name.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_checkpointed_table_despite_counter_id_alias() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    let tables = 40;
+    let columns = (0..12)
+        .map(|c| format!("column_with_a_long_name_{c:02} TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for i in 0..tables {
+        db.conn
+            .execute(format!(
+                "CREATE TABLE t{i}({columns}, \
+                 UNIQUE(column_with_a_long_name_00), \
+                 UNIQUE(column_with_a_long_name_01), \
+                 UNIQUE(column_with_a_long_name_02))"
+            ))
+            .unwrap();
+        db.conn
+            .execute(format!(
+                "INSERT INTO t{i} VALUES ('a{i}', 'b{i}', 'c{i}', 'd{i}', 'e{i}', 'f{i}', \
+                 'g{i}', 'h{i}', 'i{i}', 'j{i}', 'k{i}', 'l{i}')"
+            ))
+            .unwrap();
+    }
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for i in 0..tables {
+        db.conn
+            .execute(format!(
+                "INSERT INTO t{i} VALUES ('A{i}', 'B{i}', 'C{i}', 'D{i}', 'E{i}', 'F{i}', \
+                 'G{i}', 'H{i}', 'I{i}', 'J{i}', 'K{i}', 'L{i}')"
+            ))
+            .unwrap();
+    }
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+    for i in 0..tables {
+        let name = format!("t{i}");
+        assert!(
+            objects.iter().any(|object| object.name == name),
+            "{name} missing from portable object maps"
+        );
+    }
+}
+
+/// Variant that does 3 restart cycles with tables created across each incarnation.
+/// This stresses the table_id_to_rootpage mapping more aggressively.
+#[test]
+fn test_recovery_three_restarts_with_table_creation() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    // Incarnation 1: create tables, checkpoint
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            conn.execute(format!("CREATE TABLE a{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO a{i} VALUES (1, 'a')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    // Incarnation 2: create more tables, insert into old, checkpoint, then more writes
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            conn.execute(format!("CREATE TABLE b{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (1, 'b')"))
+                .unwrap();
+        }
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (2, 'a2')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Un-checkpointed writes
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (3, 'a3')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (2, 'b2')"))
+                .unwrap();
+        }
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    // Incarnation 3: create even more tables, insert everywhere, checkpoint, more writes
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            conn.execute(format!("CREATE TABLE c{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO c{i} VALUES (1, 'c')"))
+                .unwrap();
+        }
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (4, 'a4')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (3, 'b3')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Un-checkpointed writes to all tables
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (5, 'a5')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (4, 'b4')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO c{i} VALUES (2, 'c2')"))
+                .unwrap();
+        }
+        conn.close().unwrap();
+    }
+
+    // Final restart - should not panic during log replay
+    db.restart();
+
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            let rows = get_rows(&conn, &format!("SELECT id FROM a{i} ORDER BY id"));
+            assert_eq!(rows.len(), 5, "table a{i} should have 5 rows");
+            let rows = get_rows(&conn, &format!("SELECT id FROM b{i} ORDER BY id"));
+            assert_eq!(rows.len(), 4, "table b{i} should have 4 rows");
+            let rows = get_rows(&conn, &format!("SELECT id FROM c{i} ORDER BY id"));
+            assert_eq!(rows.len(), 2, "table c{i} should have 2 rows");
+        }
+    }
+}
+
+#[test]
+fn test_recovery_after_drop_table_with_many_schema_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let target = "mvcc_sync_items_1777416431036232886";
+    let target_index = "mvcc_sync_items_1777416431036232886_owner_rev_idx";
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        for i in 0..350 {
+            conn.execute(format!(
+                "CREATE TABLE filler_{i}(id INTEGER PRIMARY KEY, owner TEXT, rev INTEGER)"
+            ))
+            .unwrap();
+            conn.execute(format!(
+                "CREATE INDEX filler_{i}_idx ON filler_{i}(owner, rev)"
+            ))
+            .unwrap();
+        }
+        conn.execute(format!(
+            "CREATE TABLE IF NOT EXISTS {target} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, portable_changes TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "CREATE INDEX IF NOT EXISTS {target_index} ON {target} (owner, rev)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO {target} (id, owner, portable_changes, rev) VALUES (1, 'seed-a', 'alpha', 1)"
+        ))
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("DROP TABLE IF EXISTS {target}"))
+            .unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        &format!(
+            "SELECT type, name, tbl_name FROM sqlite_schema WHERE name IN ('{target}', '{target_index}') ORDER BY type, name"
+        ),
+    );
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+}
+
+#[test]
+fn test_drop_recreate_indexed_table_many_inserts_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    for round in 0..2 {
+        {
+            let conn = db.connect();
+            let mv_store = db.get_mvcc_store();
+            mv_store.set_checkpoint_threshold(4096);
+
+            if round > 0 {
+                conn.execute("DROP TABLE IF EXISTS t").unwrap();
+            }
+
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
+
+            for i in 0..1000 {
+                conn.execute(format!("INSERT INTO t VALUES({i}, 'a_{i}', 'b_{i}', {i})"))
+                    .unwrap();
+            }
+
+            conn.close().unwrap();
+        }
+
+        db.restart();
+
+        {
+            let conn = db.connect();
+            let rows = get_rows(&conn, "SELECT count(*) FROM t");
+            assert_eq!(
+                rows[0][0].as_int().unwrap(),
+                1000,
+                "round {round}: expected 1000 rows"
+            );
+            conn.close().unwrap();
+        }
+    }
+}
+
+/// What this test checks: CREATE TYPE (which writes to __turso_internal_types,
+/// not sqlite_schema) is visible to a second connection under MVCC.
+/// Why this matters: The commit phase must detect schema changes even when no
+/// rows are written to sqlite_schema. Without the fix, did_commit_schema_change
+/// stayed false and the second connection never reloaded the schema.
+#[test]
+fn test_create_type_visible_to_second_connection_under_mvcc() {
+    let db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
+
+    // conn1: define a custom type
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TYPE my_uint(value any) BASE text ENCODE my_uint_enc(value) DECODE CAST(my_uint_dec(value) AS text)")
+        .unwrap();
+    conn1.close().unwrap();
+
+    // conn2: the type should be visible without reopening the database
+    let conn2 = db.connect();
+    let rows = get_rows(
+        &conn2,
+        "SELECT name FROM sqlite_turso_types WHERE name LIKE 'my_uint%'",
+    );
+    assert_eq!(rows.len(), 1, "CREATE TYPE should be visible to conn2");
+    assert_eq!(rows[0][0].to_string(), "my_uint(value any)");
+    conn2.close().unwrap();
+}
+
+/// Dropped roots that are still live roots must not be walked twice.
+#[test]
+fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    let root_page = rows[0][0].as_int().unwrap();
+    assert!(root_page > 0);
+
+    conn.with_schema_mut(|schema| {
+        schema.dropped_root_pages.insert(root_page);
+    })
+    .unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Passive mode: a stale dropped-root entry for a page already walked as a btree child must not
+/// report double-reference.
+#[test]
+fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..1000 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
+    let root_page = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name='t'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(page_count > root_page, "t should span multiple pages");
+    conn.with_schema_mut(|schema| {
+        schema.dropped_root_pages.insert(page_count);
+    })
+    .unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "a reused dropped root must not be reported as doubly-referenced"
+    );
+}
+
+/// PASSIVE port of PR #7620's reproducer: a checkpointed row gets an INSERT OR REPLACE (new
+/// btree-resident marker + replacement) then the replacement is deleted. GC must retain the
+/// btree-resident marker until checkpoint applies the physical delete, or the stale table row
+/// survives while its index entry is removed -> "row missing from index".
+#[test]
+fn test_mvcc_passive_replace_then_delete_keeps_table_and_index_consistent() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name, iq, year)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_iq ON t(iq)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (1,'v',100,2024),(2,'einstein',150,1950),(3,'newton',140,1850)",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.execute("INSERT OR REPLACE INTO t(id,name,iq,year) VALUES(1,'v',120,2025)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id=1").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "passive replace-then-delete must keep table/index consistent, got {rows:?}"
+    );
+}
+
+/// Snapshot stability under all of: nested-savepoint rollbacks, checkpoints,
+/// CREATE/DROP INDEX, and concurrent committed writers.
+///
+/// One reader holds a long BEGIN CONCURRENT and repeatedly samples
+/// `SELECT count(*) FROM t`; *every sample within the tx must be equal*.
+/// If any pair differs, MVCC snapshot isolation is violated — the case the
+/// original analysis points at (`gc_version_chain` Rule 3 reaping `V_old`
+/// after a savepoint-thread's rollback restores `end=None`, while the
+/// reader's snapshot still depends on it).
+///
+/// Disruptor threads (each toggleable via env):
+///   REPRO_SP=1     — runs the nested-savepoint driver (BEGIN CONCURRENT;
+///                    SAVEPOINT × depth with INSERTs and DELETEs of
+///                    pre-existing rows; ROLLBACK TO sp_<rb>; RELEASE; COMMIT)
+///   REPRO_CKPT=1   — cycles PRAGMA wal_checkpoint(PASSIVE/FULL/RESTART/TRUNCATE)
+///   REPRO_DDL=1    — CREATE/DROP INDEX cycle
+///   REPRO_WRITER=1 — committed INSERT/DELETE in BEGIN CONCURRENT/COMMIT
+///   (defaults: SP, CKPT, WRITER on; DDL off because it currently hangs.)
+///
+/// Other knobs:
+///   REPRO_DURATION_SECS=N  total wall-clock cap (default 30)
+///   REPRO_READER_OPS=N     count samples per reader transaction (default 8)
+#[test]
+fn test_snapshot_stability_full() {
+    use std::time::{Duration, Instant};
+    use turso_core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+    // Honor RUST_LOG when set; ignored if a subscriber is already installed.
+    // NOTE: deliberately NOT using `with_test_writer()` — that routes through
+    // libtest's stdout capture, which serializes events behind a mutex and is
+    // slow enough under heavy concurrency to suppress the very race we're
+    // trying to log.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, b BLOB)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        // Pre-existing rows so V_old candidates exist before any tx starts.
+        for i in 0..500 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mismatch = Arc::new(AtomicBool::new(false));
+    let reader_iters = Arc::new(AtomicU64::new(0));
+    let reader_samples = Arc::new(AtomicU64::new(0));
+    let sp_iters = Arc::new(AtomicU64::new(0));
+    let writer_iters = Arc::new(AtomicU64::new(0));
+    let ckpt_iters = Arc::new(AtomicU64::new(0));
+    let ddl_iters = Arc::new(AtomicU64::new(0));
+    let next_id = Arc::new(AtomicU64::new(10_000_000));
+
+    let mismatch_first = Arc::new(AtomicI64::new(0));
+    let mismatch_second = Arc::new(AtomicI64::new(0));
+    let mismatch_idx_a = Arc::new(AtomicU64::new(0));
+    let mismatch_idx_b = Arc::new(AtomicU64::new(0));
+
+    let duration = Duration::from_secs(
+        std::env::var("REPRO_DURATION_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5),
+    );
+    let reader_ops: usize = std::env::var("REPRO_READER_OPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+
+    let enable_sp = std::env::var("REPRO_SP").map(|s| s != "0").unwrap_or(true);
+    let enable_writer = std::env::var("REPRO_WRITER")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    let enable_ckpt = std::env::var("REPRO_CKPT")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    let enable_ddl = std::env::var("REPRO_DDL")
+        .map(|s| s != "0")
+        .unwrap_or(false);
+
+    // --- Reader: snapshot-stability assertion ---
+    let reader = {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let reader_iters = reader_iters.clone();
+        let reader_samples = reader_samples.clone();
+        let mismatch_first = mismatch_first.clone();
+        let mismatch_second = mismatch_second.clone();
+        let mismatch_idx_a = mismatch_idx_a.clone();
+        let mismatch_idx_b = mismatch_idx_b.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let mut samples: Vec<i64> = Vec::with_capacity(reader_ops);
+                let mut busy = false;
+                for _ in 0..reader_ops {
+                    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let rows = match stmt.run_collect_rows() {
+                        Ok(rows) => rows,
+                        // BEGIN CONCURRENT is deferred: the first read
+                        // materializes the transaction and can hit the
+                        // checkpoint gate, where BEGIN used to absorb the
+                        // Busy.
+                        Err(LimboError::Busy) => {
+                            busy = true;
+                            break;
+                        }
+                        Err(e) => panic!("reader failed: {e:?}"),
+                    };
+                    let c = rows[0][0].as_int().unwrap();
+                    samples.push(c);
+                    reader_samples.fetch_add(1, Ordering::Relaxed);
+                }
+                if busy {
+                    let _ = conn.execute("ROLLBACK");
+                    std::thread::yield_now();
+                    continue;
+                }
+                // All samples within one snapshot must be equal.
+                if let Some((i, &c)) = samples.iter().enumerate().find(|(_, &c)| c != samples[0]) {
+                    mismatch_first.store(samples[0], Ordering::Relaxed);
+                    mismatch_second.store(c, Ordering::Relaxed);
+                    mismatch_idx_a.store(0, Ordering::Relaxed);
+                    mismatch_idx_b.store(i as u64, Ordering::Relaxed);
+                    mismatch.store(true, Ordering::Relaxed);
+                    let _ = conn.execute("ROLLBACK");
+                    return;
+                }
+                let _ = conn.execute("COMMIT");
+                reader_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // --- Savepoint-rollback driver: tombstones pre-existing rows inside a
+    //     savepoint, then rolls back, restoring V_old.end = None. ---
+    let sp_thread = enable_sp.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let sp_iters = sp_iters.clone();
+        let next_id = next_id.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(0xCAFEF00D);
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let depth = 2 + (rng.random::<u8>() % 3) as usize;
+                let mut sps = Vec::with_capacity(depth);
+                let mut aborted = false;
+                'sp: for i in 0..depth {
+                    let name = format!("sp_{i}_{}", rng.random::<u32>() % 100_000);
+                    if conn.execute(format!("SAVEPOINT {name}")).is_err() {
+                        aborted = true;
+                        break 'sp;
+                    }
+                    sps.push(name);
+                    let muts = 1 + (rng.random::<u8>() % 4) as u64;
+                    for _ in 0..muts {
+                        let op = rng.random::<u8>() % 3;
+                        let sql = if op == 0 {
+                            // Tombstone a pre-existing baseline row inside SP.
+                            let target = (rng.random::<u32>() % 500) as i64;
+                            format!("DELETE FROM t WHERE id = {target}")
+                        } else {
+                            let id = next_id.fetch_add(1, Ordering::Relaxed) as i64;
+                            format!("INSERT INTO t VALUES ({id}, 'sp_{id}', NULL)")
+                        };
+                        match conn.execute(&sql) {
+                            Ok(_) => {}
+                            Err(LimboError::Constraint(_)) => {}
+                            Err(LimboError::WriteWriteConflict)
+                            | Err(LimboError::Busy)
+                            | Err(LimboError::TxTerminated) => {
+                                aborted = true;
+                                break 'sp;
+                            }
+                            Err(e) => panic!("sp mutation failed: {e:?}"),
+                        }
+                    }
+                }
+                if aborted {
+                    let _ = conn.execute("ROLLBACK");
+                    continue;
+                }
+                let rb = (rng.random::<u8>() as usize) % depth;
+                let target = sps[rb].clone();
+                let _ = conn.execute(format!("ROLLBACK TO {target}"));
+                let _ = conn.execute(format!("RELEASE {target}"));
+                let _ = conn.execute("COMMIT");
+                sp_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+
+    // --- Independent committed writer: drives ckpt_max + GC. ---
+    let writer_thread = enable_writer.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let writer_iters = writer_iters.clone();
+        let next_id = next_id.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(0xDEADBEEF);
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let id = next_id.fetch_add(1, Ordering::Relaxed) as i64;
+                let sql = if rng.random::<u8>() & 3 == 0 {
+                    let target = (rng.random::<u32>() % 500) as i64;
+                    format!("DELETE FROM t WHERE id = {target}")
+                } else {
+                    format!("INSERT INTO t VALUES ({id}, 'w_{id}', NULL)")
+                };
+                if conn.execute(&sql).is_err() {
+                    let _ = conn.execute("ROLLBACK");
+                    continue;
+                }
+                if conn.execute("COMMIT").is_ok() {
+                    writer_iters.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    });
+
+    // --- Checkpoint thread: drives drop_unused_row_versions. ---
+    let ckpt_thread = enable_ckpt.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let ckpt_iters = ckpt_iters.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
+            let mut idx = 0usize;
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                let _ = conn.execute(format!(
+                    "PRAGMA wal_checkpoint({})",
+                    modes[idx % modes.len()]
+                ));
+                idx = idx.wrapping_add(1);
+                ckpt_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+
+    // --- DDL thread: CREATE INDEX / DROP INDEX cycle (default OFF). ---
+    let ddl_thread = enable_ddl.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let ddl_iters = ddl_iters.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            let mut i = 0u32;
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                let name = format!("idx_dyn_{}", i % 4);
+                let _ = conn.execute(format!("CREATE INDEX {name} ON t(v)"));
+                let _ = conn.execute(format!("DROP INDEX {name}"));
+                i = i.wrapping_add(1);
+                ddl_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+
+    let started = Instant::now();
+    while started.elapsed() < duration && !mismatch.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    reader.join().unwrap();
+    if let Some(h) = sp_thread {
+        h.join().unwrap();
+    }
+    if let Some(h) = writer_thread {
+        h.join().unwrap();
+    }
+    if let Some(h) = ckpt_thread {
+        h.join().unwrap();
+    }
+    if let Some(h) = ddl_thread {
+        h.join().unwrap();
+    }
+
+    let r = reader_iters.load(Ordering::Relaxed);
+    let rs = reader_samples.load(Ordering::Relaxed);
+    let s = sp_iters.load(Ordering::Relaxed);
+    let w = writer_iters.load(Ordering::Relaxed);
+    let c = ckpt_iters.load(Ordering::Relaxed);
+    let d = ddl_iters.load(Ordering::Relaxed);
+    eprintln!(
+        "reader_iters={r} reader_samples={rs} sp_iters={s} writer_iters={w} ckpt_iters={c} ddl_iters={d} elapsed={:?}",
+        started.elapsed()
+    );
+
+    if mismatch.load(Ordering::Relaxed) {
+        let a = mismatch_first.load(Ordering::Relaxed);
+        let b = mismatch_second.load(Ordering::Relaxed);
+        let ia = mismatch_idx_a.load(Ordering::Relaxed);
+        let ib = mismatch_idx_b.load(Ordering::Relaxed);
+        panic!(
+            "snapshot count drifted within a single BEGIN CONCURRENT: \
+             samples[{ia}]={a} samples[{ib}]={b} \
+             (reader_iters={r}, sp_iters={s}, writer_iters={w}, ckpt_iters={c}, ddl_iters={d})"
+        );
+    }
+    assert!(rs > 0, "reader made no progress");
+}
+
+#[test]
+fn test_read_lock_leak_deferred_then_concurrent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn0.execute("INSERT INTO t1 VALUES(1, 'v1')").unwrap();
+    conn0.close().unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN DEFERRED").unwrap();
+    // BEGIN CONCURRENT after BEGIN DEFERRED should error but not leak state
+    let result = conn1.execute("BEGIN CONCURRENT");
+    assert!(result.is_err());
+
+    // After the error, SELECT should work without panicking
+    let rows = get_rows(&conn1, "SELECT * FROM t1");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    setup.close().unwrap();
+
+    let ddl = db.connect();
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE t SET c = 'writer' WHERE id = 1")
+        .unwrap();
+
+    ddl.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        .unwrap();
+
+    let commit_err = writer
+        .execute("COMMIT")
+        .expect_err("writer snapshot predates committed schema change");
+    assert!(matches!(commit_err, LimboError::SchemaConflict));
+    assert!(
+        writer.get_auto_commit(),
+        "SchemaConflict should roll back the stale writer transaction"
+    );
+
+    let verify = db.connect();
+    let columns = get_rows(&verify, "PRAGMA table_info(t)");
+    let column_names: Vec<String> = columns.iter().map(|row| row[1].to_string()).collect();
+    assert_eq!(column_names, vec!["id", "c", "extra"]);
+    let rows = get_rows(&verify, "SELECT id, c, extra FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].to_string(), "a");
+    assert!(matches!(&rows[0][2], turso_core::types::Value::Null));
+}
+
+#[test]
+fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT, keep INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(1, 'a', 10)").unwrap();
+    setup.execute("INSERT INTO t VALUES(2, 'b', 20)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES(3, 'c', 30)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("CREATE INDEX idx_t_c ON t(c)").unwrap();
+
+    let commit_err = writer
+        .execute("COMMIT")
+        .expect_err("writer snapshot predates committed schema change");
+    assert!(matches!(commit_err, LimboError::SchemaConflict));
+    assert!(writer.get_auto_commit());
+
+    let verify = db.connect();
+    let rows = get_rows(&verify, "SELECT id, c, keep FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let indexes = get_rows(
+        &verify,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_c'",
+    );
+    assert_eq!(indexes.len(), 1);
+    let rows = get_rows(&verify, "PRAGMA integrity_check");
+    assert_eq!(rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_schema_row_insert_does_not_count_as_statement_change() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1),(2),(3)").unwrap();
+
+    // The sqlite_schema row insert must count neither in the statement change
+    // count nor in last_insert_rowid. Under MVCC the schema cursor reports
+    // the schema table id as its root page, not page 1.
+    let mut stmt = conn
+        .prepare("CREATE TABLE dst AS SELECT * FROM src WHERE id > 1")
+        .unwrap();
+    stmt.run_ignore_rows().unwrap();
+    assert_eq!(
+        stmt.n_change(),
+        2,
+        "CTAS must count only the copied data rows"
+    );
+
+    let last_rowid_before = conn.last_insert_rowid();
+    let mut stmt = conn.prepare("CREATE TABLE empty_t(x)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    assert_eq!(stmt.n_change(), 0, "plain CREATE TABLE changes no rows");
+    assert_eq!(
+        conn.last_insert_rowid(),
+        last_rowid_before,
+        "the schema row insert must not update last_insert_rowid"
+    );
+}
+
+#[test]
+fn test_open_with_mvcc_option_converts_fresh_database() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("fresh.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(
+        db.mvcc_enabled(),
+        "open must leave the database in MVCC mode"
+    );
+    {
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    // A later open without the flag still comes up in MVCC mode: the journal
+    // mode is a property of the database, not of the open.
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(db.mvcc_enabled());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_open_with_mvcc_option_converts_existing_wal_database() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("wal.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(!db.mvcc_enabled());
+    {
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'wal-era')").unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(db.mvcc_enabled(), "open must convert the WAL database");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT c FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "wal-era");
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'mvcc-era')")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT c FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("ro.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    {
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default() | OpenFlags::ReadOnly,
+        DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(
+        !db.mvcc_enabled(),
+        "a read-only open cannot write the conversion"
+    );
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
+#[test]
+fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_marker() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original')")
+        .unwrap();
+    setup.close().unwrap();
+
+    let concurrent = db.connect();
+    let exclusive = db.connect();
+    concurrent.execute("BEGIN CONCURRENT").unwrap();
+    concurrent.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let update_err = exclusive
+        .execute("UPDATE t SET text = 'exclusive' WHERE id = 1")
+        .expect_err("exclusive writer must not replace another transaction's delete marker");
+    assert!(matches!(update_err, LimboError::WriteWriteConflict));
+    assert!(exclusive.get_auto_commit());
+
+    let rows = get_rows(&concurrent, "SELECT * FROM t");
+    assert!(
+        rows.is_empty(),
+        "concurrent tx should still see its own delete"
+    );
+    concurrent.execute("COMMIT").unwrap();
+    assert!(
+        concurrent.get_auto_commit(),
+        "concurrent transaction should remain usable after rejected exclusive write"
+    );
+
+    let rows = get_rows(&exclusive, "SELECT id, text FROM t");
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn test_explicit_delete_conflicts_with_concurrent_delete_without_replacing_marker() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original')")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES(2, 'keep')").unwrap();
+    setup.close().unwrap();
+
+    let concurrent = db.connect();
+    let exclusive = db.connect();
+    concurrent.execute("BEGIN CONCURRENT").unwrap();
+    concurrent.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    exclusive.execute("BEGIN").unwrap();
+    let rows = get_rows(&exclusive, "SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    let delete_err = exclusive
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("exclusive delete must conflict instead of stealing row marker");
+    assert!(matches!(delete_err, LimboError::WriteWriteConflict));
+    assert!(exclusive.get_auto_commit());
+
+    let rows = get_rows(&concurrent, "SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    concurrent.execute("COMMIT").unwrap();
+    let rows = get_rows(&exclusive, "SELECT id, text FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_delete_of_btree_row_conflicts_with_committed_concurrent_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original'), (2, 'keep')")
+        .unwrap();
+    let store = db.get_mvcc_store();
+    let root_page = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let row_id = RowID::new(store.get_table_id_from_root_page(root_page), RowKey::Int(1));
+    assert!(
+        store.rows.get(&row_id).is_none(),
+        "the row must live only in the B-tree for this test to mean anything"
+    );
+    setup.close().unwrap();
+
+    let stale = db.connect();
+    let deleter = db.connect();
+    stale.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(get_rows(&stale, "SELECT id FROM t ORDER BY id").len(), 2);
+    deleter.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let err = stale
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("a delete of a row another transaction already deleted must conflict");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "{err:?}");
+    assert!(stale.get_auto_commit());
+
+    let rows = get_rows(&deleter, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, text TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(1, 'original'), (2, 'keep')")
+        .unwrap();
+    let store = db.get_mvcc_store();
+    let root_page = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let row_id = RowID::new(store.get_table_id_from_root_page(root_page), RowKey::Int(1));
+    assert!(store.rows.get(&row_id).is_none());
+    setup.close().unwrap();
+
+    let first = db.connect();
+    let second = db.connect();
+    first.execute("BEGIN CONCURRENT").unwrap();
+    first.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    second.execute("BEGIN CONCURRENT").unwrap();
+    let err = second
+        .execute("DELETE FROM t WHERE id = 1")
+        .expect_err("a delete of a row another open transaction deleted must conflict");
+    assert!(matches!(err, LimboError::WriteWriteConflict), "{err:?}");
+    assert!(second.get_auto_commit());
+
+    first.execute("COMMIT").unwrap();
+    let rows = get_rows(&second, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+/// Regression for #6754: dropping a Statement that paused mid-IO inside
+/// op_new_rowid leaks the per-table RowidAllocator lock. With the Drop
+/// impl on MvccLazyCursor, end_new_rowid runs on cursor teardown so the
+/// next INSERT into the same table from any connection makes progress.
+#[test]
+fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
+    use std::time::{Duration, Instant};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let leaker = db.connect();
+    let victim = db.connect();
+
+    // Force the seek that runs from inside op_new_rowid's SeekingToLast
+    // to yield IO at SeekStart. At that moment the rowid allocator lock
+    // is held.
+    leaker.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::SeekStart.point()
+    ])));
+
+    let mut leak_stmt = leaker
+        .prepare("INSERT INTO t VALUES (NULL, 'leaker')")
+        .unwrap();
+    match leak_stmt.step().unwrap() {
+        turso_core::StepResult::Yield => {}
+        other => panic!("expected yield from injected seek_start; got {other:?}"),
+    }
+
+    // Drop the statement without advancing past the yield. The Drop impl
+    // on MvccLazyCursor must release the rowid allocator lock.
+    drop(leak_stmt);
+    leaker.set_yield_injector(None);
+
+    // A different connection must now be able to INSERT into the same
+    // table within a small budget.
+    let mut victim_stmt = victim
+        .prepare("INSERT INTO t VALUES (NULL, 'victim')")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() >= deadline {
+            panic!("victim INSERT did not complete within 5s — rowid allocator lock leaked");
+        }
+        match victim_stmt.step().unwrap() {
+            turso_core::StepResult::Done => break,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => continue,
+            other => panic!("unexpected step result on victim INSERT: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn exclusive_commit_failure_at_after_remove_tx_strands_exclusive_atom() {
+    let db = MvccTestDbNoConn::new();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        LimboError::TxError("synthetic AfterRemoveTx failure".to_string()),
+    )])));
+
+    conn_a
+        .execute("COMMIT")
+        .expect_err("COMMIT must surface the injected TxError");
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    let step_result = loop {
+        match commit_b.step() {
+            Ok(StepResult::IO | StepResult::Yield) => continue,
+            other => break other,
+        }
+    };
+
+    match step_result {
+        Ok(StepResult::Done) => {}
+        Ok(other) => panic!("stage 3: unexpected step result: {other:?}"),
+        Err(err) => panic!("INSERT after failed commit must not return error, got {err}"),
+    }
+}
+
+/// Regression for #6755: dropping a Statement driving an EXCLUSIVE
+/// (BEGIN IMMEDIATE) COMMIT at `LogRecordPrepared` used to leak both
+/// `pager_commit_lock` and the `exclusive_tx` atomic. With abort-side
+/// `cleanup_abandoned_mvcc_commit` calling `rollback_tx`, both are
+/// released and a second connection's BEGIN IMMEDIATE makes progress.
+#[test]
+fn dropped_exclusive_commit_releases_locks() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    let tx_a = conn_a
+        .get_mv_tx()
+        .map(|(tx_id, _)| tx_id)
+        .expect("EXCLUSIVE tx_a must be open after INSERT");
+    assert!(
+        mv_store.is_exclusive_tx(&tx_a),
+        "EXCLUSIVE tx_a must own the exclusive_tx atomic"
+    );
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn_a.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            turso_core::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn_a.set_yield_injector(None);
+
+    // After abort, exclusive_tx must be released.
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "exclusive_tx must be released by abort-side cleanup"
+    );
+
+    // conn_b must be able to take the exclusive lock.
+    conn_b.execute("BEGIN IMMEDIATE").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn_b, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn dropped_main_commit_rolls_back_temp_schema_changes() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'main')").unwrap();
+    conn.execute("CREATE TEMP TABLE temp_only (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX temp_only_v_idx ON temp_only(v)")
+        .unwrap();
+
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            turso_core::StepResult::Yield => {}
+            other => panic!("expected yield at LogRecordPrepared; got {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+
+    let temp_err = match conn.prepare("SELECT * FROM temp_only") {
+        Ok(_) => {
+            panic!("abandoned COMMIT must roll back temp schema created inside the transaction")
+        }
+        Err(err) => err,
+    };
+    assert!(
+        temp_err.to_string().contains("no such table"),
+        "expected rolled-back temp table to be absent, got {temp_err}",
+    );
+    let rows = get_rows(&conn, "SELECT id FROM t ORDER BY id");
+    assert!(
+        rows.is_empty(),
+        "abandoned COMMIT must roll back main MVCC writes too",
+    );
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// DurableStorage::log_tx returning Busy should not leak pager_commit_lock.
+/// https://github.com/tursodatabase/turso/issues/6753.
+#[test]
+fn busy_from_log_tx_does_not_block_subsequent_commit_with_group_commit() {
+    busy_from_log_tx_does_not_block_subsequent_commit(true);
+}
+
+#[test]
+fn busy_from_log_tx_does_not_block_subsequent_commit_without_group_commit() {
+    busy_from_log_tx_does_not_block_subsequent_commit(false);
+}
+
+fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
+    use std::time::Duration;
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::EncryptionContext;
+    use turso_core::{CheckpointResult, File, Result, IO};
+
+    /// BusyOnLogTxStorage is a test double that can be stubbed to return [LimboError::Busy] from log_tx.
+    #[derive(Debug)]
+    struct BusyOnLogTxStorage {
+        inner: Arc<dyn DurableStorage>,
+        arm_log_tx_busy: AtomicBool,
+    }
+    impl BusyOnLogTxStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                arm_log_tx_busy: AtomicBool::new(false),
+            })
+        }
+        fn arm(&self) {
+            self.arm_log_tx_busy.store(true, Ordering::Release);
+        }
+    }
+    impl DurableStorage for BusyOnLogTxStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_id: &RowID,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            if self.arm_log_tx_busy.swap(false, Ordering::AcqRel) {
+                return Err(LimboError::Busy);
+            }
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    fn drive_to_done_or_timeout(stmt: &mut Statement, budget: usize) {
+        for _ in 0..budget {
+            match stmt.step() {
+                Ok(StepResult::Done) => return,
+                Ok(StepResult::IO | StepResult::Yield) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(other) => panic!("unexpected step: {other:?}"),
+                Err(error) => panic!("received error: {error}"),
+            }
+        }
+        panic!("budged elapsed: {budget} iterations");
+    }
+
+    // Step 1: open normally so PRAGMA journal_mode=mvcc creates the logical log.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    // Step 3: re-open with the busy-on-log_tx storage wrapper.
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file,
+        io.clone(),
+        None,
+    ));
+    let busy_storage = BusyOnLogTxStorage::new(inner_storage);
+    let db = Database::open(
+        io,
+        &path_str,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(busy_storage.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+
+    let conn_a = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn_b = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn_a
+        .execute(format!(
+            "PRAGMA mvcc_group_commit = {}",
+            if group_commit { "on" } else { "off" }
+        ))
+        .unwrap();
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let mv_store: Arc<Store> = db.get_mv_store().clone().unwrap();
+
+    // Step 3: open a CONCURRENT tx, do an INSERT, then arm log_tx Busy.
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_a = conn_a
+        .get_mv_tx()
+        .map(|(tx_id, _)| tx_id)
+        .expect("tx_a must be open after INSERT");
+    assert!(
+        !mv_store.is_exclusive_tx(&tx_a),
+        "tx_a must be CONCURRENT (non-exclusive) so it goes through BeginCommitLogicalLog"
+    );
+    busy_storage.arm();
+
+    conn_a
+        .execute("COMMIT")
+        .expect_err("COMMIT must surface the injected Busy from log_tx");
+
+    // Step 4: from another CONCURRENT tx, do an INSERT; the INSERT should go through.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    drive_to_done_or_timeout(&mut commit_b, 30); // this times out if pager_commit_lock or the group retry set is leaked
+}
+
+/// `on_log_write_complete` may return extra durability work (turso-server waits
+/// for S3). The logical-log offset must not advance until that completion
+/// finishes.
+#[test]
+fn logical_log_offset_advances_only_after_on_log_write_complete() {
+    use turso_core::io::FileSyncType;
+    use turso_core::mvcc;
+    use turso_core::mvcc::database::{LogRecord, RowVersion};
+    use turso_core::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use turso_core::mvcc::persistent_storage::DurableStorage;
+    use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
+    use turso_core::EncryptionContext;
+    use turso_core::{CheckpointResult, File, Result, IO};
+
+    #[derive(Debug)]
+    struct DeferredOnLogWriteCompleteStorage {
+        inner: Arc<dyn DurableStorage>,
+        arm: AtomicBool,
+        pending: Mutex<Option<Completion>>,
+        advances: AtomicU64,
+    }
+    impl DeferredOnLogWriteCompleteStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                arm: AtomicBool::new(false),
+                pending: Mutex::new(None),
+                advances: AtomicU64::new(0),
+            })
+        }
+        fn arm(&self) {
+            self.arm.store(true, Ordering::Release);
+        }
+        fn take_pending(&self) -> Option<Completion> {
+            self.pending.lock().take()
+        }
+        fn advance_count(&self) -> u64 {
+            self.advances.load(Ordering::Acquire)
+        }
+    }
+    impl DurableStorage for DeferredOnLogWriteCompleteStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_id: &RowID,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn on_log_write_complete(&self) -> Result<Completion> {
+            if self.arm.swap(false, Ordering::AcqRel) {
+                let c = Completion::new_wait();
+                *self.pending.lock() = Some(c.clone());
+                return Ok(c);
+            }
+            self.inner.on_log_write_complete()
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            if self.pending.lock().as_ref().is_some_and(|c| !c.finished()) {
+                panic!("logical log offset advanced before on_log_write_complete finished");
+            }
+            self.advances.fetch_add(1, Ordering::AcqRel);
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    fn open_db(
+        storage: &Arc<DeferredOnLogWriteCompleteStorage>,
+        io: Arc<dyn IO>,
+        path: &str,
+    ) -> Arc<Database> {
+        Database::open(
+            io,
+            path,
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+        )
+        .unwrap()
+    }
+
+    fn drive_commit_until_wait(
+        stmt: &mut Statement,
+        storage: &DeferredOnLogWriteCompleteStorage,
+        io: &Arc<dyn IO>,
+    ) -> Completion {
+        for _ in 0..10_000 {
+            match stmt.step().unwrap() {
+                StepResult::Done => panic!("COMMIT finished before on_log_write_complete wait"),
+                StepResult::IO | StepResult::Yield => {
+                    if let Some(c) = storage.take_pending() {
+                        return c;
+                    }
+                    io.step().unwrap();
+                }
+                other => panic!("unexpected step: {other:?}"),
+            }
+        }
+        panic!("COMMIT never reached on_log_write_complete wait")
+    }
+
+    fn drive_commit_after_wait(stmt: &mut Statement, io: &Arc<dyn IO>) {
+        for _ in 0..10_000 {
+            match stmt.step().unwrap() {
+                StepResult::Done => return,
+                StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                other => panic!("unexpected step: {other:?}"),
+            }
+        }
+        panic!("COMMIT never finished after on_log_write_complete")
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file,
+        io.clone(),
+        None,
+    ));
+    let storage = DeferredOnLogWriteCompleteStorage::new(inner_storage);
+    let db = open_db(&storage, io.clone(), &path_str);
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let advances_before = storage.advance_count();
+    storage.arm();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let wait = drive_commit_until_wait(&mut commit, &storage, &io);
+    assert_eq!(
+        storage.advance_count(),
+        advances_before,
+        "offset must not advance while on_log_write_complete is still pending"
+    );
+    wait.complete(0);
+    drive_commit_after_wait(&mut commit, &io);
+    drop(commit);
+    assert!(
+        storage.advance_count() > advances_before,
+        "offset must advance after on_log_write_complete finishes"
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    storage.arm();
+    let mut abandoned = conn.prepare("COMMIT").unwrap();
+    let _wait = drive_commit_until_wait(&mut abandoned, &storage, &io);
+    drop(abandoned);
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t"),
+        vec![vec![Value::from_i64(1)]],
+        "dropping COMMIT while extra durability is pending must not publish the row"
+    );
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    storage.arm();
+    let mut retry = conn.prepare("COMMIT").unwrap();
+    let wait = drive_commit_until_wait(&mut retry, &storage, &io);
+    wait.complete(0);
+    drive_commit_after_wait(&mut retry, &io);
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t ORDER BY id"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
+fn test_dropped_commit_corrupts_subsequent_insert() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([LogRecordPrepared.point()])));
+
+    {
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            StepResult::IO | StepResult::Yield | StepResult::Done => {}
+            other => panic!("unexpected step result: {other:?}"),
+        };
+    }
+
+    conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+}
+
+#[test]
+fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
+        StepResult::Yield => {} // tx will immediately hit injected yield point
+        other => panic!("tx should yield, got: {other:?}"),
+    }
+
+    assert!(matches!(
+        conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
+        LimboError::NoActiveTransaction { .. }
+    ));
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    match conn_b.prepare("COMMIT").unwrap().step() {
+        Ok(StepResult::IO) => {}
+        Err(err) => panic!("conn_b COMMIT must not error; got: {err:?}"),
+        _ => {}
+    }
+}
+
+/// A concurrent explicit rowid insert must raise the allocator watermark before
+/// another transaction performs auto-rowid allocation. Otherwise later auto
+/// inserts can overwrite the explicit row and leave secondary indexes stale.
+#[test]
+fn test_concurrent_explicit_rowid_high_watermark_not_clobbered() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v) VALUES (1000, 'A-explicit')")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(v) VALUES ('B-auto')").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn0, "SELECT rowid, v FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1000);
+    assert_eq!(rows[0][1].to_string(), "A-explicit");
+    assert_eq!(rows[1][0].as_int().unwrap(), 1001);
+    assert_eq!(rows[1][1].to_string(), "B-auto");
+}
+
+#[test]
+fn test_concurrent_explicit_rowid_auto_rowid_does_not_walk_back_into_collision() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v) VALUES (5, 'A')")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..5 {
+        conn2
+            .execute(format!("INSERT INTO t(v) VALUES ('B{i}')"))
+            .unwrap();
+    }
+    conn2.execute("COMMIT").unwrap();
+    conn1
+        .execute("COMMIT")
+        .expect("explicit rowid transaction should not conflict with auto rowids");
+
+    let rows = get_rows(&conn0, "SELECT rowid, v FROM t ORDER BY rowid");
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0][0].as_int().unwrap(), 5);
+    assert_eq!(rows[0][1].to_string(), "A");
+    for i in 0..5 {
+        assert_eq!(rows[i + 1][0].as_int().unwrap(), 6 + i as i64);
+        assert_eq!(rows[i + 1][1].to_string(), format!("B{i}"));
+    }
+}
+
+#[test]
+fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, k INTEGER)")
+        .unwrap();
+    conn1.execute("CREATE INDEX t_k ON t(k)").unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("INSERT INTO t(id, v, k) VALUES (5, 'A', 999)")
+        .unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t(v, k) VALUES ('B', 100)")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    for (v, k) in [("p2", 200), ("p3", 300), ("p4", 400), ("p5", 500)] {
+        conn1
+            .execute(format!("INSERT INTO t(v, k) VALUES ('{v}', {k})"))
+            .unwrap();
+    }
+
+    let integrity = get_rows(&conn1, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(
+        integrity[0][0].to_string(),
+        "ok",
+        "integrity_check should not report stale secondary index entries"
+    );
+
+    let indexed = get_rows(
+        &conn1,
+        "SELECT rowid, v, k FROM t INDEXED BY t_k WHERE k = 999",
+    );
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0][0].as_int().unwrap(), 5);
+    assert_eq!(indexed[0][1].to_string(), "A");
+    assert_eq!(indexed[0][2].as_int().unwrap(), 999);
+}
+
+#[test]
+fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t(id, v) VALUES(-5, 'manual')")
+        .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES('auto')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), -5);
+    assert_eq!(rows[0][1].to_string(), "manual");
+    assert_eq!(rows[1][0].as_int().unwrap(), -4);
+    assert_eq!(rows[1][1].to_string(), "auto");
+}
+
+/// A passive checkpoint must not panic when collecting or writing a user-data tombstone
+/// for a table whose B-tree was destroyed in a prior checkpoint (e.g. DROP SEQUENCE after
+/// the backing table was materialized).
+#[test]
+fn test_passive_checkpoint_skips_late_tombstone_after_prior_destroy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mv_store = db.get_db().get_mv_store().clone().unwrap();
+    let rootpage = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mv_store.get_table_id_from_root_page(rootpage);
+
+    conn.execute("DROP TABLE t").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    // BEGIN CONCURRENT is deferred; run a statement to materialize the
+    // transaction before driving the MvStore directly.
+    let _ = get_rows(&conn, "SELECT count(*) FROM sqlite_schema");
+    let tx = conn.get_mv_tx().map(|(tx_id, _)| tx_id).unwrap();
+    mv_store
+        .delete(tx, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Autoincrement in an ATTACH'd MVCC database must persist across checkpoint + restart.
+///
+/// Before the fix, dirty_sequences lacked a database_id so flush always targeted main,
+/// and the checkpoint compaction only read main's schema — values silently reset on restart.
+#[test]
+fn test_autoincrement_in_attached_mvcc_database() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let opts = DatabaseOpts::new().with_attach(true);
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+
+    // Create a second temp file for the attached database.
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    // Phase 1: attach, create table, insert, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('b')").unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('c')").unwrap();
+
+        // Checkpoint the attached db
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: restart main, re-attach, insert — id must be 4
+    db.close();
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        conn.execute("INSERT INTO aux.t(val) VALUES ('d')").unwrap();
+        let rows = get_rows(&conn, "SELECT MAX(id) FROM aux.t");
+        let max_id = rows[0][0].as_int().unwrap();
+        assert_eq!(
+            max_id, 4,
+            "after restart, next autoincrement id must be 4, got {max_id}"
+        );
+    }
+}
+
+/// Explicit sequences in an ATTACH'd MVCC database must persist across checkpoint + restart.
+#[test]
+fn test_create_sequence_in_attached_mvcc_database() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let opts = DatabaseOpts::new().with_attach(true);
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    // Phase 1: attach, create sequence, advance it, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        // Create an autoincrement table in aux to ensure sqlite_sequence exists
+        conn.execute("CREATE TABLE aux.dummy(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .unwrap();
+
+        conn.execute("CREATE SEQUENCE aux.my_seq").unwrap();
+
+        // Advance the sequence 3 times
+        for _ in 0..3 {
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let rows = get_rows(&conn, "SELECT nextval('aux.my_seq')");
+            assert_eq!(rows.len(), 1);
+            conn.execute("COMMIT").unwrap();
+        }
+
+        // Checkpoint aux
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: restart, re-attach, nextval must resume from 4
+    db.close();
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        let rows = get_rows(&conn, "SELECT nextval('aux.my_seq')");
+        let val = rows[0][0].as_int().unwrap();
+        assert_eq!(
+            val, 4,
+            "after restart, nextval should resume from 4, got {val}"
+        );
+    }
+}
+
+/// Regression: a non-CYCLE `nextval` issued inside a `BEGIN CONCURRENT`
+/// transaction must never drive `op_sequence_commit_inner_tx` to retry.
+/// The autonomous inner tx is only allowed to absorb conflicts that
+/// are *inherent* to two concurrent allocations of the same sequence
+/// value (PK collision on the new watermark row). Any additional
+/// contention surface — most notably inline backing-table compaction
+/// (Delete of the prior watermark row that concurrent allocators also
+/// touch) — is a design regression and is forbidden on this hot path.
+///
+/// Autocommit nextval is uninteresting here: `begin_write_on_database`
+/// opens an *exclusive* outer tx, so `op_sequence_begin_inner_tx`
+/// takes the `SEQ_PATH_SKIPPED` branch and no inner tx ever wraps.
+/// Concurrent execution is only possible via explicit
+/// `BEGIN CONCURRENT`, which is the path this test exercises.
+///
+/// Staging: tx A begins concurrent and runs `nextval`, which wraps in
+/// an autonomous inner tx. We pin that inner tx's commit at a yield
+/// point so its writes are still uncommitted. Tx B then runs a full
+/// autocommit `nextval` end-to-end (it gets the watermark before A
+/// because A's writes are invisible). When A resumes, its inner-tx
+/// commit must complete without retry: the only allowed retry source
+/// (new-value PK collision) is avoided because B's commit has already
+/// advanced disk past A's chosen target.
+///
+/// `Connection::sequence_inner_retries` is the cross-statement
+/// observability hook (see its doc): assert it is zero across the
+/// scenario.
+#[test]
+fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        // Prime the backing table so the first observed allocation is
+        // not the special start-row overwrite (which doesn't exercise
+        // the compaction Delete). After this, the table is in the
+        // "1 historical row + 1 new row per nextval" steady state.
+        for _ in 0..3 {
+            setup.execute("SELECT nextval('s')").unwrap();
+        }
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.reset_sequence_inner_retries();
+    conn_b.reset_sequence_inner_retries();
+
+    // A: BEGIN CONCURRENT so the outer tx is Concurrent, not exclusive.
+    // The next `nextval` will wrap in an autonomous inner Concurrent tx
+    // (path = SEQ_PATH_WRAPPED). That inner tx is the one whose commit
+    // path must never retry.
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+
+    // Pin A AFTER its inner-tx commit publishes the new watermark, but
+    // before the post-commit cleanup that removes the tx from `txs`.
+    // At this point A's row is visible to any snapshot taken later —
+    // so B's BEGIN CONCURRENT below sees A's K+1 and picks K+2 instead
+    // of K+1, sidestepping the unavoidable "two readers see same MAX,
+    // both target MAX+1" PK collision. With that collision removed,
+    // any retry observed is from contention on a *shared* row written
+    // by the nextval path (the canary the test exists to enforce).
+    let injector = FixedYieldInjector::new([CommitYieldPoint::BeforeFinishCommittedTx.point()]);
+    conn_a.set_yield_injector(Some(injector.clone()));
+    let mut next_a = conn_a.prepare("SELECT nextval('s')").unwrap();
+    // Drive past real cursor-read IOs (page cache misses on the backing
+    // table) and stop precisely when the injector has fired. `nextval`
+    // emits many cursor instructions before the inner-tx commit, so a
+    // "break on first StepResult::IO" loop would exit on a real IO
+    // rather than the synthetic injected yield. The FixedYieldInjector
+    // consumes its entry on the first matching `should_yield` call, so
+    // `is_empty()` after a step is the unambiguous signal that the
+    // inject point was reached.
+    let injected = loop {
+        match next_a.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if injector.is_empty() {
+                    break true;
+                }
+                conn_a.get_pager().io.step().unwrap();
+            }
+            StepResult::Done | StepResult::Row => break false,
+            other => panic!(
+                "unexpected step result while driving A's nextval to its \
+                 inner-tx commit yield: {other:?}"
+            ),
+        }
+    };
+    assert!(
+        injected,
+        "A's nextval inner-tx commit should yield at \
+         BeforeFinishCommittedTx; injector did not fire — yield-point \
+         lineup likely shifted."
+    );
+
+    // B also goes Concurrent (an autocommit nextval would try to open an
+    // exclusive tx and busy out against A's in-flight Concurrent inner
+    // tx). B's snapshot does not see A's not-yet-committed inner-tx
+    // writes, so B inserts watermark+1 in its own inner tx. With the
+    // design invariant (no hot-path writes of shared rows in nextval),
+    // B's nextval and commit both succeed cleanly. If anything in this
+    // sequence fails with WriteWriteConflict, it is the canary: A and
+    // B touched a shared row — almost certainly the prior watermark
+    // that inline backing-table compaction deletes.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    let b_nextval = conn_b.execute("SELECT nextval('s')");
+    assert!(
+        !matches!(b_nextval, Err(LimboError::WriteWriteConflict)),
+        "B's `SELECT nextval('s')` returned WriteWriteConflict against \
+         A's parked inner tx. Two concurrent nextvals on a non-CYCLE \
+         seq must not share a written row — this is the canary for \
+         inline backing-table compaction or any other hot-path write \
+         of a shared row. See PR #7137: inline compaction is not \
+         allowed."
+    );
+    b_nextval.unwrap();
+    let b_commit = conn_b.execute("COMMIT");
+    assert!(
+        !matches!(b_commit, Err(LimboError::WriteWriteConflict)),
+        "B's COMMIT returned WriteWriteConflict against A's parked \
+         inner tx. Same canary as the nextval assertion above — \
+         a shared written row exists somewhere on the nextval path."
+    );
+    b_commit.unwrap();
+
+    // Resume A's inner-tx commit. Any retry here is a regression — the
+    // test's whole point is that the inner-tx commit path is free of
+    // contended-write surfaces beyond the (here-avoided) new-watermark
+    // PK.
+    conn_a.set_yield_injector(None);
+    let a_finish = next_a.run_collect_rows();
+    drop(next_a);
+    assert!(
+        !matches!(a_finish, Err(LimboError::WriteWriteConflict)),
+        "A's resumed inner-tx commit returned WriteWriteConflict — \
+         same canary as B above; the inner tx wrote a row B's commit \
+         already touched. See PR #7137."
+    );
+    a_finish.unwrap();
+    conn_a.execute("COMMIT").unwrap();
+
+    let a_retries = conn_a.sequence_inner_retries();
+    let b_retries = conn_b.sequence_inner_retries();
+    assert_eq!(
+        a_retries, 0,
+        "A's inner tx retried — `Connection::sequence_inner_retries` \
+         is the canary for inline backing-table compaction or any \
+         other hot-path write of a shared row. See PR #7137: inline \
+         compaction is not allowed."
+    );
+    assert_eq!(
+        b_retries, 0,
+        "B's inner tx retried — same canary as A. See PR #7137."
+    );
+}
+
+#[test]
+fn test_nextval_inner_tx_retry_keeps_outer_concurrent_tx_committable() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        setup.execute("CREATE TABLE t(x)").unwrap();
+        setup.execute("CREATE TABLE u(x)").unwrap();
+        setup.execute("SELECT nextval('s')").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.reset_sequence_inner_retries();
+
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let injector = FixedYieldInjector::new([CommitYieldPoint::CommitValidation.point()]);
+    conn_b.set_yield_injector(Some(injector.clone()));
+    let mut insert_b = conn_b.prepare("INSERT INTO u VALUES (1)").unwrap();
+    loop {
+        match insert_b.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                if injector.is_empty() {
+                    break;
+                }
+                conn_b.get_pager().io.step().unwrap();
+            }
+            other => panic!("B's insert should yield inside its commit, got {other:?}"),
+        }
+    }
+
+    let mut next_a = conn_a.prepare("SELECT nextval('s')").unwrap();
+    let mut seek_injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+    conn_a.set_yield_injector(Some(seek_injector.clone()));
+    while conn_a.sequence_inner_retries() == 0 {
+        if seek_injector.is_empty() {
+            seek_injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+            conn_a.set_yield_injector(None);
+            conn_a.set_yield_injector(Some(seek_injector.clone()));
+        }
+        match next_a.step().unwrap() {
+            StepResult::IO | StepResult::Yield => conn_a.get_pager().io.step().unwrap(),
+            other => panic!("A's nextval should retry its inner tx while B commits, got {other:?}"),
+        }
+    }
+    conn_a.set_yield_injector(None);
+
+    conn_b.set_yield_injector(None);
+    insert_b.run_collect_rows().unwrap();
+    drop(insert_b);
+
+    next_a.run_collect_rows().unwrap();
+    drop(next_a);
+    conn_a.execute("COMMIT").unwrap();
+
+    let reader = db.connect();
+    let rows = get_rows(&reader, "SELECT x FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
+
+#[test]
+fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
+    let db = MvccTestDbNoConn::new();
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    setup.execute("CREATE SEQUENCE s").unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let nextval_conn = db.connect();
+    let setval_conn = db.connect();
+
+    nextval_conn.execute("BEGIN CONCURRENT").unwrap();
+    setval_conn.execute("BEGIN CONCURRENT").unwrap();
+    nextval_conn.execute("DELETE FROM t WHERE TRUE").unwrap();
+
+    let setval_rows = get_rows(&setval_conn, "SELECT setval('s', 100, true)");
+    assert_eq!(setval_rows[0][0].as_int().unwrap(), 100);
+
+    let nextval = nextval_conn.execute("SELECT nextval('s')");
+    assert!(
+        matches!(nextval, Err(LimboError::WriteWriteConflict)),
+        "conflicting nextval must abort with WriteWriteConflict, got {nextval:?}"
+    );
+
+    setval_conn.execute("COMMIT").unwrap();
+
+    assert!(
+        nextval_conn.get_auto_commit(),
+        "write-write conflict must leave the losing connection in autocommit"
+    );
+    assert_eq!(
+        nextval_conn.get_mv_tx().map(|(tx_id, _)| tx_id),
+        None,
+        "write-write conflict must clear the losing connection's MVCC tx"
+    );
+
+    let commit = nextval_conn.execute("COMMIT");
+    assert!(
+        matches!(commit, Err(LimboError::NoActiveTransaction { .. })),
+        "COMMIT after conflict rollback must report no active transaction, got {commit:?}"
+    );
+
+    let rows = get_rows(&setup, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        1,
+        "the DELETE from the rolled-back transaction must not persist"
+    );
+}
+
+/// Regression: a multi-row `INSERT INTO autoinc_table VALUES (...), (...)`
+/// inside `BEGIN CONCURRENT` whose second-row nextval exhausts the
+/// AUTOINCREMENT sequence must leave NO partial row committed — even
+/// though the autonomous inner-tx pattern means the first row's
+/// nextval already committed its sequence advance independently of the
+/// outer tx.
+///
+/// The bug Nikita reported on PR #7137 (2026-05-26): after setting the
+/// AUTOINCREMENT seq one step below i64::MAX and trying to insert two
+/// rows, the first row's table insert leaked through to the post-COMMIT
+/// state despite the statement returning `DatabaseFull`. Root cause was
+/// twofold:
+///
+///   * `set_insert_stmt_journal_flags` did not flag AUTOINCREMENT inserts
+///     as `may_abort`, so the statement-level MVCC savepoint was never
+///     opened and the outer tx's table-row write had nothing to roll back
+///     against on error.
+///   * The vdbe abort path called `end_statement(RollbackSavepoint)` via
+///     `connection.get_mv_tx().map(|(tx_id, _)| tx_id)`, but that returned the still-pending
+///     autonomous inner-tx id (the inner tx began but never reached
+///     `op_sequence_commit_inner_tx`). The savepoint rollback ran against
+///     the wrong tx and left the outer tx's row in its write_set.
+///
+/// Both halves of the fix must hold for this test to pass.
+#[test]
+fn test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE autoinc(x INTEGER PRIMARY KEY AUTOINCREMENT, y)")
+        .unwrap();
+    setup
+        .execute(
+            "SELECT setval('__turso_internal_autoincrement_autoinc', \
+             9223372036854775807 - 1)",
+        )
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    // Second row's nextval exhausts the seq → DatabaseFull. The first
+    // row's table write must be rolled back at the statement level.
+    let insert = conn.execute("INSERT INTO autoinc(y) VALUES (1), (2)");
+    assert!(
+        matches!(insert, Err(LimboError::DatabaseFull)),
+        "expected DatabaseFull on the second nextval, got {insert:?}"
+    );
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT x, y FROM autoinc");
+    assert!(
+        rows.is_empty(),
+        "INSERT VALUES (1), (2) errored mid-statement on sequence exhaustion; \
+         per-statement atomicity requires zero rows to land in the table, but \
+         saw {} row(s): {rows:?}",
+        rows.len(),
+    );
+}
+
+/// Companion to `test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion`:
+/// when a `BEGIN CONCURRENT` block runs several *single-statement*
+/// INSERTs into the same AUTOINCREMENT table, each statement is either
+/// fully committed or fully rolled back (no partial state). Earlier
+/// successful statements must NOT be undone by a later statement's
+/// sequence-exhaustion failure — only the failing statement is.
+///
+/// Setup arranges the seq with exactly two values remaining: the third
+/// INSERT exhausts. After COMMIT, the first two successful inserts
+/// must survive and the failed third must contribute nothing.
+///
+/// Uses a single-column AUTOINCREMENT table so every INSERT is purely
+/// a sequence-driven row allocation — there is no other column whose
+/// value could mask a per-row write surviving its statement's
+/// rollback.
+#[test]
+fn test_per_statement_atomicity_across_multi_statement_autoincrement_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE only_id(x INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    // Leave room for exactly two more emissions: nextval will yield
+    // MAX-1 and MAX, then the third call returns DatabaseFull.
+    setup
+        .execute(
+            "SELECT setval('__turso_internal_autoincrement_only_id', \
+             9223372036854775807 - 2)",
+        )
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn = db.connect();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // First two single-statement INSERTs must succeed end-to-end.
+    let r1 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
+    assert!(r1.is_ok(), "first INSERT must succeed, got {r1:?}");
+    let r2 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
+    assert!(r2.is_ok(), "second INSERT must succeed, got {r2:?}");
+
+    // The third statement exhausts the seq mid-flight and must fail.
+    let r3 = conn.execute("INSERT INTO only_id DEFAULT VALUES");
+    assert!(
+        matches!(r3, Err(LimboError::DatabaseFull)),
+        "third INSERT must exhaust the seq and return DatabaseFull, got {r3:?}"
+    );
+
+    // The outer tx is still alive — its first two successful statements
+    // stay in the write_set, the failing third contributed nothing,
+    // and COMMIT publishes exactly two rows.
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT x FROM only_id ORDER BY x");
+    assert_eq!(
+        rows.len(),
+        2,
+        "two committed inserts must survive a later failing statement; \
+         got {} row(s): {rows:?}",
+        rows.len(),
+    );
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        9223372036854775806,
+        "first surviving row id"
+    );
+    assert_eq!(
+        rows[1][0].as_int().unwrap(),
+        9223372036854775807,
+        "second surviving row id"
+    );
+}
+
+/// Regression: the same stale `global_header` overwrite can lose user-visible
+/// database-header state, not just regress the internal schema cookie.
+///
+/// `PRAGMA user_version` is committed through the MVCC header path. If an older
+/// transaction resumes after that newer header-only commit and overwrites
+/// `global_header` with its stale header snapshot, users observe the committed
+/// user_version move backward.
+#[test]
+fn test_global_header_regression_would_lose_committed_user_version() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup.execute("PRAGMA user_version = 7").unwrap();
+        setup
+            .execute("INSERT INTO t VALUES (1, 'initial')")
+            .unwrap();
+        setup.close().unwrap();
+    }
+
+    let older = db.connect();
+    let header_writer = db.connect();
+    let observer = db.connect();
+
+    older.execute("BEGIN CONCURRENT").unwrap();
+    older
+        .execute("UPDATE t SET v = 'older' WHERE id = 1")
+        .unwrap();
+    older.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+    let mut older_commit = older.prepare("COMMIT").unwrap();
+    let mut yielded_older = false;
+    for _ in 0..200 {
+        match older_commit.step().unwrap() {
+            StepResult::Yield => {
+                yielded_older = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded_older,
+        "older COMMIT should yield before publishing global_header"
+    );
+
+    header_writer.execute("BEGIN").unwrap();
+    header_writer.execute("PRAGMA user_version = 42").unwrap();
+    header_writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&observer, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        42,
+        "newer header-only commit should publish user_version before older resumes"
+    );
+
+    older.set_yield_injector(None);
+    older_commit.run_ignore_rows().unwrap();
+    drop(older_commit);
+
+    let rows = get_rows(&observer, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        42,
+        "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
+    );
+}
+
+/// A writer paused in `FinalizeCommit` is already `Committed` but has not yet
+/// raised `last_committed_tx_ts`. An older transaction must still get Busy when
+/// it tries to take the exclusive lock, or its CREATE INDEX misses the row.
+#[test]
+fn test_create_index_exclusive_acquire_rechecks_committed_tx_before_watermark_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    assert!(matches!(writer_commit.step().unwrap(), StepResult::Yield));
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(turso_core::LimboError::Busy)),
+        "DDL transaction older than an already-committed writer should return Busy: {result:?}"
+    );
+    ddl.execute("ROLLBACK").unwrap();
+
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
+    assert_eq!(rows.len(), 1);
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+/// Same as above, but the writer's COMMIT statement is dropped while paused in
+/// `FinalizeCommit`. Dropping it finishes the commit and removes the
+/// transaction, so an older transaction must still get Busy afterwards.
+#[test]
+fn test_create_index_exclusive_acquire_after_dropped_commit_returns_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    assert!(matches!(writer_commit.step().unwrap(), StepResult::Yield));
+    drop(writer_commit);
+    assert!(writer.get_mv_tx().map(|(tx_id, _)| tx_id).is_none());
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(turso_core::LimboError::Busy)),
+        "DDL transaction older than a committed writer should return Busy: {result:?}"
+    );
+    ddl.execute("ROLLBACK").unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 2");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Contract test for [`turso_core::StepResult::Yield`]: an explicit yield (here an
+/// injected one) must surface as `Yield`, not as `IO` — there are no pending
+/// completions to drive, so the caller can simply step the statement again,
+/// possibly after doing other work first.
+#[test]
+fn injected_yield_surfaces_as_step_result_yield() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let first = commit.step().unwrap();
+    assert!(
+        matches!(first, turso_core::StepResult::Yield),
+        "injected yield must surface as StepResult::Yield, got {first:?}"
+    );
+    conn.set_yield_injector(None);
+
+    // After a yield the statement just resumes at the same point.
+    commit.run_ignore_rows().unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7477.
+#[test]
+fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = MVCC_COMMIT_BATCH_SIZE + 476;
+    let values = (1..=n_rows)
+        .map(|i| format!("({i}, 'v{i}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    setup
+        .execute(format!("INSERT INTO t(id, v) VALUES {values}"))
+        .unwrap();
+
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("DELETE FROM t").unwrap();
+
+    let log_owned = FixedYieldInjector::new([CommitYieldPoint::LogRecordMarkedWritten.point()]);
+    conn_a.set_yield_injector(Some(log_owned.clone()));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+
+    for _ in 0..10_000 {
+        match commit_a.step().unwrap() {
+            StepResult::IO | StepResult::Yield if log_owned.is_empty() => break,
+            StepResult::IO | StepResult::Yield => {}
+            StepResult::Done => panic!("COMMIT completed before LogRecordMarkedWritten yielded"),
+            other => panic!("unexpected COMMIT result before LogRecordMarkedWritten: {other:?}"),
+        }
+    }
+
+    conn_a.set_yield_injector(None);
+
+    match commit_a.step().unwrap() {
+        StepResult::IO | StepResult::Yield => {}
+        StepResult::Done => panic!("COMMIT completed before RewriteLiveVersions yielded"),
+        other => panic!("unexpected COMMIT result after LogRecordMarkedWritten: {other:?}"),
+    }
+
+    drop(commit_a);
+
+    let conn_b = db.connect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b
+            .execute(format!(
+                "INSERT INTO t(id, v) VALUES ({n_rows}, 'replacement')"
+            ))
+            .unwrap();
+        conn_b.execute("COMMIT")
+    }));
+
+    assert!(
+        result.is_ok(),
+        "later public writer must not panic on a stale removed tombstone TxID"
+    );
+
+    result
+        .unwrap()
+        .expect("later public writer must not conflict on a stale removed tombstone TxID");
+}
+
+#[test]
+fn rolled_back_insert_leaves_no_dirty_key() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let mvstore = db.get_mvcc_store();
+    let before = mvstore.checkpoint_dirty_table_keys.len();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'rolled back')")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(mvstore.checkpoint_dirty_table_keys.len(), before);
+
+    conn.execute("INSERT INTO t VALUES (2, 'committed')")
+        .unwrap();
+    assert_eq!(mvstore.checkpoint_dirty_table_keys.len(), before + 1);
+}
+
+/// A Busy commit of the inner tx that allocates an AUTOINCREMENT id must be
+/// retried on the inner tx. It used to roll back the inner tx and then, on
+/// the retry, commit the outer `BEGIN CONCURRENT` tx in its place, so the
+/// outer tx's writes survived a later ROLLBACK.
+#[test]
+fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
+    for use_trigger in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+        conn_a
+            .execute("CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+            .unwrap();
+        conn_a.execute("CREATE TABLE p (v TEXT)").unwrap();
+        conn_a.execute("CREATE TABLE q (v TEXT)").unwrap();
+        conn_a
+            .execute(
+                "CREATE TRIGGER q_ins AFTER INSERT ON q BEGIN INSERT INTO s (v) VALUES (2); END",
+            )
+            .unwrap();
+
+        conn_b.execute("BEGIN IMMEDIATE").unwrap();
+        conn_b.execute("INSERT INTO p VALUES ('b')").unwrap();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a.execute("INSERT INTO p VALUES ('a')").unwrap();
+        let sql = if use_trigger {
+            "INSERT INTO q VALUES (1)"
+        } else {
+            "INSERT INTO s (v) VALUES (1)"
+        };
+        let mut insert = conn_a.prepare(sql).unwrap();
+        step_until_busy_then_release(&mut insert, &conn_b).unwrap();
+        drop(insert);
+
+        assert_eq!(
+            get_rows(&conn_a, "SELECT v FROM s"),
+            vec![vec![Value::from_i64(if use_trigger { 2 } else { 1 })]]
+        );
+        conn_a.execute("ROLLBACK").unwrap();
+
+        let conn_c = db.connect();
+        assert_eq!(
+            get_rows(&conn_c, "SELECT v FROM p"),
+            vec![vec![Value::build_text("b")]]
+        );
+        assert!(get_rows(&conn_c, "SELECT v FROM s").is_empty());
+    }
+}
+
+fn step_until_busy_then_release(
+    stmt: &mut turso_core::Statement,
+    lock_holder: &Arc<Connection>,
+) -> Result<()> {
+    let mut released = false;
+    loop {
+        match stmt.step()? {
+            StepResult::IO | StepResult::Yield => stmt._io().step()?,
+            StepResult::Busy if !released => {
+                lock_holder.execute("COMMIT")?;
+                released = true;
+            }
+            StepResult::Done => {
+                assert!(released, "statement must hit Busy while the lock is held");
+                return Ok(());
+            }
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+}
