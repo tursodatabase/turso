@@ -917,14 +917,16 @@ fn get_subquery_parser<'a>(
                 let reg_start = program.alloc_registers(reg_count);
 
                 let env = TypeEnv::new(Some(&plan.table_references), resolver);
+                let affinities = plan.subquery_column_affinities(
+                    &ExprContext::new(Some(&plan.table_references), resolver),
+                    resolver,
+                );
                 let columns: Vec<_> = plan
                     .result_columns
                     .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
-                        affinity: get_expr_affinity(
-                            &result_col.expr,
-                            &ExprContext::new(Some(&plan.table_references), resolver),
-                        ),
+                    .zip(affinities)
+                    .map(|(result_col, affinity)| RowValueSubqueryColumn {
+                        affinity,
                         expr_type: type_of(&result_col.expr, &env),
                     })
                     .collect();
@@ -1124,20 +1126,28 @@ fn get_subquery_parser<'a>(
                 // "x IN (SELECT y ...)" compares x and y like "x = y" does, so
                 // the ephemeral index uses the collation of that comparison
                 // for its NotFound/Found probes.
+                let rhs_context = ExprContext::new(Some(table_references), resolver);
+                let rhs_affinities = match &plan {
+                    Plan::Select(select) => {
+                        select.subquery_column_affinities(&rhs_context, resolver)
+                    }
+                    Plan::CompoundSelect { right_most, .. } => {
+                        right_most.subquery_column_affinities(&rhs_context, resolver)
+                    }
+                    _ => result_columns
+                        .iter()
+                        .map(|rc| get_expr_affinity(&rc.expr, &rhs_context))
+                        .collect(),
+                };
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
                 let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
-                for (i, lhs_expr) in lhs_columns.enumerate() {
+                for (lhs_expr, &rhs_affinity) in lhs_columns.zip(&rhs_affinities) {
                     let lhs_affinity = get_expr_affinity(
                         lhs_expr,
                         &ExprContext::new(Some(referenced_tables), resolver),
                     );
                     affinity_chars.push(
-                        comparison_affinity(
-                            &result_columns[i].expr,
-                            lhs_affinity,
-                            &ExprContext::new(Some(table_references), resolver),
-                        )
-                        .aff_mask(),
+                        comparison_affinity(rhs_affinity, lhs_affinity, &rhs_context).aff_mask(),
                     );
                     lhs_exprs.push(lhs_expr);
                 }
