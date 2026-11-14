@@ -396,7 +396,9 @@ pub fn format_numeric(bd: &BigDecimal) -> String {
 
 /// Validate that a BigDecimal fits within the given precision and scale.
 /// Precision = total number of significant digits.
-/// Scale = number of digits after the decimal point.
+/// Scale = number of digits after the decimal point. As in PostgreSQL, it may
+/// be larger than the precision (`numeric(2,5)` holds values below 0.001) or
+/// negative (`numeric(5,-2)` rounds to hundreds).
 pub fn validate_precision_scale(
     val: &BigDecimal,
     precision: i64,
@@ -407,16 +409,6 @@ pub fn validate_precision_scale(
     if precision <= 0 {
         return Err(LimboError::Constraint(format!(
             "numeric precision must be positive, got {precision}"
-        )));
-    }
-    if scale < 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale must be non-negative, got {scale}"
-        )));
-    }
-    if scale > precision {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale ({scale}) must not exceed precision ({precision})"
         )));
     }
 
@@ -497,6 +489,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_validate_precision_scale_larger_than_precision() {
+        let val = BigDecimal::from_str("0.00012").unwrap();
+        let result = validate_precision_scale(&val, 2, 5).unwrap();
+        assert_eq!(format_numeric(&result), "0.00012");
+        let val = BigDecimal::from_str("0.000995").unwrap();
+        assert!(validate_precision_scale(&val, 2, 5).is_err());
+    }
+
+    #[test]
+    fn test_validate_precision_scale_negative() {
+        let val = BigDecimal::from_str("12345").unwrap();
+        let result = validate_precision_scale(&val, 5, -2).unwrap();
+        assert_eq!(format_numeric(&result), "12300");
+        let val = BigDecimal::from_str("-55").unwrap();
+        let result = validate_precision_scale(&val, 5, -2).unwrap();
+        assert_eq!(format_numeric(&result), "-100");
+        let val = BigDecimal::from_str("9999950").unwrap();
+        assert!(validate_precision_scale(&val, 5, -2).is_err());
+    }
+
     // ================================================================
     // Property-based fuzz tests (quickcheck)
     // ================================================================
@@ -530,7 +543,7 @@ mod tests {
     impl Arbitrary for ArbPrecisionScale {
         fn arbitrary(g: &mut Gen) -> Self {
             let precision = (u8::arbitrary(g) % 38) as i64 + 1; // 1..=38
-            let scale = (u8::arbitrary(g) as i64) % (precision + 1); // 0..=precision
+            let scale = (u8::arbitrary(g) as i64) % (3 * precision + 1) - precision; // -precision..=2*precision
             ArbPrecisionScale { precision, scale }
         }
     }

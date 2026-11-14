@@ -369,6 +369,78 @@ expect {
     |-1.000
 }
 
+test table-numeric-scale-larger-than-precision {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(2,5));
+    INSERT INTO nm VALUES (1, 0.00012), (2, -0.000985);
+    SELECT v FROM nm ORDER BY id;
+}
+expect {
+    0.00012
+    -0.00099
+}
+
+test table-numeric-negative-scale-rounds-before-the-point {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(5,-2));
+    INSERT INTO nm VALUES (1, 12345), (2, -55), (3, 50);
+    ALTER TABLE nm ADD COLUMN w numeric(4,-1);
+    UPDATE nm SET w = 1234;
+    SELECT v, w FROM nm ORDER BY id;
+}
+expect {
+    12300|1230
+    -100|1230
+    100|1230
+}
+
+test table-numeric-precision-zero-rejected-at-create {
+    CREATE TABLE nm (v numeric(0,0));
+}
+@sqlstate 22023
+expect error {}
+
+test table-numeric-precision-too-large-rejected-at-create {
+    CREATE TABLE nm (v numeric(1001));
+}
+@sqlstate 22023
+expect error {}
+
+test table-numeric-scale-out-of-range-rejected-at-create {
+    CREATE TABLE nm (v numeric(5,1001));
+}
+@sqlstate 22023
+expect error {}
+
+test table-numeric-three-modifiers-rejected-at-create {
+    CREATE TABLE nm (v numeric(1,2,3));
+}
+@sqlstate 22023
+expect error {}
+
+test table-numeric-array-precision-zero-rejected-at-create {
+    CREATE TABLE nm (v numeric(0)[]);
+}
+@sqlstate 22023
+expect error {}
+
+test table-varchar-length-zero-rejected-at-create {
+    CREATE TABLE vc (v varchar(0));
+}
+@sqlstate 22023
+expect error {}
+
+test table-varchar-length-too-large-rejected-at-create {
+    CREATE TABLE vc (v varchar(10485761));
+}
+@sqlstate 22023
+expect error {}
+
+test table-add-column-numeric-precision-zero-rejected {
+    CREATE TABLE nm (id int);
+    ALTER TABLE nm ADD COLUMN v numeric(0);
+}
+@sqlstate 22023
+expect error {}
+
 test table-numeric-negation-and-modulo-compare-as-numbers {
     CREATE TABLE nm (id int PRIMARY KEY, v numeric(10,2));
     INSERT INTO nm VALUES (1, 9), (2, 10), (3, -1.5), (4, 1.5);

@@ -1818,12 +1818,35 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test numeric-scale-exceeds-precision-rejected {
+test numeric-scale-exceeds-precision-holds-small-values {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(3,5)) STRICT;
-    INSERT INTO t1 VALUES (1, 5);
+    INSERT INTO t1 VALUES (1, 0.00123), (2, -0.009994);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|0.00123
+    2|-0.00999
+}
+
+@requires strict "uses STRICT tables"
+test numeric-scale-exceeds-precision-rejects-larger-value {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(3,5)) STRICT;
+    INSERT INTO t1 VALUES (1, 0.01);
 }
 expect error {
-    numeric scale
+    numeric value out of range
+}
+
+@requires strict "uses STRICT tables"
+test numeric-negative-scale-rounds-before-the-point {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,-2)) STRICT;
+    INSERT INTO t1 VALUES (1, 12345), (2, -55), (3, 0);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|12300
+    2|-100
+    3|0
 }
 
 # AFTER UPDATE trigger should see decoded OLD and NEW values, not encoded blobs

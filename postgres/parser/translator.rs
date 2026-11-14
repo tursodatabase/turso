@@ -6991,6 +6991,7 @@ fn extract_integer_typmods(
 }
 
 fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, ParseError> {
+    check_type_modifiers(pg_type, typmods)?;
     let mapping = map_pg_type(pg_type, typmods)
         .ok_or_else(|| ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}")))?;
     if !typmods.is_empty() && mapping.type_params.is_empty() {
@@ -7000,6 +7001,55 @@ fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, Pars
     }
     check_array_dimensions(mapping.array_dimensions)?;
     Ok(mapping)
+}
+
+/// Checks the type modifiers of `numeric` and `varchar` with PostgreSQL's
+/// limits, so a type that PostgreSQL refuses fails when the column is created
+/// rather than at the first INSERT.
+fn check_type_modifiers(pg_type: &str, typmods: &[i64]) -> Result<(), ParseError> {
+    const NUMERIC_MAX_PRECISION: i64 = 1000;
+    const NUMERIC_MIN_SCALE: i64 = -1000;
+    const NUMERIC_MAX_SCALE: i64 = 1000;
+    const VARCHAR_MAX_LENGTH: i64 = 10_485_760;
+
+    let invalid = |message: String| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+        message,
+    };
+    let base_type = pg_type.trim_end_matches("[]");
+    let base_type = base_type.strip_prefix('_').unwrap_or(base_type);
+    match (base_type.to_lowercase().as_str(), typmods) {
+        (_, []) => Ok(()),
+        ("numeric" | "decimal", [precision, scale @ ..]) if scale.len() <= 1 => {
+            if !(1..=NUMERIC_MAX_PRECISION).contains(precision) {
+                return Err(invalid(format!(
+                    "NUMERIC precision {precision} must be between 1 and {NUMERIC_MAX_PRECISION}"
+                )));
+            }
+            if let [scale] = scale {
+                if !(NUMERIC_MIN_SCALE..=NUMERIC_MAX_SCALE).contains(scale) {
+                    return Err(invalid(format!(
+                        "NUMERIC scale {scale} must be between {NUMERIC_MIN_SCALE} and {NUMERIC_MAX_SCALE}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        ("numeric" | "decimal", _) => Err(invalid("invalid NUMERIC type modifier".into())),
+        ("varchar", [length]) => {
+            if *length < 1 {
+                return Err(invalid("length for type varchar must be at least 1".into()));
+            }
+            if *length > VARCHAR_MAX_LENGTH {
+                return Err(invalid(format!(
+                    "length for type varchar cannot exceed {VARCHAR_MAX_LENGTH}"
+                )));
+            }
+            Ok(())
+        }
+        ("varchar", _) => Err(invalid("invalid type modifier".into())),
+        _ => Ok(()),
+    }
 }
 
 /// PostgreSQL accepts any number of `[]` in a type name, but a Turso column

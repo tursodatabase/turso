@@ -174,7 +174,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
-| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied; modifiers on other types and in casts (`x::varchar(3)`) rejected |
+| Type modifier support | 🟡 Partial | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied, including a scale above the precision or below zero; CREATE TABLE and ALTER TABLE ADD COLUMN check numeric precision (1 to 1000), scale (-1000 to 1000) and varchar length (1 to 10485760) as PostgreSQL does; modifiers on other types and in casts (`x::varchar(3)`) rejected |
 | UUIDv7 | ❌ Not supported | |
 | XML data type | ❌ Not supported | xml columns degrade to TEXT; no XML functions |
 
