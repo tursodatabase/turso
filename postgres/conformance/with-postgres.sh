@@ -7,12 +7,13 @@
 # script starts a throwaway PostgreSQL container with Docker, runs the
 # command, and removes the container.
 #
-# To test against another PostgreSQL version, set POSTGRES_VERSION, for
-# example POSTGRES_VERSION=18. To upgrade the version for everyone, change
-# the default below.
+# The default is PostgreSQL 18, the version in postgres/version. To try
+# another version locally, set POSTGRES_VERSION to a tag of the postgres
+# Docker image, for example POSTGRES_VERSION=17.
 set -euo pipefail
 
-POSTGRES_VERSION="${POSTGRES_VERSION:-17}"
+VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/../version"
+POSTGRES_VERSION="${POSTGRES_VERSION:-$(cat "$VERSION_FILE")}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:$POSTGRES_VERSION}"
 
 if [[ -n "${PG_DSN:-}" ]]; then
@@ -22,7 +23,7 @@ fi
 if ! docker info >/dev/null 2>&1; then
     echo "error: PG_DSN is not set and Docker is not running." >&2
     echo "Start Docker, or set PG_DSN to a PostgreSQL server, for example" >&2
-    echo "PG_DSN=postgres://sqltest@127.0.0.1:5432/postgres." >&2
+    echo "PG_DSN=postgres://postgres@127.0.0.1:5432/postgres." >&2
     exit 2
 fi
 
@@ -54,10 +55,7 @@ if ! docker exec "$container" pg_isready --host 127.0.0.1 --username postgres >/
     exit 1
 fi
 
-docker exec "$container" psql --quiet --username postgres \
-    --command "CREATE ROLE sqltest LOGIN CREATEDB" >/dev/null
-
 port=$(docker port "$container" 5432/tcp | head -n 1 | sed 's/.*://')
-export PG_DSN="postgres://sqltest@127.0.0.1:${port}/postgres"
+export PG_DSN="postgres://postgres@127.0.0.1:${port}/postgres"
 echo "Using $POSTGRES_IMAGE at $PG_DSN" >&2
 "$@"

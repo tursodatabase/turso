@@ -394,8 +394,13 @@ def test_parse_error():
     turso = TestTursoShell(init_commands="")
     turso.run_test_fn(
         "select * from sqlite_schema limit asdf;",
-        lambda res: "Parse error: " in res,
-        "Try to LIMIT using an identifier should trigger a Parse error",
+        lambda res: "no such column: asdf" in res,
+        "Try to LIMIT using an identifier should trigger an error",
+    )
+    turso.run_test_fn(
+        "SELECT group_concat('a', 'b', 'c');",
+        lambda res: res == "× wrong number of arguments to function group_concat()",
+        "Wrong argument count for group_concat prints only the error",
     )
     turso.quit()
 

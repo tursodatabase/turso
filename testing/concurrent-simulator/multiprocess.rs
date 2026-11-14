@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -35,6 +35,7 @@ use crate::{
     SimulatorState, Stats, StepResult, create_initial_indexes, create_initial_schema,
     multiprocess_platform_io,
 };
+use turso_core::SessionRole;
 
 /// Configuration for the multiprocess simulator.
 pub struct MultiprocessOpts {
@@ -277,7 +278,7 @@ impl MultiprocessWhopper {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
             if opts.enable_mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'")?;

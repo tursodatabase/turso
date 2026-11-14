@@ -3,6 +3,9 @@ use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::schema::SequencesByNamespace;
+use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -12,6 +15,7 @@ use crate::sync::{
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::IOResult;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -24,14 +28,14 @@ use crate::{
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
-    translate::collate::CollationSeq,
+    translate::collate::TextCollation,
     util::IOExt,
     vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
     ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
-    Value, VirtualTable, WalAutoActions,
+    Program, QueryMode, Result, Schema, Statement, SyncMode, TransactionMode, Trigger, Value,
+    VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -39,7 +43,10 @@ use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::any::Any;
-use std::cmp::Ordering as CmpOrdering;
+use std::borrow::Cow;
+use std::collections::VecDeque;
+
+use crate::security::roles::SessionRole;
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -67,7 +74,7 @@ fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
 }
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TransactionState {
+pub enum TransactionState {
     Write {
         schema_did_change: bool,
     },
@@ -207,7 +214,10 @@ pub struct ReparseSchemaInner {
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
-    preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+    preserved_sequences: Option<SequencesByNamespace>,
+    /// The `sqlite_schema` scan, which also collects the indexes and
+    /// materialized views that are built once the types are loaded.
+    parse: Box<crate::util::ParseSchemaRowsState>,
     phase: ReparsePhase,
 }
 
@@ -225,8 +235,11 @@ pub enum SubqueryUnnestingMode {
 
 enum ReparsePhase {
     /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
-    ParseSchema {
-        parse: Box<crate::util::ParseSchemaRowsState>,
+    ParseSchema,
+    /// Loading the names of the namespaces from the namespaces table.
+    LoadNamespaces {
+        stmt: Box<Statement>,
+        rows: Vec<(i64, String)>,
     },
     /// Recovering sequence descriptors from each `__turso_internal_seq_*`
     /// backing table via SQL (or grafting the VACUUM-preserved map). The
@@ -255,10 +268,37 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    /// Loading the CREATE TYPE statements `type_sqls`, then building the
+    /// materialized views and indexes collected by the `sqlite_schema` scan.
+    BuildIndexes { type_sqls: Vec<String> },
+    /// Loading the dialect's own schema state, such as the PostgreSQL
+    /// frontend's relation catalog: `stmt` reads one query into `rows`, the
+    /// rows of the queries before it are in `results`, and `queries` are
+    /// still to be read.
+    LoadDialectSchema {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+        results: Vec<Vec<Vec<Value>>>,
+        queries: VecDeque<String>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
     },
+}
+
+impl ReparsePhase {
+    fn populate_sequences() -> Self {
+        ReparsePhase::PopulateSequences {
+            pending: None,
+            idx: 0,
+            stmt: None,
+            meta: None,
+            seq: None,
+            watermark_stmt: None,
+            watermark_row: None,
+        }
+    }
 }
 
 /// Re-entrant driver state for
@@ -354,13 +394,80 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// How much storage the main database uses, read by
+/// [`Connection::storage_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// The page size in bytes, as `PRAGMA page_size` returns it.
+    pub page_size: u32,
+    /// The pages in the database, as `PRAGMA page_count` returns it. Under
+    /// MVCC this counts the pages as of the last checkpoint of the logical
+    /// log: rows committed since then are only in the log.
+    pub page_count: u32,
+    /// The unused pages, as `PRAGMA freelist_count` returns it. Under MVCC,
+    /// as of the last checkpoint, like `page_count`.
+    pub freelist_count: u32,
+    /// The bytes written to the MVCC logical log since its last checkpoint,
+    /// which holds every change committed since then, deleted and replaced
+    /// rows included. 0 without MVCC.
+    pub logical_log_bytes: u64,
+}
+
+/// A read of [`StorageStats`], started by [`Connection::storage_stats`].
+pub struct StorageStatsRead {
+    connection: Arc<Connection>,
+    statement: Option<Statement>,
+    stats: Option<StorageStats>,
+}
+
+impl StorageStatsRead {
+    /// Reads the counts with a query of the engine's own, which the role the
+    /// connection's user set does not limit. It runs like a top-level
+    /// statement, in its own read transaction when no transaction is open.
+    /// Returns [`IOResult::IO`] when the query waits for storage: wait for
+    /// the completions and call `read` again. Do not run other statements
+    /// on the connection until it returns [`IOResult::Done`] or an error,
+    /// or until this value is dropped.
+    pub fn read(&mut self) -> Result<IOResult<StorageStats>> {
+        let statement = match &mut self.statement {
+            Some(statement) => statement,
+            None => self
+                .statement
+                .insert(self.connection.prepare_engine_metadata_read(
+                "SELECT * FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count()",
+            )?),
+        };
+        let stats = &mut self.stats;
+        crate::return_if_io!(statement.run_with_row_callback_nonblock(|row| {
+            let count = |idx| {
+                u32::try_from(row.get::<i64>(idx)?)
+                    .map_err(|_| LimboError::InternalError("negative storage count".to_string()))
+            };
+            *stats = Some(StorageStats {
+                page_size: count(0)?,
+                page_count: count(1)?,
+                freelist_count: count(2)?,
+                logical_log_bytes: 0,
+            });
+            Ok(())
+        }));
+        let mut stats = self.stats.ok_or_else(|| {
+            LimboError::InternalError("storage stats query returned no row".to_string())
+        })?;
+        if let Some(mv_store) = self.connection.mv_store().as_ref() {
+            stats.logical_log_bytes = mv_store.logical_log_offset();
+        }
+        Ok(IOResult::Done(stats))
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
-    pub(crate) db: Arc<Database>,
+    pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -378,9 +485,12 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
-    pub(crate) syms: parking_lot::RwLock<SymbolTable>,
+    pub syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
+    /// Page size from the last `PRAGMA page_size` on any database of this connection, or 0.
+    /// Like SQLite's `db->nextPagesize`, `VACUUM INTO` uses it for the output database.
+    pub(super) next_page_size: AtomicU32,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
     /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
@@ -411,7 +521,7 @@ pub struct Connection {
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     /// The names that qualify object names in SQL, each referring to a
     /// database.
-    pub(super) namespaces: crate::Namespaces,
+    pub(super) qualifiers: Qualifiers,
     /// The namespace names that a name without a namespace is looked up
     /// through, in order. None means main, then the other databases by id.
     pub(super) search_path: RwLock<Option<Vec<String>>>,
@@ -420,6 +530,11 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// True while a READ ONLY transaction is active. Cleared when the
+    /// transaction ends (COMMIT, ROLLBACK, or any implicit rollback).
+    /// Unlike query_only, this is per-transaction: it resets automatically
+    /// when the transaction ends, so it is safe to use for BEGIN READ ONLY.
+    pub(super) tx_read_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -453,6 +568,9 @@ pub struct Connection {
     /// a non-CYCLE nextval means inline backing-table compaction
     /// (or another contended write) was reintroduced.
     pub(crate) sequence_inner_retries: AtomicU64,
+    /// Next value returned by the test-only `test_nondet_counter()` function.
+    #[cfg(feature = "test_helper")]
+    pub(crate) test_nondet_counter: AtomicI64,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -484,7 +602,7 @@ pub struct Connection {
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
-    pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -505,6 +623,18 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Whether non-TEMP triggers fire for statements prepared on this
+    /// connection. TEMP triggers always fire, matching SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER`. Not exposed as a PRAGMA: a SQL
+    /// client must not be able to turn off triggers a database relies on
+    /// for its own rules. Only a Rust API caller (the sync engine's row
+    /// replay) can set it.
+    pub(super) triggers_enabled: AtomicBool,
+    /// Whether INSERT and UPDATE statements prepared on this connection write
+    /// the values they are given to custom-type columns as stored values,
+    /// without ENCODE. Set only on the connection VACUUM builds its copy of
+    /// the database with, like SQLite's `DBFLAG_Vacuum`.
+    pub(super) writes_stored_values: AtomicBool,
     /// Number of active top-level write statements on this connection.
     ///
     /// This is currently only 0 or 1. We return Busy instead of allowing a
@@ -523,10 +653,18 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// How many unfinished statements have opened a transaction with a
+    /// `Transaction` instruction, that is, read or write a database file.
+    /// SQLite's `db->nVdbeRead`.
+    pub(crate) n_active_read_statements: AtomicI32,
+    /// How many of `n_active_read_statements` free a b-tree
+    /// (`PreparedProgram::destroys_btree`), as DROP TABLE and DROP INDEX do.
+    pub(crate) n_active_destroy_statements: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    pub(super) automatic_index_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// One prepared cursor per index-method attachment touched by the active
@@ -555,6 +693,10 @@ pub struct Connection {
     /// Per-connection last-returned value for each sequence (for currval()),
     /// by the database and normalized name of the sequence.
     pub(crate) sequence_currvals: RwLock<HashMap<(usize, String), i64>>,
+    /// The role the session logged in as. `SET ROLE` checks against it.
+    pub(crate) session_role: RoleId,
+    /// The role whose privileges statements are checked against.
+    pub(crate) current_role: RwLock<RoleId>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -656,7 +798,6 @@ impl Connection {
             self.db.dialect().as_ref(),
         )
         .expect("built-in type definitions are malformed");
-        schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -667,7 +808,6 @@ impl Connection {
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled())
             .with_without_rowid(self.db.experimental_without_rowid_enabled())
     }
 
@@ -779,7 +919,7 @@ impl Connection {
     }
 
     /// Returns true once the per-connection temp database has been created.
-    pub(crate) fn has_temp_database(&self) -> bool {
+    pub fn has_temp_database(&self) -> bool {
         self.temp.database.read().is_some()
     }
 
@@ -883,7 +1023,7 @@ impl Connection {
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.
     #[inline]
-    pub(crate) fn bump_prepare_context_generation(&self) {
+    pub fn bump_prepare_context_generation(&self) {
         self.prepare_context_generation
             .fetch_add(1, Ordering::Release);
     }
@@ -1089,7 +1229,13 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                // An engine schema statement is the engine's own SQLite text,
+                // whatever the database's dialect parses.
+                if matches!(origin, StatementOrigin::EngineSchemaWrite) {
+                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                } else {
+                    self.parse_sql(sql)?
+                }
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1381,7 +1527,7 @@ impl Connection {
     pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
         self: &Arc<Connection>,
         cookie: u32,
-        sequences: rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>,
+        sequences: SequencesByNamespace,
     ) -> Result<()> {
         let io = self.pager.load().io.clone();
         let mut state = ReparseSchemaState::default();
@@ -1399,9 +1545,10 @@ impl Connection {
         })
     }
 
-    /// Non-blocking schema reparse. Reads the current schema cookie, then drives
-    /// the schema rebuild via the shared [`ReparseSchemaState`].
-    pub(crate) fn reparse_schema_nonblock(
+    /// Rebuilds this connection's schema, including dialect metadata, without
+    /// blocking. Preserve `state` across I/O yields and resume on this connection.
+    /// An active schema transaction publishes the rebuilt schema when it commits.
+    pub fn reparse_schema_nonblock(
         self: &Arc<Connection>,
         state: &mut ReparseSchemaState,
     ) -> crate::types::IOResultOr<()> {
@@ -1424,7 +1571,7 @@ impl Connection {
     fn init_reparse_building(
         self: &Arc<Connection>,
         cookie: u32,
-        preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+        preserved_sequences: Option<SequencesByNamespace>,
     ) -> Result<ReparseSchemaInner> {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
@@ -1433,7 +1580,6 @@ impl Connection {
             self.experimental_custom_types_enabled(),
             self.db.dialect().as_ref(),
         )?;
-        fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
@@ -1443,12 +1589,9 @@ impl Connection {
         // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
         // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
         // with a new clean schema that has the same header cookie.
-        self.with_schema_mut(|schema| {
-            *schema = fresh.try_clone()?;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
+        self.install_schema_keeping_dialect_schema(&fresh)?;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1460,9 +1603,8 @@ impl Connection {
             _guard: guard,
             fresh,
             preserved_sequences,
-            phase: ReparsePhase::ParseSchema {
-                parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
-            },
+            parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
+            phase: ReparsePhase::ParseSchema,
         })
     }
 
@@ -1478,31 +1620,52 @@ impl Connection {
                 unreachable!("drive_reparse_building requires Building state");
             };
             match &mut inner.phase {
-                ReparsePhase::ParseSchema { parse } => {
+                ReparsePhase::ParseSchema => {
                     // Resolver so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
-                        self.namespaces
+                        self.qualifiers
                             .database_id(&crate::util::normalize_ident(name))
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
-                        parse,
+                        &mut inner.parse,
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
                         self.db.dialect().as_ref(),
                     ));
 
+                    // Under a dialect without namespaces, a table of that name
+                    // is an ordinary table.
+                    if inner.fresh.supports_namespaces()
+                        && inner.fresh.has_table(
+                            NamespaceId::ROOT,
+                            crate::schema::TURSO_NAMESPACES_TABLE_NAME,
+                        )
+                    {
+                        // Install the schema so the namespaces table can be read.
+                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
+                        let stmt = self.prepare_internal(format!(
+                            "SELECT id, name FROM {}",
+                            crate::schema::TURSO_NAMESPACES_TABLE_NAME
+                        ))?;
+                        inner.phase = ReparsePhase::LoadNamespaces {
+                            stmt: Box::new(stmt),
+                            rows: Vec::new(),
+                        };
+                    } else {
+                        inner.fresh.load_namespace_names(&[])?;
+                        inner.phase = ReparsePhase::populate_sequences();
+                    }
+                }
+                ReparsePhase::LoadNamespaces { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
+                        Ok(())
+                    }));
+                    inner.fresh.load_namespace_names(rows)?;
                     // Next: recover sequence descriptors (or graft the VACUUM map).
-                    inner.phase = ReparsePhase::PopulateSequences {
-                        pending: None,
-                        idx: 0,
-                        stmt: None,
-                        meta: None,
-                        seq: None,
-                        watermark_stmt: None,
-                        watermark_row: None,
-                    };
+                    inner.phase = ReparsePhase::populate_sequences();
                 }
                 ReparsePhase::PopulateSequences {
                     pending,
@@ -1519,15 +1682,12 @@ impl Connection {
                     // descriptor SELECTs can resolve the backing tables.
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.sequences = sequences;
+                            inner.fresh.set_sequences_by_namespace(sequences);
                             *pending = Some(crate::alloc::vec![]);
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
-                                self.with_schema_mut(|schema| {
-                                    *schema = inner.fresh.try_clone()?;
-                                    Ok::<_, crate::alloc::TryReserveError>(())
-                                })??;
+                                self.install_schema_keeping_dialect_schema(&inner.fresh)?;
                             }
                             *pending = Some(work);
                         }
@@ -1548,7 +1708,8 @@ impl Connection {
                         };
                         let (backing_table_name, seq_name) = entry;
                         let normalized = crate::util::normalize_ident(&seq_name);
-                        if inner.fresh.sequences.contains_key(&normalized) {
+                        let (namespace, sequence_name) = inner.fresh.demangle_name(&normalized);
+                        if inner.fresh.has_sequence(namespace, sequence_name) {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -1565,7 +1726,7 @@ impl Connection {
                                 meta,
                             ));
                             *seq = Some(Self::sequence_from_descriptor_meta(
-                                &seq_name,
+                                sequence_name,
                                 &backing_table_name,
                                 *meta,
                             )?);
@@ -1588,7 +1749,9 @@ impl Connection {
                             mv_store.set_sequence_watermark(&normalized, watermark);
                         }
                         let sequence = seq.take().expect("sequence set above");
-                        inner.fresh.sequences.insert(normalized, Arc::new(sequence));
+                        inner
+                            .fresh
+                            .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
                         *meta = None;
@@ -1600,14 +1763,10 @@ impl Connection {
                     if self.experimental_custom_types_enabled()
                         && inner
                             .fresh
-                            .tables
-                            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+                            .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         // Temporarily install the schema so we can query against it.
-                        self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.try_clone()?;
-                            Ok::<_, crate::alloc::TryReserveError>(())
-                        })??;
+                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
@@ -1617,9 +1776,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = ReparsePhase::BuildIndexes { type_sqls: vec![] };
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1627,8 +1784,43 @@ impl Connection {
                         type_rows.push(row.get::<&str>(1)?.to_string());
                         Ok(())
                     }));
-                    let type_rows = std::mem::take(type_rows);
-                    inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = ReparsePhase::BuildIndexes {
+                        type_sqls: std::mem::take(type_rows),
+                    };
+                }
+                ReparsePhase::BuildIndexes { type_sqls } => {
+                    crate::util::populate_types_views_then_indices(
+                        &mut inner.parse,
+                        &mut inner.fresh,
+                        &self.syms.read(),
+                        type_sqls,
+                    )?;
+                    inner.phase = self.load_dialect_schema_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadDialectSchema {
+                    stmt,
+                    rows,
+                    results,
+                    queries,
+                } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "dialect schema state must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    results.push(std::mem::take(rows));
+                    if let Some(sql) = queries.pop_front() {
+                        *stmt = Box::new(self.prepare_engine_metadata_read(&sql)?);
+                        continue;
+                    }
+                    inner.fresh.dialect_schema = Some(
+                        self.db
+                            .dialect()
+                            .build_schema_state(&inner.fresh, results)?,
+                    );
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1646,7 +1838,7 @@ impl Connection {
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
-                        fresh.tables.keys()
+                        fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
                     );
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
@@ -1655,6 +1847,68 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Returns the phase that loads the dialect's own schema state into
+    /// `fresh`, or the stats refresh phase if the dialect keeps none in this
+    /// database. The fresh schema is installed first, because the current
+    /// schema may not contain the dialect's tables yet.
+    fn load_dialect_schema_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        let mut queries = VecDeque::from(self.db.dialect().schema_state_queries(fresh));
+        let Some(sql) = queries.pop_front() else {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        };
+        self.install_schema_keeping_dialect_schema(fresh)?;
+        let stmt = self.prepare_engine_metadata_read(&sql)?;
+        Ok(ReparsePhase::LoadDialectSchema {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+            results: Vec::new(),
+            queries,
+        })
+    }
+
+    /// Prepares a read of an engine table that holds state the schema is
+    /// built from: the schema table or the dialect's own schema state. The table belongs to the engine, so its name is looked up in
+    /// every database, whatever the search path says, and no role's
+    /// privileges limit the read. The read is a top-level statement, so it
+    /// runs in its own read transaction when the schema is read outside a
+    /// transaction.
+    pub(crate) fn prepare_engine_metadata_read(
+        self: &Arc<Connection>,
+        sql: &str,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
+    }
+
+    /// Prepares a schema statement of the engine's own: SQLite text whatever
+    /// the database's dialect, allowed to name the engine's reserved objects,
+    /// and run as an ordinary top-level statement with its own transaction
+    /// work. Frontends use it to create and fill their internal tables at
+    /// open, like the relation catalog of the PostgreSQL frontend.
+    pub fn prepare_engine_schema_statement(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        self.start_nested();
+        let statement = self.prepare_with_origin(sql, StatementOrigin::EngineSchemaWrite);
+        self.end_nested();
+        statement
+    }
+
+    /// Installs a copy of `fresh` as the connection's schema while the schema
+    /// is still being read, keeping the dialect's schema state loaded before.
+    /// It is empty in `fresh` until the dialect's tables are read, and a
+    /// statement compiled in between must not see it empty: without it, no
+    /// role exists and no table has an owner, privileges or row-level
+    /// security.
+    fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
+        self.with_schema_mut(|schema| {
+            let mut installed = fresh.try_clone()?;
+            installed.dialect_schema.clone_from(&schema.dialect_schema);
+            *schema = installed;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        Ok(())
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1724,28 +1978,11 @@ impl Connection {
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        match cmd {
-            Some(cmd) => self.run_cmd(cmd, input),
-            None => Ok(None),
-        }
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub(crate) fn run_cmd(
-        self: &Arc<Connection>,
-        cmd: Cmd,
-        input: &str,
-    ) -> Result<Option<Statement>> {
-        if self.is_closed() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
-        }
+        let Some(cmd) = cmd else {
+            return Ok(None);
+        };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, pager, mode, 0);
-        Ok(Some(stmt))
-    }
-
-    pub fn query_runner<'a>(self: &'a Arc<Connection>, sql: &'a [u8]) -> QueryRunner<'a> {
-        QueryRunner::new(self, sql)
+        Ok(Some(Statement::new(program, pager, mode, 0)))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -1777,6 +2014,9 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
         let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
         let Some(cmd) = cmd else {
             return Ok(None);
@@ -1812,7 +2052,7 @@ impl Connection {
                 None,
                 dialect,
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
             return Ok((io, conn));
         }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
@@ -1842,7 +2082,7 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -1908,6 +2148,28 @@ impl Connection {
         self.fk_pragma.load(Ordering::Acquire)
     }
 
+    /// Turns non-TEMP triggers on or off for statements prepared from now on.
+    /// TEMP triggers keep firing either way (SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER` rule). Already-prepared statements are
+    /// unaffected until they are reprepared.
+    pub fn set_triggers_enabled(&self, enable: bool) {
+        self.triggers_enabled.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn triggers_enabled(&self) -> bool {
+        self.triggers_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_writes_stored_values(&self, enable: bool) {
+        self.writes_stored_values.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn writes_stored_values(&self) -> bool {
+        self.writes_stored_values.load(Ordering::Acquire)
+    }
+
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
         self.check_constraints_pragma
             .store(ignore, Ordering::Release);
@@ -1916,6 +2178,15 @@ impl Connection {
 
     pub fn check_constraints_ignored(&self) -> bool {
         self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_automatic_index(&self, enable: bool) {
+        self.automatic_index_pragma.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn automatic_index(&self) -> bool {
+        self.automatic_index_pragma.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
@@ -1930,28 +2201,31 @@ impl Connection {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
     }
 
-    /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
-    /// The connection's schema must already contain the table definitions so
-    /// that `prepare` can resolve the table name. Returns an empty Vec if the
-    /// types table does not exist.
-    pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
-        let has_types_table = {
+    /// Query the `(id, name)` rows of the namespaces table. The connection's
+    /// schema must already contain the table definitions so that `prepare`
+    /// can resolve the table name. Returns an empty Vec if the database has
+    /// no namespaces table.
+    pub(crate) fn query_stored_namespaces(self: &Arc<Connection>) -> Result<Vec<(i64, String)>> {
+        let has_namespaces_table = {
             let s = self.schema.read();
-            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+            s.has_table(
+                NamespaceId::ROOT,
+                crate::schema::TURSO_NAMESPACES_TABLE_NAME,
+            )
         };
-        if !has_types_table {
+        if !has_namespaces_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare_internal(format!(
-            "SELECT name, sql FROM {}",
-            crate::schema::TURSO_TYPES_TABLE_NAME
+        let mut stmt = self.prepare_internal(format!(
+            "SELECT id, name FROM {}",
+            crate::schema::TURSO_NAMESPACES_TABLE_NAME
         ))?;
-        let mut type_rows = Vec::new();
-        type_stmt.run_with_row_callback(|row| {
-            type_rows.push(row.get::<&str>(1)?.to_string());
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
             Ok(())
         })?;
-        Ok(type_rows)
+        Ok(rows)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -2202,9 +2476,22 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
+        use crate::Buffer;
 
-        let c = self.pager.load().wal_get_frame(frame_no, frame)?;
-        self.db.io.wait_for_completion(c)?;
+        let buffer = Arc::new(Buffer::new_temporary(frame.len()));
+        let pager = self.pager.load();
+        let started_read_tx = !pager.holds_read_lock();
+        if started_read_tx {
+            pager.begin_read_tx()?;
+        }
+        let result = pager
+            .wal_get_frame(frame_no, buffer.clone())
+            .and_then(|c| self.db.io.wait_for_completion(c));
+        if started_read_tx {
+            pager.end_read_tx();
+        }
+        result?;
+        frame.copy_from_slice(buffer.as_slice());
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -2701,6 +2988,18 @@ impl Connection {
         self.pager.load().get_page_size_unchecked()
     }
 
+    /// Starts reading the page size, page count and freelist count of the
+    /// main database, and the size of its MVCC logical log. An embedder uses
+    /// it to measure the database on a user's connection, whatever role the
+    /// user set.
+    pub fn storage_stats(self: &Arc<Connection>) -> StorageStatsRead {
+        StorageStatsRead {
+            connection: self.clone(),
+            statement: None,
+            stats: None,
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -2737,7 +3036,9 @@ impl Connection {
     /// Instead, the new page size is remembered and is used to set the page size when the database
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
+    /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
@@ -2833,9 +3134,7 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            let mut rows = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -2860,7 +3159,7 @@ impl Connection {
             let mut materialized_view_info = HashMap::default();
 
             let attached_resolver = |name: &str| -> Option<usize> {
-                self.namespaces
+                self.qualifiers
                     .database_id(&crate::util::normalize_ident(name))
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
@@ -2888,8 +3187,10 @@ impl Connection {
                 }
             }
 
-            match schema.populate_materialized_views_then_indices(
+            // The schema already holds every stored type.
+            match schema.populate_types_views_then_indices(
                 &syms,
+                &[],
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
@@ -2961,10 +3262,10 @@ impl Connection {
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
-        self.namespaces
-            .others()
+        self.qualifiers
+            .attached_databases()
             .into_iter()
-            .map(|(_, name)| name)
+            .map(|namespace| namespace.name)
             .collect()
     }
 
@@ -2994,10 +3295,6 @@ impl Connection {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.db.experimental_multiprocess_wal_enabled()
-    }
-
-    pub fn experimental_generated_columns_enabled(&self) -> bool {
-        self.db.experimental_generated_columns_enabled()
     }
 
     pub fn experimental_without_rowid_enabled(&self) -> bool {
@@ -3101,22 +3398,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
-        let mut stmt = self.prepare(pragma)?;
-        let mut results = Vec::new();
-        loop {
-            match stmt.step()? {
-                vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
-                    results.push(row);
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        self.prepare(pragma)?.run_collect_rows()
     }
 
     #[inline]
@@ -3204,8 +3486,8 @@ impl Connection {
     }
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
-    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        self.namespaces
+    pub fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+        self.current_qualifiers()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
     }
@@ -3230,10 +3512,10 @@ impl Connection {
     }
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
-        self.namespaces
-            .others()
+        self.qualifiers
+            .attached_databases()
             .iter()
-            .any(|(_, name)| name == alias)
+            .any(|namespace| namespace.name == alias)
     }
 
     /// List all attached database aliases
@@ -3301,7 +3583,7 @@ impl Connection {
         let entry = attached_dbs
             .index_to_data
             .get(&database_id)
-            .expect("Database ID should be valid after resolve_database_id");
+            .expect("Database ID should be valid after resolve_namespace");
         let schema = entry.db.schema.lock().clone();
         schema
     }
@@ -3331,27 +3613,98 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
-        &self.namespaces
+    /// The qualifiers the connection accepts, as of the schema it has: its
+    /// databases and the namespaces of its main database.
+    pub(crate) fn current_qualifiers(&self) -> Qualifiers {
+        self.maybe_update_schema();
+        let schema = self.schema.read().clone();
+        self.qualifiers(&schema).into_owned()
     }
 
-    /// Adds namespace `name`, which refers to database `database_id`, so
-    /// that `name.t` names the objects of that database.
-    pub fn add_namespace(&self, name: &str, database_id: usize) {
-        self.namespaces.add(name, database_id);
+    /// The qualifiers the connection accepts as of `schema`, the main
+    /// database's schema: its databases and the namespaces of `schema`.
+    /// They are the connection's own when `schema` has no namespaces.
+    pub(crate) fn qualifiers(&self, schema: &Schema) -> Cow<'_, Qualifiers> {
+        if schema.namespaces().next().is_none() {
+            return Cow::Borrowed(&self.qualifiers);
+        }
+        Cow::Owned(self.qualifiers.with_namespaces(schema.namespaces()))
+    }
+
+    /// Adds `qualifier`, so that `name.t` names the objects of the
+    /// namespace it refers to.
+    pub fn add_qualifier(&self, qualifier: Qualifier) {
+        self.qualifiers.add(qualifier);
         self.bump_prepare_context_generation();
     }
 
-    /// Removes namespace `name` and returns the database it referred to.
-    pub fn remove_namespace(&self, name: &str) -> Option<usize> {
-        let database_id = self.namespaces.remove(name);
+    /// Removes the qualifier `name` and returns the database it referred to.
+    pub fn remove_qualifier(&self, name: &str) -> Option<usize> {
+        let database_id = self.qualifiers.remove(name);
         self.bump_prepare_context_generation();
         database_id
     }
 
-    /// The name of the namespace that refers to database `database_id`.
+    /// Creates namespace `name` in the main database, as DDL of the
+    /// connection's transaction, and returns it. The schema keeps the
+    /// objects of the namespace under its id, so `name` can be anything
+    /// that no namespace is called yet.
+    pub fn create_namespace(self: &Arc<Self>, name: &str) -> Result<Qualifier> {
+        let statement = turso_parser::ast::Stmt::CreateSchema {
+            name: turso_parser::ast::Name::exact(name.to_string()),
+        };
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()?;
+        let namespace = self
+            .current_qualifiers()
+            .get(name)
+            .expect("CREATE SCHEMA added the namespace");
+        Ok(namespace)
+    }
+
+    /// Drops namespace `name` from the main database, as DDL of the
+    /// connection's transaction. Its objects stay stored under its id, so
+    /// the caller drops them first.
+    pub fn drop_namespace(self: &Arc<Self>, name: &str) -> Result<()> {
+        if self
+            .current_qualifiers()
+            .get(name)
+            .is_none_or(|namespace| namespace.is_database())
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "no such namespace: {name}"
+            )));
+        }
+        let statement = turso_parser::ast::Stmt::DropSchema {
+            name: turso_parser::ast::Name::exact(name.to_string()),
+        };
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()
+    }
+
+    /// Prepares a statement that a frontend built as an AST, such as CREATE
+    /// SCHEMA, DROP SCHEMA or GRANT. No dialect parses their text, so
+    /// preparing the statement again, after another connection changes the
+    /// schema, translates the AST itself.
+    pub fn prepare_ast_stmt(
+        self: &Arc<Self>,
+        statement: turso_parser::ast::Stmt,
+    ) -> Result<Statement> {
+        let sql = statement.to_string();
+        let cmd = turso_parser::ast::Cmd::Stmt(statement);
+        let mut stmt = self.prepare_translated_cmd(cmd.clone(), &sql)?;
+        stmt.reprepare_from(cmd);
+        Ok(stmt)
+    }
+
+    /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
-        self.namespaces.name(database_id)
+        self.qualifiers
+            .of_database(database_id)
+            .map(|namespace| namespace.name)
+    }
+
+    /// The qualifier `name`. `name` is normalized.
+    pub fn qualifier(&self, name: &str) -> Option<Qualifier> {
+        self.current_qualifiers().get(name)
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3369,16 +3722,58 @@ impl Connection {
         self.search_path.read().clone()
     }
 
-    /// The databases that a name without a namespace is looked up in, in
+    /// The namespaces that a name without a namespace is looked up in, in
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
-    pub fn search_order(&self) -> Vec<usize> {
-        self.namespaces
+    pub fn search_order(&self) -> Vec<Qualifier> {
+        self.current_qualifiers()
             .search_order(self.search_path.read().as_deref())
     }
 
+    pub fn session_role(&self) -> RoleId {
+        self.session_role
+    }
+
+    pub fn current_role(&self) -> RoleId {
+        *self.current_role.read()
+    }
+
+    /// Whether the current role passes every privilege check. Outside a
+    /// transaction, this sees role changes that other connections committed.
+    pub fn current_role_is_superuser(&self) -> bool {
+        self.maybe_update_schema();
+        let role = self.current_role();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            self.db.dialect().role_is_superuser(schema, role)
+        })
+    }
+
+    /// Whether the current role may read the value of `sequence` of
+    /// `namespace`, which needs SELECT or USAGE on it, as in PostgreSQL.
+    pub fn may_read_sequence(&self, namespace: NamespaceRef, sequence: &str) -> bool {
+        if namespace.database_id != MAIN_DB_ID || self.current_role_is_superuser() {
+            return true;
+        }
+        let role = self.current_role();
+        let dialect = self.dialect();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            [ast::Privilege::Select, ast::Privilege::Usage]
+                .into_iter()
+                .any(|privilege| {
+                    dialect.role_has_privilege(schema, namespace.id, sequence, role, privilege)
+                })
+        })
+    }
+
+    /// Statements prepared under the previous role are prepared again, because
+    /// privileges are checked when a statement is prepared.
+    pub fn set_current_role(&self, role: RoleId) {
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
+    }
+
     /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
+    pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => {
                 let schema = self.schema.read();
@@ -3439,13 +3834,14 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (seq_number, alias) in self.namespaces.others() {
+        for namespace in self.qualifiers.attached_databases() {
+            let seq_number = namespace.database_id();
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias, file_path));
+            databases.push((seq_number, namespace.name, file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -3464,6 +3860,16 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn is_tx_read_only(&self) -> bool {
+        self.tx_read_only.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_read_only(&self, value: bool) {
+        if self.tx_read_only.swap(value, Ordering::Relaxed) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {
@@ -3596,30 +4002,40 @@ impl Connection {
     /// namespace is looked up like the resolver does when a statement is
     /// compiled: in temp when there is a temp database, then through the
     /// search order.
-    pub fn find_sequence(&self, name: &str) -> Result<(usize, Arc<crate::schema::Sequence>)> {
+    pub fn find_sequence(
+        &self,
+        name: &str,
+    ) -> Result<(NamespaceRef, Arc<crate::schema::Sequence>)> {
         let not_found = |seq_name: &str| {
             LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         };
-        let get = |db_id: usize, seq_name: &str| {
-            self.with_schema(db_id, |schema| {
-                schema.get_sequence(seq_name).map(Arc::clone)
+        let get = |namespace: NamespaceRef, seq_name: &str| {
+            self.with_schema(namespace.database_id, |schema| {
+                schema.get_sequence(namespace.id, seq_name).map(Arc::clone)
             })
-            .map(|sequence| (db_id, sequence))
+            .map(|sequence| (namespace, sequence))
         };
-        if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
+        if let Some((namespace, seq)) = name.split_once('.') {
+            let namespace = self
+                .current_qualifiers()
+                .get(&crate::util::normalize_ident(namespace))
+                .ok_or_else(|| not_found(name))?;
             let seq_name = crate::util::normalize_ident(seq);
-            return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
+            return get(namespace.target, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
         let seq_name = crate::util::normalize_ident(name);
-        let mut databases = Vec::new();
+        let mut namespaces = Vec::new();
         if self.temp.database.read().is_some() {
-            databases.push(TEMP_DB_ID);
+            namespaces.push(NamespaceRef::root_of(TEMP_DB_ID));
         }
-        databases.extend(self.search_order());
-        databases
+        namespaces.extend(
+            self.search_order()
+                .into_iter()
+                .map(|namespace| namespace.target),
+        );
+        namespaces
             .into_iter()
-            .find_map(|db_id| get(db_id, &seq_name))
+            .find_map(|namespace| get(namespace, &seq_name))
             .ok_or_else(|| not_found(&seq_name))
     }
 
@@ -3651,6 +4067,11 @@ impl Connection {
         self.sequence_currvals
             .write()
             .remove(&(database_id, normalized));
+    }
+
+    /// Drop this connection's currval entries for every sequence.
+    pub fn clear_sequence_currvals(&self) {
+        self.sequence_currvals.write().clear();
     }
 
     /// Drop this connection's currval entries of every sequence of a
@@ -3734,8 +4155,12 @@ impl Connection {
                     };
                     let (backing_table_name, seq_name) = entry;
                     let normalized = crate::util::normalize_ident(&seq_name);
+                    let (namespace, sequence_name) = crate::namespace::demangle_name(
+                        self.dialect().supports_namespaces(),
+                        &normalized,
+                    );
                     let already_present =
-                        self.with_schema(MAIN_DB_ID, |s| s.get_sequence(&normalized).is_some());
+                        self.with_schema(MAIN_DB_ID, |s| s.has_sequence(namespace, sequence_name));
                     if already_present {
                         *idx += 1;
                         *stmt = None;
@@ -3753,7 +4178,7 @@ impl Connection {
                             meta,
                         ));
                         *seq = Some(Self::sequence_from_descriptor_meta(
-                            &seq_name,
+                            sequence_name,
                             &backing_table_name,
                             *meta,
                         )?);
@@ -3777,9 +4202,7 @@ impl Connection {
                     }
                     let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema
-                            .sequences
-                            .insert(normalized.clone(), Arc::new(sequence));
+                        schema.insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                     })?;
                     *idx += 1;
                     *stmt = None;
@@ -3966,6 +4389,11 @@ impl Connection {
     /// leaves MVCC AUTOINCREMENT able to re-emit a rowid already in use after a
     /// WAL→MVCC mode switch, so errors propagate to fail the open rather than
     /// continue into a state where the next INSERT NULL collides on disk.
+    /// A row whose `name` is not text names no table and is logged and skipped
+    /// (WAL mode can never look it up); the table that row once described is
+    /// left without an imported watermark. Unlike WAL mode, which falls back
+    /// to the table's largest rowid when a sequence row is absent, this sync
+    /// has no such floor — closing that gap is a separate fix.
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
@@ -3973,12 +4401,14 @@ impl Connection {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;
+        use crate::vdbe::execute::extract_int_value;
 
         loop {
             match state {
                 SyncAutoincrementState::Start => {
                     let has_seq_table = self.with_schema(MAIN_DB_ID, |s| {
-                        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
+                        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
+                            .is_some()
                     });
                     if !has_seq_table {
                         return Ok(IOResult::Done(()));
@@ -3993,9 +4423,19 @@ impl Connection {
                 }
                 SyncAutoincrementState::ReadSeqRows { stmt, rows } => {
                     crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        let name = row.get::<&str>(0)?.to_string();
-                        let seq = row.get::<i64>(1)?;
-                        rows.push((name, seq));
+                        // A row only matters for the table it names, so a
+                        // name that is not text names no table and the row is
+                        // skipped — WAL mode can never look it up either.
+                        // The seq value is coerced to an integer with the same
+                        // conversion the INSERT path uses.
+                        let Ok(name) = row.get::<&str>(0) else {
+                            tracing::warn!(
+                                "skipping sqlite_sequence row with non-text name during autoincrement sync"
+                            );
+                            return Ok(());
+                        };
+                        let seq = extract_int_value(row.get_value(1));
+                        rows.push((name.to_string(), seq));
                         Ok(())
                     }));
                     let rows = std::mem::take(rows);
@@ -4032,14 +4472,15 @@ impl Connection {
                             let sequence_name = autoincrement_sequence_name(&rows[*idx].0);
                             let backing_table_name = sequence_backing_table_name(&sequence_name);
                             let has_backing = self.with_schema(MAIN_DB_ID, |s| {
-                                s.get_btree_table(&backing_table_name).is_some()
+                                s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+                                    .is_some()
                             });
                             if !has_backing {
                                 *idx += 1;
                                 continue;
                             }
                             let seq = self
-                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(&sequence_name).cloned())
+                                .with_schema(MAIN_DB_ID, |s| s.get_sequence(NamespaceId::ROOT, &sequence_name).cloned())
                                 .ok_or_else(|| {
                                     LimboError::InternalError(format!(
                                         "sequence \"{sequence_name}\" is not loaded although its backing table exists"
@@ -4177,6 +4618,19 @@ impl Connection {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
+    /// Names of the collations registered on this connection, sorted.
+    pub fn get_syms_collation_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .syms
+            .read()
+            .collations
+            .values()
+            .map(|c| c.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
     pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, bool)> {
         self.syms
@@ -4204,94 +4658,35 @@ impl Connection {
         callback: crate::ContextCollationFunction,
         context_destructor: Option<crate::ContextDestructor>,
     ) {
-        let collation = CollationSeq::custom(&name);
         let normalized_name = crate::util::normalize_ident(&name);
         self.syms.write().collations.insert(
-            collation.id(),
-            Arc::new(function::ExternalCollation::new(
+            normalized_name.clone(),
+            function::ExternalCollation::new(
                 normalized_name,
                 context,
                 callback,
                 context_destructor,
-            )),
+            ),
         );
         self.bump_prepare_context_generation();
     }
 
     pub fn unregister_external_collation(&self, name: &str) {
-        if let Some(collation) = CollationSeq::known_custom(name) {
-            if self
-                .syms
-                .write()
-                .collations
-                .remove(&collation.id())
-                .is_some()
-            {
-                self.bump_prepare_context_generation();
-            }
+        if self
+            .syms
+            .write()
+            .collations
+            .remove(&crate::util::normalize_ident(name))
+            .is_some()
+        {
+            self.bump_prepare_context_generation();
         }
     }
 
-    pub(crate) fn get_external_collation(
-        &self,
-        collation: CollationSeq,
-    ) -> Result<Arc<function::ExternalCollation>> {
-        self.syms
-            .read()
-            .collations
-            .get(&collation.id())
-            .cloned()
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
-            })
-    }
-
-    pub(crate) fn custom_collation_compare(
-        external: &function::ExternalCollation,
-        left: &str,
-        right: &str,
-    ) -> CmpOrdering {
-        let result = unsafe {
-            (external.callback)(
-                external.context,
-                left.as_ptr(),
-                left.len(),
-                right.as_ptr(),
-                right.len(),
-            )
-        };
-        result.cmp(&0)
-    }
-
-    pub(crate) fn external_collation_comparator(
-        external: Arc<function::ExternalCollation>,
-    ) -> crate::vdbe::sorter::SortComparator {
-        Arc::new(move |left, right| {
-            Ok(match (left, right) {
-                (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
-                    Self::custom_collation_compare(&external, left.as_str(), right.as_str())
-                }
-                _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
-            })
-        })
-    }
-
-    pub(crate) fn make_collation_comparator(
-        &self,
-        collation: CollationSeq,
-    ) -> Result<crate::vdbe::sorter::SortComparator> {
-        let external = self.get_external_collation(collation)?;
-        Ok(Self::external_collation_comparator(external))
-    }
-
-    pub(crate) fn compare_external_collation(
-        &self,
-        collation: CollationSeq,
-        left: &str,
-        right: &str,
-    ) -> Result<CmpOrdering> {
-        let external = self.get_external_collation(collation)?;
-        Ok(Self::custom_collation_compare(&external, left, right))
+    /// The custom collations registered on this connection. A program keeps
+    /// them so that their callbacks live as long as it does.
+    pub(crate) fn custom_collations(&self) -> Vec<Arc<function::ExternalCollation>> {
+        self.syms.read().collations.values().cloned().collect()
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -4509,7 +4904,7 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
-    pub(crate) fn get_tx_state(&self) -> TransactionState {
+    pub fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
 
@@ -4541,7 +4936,7 @@ impl Connection {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
 
-    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
         *self.mv_tx.read()
     }
 
@@ -4861,6 +5256,7 @@ impl Connection {
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
+        self.set_tx_read_only(false);
         self.clear_tx_poison();
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
@@ -4894,6 +5290,7 @@ impl Connection {
             self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
+            self.set_tx_read_only(false);
         }
 
         self.rollback_temp_schema();
@@ -4938,6 +5335,16 @@ impl Connection {
                     .and_then(|entry| entry.db.get_mv_store().as_ref().cloned())
             }
         }
+    }
+
+    /// Turns off the automatic checkpoint of the MVCC logical log, like
+    /// `PRAGMA mvcc_checkpoint_threshold = -1` but without running SQL, so
+    /// the role the connection's user set does not limit it. The threshold
+    /// belongs to the database, so this applies to all of its connections.
+    /// Explicit checkpoints still run. Fails when the database does not use
+    /// MVCC.
+    pub fn disable_mvcc_auto_checkpoint(&self) -> Result<()> {
+        self.set_mvcc_checkpoint_threshold(-1)
     }
 
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
@@ -5009,7 +5416,8 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
-    pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
+    /// Custom collations by normalized name.
+    pub collations: HashMap<String, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
@@ -5072,19 +5480,18 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
-        let collation = CollationSeq::known_custom(name)?;
+    pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
         self.collations
-            .contains_key(&collation.id())
-            .then_some(collation)
+            .get(&crate::util::normalize_ident(name))
+            .map(|external| external.collation)
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
         for (name, func) in &other.functions {
             self.functions.insert(name.clone(), func.clone());
         }
-        for (id, collation) in &other.collations {
-            self.collations.insert(*id, collation.clone());
+        for (name, collation) in &other.collations {
+            self.collations.insert(name.clone(), collation.clone());
         }
         for (name, vtab) in &other.vtabs {
             self.vtabs.insert(name.clone(), vtab.clone());
@@ -5101,10 +5508,11 @@ impl SymbolTable {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
-    use crate::dialect::sqlite::attach::AttachDatabaseState;
+    use crate::attach::AttachDatabaseState;
+    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
+    use crate::EngineDialect;
     use crate::IOResult;
-    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5115,14 +5523,24 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap()
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
+    }
+
+    #[test]
+    fn test_the_sqlite_dialect_does_not_store_namespaces() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("main.db"));
+        assert!(conn.prepare("CREATE SCHEMA app").is_err());
+        assert!(conn.create_namespace("app").is_err());
+        assert_eq!(conn.qualifier("app"), None);
     }
 
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
@@ -5167,7 +5585,7 @@ mod tests {
 
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
-        let index = conn.namespaces.database_id(alias).unwrap();
+        let index = conn.qualifiers.database_id(alias).unwrap();
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
@@ -5177,13 +5595,17 @@ mod tests {
     fn test_named_memory_databases_on_same_io_are_distinct() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let draft_db =
-            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(EngineDialect)).unwrap();
         let synced_db =
-            Database::open_file(io, ":memory:sync-synced", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io, ":memory:sync-synced", Arc::new(EngineDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
-        let draft = draft_db.connect(ConnectOpts::new()).unwrap();
-        let synced = synced_db.connect(ConnectOpts::new()).unwrap();
+        let draft = draft_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let synced = synced_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         for conn in [&draft, &synced] {
             assert_eq!(conn.get_database_canonical_path(), "");
@@ -5209,14 +5631,18 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
 
         let first_db =
-            Database::open_file(io.clone(), ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
-        let first = first_db.connect(ConnectOpts::new()).unwrap();
+            Database::open_file(io.clone(), ":memory:reopen", Arc::new(EngineDialect)).unwrap();
+        let first = first_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
-        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
-        let second = second_db.connect(ConnectOpts::new()).unwrap();
+        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(EngineDialect)).unwrap();
+        let second = second_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
 
@@ -5273,6 +5699,33 @@ mod tests {
     }
 
     #[test]
+    fn test_a_database_that_does_not_store_namespaces_keeps_names_that_look_stored() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("main.db");
+        let conn = open_connection(&path);
+        conn.execute(
+            "CREATE TABLE __turso_ns1_t(x INTEGER); INSERT INTO __turso_ns1_t VALUES(7); \
+             CREATE TABLE p(v INTEGER); CREATE INDEX __turso_ns2_i ON p(v); INSERT INTO p VALUES(1); \
+             CREATE VIEW __turso_ns3_v AS SELECT x FROM __turso_ns1_t",
+        )
+        .unwrap();
+        assert!(conn.create_namespace("app").is_err());
+        drop(conn);
+
+        let conn = open_connection(&path);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns1_t"), 7);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns3_v"), 7);
+        assert!(conn.execute("DROP INDEX i").is_err());
+        conn.execute("DROP INDEX __turso_ns2_i").unwrap();
+        conn.execute("ALTER TABLE p RENAME TO __turso_ns4_p")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT v FROM __turso_ns4_p"), 1);
+        let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "ok");
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");
@@ -5283,10 +5736,12 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap()))
             .unwrap();
@@ -5434,6 +5889,22 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE t1(a)").unwrap();
+        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
+
+        conn.execute("PRAGMA automatic_index = OFF").unwrap();
+        stmt.run_collect_rows().unwrap();
+
+        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
+        assert_eq!(reprepares, 1);
+    }
+
+    #[test]
     fn test_temp_trigger_abort_rolls_back_temp_writes_without_panicking() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("main.db");
@@ -5540,5 +6011,31 @@ mod tests {
             "setval(13, false) committed: next nextval must return 13"
         );
         Ok(())
+    }
+
+    /// The reparse of the schema installs a fresh schema before the
+    /// dialect's schema state is read, and a statement compiled meanwhile
+    /// must not see it empty.
+    #[test]
+    fn schema_installed_while_being_read_keeps_the_loaded_dialect_schema() {
+        let db = Database::open_file(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.with_schema_mut(|schema| {
+            schema.dialect_schema = Some(Arc::new(()));
+        })
+        .unwrap();
+        let fresh = Schema::with_options(false, &EngineDialect).unwrap();
+        assert!(fresh.dialect_schema.is_none());
+
+        conn.install_schema_keeping_dialect_schema(&fresh).unwrap();
+
+        assert!(conn.schema.read().dialect_schema.is_some());
     }
 }

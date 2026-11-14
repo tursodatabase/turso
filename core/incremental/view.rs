@@ -1,5 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -8,10 +9,7 @@ use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{turso_assert, LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
-use turso_parser::{
-    ast::{Cmd, Stmt},
-    parser::Parser,
-};
+use turso_parser::ast::{Cmd, Stmt};
 
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
@@ -107,8 +105,9 @@ pub fn create_dbsp_state_index(
             nulls_order: None,
             // Key columns carry the defining query's comparison collation
             // (see state_table_sql), and the index must compare the same way.
-            collation: state_table.columns()[pos_in_table].collation_opt(),
+            collation: state_table.columns()[pos_in_table].collation(),
             pos_in_table,
+            explicit_collation: None,
             default: None,
             expr: None,
         })?;
@@ -704,9 +703,15 @@ pub struct IncrementalView {
 crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
-    pub fn from_sql(sql: &str, schema: &Schema, main_data_root: i64) -> Result<Self> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+    /// Builds the view from its `CREATE MATERIALIZED VIEW` text. `namespace`
+    /// is the namespace the view is in, where its unqualified names resolve.
+    pub fn from_sql(
+        sql: &str,
+        schema: &Schema,
+        main_data_root: i64,
+        namespace: NamespaceId,
+    ) -> Result<Self> {
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         let cmd = cmd.expect("View is an empty statement");
         match cmd {
             Cmd::Stmt(Stmt::CreateMaterializedView {
@@ -715,7 +720,7 @@ impl IncrementalView {
                 columns,
                 select,
             }) => {
-                let mut column_schema = extract_view_columns(&select, schema)?;
+                let mut column_schema = extract_view_columns(namespace, &select, schema)?;
                 column_schema.rename_columns(&columns);
                 Ok(Self {
                     name: view_name.name.as_str().to_string(),
@@ -744,11 +749,15 @@ impl IncrementalView {
     /// Schema reconstruction uses this to order persisted materialized views
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
-    pub(crate) fn referenced_table_names(select: &ast::Select) -> std::vec::Vec<String> {
+    /// The tables `select` reads, each with the namespace it is written
+    /// with, if any. A name that is a CTE of the select is not a table.
+    pub(crate) fn referenced_tables(
+        select: &ast::Select,
+    ) -> std::vec::Vec<(Option<String>, String)> {
         fn collect_source(
             source: &ast::SelectTable,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             match source {
                 ast::SelectTable::Table(name, _, _) => {
@@ -758,7 +767,12 @@ impl IncrementalView {
                     {
                         return;
                     }
-                    tables.insert(crate::util::normalize_ident(name.name.as_str()));
+                    tables.insert((
+                        name.namespace
+                            .as_ref()
+                            .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
+                        crate::util::normalize_ident(name.name.as_str()),
+                    ));
                 }
                 ast::SelectTable::Select { select, .. } => {
                     collect_select(select, cte_names, tables)
@@ -776,7 +790,7 @@ impl IncrementalView {
         fn collect_one(
             select: &ast::OneSelect,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let ast::OneSelect::Select {
                 columns,
@@ -832,7 +846,7 @@ impl IncrementalView {
         fn collect_select(
             select: &ast::Select,
             inherited_ctes: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let mut cte_names = inherited_ctes.clone();
             if let Some(with) = &select.with {
@@ -860,12 +874,14 @@ mod tests {
     use crate::alloc::vec;
     use crate::incremental::yield_test_support::OneShotYieldInjector;
     use crate::mvcc::yield_hooks::YieldPointMarker;
+    use crate::namespace::NamespaceId;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
+    use crate::security::roles::SessionRole;
     use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
-    use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
+    use crate::{ConnectOpts, Database, DatabaseOpts, EngineDialect, OpenFlags, StepResult};
     use turso_parser::ast;
 
     #[test]
@@ -890,7 +906,9 @@ mod tests {
     #[test]
     fn transaction_change_log_captures_once_for_multiple_views() {
         let schema = create_test_schema();
-        let table = schema.get_btree_table("customers").unwrap();
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, "customers")
+            .unwrap();
         let states = TransactionChanges::new();
         let views = vec!["first".to_string(), "second".to_string()];
 
@@ -919,7 +937,9 @@ mod tests {
     #[test]
     fn transaction_change_log_preserves_non_unit_weights() {
         let schema = create_test_schema();
-        let table = schema.get_btree_table("customers").unwrap();
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, "customers")
+            .unwrap();
         let states = TransactionChanges::new();
         let views = vec!["downstream".to_string()];
         let values = vec![Value::from_i64(7), Value::build_text("Ada")];
@@ -938,8 +958,10 @@ mod tests {
     #[test]
     fn transaction_change_log_orders_tables_globally_and_projects_by_identity() {
         let schema = create_test_schema();
-        let customers = schema.get_btree_table("customers").unwrap();
-        let orders = schema.get_btree_table("orders").unwrap();
+        let customers = schema
+            .get_btree_table(NamespaceId::ROOT, "customers")
+            .unwrap();
+        let orders = schema.get_btree_table(NamespaceId::ROOT, "orders").unwrap();
         let states = TransactionChanges::new();
         let views = vec!["joined_view".to_string()];
 
@@ -1043,7 +1065,9 @@ mod tests {
     #[test]
     fn update_delete_and_insert_halves_each_start_their_own_spill() {
         let schema = create_test_schema();
-        let table = schema.get_btree_table("customers").unwrap();
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, "customers")
+            .unwrap();
         let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
         let states = TransactionChanges::with_io(io.clone());
         let views = vec!["v".to_string()];
@@ -1104,7 +1128,9 @@ mod tests {
     #[test]
     fn clear_drops_a_spill_still_in_flight() {
         let schema = create_test_schema();
-        let table = schema.get_btree_table("customers").unwrap();
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, "customers")
+            .unwrap();
         let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
         let states = TransactionChanges::with_io(io.clone());
         let views = vec!["v".to_string()];
@@ -1163,10 +1189,12 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_views(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE aggregate_base(x)").unwrap();
         conn.execute(
             "CREATE MATERIALIZED VIEW aggregate_view AS SELECT SUM(x) AS total FROM aggregate_base",
@@ -1207,10 +1235,12 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_views(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
             .unwrap();
         for id in 1..260 {
@@ -1228,7 +1258,7 @@ mod tests {
             let view = conn
                 .schema
                 .read()
-                .get_materialized_view("overflow_view")
+                .get_materialized_view(NamespaceId::ROOT, "overflow_view")
                 .expect("materialized view must be present in the schema");
             let root_page = view.lock().get_root_page();
             root_page
@@ -1408,19 +1438,19 @@ mod tests {
         );
 
         schema
-            .add_btree_table(Arc::new(customers_table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(customers_table))
             .expect("Test setup: failed to add customers table");
 
         schema
-            .add_btree_table(Arc::new(orders_table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(orders_table))
             .expect("Test setup: failed to add orders table");
 
         schema
-            .add_btree_table(Arc::new(products_table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(products_table))
             .expect("Test setup: failed to add products table");
 
         schema
-            .add_btree_table(Arc::new(logs_table))
+            .add_btree_table(NamespaceId::ROOT, Arc::new(logs_table))
             .expect("Test setup: failed to add logs table");
 
         schema

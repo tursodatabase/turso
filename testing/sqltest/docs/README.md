@@ -16,8 +16,11 @@ cargo build --release
 ```
 
 The `.sqltest` corpora live in `sqlite/conformance/` (`sqlite-sqltests/` for
-SQLite-compatible coverage, `turso-sqltests/` for Turso-specific behavior);
-`make -C sqlite/conformance run` drives the full suite.
+SQLite-compatible coverage, `turso-sqltests/` for Turso-specific behavior), in
+`postgres/conformance/pg-sqltests/` for the PostgreSQL frontend, and in
+`testing/shared-sqltests/` for SQL that both frontends run.
+`make -C sqlite/conformance run` and `make -C postgres/conformance run` drive
+the full suites. Both also run `testing/shared-sqltests/`.
 
 ## Documentation Index
 

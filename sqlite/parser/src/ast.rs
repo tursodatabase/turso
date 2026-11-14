@@ -101,12 +101,14 @@ pub enum Stmt {
         /// password
         key: Option<Box<Expr>>,
     },
-    /// `BEGIN`: tx type, tx name
+    /// `BEGIN`: tx type, tx name, access mode
     Begin {
         // transaction type
         typ: Option<TransactionType>,
         // transaction name
         name: Option<Name>,
+        // READ ONLY or READ WRITE (None = use connection default, i.e. READ WRITE)
+        access_mode: Option<AccessMode>,
     },
     /// `COMMIT`/`END`: tx name
     Commit {
@@ -200,6 +202,16 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: String,
+        /// role options
+        options: RoleOptions,
+    },
+    /// `GRANT`: privileges on relations for roles. Not SQLite syntax; a
+    /// frontend with roles translates its own GRANT into this.
+    Grant(Grant),
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -227,6 +239,9 @@ pub enum Stmt {
         where_clause: Option<Box<Expr>>,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
+        /// Whether the statement is PostgreSQL's `TRUNCATE`, which deletes
+        /// every row and needs the TRUNCATE privilege rather than DELETE.
+        truncate: bool,
     },
     /// `DETACH DATABASE`: db name
     Detach {
@@ -359,6 +374,38 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `ALTER SEQUENCE name OWNED BY { table.column | NONE }`: PostgreSQL's
+    /// link from a sequence to the column that draws from it, which makes
+    /// the sequence belong to the table. Not SQLite syntax; a frontend
+    /// builds it, as the PostgreSQL frontend does for a `serial` column.
+    AlterSequenceOwnedBy {
+        seq_name: QualifiedName,
+        /// The table and its column, or None for `OWNED BY NONE`.
+        owner: Option<(QualifiedName, Name)>,
+    },
+    /// `CREATE SCHEMA`: a namespace stored in the main database. Only a
+    /// frontend that supports namespaces builds this statement; the SQLite
+    /// parser has no such syntax.
+    CreateSchema {
+        /// schema name
+        name: Name,
+    },
+    /// `DROP SCHEMA`, built only by a frontend that supports namespaces.
+    DropSchema {
+        /// schema name
+        name: Name,
+    },
+    /// `CREATE POLICY`, built only by a frontend with row-level security.
+    CreatePolicy(Box<CreatePolicy>),
+    /// `DROP POLICY`, built only by a frontend with row-level security.
+    DropPolicy {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// policy name
+        policy_name: Name,
+        /// table the policy belongs to
+        tbl_name: QualifiedName,
+    },
 }
 
 #[repr(transparent)]
@@ -444,9 +491,15 @@ pub enum Expr {
     },
     /// binary expression
     Binary(Box<Expr>, Operator, Box<Expr>),
-    /// Register reference for DBSP expression compilation
-    /// This is not part of SQL syntax but used internally for incremental computation
-    Register(usize),
+    /// A value already in a register, e.g. a column reference that the compiler
+    /// replaced with the register holding the column's value. Not SQL syntax.
+    Register {
+        /// The register.
+        register: usize,
+        /// The custom type of the decoded column value the register holds, so
+        /// that operators on it work as they do on the column.
+        custom_type: Option<Box<Type>>,
+    },
     /// `CASE` expression
     Case {
         /// operand
@@ -475,8 +528,8 @@ pub enum Expr {
         base: Box<Expr>,
         /// field or variant name
         field: Name,
-        /// pre-resolved field/variant index (populated during binding)
-        resolved: Option<FieldAccessResolution>,
+        /// the field or variant, found when the expression is bound
+        resolved: FieldAccessResolution,
     },
     /// call to a built-in function
     FunctionCall {
@@ -643,8 +696,14 @@ impl Default for Expr {
 pub struct Variable {
     pub index: NonZeroU32,
     pub name: Option<Box<str>>,
-    /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
-    pub col_type: Option<Box<str>>,
+    /// The custom type of the decoded column value this parameter holds: a
+    /// trigger's NEW and OLD columns in its body.
+    pub custom_type: Option<Box<Type>>,
+    /// Collation of the source column, if the variable stands for a column
+    /// (trigger NEW/OLD rewrite). Comparisons of the variable use it like
+    /// they use a column's collation.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub col_collation: Option<Box<str>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -656,7 +715,8 @@ impl Variable {
         Self {
             index,
             name: None,
-            col_type: None,
+            custom_type: None,
+            col_collation: None,
             numbered: false,
         }
     }
@@ -666,20 +726,24 @@ impl Variable {
         Self {
             index,
             name: None,
-            col_type: None,
+            custom_type: None,
+            col_collation: None,
             numbered: true,
         }
     }
 
-    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+    /// A variable that stands for a column with the given custom type and
+    /// collation.
+    pub fn for_column(
+        index: NonZeroU32,
+        custom_type: Option<Type>,
+        col_collation: Option<&str>,
+    ) -> Self {
         Self {
             index,
             name: None,
-            col_type: if col_type.is_empty() {
-                None
-            } else {
-                Some(col_type.into())
-            },
+            custom_type: custom_type.map(Box::new),
+            col_collation: col_collation.map(Into::into),
             numbered: false,
         }
     }
@@ -688,7 +752,8 @@ impl Variable {
         Self {
             index,
             name: Some(name.into()),
-            col_type: None,
+            custom_type: None,
+            col_collation: None,
             numbered: false,
         }
     }
@@ -711,6 +776,10 @@ pub enum SubqueryType {
     RowValue {
         result_reg_start: usize,
         num_regs: usize,
+        /// When a second row is an error, the register that counts the
+        /// subquery's rows: 0, 1, or NULL for more than one. Reading the
+        /// result raises the error if it is NULL.
+        row_count_reg: Option<usize>,
     },
     /// IN subquery; result is stored in an ephemeral index.
     /// Example: `x <NOT> IN (SELECT ...)`
@@ -733,6 +802,14 @@ impl Expr {
 
     pub fn binary(lhs: Expr, operator: Operator, rhs: Expr) -> Expr {
         Expr::Binary(Box::new(lhs), operator, Box::new(rhs))
+    }
+
+    /// A register that holds no custom-type value.
+    pub fn register(register: usize) -> Expr {
+        Expr::Register {
+            register,
+            custom_type: None,
+        }
     }
 
     pub fn not_null(expr: Expr) -> Expr {
@@ -1436,15 +1513,153 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `OWNER TO`: the relation's new owning role. Not SQLite syntax; a
+    /// frontend with roles translates its own OWNER TO into this.
+    OwnerTo {
+        /// The relation kind the statement names: `ALTER TABLE`,
+        /// `ALTER VIEW` and so on.
+        kind: RelationKind,
+        role: RoleSpec,
+        /// `IF EXISTS`: a missing relation is not an error.
+        if_exists: bool,
+    },
+    /// `ENABLE ROW LEVEL SECURITY`
+    EnableRowSecurity,
+    /// `DISABLE ROW LEVEL SECURITY`
+    DisableRowSecurity,
+}
+
+/// What kind of relation a schema object is. `ALTER ... OWNER TO` names
+/// one, and the engine's schema lists its relations by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+    Index,
+}
+
+/// A role named in DDL, like PostgreSQL's RoleSpec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RoleSpec {
+    /// A role by name.
+    Name(String),
+    /// `CURRENT_ROLE` and `CURRENT_USER`: the role the session runs as now.
+    CurrentRole,
+    /// `SESSION_USER`: the role the session logged in as.
+    SessionUser,
+}
+
+/// The options of `CREATE ROLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RoleOptions {
+    /// `INHERIT`: the role uses the privileges of the roles it is a member
+    /// of without `SET ROLE`
+    pub inherit: bool,
+    /// `BYPASSRLS`: row-level security does not limit the role
+    pub bypassrls: bool,
+}
+
+impl Default for RoleOptions {
+    /// The options of a `CREATE ROLE` that gives none.
+    fn default() -> Self {
+        Self {
+            inherit: true,
+            bypassrls: false,
+        }
+    }
+}
+
+/// `GRANT privileges ON relations TO grantees`, or `REVOKE privileges ON
+/// relations FROM grantees` when `revoke` is set. The relations are named
+/// one by one: a frontend expands a form like `ALL TABLES IN SCHEMA` before
+/// it builds this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Grant {
+    pub revoke: bool,
+    pub privileges: Vec<Privilege>,
+    /// Whether the statement grants on `SEQUENCE`s rather than on tables,
+    /// which names any relation.
+    pub on_sequences: bool,
+    pub relations: Vec<QualifiedName>,
+    pub grantees: Vec<Grantee>,
+}
+
+/// A privilege on a relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Maintain,
+    Usage,
+    /// `ALL [PRIVILEGES]`: every privilege that the kind of relation has.
+    All,
+}
+
+/// Whom a `GRANT` gives privileges to, whom a `REVOKE` takes them from, or
+/// whom a policy applies to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Grantee {
+    /// `PUBLIC`: every role.
+    Public,
+    Role(RoleSpec),
+}
+
+/// `CREATE POLICY`: which rows of a table the roles it applies to may access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreatePolicy {
+    /// policy name
+    pub policy_name: Name,
+    /// table the policy belongs to
+    pub tbl_name: QualifiedName,
+    /// `AS PERMISSIVE` (true) or `AS RESTRICTIVE` (false)
+    pub permissive: bool,
+    /// `FOR` command
+    pub command: PolicyCommand,
+    /// `TO` roles
+    pub roles: Vec<Grantee>,
+    /// `USING`: which existing rows the policy lets the roles access
+    pub using_expr: Option<Box<Expr>>,
+    /// `WITH CHECK`: which new rows the policy lets the roles write
+    pub check_expr: Option<Box<Expr>>,
+}
+
+/// The command a policy applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PolicyCommand {
+    /// `FOR ALL`
+    All,
+    /// `FOR SELECT`
+    Select,
+    /// `FOR INSERT`
+    Insert,
+    /// `FOR UPDATE`
+    Update,
+    /// `FOR DELETE`
+    Delete,
 }
 
 /// Operator mapping in a `CREATE TYPE` body
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeOperator {
-    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    /// operator symbol: "+", "-", "*", "/", "%"
     pub op: String,
-    /// function name to call, or None for naked operators (use base type comparison)
+    /// function name to call, or None for naked operators (use the base type's operator)
     pub func_name: Option<String>,
 }
 
@@ -1480,6 +1695,10 @@ pub enum CreateTypeBody {
         base: String,
         /// encode expression (called on write), uses `value` placeholder for input
         encode: Option<Box<Expr>>,
+        /// coerce expression (called on write after encode, and by a CAST with
+        /// type parameters). Rounds or rejects the encoded `value` to fit the
+        /// type parameters, which only this expression can reference.
+        coerce: Option<Box<Expr>>,
         /// decode expression (called on read), uses `value` placeholder for input
         decode: Option<Box<Expr>>,
         /// operator-to-function mappings
@@ -1903,12 +2122,16 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
+    /// turn automatic indexes on or off
+    AutomaticIndex,
     /// set the busy_timeout (see <https://www.sqlite.org/pragma.html#pragma_busy_timeout>)
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// List the collating sequences defined for the connection
+    CollationList,
     /// When ON, each INSERT, UPDATE and DELETE returns one row with the
     /// number of rows it changed.
     CountChanges,
@@ -2171,6 +2394,10 @@ pub struct TypeField {
     pub field_type: Type,
 }
 
+/// The most dimensions an array type can have. A column stores its number of
+/// dimensions in three bits.
+pub const MAX_ARRAY_DIMENSIONS: u32 = 7;
+
 /// Column type
 // https://sqlite.org/syntax/type-name.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2214,6 +2441,14 @@ pub enum TransactionType {
     Exclusive,
     /// `CONCURRENT`,
     Concurrent,
+}
+
+/// Transaction access mode (orthogonal to locking type).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
 }
 
 /// Upsert clause

@@ -1,0 +1,907 @@
+# REVOKE on tables and sequences through the PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+#
+# REVOKE takes privileges out of the relation's access control list, which
+# pg_class.relacl shows in PostgreSQL's aclitem[] form. It changes only the
+# entries that the owner gave, because only the owner grants, and a
+# superuser grants and revokes as the owner. An entry left without
+# privileges is dropped from the list.
+
+@database :memory:
+
+# What REVOKE stores: pg_class.relacl.
+
+test revoke-select-drops-the-entry-from-relacl {
+    CREATE ROLE rv_acl_reader;
+    CREATE TABLE rv_acl (id INT);
+    GRANT SELECT ON rv_acl TO rv_acl_reader;
+    REVOKE SELECT ON rv_acl FROM rv_acl_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-of-some-privileges-keeps-the-others {
+    CREATE ROLE rv_acl_some;
+    CREATE TABLE rv_acl_some_docs (id INT);
+    GRANT SELECT, INSERT, UPDATE ON rv_acl_some_docs TO rv_acl_some;
+    REVOKE INSERT ON TABLE rv_acl_some_docs FROM rv_acl_some;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_some_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,rv_acl_some=rw/postgres}
+}
+
+test revoke-of-a-privilege-never-granted-changes-nothing {
+    CREATE ROLE rv_acl_never;
+    CREATE TABLE rv_acl_never_docs (id INT);
+    GRANT SELECT ON rv_acl_never_docs TO rv_acl_never;
+    REVOKE INSERT ON rv_acl_never_docs FROM rv_acl_never;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_never_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,rv_acl_never=r/postgres}
+}
+
+test revoke-from-a-role-without-an-entry-changes-nothing {
+    CREATE ROLE rv_acl_kept;
+    CREATE ROLE rv_acl_absent;
+    CREATE TABLE rv_acl_absent_docs (id INT);
+    GRANT SELECT ON rv_acl_absent_docs TO rv_acl_kept;
+    REVOKE ALL ON rv_acl_absent_docs FROM rv_acl_absent;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_absent_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,rv_acl_kept=r/postgres}
+}
+
+# PostgreSQL starts from the owner's default list, and stores it even when
+# the REVOKE takes nothing away.
+test revoke-on-a-table-without-a-list-stores-the-default-list {
+    CREATE ROLE rv_acl_untouched;
+    CREATE TABLE rv_acl_untouched_docs (id INT);
+    REVOKE SELECT ON rv_acl_untouched_docs FROM rv_acl_untouched;
+    SELECT coalesce(relacl::text, 'null') FROM pg_class WHERE relname = 'rv_acl_untouched_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-all-drops-the-entry {
+    CREATE ROLE rv_acl_all;
+    CREATE TABLE rv_acl_all_docs (id INT);
+    CREATE TABLE rv_acl_all_privileges_docs (id INT);
+    GRANT ALL ON rv_acl_all_docs, rv_acl_all_privileges_docs TO rv_acl_all;
+    REVOKE ALL ON rv_acl_all_docs FROM rv_acl_all;
+    REVOKE ALL PRIVILEGES ON TABLE rv_acl_all_privileges_docs FROM rv_acl_all;
+    SELECT relname, relacl FROM pg_class
+        WHERE relname IN ('rv_acl_all_docs', 'rv_acl_all_privileges_docs') ORDER BY relname;
+}
+expect {
+    rv_acl_all_docs|{postgres=arwdDxtm/postgres}
+    rv_acl_all_privileges_docs|{postgres=arwdDxtm/postgres}
+}
+
+test revoke-from-public-keeps-the-entries-of-roles {
+    CREATE ROLE rv_acl_named;
+    CREATE TABLE rv_acl_public (id INT);
+    GRANT SELECT ON rv_acl_public TO PUBLIC, rv_acl_named;
+    REVOKE SELECT ON rv_acl_public FROM PUBLIC;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_public';
+}
+expect {
+    {postgres=arwdDxtm/postgres,rv_acl_named=r/postgres}
+}
+
+test revoke-from-several-roles-on-several-tables {
+    CREATE ROLE rv_acl_many_a;
+    CREATE ROLE rv_acl_many_b;
+    CREATE ROLE rv_acl_many_c;
+    CREATE TABLE rv_acl_many_x (id INT);
+    CREATE TABLE rv_acl_many_y (id INT);
+    GRANT SELECT ON rv_acl_many_x, rv_acl_many_y TO rv_acl_many_a, rv_acl_many_b, rv_acl_many_c;
+    REVOKE SELECT ON rv_acl_many_x, rv_acl_many_y FROM rv_acl_many_a, rv_acl_many_c;
+    SELECT relname, relacl FROM pg_class
+        WHERE relname IN ('rv_acl_many_x', 'rv_acl_many_y') ORDER BY relname;
+}
+expect {
+    rv_acl_many_x|{postgres=arwdDxtm/postgres,rv_acl_many_b=r/postgres}
+    rv_acl_many_y|{postgres=arwdDxtm/postgres,rv_acl_many_b=r/postgres}
+}
+
+test revoke-from-a-mixed-case-role {
+    CREATE ROLE "RvAclCased";
+    CREATE TABLE rv_acl_cased (id INT);
+    GRANT SELECT, INSERT ON rv_acl_cased TO "RvAclCased";
+    REVOKE INSERT ON rv_acl_cased FROM "RvAclCased";
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_cased';
+}
+expect {
+    {postgres=arwdDxtm/postgres,RvAclCased=r/postgres}
+}
+
+test revoke-from-current-user-shrinks-the-owners-entry {
+    CREATE TABLE rv_acl_current (id INT);
+    REVOKE SELECT ON rv_acl_current FROM CURRENT_USER;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_current';
+}
+expect {
+    {postgres=awdDxtm/postgres}
+}
+
+test revoke-from-current-role-and-session-user {
+    CREATE TABLE rv_acl_current_role (id INT);
+    REVOKE INSERT ON rv_acl_current_role FROM CURRENT_ROLE;
+    REVOKE UPDATE ON rv_acl_current_role FROM SESSION_USER;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_current_role';
+}
+expect {
+    {postgres=rdDxtm/postgres}
+}
+
+test revoke-all-from-the-owner-leaves-an-empty-list {
+    CREATE TABLE rv_acl_emptied (id INT);
+    REVOKE ALL ON rv_acl_emptied FROM postgres;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_emptied';
+}
+expect {
+    {}
+}
+
+test revoke-on-all-tables-in-schema-changes-each-table-but-not-sequences {
+    CREATE ROLE rv_acl_schema;
+    CREATE SCHEMA rv_acl_schema_s;
+    CREATE TABLE rv_acl_schema_s.a (id INT);
+    CREATE TABLE rv_acl_schema_s.b (id INT);
+    CREATE SEQUENCE rv_acl_schema_s.q;
+    GRANT SELECT ON ALL TABLES IN SCHEMA rv_acl_schema_s TO rv_acl_schema;
+    GRANT SELECT ON ALL SEQUENCES IN SCHEMA rv_acl_schema_s TO rv_acl_schema;
+    REVOKE SELECT ON ALL TABLES IN SCHEMA rv_acl_schema_s FROM rv_acl_schema;
+    SELECT c.relname, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rv_acl_schema_s' ORDER BY c.relname;
+}
+expect {
+    a|{postgres=arwdDxtm/postgres}
+    b|{postgres=arwdDxtm/postgres}
+    q|{postgres=rwU/postgres,rv_acl_schema=r/postgres}
+}
+
+test revoke-on-all-sequences-in-schema-changes-each-sequence-but-not-tables {
+    CREATE ROLE rv_acl_seq_schema;
+    CREATE SCHEMA rv_acl_seq_schema_s;
+    CREATE TABLE rv_acl_seq_schema_s.t (id INT);
+    CREATE SEQUENCE rv_acl_seq_schema_s.q;
+    CREATE SEQUENCE rv_acl_seq_schema_s.r;
+    GRANT SELECT ON ALL TABLES IN SCHEMA rv_acl_seq_schema_s TO rv_acl_seq_schema;
+    GRANT ALL ON ALL SEQUENCES IN SCHEMA rv_acl_seq_schema_s TO rv_acl_seq_schema;
+    REVOKE ALL ON ALL SEQUENCES IN SCHEMA rv_acl_seq_schema_s FROM rv_acl_seq_schema;
+    SELECT c.relname, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'rv_acl_seq_schema_s' ORDER BY c.relname;
+}
+expect {
+    q|{postgres=rwU/postgres}
+    r|{postgres=rwU/postgres}
+    t|{postgres=arwdDxtm/postgres,rv_acl_seq_schema=r/postgres}
+}
+
+test revoke-on-all-tables-in-an-empty-schema-checks-the-role {
+    CREATE SCHEMA rv_empty_schema;
+    REVOKE SELECT ON ALL TABLES IN SCHEMA rv_empty_schema FROM rv_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "rv_no_such_role" does not exist
+}
+
+test revoke-on-all-tables-in-missing-schema-fails {
+    CREATE ROLE rv_all_missing_schema;
+    REVOKE SELECT ON ALL TABLES IN SCHEMA rv_no_such_schema FROM rv_all_missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    schema "rv_no_such_schema" does not exist
+}
+
+test revoke-by-the-owner-drops-the-entry-it-gave {
+    CREATE ROLE rv_acl_owner;
+    CREATE ROLE rv_acl_owner_reader;
+    CREATE TABLE rv_acl_owned (id INT);
+    ALTER TABLE rv_acl_owned OWNER TO rv_acl_owner;
+    SET ROLE rv_acl_owner;
+    GRANT SELECT ON rv_acl_owned TO rv_acl_owner_reader;
+    REVOKE SELECT ON rv_acl_owned FROM rv_acl_owner_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_owned';
+}
+expect {
+    {rv_acl_owner=arwdDxtm/rv_acl_owner}
+}
+
+test revoke-by-a-superuser-revokes-as-the-owner {
+    CREATE ROLE rv_acl_su_owner;
+    CREATE ROLE rv_acl_su_reader;
+    CREATE TABLE rv_acl_su_owned (id INT);
+    ALTER TABLE rv_acl_su_owned OWNER TO rv_acl_su_owner;
+    SET ROLE rv_acl_su_owner;
+    GRANT SELECT ON rv_acl_su_owned TO rv_acl_su_reader;
+    RESET ROLE;
+    REVOKE SELECT ON rv_acl_su_owned FROM rv_acl_su_reader;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_su_owned';
+}
+expect {
+    {rv_acl_su_owner=arwdDxtm/rv_acl_su_owner}
+}
+
+test revoke-by-the-owner-from-itself-shrinks-its-entry {
+    CREATE ROLE rv_acl_self;
+    CREATE TABLE rv_acl_self_docs (id INT);
+    ALTER TABLE rv_acl_self_docs OWNER TO rv_acl_self;
+    SET ROLE rv_acl_self;
+    REVOKE SELECT, TRUNCATE ON rv_acl_self_docs FROM rv_acl_self;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_self_docs';
+}
+expect {
+    {rv_acl_self=awdxtm/rv_acl_self}
+}
+
+test revoke-by-a-role-without-privileges-fails {
+    CREATE ROLE rv_acl_stranger;
+    CREATE ROLE rv_acl_stranger_reader;
+    CREATE TABLE rv_acl_not_theirs (id INT);
+    GRANT SELECT ON rv_acl_not_theirs TO rv_acl_stranger_reader;
+    SET ROLE rv_acl_stranger;
+    REVOKE SELECT ON rv_acl_not_theirs FROM rv_acl_stranger_reader;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_acl_not_theirs
+}
+
+# PostgreSQL warns that no privileges could be revoked and changes nothing.
+test revoke-by-a-role-without-grant-option-changes-nothing {
+    CREATE ROLE rv_acl_no_option;
+    CREATE ROLE rv_acl_no_option_reader;
+    CREATE TABLE rv_acl_readable (id INT);
+    GRANT SELECT ON rv_acl_readable TO PUBLIC, rv_acl_no_option_reader;
+    SET ROLE rv_acl_no_option;
+    REVOKE SELECT ON rv_acl_readable FROM rv_acl_no_option_reader;
+    REVOKE ALL ON rv_acl_readable FROM PUBLIC;
+    RESET ROLE;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_readable';
+}
+expect {
+    {postgres=arwdDxtm/postgres,=r/postgres,rv_acl_no_option_reader=r/postgres}
+}
+
+# GRANT cannot give a grant option, so no privilege depends on another and
+# RESTRICT and CASCADE revoke the same.
+test revoke-restrict-drops-the-entry {
+    CREATE ROLE rv_acl_restrict;
+    CREATE TABLE rv_acl_restrict_docs (id INT);
+    GRANT SELECT ON rv_acl_restrict_docs TO rv_acl_restrict;
+    REVOKE SELECT ON rv_acl_restrict_docs FROM rv_acl_restrict RESTRICT;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_restrict_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-cascade-drops-the-entry {
+    CREATE ROLE rv_acl_cascade;
+    CREATE TABLE rv_acl_cascade_docs (id INT);
+    GRANT SELECT ON rv_acl_cascade_docs TO rv_acl_cascade;
+    REVOKE SELECT ON rv_acl_cascade_docs FROM rv_acl_cascade CASCADE;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_cascade_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-in-a-rolled-back-transaction-changes-nothing {
+    CREATE ROLE rv_acl_rolled_back;
+    CREATE TABLE rv_acl_rollback_docs (id INT);
+    GRANT SELECT ON rv_acl_rollback_docs TO rv_acl_rolled_back;
+    BEGIN;
+    REVOKE SELECT ON rv_acl_rollback_docs FROM rv_acl_rolled_back;
+    ROLLBACK;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_rollback_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres,rv_acl_rolled_back=r/postgres}
+}
+
+test revoke-in-a-committed-transaction-is-stored {
+    CREATE ROLE rv_acl_committed;
+    CREATE TABLE rv_acl_commit_docs (id INT);
+    GRANT SELECT ON rv_acl_commit_docs TO rv_acl_committed;
+    BEGIN;
+    REVOKE SELECT ON rv_acl_commit_docs FROM rv_acl_committed;
+    COMMIT;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_acl_commit_docs';
+}
+expect {
+    {postgres=arwdDxtm/postgres}
+}
+
+test revoke-in-a-read-only-transaction-fails {
+    CREATE ROLE rv_read_only;
+    CREATE TABLE rv_read_only_docs (id INT);
+    GRANT SELECT ON rv_read_only_docs TO rv_read_only;
+    BEGIN READ ONLY;
+    REVOKE SELECT ON rv_read_only_docs FROM rv_read_only;
+}
+@sqlstate 25006
+expect error {}
+
+# Errors for what REVOKE names.
+
+test revoke-on-missing-table-fails {
+    CREATE ROLE rv_missing_table;
+    REVOKE SELECT ON rv_no_such_table FROM rv_missing_table;
+}
+@sqlstate 42P01
+expect error {
+    relation "rv_no_such_table" does not exist
+}
+
+test revoke-on-table-in-missing-schema-fails {
+    CREATE ROLE rv_missing_schema;
+    REVOKE SELECT ON rv_no_such_schema.t FROM rv_missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    schema "rv_no_such_schema" does not exist
+}
+
+test revoke-from-missing-role-fails {
+    CREATE TABLE rv_missing_role_docs (id INT);
+    REVOKE SELECT ON rv_missing_role_docs FROM rv_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "rv_no_such_role" does not exist
+}
+
+test revoke-checks-the-table-before-the-role {
+    REVOKE SELECT ON rv_no_such_table FROM rv_no_such_role;
+}
+@sqlstate 42P01
+expect error {
+    relation "rv_no_such_table" does not exist
+}
+
+test revoke-on-index-fails {
+    CREATE ROLE rv_index_grantee;
+    CREATE TABLE rv_indexed (id INT);
+    CREATE INDEX rv_indexed_idx ON rv_indexed (id);
+    REVOKE SELECT ON rv_indexed_idx FROM rv_index_grantee;
+}
+@sqlstate 42809
+expect error {
+    "rv_indexed_idx" is an index
+}
+
+test revoke-of-a-privilege-tables-do-not-have-fails {
+    CREATE ROLE rv_usage;
+    CREATE TABLE rv_usage_docs (id INT);
+    REVOKE USAGE ON rv_usage_docs FROM rv_usage;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type USAGE for table
+}
+
+# Sequences.
+
+test revoke-on-sequence-drops-the-privileges {
+    CREATE ROLE rv_seq;
+    CREATE SEQUENCE rv_seq_s;
+    GRANT USAGE, SELECT, UPDATE ON SEQUENCE rv_seq_s TO rv_seq;
+    REVOKE UPDATE ON SEQUENCE rv_seq_s FROM rv_seq;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_seq_s';
+}
+expect {
+    {postgres=rwU/postgres,rv_seq=rU/postgres}
+}
+
+test revoke-all-on-sequence-drops-the-entry {
+    CREATE ROLE rv_seq_all;
+    CREATE SEQUENCE rv_seq_all_s;
+    GRANT ALL ON SEQUENCE rv_seq_all_s TO rv_seq_all;
+    REVOKE ALL ON SEQUENCE rv_seq_all_s FROM rv_seq_all;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_seq_all_s';
+}
+expect {
+    {postgres=rwU/postgres}
+}
+
+test revoke-usage-on-a-sequence-named-as-a-table {
+    CREATE ROLE rv_seq_as_table;
+    CREATE SEQUENCE rv_seq_as_table_s;
+    GRANT ALL ON rv_seq_as_table_s TO rv_seq_as_table;
+    REVOKE USAGE ON rv_seq_as_table_s FROM rv_seq_as_table;
+    SELECT relacl FROM pg_class WHERE relname = 'rv_seq_as_table_s';
+}
+expect {
+    {postgres=rwU/postgres,rv_seq_as_table=rw/postgres}
+}
+
+# A sequence has only SELECT, UPDATE and USAGE. Named as a table, PostgreSQL
+# leaves out the others with a warning, so the list does not change, and
+# stays NULL when there is none.
+test revoke-insert-on-a-sequence-named-as-a-table-changes-nothing {
+    CREATE ROLE rv_seq_insert;
+    CREATE SEQUENCE rv_seq_insert_s;
+    CREATE SEQUENCE rv_seq_insert_untouched_s;
+    GRANT ALL ON rv_seq_insert_s TO rv_seq_insert;
+    REVOKE INSERT ON rv_seq_insert_s FROM rv_seq_insert;
+    REVOKE INSERT ON rv_seq_insert_untouched_s FROM rv_seq_insert;
+    SELECT relname, coalesce(relacl::text, 'null') FROM pg_class
+        WHERE relname IN ('rv_seq_insert_s', 'rv_seq_insert_untouched_s') ORDER BY relname;
+}
+expect {
+    rv_seq_insert_s|{postgres=rwU/postgres,rv_seq_insert=rwU/postgres}
+    rv_seq_insert_untouched_s|null
+}
+
+test revoke-of-a-privilege-sequences-do-not-have-fails {
+    CREATE ROLE rv_seq_bad;
+    CREATE SEQUENCE rv_seq_bad_s;
+    REVOKE INSERT ON SEQUENCE rv_seq_bad_s FROM rv_seq_bad;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type INSERT for sequence
+}
+
+test revoke-on-sequence-of-a-table-fails {
+    CREATE ROLE rv_not_a_sequence;
+    CREATE TABLE rv_not_a_sequence_t (id INT);
+    REVOKE USAGE ON SEQUENCE rv_not_a_sequence_t FROM rv_not_a_sequence;
+}
+@sqlstate 42809
+expect error {
+    "rv_not_a_sequence_t" is not a sequence
+}
+
+# What a role may do after REVOKE. Each privilege has a test where the role
+# keeps it and one where it is revoked.
+
+test role-keeps-select-when-another-privilege-is-revoked {
+    CREATE ROLE rv_keeps_select;
+    CREATE TABLE rv_keeps_select_docs (id INT);
+    INSERT INTO rv_keeps_select_docs VALUES (1);
+    GRANT SELECT, INSERT ON rv_keeps_select_docs TO rv_keeps_select;
+    REVOKE INSERT ON rv_keeps_select_docs FROM rv_keeps_select;
+    SET ROLE rv_keeps_select;
+    SELECT id FROM rv_keeps_select_docs;
+}
+expect {
+    1
+}
+
+test role-cannot-read-after-select-is-revoked {
+    CREATE ROLE rv_no_select;
+    CREATE TABLE rv_no_select_docs (id INT);
+    GRANT SELECT ON rv_no_select_docs TO rv_no_select;
+    REVOKE SELECT ON rv_no_select_docs FROM rv_no_select;
+    SET ROLE rv_no_select;
+    SELECT id FROM rv_no_select_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_no_select_docs
+}
+
+test role-keeps-insert-when-another-privilege-is-revoked {
+    CREATE ROLE rv_keeps_insert;
+    CREATE TABLE rv_keeps_insert_docs (id INT);
+    GRANT INSERT, DELETE ON rv_keeps_insert_docs TO rv_keeps_insert;
+    REVOKE DELETE ON rv_keeps_insert_docs FROM rv_keeps_insert;
+    SET ROLE rv_keeps_insert;
+    INSERT INTO rv_keeps_insert_docs VALUES (1);
+    RESET ROLE;
+    SELECT id FROM rv_keeps_insert_docs;
+}
+expect {
+    1
+}
+
+test role-cannot-insert-after-insert-is-revoked {
+    CREATE ROLE rv_no_insert;
+    CREATE TABLE rv_no_insert_docs (id INT);
+    GRANT INSERT ON rv_no_insert_docs TO rv_no_insert;
+    REVOKE INSERT ON rv_no_insert_docs FROM rv_no_insert;
+    SET ROLE rv_no_insert;
+    INSERT INTO rv_no_insert_docs VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_no_insert_docs
+}
+
+test role-keeps-update-when-another-privilege-is-revoked {
+    CREATE ROLE rv_keeps_update;
+    CREATE TABLE rv_keeps_update_docs (id INT);
+    INSERT INTO rv_keeps_update_docs VALUES (1);
+    GRANT UPDATE, INSERT ON rv_keeps_update_docs TO rv_keeps_update;
+    REVOKE INSERT ON rv_keeps_update_docs FROM rv_keeps_update;
+    SET ROLE rv_keeps_update;
+    UPDATE rv_keeps_update_docs SET id = 2;
+    RESET ROLE;
+    SELECT id FROM rv_keeps_update_docs;
+}
+expect {
+    2
+}
+
+test role-cannot-update-after-update-is-revoked {
+    CREATE ROLE rv_no_update;
+    CREATE TABLE rv_no_update_docs (id INT);
+    INSERT INTO rv_no_update_docs VALUES (1);
+    GRANT UPDATE ON rv_no_update_docs TO rv_no_update;
+    REVOKE UPDATE ON rv_no_update_docs FROM rv_no_update;
+    SET ROLE rv_no_update;
+    UPDATE rv_no_update_docs SET id = 2;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_no_update_docs
+}
+
+test role-keeps-delete-when-another-privilege-is-revoked {
+    CREATE ROLE rv_keeps_delete;
+    CREATE TABLE rv_keeps_delete_docs (id INT);
+    INSERT INTO rv_keeps_delete_docs VALUES (1);
+    GRANT DELETE, TRUNCATE ON rv_keeps_delete_docs TO rv_keeps_delete;
+    REVOKE TRUNCATE ON rv_keeps_delete_docs FROM rv_keeps_delete;
+    SET ROLE rv_keeps_delete;
+    DELETE FROM rv_keeps_delete_docs;
+    RESET ROLE;
+    SELECT count(*) FROM rv_keeps_delete_docs;
+}
+expect {
+    0
+}
+
+test role-cannot-delete-after-delete-is-revoked {
+    CREATE ROLE rv_no_delete;
+    CREATE TABLE rv_no_delete_docs (id INT);
+    GRANT DELETE ON rv_no_delete_docs TO rv_no_delete;
+    REVOKE DELETE ON rv_no_delete_docs FROM rv_no_delete;
+    SET ROLE rv_no_delete;
+    DELETE FROM rv_no_delete_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_no_delete_docs
+}
+
+test role-keeps-truncate-when-another-privilege-is-revoked {
+    CREATE ROLE rv_keeps_truncate;
+    CREATE TABLE rv_keeps_truncate_docs (id INT);
+    INSERT INTO rv_keeps_truncate_docs VALUES (1);
+    GRANT TRUNCATE, DELETE ON rv_keeps_truncate_docs TO rv_keeps_truncate;
+    REVOKE DELETE ON rv_keeps_truncate_docs FROM rv_keeps_truncate;
+    SET ROLE rv_keeps_truncate;
+    TRUNCATE rv_keeps_truncate_docs;
+    RESET ROLE;
+    SELECT count(*) FROM rv_keeps_truncate_docs;
+}
+expect {
+    0
+}
+
+test role-cannot-truncate-after-truncate-is-revoked {
+    CREATE ROLE rv_no_truncate;
+    CREATE TABLE rv_no_truncate_docs (id INT);
+    GRANT TRUNCATE ON rv_no_truncate_docs TO rv_no_truncate;
+    REVOKE TRUNCATE ON rv_no_truncate_docs FROM rv_no_truncate;
+    SET ROLE rv_no_truncate;
+    TRUNCATE rv_no_truncate_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_no_truncate_docs
+}
+
+test role-cannot-write-after-revoke-all {
+    CREATE ROLE rv_no_all;
+    CREATE TABLE rv_no_all_docs (id INT);
+    GRANT ALL ON rv_no_all_docs TO rv_no_all;
+    REVOKE ALL ON rv_no_all_docs FROM rv_no_all;
+    SET ROLE rv_no_all;
+    INSERT INTO rv_no_all_docs VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_no_all_docs
+}
+
+test role-keeps-its-own-grant-when-public-loses-select {
+    CREATE ROLE rv_own_grant;
+    CREATE TABLE rv_own_grant_docs (id INT);
+    INSERT INTO rv_own_grant_docs VALUES (1);
+    GRANT SELECT ON rv_own_grant_docs TO PUBLIC, rv_own_grant;
+    REVOKE SELECT ON rv_own_grant_docs FROM PUBLIC;
+    SET ROLE rv_own_grant;
+    SELECT id FROM rv_own_grant_docs;
+}
+expect {
+    1
+}
+
+test role-cannot-read-after-public-loses-select {
+    CREATE ROLE rv_through_public;
+    CREATE TABLE rv_through_public_docs (id INT);
+    GRANT SELECT ON rv_through_public_docs TO PUBLIC;
+    REVOKE SELECT ON rv_through_public_docs FROM PUBLIC;
+    SET ROLE rv_through_public;
+    SELECT id FROM rv_through_public_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_through_public_docs
+}
+
+test role-keeps-select-through-public-when-its-own-grant-is-revoked {
+    CREATE ROLE rv_public_remains;
+    CREATE TABLE rv_public_remains_docs (id INT);
+    INSERT INTO rv_public_remains_docs VALUES (1);
+    GRANT SELECT ON rv_public_remains_docs TO PUBLIC, rv_public_remains;
+    REVOKE SELECT ON rv_public_remains_docs FROM rv_public_remains;
+    SET ROLE rv_public_remains;
+    SELECT id FROM rv_public_remains_docs;
+}
+expect {
+    1
+}
+
+test owner-keeps-select-when-it-revokes-another-privilege-from-itself {
+    CREATE ROLE rv_owner_keeps;
+    CREATE TABLE rv_owner_keeps_docs (id INT);
+    INSERT INTO rv_owner_keeps_docs VALUES (1);
+    ALTER TABLE rv_owner_keeps_docs OWNER TO rv_owner_keeps;
+    SET ROLE rv_owner_keeps;
+    REVOKE INSERT ON rv_owner_keeps_docs FROM rv_owner_keeps;
+    SELECT id FROM rv_owner_keeps_docs;
+}
+expect {
+    1
+}
+
+test owner-cannot-read-after-it-revokes-select-from-itself {
+    CREATE ROLE rv_owner_loses;
+    CREATE TABLE rv_owner_loses_docs (id INT);
+    ALTER TABLE rv_owner_loses_docs OWNER TO rv_owner_loses;
+    SET ROLE rv_owner_loses;
+    REVOKE SELECT ON rv_owner_loses_docs FROM rv_owner_loses;
+    SELECT id FROM rv_owner_loses_docs;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_owner_loses_docs
+}
+
+test owner-cannot-insert-after-it-revokes-insert-from-itself {
+    CREATE ROLE rv_owner_no_insert;
+    CREATE TABLE rv_owner_no_insert_docs (id INT);
+    ALTER TABLE rv_owner_no_insert_docs OWNER TO rv_owner_no_insert;
+    SET ROLE rv_owner_no_insert;
+    REVOKE INSERT ON rv_owner_no_insert_docs FROM rv_owner_no_insert;
+    INSERT INTO rv_owner_no_insert_docs VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for table rv_owner_no_insert_docs
+}
+
+test owner-reads-again-after-it-grants-itself-select {
+    CREATE ROLE rv_owner_regrants;
+    CREATE TABLE rv_owner_regrants_docs (id INT);
+    INSERT INTO rv_owner_regrants_docs VALUES (1);
+    ALTER TABLE rv_owner_regrants_docs OWNER TO rv_owner_regrants;
+    SET ROLE rv_owner_regrants;
+    REVOKE ALL ON rv_owner_regrants_docs FROM rv_owner_regrants;
+    GRANT SELECT ON rv_owner_regrants_docs TO rv_owner_regrants;
+    SELECT id FROM rv_owner_regrants_docs;
+}
+expect {
+    1
+}
+
+test role-keeps-usage-on-sequence-when-update-is-revoked {
+    CREATE ROLE rv_seq_keeps_usage;
+    CREATE SEQUENCE rv_seq_keeps_usage_s;
+    GRANT USAGE, UPDATE ON SEQUENCE rv_seq_keeps_usage_s TO rv_seq_keeps_usage;
+    REVOKE UPDATE ON SEQUENCE rv_seq_keeps_usage_s FROM rv_seq_keeps_usage;
+    SET ROLE rv_seq_keeps_usage;
+    SELECT nextval('rv_seq_keeps_usage_s');
+}
+expect {
+    1
+}
+
+test role-cannot-call-nextval-after-usage-is-revoked {
+    CREATE ROLE rv_seq_no_usage;
+    CREATE SEQUENCE rv_seq_no_usage_s;
+    GRANT USAGE ON SEQUENCE rv_seq_no_usage_s TO rv_seq_no_usage;
+    REVOKE USAGE ON SEQUENCE rv_seq_no_usage_s FROM rv_seq_no_usage;
+    SET ROLE rv_seq_no_usage;
+    SELECT nextval('rv_seq_no_usage_s');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence rv_seq_no_usage_s
+}
+
+test role-keeps-update-on-sequence-when-usage-is-revoked {
+    CREATE ROLE rv_seq_keeps_update;
+    CREATE SEQUENCE rv_seq_keeps_update_s;
+    GRANT USAGE, UPDATE ON SEQUENCE rv_seq_keeps_update_s TO rv_seq_keeps_update;
+    REVOKE USAGE ON SEQUENCE rv_seq_keeps_update_s FROM rv_seq_keeps_update;
+    SET ROLE rv_seq_keeps_update;
+    SELECT setval('rv_seq_keeps_update_s', 10);
+}
+expect {
+    10
+}
+
+test role-cannot-call-setval-after-update-is-revoked {
+    CREATE ROLE rv_seq_no_update;
+    CREATE SEQUENCE rv_seq_no_update_s;
+    GRANT ALL ON SEQUENCE rv_seq_no_update_s TO rv_seq_no_update;
+    REVOKE UPDATE ON SEQUENCE rv_seq_no_update_s FROM rv_seq_no_update;
+    SET ROLE rv_seq_no_update;
+    SELECT setval('rv_seq_no_update_s', 10);
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence rv_seq_no_update_s
+}
+
+test role-keeps-currval-when-usage-is-revoked {
+    CREATE ROLE rv_seq_keeps_select;
+    CREATE SEQUENCE rv_seq_keeps_select_s;
+    SELECT nextval('rv_seq_keeps_select_s');
+    GRANT SELECT, USAGE ON SEQUENCE rv_seq_keeps_select_s TO rv_seq_keeps_select;
+    REVOKE USAGE ON SEQUENCE rv_seq_keeps_select_s FROM rv_seq_keeps_select;
+    SET ROLE rv_seq_keeps_select;
+    SELECT currval('rv_seq_keeps_select_s');
+}
+expect {
+    1
+    1
+}
+
+test role-cannot-call-currval-after-all-is-revoked {
+    CREATE ROLE rv_seq_no_select;
+    CREATE SEQUENCE rv_seq_no_select_s;
+    SELECT nextval('rv_seq_no_select_s');
+    GRANT ALL ON SEQUENCE rv_seq_no_select_s TO rv_seq_no_select;
+    REVOKE ALL ON SEQUENCE rv_seq_no_select_s FROM rv_seq_no_select;
+    SET ROLE rv_seq_no_select;
+    SELECT currval('rv_seq_no_select_s');
+}
+@sqlstate 42501
+expect error {
+    permission denied for sequence rv_seq_no_select_s
+}
+
+# Forms that tursopg does not support. GRANT cannot give a grant option or
+# name a grantor, so REVOKE does not take them either.
+
+@skip-if postgres "PostgreSQL supports grant options"
+test revoke-grant-option-for-is-not-supported {
+    CREATE ROLE rv_option;
+    CREATE TABLE rv_option_docs (id INT);
+    REVOKE GRANT OPTION FOR SELECT ON rv_option_docs FROM rv_option;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE GRANT OPTION FOR is not supported
+}
+
+@skip-if postgres "PostgreSQL supports GRANTED BY"
+test revoke-granted-by-is-not-supported {
+    CREATE ROLE rv_granted_by;
+    CREATE TABLE rv_granted_by_docs (id INT);
+    REVOKE SELECT ON rv_granted_by_docs FROM rv_granted_by GRANTED BY postgres;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE ... GRANTED BY is not supported
+}
+
+@skip-if postgres "PostgreSQL supports column privileges"
+test revoke-of-column-privileges-is-not-supported {
+    CREATE ROLE rv_columns;
+    CREATE TABLE rv_columns_docs (id INT, body TEXT);
+    REVOKE UPDATE (body) ON rv_columns_docs FROM rv_columns;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE of column privileges is not supported
+}
+
+@skip-if postgres "PostgreSQL supports privileges on schemas"
+test revoke-on-a-schema-is-not-supported {
+    CREATE ROLE rv_schema_grantee;
+    REVOKE USAGE ON SCHEMA public FROM rv_schema_grantee;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on objects other than tables and sequences is not supported
+}
+
+@skip-if postgres "PostgreSQL supports role membership"
+test revoke-of-role-membership-is-not-supported {
+    CREATE ROLE rv_member;
+    CREATE ROLE rv_group;
+    REVOKE rv_group FROM rv_member;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE of role membership is not supported
+}
+
+@skip-if postgres "PostgreSQL has no __turso_internal_* tables"
+test revoke-on-an-engine-table-is-not-supported {
+    CREATE ROLE rv_catalog_grantee;
+    REVOKE SELECT ON pg_catalog.__turso_internal_authid FROM rv_catalog_grantee;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on internal table __turso_internal_authid is not supported
+}
+
+# Every role reads the catalog views, which have no list that a REVOKE
+# could change, so a REVOKE on one is refused rather than leaving every role
+# reading it.
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-a-catalog-view-is-not-supported {
+    REVOKE SELECT ON pg_roles FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on system catalog pg_roles is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-an-information-schema-view-is-not-supported {
+    REVOKE SELECT ON information_schema.schemata FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on system catalog information_schema.schemata is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-all-tables-in-pg-catalog-is-not-supported {
+    REVOKE SELECT ON ALL TABLES IN SCHEMA pg_catalog FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on the system catalogs of schema pg_catalog is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test revoke-on-all-tables-in-information-schema-is-not-supported {
+    REVOKE SELECT ON ALL TABLES IN SCHEMA information_schema FROM PUBLIC;
+}
+@sqlstate 0A000
+expect error {
+    REVOKE on the system catalogs of schema information_schema is not supported
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its catalog views"
+test a-role-still-reads-a-catalog-view-after-a-refused-revoke {
+    CREATE ROLE rv_catalog_reader;
+    SET ROLE rv_catalog_reader;
+    SELECT count(*) > 0 FROM pg_roles;
+}
+expect {
+    1
+}

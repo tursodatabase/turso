@@ -29,6 +29,7 @@ name = "leak_tests"
 path = "leak/mod.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 anyhow.workspace = true
 env_logger = { workspace = true }
 turso_core = { workspace = true, features = ["conn_raw_api"] }
@@ -53,6 +54,7 @@ tracing = { workspace = true }
 turso-dbhash.workspace = true
 
 [dev-dependencies]
+branches = { version = "0.4.3", default-features = false }
 similar-asserts.workspace = true
 asserting.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
@@ -61,7 +63,29 @@ turso_macros.workspace = true
 crossbeam-epoch = "0.9.18"
 
 [features]
-default = ["test_helper", "fts", "io_uring"]
+default = [
+    "test_helper",
+    "fts",
+    "io_uring",
+    "fs",
+    "uuid",
+    "time",
+    "json",
+    "series",
+    "encryption",
+    "percentile",
+    "autovacuum",
+    "conn_raw_api",
+]
+fs = ["turso_core/fs"]
+uuid = ["turso_core/uuid"]
+time = ["turso_core/time"]
+json = ["turso_core/json"]
+series = ["turso_core/series"]
+encryption = ["turso_core/encryption"]
+percentile = ["turso_core/percentile"]
+autovacuum = ["turso_core/autovacuum"]
+conn_raw_api = []
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]

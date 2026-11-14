@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -39,12 +40,13 @@ func init() {
 var (
 	_ driver.Driver             = (*serverlessDriver)(nil)
 	_ driver.Connector          = (*Connector)(nil)
-	_ driver.Conn               = (*conn)(nil)
-	_ driver.ConnPrepareContext = (*conn)(nil)
-	_ driver.ExecerContext      = (*conn)(nil)
-	_ driver.QueryerContext     = (*conn)(nil)
-	_ driver.Pinger             = (*conn)(nil)
-	_ driver.ConnBeginTx        = (*conn)(nil)
+	_ driver.Conn               = (*Connection)(nil)
+	_ driver.ConnPrepareContext = (*Connection)(nil)
+	_ driver.ExecerContext      = (*Connection)(nil)
+	_ driver.QueryerContext     = (*Connection)(nil)
+	_ driver.Pinger             = (*Connection)(nil)
+	_ driver.Validator          = (*Connection)(nil)
+	_ driver.ConnBeginTx        = (*Connection)(nil)
 	_ driver.Stmt               = (*stmt)(nil)
 	_ driver.StmtExecContext    = (*stmt)(nil)
 	_ driver.StmtQueryContext   = (*stmt)(nil)
@@ -101,6 +103,10 @@ type Connector struct {
 	url                 string
 	authToken           string
 	remoteEncryptionKey string
+	client              *http.Client
+	requestHeaders      http.Header
+	requestHeadersErr   error
+	retainSession       bool
 }
 
 // NewConnector creates a connector for the given database URL (turso://,
@@ -118,8 +124,67 @@ func (c *Connector) WithRemoteEncryptionKey(key string) *Connector {
 	return c
 }
 
-func (c *Connector) Connect(context.Context) (driver.Conn, error) {
-	return newConn(c.url, c.authToken, c.remoteEncryptionKey), nil
+func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
+	return c.OpenConnection(ctx)
+}
+
+// WithHTTPClient sets the HTTP client. Configure connectors before opening connections.
+// The client is copied; its Transport is shared and must support concurrent requests.
+func (c *Connector) WithHTTPClient(client *http.Client) *Connector {
+	c.client = client
+	return c
+}
+
+// WithRequestHeaders copies headers to send on every request, overriding defaults.
+// Host sets the request host independently of the URL destination and TLS server name.
+// Configure connectors before opening connections.
+func (c *Connector) WithRequestHeaders(headers http.Header) *Connector {
+	c.requestHeadersErr = nil
+	c.requestHeaders = make(http.Header, len(headers))
+	for name, values := range headers {
+		name = http.CanonicalHeaderKey(name)
+		if _, exists := c.requestHeaders[name]; exists {
+			c.requestHeadersErr = fmt.Errorf("turso: duplicate request header %q", name)
+			return c
+		}
+		if name == "Host" && (len(values) != 1 || values[0] == "") {
+			c.requestHeadersErr = errors.New("turso: Host requires exactly one non-empty value")
+			return c
+		}
+		c.requestHeaders[name] = append([]string(nil), values...)
+	}
+	return c
+}
+
+// WithSessionRetention keeps one backend session across autocommit calls.
+// Session loss permanently invalidates the connection, including outside transactions.
+func (c *Connector) WithSessionRetention() *Connector { c.retainSession = true; return c }
+
+// OpenConnection opens a dedicated connection for protocol adapters. Call Close when done.
+// Arguments to its driver methods must use database/sql/driver value types.
+func (c *Connector) OpenConnection(ctx context.Context) (*Connection, error) {
+	if c.requestHeadersErr != nil {
+		return nil, c.requestHeadersErr
+	}
+	conn := newConn(c.url, c.authToken, c.remoteEncryptionKey)
+	if c.client != nil {
+		client := *c.client
+		conn.sess.client = &client
+	}
+	conn.sess.requestHeaders = c.requestHeaders.Clone()
+	conn.sess.retainSession = c.retainSession
+	if c.retainSession {
+		id := 0
+		results, err := conn.sess.executePipeline(ctx, []streamRequest{{Type: "store_sql", SQL: "SELECT 1", SQLID: &id}}, true)
+		if err == nil && results[0].Error != nil {
+			err = serverError(results[0].Error)
+		}
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	return conn, nil
 }
 
 func (c *Connector) Driver() driver.Driver {
@@ -128,17 +193,18 @@ func (c *Connector) Driver() driver.Driver {
 
 // --- driver.Conn ---
 
-type conn struct {
+// Connection is a dedicated backend connection. Operations are serialized.
+type Connection struct {
 	sess   *session
 	mu     sync.Mutex
 	closed bool
 }
 
-func newConn(url, authToken, remoteEncryptionKey string) *conn {
-	return &conn{sess: newSession(url, authToken, remoteEncryptionKey)}
+func newConn(url, authToken, remoteEncryptionKey string) *Connection {
+	return &Connection{sess: newSession(url, authToken, remoteEncryptionKey)}
 }
 
-func (c *conn) Close() error {
+func (c *Connection) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -151,16 +217,41 @@ func (c *conn) Close() error {
 	return nil
 }
 
-func (c *conn) Prepare(query string) (driver.Stmt, error) {
+// IsValid prevents database/sql from pooling a lost backend session.
+func (c *Connection) IsValid() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && !c.sess.broken
+}
+
+func (c *Connection) Prepare(query string) (driver.Stmt, error) {
 	return c.PrepareContext(context.Background(), query)
 }
 
-func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+func (c *Connection) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, ErrTursoConnClosed
+	if err := c.ready(); err != nil {
+		return nil, err
 	}
+	desc, err := c.describe(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return &stmt{conn: c, sql: query, numInputs: len(desc.Params)}, nil
+}
+
+// DescribeContext returns metadata without executing the SQL or binding parameters.
+func (c *Connection) DescribeContext(ctx context.Context, query string) (*Description, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	return c.describe(ctx, query)
+}
+
+func (c *Connection) describe(ctx context.Context, query string) (*Description, error) {
 	results, err := c.sess.executePipeline(ctx, []streamRequest{{Type: "describe", SQL: query}}, true)
 	if err != nil {
 		return nil, err
@@ -172,22 +263,42 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	if result.Response == nil || result.Response.Result == nil {
 		return nil, fmt.Errorf("turso: expected describe result in pipeline response")
 	}
-	var desc describeResult
+	var desc Description
 	if err := json.Unmarshal(result.Response.Result, &desc); err != nil {
 		return nil, fmt.Errorf("turso: invalid describe result: %w", err)
 	}
-	return &stmt{conn: c, sql: query, numInputs: len(desc.Params)}, nil
+	return &desc, nil
 }
 
-func (c *conn) Begin() (driver.Tx, error) {
+// Autocommit reports the last completed operation's transaction state.
+func (c *Connection) Autocommit() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ready(); err != nil {
+		return false, err
+	}
+	return c.sess.autocommit, nil
+}
+
+func (c *Connection) ready() error {
+	if c.closed {
+		return ErrTursoConnClosed
+	}
+	if c.sess.broken {
+		return ErrSessionLost
+	}
+	return nil
+}
+
+func (c *Connection) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-func (c *conn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+func (c *Connection) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, ErrTursoConnClosed
+	if err := c.ready(); err != nil {
+		return nil, err
 	}
 	if _, err := c.sess.executeStmt(ctx, rawStmt("BEGIN")); err != nil {
 		return nil, err
@@ -195,21 +306,21 @@ func (c *conn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, erro
 	return &tx{conn: c}, nil
 }
 
-func (c *conn) Ping(ctx context.Context) error {
+func (c *Connection) Ping(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return ErrTursoConnClosed
+	if err := c.ready(); err != nil {
+		return err
 	}
 	_, err := c.sess.executeStmt(ctx, rawStmt("SELECT 1"))
 	return err
 }
 
-func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+func (c *Connection) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, ErrTursoConnClosed
+	if err := c.ready(); err != nil {
+		return nil, err
 	}
 	// Multi-statement strings run through the sequence request
 	// (section 6.3): statements execute in order and execution stops at
@@ -234,29 +345,49 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	}
 	return &execResult{
 		lastInsertId: c.sess.lastInsertRowid,
-		rowsAffected: out.rowsAffected,
+		rowsAffected: out.RowsAffected,
 	}, nil
 }
 
-func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (c *Connection) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	out, err := c.ExecuteContext(ctx, query, args)
+	if err != nil {
+		return nil, err
+	}
+	result := &rows{columns: make([]string, len(out.Columns)), decltypes: make([]string, len(out.Columns)), rows: out.Rows}
+	for i, col := range out.Columns {
+		if col.Name != nil {
+			result.columns[i] = *col.Name
+		}
+		if col.Decltype != nil {
+			result.decltypes[i] = *col.Decltype
+		}
+	}
+	return result, nil
+}
+
+// StatementResult contains the buffered output of one statement execution.
+type StatementResult struct {
+	Columns []Column
+	// Rows contains int64, float64, string, []byte, or nil values. Date/time text remains a string.
+	Rows         [][]any
+	RowsAffected int64
+}
+
+// ExecuteContext executes one statement and returns its columns, raw decoded rows,
+// and backend affected-row count together. It does not describe or reexecute SQL.
+// Arguments use database/sql/driver value types. Errors return no partial result.
+func (c *Connection) ExecuteContext(ctx context.Context, query string, args []driver.NamedValue) (*StatementResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return nil, ErrTursoConnClosed
+	if err := c.ready(); err != nil {
+		return nil, err
 	}
 	body, err := buildStmt(query, args, true)
 	if err != nil {
 		return nil, err
 	}
-	out, err := c.sess.executeStmt(ctx, body)
-	if err != nil {
-		return nil, err
-	}
-	return &rows{
-		columns:   out.columns,
-		decltypes: out.decltypes,
-		rows:      out.rows,
-	}, nil
+	return c.sess.executeStmt(ctx, body)
 }
 
 // buildStmt encodes a query and its arguments into a protocol statement
@@ -328,7 +459,7 @@ func splitStatements(sqlText string) []string {
 // --- driver.Stmt ---
 
 type stmt struct {
-	conn      *conn
+	conn      *Connection
 	sql       string
 	numInputs int
 	closed    bool
@@ -463,7 +594,7 @@ func (r *execResult) RowsAffected() (int64, error) {
 // --- driver.Tx ---
 
 type tx struct {
-	conn *conn
+	conn *Connection
 	done bool
 }
 
@@ -476,15 +607,15 @@ func (t *tx) Rollback() error {
 }
 
 func (t *tx) finish(sqlText string) error {
+	t.conn.mu.Lock()
+	defer t.conn.mu.Unlock()
 	if t.done {
 		return ErrTursoTxDone
 	}
-	t.done = true
-	t.conn.mu.Lock()
-	defer t.conn.mu.Unlock()
-	if t.conn.closed {
-		return ErrTursoConnClosed
+	if err := t.conn.ready(); err != nil {
+		return err
 	}
+	t.done = true
 	_, err := t.conn.sess.executeStmt(context.Background(), rawStmt(sqlText))
 	return err
 }

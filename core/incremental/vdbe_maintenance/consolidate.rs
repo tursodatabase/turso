@@ -1,6 +1,7 @@
 use super::stream::{open_ephemeral_delta, EphemeralDelta};
 use crate::alloc::TursoIteratorExt;
 use crate::schema::PseudoCursorType;
+use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, SorterOpenData};
@@ -77,9 +78,8 @@ pub(super) fn consolidate_delta(
             cursor_id: sorter_cursor,
             columns: key_width,
             order_collations_nulls: (0..key_width)
-                .map(|_| (SortOrder::Asc, None, None))
+                .map(|_| (SortOrder::Asc, CollationSeq::BINARY, None))
                 .try_collect()?,
-            comparators: (0..key_width).map(|_| None).try_collect()?,
         }),
     });
     let entry_start = program.alloc_registers(entry_width);
@@ -265,7 +265,7 @@ pub(super) fn consolidate_delta(
         rhs: zero_reg,
         target_pc: flush_return_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::NewRowid {
         cursor: output.cursor_id,

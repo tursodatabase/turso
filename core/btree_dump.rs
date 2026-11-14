@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::CursorTrait;
@@ -33,6 +34,10 @@ impl InternalVirtualTable for BtreeDumpTable {
 
     fn sql(&self) -> String {
         "CREATE TABLE btree_dump(record BLOB, name TEXT HIDDEN)".to_string()
+    }
+
+    fn superuser_only(&self) -> bool {
+        true
     }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
@@ -112,15 +117,13 @@ impl BtreeDumpCursor {
     /// Look up the root page for a given name (index first, then table).
     fn find_root_page(&self, name: &str) -> Option<i64> {
         // Search indexes first (indexes are stored by table name, so iterate all)
-        for indexes in self.schema.indexes.values() {
-            for index in indexes {
-                if index.name.eq_ignore_ascii_case(name) {
-                    return Some(index.root_page);
-                }
+        for index in self.schema.indexes(NamespaceId::ROOT) {
+            if index.name.eq_ignore_ascii_case(name) {
+                return Some(index.root_page);
             }
         }
         // Then search tables
-        if let Some(table) = self.schema.get_table(name) {
+        if let Some(table) = self.schema.get_table(NamespaceId::ROOT, name) {
             return table.get_root_page().ok();
         }
         None

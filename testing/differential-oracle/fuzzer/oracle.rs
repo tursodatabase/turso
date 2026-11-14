@@ -550,8 +550,8 @@ pub fn check_differential(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_core::{ConnectOpts, SessionRole};
+    use turso_sqlite::SqliteDialect;
 
     use core::f64;
 
@@ -676,7 +676,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let turso_conn = turso_db.connect(ConnectOpts::new()).unwrap();
+        let turso_conn = turso_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
         let schema = SchemaBuilder::new()
@@ -736,7 +738,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let turso_conn = turso_db.connect(ConnectOpts::new()).unwrap();
+        let turso_conn = turso_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         let schema = SchemaBuilder::new()
             .table(Table::new(
@@ -790,7 +794,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = turso_db.connect(ConnectOpts::new()).unwrap();
+        let conn = turso_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         for sql in [
             "CREATE TABLE outer_rows(id INTEGER, key1 INTEGER, amount INTEGER)",
             "CREATE TABLE inner_rows(key1 INTEGER, amount INTEGER)",

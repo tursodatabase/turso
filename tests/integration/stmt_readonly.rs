@@ -40,3 +40,20 @@ fn create_table_if_not_exists_existing_is_not_readonly(tmp_db: TempDatabase) -> 
     assert!(!is_stmt_readonly(&conn, "CREATE TABLE IF NOT EXISTS t(x)"));
     Ok(())
 }
+
+#[turso_macros::test]
+fn recursive_cte_select_is_readonly(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(is_stmt_readonly(
+        &conn,
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c"
+    ));
+    Ok(())
+}
+
+#[turso_macros::test(init_sql = "CREATE TABLE t(x)")]
+fn delete_returning_is_not_readonly(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(!is_stmt_readonly(&conn, "DELETE FROM t RETURNING x"));
+    Ok(())
+}

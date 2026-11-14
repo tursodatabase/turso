@@ -370,7 +370,7 @@ fn test_cdc_delete_all_keeps_one_record_per_deleted_row(db: TempDatabase) {
 #[turso_macros::test]
 fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
-    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+    conn.execute("CREATE TABLE \"T\" (x INTEGER PRIMARY KEY, y)")
         .unwrap();
     conn.execute("PRAGMA capture_data_changes_conn('id')")
         .unwrap();

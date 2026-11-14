@@ -1,0 +1,147 @@
+@database :memory:
+
+test where-expr-index-eq {
+    CREATE TABLE t0(a, b);
+    CREATE INDEX t0_i ON t0(b=1);
+    INSERT INTO t0 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t0 WHERE b=1;
+}
+expect {
+    2
+}
+
+test where-expr-index-gt {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_i ON t1(b>1);
+    INSERT INTO t1 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t1 WHERE b>1;
+}
+expect {
+    1
+}
+
+test where-expr-index-is-null {
+    CREATE TABLE t2(a, b);
+    CREATE INDEX t2_i ON t2(b IS NULL);
+    INSERT INTO t2 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t2 WHERE b IS NULL;
+}
+expect {
+    1
+}
+
+test where-expr-index-notnull {
+    CREATE TABLE t3(a, b);
+    CREATE INDEX t3_i ON t3(b NOTNULL);
+    INSERT INTO t3 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t3 WHERE b NOTNULL;
+}
+expect {
+    3
+}
+
+test where-expr-index-in-list {
+    CREATE TABLE t4(a, b);
+    CREATE INDEX t4_i ON t4(b IN (1,5));
+    INSERT INTO t4 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t4 WHERE b IN (1,5);
+}
+expect {
+    3
+}
+
+test where-expr-index-parenthesized {
+    CREATE TABLE t5(a, b);
+    CREATE INDEX t5_i ON t5(b=1);
+    INSERT INTO t5 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t5 WHERE (b=1);
+}
+expect {
+    2
+}
+
+test where-expr-index-repeated-term {
+    CREATE TABLE t6(a, b);
+    CREATE INDEX t6_i ON t6(b=1);
+    INSERT INTO t6 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t6 WHERE b=1 AND b=1;
+}
+expect {
+    2
+}
+
+test where-expr-index-and-other-column {
+    CREATE TABLE t7(a, b);
+    CREATE INDEX t7_i ON t7(b=1);
+    INSERT INTO t7 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t7 WHERE b=1 AND a=4;
+}
+expect {
+    1
+}
+
+test where-expr-index-or-other-column {
+    CREATE TABLE t8(a, b);
+    CREATE INDEX t8_i ON t8(b=1);
+    INSERT INTO t8 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t8 WHERE b=1 OR a=2;
+}
+expect {
+    3
+}
+
+test where-expr-index-whole-or {
+    CREATE TABLE t9(a, b);
+    CREATE INDEX t9_i ON t9(b=1 OR a=2);
+    INSERT INTO t9 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t9 WHERE b=1 OR a=2;
+}
+expect {
+    3
+}
+
+test where-expr-index-not {
+    CREATE TABLE t10(a, b);
+    CREATE INDEX t10_i ON t10(b=1);
+    INSERT INTO t10 VALUES (1,1),(2,5),(3,NULL),(4,1);
+    SELECT count(*) FROM t10 WHERE NOT b=1;
+}
+expect {
+    1
+}
+
+test where-expr-index-left-join-where {
+    CREATE TABLE l1(id);
+    CREATE TABLE r1(id, b);
+    CREATE INDEX r1_i ON r1(b=1);
+    INSERT INTO l1 VALUES (1),(2),(3);
+    INSERT INTO r1 VALUES (1,1),(2,5);
+    SELECT l1.id, r1.id FROM l1 LEFT JOIN r1 ON r1.id=l1.id WHERE r1.b=1 ORDER BY l1.id;
+}
+expect {
+    1|1
+}
+
+test where-expr-index-left-join-on {
+    CREATE TABLE l2(id);
+    CREATE TABLE r2(id, b);
+    CREATE INDEX r2_i ON r2(b=1);
+    INSERT INTO l2 VALUES (1),(2),(3);
+    INSERT INTO r2 VALUES (1,1),(2,5);
+    SELECT l2.id, r2.id FROM l2 LEFT JOIN r2 ON r2.id=l2.id AND r2.b=1 ORDER BY l2.id;
+}
+expect {
+    1|1
+    2|
+    3|
+}
+
+test where-expr-index-like {
+    CREATE TABLE tl(a, b);
+    CREATE INDEX tl_i ON tl(b LIKE 'x%');
+    INSERT INTO tl VALUES (1,'xa'),(2,'ya'),(3,NULL),(4,'xb');
+    SELECT count(*) FROM tl WHERE b LIKE 'x%';
+}
+expect {
+    2
+}
