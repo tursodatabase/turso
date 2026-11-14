@@ -1,5 +1,6 @@
 # Row-level security policies through the PostgreSQL frontend: CREATE
-# POLICY and DROP POLICY, and the rows that each role then reads.
+# POLICY, ALTER POLICY and DROP POLICY, and the rows that each role then
+# reads.
 #
 # Each test reads as the superuser or the owner where that helps, then as
 # roles that are not superusers. Roles are granted SELECT, because without
@@ -352,17 +353,6 @@ expect error {
     DROP POLICY ... CASCADE is not supported
 }
 
-@skip-if postgres "PostgreSQL supports ALTER POLICY"
-test alter-policy-is-not-supported {
-    CREATE TABLE un_policy_docs (id INT PRIMARY KEY);
-    CREATE POLICY everything ON un_policy_docs USING (true);
-    ALTER POLICY everything ON un_policy_docs USING (false);
-}
-@sqlstate 0A000
-expect error {
-    ALTER POLICY is not supported
-}
-
 test policy-on-a-view-is-rejected {
     CREATE TABLE rp_docs_21 (id INT PRIMARY KEY);
     CREATE VIEW rp_view_21 AS SELECT id FROM rp_docs_21;
@@ -522,13 +512,273 @@ expect error {
     cannot change column "owner" of table "rp_docs_42" because policy "own" uses it
 }
 
-@skip-if postgres "PostgreSQL supports ALTER POLICY ... RENAME"
-test alter-policy-rename-is-not-supported {
-    CREATE TABLE rn_policy_docs (id INT PRIMARY KEY);
-    CREATE POLICY everything ON rn_policy_docs USING (true);
-    ALTER POLICY everything ON rn_policy_docs RENAME TO all_rows;
+test alter-policy-replaces-the-using-expression {
+    CREATE ROLE ap_alice_1;
+    CREATE TABLE ap_docs_1 (id INT PRIMARY KEY);
+    INSERT INTO ap_docs_1 VALUES (1), (2), (3);
+    ALTER TABLE ap_docs_1 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY some_rows ON ap_docs_1 FOR SELECT USING (id = 1);
+    GRANT SELECT ON ap_docs_1 TO ap_alice_1;
+    ALTER POLICY some_rows ON ap_docs_1 USING (id > 1);
+    SET ROLE ap_alice_1;
+    SELECT id FROM ap_docs_1 ORDER BY id;
 }
-@sqlstate 0A000
+expect {
+    2
+    3
+}
+
+test alter-policy-replaces-the-roles {
+    CREATE ROLE ap_alice_2;
+    CREATE ROLE ap_bob_2;
+    CREATE TABLE ap_docs_2 (id INT PRIMARY KEY);
+    INSERT INTO ap_docs_2 VALUES (1), (2);
+    ALTER TABLE ap_docs_2 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON ap_docs_2 TO ap_alice_2 USING (true);
+    GRANT SELECT ON ap_docs_2 TO ap_alice_2, ap_bob_2;
+    ALTER POLICY everything ON ap_docs_2 TO ap_bob_2;
+    SET ROLE ap_alice_2;
+    SELECT count(*) FROM ap_docs_2;
+    SET ROLE ap_bob_2;
+    SELECT count(*) FROM ap_docs_2;
+}
+expect {
+    0
+    2
+}
+
+test alter-policy-keeps-the-parts-it-does-not-name {
+    CREATE ROLE ap_alice_3;
+    CREATE ROLE ap_bob_3;
+    CREATE TABLE ap_docs_3 (id INT PRIMARY KEY);
+    INSERT INTO ap_docs_3 VALUES (1), (2), (3);
+    ALTER TABLE ap_docs_3 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY some_rows ON ap_docs_3 AS RESTRICTIVE TO ap_alice_3 USING (id < 3);
+    CREATE POLICY everything ON ap_docs_3 USING (true);
+    GRANT SELECT ON ap_docs_3 TO ap_alice_3, ap_bob_3;
+    ALTER POLICY some_rows ON ap_docs_3 USING (id > 1);
+    SET ROLE ap_alice_3;
+    SELECT id FROM ap_docs_3 ORDER BY id;
+    SET ROLE ap_bob_3;
+    SELECT count(*) FROM ap_docs_3;
+}
+expect {
+    2
+    3
+    3
+}
+
+test alter-policy-replaces-the-with-check-expression {
+    CREATE ROLE ap_alice_4;
+    CREATE TABLE ap_docs_4 (id INT PRIMARY KEY);
+    ALTER TABLE ap_docs_4 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY small_ids ON ap_docs_4 FOR INSERT WITH CHECK (id < 10);
+    GRANT INSERT ON ap_docs_4 TO ap_alice_4;
+    ALTER POLICY small_ids ON ap_docs_4 WITH CHECK (id < 100);
+    SET ROLE ap_alice_4;
+    INSERT INTO ap_docs_4 VALUES (50);
+    RESET ROLE;
+    SELECT id FROM ap_docs_4;
+}
+expect {
+    50
+}
+
+test alter-policy-with-check-still-rejects-rows {
+    CREATE ROLE ap_alice_5;
+    CREATE TABLE ap_docs_5 (id INT PRIMARY KEY);
+    ALTER TABLE ap_docs_5 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY small_ids ON ap_docs_5 FOR INSERT WITH CHECK (id < 100);
+    GRANT INSERT ON ap_docs_5 TO ap_alice_5;
+    ALTER POLICY small_ids ON ap_docs_5 WITH CHECK (id < 10);
+    SET ROLE ap_alice_5;
+    INSERT INTO ap_docs_5 VALUES (50);
+}
+@sqlstate 42501
 expect error {
-    ALTER POLICY ... RENAME is not supported
+    new row violates row-level security policy for table "ap_docs_5"
+}
+
+test alter-policy-without-changes-is-accepted {
+    CREATE TABLE ap_docs_6 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_6 USING (true);
+    ALTER POLICY p ON ap_docs_6;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test alter-of-missing-policy-fails {
+    CREATE TABLE ap_docs_7 (id INT PRIMARY KEY);
+    ALTER POLICY p ON ap_docs_7 USING (true);
+}
+@sqlstate 42704
+expect error {
+    policy "p" for table "ap_docs_7" does not exist
+}
+
+test alter-policy-of-a-missing-table-fails {
+    ALTER POLICY p ON ap_missing_8 USING (true);
+}
+@sqlstate 42P01
+expect error {
+    relation "ap_missing_8" does not exist
+}
+
+test alter-policy-adds-no-with-check-to-a-select-policy {
+    CREATE TABLE ap_docs_9 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_9 FOR SELECT USING (true);
+    ALTER POLICY p ON ap_docs_9 WITH CHECK (true);
+}
+@sqlstate 42601
+expect error {
+    only USING expression allowed for SELECT, DELETE
+}
+
+test alter-policy-adds-no-using-to-an-insert-policy {
+    CREATE TABLE ap_docs_10 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_10 FOR INSERT WITH CHECK (true);
+    ALTER POLICY p ON ap_docs_10 USING (true);
+}
+@sqlstate 42601
+expect error {
+    only WITH CHECK expression allowed for INSERT
+}
+
+test alter-policy-with-unknown-column-is-rejected {
+    CREATE TABLE ap_docs_11 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_11 USING (true);
+    ALTER POLICY p ON ap_docs_11 USING (missing = 1);
+}
+@sqlstate 42703
+expect error {
+    column "missing" does not exist
+}
+
+test alter-policy-to-unknown-role-is-rejected {
+    CREATE TABLE ap_docs_12 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_12 USING (true);
+    ALTER POLICY p ON ap_docs_12 TO ap_nobody_12;
+}
+@sqlstate 42704
+expect error {
+    role "ap_nobody_12" does not exist
+}
+
+test role-that-does-not-own-the-table-cannot-alter-a-policy {
+    CREATE ROLE ap_alice_13;
+    CREATE TABLE ap_docs_13 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_13 USING (true);
+    SET ROLE ap_alice_13;
+    ALTER POLICY p ON ap_docs_13 USING (false);
+}
+@sqlstate 42501
+expect error {
+    must be owner of table ap_docs_13
+}
+
+test column-no-longer-used-by-an-altered-policy-can-be-renamed {
+    CREATE TABLE ap_docs_14 (id INT PRIMARY KEY, owner TEXT);
+    CREATE POLICY own ON ap_docs_14 USING (owner = current_user);
+    ALTER POLICY own ON ap_docs_14 USING (id > 0);
+    ALTER TABLE ap_docs_14 RENAME COLUMN owner TO author;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test rename-policy {
+    CREATE ROLE ap_alice_15;
+    CREATE TABLE ap_docs_15 (id INT PRIMARY KEY);
+    INSERT INTO ap_docs_15 VALUES (1), (2);
+    ALTER TABLE ap_docs_15 ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY everything ON ap_docs_15 USING (true);
+    GRANT SELECT ON ap_docs_15 TO ap_alice_15;
+    ALTER POLICY everything ON ap_docs_15 RENAME TO all_rows;
+    SET ROLE ap_alice_15;
+    SELECT count(*) FROM ap_docs_15;
+    RESET ROLE;
+    DROP POLICY all_rows ON ap_docs_15;
+    SET ROLE ap_alice_15;
+    SELECT count(*) FROM ap_docs_15;
+}
+expect {
+    2
+    0
+}
+
+test renamed-policy-is-gone-under-its-old-name {
+    CREATE TABLE ap_docs_16 (id INT PRIMARY KEY);
+    CREATE POLICY everything ON ap_docs_16 USING (true);
+    ALTER POLICY everything ON ap_docs_16 RENAME TO all_rows;
+    DROP POLICY everything ON ap_docs_16;
+}
+@sqlstate 42704
+expect error {
+    policy "everything" for table "ap_docs_16" does not exist
+}
+
+test rename-policy-to-a-name-in-use-fails {
+    CREATE TABLE ap_docs_17 (id INT PRIMARY KEY);
+    CREATE POLICY p1 ON ap_docs_17 USING (true);
+    CREATE POLICY p2 ON ap_docs_17 USING (true);
+    ALTER POLICY p1 ON ap_docs_17 RENAME TO p2;
+}
+@sqlstate 42710
+expect error {
+    policy "p2" for table "ap_docs_17" already exists
+}
+
+test rename-policy-to-its-own-name-fails {
+    CREATE TABLE ap_docs_18 (id INT PRIMARY KEY);
+    CREATE POLICY p1 ON ap_docs_18 USING (true);
+    ALTER POLICY p1 ON ap_docs_18 RENAME TO p1;
+}
+@sqlstate 42710
+expect error {
+    policy "p1" for table "ap_docs_18" already exists
+}
+
+test rename-of-missing-policy-fails {
+    CREATE TABLE ap_docs_19 (id INT PRIMARY KEY);
+    ALTER POLICY p ON ap_docs_19 RENAME TO q;
+}
+@sqlstate 42704
+expect error {
+    policy "p" for table "ap_docs_19" does not exist
+}
+
+# PostgreSQL parses IF EXISTS here but still fails on a missing policy.
+test rename-of-missing-policy-with-if-exists-fails {
+    CREATE TABLE ap_docs_20 (id INT PRIMARY KEY);
+    ALTER POLICY IF EXISTS p ON ap_docs_20 RENAME TO q;
+}
+@sqlstate 42704
+expect error {
+    policy "p" for table "ap_docs_20" does not exist
+}
+
+test rename-policy-keeps-quoted-case {
+    CREATE TABLE ap_docs_21 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_21 USING (true);
+    ALTER POLICY p ON ap_docs_21 RENAME TO "Own";
+    DROP POLICY own ON ap_docs_21;
+}
+@sqlstate 42704
+expect error {
+    policy "own" for table "ap_docs_21" does not exist
+}
+
+test role-that-does-not-own-the-table-cannot-rename-a-policy {
+    CREATE ROLE ap_alice_22;
+    CREATE TABLE ap_docs_22 (id INT PRIMARY KEY);
+    CREATE POLICY p ON ap_docs_22 USING (true);
+    SET ROLE ap_alice_22;
+    ALTER POLICY p ON ap_docs_22 RENAME TO q;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table ap_docs_22
 }

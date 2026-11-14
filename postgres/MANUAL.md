@@ -180,6 +180,53 @@ CREATE POLICY own_docs ON docs FOR SELECT USING (owner = (SELECT current_user));
 GRANT SELECT ON docs TO alice;
 ```
 
+### `ALTER POLICY` — change a row-level security policy
+
+**Synopsis:**
+
+```sql
+ALTER POLICY name ON table_name RENAME TO new_name
+
+ALTER POLICY name ON table_name
+    [ TO { role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER } [, ...] ]
+    [ USING ( using_expression ) ]
+    [ WITH CHECK ( check_expression ) ]
+```
+
+**Description:**
+
+`ALTER POLICY` changes the roles, `USING` expression or `WITH CHECK`
+expression of the policy `name` of the table, or renames the policy. The
+roles and expressions that the statement gives replace those of the policy,
+and the others stay as they are. A policy's command and whether it is
+permissive or restrictive cannot be changed; drop the policy and create it
+again instead.
+
+**Parameters:**
+
+- `name`: The name of an existing policy of the table.
+- `table_name`: The name of the table, optionally qualified with its schema.
+- `new_name`: The new name of the policy. No other policy of the table may
+  have it.
+- `TO`, `using_expression`, `check_expression`: As for `CREATE POLICY`. A
+  `SELECT` or `DELETE` policy cannot get a `WITH CHECK` expression, and an
+  `INSERT` policy cannot get a `USING` expression.
+
+**Notes:**
+
+Only the owner of the table or a superuser may alter its policies.
+
+As in PostgreSQL, `ALTER POLICY IF EXISTS ... RENAME TO` is accepted, but a
+missing table or policy is still an error.
+
+**Examples:**
+
+```sql
+ALTER POLICY own_docs ON docs USING (owner = (SELECT current_user) AND title IS NOT NULL);
+ALTER POLICY own_docs ON docs TO alice, bob;
+ALTER POLICY own_docs ON docs RENAME TO my_docs;
+```
+
 ### `DROP POLICY` — remove a row-level security policy from a table
 
 **Synopsis:**

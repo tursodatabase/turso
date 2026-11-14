@@ -246,6 +246,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
+            NodeRef::AlterPolicyStmt(policy) => self.translate_alter_policy(policy)?,
             NodeRef::GrantRoleStmt(grant) => {
                 return Err(ParseError::not_supported(if grant.is_grant {
                     "GRANT of role membership"
@@ -1069,6 +1070,43 @@ impl PostgreSQLTranslator {
         })))
     }
 
+    /// `ALTER POLICY ... [TO roles] [USING (expr)] [WITH CHECK (expr)]`. An
+    /// omitted part keeps its value; a missing `TO` reaches here as an empty
+    /// role list, because PostgreSQL's grammar has no empty `TO`.
+    fn translate_alter_policy(
+        &self,
+        policy: &pg_query::protobuf::AlterPolicyStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let table = policy
+            .table
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("ALTER POLICY: missing table".into()))?;
+        let roles = if policy.roles.is_empty() {
+            None
+        } else {
+            Some(policy_roles(&policy.roles)?)
+        };
+        let using_expr = policy
+            .qual
+            .as_ref()
+            .map(|expr| self.translate_expr(expr).map(Box::new))
+            .transpose()?;
+        let check_expr = policy
+            .with_check
+            .as_ref()
+            .map(|expr| self.translate_expr(expr).map(Box::new))
+            .transpose()?;
+        Ok(ast::Stmt::AlterPolicy(Box::new(ast::AlterPolicy {
+            policy_name: ast::Name::exact(policy.policy_name.clone()),
+            tbl_name: self.qualified_name_from_range_var(table)?,
+            body: ast::AlterPolicyBody::Change {
+                roles,
+                using_expr,
+                check_expr,
+            },
+        })))
+    }
+
     fn translate_alter_table(
         &self,
         alter: &pg_query::protobuf::AlterTableStmt,
@@ -1290,6 +1328,9 @@ impl PostgreSQLTranslator {
 
         let rename_type = ObjectType::try_from(rename.rename_type)
             .map_err(|_| ParseError::ParseError("RENAME: invalid type".into()))?;
+        if rename_type == ObjectType::ObjectPolicy {
+            return self.translate_rename_policy(rename);
+        }
         if !matches!(
             rename_type,
             ObjectType::ObjectTable | ObjectType::ObjectColumn
@@ -1335,6 +1376,24 @@ impl PostgreSQLTranslator {
             }
             _ => unreachable!("only tables and columns reach here"),
         }
+    }
+
+    /// `ALTER POLICY [IF EXISTS] name ON table RENAME TO new_name`.
+    /// PostgreSQL parses `IF EXISTS` but ignores it: a missing table or
+    /// policy is still an error, so it is ignored here too.
+    fn translate_rename_policy(
+        &self,
+        rename: &pg_query::protobuf::RenameStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let relation = rename
+            .relation
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("ALTER POLICY: missing table".into()))?;
+        Ok(ast::Stmt::AlterPolicy(Box::new(ast::AlterPolicy {
+            policy_name: exact_name(&rename.subname),
+            tbl_name: self.qualified_name_from_range_var(relation)?,
+            body: ast::AlterPolicyBody::RenameTo(exact_name(&rename.newname)),
+        })))
     }
 
     /// Translate a PG ColumnDef to a Turso ColumnDefinition AST node.

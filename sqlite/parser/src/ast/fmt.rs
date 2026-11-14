@@ -918,6 +918,7 @@ impl ToTokens for Stmt {
                 Ok(())
             }
             Self::CreatePolicy(policy) => policy.to_tokens(s, context),
+            Self::AlterPolicy(policy) => policy.to_tokens(s, context),
             Self::DropPolicy {
                 if_exists,
                 policy_name,
@@ -1887,6 +1888,52 @@ impl ToTokens for CreatePolicy {
             s.append(TK_RP, None)?;
         }
         Ok(())
+    }
+}
+
+impl_display_for_to_tokens!(AlterPolicy);
+impl ToTokens for AlterPolicy {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ALTER, None)?;
+        s.append(TK_ID, Some("POLICY"))?;
+        self.policy_name.to_tokens(s, context)?;
+        s.append(TK_ON, None)?;
+        self.tbl_name.to_tokens(s, context)?;
+        match &self.body {
+            AlterPolicyBody::Change {
+                roles,
+                using_expr,
+                check_expr,
+            } => {
+                if let Some(roles) = roles {
+                    s.append(TK_TO, None)?;
+                    s.comma(roles, context)?;
+                }
+                if let Some(expr) = using_expr {
+                    s.append(TK_USING, None)?;
+                    s.append(TK_LP, None)?;
+                    expr.to_tokens(s, context)?;
+                    s.append(TK_RP, None)?;
+                }
+                if let Some(expr) = check_expr {
+                    s.append(TK_WITH, None)?;
+                    s.append(TK_CHECK, None)?;
+                    s.append(TK_LP, None)?;
+                    expr.to_tokens(s, context)?;
+                    s.append(TK_RP, None)?;
+                }
+                Ok(())
+            }
+            AlterPolicyBody::RenameTo(new_name) => {
+                s.append(TK_RENAME, None)?;
+                s.append(TK_TO, None)?;
+                new_name.to_tokens(s, context)
+            }
+        }
     }
 }
 

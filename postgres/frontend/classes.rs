@@ -46,7 +46,7 @@ use turso_parser::ast;
 use turso_core::MAIN_DB_ID;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_GRANT_OPERATION,
-    SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_OBJECT,
 };
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
@@ -328,6 +328,9 @@ impl ClassCatalog {
                 }
             }
             CatalogChange::CreatePolicy {
+                namespace, name, ..
+            }
+            | CatalogChange::AlterPolicy {
                 namespace, name, ..
             }
             | CatalogChange::DropPolicy {
@@ -630,6 +633,7 @@ pub(crate) fn translate_catalog_changes(
             } | CatalogChange::Grant { .. }
                 | CatalogChange::SetRowSecurity { .. }
                 | CatalogChange::CreatePolicy { .. }
+                | CatalogChange::AlterPolicy { .. }
                 | CatalogChange::DropPolicy { .. }
         )
     });
@@ -924,15 +928,23 @@ pub(crate) fn translate_catalog_changes(
                     using_expr: policy.using_expr.as_deref().cloned(),
                     check_expr: policy.check_expr.as_deref().cloned(),
                 });
-                let stored = policies::stored_text(&relpolicies);
-                // The catalog reads the conditions back from the stored form,
-                // so a condition that does not read back is refused here
-                // rather than leaving a database that cannot be opened.
-                if policies::parse(&stored).is_none() {
-                    return Err(LimboError::ParseError(format!(
-                        "the conditions of policy \"{policy_name}\" cannot be stored"
-                    )));
-                }
+                let stored = stored_policies(&relpolicies, policy_name)?;
+                emit_class_row_set_policies(
+                    program,
+                    &cursors,
+                    *namespace,
+                    name,
+                    Some(stored),
+                    change,
+                );
+            }
+            CatalogChange::AlterPolicy {
+                namespace,
+                name,
+                policy,
+            } => {
+                let class = table_class(schema, *namespace, name)?;
+                let stored = alter_policy(schema, connection, name, &class.relpolicies, policy)?;
                 emit_class_row_set_policies(
                     program,
                     &cursors,
@@ -988,6 +1000,101 @@ fn catalog_view_name(name: &str) -> String {
         Some(view) => format!("information_schema.{view}"),
         None => name.to_string(),
     }
+}
+
+/// The stored form of `relpolicies`, the policies of table `name`, after
+/// `policy` changes them. The checks and their order are PostgreSQL's.
+fn alter_policy(
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    name: &str,
+    relpolicies: &[RowPolicy],
+    policy: &ast::AlterPolicy,
+) -> turso_core::Result<String> {
+    let mut relpolicies = relpolicies.to_vec();
+    let policy_name = policy.policy_name.as_str();
+    let new_roles = match &policy.body {
+        ast::AlterPolicyBody::Change {
+            roles: Some(roles), ..
+        } => Some(
+            roles
+                .iter()
+                .map(|role| resolve_policy_role(schema, connection, role))
+                .collect::<turso_core::Result<Vec<_>>>()?,
+        ),
+        _ => None,
+    };
+    if let ast::AlterPolicyBody::RenameTo(new_name) = &policy.body {
+        let new_name = new_name.as_str();
+        if relpolicies.iter().any(|existing| existing.name == new_name) {
+            return Err(sqlstate_error(
+                SQLSTATE_DUPLICATE_OBJECT,
+                format!("policy \"{new_name}\" for table \"{name}\" already exists"),
+            ));
+        }
+    }
+    let Some(existing) = relpolicies
+        .iter_mut()
+        .find(|existing| existing.name == policy_name)
+    else {
+        return Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_OBJECT,
+            format!("policy \"{policy_name}\" for table \"{name}\" does not exist"),
+        ));
+    };
+    match &policy.body {
+        ast::AlterPolicyBody::RenameTo(new_name) => {
+            existing.name = new_name.as_str().to_string();
+        }
+        ast::AlterPolicyBody::Change {
+            using_expr,
+            check_expr,
+            ..
+        } => {
+            if check_expr.is_some()
+                && matches!(
+                    existing.command,
+                    ast::PolicyCommand::Select | ast::PolicyCommand::Delete
+                )
+            {
+                return Err(sqlstate_error(
+                    SQLSTATE_SYNTAX_ERROR,
+                    "only USING expression allowed for SELECT, DELETE",
+                ));
+            }
+            if using_expr.is_some() && existing.command == ast::PolicyCommand::Insert {
+                return Err(sqlstate_error(
+                    SQLSTATE_SYNTAX_ERROR,
+                    "only WITH CHECK expression allowed for INSERT",
+                ));
+            }
+            if let Some(roles) = new_roles {
+                existing.roles = roles;
+            }
+            if let Some(expr) = using_expr {
+                existing.using_expr = Some(expr.as_ref().clone());
+            }
+            if let Some(expr) = check_expr {
+                existing.check_expr = Some(expr.as_ref().clone());
+            }
+        }
+    }
+    let stored_name = existing.name.clone();
+    stored_policies(&relpolicies, &stored_name)
+}
+
+/// The stored form of `relpolicies`, after a change to policy
+/// `policy_name`. The catalog reads the conditions back from the stored
+/// form, so a condition that does not read back is refused here rather than
+/// leaving a database that cannot be opened.
+fn stored_policies(relpolicies: &[RowPolicy], policy_name: &str) -> turso_core::Result<String> {
+    let stored = policies::stored_text(relpolicies);
+    if policies::parse(&stored).is_none() {
+        return Err(LimboError::ParseError(format!(
+            "the conditions of policy \"{policy_name}\" cannot be stored"
+        )));
+    }
+    Ok(stored)
 }
 
 /// The class row of table `name` of `namespace`, which row-level security

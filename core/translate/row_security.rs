@@ -647,6 +647,41 @@ pub(crate) fn translate_create_policy(
     )
 }
 
+/// ALTER POLICY. The dialect replaces the roles and conditions that the
+/// statement gives, or renames the policy. The conditions are checked and
+/// stored as for CREATE POLICY.
+/// [`crate::translate::roles::check_statement_privileges`] lets the table's
+/// owner and superusers run it.
+pub(crate) fn translate_alter_policy(
+    policy: &ast::AlterPolicy,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let (namespace, table) = row_security_table(&policy.tbl_name, resolver)?;
+    let mut stored = policy.clone();
+    if let ast::AlterPolicyBody::Change {
+        using_expr,
+        check_expr,
+        ..
+    } = &mut stored.body
+    {
+        for expr in [using_expr, check_expr].into_iter().flatten() {
+            prepare_policy_expr(expr, namespace, &table, resolver)?;
+        }
+    }
+    translate_change(
+        CatalogChange::AlterPolicy {
+            namespace: namespace.id,
+            name: normalize_ident(&table.declared_name),
+            policy: Box::new(stored),
+        },
+        resolver,
+        program,
+        connection,
+    )
+}
+
 /// DROP POLICY. With IF EXISTS, a missing table or policy is not an error,
 /// as in PostgreSQL.
 pub(crate) fn translate_drop_policy(

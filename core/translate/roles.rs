@@ -136,9 +136,18 @@ pub fn check_statement_privileges(
                 _ => owner_denial(),
             }
         }
-        // Only the table's owner may create or drop its policies, as in
-        // PostgreSQL.
+        // Only the table's owner may create, alter or drop its policies, as
+        // in PostgreSQL.
         ast::Stmt::CreatePolicy(policy) => {
+            if may_act_as_owner_of_table(resolver, connection, &policy.tbl_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Alter,
+                Object::Table(policy.tbl_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::AlterPolicy(policy) => {
             if may_act_as_owner_of_table(resolver, connection, &policy.tbl_name) {
                 return Ok(());
             }

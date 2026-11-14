@@ -397,6 +397,8 @@ pub enum Stmt {
     },
     /// `CREATE POLICY`, built only by a frontend with row-level security.
     CreatePolicy(Box<CreatePolicy>),
+    /// `ALTER POLICY`, built only by a frontend with row-level security.
+    AlterPolicy(Box<AlterPolicy>),
     /// `DROP POLICY`, built only by a frontend with row-level security.
     DropPolicy {
         /// `IF EXISTS`
@@ -1635,6 +1637,36 @@ pub struct CreatePolicy {
     pub using_expr: Option<Box<Expr>>,
     /// `WITH CHECK`: which new rows the policy lets the roles write
     pub check_expr: Option<Box<Expr>>,
+}
+
+/// `ALTER POLICY`: changes a policy of a table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AlterPolicy {
+    /// policy name
+    pub policy_name: Name,
+    /// table the policy belongs to
+    pub tbl_name: QualifiedName,
+    /// what changes
+    pub body: AlterPolicyBody,
+}
+
+/// What `ALTER POLICY` changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AlterPolicyBody {
+    /// `[TO roles] [USING (expr)] [WITH CHECK (expr)]`: the parts that are
+    /// given replace those of the policy, and the others stay.
+    Change {
+        /// `TO` roles
+        roles: Option<Vec<Grantee>>,
+        /// `USING`
+        using_expr: Option<Box<Expr>>,
+        /// `WITH CHECK`
+        check_expr: Option<Box<Expr>>,
+    },
+    /// `RENAME TO`
+    RenameTo(Name),
 }
 
 /// The command a policy applies to.
