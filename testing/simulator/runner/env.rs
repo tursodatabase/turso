@@ -31,6 +31,7 @@ use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 use turso_core::SessionRole;
+use turso_core::storage::sqlite3_ondisk::PageSize;
 
 /// Pre-create attached DB files with MVCC journal mode so that journal modes
 /// are compatible when ATTACH happens later during simulation.
@@ -1610,6 +1611,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn page_size_comes_from_the_seed_or_the_flag() {
+        use clap::Parser;
+        let page_size = |seed: u64, args: &[&str]| {
+            let output = tempfile::tempdir().unwrap();
+            let env = SimulatorEnv::new(
+                seed,
+                &SimulatorCLI::parse_from(args),
+                Paths::new(output.path()),
+                SimulationType::Default,
+                &Profile::faultless(),
+            );
+            env.opts.page_size
+        };
+        let drawn: std::collections::BTreeSet<usize> = (1..=20)
+            .map(|seed| page_size(seed, &["limbo_sim", "--io-backend", "memory"]))
+            .collect();
+        assert!(
+            drawn.len() > 1,
+            "every seed drew the same page size: {drawn:?}"
+        );
+        let flag = ["limbo_sim", "--io-backend", "memory", "--page-size", "512"];
+        assert!((1..=20).all(|seed| page_size(seed, &flag) == 512));
+    }
+
     /// Page sizes that main and aux0 report once each has a table.
     fn page_sizes_after_first_write(env: &mut SimulatorEnv) -> (usize, usize) {
         env.clear();
@@ -1887,6 +1913,17 @@ impl SimulatorEnv {
 
         let num_attached = rng.random_range(1..=3usize);
         let attached_dbs: Vec<String> = (0..num_attached).map(|i| format!("aux{i}")).collect();
+        let max_interactions = rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests);
+        // Drawing the page size before the other settings would change the number of
+        // attached databases and the plan length of every seed.
+        let drawn_page_size =
+            1usize << rng.random_range(PageSize::MIN.ilog2()..=PageSize::MAX.ilog2());
+        let page_size = cli_opts.page_size.map_or(drawn_page_size, |size| {
+            PageSize::new(size)
+                .unwrap_or_else(|| panic!("--page-size {size} is not a valid page size"))
+                .get() as usize
+        });
+        tracing::info!("page_size={page_size}");
 
         let mut opts = SimulatorOpts {
             seed,
@@ -1904,8 +1941,8 @@ impl SimulatorEnv {
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
-            page_size: 4096, // TODO: randomize this too
-            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
+            page_size,
+            max_interactions,
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
             disable_integrity_check: cli_opts.disable_integrity_check,
