@@ -25,6 +25,13 @@ mod integrity_check;
 mod lossy_index_keys;
 #[cfg(feature = "io_memory_yield")]
 mod memory_yield;
+#[cfg(all(
+    feature = "fs",
+    any(unix, target_os = "windows"),
+    target_pointer_width = "64",
+    any(not(target_os = "windows"), feature = "win_iocp")
+))]
+mod multiprocess;
 mod mvcc;
 mod native_extension;
 mod pragma;
