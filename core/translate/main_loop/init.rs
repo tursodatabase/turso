@@ -15,7 +15,11 @@ pub fn init_distinct(
             ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
         })
         .collect::<Result<Vec<_>>>()?;
-    DistinctCtx::new(program, collations, plan.distinct_ordered)
+    DistinctCtx::new(
+        program,
+        collations,
+        plan.distinct_ordered && plan.aggregates.is_empty(),
+    )
 }
 
 /// First step of Loop emission, opens cursors for all tables and initializes distinct aggregate
