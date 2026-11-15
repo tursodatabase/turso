@@ -16,7 +16,7 @@ use crate::IO;
 use crate::{
     schema::{Column, Index, Schema, Table, Trigger, Type},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
+    EncryptionOpts, LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1155,6 +1155,22 @@ impl<'a> OpenOptions<'a> {
         }
 
         Ok(opts)
+    }
+
+    pub fn encryption_opts(&self) -> Result<Option<EncryptionOpts>> {
+        match (&self.cipher, &self.hexkey) {
+            (Some(cipher), Some(hexkey)) => Ok(Some(EncryptionOpts {
+                cipher: cipher.clone(),
+                hexkey: hexkey.clone(),
+            })),
+            (Some(_), None) => Err(LimboError::InvalidArgument(
+                "hexkey is required when cipher is provided".to_string(),
+            )),
+            (None, Some(_)) => Err(LimboError::InvalidArgument(
+                "cipher is required when hexkey is provided".to_string(),
+            )),
+            (None, None) => Ok(None),
+        }
     }
 
     pub fn get_flags(&self) -> Result<OpenFlags> {
@@ -5396,6 +5412,41 @@ pub mod tests {
         let opts = OpenOptions::parse(uri).unwrap();
         assert_eq!(opts.path, "/home/user/db.sqlite");
         assert_eq!(opts.authority, None);
+    }
+
+    #[test]
+    fn test_uri_encryption_opts_none() {
+        for uri in ["test.db", "file:test.db?mode=ro"] {
+            let opts = OpenOptions::parse(uri).unwrap();
+            assert!(opts.encryption_opts().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn test_uri_encryption_opts_pair() {
+        let opts = OpenOptions::parse("file:test.db?cipher=aegis%32%35%36&hexkey=0011%32%32%33%33")
+            .unwrap();
+        let encryption_opts = opts.encryption_opts().unwrap().unwrap();
+        assert_eq!(encryption_opts.cipher, "aegis256");
+        assert_eq!(encryption_opts.hexkey, "00112233");
+    }
+
+    #[test]
+    fn test_uri_encryption_opts_incomplete() {
+        for (uri, expected) in [
+            (
+                "file:test.db?cipher=aegis256",
+                "hexkey is required when cipher is provided",
+            ),
+            (
+                "file:test.db?hexkey=00112233",
+                "cipher is required when hexkey is provided",
+            ),
+        ] {
+            let opts = OpenOptions::parse(uri).unwrap();
+            let err = opts.encryption_opts().unwrap_err();
+            assert!(matches!(err, LimboError::InvalidArgument(ref message) if message == expected));
+        }
     }
 
     #[test]

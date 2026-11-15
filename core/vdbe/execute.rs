@@ -75,9 +75,10 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, CipherMode, Clock, Completion, ConnectOpts,
+    Connection, Database, DatabaseStorage, EncryptionOpts, IOExt, MonotonicInstant, MvCursor,
+    NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef, WalAutoActions,
+    WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -183,8 +184,8 @@ use crate::connection::resolve_ext_path;
 use crate::security::roles::SessionRole;
 use crate::vdbe::builder::CursorTypeExt;
 use crate::{
-    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
-    Pager, Result,
+    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation,
+    EncryptionKey, MvStore, Pager, Result,
 };
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
@@ -19210,13 +19211,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 };
                 let dest_path = dest_path.as_str().to_string();
                 let target = crate::util::OpenOptions::parse(&dest_path)?;
-                if target.cipher.is_some() || target.hexkey.is_some() {
-                    return Err(LimboError::InvalidArgument(
-                        "VACUUM INTO does not support the cipher and hexkey URI parameters"
-                            .to_string(),
-                    )
-                    .into());
-                }
+                let encryption_opts = target.encryption_opts()?;
                 let output_in_memory = target.path.is_empty()
                     || target.path == crate::util::MEMORY_PATH
                     || target.mode == crate::util::OpenMode::Memory;
@@ -19305,6 +19300,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
+                let output_opts = output_opts
+                    .with_encryption(output_opts.enable_encryption || encryption_opts.is_some());
 
                 let (io, dest_path): (Arc<dyn crate::IO>, String) = if output_in_memory {
                     (
@@ -19327,6 +19324,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
+                            .encryption(encryption_opts.clone())
                             .page_codec(codec.clone()),
                     )?,
                     None => crate::Database::open_file_with_flags(
@@ -19334,20 +19332,33 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         &dest_path,
                         OpenFlags::Create,
                         output_opts,
-                        None,
+                        encryption_opts.clone(),
                         source_db.dialect(),
                     )?,
                 };
+                // set reserved_space on destination to match source or use encryption parameters,
+                // if specified. This is important for databases using encryption or checksums.
+                // Must be set before page 1 is allocated (before any schema operations)
+                let (encryption_key, reserved_bytes) =
+                    if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
+                        let cipher_mode = CipherMode::try_from(cipher.as_str())?;
+                        (
+                            Some(EncryptionKey::from_hex_string(&hexkey)?),
+                            cipher_mode.metadata_size() as u8,
+                        )
+                    } else {
+                        (None, reserved_space)
+                    };
                 let output_conn = match page_codec {
                     Some(codec) => output_db
                         .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))?,
-                    None => output_db.connect(ConnectOpts::new(SessionRole::Superuser))?,
+                    None => output_db.connect(
+                        ConnectOpts::new(SessionRole::Superuser)
+                            .with_encryption_key(encryption_key),
+                    )?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
-                // set reserved_space on output to match source
-                // this is important for databases using encryption or checksums
-                // must be set before page 1 is allocated (before any schema operations)
-                output_conn.set_reserved_bytes(reserved_space)?;
+                output_conn.set_reserved_bytes(reserved_bytes)?;
 
                 mirror_symbols(&program.connection, &output_conn);
                 let source_custom_types = capture_custom_types(&program.connection, source_db_id);
