@@ -1268,10 +1268,98 @@ pub fn translate_drop_sequence(
     Ok(())
 }
 
-/// Qualifies each sequence named without a schema in `expr` with the schema
-/// it resolves to now, so the expression keeps that sequence after the
-/// search path changes. Returns whether a name was qualified.
-pub(crate) fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool> {
+/// Qualifies each sequence named without a schema in the expressions that
+/// `stmt` stores in the schema with the schema it resolves to now, so the
+/// expressions keep that sequence after the search path changes. Returns
+/// whether a name was qualified.
+pub(crate) fn bind_sequence_names_in_stored_expressions(
+    stmt: &mut ast::Stmt,
+    resolver: &Resolver,
+) -> Result<bool> {
+    match stmt {
+        ast::Stmt::CreateTable { body, .. } => bind_sequence_names_in_table_body(body, resolver),
+        ast::Stmt::CreateView { select, .. } => bind_sequence_names_in_select(select, resolver),
+        ast::Stmt::AlterTable(_)
+        | ast::Stmt::Analyze { .. }
+        | ast::Stmt::Attach { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateIndex { .. }
+        | ast::Stmt::CreateTrigger { .. }
+        | ast::Stmt::CreateMaterializedView { .. }
+        | ast::Stmt::CreateVirtualTable(_)
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::Grant(_)
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Detach { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Pragma { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Select(_)
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Vacuum { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::AlterSequenceOwnedBy { .. }
+        | ast::Stmt::CreateSchema { .. }
+        | ast::Stmt::DropSchema { .. }
+        | ast::Stmt::CreatePolicy(_)
+        | ast::Stmt::DropPolicy { .. } => Ok(false),
+    }
+}
+
+fn bind_sequence_names_in_table_body(
+    body: &mut ast::CreateTableBody,
+    resolver: &Resolver,
+) -> Result<bool> {
+    match body {
+        ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => {
+            let mut bound = false;
+            for column in columns {
+                bound |=
+                    bind_sequence_names_in_column_constraints(&mut column.constraints, resolver)?;
+            }
+            Ok(bound)
+        }
+        ast::CreateTableBody::AsSelect(_) => Ok(false),
+    }
+}
+
+fn bind_sequence_names_in_column_constraints(
+    constraints: &mut [ast::NamedColumnConstraint],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut bound = false;
+    for constraint in constraints {
+        match &mut constraint.constraint {
+            ast::ColumnConstraint::Default(expr) => {
+                bound |= bind_sequence_names(expr, resolver)?;
+            }
+            ast::ColumnConstraint::PrimaryKey { .. }
+            | ast::ColumnConstraint::NotNull { .. }
+            | ast::ColumnConstraint::Unique(_)
+            | ast::ColumnConstraint::Check { .. }
+            | ast::ColumnConstraint::Collate { .. }
+            | ast::ColumnConstraint::ForeignKey { .. }
+            | ast::ColumnConstraint::Generated { .. } => {}
+        }
+    }
+    Ok(bound)
+}
+
+fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool> {
     let mut bound = false;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         bound |= bind_sequence_call(expr, resolver);
@@ -1280,15 +1368,13 @@ pub(crate) fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> 
     Ok(bound)
 }
 
-/// [`bind_sequence_names`] for every expression of a SELECT.
-pub(crate) fn bind_sequence_names_in_select(
-    select: &mut ast::Select,
-    resolver: &Resolver,
-) -> Result<()> {
+fn bind_sequence_names_in_select(select: &mut ast::Select, resolver: &Resolver) -> Result<bool> {
+    let mut bound = false;
     rewrite_select_expressions(select, &mut |expr: &mut ast::Expr| {
-        bind_sequence_call(expr, resolver);
+        bound |= bind_sequence_call(expr, resolver);
         Ok(())
-    })
+    })?;
+    Ok(bound)
 }
 
 fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {

@@ -31,7 +31,6 @@ use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
-use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
@@ -1142,10 +1141,11 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    bound_sequence_names: bool,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
-    let (mut body, ctas_info) = match body {
+    let (body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
             let (info, col_defs) = derive_ctas_schema(
                 select,
@@ -1265,9 +1265,6 @@ pub fn translate_create_table(
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
-    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
-        && bind_default_sequence_names(&mut body, resolver)?;
-
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
         columns,
@@ -1612,26 +1609,6 @@ pub fn translate_create_table(
     }
 
     Ok(())
-}
-
-/// Binds the sequences named in the column defaults of `body` to the
-/// schemas they resolve to now. See [`bind_sequence_names`].
-fn bind_default_sequence_names(
-    body: &mut ast::CreateTableBody,
-    resolver: &Resolver,
-) -> Result<bool> {
-    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Ok(false);
-    };
-    let mut bound = false;
-    for column in columns {
-        for constraint in &mut column.constraints {
-            if let ast::ColumnConstraint::Default(expr) = &mut constraint.constraint {
-                bound |= bind_sequence_names(expr, resolver)?;
-            }
-        }
-    }
-    Ok(bound)
 }
 
 /// Translates `CREATE SCHEMA name`: a new namespace of the main
