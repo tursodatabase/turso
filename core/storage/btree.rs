@@ -1369,14 +1369,16 @@ impl BTreeCursor {
         root_page: i64,
         table: &BTreeTable,
         num_columns: usize,
-    ) -> Self {
-        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+    ) -> Result<Self> {
+        table.check_without_rowid_key_is_supported()?;
+        let pk_columns = table.primary_key_columns.iter().enumerate();
+        let key_info = pk_columns.map(|(i, (col_name, order))| {
             let (_, column) = table
                 .get_column(col_name)
                 .expect("WITHOUT ROWID primary key column should exist");
             crate::types::KeyInfo {
                 sort_order: *order,
-                collation: column.collation(),
+                collation: table.primary_key_collation(i, column),
                 nulls_order: None,
             }
         });
@@ -1384,7 +1386,12 @@ impl BTreeCursor {
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),
         );
-        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+        Ok(Self::new_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+        ))
     }
 
     pub fn new_index(

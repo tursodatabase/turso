@@ -1,5 +1,7 @@
 use crate::assertions::{AssertColumn, Cell};
-use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use crate::common::{
+    limbo_exec_rows, sqlite_exec_rows, try_limbo_exec_rows, ExecRows, TempDatabase,
+};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
@@ -204,6 +206,68 @@ fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyho
         .display_string()
         .contains("INDEXED BY is not supported on WITHOUT ROWID tables");
 
+    Ok(())
+}
+
+/// SQLite stores a column once per PRIMARY KEY entry when the entries have
+/// different collations, and Turso stores it once. Turso refuses to read or
+/// write such a table rather than misread or overwrite SQLite's rows.
+#[turso_macros::test]
+fn test_without_rowid_primary_key_repeating_column_with_other_collation_is_refused(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid_repeated_pk.db");
+    {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE t(a, b, PRIMARY KEY(a COLLATE NOCASE, b, a)) WITHOUT ROWID;
+            INSERT INTO t VALUES ('b', 1);
+            CREATE TABLE other(x);
+            INSERT INTO other VALUES (1);
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+    }
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    for query in ["INSERT INTO t VALUES ('B', 1)", "SELECT a, b FROM t"] {
+        let err = try_limbo_exec_rows(&db, &conn, query).unwrap_err();
+        assert_that!(err.to_string())
+            .contains("lists a column more than once with different collations");
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT x FROM other"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![rusqlite::types::Value::Text(
+            "table t: not checked, Turso does not support a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations".to_string()
+        )]]
+    );
+    drop(conn);
+    drop(db);
+
+    let sqlite = SqliteConnection::open(&db_path)?;
+    assert_eq!(
+        sqlite_exec_rows(&sqlite, "SELECT a, b FROM t"),
+        vec![vec![
+            rusqlite::types::Value::Text("b".to_string()),
+            rusqlite::types::Value::Integer(1)
+        ]]
+    );
+    drop(sqlite);
+
+    // DROP TABLE does not open a cursor on the table, so the table can still be removed.
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    limbo_exec_rows(&conn, "DROP TABLE t");
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]]
+    );
     Ok(())
 }
 
