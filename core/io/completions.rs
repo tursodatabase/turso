@@ -59,9 +59,7 @@ pub struct Context {
 
 impl ContextInner {
     pub fn new() -> Self {
-        Self {
-            wakers: SmallVec::new(),
-        }
+        Self::default()
     }
 
     /// Registers `waker` unless a waker of the same task is registered already. Registering
@@ -1302,15 +1300,6 @@ mod tests {
         assert!(c.failed());
     }
 
-    /// A waker that counts its wakes.
-    struct WakeCount(AtomicUsize);
-
-    impl std::task::Wake for WakeCount {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     /// A waker registered while another thread completes the completion is woken in every
     /// interleaving, including a completion that finishes after `set_waker` tested it and before
     /// the waker was stored.
@@ -1320,15 +1309,15 @@ mod tests {
         shuttle::check_dfs(
             || {
                 let c = Completion::new_wait();
-                let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+                let task = PollingTask::new(&c);
                 let completer = {
                     let c = c.clone();
                     crate::thread::spawn(move || c.complete(0))
                 };
-                c.set_waker(&Waker::from(count.clone()));
+                c.set_waker(&Waker::from(task.clone()));
                 completer.join().unwrap();
                 assert_ne!(
-                    count.0.load(Ordering::SeqCst),
+                    task.wakes(),
                     0,
                     "the completion finished without waking its waker"
                 );
@@ -1342,9 +1331,7 @@ mod tests {
     #[test]
     fn each_task_waiting_on_a_completion_is_woken_once_when_it_finishes() {
         let c = Completion::new_wait();
-        let tasks: Vec<_> = (0..3)
-            .map(|_| Arc::new(WakeCount(AtomicUsize::new(0))))
-            .collect();
+        let tasks: Vec<_> = (0..3).map(|_| PollingTask::new(&c)).collect();
         for task in &tasks {
             c.set_waker(&Waker::from(task.clone()));
             // Registering the same task again keeps one waker for it.
@@ -1353,14 +1340,14 @@ mod tests {
         assert!(
             tasks
                 .iter()
-                .all(|task| task.0.load(Ordering::SeqCst) == 0 && Arc::strong_count(task) == 2),
+                .all(|task| task.wakes() == 0 && Arc::strong_count(task) == 2),
             "a registration woke or dropped another task's waker"
         );
         c.complete(0);
         assert!(
             tasks
                 .iter()
-                .all(|task| task.0.load(Ordering::SeqCst) == 1 && Arc::strong_count(task) == 1),
+                .all(|task| task.wakes() == 1 && Arc::strong_count(task) == 1),
             "finishing did not wake each waker once and drop it"
         );
     }
