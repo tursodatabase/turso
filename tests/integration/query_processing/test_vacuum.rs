@@ -6813,3 +6813,159 @@ fn test_vacuum_into_followed_by_writes_and_indexed_read() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+/// `VACUUM INTO` commits the target in batches of rows / bytes and truncates
+/// the target's WAL every few batches, so that a copy of a database of any
+/// size runs in bounded memory. The copy must be the same database for all
+/// that. The fixture is sized to cross several row batches, several byte
+/// batches and a WAL truncation, and carries everything the build order
+/// touches: a custom type with an index on it, an expression index whose
+/// keys are in no rowid order over a table larger than a row batch (the
+/// indexes are built after the rows, each committed on its own),
+/// AUTOINCREMENT counters above max(rowid) (copied last), a generated column
+/// (left out of the copied column list), a trigger, views and materialized
+/// views (replayed after the rows), and a non-default page size.
+#[test]
+fn test_vacuum_into_batched_copy_is_faithful() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true).with_views(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+    conn.reset_page_size(turso_core::MAIN_DB_ID, 8192)?;
+
+    // Custom type with an index on a column of it (words: 4 rows).
+    create_custom_type_ordering_fixture(&conn)?;
+
+    // AUTOINCREMENT across a row batch, with the newest rows deleted so the
+    // counter sits above max(id); a trigger that logs each insert.
+    conn.execute("CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg TEXT)")?;
+    conn.execute(
+        "CREATE TRIGGER seq_log AFTER INSERT ON seq BEGIN \
+         INSERT INTO log(msg) VALUES ('inserted ' || new.id); END",
+    )?;
+    conn.execute("INSERT INTO seq(val) SELECT 'v' || value FROM generate_series(1, 30000)")?;
+    conn.execute("DELETE FROM seq WHERE id > 29000")?;
+    conn.execute("DELETE FROM log")?;
+
+    // A generated column across a row batch.
+    conn.execute(
+        "CREATE TABLE gen(a INTEGER, b INTEGER, \
+         c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL)",
+    )?;
+    conn.execute("INSERT INTO gen(a, b) SELECT value, value * 2 FROM generate_series(1, 25000)")?;
+    // An index whose keys are scrambled with respect to the rowids (Knuth's
+    // multiplicative hash), over a table that crosses a row batch.
+    conn.execute("CREATE INDEX gen_scrambled ON gen((a * 2654435761) % 1000003)")?;
+    let scrambled_probe = "SELECT group_concat(a) FROM (SELECT a FROM gen \
+                           WHERE (a * 2654435761) % 1000003 BETWEEN 1000 AND 3000 ORDER BY a)";
+
+    // Byte batches and a WAL truncation: 900 rows of 100 KB, 11 batches of
+    // 8 MiB, the WAL truncated every 8 of them.
+    conn.execute("CREATE TABLE blobs(id INTEGER PRIMARY KEY, payload BLOB)")?;
+    conn.execute(
+        "INSERT INTO blobs(payload) SELECT randomblob(100000) FROM generate_series(1, 900)",
+    )?;
+
+    // Views and materialized views (tables t and u).
+    create_materialized_view_fixture(&conn)?;
+    conn.execute("CREATE VIEW seq_count AS SELECT count(*) AS n FROM seq")?;
+
+    let tables = [
+        "words",
+        "seq",
+        "log",
+        "gen",
+        "blobs",
+        "t",
+        "u",
+        "sqlite_sequence",
+    ];
+    let source_hashes = table_hashes(&tmp_db, &tables);
+    let source_schema = user_schema_snapshot(&conn);
+    let source_types = custom_type_sql_snapshot(&conn);
+    let source_counter = scalar_i64(&conn, "SELECT seq FROM sqlite_sequence WHERE name = 'seq'");
+    assert_eq!(source_counter, 30000);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let (dest_db, dest_conn) = connect_existing_with_opts(&dest_path, tmp_db.db_opts);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(scalar_i64(&dest_conn, "PRAGMA page_size"), 8192);
+    assert_eq!(table_hashes(&dest_db, &tables), source_hashes);
+    assert_eq!(user_schema_snapshot(&dest_conn), source_schema);
+    assert_eq!(custom_type_sql_snapshot(&dest_conn), source_types);
+    assert_eq!(
+        scalar_i64(
+            &dest_conn,
+            "SELECT seq FROM sqlite_sequence WHERE name = 'seq'"
+        ),
+        source_counter
+    );
+    assert_eq!(
+        scalar_i64(
+            &dest_conn,
+            "SELECT count(*) + max(id) + sum(length(payload)) FROM blobs"
+        ),
+        900 + 900 + 900 * 100_000
+    );
+    assert_eq!(
+        scalar_i64(&dest_conn, "SELECT sum(c) FROM gen WHERE c = a + b"),
+        scalar_i64(&conn, "SELECT sum(c) FROM gen"),
+    );
+    // The scrambled index answers a range probe with the same rows as the
+    // source — read through the index itself, not the table.
+    let source_probe: Vec<(String,)> = conn.exec_rows(scrambled_probe);
+    let dest_probe: Vec<(String,)> = dest_conn
+        .exec_rows(&scrambled_probe.replace("FROM gen ", "FROM gen INDEXED BY gen_scrambled "));
+    assert!(
+        source_probe[0].0.split(',').count() > 10,
+        "the probe should match many rows, got {:?}",
+        source_probe[0].0
+    );
+    assert_eq!(dest_probe, source_probe);
+    assert_custom_type_ordering_fixture(&dest_conn);
+    assert_materialized_views_equal_their_queries(&dest_conn);
+
+    // The copy keeps working: the counter does not reuse a deleted id, the
+    // trigger fires, the custom type is usable in new schema, the views
+    // are maintained.
+    dest_conn.execute("INSERT INTO seq(val) VALUES ('after')")?;
+    assert_eq!(scalar_i64(&dest_conn, "SELECT max(id) FROM seq"), 30001);
+    assert_eq!(scalar_i64(&dest_conn, "SELECT count(*) FROM log"), 1);
+    assert_eq!(scalar_i64(&dest_conn, "SELECT n FROM seq_count"), 29001);
+    assert_custom_type_reusable_for_new_schema(&dest_conn)?;
+    dest_conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    assert_materialized_views_equal_their_queries(&dest_conn);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    Ok(())
+}
+
+/// The schema snapshot without the automatic indexes of the engine's
+/// internal tables: the source creates `__turso_internal_types` without a
+/// sqlite_schema row for the index of its PRIMARY KEY, while the copy's
+/// CREATE TABLE replay adds one. That is how VACUUM INTO has always copied a
+/// database with custom types, batched or not, and not what this test is
+/// about.
+fn user_schema_snapshot(conn: &Arc<Connection>) -> Vec<NormalizedSchemaRow> {
+    normalized_schema_snapshot(conn)
+        .into_iter()
+        .filter(|row| !row.name.starts_with("sqlite_autoindex___turso_internal_"))
+        .collect()
+}
+
+/// The dbhash of each of `tables` in `db`, in order.
+fn table_hashes(db: &TempDatabase, tables: &[&str]) -> Vec<String> {
+    tables
+        .iter()
+        .map(|table| {
+            let options = turso_dbhash::DbHashOptions {
+                table_filter: Some(table.to_string()),
+                without_schema: true,
+                ..Default::default()
+            };
+            compute_dbhash_with_options_and_database_opts(db, &options, db.db_opts).hash
+        })
+        .collect()
+}
