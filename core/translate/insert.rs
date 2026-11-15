@@ -3052,35 +3052,46 @@ fn translate_column(
             dest_end: None,
         });
     } else {
-        let resolved = resolver
-            .schema()
-            .resolve_type(&column.ty_str, is_strict)
-            .ok()
-            .flatten();
-        let default_expr = column
-            .default
-            .as_deref()
-            .or_else(|| resolved.as_ref().and_then(|r| r.default_expr()));
-        let Some(default_expr) = default_expr else {
-            program.emit_insn(Insn::Null {
-                dest: column_register,
-                dest_end: None,
-            });
-            return Ok(());
-        };
-        let has_custom_encode = resolved.as_ref().is_some_and(|r| r.has_encode_or_coerce());
-        if has_custom_encode {
-            translate_expr_no_constant_opt(
-                program,
-                None,
-                default_expr,
-                column_register,
-                resolver,
-                NoConstantOptReason::CustomTypeEncode,
-            )?;
-        } else {
-            translate_expr(program, None, default_expr, column_register, resolver)?;
-        }
+        translate_column_default(program, column, column_register, resolver, is_strict)?;
+    }
+    Ok(())
+}
+
+fn translate_column_default(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    column_register: usize,
+    resolver: &Resolver,
+    is_strict: bool,
+) -> Result<()> {
+    let resolved = resolver
+        .schema()
+        .resolve_type(&column.ty_str, is_strict)
+        .ok()
+        .flatten();
+    let default_expr = column
+        .default
+        .as_deref()
+        .or_else(|| resolved.as_ref().and_then(|r| r.default_expr()));
+    let Some(default_expr) = default_expr else {
+        program.emit_insn(Insn::Null {
+            dest: column_register,
+            dest_end: None,
+        });
+        return Ok(());
+    };
+    let has_custom_encode = resolved.as_ref().is_some_and(|r| r.has_encode_or_coerce());
+    if has_custom_encode {
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            default_expr,
+            column_register,
+            resolver,
+            NoConstantOptReason::CustomTypeEncode,
+        )?;
+    } else {
+        translate_expr(program, None, default_expr, column_register, resolver)?;
     }
     Ok(())
 }
