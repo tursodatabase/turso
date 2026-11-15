@@ -826,6 +826,10 @@ fn prepare_policy_expr(
             }
             ast::Expr::FunctionCallStar { name, .. } => {
                 check_policy_function(name.as_str(), 0, resolver)?;
+                resolver
+                    .catalog
+                    .dialect
+                    .check_star_call_of_plain_function(name.as_str())?;
             }
             _ => {}
         }

@@ -382,6 +382,13 @@ expect error {
     aggregate functions are not allowed in policy expressions
 }
 
+test policy-with-star-argument-to-plain-function-is-rejected {
+    CREATE TABLE rp_docs_star (id INT PRIMARY KEY);
+    CREATE POLICY p ON rp_docs_star USING (random(*) > 0);
+}
+@sqlstate 42809
+expect error {random\(\*\) specified, but random is not an aggregate function}
+
 test policy-with-unknown-column-is-rejected {
     CREATE TABLE rp_docs_25 (id INT PRIMARY KEY);
     CREATE POLICY p ON rp_docs_25 USING (missing = 1);
