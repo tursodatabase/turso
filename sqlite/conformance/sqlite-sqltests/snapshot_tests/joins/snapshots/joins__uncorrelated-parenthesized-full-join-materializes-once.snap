@@ -87,9 +87,9 @@ addr  opcode              p1  p2  p3  p4      p5  comment
   51    Integer            1  20   0           0  r[20]=1; LIMIT counter
   52    IfNot             20  78   0           0  if !r[20] goto 78
   53    OpenRead           4   3   0  k(2,B)   0  table=nested_once_anchor, root=3, iDb=0
-  54    InitCoroutine      4   0   6           0
-  55      Yield            4  78   0           0
-  56      IfNot           21  77   1           0  if !r[21] goto 77
+  54    IfNot             21  78   1           0  if !r[21] goto 78
+  55    InitCoroutine      4   0   6           0
+  56      Yield            4  78   0           0
   57      Once            66   0   0           0  goto 66
   58      OpenAutoindex    5   0   0           0  cursor=5
   59      Rewind           4  66   0           0  Rewind table nested_once_anchor
@@ -110,7 +110,7 @@ addr  opcode              p1  p2  p3  p4      p5  comment
   74        Copy          19   1   0           0  r[1]=r[19]
   75        DecrJumpZero  20  78   0           0  if (--r[20]==0) goto 78
   76      Next             5  71   0           0
-  77    Goto               0  55   0           0
+  77    Goto               0  56   0           0
   78    Return             3   0   1           0
   79    Copy               1   2   0           0  r[2]=r[1]
   80    ResultRow          2   1   0           0  output=r[2]

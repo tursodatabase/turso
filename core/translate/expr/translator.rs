@@ -31,9 +31,6 @@ pub enum NoConstantOptReason {
     /// Each value reuses the same register, so hoisting would collapse
     /// all values into the last one.
     InListEphemeral,
-    /// The SELECT has a constant-false WHERE clause, so result expressions
-    /// must stay after the jump that skips producing rows.
-    FilteredResultRow,
 }
 
 /// Controls how binary expressions are emitted.
@@ -104,7 +101,17 @@ pub fn translate_expr(
 ) -> Result<usize> {
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
-            Some(program.constant_span_start())
+            let placement = if !resolver
+                .catalog
+                .dialect
+                .computes_constant_calls_before_reading_rows()
+                && expression_can_fail_on_input(expr, &TypeEnv::new(referenced_tables, resolver))
+            {
+                ConstantSpanPlacement::FirstUse
+            } else {
+                ConstantSpanPlacement::Hoisted
+            };
+            Some(program.constant_span_start(placement))
         } else {
             None
         }

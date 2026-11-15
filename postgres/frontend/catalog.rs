@@ -334,6 +334,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn computes_constant_calls_before_reading_rows(&self) -> bool {
+        true
+    }
+
     fn constraint_errors_show_values(&self) -> bool {
         true
     }

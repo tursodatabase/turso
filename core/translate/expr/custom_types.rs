@@ -377,7 +377,8 @@ pub(crate) fn translate_untyped_operand_as(
     resolver: &Resolver,
 ) -> Result<usize> {
     // The operand is a constant, so its conversion is computed once with it.
-    let constant_span = (!program.constant_span_is_open()).then(|| program.constant_span_start());
+    let constant_span = (!program.constant_span_is_open())
+        .then(|| program.constant_span_start(ConstantSpanPlacement::Hoisted));
     translate_expr(program, referenced_tables, operand, reg, resolver)?;
     emit_untyped_operand_store(program, resolved, reg, resolver)?;
     emit_decode(program, resolved, reg, resolver)?;
