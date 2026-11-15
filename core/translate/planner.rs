@@ -1130,7 +1130,7 @@ fn add_aggregate_if_not_exists(
 
 /// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
 /// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
-fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
+pub(crate) fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
     match normalized_name {
         "mode" => Some(AggFunc::Mode),
         "percentile_cont" => Some(AggFunc::PercentileCont),
@@ -2647,10 +2647,11 @@ pub fn parse_where(
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
+    aggregates_allowed: bool,
     resolver: &Resolver,
 ) -> Result<()> {
+    let start_idx = out_where_clause.len();
     if let Some(where_expr) = where_clause {
-        let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
             rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
@@ -2662,36 +2663,115 @@ pub fn parse_where(
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
-        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
-        // considered independently by constraint extraction and range planning.
-        // Re-break any ANDs that were created so they become separate WhereTerms for
-        // constraint extraction.
-        let mut i = start_idx;
-        while i < out_where_clause.len() {
-            if matches!(
-                &out_where_clause[i].expr,
-                Expr::Binary(_, ast::Operator::And, _)
-            ) {
-                let term = out_where_clause.remove(i);
-                let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve the source from the original term.
-                for new_term in new_terms.iter_mut() {
-                    new_term.origin = term.origin;
-                }
-                let count = new_terms.len();
-                for (j, new_term) in new_terms.into_iter().enumerate() {
-                    out_where_clause.insert(i + j, new_term);
-                }
-                i += count;
-            } else {
-                i += 1;
+    }
+    // Like SQLite, reject these while resolving names, so that a term that gets no code,
+    // such as `WHERE 1 OR row_number()` or `ON 0 AND max(a)`, is rejected too. The list
+    // also holds the ON terms that `parse_from` bound.
+    for term in out_where_clause.iter() {
+        walk_expr(&term.expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            if let Some(name) = window_function_name(expr, &resolver.catalog)? {
+                crate::bail_parse_error!("misuse of window function {}()", name);
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        if !aggregates_allowed {
+            if let Some(name) = first_aggregate_without_over_clause(&term.expr, resolver)? {
+                crate::bail_parse_error!("misuse of aggregate function {}()", name);
             }
         }
-        Ok(())
-    } else {
-        Ok(())
     }
+    // BETWEEN in WHERE is rewritten to binary terms here so each side can be
+    // considered independently by constraint extraction and range planning.
+    // Re-break any ANDs that were created so they become separate WhereTerms for
+    // constraint extraction.
+    let mut i = start_idx;
+    while i < out_where_clause.len() {
+        if matches!(
+            &out_where_clause[i].expr,
+            Expr::Binary(_, ast::Operator::And, _)
+        ) {
+            let term = out_where_clause.remove(i);
+            let mut new_terms: Vec<WhereTerm> = Vec::new();
+            break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+            // Preserve the source from the original term.
+            for new_term in new_terms.iter_mut() {
+                new_term.origin = term.origin;
+            }
+            let count = new_terms.len();
+            for (j, new_term) in new_terms.into_iter().enumerate() {
+                out_where_clause.insert(i + j, new_term);
+            }
+            i += count;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The name of the function `expr` calls if that is a window function: a call with
+/// an OVER clause, or a function that only works as a window function, such as
+/// `row_number()`.
+pub(crate) fn window_function_name<'a>(
+    expr: &'a ast::Expr,
+    resolver: &crate::translate::catalog::CatalogContext,
+) -> Result<Option<&'a str>> {
+    let (name, arg_count, filter_over) = match expr {
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => (name, args.len(), filter_over),
+        ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+        _ => return Ok(None),
+    };
+    if filter_over.over_clause.is_some()
+        || matches!(
+            resolver.resolve_function(name.as_str(), arg_count)?,
+            Some(Func::Window(_))
+        )
+    {
+        return Ok(Some(name.as_str()));
+    }
+    Ok(None)
+}
+
+/// The name of the first aggregate call in `expr` that has no OVER clause.
+pub(crate) fn first_aggregate_without_over_clause<'a>(
+    expr: &'a ast::Expr,
+    resolver: &Resolver,
+) -> Result<Option<&'a str>> {
+    let mut found = None;
+    walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
+        let (name, args_count, filter_over) = match e {
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => (name, args.len(), filter_over),
+            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+            _ => return Ok(WalkControl::Continue),
+        };
+        if found.is_some() || filter_over.over_clause.is_some() {
+            return Ok(WalkControl::Continue);
+        }
+        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
+        {
+            Ok(Some(crate::function::Func::Agg(_))) => true,
+            _ => resolver
+                .catalog
+                .symbol_table
+                .resolve_function(name.as_str(), args_count)
+                .is_some_and(|f| f.func.is_aggregate()),
+        };
+        if is_aggregate {
+            found = Some(name.as_str());
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {

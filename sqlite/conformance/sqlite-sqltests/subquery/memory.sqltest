@@ -679,6 +679,54 @@ expect error {
     no such column: t2\.d
 }
 
+# A GROUP BY term in a correlated subquery cannot name an outer column itself, but
+# it can name a result column, by number or alias, that reads one. A GROUP BY alias
+# is preferred over an outer column with the same name.
+@cross-check-integrity
+test subquery-correlated-group-by-result-column-reads-outer-column {
+    create table t1(b, c);
+    insert into t1 values(5, 1), (7, 2), (5, 3);
+    create table t2(d);
+    insert into t2 values(2), (3);
+
+    select (select d from t1 group by 1) from t2 order by 1;
+    select (select d + b as k from t1 group by k + 1 order by 1) from t2 order by 1;
+    select (select b as d from t1 group by d order by 1 desc) from t2;
+    select d from t2 where (select d from t1 group by 1 having d > 2);
+}
+expect {
+    2
+    3
+    7
+    8
+    7
+    7
+    3
+}
+
+# Unqualified outer column in GROUP BY of a correlated subquery.
+@cross-check-integrity
+test subquery-correlated-unqualified-outer-ref-in-group-by {
+    create table t1(b, c);
+    create table t2(d);
+
+    select (select 1 from t1 group by d) from t2;
+}
+expect error {
+    no such column: d
+}
+
+# Schema-qualified outer column in GROUP BY of a correlated subquery.
+@cross-check-integrity
+test subquery-correlated-schema-qualified-outer-ref-in-group-by {
+    create table t1(b, c);
+    create table t2(d);
+
+    select (select 1 from t1 group by main.t2.d) from t2;
+}
+expect error {
+    no such column: main\.t2\.d
+}
 # Uncorrelated IN-subquery in ORDER BY clause
 @cross-check-integrity
 test subquery-uncorrelated-in-order-by-in {

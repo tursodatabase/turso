@@ -249,6 +249,638 @@ expect error {
     misuse of aggregate: max()
 }
 
+# The ORDER BY terms that the rowid truncation or a single-row aggregate removes are
+# never evaluated, but SQLite still resolves the names and functions in them.
+test orderby_rowid_truncation_checks_subquery_column_names {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY id, (SELECT c0 FROM z);
+}
+expect error {
+    no such column: c0
+}
+
+test orderby_rowid_truncation_checks_exists_column_names {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY id, EXISTS (SELECT c0 FROM z) LIMIT 1;
+}
+expect error {
+    no such column: c0
+}
+
+test orderby_rowid_truncation_checks_in_subquery_table_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY rowid, d IN (SELECT 1 FROM nosuch);
+}
+expect error {
+    no such table: nosuch
+}
+
+test orderby_rowid_truncation_checks_nested_cte_column_names {
+    CREATE TABLE x(a, b);
+    INSERT INTO x(a) VALUES (1);
+    CREATE TABLE z(q INTEGER, p INTEGER);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d INTEGER);
+    UPDATE x SET b = 1
+    WHERE 1 OR (
+        SELECT d FROM y
+        ORDER BY id, MAX(0, d, EXISTS (
+            WITH c AS (SELECT * FROM z WHERE p)
+            SELECT DISTINCT c0 FROM c WHERE c0 ORDER BY c0
+        ))
+        LIMIT 1
+    )
+    RETURNING a, b;
+}
+expect error {
+    no such column: c0
+}
+
+test orderby_single_row_aggregate_checks_subquery_column_names {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT count(*) FROM y ORDER BY (SELECT c0 FROM z);
+}
+expect error {
+    no such column: c0
+}
+
+test orderby_rowid_truncation_checks_subquery_function_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY id, (SELECT nosuchfn(d));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test orderby_rowid_truncation_checks_function_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY id, nosuchfn(1);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test orderby_rowid_truncation_checks_function_argument_counts {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY id, (SELECT abs(1, 2, 3));
+}
+expect error {
+    wrong number of arguments to function abs\(\)
+}
+
+test orderby_single_row_aggregate_checks_function_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT count(*) FROM y ORDER BY nosuchfn(1);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test exists_orderby_checks_function_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 2);
+    SELECT EXISTS (SELECT 1 FROM y ORDER BY nosuchfn(d));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test exists_orderby_checks_function_argument_counts {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 2);
+    SELECT EXISTS (SELECT 1 FROM y ORDER BY abs(d, 1));
+}
+expect error {
+    wrong number of arguments to function abs\(\)
+}
+
+test exists_orderby_ignores_unknown_collation {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 2);
+    SELECT EXISTS (SELECT 1 FROM y ORDER BY d COLLATE bogus);
+}
+expect {
+    1
+}
+
+test orderby_rowid_truncation_checks_collation_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 2);
+    SELECT d FROM y ORDER BY id, d COLLATE bogus;
+}
+expect error {
+    no such collation sequence: bogus
+}
+
+test orderby_rowid_truncation_checks_collation_names_under_operator {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 2);
+    SELECT d FROM y ORDER BY id, (d COLLATE bogus) + 1;
+}
+expect error {
+    no such collation sequence: bogus
+}
+
+test orderby_single_row_aggregate_checks_collation_names {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 2);
+    SELECT count(*) FROM y ORDER BY d COLLATE bogus;
+}
+expect error {
+    no such collation sequence: bogus
+}
+
+test orderby_rowid_truncation_checks_aggregate_in_subquery_where {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q = max(y.d));
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+test orderby_single_row_aggregate_checks_aggregate_in_subquery_where {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT count(*) FROM y ORDER BY (SELECT q FROM z WHERE q = max(y.d));
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+# Terms after a rowid first term never change the order, so they get no code,
+# even a compound subquery that Turso cannot run as a scalar subquery.
+@cross-check-integrity
+test orderby_rowid_truncation_cuts_compound_subquery {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT d FROM y ORDER BY id, (SELECT 1 UNION ALL SELECT 2);
+    UPDATE y SET d = 7 WHERE id IN (SELECT id FROM y ORDER BY id, (SELECT 1 UNION ALL SELECT 2));
+    SELECT d FROM y;
+}
+expect {
+    5
+    6
+    7
+    7
+}
+
+# SQLite reports these errors only while generating code, which removed terms never
+# get.
+@cross-check-integrity
+test orderby_removed_term_ignores_errors_sqlite_reports_while_generating_code {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT count(*) FROM y ORDER BY (SELECT group_concat(DISTINCT q, ',') FROM z);
+    SELECT count(*) FROM y ORDER BY (SELECT value FROM json_each(1, 2, 3));
+    SELECT count(*) FROM y ORDER BY (SELECT value FROM generate_series(1, 2, 3, 4, 5));
+    SELECT d FROM y ORDER BY id, (SELECT group_concat(DISTINCT q, d) FROM z);
+    SELECT d FROM y ORDER BY id, (SELECT group_concat(DISTINCT q, ',') FROM z WHERE q = d);
+    SELECT d FROM y ORDER BY id, (SELECT value FROM json_each(d, 2, 3));
+}
+expect {
+    1
+    1
+    1
+    5
+    5
+    5
+}
+
+# Each nested subquery's ORDER BY terms after the rowid are checked by planning
+# their subqueries once, so preparing the statement takes time linear in the nesting.
+@cross-check-integrity
+test orderby_terms_after_rowid_in_nested_subqueries_are_planned_once {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, (SELECT d FROM y ORDER BY id, 1))))))))))))))))))))));
+    SELECT (SELECT d FROM y AS t11 ORDER BY t11.id, (SELECT (SELECT d FROM y AS t10 ORDER BY t10.id, (SELECT (SELECT d FROM y AS t9 ORDER BY t9.id, (SELECT (SELECT d FROM y AS t8 ORDER BY t8.id, (SELECT (SELECT d FROM y AS t7 ORDER BY t7.id, (SELECT (SELECT d FROM y AS t6 ORDER BY t6.id, (SELECT (SELECT d FROM y AS t5 ORDER BY t5.id, (SELECT (SELECT d FROM y AS t4 ORDER BY t4.id, (SELECT (SELECT d FROM y AS t3 ORDER BY t3.id, (SELECT (SELECT d FROM y AS t2 ORDER BY t2.id, (SELECT (SELECT d FROM y AS t1 ORDER BY t1.id, (SELECT (SELECT d FROM y AS t0 ORDER BY t0.id, (SELECT 1 WHERE t0.d), (SELECT d FROM y)) WHERE t1.d), (SELECT d FROM y)) WHERE t2.d), (SELECT d FROM y)) WHERE t3.d), (SELECT d FROM y)) WHERE t4.d), (SELECT d FROM y)) WHERE t5.d), (SELECT d FROM y)) WHERE t6.d), (SELECT d FROM y)) WHERE t7.d), (SELECT d FROM y)) WHERE t8.d), (SELECT d FROM y)) WHERE t9.d), (SELECT d FROM y)) WHERE t10.d), (SELECT d FROM y)) WHERE t11.d), (SELECT d FROM y));
+}
+expect {
+    5
+    5
+}
+
+@cross-check-integrity
+test orderby_cut_term_in_checked_subquery_reports_name_error {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    CREATE TABLE w(id INTEGER PRIMARY KEY, e);
+    CREATE TABLE z(q, p);
+    SELECT d FROM y ORDER BY id, (SELECT e FROM w ORDER BY w.id, (SELECT q FROM z), (SELECT c0 FROM z));
+}
+expect error {
+    no such column: c0
+}
+
+@cross-check-integrity
+test orderby_removed_term_ignores_wrong_column_count_in_subquery_that_reads_the_table {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q = y.d AND q IN (SELECT 1, 2));
+    SELECT d FROM y ORDER BY id, (SELECT (SELECT q FROM z WHERE q = y.d AND q IN (SELECT 1, 2)));
+    SELECT count(*) FROM y ORDER BY (SELECT q FROM z WHERE q IN (SELECT 1, 2));
+}
+expect {
+    5
+    6
+    5
+    6
+    2
+}
+
+@cross-check-integrity
+test orderby_rowid_truncation_cuts_terms_that_read_the_table {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT d FROM y ORDER BY id, d IN (SELECT 1, 2);
+    SELECT d FROM y ORDER BY id, (SELECT q, p FROM z WHERE q = y.d);
+    SELECT d FROM y ORDER BY id DESC, (SELECT 1), random();
+}
+expect {
+    5
+    6
+    5
+    6
+    6
+    5
+}
+
+# A GROUP BY term that names a result column by number or alias may read the
+# outer query's columns through it.
+@cross-check-integrity
+test orderby_removed_term_subquery_groups_by_result_column_of_outer_column {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (5, 1);
+    SELECT d FROM y ORDER BY id, (SELECT d FROM z GROUP BY 1);
+    SELECT d FROM y ORDER BY id, (SELECT d AS k FROM z GROUP BY k);
+    SELECT count(*) FROM y ORDER BY (SELECT d FROM z GROUP BY 1);
+}
+expect {
+    5
+    6
+    5
+    6
+    2
+}
+
+# SQLite reports most wrong column counts only while generating code, so a subquery
+# with one in a removed ORDER BY term is accepted.
+@cross-check-integrity
+test orderby_removed_term_subquery_with_wrong_column_count {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (5, 1);
+    SELECT d FROM y ORDER BY id, (SELECT (1, 2) FROM z WHERE q = y.d);
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q = y.d ORDER BY (1, 2));
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q = y.d GROUP BY (1, 2));
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q = y.d LIMIT (1, 2));
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE y.d IN (SELECT q, p FROM z));
+    SELECT d FROM y ORDER BY id, (SELECT q FROM z WHERE q = y.d AND 1 IN ((1, 2)));
+    SELECT count(*) FROM y ORDER BY (SELECT (1, 2) FROM z);
+    SELECT count(*) FROM y ORDER BY (SELECT q FROM z WHERE q IN (SELECT (1, 2) FROM z));
+}
+expect {
+    5
+    6
+    5
+    6
+    5
+    6
+    5
+    6
+    5
+    6
+    5
+    6
+    2
+    2
+}
+
+test orderby_removed_term_subquery_with_wrong_in_list_row_size {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT count(*) FROM y ORDER BY (SELECT 1 FROM z WHERE (q, p) IN ((1, 2, 3)));
+}
+expect error {
+    element has 3 terms - expected 2
+}
+
+test orderby_after_rowid_subquery_with_wrong_in_list_row_size {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    SELECT d FROM y ORDER BY id, (SELECT 1 FROM z WHERE (q, p) IN ((1, 2, 3)) AND p = y.d);
+}
+expect error {
+    element has 3 terms - expected 2
+}
+
+test where_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y WHERE 0 AND max(d);
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+test delete_where_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    DELETE FROM y WHERE 0 AND max(d);
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+test update_where_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    UPDATE y SET d = 1 WHERE 0 AND count(*);
+}
+expect error {
+    misuse of aggregate function count\(\)
+}
+
+test where_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT d FROM y WHERE 0 AND nosuchfn(d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test delete_where_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    DELETE FROM y WHERE 1 OR nosuchfn(d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test update_where_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR nosuchfn(d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test update_where_checks_function_argument_counts_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR abs(1, 2);
+}
+expect error {
+    wrong number of arguments to function abs\(\)
+}
+
+test update_where_checks_coalesce_argument_count_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR coalesce(d);
+}
+expect error {
+    wrong number of arguments to function coalesce\(\)
+}
+
+test update_where_checks_iif_argument_count_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR iif(d);
+}
+expect error {
+    wrong number of arguments to function iif\(\)
+}
+
+test join_on_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR nosuchfn(w.d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test left_join_on_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y LEFT JOIN y AS w ON 0 AND nosuchfn(w.d);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test join_on_checks_function_argument_counts_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR abs(1, 2);
+}
+expect error {
+    wrong number of arguments to function abs\(\)
+}
+
+test join_on_rejects_aggregate_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 0 AND max(w.d);
+}
+expect error {
+    misuse of aggregate function max\(\)
+}
+
+test update_from_join_on_checks_function_names_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 3 FROM y AS a JOIN y AS b ON 1 OR nosuchfn(b.d) WHERE a.id = y.id;
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test where_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR row_number() OVER ();
+}
+expect error {
+    misuse of window function row_number\(\)
+}
+
+test update_where_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 1 WHERE 1 OR sum(d) OVER ();
+}
+expect error {
+    misuse of window function sum\(\)
+}
+
+test join_on_rejects_window_function_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR sum(w.d) OVER ();
+}
+expect error {
+    misuse of window function sum\(\)
+}
+
+test where_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR lag(d);
+}
+expect error {
+    misuse of window function lag\(\)
+}
+
+test update_where_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    UPDATE y SET d = 2 WHERE 1 OR row_number();
+}
+expect error {
+    misuse of window function row_number\(\)
+}
+
+test join_on_rejects_window_only_function_without_over_in_term_without_code {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT * FROM y JOIN y AS w ON 1 OR ntile(2);
+}
+expect error {
+    misuse of window function ntile\(\)
+}
+
+@cross-check-integrity
+test where_subquery_allows_window_function {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR (SELECT sum(d) OVER ());
+}
+expect {
+    5
+}
+
+test where_checks_function_names_in_exists_result_columns {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR EXISTS (SELECT nosuchfn(1));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test result_column_checks_function_names_in_exists_result_columns {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT EXISTS (SELECT nosuchfn(1));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+# SQLite checks a named window only where a function uses it, and a CTE only
+# where a FROM clause reads it.
+@cross-check-integrity
+test where_subquery_ignores_unused_window_and_cte {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE d > (SELECT 1 FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+    SELECT d FROM y WHERE 1 OR (WITH c AS (SELECT nosuchfn(1)) SELECT 1);
+    SELECT d FROM y ORDER BY id, (SELECT 1 FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+    SELECT 1 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (PARTITION BY nosuchcol);
+}
+expect {
+    5
+    5
+    1
+}
+
+test select_checks_window_used_through_another_window {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    SELECT count(*) OVER w2 FROM y WINDOW w AS (ORDER BY nosuchfn(d)), w2 AS (w);
+}
+expect error {
+    no such function: nosuchfn
+}
+
+test where_subquery_checks_used_window {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5);
+    SELECT d FROM y WHERE 1 OR (SELECT sum(q) OVER w FROM z WINDOW w AS (ORDER BY nosuchfn(q)));
+}
+expect error {
+    no such function: nosuchfn
+}
+
+# The WHERE of an aggregate query may use an aggregate of an outer query.
+@cross-check-integrity
+test where_of_aggregate_subquery_uses_outer_aggregate {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (5, 1), (6, 2);
+    SELECT d FROM y ORDER BY id, (SELECT count(*) FROM z WHERE q = max(y.d));
+    SELECT max(d) FROM y ORDER BY (SELECT count(*) FROM z WHERE q = max(y.d));
+}
+expect {
+    5
+    6
+    6
+}
+
+# An aggregate of the outer query inside a removed term does not make the
+# query, or the query around it, an aggregate query.
+@cross-check-integrity
+test orderby_rowid_truncation_drops_aggregate_in_subquery {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (1, 1), (2, 2);
+    SELECT d FROM y ORDER BY id, (SELECT max(d) FROM z);
+    SELECT q, (SELECT d FROM y WHERE id = z.q ORDER BY id, (SELECT max(d) FROM z)) FROM z;
+    SELECT d FROM y ORDER BY id, EXISTS (SELECT 1 FROM z WHERE z.q = y.d);
+}
+expect {
+    5
+    6
+    1|5
+    2|6
+    5
+    6
+}
+
+# Subqueries in ORDER BY can use the aliases of the result columns.
+@cross-check-integrity
+test orderby_removed_term_subquery_uses_result_column_alias {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (1, 2);
+    SELECT d AS xx FROM y ORDER BY id, (SELECT xx FROM z);
+    SELECT d AS xx FROM y ORDER BY id, (SELECT q FROM z WHERE q = xx);
+    SELECT sum(d) AS s FROM y ORDER BY (SELECT s);
+    SELECT count(*) AS cc FROM y ORDER BY (SELECT cc FROM z);
+}
+expect {
+    5
+    6
+    5
+    6
+    11
+    2
+}
+
 # Unary-plus on integer literals should still resolve as column index
 # references, matching SQLite behavior.
 # Fixes select1-4.9.2 in sqlite/conformance/upstream/all.test.
@@ -437,4 +1069,27 @@ expect {
     1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
     2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
     16|0|0|USE SORTER FOR ORDER BY
+}
+
+@skip-if sqlite "SQLite has no WITHIN GROUP syntax for percentile_disc and percentile_cont"
+test ordered_set_aggregates_in_where_and_order_by {
+    CREATE TABLE z(q, p);
+    CREATE TABLE y(id INTEGER PRIMARY KEY, d);
+    INSERT INTO y VALUES (1, 5), (2, 6);
+    INSERT INTO z VALUES (5, 1), (6, 2);
+    SELECT d FROM y WHERE d > (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT d FROM y WHERE d IN (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT d FROM y WHERE EXISTS (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    UPDATE y SET d = 9 WHERE d > (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY d) FROM y ORDER BY percentile_disc(0.5) WITHIN GROUP (ORDER BY d);
+    SELECT d FROM y ORDER BY id, (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY q) FROM z);
+}
+expect {
+    6
+    5
+    5
+    6
+    5
+    5
+    9
 }

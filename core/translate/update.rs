@@ -531,6 +531,7 @@ fn prepare_update_plan(
         &mut read_scope_tables,
         None,
         &mut where_clause,
+        false,
         resolver,
     )?;
     append_vtab_predicates_to_where_clause(
