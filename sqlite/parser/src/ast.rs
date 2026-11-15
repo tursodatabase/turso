@@ -304,6 +304,8 @@ pub enum Stmt {
         body: InsertBody,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
+        /// Whether an `INTEGER PRIMARY KEY` that is NULL or not given takes the column DEFAULT instead of a generated rowid.
+        integer_primary_key_takes_default: bool,
     },
     /// `PRAGMA`: pragma name, body
     Pragma {

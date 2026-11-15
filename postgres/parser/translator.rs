@@ -1934,6 +1934,7 @@ impl PostgreSQLTranslator {
                 columns,
                 body: ast::InsertBody::DefaultValues,
                 returning: self.translate_returning(&insert.returning_list, relation, true)?,
+                integer_primary_key_takes_default: true,
             });
         };
 
@@ -2009,6 +2010,7 @@ impl PostgreSQLTranslator {
             columns,
             body,
             returning,
+            integer_primary_key_takes_default: true,
         })
     }
 

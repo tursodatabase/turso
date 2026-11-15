@@ -5498,6 +5498,7 @@ impl<'a> Parser<'a> {
             columns,
             body,
             returning,
+            integer_primary_key_takes_default: false,
         })
     }
 
@@ -13080,6 +13081,7 @@ mod tests {
                         limit: None,
                     }, None),
                     returning: vec![],
+                    integer_primary_key_takes_default: false,
                 })],
             ),
             (
@@ -13108,6 +13110,7 @@ mod tests {
                         limit: None,
                     }, None),
                     returning: vec![],
+                    integer_primary_key_takes_default: false,
                 })],
             ),
             (
@@ -13156,6 +13159,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    integer_primary_key_takes_default: false,
                 })],
             ),
             (
@@ -13204,6 +13208,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    integer_primary_key_takes_default: false,
                 })],
             ),
             // parse update

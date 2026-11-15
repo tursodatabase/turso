@@ -299,6 +299,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 columns: col_names.clone(),
                 body,
                 returning: returning.clone(),
+                integer_primary_key_takes_default: false,
             })
         }
         ast::TriggerCmd::Update {

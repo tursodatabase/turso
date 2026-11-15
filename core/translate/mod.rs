@@ -541,6 +541,7 @@ fn translate_statement(
             columns,
             body,
             returning,
+            integer_primary_key_takes_default,
         } => translate_insert(
             resolver,
             or_conflict,
@@ -548,6 +549,7 @@ fn translate_statement(
             columns,
             body,
             returning,
+            integer_primary_key_takes_default,
             with,
             program,
             connection,

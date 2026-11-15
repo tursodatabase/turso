@@ -568,6 +568,7 @@ impl ToTokens for Stmt {
                 columns,
                 body,
                 returning,
+                ..
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
