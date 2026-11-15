@@ -548,6 +548,59 @@ fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
     }
 }
 
+/// The stored name of the column that owns sequence `relname`, read from
+/// the catalog table.
+fn stored_relownedbycolumn(conn: &Arc<Connection>, relname: &str) -> Option<String> {
+    let rows = conn
+        .prepare(format!(
+            "SELECT relownedbycolumn FROM __turso_internal_classes WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{relname} has one class row: {rows:?}");
+    match &rows[0][0] {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str().to_string()),
+        other => panic!("relownedbycolumn is text or NULL, got {other:?}"),
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn the_catalog_stores_the_column_that_owns_a_sequence(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (id serial, other int)").unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("id")
+    );
+
+    pg.execute("ALTER TABLE t RENAME COLUMN id TO ident")
+        .unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("ident")
+    );
+
+    pg.execute("ALTER SEQUENCE t_id_seq OWNED BY t.other")
+        .unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("other")
+    );
+
+    pg.execute("ALTER TABLE t RENAME COLUMN ident TO id")
+        .unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("other")
+    );
+
+    pg.execute("ALTER SEQUENCE t_id_seq OWNED BY NONE").unwrap();
+    assert_eq!(stored_relownedbycolumn(&conn, "t_id_seq"), None);
+}
+
 #[turso_macros::test(mvcc)]
 fn grant_select_stores_the_list_in_the_file_and_it_survives_a_reopen(db: TempDatabase) {
     let pg = db.connect_postgres();

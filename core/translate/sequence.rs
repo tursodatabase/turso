@@ -11,7 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{CatalogChange, NewOwner};
+use crate::dialect::{CatalogChange, NewOwner, OwnerColumn};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -1476,7 +1476,7 @@ pub fn translate_alter_sequence_owned_by(
     let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
         bail_parse_error!("sequence \"{normalized_name}\" does not exist");
     };
-    let table = match owner {
+    let owner_column = match owner {
         Some((table_name, column)) => {
             let normalized_table = normalize_ident(table_name.name.as_str());
             // The lookup names a namespace even when no table has the name,
@@ -1495,13 +1495,15 @@ pub fn translate_alter_sequence_owned_by(
             {
                 bail_parse_error!("sequence must be in same schema as table it is linked to");
             }
-            let has_column = table.get_column(column.as_str()).is_some();
-            if !has_column {
+            let Some(column_name) = table
+                .get_column(column.as_str())
+                .and_then(|(_, column)| column.name.clone())
+            else {
                 bail_parse_error!(
                     "column \"{}\" of relation \"{normalized_table}\" does not exist",
                     column.as_str()
                 );
-            }
+            };
             let dialect = &resolver.catalog.dialect;
             let (sequence_owner, table_owner) =
                 resolver.with_schema(namespace.database_id, |schema| {
@@ -1513,7 +1515,10 @@ pub fn translate_alter_sequence_owned_by(
             if sequence_owner.is_some() && table_owner.is_some() && sequence_owner != table_owner {
                 bail_parse_error!("sequence must have same owner as table it is linked to");
             }
-            Some(normalized_table)
+            Some(OwnerColumn {
+                table: normalized_table,
+                column: column_name,
+            })
         }
         None => None,
     };
@@ -1529,7 +1534,7 @@ pub fn translate_alter_sequence_owned_by(
         &[CatalogChange::ChangeOwner {
             namespace: namespace.id,
             name: normalized_name,
-            owner: NewOwner::Table(table),
+            owner: NewOwner::Column(owner_column),
         }],
     )?;
     schema::emit_schema_cookie(resolver, program);

@@ -70,9 +70,10 @@ pub(crate) const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
 
 /// The columns the rest of this module reads and writes. `relownedby` is
 /// the oid of the table whose serial column owns the relation, 0 when no
-/// relation owns it: what PostgreSQL records in `pg_depend` as an automatic
-/// dependency, kept here until there is a `pg_depend`. `relacl` is the
-/// access control list in the text form of PostgreSQL's `aclitem[]`, NULL
+/// relation owns it, and `relownedbycolumn` is the name of that column:
+/// what PostgreSQL records in `pg_depend` as an automatic dependency, kept
+/// here until there is a `pg_depend`, NULL when no relation owns it.
+/// `relacl` is the access control list in the text form of PostgreSQL's `aclitem[]`, NULL
 /// until the first `GRANT`, when the owner has every privilege and nobody
 /// else has any. `relrowsecurity` is 1 when the table has row-level
 /// security, 0 otherwise. `relpolicies` holds the table's row-level security
@@ -86,9 +87,10 @@ const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     relownedby INTEGER NOT NULL, \
     relacl TEXT, \
     relrowsecurity INTEGER NOT NULL DEFAULT 0, \
-    relpolicies TEXT)";
+    relpolicies TEXT, \
+    relownedbycolumn TEXT)";
 
-const CLASS_COLUMN_COUNT: usize = 9;
+const CLASS_COLUMN_COUNT: usize = 10;
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
      ON __turso_internal_classes (relnamespace, relname)";
@@ -130,12 +132,23 @@ pub(crate) struct RelationClass {
     /// The oid of the table whose serial column owns this sequence; 0 when
     /// no relation owns it.
     pub(crate) relownedby: i64,
+    /// The name of the column that owns this sequence, None when no relation
+    /// owns it.
+    pub(crate) relownedbycolumn: Option<String>,
     /// The privileges `GRANT` gave, None before the first `GRANT`.
     pub(crate) relacl: Option<Acl>,
     /// Whether the table has row-level security.
     pub(crate) relrowsecurity: bool,
     /// The table's row-level security policies.
     pub(crate) relpolicies: Vec<RowPolicy>,
+}
+
+impl RelationClass {
+    fn is_owned_by_column(&self, column: &str) -> bool {
+        self.relownedbycolumn
+            .as_deref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(column))
+    }
 }
 
 /// The class rows of a database, loaded as the engine's opaque dialect
@@ -165,7 +178,7 @@ impl ClassCatalog {
 
     /// Returns a catalog of the rows read from the classes table. Each row is
     /// `(oid, relname, relnamespace, relkind, relowner, relownedby, relacl,
-    /// relrowsecurity, relpolicies)`.
+    /// relrowsecurity, relpolicies, relownedbycolumn)`.
     fn new(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
@@ -225,6 +238,7 @@ impl ClassCatalog {
                     relkind: *kind,
                     relowner: RoleId::from_stored(read_back_integer(owner)?),
                     relownedby: 0,
+                    relownedbycolumn: None,
                     relacl: None,
                     relrowsecurity: false,
                     relpolicies: Vec::new(),
@@ -236,6 +250,7 @@ impl ClassCatalog {
                     for class in self.by_oid.values_mut() {
                         if class.relownedby == dropped.oid {
                             class.relownedby = 0;
+                            class.relownedbycolumn = None;
                         }
                     }
                 }
@@ -243,18 +258,31 @@ impl ClassCatalog {
             CatalogChange::ChangeOwner {
                 namespace,
                 name,
-                owner: NewOwner::Table(table),
+                owner: NewOwner::Column(owner),
             } => {
-                let table_oid = table
+                let table_oid = owner
                     .as_ref()
-                    .and_then(|table| self.oids_by_name.get(&(*namespace, table.clone())))
+                    .and_then(|owner| self.oids_by_name.get(&(*namespace, owner.table.clone())))
                     .copied()
                     .unwrap_or(0);
                 if let Some(oid) = self.oids_by_name.get(&(*namespace, name.clone())) {
-                    self.by_oid
-                        .get_mut(oid)
-                        .expect("both maps hold the row")
-                        .relownedby = table_oid;
+                    let class = self.by_oid.get_mut(oid).expect("both maps hold the row");
+                    class.relownedby = table_oid;
+                    class.relownedbycolumn = owner.as_ref().map(|owner| owner.column.clone());
+                }
+            }
+            CatalogChange::RenameColumn {
+                namespace,
+                table,
+                old_name,
+                new_name,
+            } => {
+                if let Some(table_oid) = self.oids_by_name.get(&(*namespace, table.clone())) {
+                    for class in self.by_oid.values_mut() {
+                        if class.relownedby == *table_oid && class.is_owned_by_column(old_name) {
+                            class.relownedbycolumn = Some(new_name.clone());
+                        }
+                    }
                 }
             }
             CatalogChange::Rename {
@@ -361,7 +389,7 @@ impl ClassCatalog {
 }
 
 fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
-    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies] =
+    let [oid, relname, relnamespace, relkind, relowner, relownedby, relacl, relrowsecurity, relpolicies, relownedbycolumn] =
         row
     else {
         return Err(corrupt_row(row));
@@ -405,6 +433,11 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 }
                 _ => return Err(corrupt_row(row)),
             };
+            let relownedbycolumn = match relownedbycolumn {
+                Value::Null => None,
+                Value::Text(text) if *relownedby != 0 => Some(text.as_str().to_string()),
+                _ => return Err(corrupt_row(row)),
+            };
             Ok(RelationClass {
                 oid: *oid,
                 relname: relname.as_str().to_string(),
@@ -412,6 +445,7 @@ fn class_from_row(row: &[Value]) -> turso_core::Result<RelationClass> {
                 relkind,
                 relowner: RoleId::from_stored(*relowner),
                 relownedby: *relownedby,
+                relownedbycolumn,
                 relacl,
                 relrowsecurity: *relrowsecurity == 1,
                 relpolicies,
@@ -437,7 +471,7 @@ pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     Some(format!(
         "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, relacl, \
-         relrowsecurity, relpolicies FROM {CLASSES_TABLE_NAME}"
+         relrowsecurity, relpolicies, relownedbycolumn FROM {CLASSES_TABLE_NAME}"
     ))
 }
 
@@ -644,25 +678,79 @@ pub(crate) fn translate_catalog_changes(
                 // What the dropped relation owned, such as the sequences of
                 // a table's serial columns, stays and is nobody's now.
                 for (owned_namespace, owned_name) in owned {
-                    emit_class_row_set_owned_by(program, &cursors, owned_namespace, &owned_name, 0);
+                    emit_class_row_set_owned_by(
+                        program,
+                        &cursors,
+                        owned_namespace,
+                        &owned_name,
+                        0,
+                        None,
+                    );
                 }
                 emit_class_row_delete(program, &cursors, *namespace, name)
             }
             CatalogChange::ChangeOwner {
                 namespace,
                 name,
-                owner: NewOwner::Table(table),
+                owner: NewOwner::Column(owner),
             } => {
-                let table_oid = match table {
-                    Some(table) => class_catalog(schema)
-                        .and_then(|catalog| catalog.get_by_name(*namespace, table))
+                let table_oid = match owner {
+                    Some(owner) => class_catalog(schema)
+                        .and_then(|catalog| catalog.get_by_name(*namespace, &owner.table))
                         .map(|class| class.oid)
                         .ok_or_else(|| {
-                            LimboError::ParseError(format!("relation \"{table}\" does not exist"))
+                            LimboError::ParseError(format!(
+                                "relation \"{}\" does not exist",
+                                owner.table
+                            ))
                         })?,
                     None => 0,
                 };
-                emit_class_row_set_owned_by(program, &cursors, *namespace, name, table_oid);
+                emit_class_row_set_owned_by(
+                    program,
+                    &cursors,
+                    *namespace,
+                    name,
+                    table_oid,
+                    owner.as_ref().map(|owner| owner.column.as_str()),
+                );
+                program.emit_insn(Insn::CatalogChange {
+                    db: MAIN_DB_ID,
+                    change: Box::new(change.clone()),
+                    value_regs: vec![],
+                });
+            }
+            CatalogChange::RenameColumn {
+                namespace,
+                table,
+                old_name,
+                new_name,
+            } => {
+                let owned: Vec<(String, i64)> = class_catalog(schema)
+                    .and_then(|catalog| {
+                        let table = catalog.get_by_name(*namespace, table)?;
+                        Some(
+                            catalog
+                                .owned_by(table.oid)
+                                .filter(|owned| owned.is_owned_by_column(old_name))
+                                .map(|owned| (owned.relname.clone(), table.oid))
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or_default();
+                if owned.is_empty() {
+                    continue;
+                }
+                for (sequence, table_oid) in owned {
+                    emit_class_row_set_owned_by(
+                        program,
+                        &cursors,
+                        *namespace,
+                        &sequence,
+                        table_oid,
+                        Some(new_name),
+                    );
+                }
                 program.emit_insn(Insn::CatalogChange {
                     db: MAIN_DB_ID,
                     change: Box::new(change.clone()),
@@ -1188,7 +1276,7 @@ fn emit_class_row_insert(
     });
     program.emit_insn(Insn::Null {
         dest: first_column_reg + 8,
-        dest_end: None,
+        dest_end: Some(first_column_reg + 9),
     });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -1231,15 +1319,17 @@ fn emit_class_row_insert(
     });
 }
 
-/// Makes the table with oid `table_oid` the owner of relation `name` of
-/// `namespace`, its `relownedby`; 0 makes the relation nobody's. The
-/// caller tells the in-memory catalog.
+/// Makes column `column` of the table with oid `table_oid` the owner of
+/// relation `name` of `namespace`: its `relownedby` and `relownedbycolumn`.
+/// 0 and None make the relation nobody's. The caller tells the in-memory
+/// catalog.
 fn emit_class_row_set_owned_by(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
     namespace: NamespaceId,
     name: &str,
     table_oid: i64,
+    column: Option<&str>,
 ) {
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
@@ -1252,6 +1342,10 @@ fn emit_class_row_set_owned_by(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            match column {
+                Some(column) => ClassRecordColumn::Literal(column.to_string()),
+                None => ClassRecordColumn::Null,
+            },
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1305,6 +1399,7 @@ fn emit_class_row_rename(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relownedbycolumn_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1347,6 +1442,7 @@ fn emit_class_row_set_owner(
             ClassRecordColumn::Register(acl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relownedbycolumn_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1383,6 +1479,7 @@ fn emit_class_row_set_acl(
             ClassRecordColumn::Register(acl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relownedbycolumn_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1416,6 +1513,7 @@ fn emit_class_row_set_row_security(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::LiteralInt(i64::from(*enabled)),
             ClassRecordColumn::Register(row.relpolicies_reg),
+            ClassRecordColumn::Register(row.relownedbycolumn_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1458,6 +1556,7 @@ fn emit_class_row_set_policies(
             ClassRecordColumn::Register(row.relacl_reg),
             ClassRecordColumn::Register(row.relrowsecurity_reg),
             ClassRecordColumn::Register(policies_reg),
+            ClassRecordColumn::Register(row.relownedbycolumn_reg),
         );
         emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
     });
@@ -1492,6 +1591,7 @@ struct FoundClassRow {
     relacl_reg: usize,
     relrowsecurity_reg: usize,
     relpolicies_reg: usize,
+    relownedbycolumn_reg: usize,
 }
 
 /// Scans the classes table for the row of relation `name` of `namespace` and
@@ -1547,6 +1647,7 @@ fn emit_find_class_row(
         relacl_reg: program.alloc_register(),
         relrowsecurity_reg: program.alloc_register(),
         relpolicies_reg: program.alloc_register(),
+        relownedbycolumn_reg: program.alloc_register(),
     };
     program.emit_insn(Insn::RowId {
         cursor_id: cursors.table_cursor_id,
@@ -1558,6 +1659,7 @@ fn emit_find_class_row(
     program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 7, row.relrowsecurity_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 8, row.relpolicies_reg);
+    program.emit_column_or_rowid(cursors.table_cursor_id, 9, row.relownedbycolumn_reg);
     found(program, &row);
     program.emit_insn(Insn::Goto { target_pc: done });
 
@@ -1576,12 +1678,13 @@ fn emit_find_class_row(
 enum ClassRecordColumn {
     Literal(String),
     LiteralInt(i64),
+    Null,
     Register(usize),
 }
 
 /// Builds a class record `(NULL, relname, relnamespace, relkind, relowner,
-/// relownedby, relacl, relrowsecurity, relpolicies)` and returns its
-/// register.
+/// relownedby, relacl, relrowsecurity, relpolicies, relownedbycolumn)` and
+/// returns its register.
 #[allow(clippy::too_many_arguments)]
 fn emit_class_record(
     program: &mut ProgramBuilder,
@@ -1593,6 +1696,7 @@ fn emit_class_record(
     relacl: ClassRecordColumn,
     relrowsecurity: ClassRecordColumn,
     relpolicies: ClassRecordColumn,
+    relownedbycolumn: ClassRecordColumn,
 ) -> usize {
     let first_column_reg = program.alloc_registers(CLASS_COLUMN_COUNT);
     program.emit_insn(Insn::Null {
@@ -1608,6 +1712,7 @@ fn emit_class_record(
         relacl,
         relrowsecurity,
         relpolicies,
+        relownedbycolumn,
     ]
     .into_iter()
     .enumerate()
@@ -1619,6 +1724,12 @@ fn emit_class_record(
             }
             ClassRecordColumn::LiteralInt(value) => {
                 program.emit_insn(Insn::Integer { value, dest });
+            }
+            ClassRecordColumn::Null => {
+                program.emit_insn(Insn::Null {
+                    dest,
+                    dest_end: None,
+                });
             }
             ClassRecordColumn::Register(src_reg) => {
                 program.emit_insn(Insn::Copy {

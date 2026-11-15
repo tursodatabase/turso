@@ -2503,6 +2503,22 @@ pub fn translate_alter_table(
                 )?;
             }
 
+            if col_name != old_column_name
+                && schema::dialect_relation_hooks_apply(connection, database_id)?
+            {
+                resolver.catalog.dialect.translate_catalog_changes(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    &[CatalogChange::RenameColumn {
+                        namespace: namespace.id,
+                        table: normalize_ident(table_name),
+                        old_name: old_column_name.to_string(),
+                        new_name: col_name.to_string(),
+                    }],
+                )?;
+            }
+
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::SchemaVersion,
