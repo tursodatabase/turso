@@ -10927,15 +10927,13 @@ mod tests {
         },
     };
 
-    use tempfile::TempDir;
-
     use crate::{
         storage::{
             btree::{compute_free_space, fill_cell_payload, payload_overflow_threshold_max},
             sqlite3_ondisk::{BTreeCell, PageContent, PageType, TableLeafCell},
         },
         types::Value,
-        Database, Page, Pager, PlatformIO,
+        Database, Page, Pager,
     };
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
@@ -11014,25 +11012,6 @@ mod tests {
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
-    }
-
-    /// The returned `TempDir` deletes the database directory when it drops, so
-    /// callers must hold it for as long as they use the database.
-    #[allow(clippy::arc_with_non_send_sync)]
-    fn get_database() -> (Arc<Database>, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("test.db");
-        {
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .pragma_update(None, "journal_mode", "wal")
-                .unwrap();
-        }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
-            .unwrap();
-
-        (db, temp_dir)
     }
 
     /// Deterministic coverage for the allocation-failure window created by routing
@@ -11453,7 +11432,7 @@ mod tests {
         pos: usize,
         page: PageRef,
         record: ImmutableRecord,
-        conn: &Arc<Connection>,
+        pager: &Arc<Pager>,
     ) -> crate::alloc::Vec<u8> {
         let mut payload: crate::alloc::Vec<u8> = crate::alloc::vec![];
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
@@ -11466,11 +11445,11 @@ mod tests {
                     pos,
                     &record,
                     4096,
-                    &conn.pager.load(),
+                    pager,
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.load().clone(),
+            pager,
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, pos, 4096).unwrap();
@@ -11510,16 +11489,13 @@ mod tests {
 
     #[test]
     fn test_insert_cell() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
         let page = get_page(2);
 
         let header_size = 8;
         let regs = &[Register::Value(Value::from_i64(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(1, 0, page.clone(), record, &conn);
+        let payload = add_record(1, 0, page.clone(), record, &pager);
         let page_contents = page.get_contents();
         assert_eq!(page_contents.cell_count(), 1);
         let free = compute_free_space(page_contents, 4096).unwrap();
@@ -11549,10 +11525,7 @@ mod tests {
 
     #[test]
     fn test_drop_1() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -11565,7 +11538,7 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -11759,7 +11732,53 @@ mod tests {
         }
     }
 
-    fn empty_btree() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
+    fn empty_btree() -> (Arc<Pager>, i64) {
+        let pager = pager_of_new_database();
+        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
+        (pager, page2.get().id() as i64)
+    }
+
+    /// A pager whose database holds only page 1.
+    fn pager_of_new_database() -> Arc<Pager> {
+        let pager = empty_pager(4096, PageCache::default());
+        run_until_done(|| pager.allocate_page1(), &pager).unwrap();
+        pager
+    }
+
+    /// A pager over an empty in-memory database file, opened without a `Database`.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn empty_pager(page_size: u32, page_cache: PageCache) -> Arc<Pager> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+
+        let db_file = Arc::new(DatabaseFile::new(
+            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
+        ));
+
+        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
+        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
+            io.clone(),
+            wal_shared,
+            last_checksum_and_max_frame,
+            buffer_pool.clone(),
+        ));
+
+        // `allocate_page1` needs the initial page 1 to be present.
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
+        let pager =
+            Arc::new(Pager::new(db_file, Some(wal), io, page_cache, buffer_pool, shared).unwrap());
+
+        pager.io.step().unwrap();
+        pager
+            .set_initial_page_size(PageSize::new(page_size).unwrap())
+            .unwrap();
+        pager
+    }
+
+    fn empty_btree_in_database() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
@@ -11790,7 +11809,7 @@ mod tests {
 
     #[test]
     fn exact_table_seek_uses_loaded_leaf_after_page_descent() {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
         let registers = &[Register::Value(Value::Text(Text::new("x".repeat(128))))];
         let record = ImmutableRecord::from_registers(registers, registers.len()).unwrap();
@@ -11917,13 +11936,7 @@ mod tests {
 
     #[test]
     fn btree_with_virtual_page_1() -> Result<()> {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let pager = conn.pager.load().clone();
+        let pager = empty_pager(4096, PageCache::default());
 
         let mut cursor = BTreeCursor::new(pager, 1, 5);
         let result = cursor.rewind()?;
@@ -11939,7 +11952,7 @@ mod tests {
     #[test]
     pub fn btree_test_overflow_pages_are_cleared_on_overwrite() {
         // Create a database with a table
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
 
         // Get the maximum local payload size for table leaf pages
@@ -12111,7 +12124,7 @@ mod tests {
             ]
             .as_slice(),
         ] {
-            let (pager, root_page, _, _) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let num_columns = 5;
 
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -12179,7 +12192,7 @@ mod tests {
         let num_columns = 5;
 
         for _ in 0..attempts {
-            let (pager, root_page, _db, conn) = empty_btree();
+            let (pager, root_page, _db, conn) = empty_btree_in_database();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
@@ -12305,7 +12318,7 @@ mod tests {
         let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
-            let (pager, _, _db, conn) = empty_btree();
+            let (pager, _, _db, conn) = empty_btree_in_database();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12482,7 +12495,7 @@ mod tests {
         tracing::info!("super seed: {}", seed);
 
         for _ in 0..attempts {
-            let (pager, _, _db, conn) = empty_btree();
+            let (pager, _, _db, conn) = empty_btree_in_database();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12718,10 +12731,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_odd() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -12735,7 +12745,7 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -12765,10 +12775,7 @@ mod tests {
 
     #[test]
     fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
         let usable_space = 4096;
         let mut rng = ChaCha8Rng::seed_from_u64(1700);
         let mut predicted_no_balancing = 0;
@@ -12792,7 +12799,7 @@ mod tests {
                     page_contents.cell_count(),
                     page.clone(),
                     record,
-                    &conn,
+                    &pager,
                 );
                 rowid += 1;
             }
@@ -12893,7 +12900,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         tracing::info!("seed: {seed}");
         for attempt in 0..8 {
-            let (pager, _, _db, conn) = empty_btree();
+            let (pager, _, _db, conn) = empty_btree_in_database();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -13088,46 +13095,8 @@ mod tests {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn setup_test_env(database_size: u32) -> Arc<Pager> {
-        let page_size = 512;
-
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let buffer_pool = BufferPool::begin_init(&io, page_size * 128);
-
-        let db_file = Arc::new(DatabaseFile::new(
-            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
-        ));
-
-        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
-        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
-        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            last_checksum_and_max_frame,
-            buffer_pool.clone(),
-        ));
-
-        // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
-        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
-        let pager = Arc::new(
-            Pager::new(
-                db_file,
-                Some(wal),
-                io,
-                PageCache::new(10),
-                buffer_pool,
-                shared,
-            )
-            .unwrap(),
-        );
-
-        pager.io.step().unwrap();
-
-        pager
-            .set_initial_page_size(PageSize::new(page_size as u32).unwrap())
-            .unwrap();
+        let pager = empty_pager(512, PageCache::new(10));
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         for _ in 0..(database_size - 1) {
             let _res = pager.allocate_page().unwrap();
@@ -13329,7 +13298,7 @@ mod tests {
     /// equals the true cell count.
     #[test]
     fn count_survives_spill_yield_at_finalization() {
-        let (pager, root_page, _db, _conn) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let n: u16 = 7;
 
         // `count()` only reads cell_count from the header; no real cells needed.
@@ -13355,7 +13324,7 @@ mod tests {
     /// Regression test for https://github.com/tursodatabase/turso/issues/7473.
     #[test]
     fn table_leaf_oversized_cell_count_reads_corrupt_not_panic() {
-        let (pager, root_page, _db, _conn) = empty_btree();
+        let (pager, root_page) = empty_btree();
 
         let (root, _c) = pager.io.block(|| pager.read_page(root_page)).unwrap();
         while root.is_locked() {
@@ -13520,7 +13489,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_with_single_page() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 10;
 
@@ -13545,7 +13514,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_with_multiple_pages() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 1000;
 
@@ -13571,7 +13540,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_reinsertion() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 1000;
 
@@ -13618,7 +13587,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_multiple_cursors() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 1000;
 
@@ -13660,7 +13629,7 @@ mod tests {
     /// dup cursor returns the previous partition's row count.
     #[test]
     pub fn test_clear_btree_resets_count_cache() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
 
         let mut cursor_main = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -13698,7 +13667,7 @@ mod tests {
     /// Verify that clear_btree() resets its own count cache, not just sibling cursors.
     #[test]
     pub fn test_clear_btree_resets_own_count_cache() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
 
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -13730,7 +13699,7 @@ mod tests {
     /// re-traverses the btree instead of returning the stale cached value.
     #[test]
     pub fn test_insert_invalidates_count_cache() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
 
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
@@ -13761,7 +13730,7 @@ mod tests {
     /// pages and reads left-child pointers accurately.
     #[test]
     pub fn test_btree_count_multi_level_table() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 1;
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
@@ -13795,7 +13764,7 @@ mod tests {
 
     #[test]
     pub fn test_clear_btree_with_overflow_pages() -> Result<()> {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
         let record_count = 100;
 
@@ -13826,10 +13795,7 @@ mod tests {
 
     #[test]
     pub fn test_defragment() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -13842,7 +13808,7 @@ mod tests {
         for i in 0..3 {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -13869,10 +13835,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_odd_with_defragment() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -13886,7 +13849,7 @@ mod tests {
         for i in 0..total_cells {
             let regs = &[Register::Value(Value::from_i64(i as i64))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(i, i, page.clone(), record, &conn);
+            let payload = add_record(i, i, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), i + 1);
             let free = compute_free_space(page_contents, usable_space).unwrap();
             total_size += payload.len() + 2;
@@ -13918,10 +13881,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_drop_defragment_insert() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -13955,11 +13915,11 @@ mod tests {
                                 cell_idx,
                                 &record,
                                 4096,
-                                &conn.pager.load(),
+                                &pager,
                                 &mut fill_cell_payload_state,
                             )
                         },
-                        &conn.pager.load().clone(),
+                        &pager,
                     )
                     .unwrap();
                     if (free as usize) < payload.len() + 2 {
@@ -14004,10 +13964,7 @@ mod tests {
     pub fn test_fuzz_drop_defragment_insert_issue_1085() {
         // This test is used to demonstrate that issue at https://github.com/tursodatabase/turso/issues/1085
         // is FIXED.
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14040,11 +13997,11 @@ mod tests {
                                     cell_idx,
                                     &record,
                                     4096,
-                                    &conn.pager.load(),
+                                    &pager,
                                     &mut fill_cell_payload_state,
                                 )
                             },
-                            &conn.pager.load().clone(),
+                            &pager,
                         )
                         .unwrap();
                         if (free as usize) < payload.len() - 2 {
@@ -14079,10 +14036,7 @@ mod tests {
 
     #[test]
     pub fn test_free_space() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
         let page = get_page(2);
 
         let page_contents = page.get_contents();
@@ -14091,7 +14045,7 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
         let free = compute_free_space(page_contents, usable_space).unwrap();
         assert_eq!(free, 4096 - payload.len() - 2 - header_size);
     }
@@ -14140,10 +14094,7 @@ mod tests {
 
     #[test]
     pub fn test_defragment_1() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14152,7 +14103,7 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
 
         assert_eq!(page_contents.cell_count(), 1);
         defragment_page(page_contents, usable_space, 4).unwrap();
@@ -14164,10 +14115,7 @@ mod tests {
 
     #[test]
     pub fn test_insert_drop_insert() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14179,7 +14127,7 @@ mod tests {
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
 
         assert_eq!(page_contents.cell_count(), 1);
         drop_cell(page_contents, 0, usable_space).unwrap();
@@ -14187,7 +14135,7 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
         assert_eq!(page_contents.cell_count(), 1);
 
         let (start, len) = page_contents.cell_get_raw_region(0, usable_space).unwrap();
@@ -14197,10 +14145,7 @@ mod tests {
 
     #[test]
     pub fn test_insert_drop_insert_multiple() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14212,7 +14157,7 @@ mod tests {
             Register::Value(Value::Text(Text::new("aaaaaaaa"))),
         ];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
 
         for _ in 0..100 {
             assert_eq!(page_contents.cell_count(), 1);
@@ -14221,7 +14166,7 @@ mod tests {
 
             let regs = &[Register::Value(Value::from_i64(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let payload = add_record(0, 0, page.clone(), record, &conn);
+            let payload = add_record(0, 0, page.clone(), record, &pager);
             assert_eq!(page_contents.cell_count(), 1);
 
             let (start, len) = page_contents.cell_get_raw_region(0, usable_space).unwrap();
@@ -14232,10 +14177,7 @@ mod tests {
 
     #[test]
     pub fn test_drop_a_few_insert() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14244,13 +14186,13 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let payload = add_record(0, 0, page.clone(), record, &conn);
+        let payload = add_record(0, 0, page.clone(), record, &pager);
         let regs = &[Register::Value(Value::from_i64(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(1, 1, page.clone(), record, &conn);
+        let _ = add_record(1, 1, page.clone(), record, &pager);
         let regs = &[Register::Value(Value::from_i64(2))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(2, 2, page.clone(), record, &conn);
+        let _ = add_record(2, 2, page.clone(), record, &pager);
 
         drop_cell(page_contents, 1, usable_space).unwrap();
         drop_cell(page_contents, 1, usable_space).unwrap();
@@ -14260,10 +14202,7 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_1() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
 
@@ -14272,39 +14211,36 @@ mod tests {
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 0, page.clone(), record, &conn);
+        let _ = add_record(0, 0, page.clone(), record, &pager);
         drop_cell(page_contents, 0, usable_space).unwrap();
 
         defragment_page(page_contents, usable_space, 4).unwrap();
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 1, page.clone(), record, &conn);
+        let _ = add_record(0, 1, page.clone(), record, &pager);
 
         drop_cell(page_contents, 0, usable_space).unwrap();
 
         let regs = &[Register::Value(Value::from_i64(0))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-        let _ = add_record(0, 1, page.clone(), record, &conn);
+        let _ = add_record(0, 1, page.clone(), record, &pager);
     }
 
     #[test]
     pub fn test_fuzz_victim_2() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
             let regs = &[Register::Value(Value::from_i64(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let _ = add_record(0, pos, page, record, &conn);
+            let _ = add_record(0, pos, page, record, &pager);
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -14337,17 +14273,14 @@ mod tests {
 
     #[test]
     pub fn test_fuzz_victim_3() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
         let usable_space = 4096;
         let insert = |pos, page| {
             let regs = &[Register::Value(Value::from_i64(0))];
             let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
-            let _ = add_record(0, pos, page, record, &conn);
+            let _ = add_record(0, pos, page, record, &pager);
         };
         let drop = |pos, page| {
             drop_cell(page, pos, usable_space).unwrap();
@@ -14368,11 +14301,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    &conn.pager.load(),
+                    &pager,
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.load().clone(),
+            &pager,
         )
         .unwrap();
 
@@ -14394,7 +14327,7 @@ mod tests {
 
     #[test]
     pub fn btree_insert_sequential() {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut keys = Vec::new();
         let num_columns = 5;
 
@@ -14436,10 +14369,7 @@ mod tests {
 
     #[test]
     pub fn test_big_payload_compute_free() {
-        let (db, _temp_dir) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let pager = pager_of_new_database();
 
         let page = get_page(2);
         let usable_space = 4096;
@@ -14456,11 +14386,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    &conn.pager.load(),
+                    &pager,
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.load().clone(),
+            &pager,
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, 0, 4096).unwrap();
@@ -14509,7 +14439,7 @@ mod tests {
     /// leaf, so the cursor is re-seeked onto row 3 and told that its next
     /// next() must stay there.
     fn three_rows_with_middle_deleted() -> (Arc<Pager>, i64, BTreeCursor) {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
         for rowid in 1..=3 {
             insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
@@ -14567,7 +14497,7 @@ mod tests {
         for n in [1i64, 2, 3, 10, 200] {
             for large in [false, true] {
                 for target in ["min", "max", "mid", "drain"] {
-                    let (pager, root_page, _, _) = empty_btree();
+                    let (pager, root_page) = empty_btree();
                     let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
                     for rowid in 1..=n {
                         let v = if large {
@@ -14615,7 +14545,7 @@ mod tests {
 
     #[test]
     fn seek_after_delete_to_empty_clears_record_position() {
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
 
         insert_record(&mut cursor, &pager, 1, Value::from_i64(10)).unwrap();
@@ -14642,7 +14572,7 @@ mod tests {
 
     #[test]
     fn index_seek_after_delete_to_empty_clears_record_position() {
-        let (pager, _, _, _) = empty_btree();
+        let (pager, _) = empty_btree();
         let root_page = run_until_done(
             || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
             pager.deref(),
@@ -14718,7 +14648,7 @@ mod tests {
         // 3. Verify validity/integrity of btree after deleting and also verify that these
         //    values are actually deleted.
 
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
 
         // Insert 10,000 records in to the BTree.
@@ -14797,7 +14727,7 @@ mod tests {
             huge_texts.push(huge_text);
         }
 
-        let (pager, root_page, _, _) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let num_columns = 5;
 
         for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
@@ -14859,7 +14789,7 @@ mod tests {
                 cell_count_per_page_cumulative: [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
             };
             let mut cells_cloned = Vec::new();
-            let (pager, _, _, _) = empty_btree();
+            let (pager, _) = empty_btree();
             let page_type = PageType::TableLeaf;
             let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             btree_init_page(&page, page_type, 0, pager.usable_space());
@@ -14993,7 +14923,7 @@ mod tests {
         /// page's last cell instead of the true maximum.
         #[test]
         fn peer_write_invalidates_rightmost_page_cache() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut reader = make_registered_cursor(&pager, root_page, 1);
 
@@ -15038,7 +14968,7 @@ mod tests {
         /// without invalidation every later count() returns the stale value.
         #[test]
         fn peer_write_invalidates_count_cache() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut reader = make_registered_cursor(&pager, root_page, 1);
 
@@ -15058,7 +14988,7 @@ mod tests {
 
         #[test]
         fn registry_toggles_has_peers_flag() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let cursor_a = make_registered_cursor(&pager, root_page, 1);
             assert!(
                 !cursor_a
@@ -15094,7 +15024,7 @@ mod tests {
         fn registry_buckets_per_root_page() {
             // Cursors on different root pages must not see each other as
             // peers; saveAllCursors is per-root (SQLite btree.c:806).
-            let (pager, root_a, _db, _conn) = empty_btree();
+            let (pager, root_a) = empty_btree();
             let page_b = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             btree_init_page(&page_b, PageType::TableLeaf, 0, pager.usable_space());
             let root_b = page_b.get().id() as i64;
@@ -15114,7 +15044,7 @@ mod tests {
 
         #[test]
         fn try_save_position_table_returns_saved() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
             for rowid in 1..=5 {
                 insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
@@ -15140,7 +15070,7 @@ mod tests {
         fn try_save_position_unpositioned_returns_saved_noop() {
             // valid_state=Valid + has_record=false ⇒ nothing to save and
             // nothing to invalidate (stack already in a re-navigable state).
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
             let outcome = run_until_done(
                 || cursor.try_save_position_for_external_balance(),
@@ -15156,7 +15086,7 @@ mod tests {
             // Without saveAllCursors, ResetSorter used to invalidate dup
             // cursors via pointer-equality from op_reset_sorter. Now
             // clear_btree itself does it via the pager registry.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -15191,7 +15121,7 @@ mod tests {
             // and rowid() silently returns 6. With the port, cursor2's
             // position is saved on entry to delete and restored on next
             // access — rowid() returns 5.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -15229,7 +15159,7 @@ mod tests {
             // next() returns the cell the seek landed on instead of stepping
             // past it. Forward iteration continues correctly after a peer
             // deletes the row we were sitting on.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -15325,7 +15255,7 @@ mod tests {
 
         #[test]
         fn peer_after_last_cell_of_leaf_continues_forward_after_split() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             let previous_rowid =
@@ -15349,7 +15279,7 @@ mod tests {
 
         #[test]
         fn peer_after_last_cell_of_leaf_continues_forward_after_two_splits() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             let previous_rowid =
@@ -15387,7 +15317,7 @@ mod tests {
 
         #[test]
         fn peer_after_last_cell_of_leaf_steps_back_to_that_cell_after_split() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             let previous_rowid =
@@ -15403,7 +15333,7 @@ mod tests {
 
         #[test]
         fn peer_left_on_emptied_tree_stays_at_end_after_split() {
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
             insert_record(&mut writer, &pager, 10, Value::from_i64(10)).unwrap();
@@ -15436,7 +15366,7 @@ mod tests {
 
         #[test]
         fn index_peer_after_last_cell_of_leaf_continues_forward_after_two_inserts() {
-            let (pager, _, _db, _conn) = empty_btree();
+            let (pager, _) = empty_btree();
             let root_page = run_until_done(
                 || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
                 pager.deref(),
@@ -15549,7 +15479,7 @@ mod tests {
         #[test]
         fn record_payload_restores_after_peer_insert() {
             for size in [16, 6000] {
-                let (pager, root_page, _db, _conn) = empty_btree();
+                let (pager, root_page) = empty_btree();
                 let mut writer = make_registered_cursor(&pager, root_page, 1);
                 let mut reader = make_registered_cursor(&pager, root_page, 1);
                 let value = Value::Blob(crate::alloc::vec![b'x'; size]);
@@ -15612,7 +15542,7 @@ mod tests {
             // cells to shift right on the shared page). Without saveAllCursors,
             // cursor2's cell_idx now points to rowid=4. With the port, the
             // saved rowid=5 is restored on next access.
-            let (pager, root_page, _db, _conn) = empty_btree();
+            let (pager, root_page) = empty_btree();
             let mut writer = make_registered_cursor(&pager, root_page, 1);
             let mut peer = make_registered_cursor(&pager, root_page, 1);
 
@@ -16296,7 +16226,7 @@ mod tests {
     /// past one leaf so the predicate has ancestors to check.
     #[test]
     fn next_past_the_last_row_lands_on_the_rightmost_leaf_append_slot() {
-        let (pager, root_page, _db, _conn) = empty_btree();
+        let (pager, root_page) = empty_btree();
         let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
         let cursor = &mut cursor;
 
