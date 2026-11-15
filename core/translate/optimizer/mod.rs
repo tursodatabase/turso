@@ -69,8 +69,8 @@ use join::{
 };
 use lift_common_subexpressions::rewrite_or_terms;
 use order::{
-    compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
-    EliminatesSortBy, OrderTargetPurpose,
+    compute_order_target, plan_groups_equal_keys, plan_satisfies_order_target,
+    simple_aggregate_order_target, EliminatesSortBy, OrderTargetPurpose,
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -1357,6 +1357,7 @@ fn apply_select_table_plan(
     let Some(table_plan) = table_plan else {
         return Ok(());
     };
+    let distinct_ordered = distinct_rows_are_ordered(plan, &table_plan, resolver)?;
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1365,7 +1366,35 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    plan.distinct_ordered = distinct_ordered;
     Ok(())
+}
+
+fn distinct_rows_are_ordered(
+    plan: &SelectPlan,
+    table_plan: &TableAccessPlan,
+    resolver: &Resolver,
+) -> Result<bool> {
+    if plan.group_by.is_some() {
+        return Ok(false);
+    }
+    let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
+        [] if plan.distinctness.is_distinct() => {
+            plan.result_columns.iter().map(|col| &col.expr).collect()
+        }
+        [agg] if agg.is_distinct() => agg.args.iter().collect(),
+        _ => return Ok(false),
+    };
+    plan_groups_equal_keys(
+        &table_plan.join,
+        &table_plan.access_methods,
+        plan.table_references.joined_tables(),
+        &table_plan.constraints,
+        &exprs,
+        &plan.table_references,
+        resolver,
+        resolver.schema(),
+    )
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
@@ -1756,6 +1785,7 @@ fn build_update_write_set_plan(
         offset: None,
         contains_constant_false_condition: false,
         distinctness: super::plan::Distinctness::NonDistinct,
+        distinct_ordered: false,
         values: vec![],
         window: None,
         input_cardinality_hint: None,
@@ -3231,7 +3261,7 @@ fn apply_table_access_plan(
                 }
                 order_by.clear();
             }
-            OrderTargetPurpose::Extremum => {}
+            OrderTargetPurpose::Extremum | OrderTargetPurpose::Distinct => {}
         }
     }
 

@@ -1175,9 +1175,7 @@ pub fn group_by_emit_row_phase<'a>(
             let ctx = ctx
                 .as_ref()
                 .expect("distinct aggregate context not populated");
-            program.emit_insn(Insn::HashClear {
-                hash_table_id: ctx.hash_table_id,
-            });
+            ctx.emit_reset(program);
         });
 
     program.emit_insn(Insn::Integer {

@@ -241,6 +241,7 @@ fn prepare_window_subquery(
         contains_constant_false_condition: false,
         query_destination: QueryDestination::placeholder_for_subquery(),
         distinctness: Distinctness::NonDistinct,
+        distinct_ordered: false,
         values: vec![],
         window: None,
         non_from_clause_subqueries: vec![],

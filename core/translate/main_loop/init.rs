@@ -15,7 +15,7 @@ pub fn init_distinct(
             ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
         })
         .collect::<Result<Vec<_>>>()?;
-    DistinctCtx::new(program, collations)
+    DistinctCtx::new(program, collations, plan.distinct_ordered)
 }
 
 /// First step of Loop emission, opens cursors for all tables and initializes distinct aggregate
@@ -30,6 +30,7 @@ impl InitLoop {
         t_ctx: &mut TranslateCtx<'a>,
         tables: &TableReferences,
         aggregates: &mut [Aggregate],
+        distinct_ordered: bool,
         mode: &OperationMode,
         where_clause: &[WhereTerm],
         join_order: &[JoinOrderMember],
@@ -89,20 +90,18 @@ impl InitLoop {
             );
             let collations =
                 vec![ExprContext::new(Some(tables), &t_ctx.resolver).expr_collation(&agg.args[0])?];
-            let ctx = DistinctCtx::new(program, collations)?;
-            let hash_table_id = ctx.hash_table_id;
+            let ctx = DistinctCtx::new(program, collations, distinct_ordered)?;
+            ctx.emit_reset(program);
             agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };
-            // DISTINCT aggregate hash tables live in ProgramState, so a correlated
-            // subquery can re-enter with rows from the previous invocation still
-            // recorded unless we clear the seen-set here.
-            program.emit_insn(Insn::HashClear { hash_table_id });
-            emit_explain!(
-                program,
-                false,
-                crate::translate::eqp::EqpDetail::DistinctAggregate {
-                    function: agg.func.to_string(),
-                }
-            );
+            if !distinct_ordered {
+                emit_explain!(
+                    program,
+                    false,
+                    crate::translate::eqp::EqpDetail::DistinctAggregate {
+                        function: agg.func.to_string(),
+                    }
+                );
+            }
         }
         let mut required_tables: TableMask = join_order
             .iter()

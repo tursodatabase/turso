@@ -212,10 +212,10 @@ pub fn emit_query<'a>(
         *ctx = distinct_ctx
     }
     if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
-        program.emit_insn(Insn::HashClear {
-            hash_table_id: ctx.hash_table_id,
-        });
-        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+        ctx.emit_reset(program);
+        if !ctx.is_ordered() {
+            emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+        }
     }
 
     let end_label = program.allocate_label();
@@ -249,6 +249,7 @@ pub fn emit_query<'a>(
         t_ctx,
         &plan.table_references,
         &mut plan.aggregates,
+        plan.distinct_ordered,
         &OperationMode::SELECT,
         &plan.where_clause,
         &plan.join_order,
@@ -1117,6 +1118,7 @@ fn build_materialized_build_input_plan(
             },
         },
         distinctness: Distinctness::NonDistinct,
+        distinct_ordered: false,
         values: vec![],
         window: None,
         non_from_clause_subqueries,

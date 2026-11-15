@@ -9,7 +9,7 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{AggStepData, HashDistinctData, Insn},
+        insn::{AggStepData, Insn},
     },
     LimboError, Result,
 };
@@ -232,16 +232,7 @@ pub fn handle_distinct(
     let distinct_ctx = ctx
         .as_ref()
         .expect("distinct aggregate context not populated");
-    let num_regs = 1;
-    program.emit_insn(Insn::HashDistinct {
-        data: Box::new(HashDistinctData {
-            hash_table_id: distinct_ctx.hash_table_id,
-            key_start_reg: agg_arg_reg,
-            num_keys: num_regs,
-            collations: distinct_ctx.collations.clone(),
-            target_pc: distinct_ctx.label_on_conflict,
-        }),
-    });
+    distinct_ctx.emit_deduplication_insns(program, 1, agg_arg_reg);
 }
 
 /// Source of aggregate function arguments during bytecode emission.

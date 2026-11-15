@@ -63,6 +63,7 @@ pub enum OrderTargetPurpose {
     /// Matching this target enables an extremum fast path, analogous to
     /// SQLite's WHERE_ORDERBY_MIN/MAX planning mode.
     Extremum,
+    Distinct,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -245,6 +246,43 @@ pub fn compute_order_target(
             )
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_groups_equal_keys(
+    plan: &JoinN,
+    access_methods_arena: &[AccessMethod],
+    joined_tables: &[JoinedTable],
+    table_constraints: &[TableConstraints],
+    exprs: &[&ast::Expr],
+    tables: &TableReferences,
+    resolver: &Resolver,
+    schema: &Schema,
+) -> Result<bool> {
+    for order in [SortOrder::Asc, SortOrder::Desc] {
+        // TODO: sqlite also does this for DISTINCT b, a on an index (a, b), we don't yet
+        let Some(target) = OrderTarget::maybe_from_iterator(
+            exprs.iter().map(|expr| (*expr, order, None)),
+            tables,
+            resolver,
+            OrderTargetPurpose::Distinct,
+        )?
+        else {
+            return Ok(false);
+        };
+        // TODO: sqlite also does this for inner table columns when the outer table returns only one row, we don't yet
+        if plan_satisfies_order_target(
+            plan,
+            access_methods_arena,
+            joined_tables,
+            table_constraints,
+            &target,
+            schema,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Check if the plan's row iteration order matches the [OrderTarget]'s column order.

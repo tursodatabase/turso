@@ -415,6 +415,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
+                distinct_ordered: false,
                 values: vec![],
                 window: None,
                 non_from_clause_subqueries: vec![],
@@ -937,6 +938,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
+                distinct_ordered: false,
                 values: values
                     .into_iter()
                     .map(|values| values.into_iter().map(|value| *value).collect())

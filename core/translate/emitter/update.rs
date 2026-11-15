@@ -300,6 +300,7 @@ pub fn emit_program_for_update(
         &mut t_ctx,
         &write_phase_tables,
         &mut [],
+        false,
         &mode,
         &plan.where_clause,
         &join_order,
