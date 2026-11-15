@@ -19546,6 +19546,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::security::roles::SessionRole;
     use crate::translate::collate::CollationSeq;
+    use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
     use crate::vdbe::BranchOffset;
     use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
@@ -19593,7 +19594,7 @@ mod tests {
     }
 
     fn assert_set_subtype_error(subtype: Value, expected_message: &str) {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let mut state = ProgramState::new(2, 0);
         let original = Value::build_text("unchanged");
         state.set_register(0, Register::Value(subtype));
@@ -19602,7 +19603,7 @@ mod tests {
             subtype_reg: 0,
             dest_reg: 1,
         };
-        let err = match op_set_subtype(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_set_subtype(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("invalid subtype must fail"),
             Err(err) => err,
         };
@@ -19614,7 +19615,7 @@ mod tests {
         assert_eq!(state.get_register(1).get_value(), &original);
     }
 
-    fn prepare_test_statement() -> Statement {
+    fn empty_program() -> (Program, Arc<Pager>) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
             io,
@@ -19628,7 +19629,11 @@ mod tests {
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.prepare("SELECT 1;").unwrap()
+        let pager = conn.get_pager();
+        let builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
+        let program = builder.build(conn, false, "").unwrap();
+        (program, pager)
     }
 
     fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
@@ -19937,7 +19942,7 @@ mod tests {
 
     #[test]
     fn test_hash_probe_rejects_unloaded_spilled_partition_without_probe_rowid() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let (ht, probe_key, _) = make_spilled_hash_table();
 
         let mut state = ProgramState::new(2, 0);
@@ -19956,7 +19961,7 @@ mod tests {
             probe_rowid_reg: None,
         };
 
-        let err = match op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_hash_probe(&program, &mut state, &insn, &pager) {
             Ok(_) => {
                 panic!("HashProbe should reject grace-only probing without a loaded partition")
             }
@@ -19976,7 +19981,7 @@ mod tests {
 
     #[test]
     fn test_hash_probe_allows_grace_style_probe_after_partition_preload() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let (mut ht, probe_key, partition_idx) = make_spilled_hash_table();
 
         loop {
@@ -20011,7 +20016,7 @@ mod tests {
             probe_rowid_reg: None,
         };
 
-        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+        let step = op_hash_probe(&program, &mut state, &insn, &pager)
             .expect("preloaded grace probe should succeed");
         assert!(matches!(step, InsnFunctionStepResult::Step));
         assert_eq!(state.pc, 1, "matching probe should fall through");
@@ -20024,7 +20029,7 @@ mod tests {
 
     #[test]
     fn test_decr_jump_zero_non_integer_register_returns_error() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
 
         let mut state = ProgramState::new(1, 0);
         state.set_register(0, Register::Value(Value::Text("not-an-int".into())));
@@ -20034,7 +20039,7 @@ mod tests {
             target_pc: crate::vdbe::BranchOffset::Offset(1),
         };
 
-        let err = match op_decr_jump_zero(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_decr_jump_zero(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("non-integer register must fail"),
             Err(err) => err,
         };
@@ -20044,7 +20049,7 @@ mod tests {
 
     #[test]
     fn test_make_record_overlapping_dest_returns_error() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
 
         let mut state = ProgramState::new(3, 0);
         for i in 0..3 {
@@ -20058,7 +20063,7 @@ mod tests {
             affinity_str: None,
         };
 
-        let err = match op_make_record(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_make_record(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("overlapping destination register must fail"),
             Err(err) => err,
         };
@@ -20070,7 +20075,7 @@ mod tests {
 
     #[test]
     fn test_sorter_data_unpaired_content_register_returns_error() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
 
         // Pseudo cursor 1 exposes register 2, but SorterData targets register 3.
         let mut state = ProgramState::new(4, 2);
@@ -20081,7 +20086,7 @@ mod tests {
             pseudo_cursor: 1,
         };
 
-        let err = match op_sorter_data(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_sorter_data(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("unpaired content register must fail"),
             Err(err) => err,
         };
@@ -20100,7 +20105,7 @@ mod tests {
 
     #[test]
     fn if_null_row_does_nothing_for_unopened_cursor() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let mut state = ProgramState::new(1, 1);
         state.set_register(0, Register::Value(Value::from_i64(7)));
         let insn = Insn::IfNullRow {
@@ -20109,7 +20114,7 @@ mod tests {
             dest: 0,
         };
 
-        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+        let step = op_if_null_row(&program, &mut state, &insn, &pager)
             .expect("IfNullRow must accept an unopened cursor");
 
         assert!(matches!(step, InsnFunctionStepResult::Step));
@@ -20119,7 +20124,7 @@ mod tests {
 
     #[test]
     fn if_null_row_clears_destination_and_jumps() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let mut state = ProgramState::new(1, 1);
         state.cursors[0] = Some(Cursor::NullRow);
         state.set_register(0, Register::Value(Value::from_i64(7)));
@@ -20129,7 +20134,7 @@ mod tests {
             dest: 0,
         };
 
-        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+        let step = op_if_null_row(&program, &mut state, &insn, &pager)
             .expect("IfNullRow must accept a null-row cursor");
 
         assert!(matches!(step, InsnFunctionStepResult::Step));
