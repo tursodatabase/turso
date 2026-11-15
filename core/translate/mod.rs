@@ -296,6 +296,10 @@ fn translate_statement(
         None
     };
 
+    let mut stmt = stmt;
+    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
+        && sequence::bind_sequence_names_in_stored_expressions(&mut stmt, resolver)?;
+
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -336,6 +340,7 @@ fn translate_statement(
             program,
             connection,
             input,
+            bound_sequence_names,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,

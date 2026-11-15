@@ -65,6 +65,13 @@ pub enum CatalogChange {
         name: String,
         owner: NewOwner,
     },
+    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
+    RenameColumn {
+        namespace: NamespaceId,
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
     /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
     /// relation FROM grantees` when `revoke` is set.
     Grant {
@@ -105,12 +112,19 @@ pub enum CatalogChange {
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
 #[derive(Debug, Clone)]
 pub enum NewOwner {
-    /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
-    /// table.column` names one for a sequence, or no table. What a table
-    /// owns changes owner with it, and not on its own.
-    Table(Option<String>),
+    /// A column of a table of the same namespace, as `ALTER SEQUENCE ...
+    /// OWNED BY table.column` names one for a sequence, or no column. What a
+    /// table owns changes owner with it, and not on its own.
+    Column(Option<OwnerColumn>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// The column that owns a sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerColumn {
+    pub table: String,
+    pub column: String,
 }
 
 /// What a built-in scalar function may read besides its arguments.
@@ -306,13 +320,9 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a sequence named without a schema in a column default or a
-    /// view body is bound to the schema it is found in when the table or
-    /// view is created.
-    ///
-    /// PostgreSQL stores the bound name, so the default or view keeps its
-    /// sequence after the search path changes. SQLite looks the name up
-    /// each time the default or view runs.
+    /// Whether a sequence named without a schema in an expression stored in
+    /// the schema is bound to the schema it is found in when the expression
+    /// is created.
     fn binds_names_at_create(&self) -> bool {
         false
     }
@@ -388,7 +398,7 @@ pub trait Dialect: Send + Sync + 'static {
                     ));
                 }
                 CatalogChange::ChangeOwner {
-                    owner: NewOwner::Table(_),
+                    owner: NewOwner::Column(_),
                     ..
                 } => {
                     return Err(LimboError::ParseError(
@@ -480,6 +490,22 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Option<RoleId> {
         let _ = (schema, namespace, name);
         None
+    }
+
+    /// The sequences of `namespace` that `column` of table `table` owns, or
+    /// that any column of the table owns when `column` is None.
+    ///
+    /// Which column owns a sequence has to be stored in a table of its own,
+    /// so only a dialect that keeps one has owned sequences. SQLite has none.
+    fn owned_sequences(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: Option<&str>,
+    ) -> Vec<String> {
+        let _ = (schema, namespace, table, column);
+        Vec::new()
     }
 
     /// Whether `role` has `privilege` on relation `name` of `namespace`,

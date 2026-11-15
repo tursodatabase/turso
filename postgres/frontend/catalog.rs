@@ -294,6 +294,16 @@ impl Dialect for PostgresDialect {
         crate::classes::relation_owner(schema, namespace, name)
     }
 
+    fn owned_sequences(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: Option<&str>,
+    ) -> Vec<String> {
+        crate::classes::owned_sequences(schema, namespace, table, column)
+    }
+
     fn role_has_privilege(
         &self,
         schema: &Schema,
