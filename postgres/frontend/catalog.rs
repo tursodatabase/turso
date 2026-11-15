@@ -348,6 +348,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn generates_integer_primary_keys(&self) -> bool {
+        false
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
