@@ -528,7 +528,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         offset: None,
         contains_constant_false_condition: false,
         distinctness: super::plan::Distinctness::NonDistinct,
-        distinct_ordered: false,
         values: vec![],
         window: None,
         // WHERE subqueries should already be planned into this SelectPlan when needed.

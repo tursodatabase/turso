@@ -208,7 +208,7 @@ pub fn emit_ungrouped_aggregation<'a>(
 
     // Resolve the SELECT DISTINCT label if present
     // When a duplicate is found by the Found instruction, jump here to skip emitting the row
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
@@ -226,7 +226,7 @@ pub fn handle_distinct(
     distinctness: &Distinctness,
     agg_arg_reg: usize,
 ) {
-    let Distinctness::Distinct { ctx } = distinctness else {
+    let Distinctness::Distinct { ctx, .. } = distinctness else {
         return;
     };
     let distinct_ctx = ctx
@@ -427,7 +427,7 @@ pub fn emit_aggregate_final(
         let mut sorted_aggregate = aggregate.clone();
         let duplicate = if aggregate.distinct_uses_order_key() {
             let label = program.allocate_label();
-            let Distinctness::Distinct { ctx: Some(ctx) } = &mut sorted_aggregate.distinctness
+            let Distinctness::Distinct { ctx: Some(ctx), .. } = &mut sorted_aggregate.distinctness
             else {
                 unreachable!("ordered DISTINCT requires a distinct context");
             };

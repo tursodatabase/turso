@@ -766,19 +766,34 @@ pub enum Distinctness {
     NonDistinct,
     /// The column is a DISTINCT column,
     /// and includes a translation context for handling duplicates.
-    Distinct { ctx: Option<DistinctCtx> },
+    Distinct {
+        ctx: Option<DistinctCtx>,
+        /// rows already come sorted by the distinct columns
+        ordered: bool,
+    },
 }
 
 impl Distinctness {
     pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
         match distinctness {
-            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
+            Some(ast::Distinctness::Distinct) => Self::Distinct {
+                ctx: None,
+                ordered: false,
+            },
             Some(ast::Distinctness::All) => Self::NonDistinct,
             None => Self::NonDistinct,
         }
     }
     pub fn is_distinct(&self) -> bool {
         matches!(self, Distinctness::Distinct { .. })
+    }
+    pub fn is_ordered(&self) -> bool {
+        matches!(self, Distinctness::Distinct { ordered: true, .. })
+    }
+    pub fn set_ordered(&mut self, value: bool) {
+        if let Distinctness::Distinct { ordered, .. } = self {
+            *ordered = value;
+        }
     }
 }
 
@@ -958,8 +973,6 @@ pub struct SelectPlan {
     pub query_destination: QueryDestination,
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
-    /// rows already come sorted by the distinct columns
-    pub distinct_ordered: bool,
     /// values: https://sqlite.org/syntax/select-core.html
     pub values: Vec<Vec<Expr>>,
     /// The window definition and all window functions associated with it. There is at most one

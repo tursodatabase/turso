@@ -15,11 +15,7 @@ pub fn init_distinct(
             ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
         })
         .collect::<Result<Vec<_>>>()?;
-    DistinctCtx::new(
-        program,
-        collations,
-        plan.distinct_ordered && plan.aggregates.is_empty(),
-    )
+    DistinctCtx::new(program, collations, plan.distinctness.is_ordered())
 }
 
 /// First step of Loop emission, opens cursors for all tables and initializes distinct aggregate
@@ -34,7 +30,6 @@ impl InitLoop {
         t_ctx: &mut TranslateCtx<'a>,
         tables: &TableReferences,
         aggregates: &mut [Aggregate],
-        distinct_ordered: bool,
         mode: &OperationMode,
         where_clause: &[WhereTerm],
         join_order: &[JoinOrderMember],
@@ -94,10 +89,14 @@ impl InitLoop {
             );
             let collations =
                 vec![ExprContext::new(Some(tables), &t_ctx.resolver).expr_collation(&agg.args[0])?];
-            let ctx = DistinctCtx::new(program, collations, distinct_ordered)?;
+            let ordered = agg.distinctness.is_ordered();
+            let ctx = DistinctCtx::new(program, collations, ordered)?;
             ctx.emit_reset(program);
-            agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };
-            if !distinct_ordered {
+            agg.distinctness = Distinctness::Distinct {
+                ctx: Some(ctx),
+                ordered,
+            };
+            if !ordered {
                 emit_explain!(
                     program,
                     false,

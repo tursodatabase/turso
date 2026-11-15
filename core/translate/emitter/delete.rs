@@ -130,7 +130,6 @@ fn emit_row_loop_delete(
         &mut t_ctx,
         &plan.table_references,
         &mut [],
-        false,
         &OperationMode::DELETE,
         &plan.where_clause,
         &join_order,

@@ -208,10 +208,10 @@ pub fn emit_query<'a>(
     } else {
         None
     };
-    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
-    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx: Some(ctx), .. } = &plan.distinctness {
         ctx.emit_reset(program);
         if !ctx.is_ordered() {
             emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
@@ -249,7 +249,6 @@ pub fn emit_query<'a>(
         t_ctx,
         &plan.table_references,
         &mut plan.aggregates,
-        plan.distinct_ordered,
         &OperationMode::SELECT,
         &plan.where_clause,
         &plan.join_order,
@@ -259,7 +258,7 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
-        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
             program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
         }
@@ -1118,7 +1117,6 @@ fn build_materialized_build_input_plan(
             },
         },
         distinctness: Distinctness::NonDistinct,
-        distinct_ordered: false,
         values: vec![],
         window: None,
         non_from_clause_subqueries,

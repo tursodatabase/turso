@@ -241,7 +241,6 @@ fn prepare_window_subquery(
         contains_constant_false_condition: false,
         query_destination: QueryDestination::placeholder_for_subquery(),
         distinctness: Distinctness::NonDistinct,
-        distinct_ordered: false,
         values: vec![],
         window: None,
         non_from_clause_subqueries: vec![],
@@ -3965,7 +3964,7 @@ fn emit_row_output_subroutine(
 
     program.preassign_label_to_next_insn(label_skip_returning_row);
 
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
