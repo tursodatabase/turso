@@ -2,11 +2,14 @@ use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
-use super::windows_lock::{acquire_process_file_lock, ProcessFileLockGuard};
-use crate::sync::Arc;
+use super::windows_lock::{
+    acquire_process_file_lock, stable_lock_path, ProcessFileLockGuard, ProcessLockMode,
+};
+use crate::sync::{Arc, Mutex};
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
 use std::cell::Cell;
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::ptr;
 #[cfg(feature = "fs")]
 use tracing::debug;
@@ -16,10 +19,9 @@ use windows_sys::Win32::Foundation::{
     GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_ATTRIBUTE_NORMAL,
-    FILE_END_OF_FILE_INFO, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS,
+    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, ReadFile,
+    SetFileInformationByHandle, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_END_OF_FILE_INFO,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
     OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
@@ -170,13 +172,17 @@ impl IO for WindowsIO {
             return Err(last_os_error("open"));
         }
 
+        // Resolve the lock key once so a later cwd change cannot redirect
+        // `lock_file` to a different file.
+        let lock_key = stable_lock_path(Path::new(path));
+
         // Cross-process advisory lock: rejects opens from other processes while
         // permitting multiple in-process handles. See `ProcessFileLockEntry`.
         let process_lock = if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
-            match acquire_process_file_lock(path) {
-                Ok(guard) => Some(guard),
+            match acquire_process_file_lock(&lock_key, ProcessLockMode::OpenTime) {
+                Ok(guard) => Some((ProcessLockMode::OpenTime, guard)),
                 Err(e) => {
                     unsafe {
                         CloseHandle(file_handle);
@@ -190,7 +196,8 @@ impl IO for WindowsIO {
 
         Ok(Arc::new(WindowsFile {
             handle: file_handle,
-            _process_lock: process_lock,
+            process_lock: Mutex::new(process_lock),
+            lock_key,
         }))
     }
 
@@ -222,7 +229,11 @@ pub struct WindowsFile {
     /// Process-wide advisory lock held while this file is open. The lock lives
     /// in a dedicated handle managed by `ProcessFileLockEntry`; this field
     /// just keeps the registry refcount up. Dropped automatically with `self`.
-    _process_lock: Option<ProcessFileLockGuard>,
+    /// The mode records how the held lock was taken.
+    process_lock: Mutex<Option<(ProcessLockMode, ProcessFileLockGuard)>>,
+    /// Lock key resolved once in `open_file`, used to re-acquire the process
+    /// lock in `lock_file`.
+    lock_key: PathBuf,
 }
 
 unsafe impl Send for WindowsFile {}
@@ -233,26 +244,25 @@ impl File for WindowsFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         trace!("lock_file(exclusive = {})", exclusive);
 
-        let flags = if exclusive {
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+        // Advisory lock kept outside the data range (a whole-range LockFileEx
+        // makes Windows reject I/O). Converting between modes releases the held
+        // lock first, like flock.
+        let mut held = self.process_lock.lock();
+        let mode = if exclusive {
+            ProcessLockMode::Exclusive
         } else {
-            LOCKFILE_FAIL_IMMEDIATELY
+            ProcessLockMode::Shared
         };
-
-        let mut overlapped = overlapped_at(0);
-        let result =
-            unsafe { LockFileEx(self.handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) };
-
-        if result == FALSE {
-            let err = std::io::Error::last_os_error();
-            let message = match err.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking file. File is locked by another process".to_string()
-                }
-                _ => format!("Failed locking file, {err}"),
-            };
-            return Err(LimboError::LockingError(message));
+        // An open-time lock already is an exclusive lock.
+        if matches!(&*held, Some((held_mode, _))
+            if *held_mode == mode
+                || (exclusive && *held_mode == ProcessLockMode::OpenTime))
+        {
+            return Ok(());
         }
+        drop(held.take());
+        let guard = acquire_process_file_lock(&self.lock_key, mode)?;
+        *held = Some((mode, guard));
         Ok(())
     }
 
@@ -260,15 +270,7 @@ impl File for WindowsFile {
     fn unlock_file(&self) -> Result<()> {
         trace!("unlock_file");
 
-        let mut overlapped = overlapped_at(0);
-        let result = unsafe { UnlockFileEx(self.handle, 0, u32::MAX, u32::MAX, &mut overlapped) };
-
-        if result == FALSE {
-            let err = std::io::Error::last_os_error();
-            return Err(LimboError::LockingError(format!(
-                "Failed to release file lock: {err}"
-            )));
-        }
+        drop(self.process_lock.lock().take());
         Ok(())
     }
 
@@ -450,7 +452,7 @@ impl Drop for WindowsFile {
             CloseHandle(self.handle);
         }
         // The process-wide advisory lock is released by `ProcessFileLockGuard::drop`
-        // after the `_process_lock` field is dropped here.
+        // after the `process_lock` field is dropped here.
     }
 }
 

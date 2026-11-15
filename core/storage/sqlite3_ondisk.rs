@@ -1569,6 +1569,7 @@ impl BuildSharedWal {
                 last_checksum: (0, 0),
                 loaded: AtomicBool::new(false),
                 loaded_from_disk_scan: AtomicBool::new(true),
+                disk_scan_reconciled: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
             },
             runtime: WalSharedRuntime {

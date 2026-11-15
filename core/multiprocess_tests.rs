@@ -2,7 +2,10 @@ use super::*;
 use crate::database::remove_file_from_database_registry;
 use crate::security::roles::SessionRole;
 use crate::storage::database::DatabaseFile;
-use crate::sync::atomic::Ordering;
+use crate::storage::shared_wal_coordination::{
+    MappedSharedWalCoordination, SharedWalCoordinationOpenMode,
+};
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::process::Command;
 use std::time::Duration;
 
@@ -39,6 +42,18 @@ const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
+const MULTIPROCESS_DB_FILE_LOCK_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_db_file_lock_child_process";
+const EXCLUSIVE_DB_FILE_LOCK_CHILD_TEST: &str =
+    "multiprocess_tests::exclusive_db_file_lock_child_process";
+const DISABLED_FILE_LOCK_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_open_with_disabled_file_lock_child_process";
+const MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_paused_creator_child_process";
+const MULTIPROCESS_FIRST_OPENER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_first_opener_child_process";
+const MULTIPROCESS_NEW_DB_CREATOR_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_new_db_creator_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -484,6 +499,712 @@ fn multiprocess_async_open_child_process() {
     assert_eq!(count_test_rows(&conn), 1);
 }
 
+#[test]
+fn multiprocess_open_reinitializes_unpublished_coordination_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("unpublished-header.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let shm_path = storage::wal::coordination_path_for_wal_path(&format!("{db_path_str}-wal"));
+    // A creator that died after sizing the file but before publishing the header.
+    std::fs::File::create(&shm_path)
+        .unwrap()
+        .set_len(1 << 16)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key)")
+        .unwrap();
+}
+
+/// Where a paused creator of the coordination file stalls.
+#[derive(Clone, Copy)]
+enum CreatorPause {
+    /// After probing the lifetime byte, before taking it: the creator has not
+    /// yet been seen by any other process.
+    AfterProbe,
+    /// File sized, lifetime lock held, header not published.
+    BeforeInitialize,
+}
+
+/// Start a child that stalls as the creator of the coordination file of
+/// `db_path` at `pause` and wait until it has. It finishes creating the file
+/// once `release_file` exists.
+fn spawn_paused_creator(
+    db_path: &std::path::Path,
+    ready_file: &std::path::Path,
+    release_file: &std::path::Path,
+    pause: CreatorPause,
+) -> std::process::Child {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .arg(MULTIPROCESS_PAUSED_CREATOR_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+        .env("TURSO_MULTIPROCESS_READY_FILE", ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", release_file);
+    if matches!(pause, CreatorPause::AfterProbe) {
+        command.env("TURSO_MULTIPROCESS_PAUSE_AFTER_PROBE", "1");
+    }
+    let child = command.spawn().unwrap();
+    wait_for_file(ready_file);
+    child
+}
+
+/// Child half of the creator-in-flight tests.
+#[test]
+fn multiprocess_paused_creator_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let wal_path = format!("{}-wal", db_path.to_str().unwrap());
+    let shm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+    let pause = || {
+        std::fs::write(&ready_file, b"ready").unwrap();
+        wait_for_file(&release_file);
+    };
+    let noop = || {};
+    let pause_fn: &dyn Fn() = &pause;
+    let noop_fn: &dyn Fn() = &noop;
+    let (after_probe, before_initialize) =
+        if std::env::var_os("TURSO_MULTIPROCESS_PAUSE_AFTER_PROBE").is_some() {
+            (pause_fn, noop_fn)
+        } else {
+            (noop_fn, pause_fn)
+        };
+    let _authority = MappedSharedWalCoordination::create_or_open_paused_for_tests(
+        &io,
+        std::path::Path::new(&shm_path),
+        64,
+        after_probe,
+        before_initialize,
+    )
+    .unwrap();
+}
+
+/// Open an existing database with `flags` while a child process is paused at
+/// `pause` as the creator of its coordination file, and return the open's
+/// result.
+///
+/// The creator stays paused until the open has had ample time to fail, so the
+/// open cannot finish before the release unless it fails: an opener without
+/// the wait returns its error immediately.
+fn open_while_creator_paused(
+    name: &str,
+    flags: OpenFlags,
+    pause: CreatorPause,
+) -> std::thread::Result<Result<(bool, i64)>> {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join(name);
+    let db_path_str = db_path.to_str().unwrap().to_string();
+    let ready_file = dir.path().join("creator-ready");
+    let release_file = dir.path().join("creator-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    {
+        let db = Database::open_file(io.clone(), &db_path_str, Arc::new(EngineDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into test(value) values ('seed')")
+            .unwrap();
+    }
+    remove_file_from_database_registry(&db_path_str);
+
+    let mut creator = spawn_paused_creator(&db_path, &ready_file, &release_file, pause);
+    let opener = std::thread::spawn(move || -> Result<(bool, i64)> {
+        let db = open_multiprocess_db_with_flags(io, &db_path_str, flags)?;
+        let attached = db.shared_wal_coordination()?.is_some();
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        Ok((attached, count_test_rows(&conn)))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let finished_early = opener.is_finished();
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        !finished_early,
+        "open must wait for the creator that holds the init lock"
+    );
+    let result = opener.join();
+    assert!(creator.wait().unwrap().success());
+    result
+}
+
+#[test]
+fn readonly_multiprocess_open_waits_for_concurrent_creator() {
+    let (attached, rows) = open_while_creator_paused(
+        "readonly-waits-for-creator.db",
+        OpenFlags::ReadOnly,
+        CreatorPause::BeforeInitialize,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        attached,
+        "reader must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn writable_multiprocess_open_waits_for_concurrent_creator() {
+    let (attached, rows) = open_while_creator_paused(
+        "writable-waits-for-creator.db",
+        OpenFlags::default(),
+        CreatorPause::BeforeInitialize,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        attached,
+        "opener must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+}
+
+/// A read-only open must wait for a creator that has probed the lifetime byte
+/// but not yet taken it. Without the init lock the reader probes the byte as
+/// free in that window, finds the file still short and reports it as corrupt
+/// because it sees no live creator.
+#[test]
+fn readonly_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
+    let (attached, rows) = open_while_creator_paused(
+        "readonly-waits-for-unlocked-creator.db",
+        OpenFlags::ReadOnly,
+        CreatorPause::AfterProbe,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        attached,
+        "reader must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+}
+
+/// A writable open must not decide the open mode while a creator is between
+/// probing the lifetime byte and taking it. Without the init lock it probes
+/// the byte as free too, decides Exclusive and initializes the file under
+/// the creator.
+#[test]
+fn writable_multiprocess_open_waits_for_creator_that_has_not_locked_yet() {
+    let (attached, rows) = open_while_creator_paused(
+        "writable-waits-for-unlocked-creator.db",
+        OpenFlags::default(),
+        CreatorPause::AfterProbe,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        attached,
+        "opener must attach to the published coordination file"
+    );
+    assert_eq!(rows, 1);
+}
+
+/// A child that opens the coordination file as one of two concurrent first
+/// openers, paused after probing the lifetime byte until released, then records
+/// one commit in it and holds the file open until told to exit.
+struct FirstOpener {
+    child: std::process::Child,
+    probe_ready_file: std::path::PathBuf,
+    probe_release_file: std::path::PathBuf,
+    opened_file: std::path::PathBuf,
+    done_file: std::path::PathBuf,
+}
+
+impl FirstOpener {
+    fn spawn(db_path: &std::path::Path, dir: &std::path::Path, role: &str) -> Self {
+        let probe_ready_file = dir.join(format!("{role}-probe-ready"));
+        let probe_release_file = dir.join(format!("{role}-probe-release"));
+        let opened_file = dir.join(format!("{role}-opened"));
+        let done_file = dir.join(format!("{role}-done"));
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg(MULTIPROCESS_FIRST_OPENER_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+            .env("TURSO_MULTIPROCESS_OPENER_ROLE", role)
+            .env("TURSO_MULTIPROCESS_PROBE_READY_FILE", &probe_ready_file)
+            .env("TURSO_MULTIPROCESS_PROBE_RELEASE_FILE", &probe_release_file)
+            .env("TURSO_MULTIPROCESS_OPENED_FILE", &opened_file)
+            .env("TURSO_MULTIPROCESS_DONE_FILE", &done_file)
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            probe_ready_file,
+            probe_release_file,
+            opened_file,
+            done_file,
+        }
+    }
+
+    fn release_probe(&self) {
+        std::fs::write(&self.probe_release_file, b"release").unwrap();
+    }
+}
+
+impl Drop for FirstOpener {
+    /// Unblock and reap the child so a failed assertion leaves none behind.
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.probe_release_file, b"release");
+        let _ = std::fs::write(&self.done_file, b"done");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Two flagged first openers must not both initialize the coordination file.
+/// The first is paused after probing the lifetime byte as free, before taking
+/// it. The second must not get as far as probing: without the init lock it
+/// probes the byte as free too, and both can decide Exclusive and initialize
+/// the file, the later one resetting state the earlier one already uses. With
+/// it the second waits, then opens in MultiProcess mode over the file the
+/// first initialized, and both commits are visible afterwards.
+#[test]
+fn concurrent_first_openers_initialize_the_coordination_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("first-openers.db");
+    let shm_path =
+        storage::wal::coordination_path_for_wal_path(&format!("{}-wal", db_path.to_str().unwrap()));
+
+    let mut first = FirstOpener::spawn(&db_path, dir.path(), "first");
+    wait_for_file(&first.probe_ready_file);
+    let mut second = FirstOpener::spawn(&db_path, dir.path(), "second");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !second.probe_ready_file.exists(),
+        "the second opener probed the lifetime byte while the first was still deciding the open mode"
+    );
+
+    first.release_probe();
+    wait_for_file(&first.opened_file);
+    wait_for_file(&second.probe_ready_file);
+    second.release_probe();
+    wait_for_file(&second.opened_file);
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let observer =
+        MappedSharedWalCoordination::open_existing(&io, std::path::Path::new(&shm_path), 64)
+            .unwrap()
+            .expect("coordination file exists");
+    let snapshot = observer.snapshot();
+    assert_eq!(snapshot.max_frame, 2);
+    assert_eq!(snapshot.transaction_count, 2);
+    assert_eq!(observer.find_frame(7, 0, 2, None), Some(1));
+    assert_eq!(observer.find_frame(9, 0, 2, None), Some(2));
+    drop(observer);
+
+    std::fs::write(&first.done_file, b"done").unwrap();
+    std::fs::write(&second.done_file, b"done").unwrap();
+    assert!(first.child.wait().unwrap().success());
+    assert!(second.child.wait().unwrap().success());
+}
+
+/// Child half of `concurrent_first_openers_initialize_the_coordination_file_once`.
+#[test]
+fn multiprocess_first_opener_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let env_path = |name: &str| std::path::PathBuf::from(std::env::var_os(name).unwrap());
+    let role = std::env::var("TURSO_MULTIPROCESS_OPENER_ROLE").unwrap();
+    let probe_ready_file = env_path("TURSO_MULTIPROCESS_PROBE_READY_FILE");
+    let probe_release_file = env_path("TURSO_MULTIPROCESS_PROBE_RELEASE_FILE");
+    let opened_file = env_path("TURSO_MULTIPROCESS_OPENED_FILE");
+    let done_file = env_path("TURSO_MULTIPROCESS_DONE_FILE");
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let wal_path = format!("{}-wal", db_path.to_str().unwrap());
+    let shm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+    let authority = MappedSharedWalCoordination::create_or_open_paused_for_tests(
+        &io,
+        std::path::Path::new(&shm_path),
+        64,
+        &|| {
+            std::fs::write(&probe_ready_file, b"ready").unwrap();
+            wait_for_file(&probe_release_file);
+        },
+        &|| {},
+    )
+    .unwrap();
+
+    let (page_id, frame_id) = if role == "first" {
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+        (7, 1)
+    } else {
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::MultiProcess
+        );
+        // The first opener's commit must have survived this open.
+        assert_eq!(authority.snapshot().max_frame, 1);
+        assert_eq!(authority.find_frame(7, 0, 1, None), Some(1));
+        (9, 2)
+    };
+    let owner = authority.owner_record();
+    assert!(authority.try_acquire_writer(owner));
+    authority.record_frame(page_id, frame_id);
+    authority.publish_commit(frame_id, 0, 0, frame_id);
+    authority.release_writer(owner);
+    std::fs::write(&opened_file, b"opened").unwrap();
+    wait_for_file(&done_file);
+}
+
+/// A process that opened a new database and has not written yet must notice
+/// that another process created it. Its in-memory page 1 describes an empty
+/// database; building the first write on it would write a second page 1 and a
+/// second sqlite_schema over the other process's committed table.
+#[test]
+fn process_holding_an_empty_database_adopts_one_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("created-by-other-process.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    let child_output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_NEW_DB_CREATOR_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    // Prepared while this process still believes the database is empty.
+    conn.execute("create table if not exists t(x)").unwrap();
+    conn.execute("insert into t values (2)").unwrap();
+
+    let xs = |conn: &Arc<Connection>| {
+        get_rows(conn, "select x from t order by x")
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![Value::from_i64(1), Value::from_i64(2)];
+    assert_eq!(xs(&conn), expected);
+    let fresh = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(xs(&fresh), expected);
+}
+
+/// Child half of `process_holding_an_empty_database_adopts_one_created_by_another_process`.
+#[test]
+fn multiprocess_new_db_creator_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(x)").unwrap();
+    conn.execute("insert into t values (1)").unwrap();
+    conn.close().unwrap();
+}
+
+/// A read-only open never creates or initializes the coordination file. A
+/// writer creates it empty before it takes the init lock, so a short file with
+/// no live creator is a creator that has not started yet (or died): the open
+/// reports retryable `Busy`, not `Corrupt`, and leaves the file alone.
+#[test]
+fn readonly_open_reports_an_empty_coordination_file_as_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let shm_path = dir.path().join("short.db-tshm");
+    std::fs::File::create(&shm_path).unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let err = MappedSharedWalCoordination::open_existing(&io, &shm_path, 64).err();
+    assert!(
+        matches!(err, Some(LimboError::Busy)),
+        "empty file without a creator: {err:?}"
+    );
+    assert_eq!(std::fs::metadata(&shm_path).unwrap().len(), 0);
+}
+
+/// Same for a file that was sized but whose header was never published, such
+/// as one left by a creator that died: a writable opener re-initializes it, a
+/// read-only opener reports `Busy` and does not touch it.
+#[test]
+fn readonly_open_reports_an_unpublished_coordination_file_as_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let shm_path = dir.path().join("unpublished.db-tshm");
+    // Larger than the header for 64 reader slots, all zero: no magic.
+    let len = 1 << 20;
+    std::fs::File::create(&shm_path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let err = MappedSharedWalCoordination::open_existing(&io, &shm_path, 64).err();
+    assert!(
+        matches!(err, Some(LimboError::Busy)),
+        "unpublished file without a creator: {err:?}"
+    );
+    assert_eq!(std::fs::metadata(&shm_path).unwrap().len(), len);
+}
+
+/// A flagged open must not be rejected as a legacy open while another process
+/// holds a shared lock on the database file, as another flagged opener does
+/// while it probes.
+#[test]
+fn multiprocess_open_succeeds_while_another_process_holds_shared_db_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("shared-db-lock.db");
+    let ready_file = dir.path().join("lock-ready");
+    let release_file = dir.path().join("lock-release");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_DB_FILE_LOCK_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", &db_path)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let opened = open_multiprocess_db(io, db_path.to_str().unwrap()).map(drop);
+    std::fs::write(&release_file, b"release").unwrap();
+    opened.expect("flagged open must coexist with a shared lock on the database file");
+    assert!(child.wait().unwrap().success());
+}
+
+/// Child half of `multiprocess_open_succeeds_while_another_process_holds_shared_db_lock`.
+#[test]
+fn multiprocess_db_file_lock_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let file = io
+        .open_file(
+            db_path.to_str().unwrap(),
+            OpenFlags::Create | OpenFlags::NoLock,
+            true,
+        )
+        .unwrap();
+    file.lock_file(false).unwrap();
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+/// A multiprocess open keeps a shared lock on the database file for as long as
+/// the database is open, so a legacy process, which locks the file
+/// exclusively, cannot open it even before the `-tshm` file exists.
+#[test]
+fn multiprocess_open_keeps_a_shared_database_file_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("held-shared-lock.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let _db = open_multiprocess_db(io, db_path_str).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(EXCLUSIVE_DB_FILE_LOCK_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "another process could lock the database file exclusively while a multiprocess open held it: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+/// Child half of `multiprocess_open_keeps_a_shared_database_file_lock`: the
+/// exclusive lock a legacy open takes must fail.
+#[test]
+fn exclusive_db_file_lock_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let file = io
+        .open_file(db_path.to_str().unwrap(), OpenFlags::NoLock, true)
+        .unwrap();
+    assert!(
+        matches!(file.lock_file(true), Err(LimboError::LockingError(_))),
+        "the database file must stay locked shared by the multiprocess open"
+    );
+}
+
+/// With `LIMBO_DISABLE_FILE_LOCK` set, a flagged open must not probe the database
+/// file lock, as `open_file` takes none.
+#[test]
+fn multiprocess_open_ignores_legacy_lock_when_file_locks_are_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("disabled-file-lock.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let _db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(DISABLED_FILE_LOCK_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env(crate::io::common::ENV_DISABLE_FILE_LOCK, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "flagged child open unexpectedly failed with file locks disabled: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+/// Child half of `multiprocess_open_ignores_legacy_lock_when_file_locks_are_disabled`.
+#[test]
+fn multiprocess_open_with_disabled_file_lock_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    open_multiprocess_db(io, db_path.to_str().unwrap())
+        .expect("flagged open must not probe the database file lock when file locks are disabled");
+}
+
+/// The real IO, except that every `sleep` moves the monotonic clock forward by
+/// an hour instead of blocking, so bounded waits expire at once.
+struct FastForwardIO {
+    inner: Arc<dyn IO>,
+    skipped_nanos: AtomicU64,
+    sleeps: AtomicUsize,
+}
+
+impl Clock for FastForwardIO {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+            + Duration::from_nanos(self.skipped_nanos.load(Ordering::Acquire))
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for FastForwardIO {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.inner.open_shared_wal_file(path)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        self.inner.supports_shared_wal_coordination()
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        self.sleeps.fetch_add(1, Ordering::AcqRel);
+        self.skipped_nanos.fetch_add(
+            Duration::from_secs(3600).as_nanos() as u64,
+            Ordering::AcqRel,
+        );
+    }
+}
+
+/// An opener that finds a creator stalled past the bounded wait gets the
+/// retryable `Busy`, not `Corrupt`, for the writable and the read-only path,
+/// and the wait runs on the IO's clock and sleep. A retry succeeds once the
+/// creator finishes.
+#[test]
+fn stalled_creator_makes_openers_return_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("stalled-creator.db");
+    let wal_path = format!("{}-wal", db_path.to_str().unwrap());
+    let shm_path =
+        std::path::PathBuf::from(storage::wal::coordination_path_for_wal_path(&wal_path));
+    let ready_file = dir.path().join("creator-ready");
+    let release_file = dir.path().join("creator-release");
+    let mut creator = spawn_paused_creator(
+        &db_path,
+        &ready_file,
+        &release_file,
+        CreatorPause::BeforeInitialize,
+    );
+
+    let fast_forward = Arc::new(FastForwardIO {
+        inner: multiprocess_test_io(),
+        skipped_nanos: AtomicU64::new(0),
+        sleeps: AtomicUsize::new(0),
+    });
+    let io: Arc<dyn IO> = fast_forward.clone();
+    let writable_err = MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).err();
+    let readonly_err = MappedSharedWalCoordination::open_existing(&io, &shm_path, 64).err();
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        matches!(writable_err, Some(LimboError::Busy)),
+        "writable open: {writable_err:?}"
+    );
+    assert!(
+        matches!(readonly_err, Some(LimboError::Busy)),
+        "read-only open: {readonly_err:?}"
+    );
+    assert!(
+        fast_forward.sleeps.load(Ordering::Acquire) >= 2,
+        "each open must wait through the IO's sleep"
+    );
+
+    assert!(creator.wait().unwrap().success());
+    let io = multiprocess_test_io();
+    MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64)
+        .map(drop)
+        .expect("a retry after the creator finished must succeed");
+}
+
 /// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
 /// open the multiprocess database, hold it open (keeping the authority in
 /// multiprocess mode), signal readiness, and wait for release before exiting.
@@ -626,6 +1347,9 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 
     authority.install_snapshot(stale_snapshot);
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn_a);
     drop(db_a);
     remove_file_from_database_registry(db_path_str);
@@ -764,6 +1488,9 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     );
     authority.clear_backfill_proof();
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn);
     drop(db);
     remove_file_from_database_registry(db_path_str);
@@ -913,6 +1640,9 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         "DB-header mismatch coverage requires live WAL frames beyond the backfill point"
     );
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn);
     drop(db);
     flip_db_header_reserved_byte(&db_path);
@@ -2256,6 +2986,9 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
         "test setup should mark the shared frame index incomplete before reopen"
     );
 
+    // The reopen is a cold open: a mapping that stays alive in this process
+    // would be treated as a peer and keep the authority as it is.
+    drop(authority);
     drop(conn_a);
     drop(db_a);
     remove_file_from_database_registry(db_path_str);

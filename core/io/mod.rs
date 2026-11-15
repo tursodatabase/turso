@@ -61,7 +61,7 @@ pub use memory::MemoryIO;
 #[cfg(feature = "io_memory_yield")]
 pub use memory_yield::MemoryYieldIO;
 pub mod clock;
-mod common;
+pub(crate) mod common;
 mod completions;
 pub use clock::Clock;
 pub use completions::*;
