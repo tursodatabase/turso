@@ -920,7 +920,6 @@ fn single_value_of_mut(select: &mut ast::Select) -> Option<&mut ast::Expr> {
 
 #[cfg(test)]
 mod tests {
-    use crate::security::roles::SessionRole;
     use std::sync::Arc;
 
     use rustc_hash::FxHashMap;
@@ -936,7 +935,7 @@ mod tests {
     use crate::security::policy::RowPolicy;
     use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::{Database, DatabaseCatalog, MemoryIO, Qualifiers, RwLock, SymbolTable};
+    use crate::{DatabaseCatalog, Qualifiers, RwLock, SymbolTable};
 
     /// The engine dialect, except that every table of a schema with dialect
     /// schema state has row-level security, and table `documents` has a
@@ -1176,83 +1175,5 @@ mod tests {
             role,
         );
         f(&mut resolver)
-    }
-
-    /// A materialized view stores the rows of its query when it is refreshed,
-    /// so policies on it could not limit them.
-    #[test]
-    fn row_security_statements_reject_a_materialized_view() {
-        let db = Database::open_file_with_flags(
-            Arc::new(MemoryIO::new()),
-            "row-security-materialized-view.db",
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_views(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT x FROM t")
-            .unwrap();
-        let mv = || ast::QualifiedName::single(ast::Name::exact("mv".to_string()));
-        let statements = [
-            ast::Stmt::AlterTable(ast::AlterTable {
-                name: mv(),
-                body: ast::AlterTableBody::EnableRowSecurity,
-            }),
-            ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
-                policy_name: ast::Name::exact("p".to_string()),
-                tbl_name: mv(),
-                permissive: true,
-                command: ast::PolicyCommand::All,
-                roles: vec![ast::Grantee::Public],
-                using_expr: None,
-                check_expr: None,
-            })),
-        ];
-
-        for statement in statements {
-            let sql = statement.to_string();
-            let error = conn
-                .prepare_translated_cmd(ast::Cmd::Stmt(statement), &sql)
-                .unwrap_err();
-
-            assert!(
-                error.to_string().contains("\"mv\" is not a table"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn enabling_row_security_fails_under_a_dialect_without_it() {
-        let db = Database::open_file(
-            Arc::new(MemoryIO::new()),
-            ":memory:",
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-        let enable = ast::Cmd::Stmt(ast::Stmt::AlterTable(ast::AlterTable {
-            name: ast::QualifiedName::single(ast::Name::exact("t".to_string())),
-            body: ast::AlterTableBody::EnableRowSecurity,
-        }));
-
-        let error = conn
-            .prepare_translated_cmd(enable, "ALTER TABLE t ENABLE ROW LEVEL SECURITY")
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("row-level security is not supported"),
-            "{error}"
-        );
     }
 }

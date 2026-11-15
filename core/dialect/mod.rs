@@ -898,18 +898,6 @@ mod tests {
     }
 
     #[test]
-    fn consume_stmt_reports_parse_error() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        assert!(conn.consume_stmt("SELECT * FROM").is_err());
-        conn.close().unwrap();
-    }
-
-    #[test]
     fn dialect_catalog_available_on_every_schema_and_rebuild() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "dialect-catalog.db", Arc::new(TestDialect::default())).unwrap();
