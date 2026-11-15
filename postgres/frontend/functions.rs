@@ -237,18 +237,6 @@ impl ScalarReturn for Boolean {
     }
 }
 
-/// A `uuid` value in its text form, such as
-/// `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`.
-pub(crate) struct Uuid(pub(crate) String);
-
-impl ScalarReturn for Uuid {
-    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("uuid"));
-
-    fn into_value(self) -> Value {
-        Value::build_text(self.0)
-    }
-}
-
 fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<String>> {
     let include_implicit = match argument {
         Value::Null => return Ok(None),
