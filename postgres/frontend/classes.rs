@@ -88,23 +88,6 @@ const CREATE_CLASSES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_classes (\
     relrowsecurity INTEGER NOT NULL DEFAULT 0, \
     relpolicies TEXT)";
 
-const ACL_COLUMN_NAME: &str = "relacl";
-
-const ROW_SECURITY_COLUMN_NAME: &str = "relrowsecurity";
-
-const POLICIES_COLUMN_NAME: &str = "relpolicies";
-
-/// Adds `relacl` to a catalog made before it had the column.
-const ADD_ACL_COLUMN_SQL: &str = "ALTER TABLE __turso_internal_classes ADD COLUMN relacl TEXT";
-
-/// Adds `relrowsecurity` to a catalog made before it had the column.
-const ADD_ROW_SECURITY_COLUMN_SQL: &str =
-    "ALTER TABLE __turso_internal_classes ADD COLUMN relrowsecurity INTEGER NOT NULL DEFAULT 0";
-
-/// Adds `relpolicies` to a catalog made before it had the column.
-const ADD_POLICIES_COLUMN_SQL: &str =
-    "ALTER TABLE __turso_internal_classes ADD COLUMN relpolicies TEXT";
-
 const CLASS_COLUMN_COUNT: usize = 9;
 
 const CREATE_CLASSES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_classes_name \
@@ -450,42 +433,12 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
 
 /// The query of the relation catalog for
 /// [`turso_core::Dialect::schema_state_queries`].
-/// A catalog made before it had `relacl`, `relrowsecurity` or `relpolicies`
-/// and opened read-only, which cannot add them, reads as having no grants,
-/// no row-level security and no policies.
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
-    let table = schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
-    let relacl = if has_acl_column(&table) {
-        "relacl"
-    } else {
-        "NULL AS relacl"
-    };
-    let relrowsecurity = if has_row_security_column(&table) {
-        "relrowsecurity"
-    } else {
-        "0 AS relrowsecurity"
-    };
-    let relpolicies = if has_policies_column(&table) {
-        "relpolicies"
-    } else {
-        "NULL AS relpolicies"
-    };
+    schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     Some(format!(
-        "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, {relacl}, \
-         {relrowsecurity}, {relpolicies} FROM {CLASSES_TABLE_NAME}"
+        "SELECT oid, relname, relnamespace, relkind, relowner, relownedby, relacl, \
+         relrowsecurity, relpolicies FROM {CLASSES_TABLE_NAME}"
     ))
-}
-
-fn has_acl_column(table: &BTreeTable) -> bool {
-    table.get_column(ACL_COLUMN_NAME).is_some()
-}
-
-fn has_row_security_column(table: &BTreeTable) -> bool {
-    table.get_column(ROW_SECURITY_COLUMN_NAME).is_some()
-}
-
-fn has_policies_column(table: &BTreeTable) -> bool {
-    table.get_column(POLICIES_COLUMN_NAME).is_some()
 }
 
 /// [`turso_core::Dialect::relation_owner`] for the PostgreSQL frontend.
@@ -1086,13 +1039,6 @@ struct ClassTableCursors {
     table_cursor_id: usize,
     index_cursor_id: usize,
     index_name: String,
-    /// False for a catalog made before it had `relacl` and opened read-only,
-    /// which has no column to read; the write that follows fails anyway.
-    has_acl_column: bool,
-    /// The same for `relrowsecurity`.
-    has_row_security_column: bool,
-    /// The same for `relpolicies`.
-    has_policies_column: bool,
     /// Only opened when the statement inserts a row, which allocates an oid.
     seq_cursor_id: Option<usize>,
     seq_table: Option<Arc<BTreeTable>>,
@@ -1150,9 +1096,6 @@ fn open_class_table_for_writing(
         table_cursor_id,
         index_cursor_id,
         index_name: name_index.name.clone(),
-        has_acl_column: has_acl_column(&table),
-        has_row_security_column: has_row_security_column(&table),
-        has_policies_column: has_policies_column(&table),
         seq_cursor_id,
         seq_table,
     }))
@@ -1612,30 +1555,9 @@ fn emit_find_class_row(
     program.emit_column_or_rowid(cursors.table_cursor_id, 3, row.relkind_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 4, row.relowner_reg);
     program.emit_column_or_rowid(cursors.table_cursor_id, 5, row.relownedby_reg);
-    if cursors.has_acl_column {
-        program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: row.relacl_reg,
-            dest_end: None,
-        });
-    }
-    if cursors.has_row_security_column {
-        program.emit_column_or_rowid(cursors.table_cursor_id, 7, row.relrowsecurity_reg);
-    } else {
-        program.emit_insn(Insn::Integer {
-            value: 0,
-            dest: row.relrowsecurity_reg,
-        });
-    }
-    if cursors.has_policies_column {
-        program.emit_column_or_rowid(cursors.table_cursor_id, 8, row.relpolicies_reg);
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: row.relpolicies_reg,
-            dest_end: None,
-        });
-    }
+    program.emit_column_or_rowid(cursors.table_cursor_id, 6, row.relacl_reg);
+    program.emit_column_or_rowid(cursors.table_cursor_id, 7, row.relrowsecurity_reg);
+    program.emit_column_or_rowid(cursors.table_cursor_id, 8, row.relpolicies_reg);
     found(program, &row);
     program.emit_insn(Insn::Goto { target_pc: done });
 
@@ -1860,17 +1782,7 @@ pub(crate) fn initialize_schema(
         return Ok(Vec::new());
     }
     let mut statements = Vec::new();
-    if let Some(table) = table {
-        if !has_acl_column(&table) {
-            statements.push(ADD_ACL_COLUMN_SQL.to_string());
-        }
-        if !has_row_security_column(&table) {
-            statements.push(ADD_ROW_SECURITY_COLUMN_SQL.to_string());
-        }
-        if !has_policies_column(&table) {
-            statements.push(ADD_POLICIES_COLUMN_SQL.to_string());
-        }
-    } else {
+    if table.is_none() {
         statements.push(CREATE_CLASSES_TABLE_SQL.to_string());
         statements.push(CREATE_CLASSES_NAME_INDEX_SQL.to_string());
         if schema
