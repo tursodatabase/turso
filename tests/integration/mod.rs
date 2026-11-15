@@ -15,6 +15,7 @@ mod custom_types;
 mod database;
 mod database_leak;
 mod database_open;
+mod dialect;
 mod expr_depth_stack_overflow;
 mod external_apis;
 mod functions;
