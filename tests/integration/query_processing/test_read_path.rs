@@ -4,6 +4,7 @@ use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use std::sync::Arc;
 use tempfile::TempDir;
+use turso_core::vdbe::insn::Insn;
 use turso_core::{ConnectOpts, LimboError, SessionRole, StepResult, Value};
 use turso_core::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 use turso_sqlite::SqliteDialect;
@@ -1554,5 +1555,42 @@ fn test_negate_blob_subscript_invalid_utf8_no_panic() {
     assert!(
         result.is_ok(),
         "Negating a blob subscript with invalid UTF-8 text should not panic"
+    );
+}
+
+#[test]
+fn nth_value_reads_from_saved_rows_without_an_accumulator() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE items(value)").unwrap();
+
+    let statement = conn
+        .prepare("SELECT nth_value(value, 2) OVER (ORDER BY value) FROM items")
+        .unwrap();
+    let instructions = &statement.get_program().insns;
+
+    let missing_row_target = instructions
+        .iter()
+        .find_map(|(instruction, _)| match instruction {
+            Insn::SeekRowid { target_pc, .. } => Some(target_pc.as_offset_int() as usize),
+            _ => None,
+        })
+        .expect("nth_value must read its answer from the saved window rows");
+    assert!(
+        matches!(
+            &instructions[missing_row_target].0,
+            Insn::Halt { on_error: None, .. }
+        ),
+        "a missing saved row must stop execution instead of returning NULL"
+    );
+    assert!(
+        instructions.iter().all(|(instruction, _)| !matches!(
+            instruction,
+            Insn::AggStep { .. } | Insn::AggValue { .. }
+        )),
+        "nth_value must not keep another copy of saved values in an accumulator"
     );
 }

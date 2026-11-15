@@ -1,14 +1,17 @@
 use tempfile::TempDir;
 use turso_core::connection::*;
+use turso_core::dialect::Dialect;
 use turso_core::io::MemoryIO;
 use turso_core::io::IO;
 use turso_core::security::roles::SessionRole;
+use turso_core::storage::database::DatabaseFile;
 use turso_core::sync::Arc;
 use turso_core::ConnectOpts;
 use turso_core::Database;
 use turso_core::DatabaseOpts;
 use turso_core::LimboError;
 use turso_core::OpenFlags;
+use turso_core::OpenOptions;
 use turso_core::Result;
 use turso_core::Value;
 use turso_core::MAIN_DB_ID;
@@ -387,4 +390,22 @@ fn test_setval_uncalled_emits_stored_value_as_next() -> Result<()> {
         "setval(13, false) committed: next nextval must return 13"
     );
     Ok(())
+}
+
+#[test]
+fn consume_stmt_reports_parse_error() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    assert!(conn.consume_stmt("SELECT * FROM").is_err());
+    conn.close().unwrap();
+}
+
+fn open_db(io: &Arc<dyn IO>, path: &str, dialect: Arc<dyn Dialect>) -> Result<Arc<Database>> {
+    let file = io.open_file(path, OpenFlags::Create, true)?;
+    let db_file = Arc::new(DatabaseFile::new(file));
+    Database::open(io.clone(), path, OpenOptions::new(dialect).storage(db_file))
 }
