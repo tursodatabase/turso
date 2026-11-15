@@ -2,8 +2,11 @@ use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
+use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::{ConnectOpts, LimboError, SessionRole, StepResult, Value};
+use turso_core::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+use turso_sqlite::SqliteDialect;
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -1526,4 +1529,30 @@ fn test_overflow_value_read_again_after_row_is_rewritten(
         ]
     );
     Ok(())
+}
+
+#[test]
+fn test_negate_blob_subscript_invalid_utf8_no_panic() {
+    // Reproduces fuzzer bug at seed 27035.
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")
+    }));
+    assert!(
+        result.is_ok(),
+        "Negating a blob subscript with invalid UTF-8 text should not panic"
+    );
 }

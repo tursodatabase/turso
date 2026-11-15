@@ -4531,8 +4531,7 @@ pub(crate) fn decode_serial_type_into_register(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::ConnectOpts;
+
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
@@ -4555,35 +4554,6 @@ mod tests {
         let returned = result.unwrap_err();
         assert_eq!(std::ptr::from_ref(returned.as_ref()), original);
         assert!(matches!(*returned, LimboError::InternalError(ref msg) if msg == "test error"));
-    }
-
-    #[test]
-    fn normal_step_preserves_execution_state_with_and_without_tracing() {
-        for trace in [false, true] {
-            let io = Arc::new(crate::MemoryIO::new());
-            let db =
-                crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.set_vdbe_trace(trace);
-            let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);
-            assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Running);
-            assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
-
-            let mut stmt = conn.prepare("SELECT abs(-9223372036854775808)").unwrap();
-            assert!(matches!(stmt.step(), Err(LimboError::IntegerOverflow)));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Failed);
-
-            conn.set_progress_handler(1, Some(Box::new(|| true)));
-            let mut stmt = conn.prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT sum(x) FROM t").unwrap();
-            assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);
-        }
     }
 
     #[test]

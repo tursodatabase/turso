@@ -1,4 +1,6 @@
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+mod fts;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 mod json;
 
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
