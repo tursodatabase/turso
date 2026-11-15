@@ -7,8 +7,14 @@ use crate::common::{
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as StdOrdering;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
+use turso_core::io::{FileId, FileSyncType};
+use turso_core::{
+    Buffer, Clock, Completion, File, MemoryIO, MonotonicInstant, OpenFlags, WallClockInstant, IO,
+};
 use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, SessionRole,
     StepResult, Value,
@@ -6809,6 +6815,387 @@ fn test_vacuum_into_followed_by_writes_and_indexed_read() -> anyhow::Result<()> 
     assert_eq!(
         scalar_i64(&conn, "SELECT count(*) FROM t INDEXED BY i_c WHERE c >= ''"),
         55
+    );
+
+    Ok(())
+}
+
+/// test to check that vacuum into connection state is reset if it is
+/// interrupted mid way
+#[test]
+fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
+    let did_interrupt = Arc::new(AtomicBool::new(false));
+    let conn_for_progress = conn.clone();
+    let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
+    let did_interrupt_for_handler = did_interrupt.clone();
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || {
+            if !conn_for_progress.get_auto_commit() {
+                let calls = source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+                calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+            } else {
+                false
+            }
+        })),
+    );
+
+    let dest_dir = tempfile::TempDir::new().unwrap();
+    let dest_path = dest_dir.path().join("busy_vacuum.db");
+    let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
+    let step = stmt.step().unwrap();
+    conn.set_progress_handler(0, None);
+
+    assert!(
+        matches!(step, StepResult::Busy),
+        "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+    );
+    assert!(
+        source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+        "test should interrupt after VACUUM INTO opens the source transaction"
+    );
+    assert!(
+        did_interrupt.load(Ordering::SeqCst),
+        "progress handler should have interrupted VACUUM INTO exactly once"
+    );
+    assert!(
+        conn.get_auto_commit(),
+        "Busy cleanup should roll back the source transaction before returning"
+    );
+}
+
+#[test]
+fn test_in_place_vacuum_succeeds_and_releases_source_locks() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "in-place-vacuum-design-b.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    for i in 0..128 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+
+    conn.execute("VACUUM").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT count(*), coalesce(sum(id), 0) FROM t")
+        .unwrap();
+    let mut count = 0_i64;
+    let mut sum = 0_i64;
+    stmt.run_with_row_callback(|row| {
+        count = row.get(0)?;
+        sum = row.get(1)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 64);
+    assert_eq!(sum, (1..128).step_by(2).sum::<i64>());
+    assert!(conn.get_auto_commit());
+
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock());
+    assert!(!pager.holds_write_lock());
+}
+
+#[test]
+fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "in-place-vacuum-busy-before-copyback.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    for i in 0..32 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+            .unwrap();
+    }
+
+    let did_interrupt = Arc::new(AtomicBool::new(false));
+    let conn_for_progress = conn.clone();
+    let did_interrupt_for_handler = did_interrupt.clone();
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || {
+            !conn_for_progress.get_auto_commit()
+                && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+        })),
+    );
+
+    let mut stmt = conn.prepare("VACUUM").unwrap();
+    let step = stmt.step().unwrap();
+    conn.set_progress_handler(0, None);
+
+    assert!(
+        matches!(step, StepResult::Busy),
+        "progress interruption inside in-place VACUUM should surface as Busy, got {step:?}"
+    );
+    assert!(
+        did_interrupt.load(Ordering::SeqCst),
+        "test should interrupt after in-place VACUUM opens the source snapshot"
+    );
+    assert!(
+        conn.get_auto_commit(),
+        "Busy cleanup should restore auto-commit before returning"
+    );
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock());
+    assert!(!pager.holds_write_lock());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SyncCounts {
+    db: usize,
+    wal: usize,
+}
+
+struct SyncCountingIo {
+    inner: Arc<MemoryIO>,
+    tracked_db_path: String,
+    tracked_wal_path: String,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl SyncCountingIo {
+    fn new(tracked_db_path: &str) -> Self {
+        Self {
+            inner: Arc::new(MemoryIO::new()),
+            tracked_db_path: tracked_db_path.to_string(),
+            tracked_wal_path: format!("{tracked_db_path}-wal"),
+            db_syncs: Arc::new(AtomicUsize::new(0)),
+            wal_syncs: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn counts(&self) -> SyncCounts {
+        SyncCounts {
+            db: self.db_syncs.load(StdOrdering::SeqCst),
+            wal: self.wal_syncs.load(StdOrdering::SeqCst),
+        }
+    }
+}
+
+impl Clock for SyncCountingIo {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for SyncCountingIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        let inner = self.inner.open_file(path, flags, direct)?;
+        Ok(Arc::new(SyncCountingFile {
+            inner,
+            count_as_db_sync: path == self.tracked_db_path,
+            count_as_wal_sync: path == self.tracked_wal_path,
+            db_syncs: self.db_syncs.clone(),
+            wal_syncs: self.wal_syncs.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.drain_completions(completions)
+    }
+
+    fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.cancel(completions)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+struct SyncCountingFile {
+    inner: Arc<dyn File>,
+    count_as_db_sync: bool,
+    count_as_wal_sync: bool,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl File for SyncCountingFile {
+    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.pread(pos, c)
+    }
+
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> turso_core::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if self.count_as_db_sync {
+            self.db_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        if self.count_as_wal_sync {
+            self.wal_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        self.inner.sync(c, sync_type)
+    }
+
+    fn size(&self) -> turso_core::Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.truncate(len, c)
+    }
+}
+
+#[test]
+fn in_place_vacuum_with_sync_off_syncs_source_db_once_and_wal_twice() -> turso_core::Result<()> {
+    let io = Arc::new(SyncCountingIo::new("vacuum-source.db"));
+    let io_dyn: Arc<dyn IO> = io.clone();
+    let db = Database::open_file_with_flags(
+        io_dyn,
+        "vacuum-source.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.set_sync_mode(turso_core::SyncMode::Off);
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'y')")?;
+
+    let before = io.counts();
+    assert_eq!(
+        before.db, 1,
+        "creating the database does exactly one source db fsync (page 1 must be \
+         durable before the first WAL commit, even with synchronous=OFF); \
+         ordinary writes must not add more"
+    );
+
+    conn.execute("VACUUM")?;
+
+    let after = io.counts();
+    assert_eq!(
+        after.db - before.db,
+        1,
+        "in-place VACUUM must do exactly one source DB fsync before truncating WAL"
+    );
+    assert_eq!(
+        after.wal - before.wal,
+        2,
+        "in-place VACUUM with synchronous=OFF must do one WAL fsync before backfill \
+         (the checkpoint crash-atomicity barrier; VACUUM forces the checkpoint to \
+         synchronous=FULL) and one after truncation"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> turso_core::Result<()> {
+    let io = Arc::new(SyncCountingIo::new("vacuum-source-full.db"));
+    let io_dyn: Arc<dyn IO> = io.clone();
+    let db = Database::open_file_with_flags(
+        io_dyn,
+        "vacuum-source-full.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.set_sync_mode(turso_core::SyncMode::Off);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'y')")?;
+
+    conn.set_sync_mode(turso_core::SyncMode::Full);
+    let before = io.counts();
+
+    conn.execute("VACUUM")?;
+
+    let after = io.counts();
+    assert_eq!(
+        after.db - before.db,
+        1,
+        "in-place VACUUM must still do exactly one source DB fsync under synchronous=FULL"
+    );
+    assert_eq!(
+        after.wal - before.wal,
+        3,
+        "in-place VACUUM with synchronous=FULL must do one WAL fsync before publish, \
+         one before backfill (the checkpoint crash-atomicity barrier), and one after \
+         truncation"
     );
 
     Ok(())

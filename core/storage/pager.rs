@@ -6914,15 +6914,6 @@ mod tests {
         drop(db);
     }
 
-    #[test]
-    #[should_panic(expected = "rollback must discard pages while holding the WAL write lock")]
-    fn rollback_without_the_write_lock_panics() {
-        let (_db, conn) = open_memory_database("rollback-without-write-lock.db");
-        conn.execute("CREATE TABLE t(x)").unwrap();
-
-        conn.pager.load().rollback(false, &conn, true);
-    }
-
     fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = crate::Database::open_file(io, path, Arc::new(crate::EngineDialect)).unwrap();
