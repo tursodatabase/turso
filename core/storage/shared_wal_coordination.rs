@@ -754,6 +754,11 @@ type ProcessMappingResult = (
     Arc<Mutex<ProcessLocalOwnershipState>>,
 );
 
+#[cfg(test)]
+thread_local! {
+    static FRAME_BLOCK_PROBE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl MappedSharedWalCoordination {
     const fn default_ownership_mode() -> SharedWalOwnershipMode {
         if cfg!(target_os = "linux") {
@@ -2801,6 +2806,8 @@ impl MappedSharedWalCoordination {
         let mut slot = Self::hash_page_id(page_id);
         let mut latest = None;
         for _ in 0..FRAME_INDEX_BLOCK_HASH_SLOTS {
+            #[cfg(test)]
+            FRAME_BLOCK_PROBE_STEPS.with(|steps| steps.set(steps.get() + 1));
             let local_plus_one = hash[slot];
             if local_plus_one == 0 {
                 break;
@@ -4421,6 +4428,28 @@ mod tests {
             mapped.iter_latest_frames(0, 10),
             vec![(colliding[0], 6), (colliding[1], 10), (colliding[2], 8),]
         );
+    }
+
+    #[test]
+    fn find_frame_does_not_spin_on_an_entry_its_reader_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let colliding = colliding_page_ids(3);
+
+        mapped.record_frame(colliding[0], 2);
+        mapped.record_frame(colliding[1], 4);
+        mapped.record_frame(colliding[0], 6);
+        mapped.record_frame(colliding[2], 8);
+        mapped.record_frame(colliding[1], 10);
+
+        FRAME_BLOCK_PROBE_STEPS.with(|steps| steps.set(0));
+        let found = mapped.find_frame(colliding[1], 0, 10, Some(9));
+        let probe_steps = FRAME_BLOCK_PROBE_STEPS.with(|steps| steps.get());
+
+        assert_eq!(found, Some(4));
+        // 5 entries in the chain plus the empty slot that ends it.
+        assert!(probe_steps <= 6, "probed {probe_steps} slots");
     }
 
     #[test]
