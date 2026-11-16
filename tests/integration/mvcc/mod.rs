@@ -2,6 +2,7 @@ mod checkpoint;
 mod database;
 mod group_commit;
 mod hermitage;
+mod persistence;
 mod store;
 mod test_db;
 
