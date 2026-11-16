@@ -2880,32 +2880,25 @@ impl PostgreSQLTranslator {
             ast::QualifiedName::single(name)
         };
         if func_name == "unnest" {
-            if args.len() != 1 || range_func.ordinality || range_func.functions.len() != 1 {
+            if args.len() != 1 {
                 return Err(ParseError::ParseError(
-                    "unnest currently requires one array without WITH ORDINALITY or ROWS FROM"
-                        .into(),
+                    "unnest currently requires exactly one array".into(),
                 ));
             }
-            let column_name = match range_func.alias.as_ref() {
-                Some(alias) if alias.colnames.len() > 1 => {
-                    return Err(ParseError::ParseError(
-                        "unnest has only one output column".into(),
-                    ));
-                }
-                Some(alias) => match alias.colnames.first().and_then(|node| node.node.as_ref()) {
-                    Some(pg_query::protobuf::node::Node::String(name)) => name.sval.clone(),
-                    None => alias.aliasname.clone(),
-                    _ => {
-                        return Err(ParseError::ParseError("invalid unnest column alias".into()));
-                    }
-                },
-                None => "unnest".into(),
-            };
+            let element_name = range_func
+                .alias
+                .as_ref()
+                .map_or(func_name, |range_alias| range_alias.aliasname.as_str());
+            let names = range_function_column_names(range_func, vec![element_name.to_string()])?;
+            let column = |name: &str| ast::Expr::Id(exact_name(name));
             return Ok(ast::SelectTable::Select {
                 select: function_select(
                     qualified_name,
                     args,
-                    vec![(ast::Expr::Id(exact_name("unnest")), column_name)],
+                    [column("unnest"), bigint(column("ordinality"))]
+                        .into_iter()
+                        .zip(names)
+                        .collect(),
                 ),
                 alias,
                 lateral: true,
@@ -13545,6 +13538,7 @@ mod tests {
             "two columns with the same name",
         );
         assert_translates("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS g(n, o)");
+        assert_translates("SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(x, o)");
         assert_not_supported(
             "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
             "inside ROWS FROM",

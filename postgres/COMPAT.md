@@ -246,7 +246,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
-| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(); rejected on other functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
+| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series() and unnest(); rejected on other functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 

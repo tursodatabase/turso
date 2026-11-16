@@ -16,7 +16,7 @@ impl VirtualTableModule for Unnest {
     type Table = Self;
 
     fn schema(&self, _args: &[Value]) -> Result<String> {
-        Ok("CREATE TABLE unnest (unnest, input HIDDEN)".into())
+        Ok("CREATE TABLE unnest (unnest, input HIDDEN, ordinality INTEGER HIDDEN)".into())
     }
 
     fn create(&self, _args: &[Value]) -> Result<Self> {
@@ -82,6 +82,7 @@ impl VirtualTableCursor for UnnestCursor {
         Ok(IOResult::Done(match column {
             0 => self.values[self.position].clone(),
             1 => self.input.clone(),
+            2 => Value::from_i64(self.position as i64 + 1),
             _ => unreachable!("invalid unnest column"),
         }))
     }

@@ -251,6 +251,140 @@ expect {
     300|3
 }
 
+setup arrays {
+    CREATE TABLE t(id INT, arr TEXT[]);
+    INSERT INTO t VALUES (1, '{a,b}'), (2, '{}'), (3, NULL), (4, '{c}');
+}
+
+test unnest-with-ordinality {
+    SELECT * FROM unnest(ARRAY['a', 'b']) WITH ORDINALITY;
+}
+expect {
+    a|1
+    b|2
+}
+
+test unnest-with-ordinality-column-names {
+    SELECT unnest, ordinality FROM unnest(ARRAY['a']) WITH ORDINALITY;
+    SELECT u.u, u.ordinality FROM unnest(ARRAY['b']) WITH ORDINALITY AS u;
+    SELECT x, ordinality FROM unnest(ARRAY['c']) WITH ORDINALITY AS u(x);
+    SELECT n, x FROM unnest(ARRAY['d']) WITH ORDINALITY AS u(x, n);
+}
+expect {
+    a|1
+    b|1
+    c|1
+    1|d
+}
+
+test unnest-column-alias-list-longer-than-element-and-ordinality-errors {
+    SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+    table "u" has 2 columns available but 3 columns specified
+}
+
+test unnest-column-alias-list-longer-than-element-errors {
+    SELECT * FROM unnest(ARRAY[1, 2]) AS u(a, b);
+}
+@sqlstate 42P10
+expect error {
+    table "u" has 1 columns available but 2 columns specified
+}
+
+test unnest-without-ordinality-has-no-ordinality-column {
+    SELECT * FROM unnest(ARRAY[1]) AS u WHERE ordinality = 1;
+}
+@sqlstate 42703
+expect error {
+}
+
+test unnest-ordinality-counts-null-elements {
+    SELECT COALESCE(x, '<null>'), n FROM unnest(ARRAY[NULL, 'b', NULL]) WITH ORDINALITY AS u(x, n) WHERE n > 1;
+}
+expect {
+    b|2
+    <null>|3
+}
+
+test unnest-ordinality-is-the-position-and-not-the-sort-order {
+    SELECT * FROM unnest(ARRAY[3, 1, 2]) WITH ORDINALITY AS u(x, o) ORDER BY x;
+}
+expect {
+    1|2
+    2|3
+    3|1
+}
+
+test unnest-ordinality-of-a-null-array {
+    SELECT count(*) FROM unnest(NULL::int[]) WITH ORDINALITY;
+}
+expect {
+    0
+}
+
+test unnest-ordinality-of-a-two-dimensional-array {
+    SELECT * FROM unnest(ARRAY[[1, 2], [3, 4]]) WITH ORDINALITY;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+}
+
+@setup arrays
+test unnest-ordinality-restarts-for-each-table-row {
+    SELECT id, x, ordinality FROM t, unnest(arr) WITH ORDINALITY AS u(x) ORDER BY id, ordinality;
+}
+expect {
+    1|a|1
+    1|b|2
+    4|c|1
+}
+
+@setup arrays
+test unnest-ordinality-is-null-for-unmatched-left-join-rows {
+    SELECT id, x, n FROM t LEFT JOIN LATERAL unnest(arr) WITH ORDINALITY AS u(x, n) ON true ORDER BY id, n;
+}
+expect {
+    1|a|1
+    1|b|2
+    2||
+    3||
+    4|c|1
+}
+
+@setup arrays
+test where-on-unnest-ordinality-in-a-lateral-join {
+    SELECT id, x, n FROM t CROSS JOIN LATERAL unnest(arr) WITH ORDINALITY AS u(x, n) WHERE n = 2;
+}
+expect {
+    1|b|2
+}
+
+@setup arrays
+test unnest-ordinality-in-a-correlated-scalar-subquery {
+    SELECT id, (SELECT max(o) FROM unnest(arr) WITH ORDINALITY AS u(x, o)) FROM t ORDER BY id;
+}
+expect {
+    1|2
+    2|
+    3|
+    4|1
+}
+
+test unnest-argument-is-a-table-column-named-ordinality {
+    CREATE TABLE k(ordinality INT[]);
+    INSERT INTO k VALUES ('{5,6}');
+    SELECT e, o FROM k, unnest(ordinality) WITH ORDINALITY AS u(e, o);
+}
+expect {
+    5|1
+    6|2
+}
+
 test with-ordinality-after-the-alias-is-a-syntax-error {
     SELECT * FROM generate_series(1, 2) AS g WITH ORDINALITY;
 }
