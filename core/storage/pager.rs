@@ -3296,6 +3296,11 @@ impl Pager {
         self.wal.as_ref().map(|wal| wal.backfill_frame())
     }
 
+    /// The write-ahead log of this pager, or `None` if there is no WAL.
+    pub fn wal(&self) -> Option<&Arc<dyn Wal>> {
+        self.wal.as_ref()
+    }
+
     /// Number of the last frame in the WAL, or `None` if there is no WAL.
     pub fn wal_max_frame(&self) -> Option<u64> {
         self.wal.as_ref().map(|wal| wal.get_max_frame_in_wal())
