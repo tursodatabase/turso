@@ -1804,6 +1804,14 @@ impl ToTokens for Grant {
                 }
                 s.comma(relations, context)?;
             }
+            GrantObjects::Roles(roles) => {
+                for (i, role) in roles.iter().enumerate() {
+                    if i > 0 {
+                        s.append(TK_COMMA, None)?;
+                    }
+                    s.append(TK_ID, Some(role))?;
+                }
+            }
         }
         if self.revoke {
             s.append(TK_FROM, None)?;

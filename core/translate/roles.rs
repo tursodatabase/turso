@@ -86,7 +86,9 @@ pub fn check_statement_privileges(
             )
         }
         // The dialect decides who may grant or revoke on each relation, from
-        // the privileges it stores.
+        // the privileges it stores, and who may grant or revoke role
+        // membership, after it looks up the roles so that a role that does
+        // not exist is reported as such.
         ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
@@ -529,19 +531,31 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT` and `REVOKE`: the dialect changes the privileges it stores with
-/// each relation, through its relation hooks, as it stores ownership.
+/// `GRANT` and `REVOKE`. Of privileges on relations, the dialect changes
+/// the privileges it stores with each relation, through its relation hooks,
+/// as it stores ownership. Of roles, the dialect stores the membership,
+/// through the same hook as its other catalog changes.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let ast::GrantObjects::Relations {
-        privileges,
-        on_sequences,
-        relations,
-    } = &grant.objects;
+    let (privileges, on_sequences, relations) = match &grant.objects {
+        ast::GrantObjects::Relations {
+            privileges,
+            on_sequences,
+            relations,
+        } => (privileges, on_sequences, relations),
+        ast::GrantObjects::Roles(roles) => {
+            let change = CatalogChange::GrantRole {
+                revoke: grant.revoke,
+                roles: roles.clone(),
+                grantees: grant.grantees.clone(),
+            };
+            return translate_change(change, resolver, program, connection);
+        }
+    };
     let mut changes = Vec::with_capacity(relations.len());
     for qualified_name in relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());

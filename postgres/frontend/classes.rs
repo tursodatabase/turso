@@ -353,6 +353,11 @@ impl ClassCatalog {
                     "CREATE ROLE reached the relation catalog".to_string(),
                 ));
             }
+            CatalogChange::GrantRole { .. } => {
+                return Err(LimboError::InternalError(
+                    "GRANT of role membership reached the relation catalog".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1011,6 +1016,11 @@ pub(crate) fn translate_catalog_changes(
             CatalogChange::CreateRole { .. } => {
                 return Err(LimboError::InternalError(
                     "CREATE ROLE reached the relation catalog".to_string(),
+                ));
+            }
+            CatalogChange::GrantRole { .. } => {
+                return Err(LimboError::InternalError(
+                    "GRANT of role membership reached the relation catalog".to_string(),
                 ));
             }
         }

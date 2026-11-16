@@ -1598,6 +1598,9 @@ pub enum GrantObjects {
         on_sequences: bool,
         relations: Vec<QualifiedName>,
     },
+    /// `roles`: each grantee becomes a member of each of the roles, which
+    /// are named.
+    Roles(Vec<String>),
 }
 
 /// A privilege on a relation.
