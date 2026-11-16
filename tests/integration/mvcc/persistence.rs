@@ -1,52 +1,11 @@
+use super::checkpoint::{assert_integrity_ok, get_rows, wal_path_for_db, FixedYieldInjector};
 use crate::mvcc::test_db::MvccTestDbNoConn;
-use std::fmt::Debug;
 use turso_core::mvcc::database::checkpoint::CheckpointState;
 use turso_core::mvcc::database::checkpoint::CheckpointStateMachine;
-use turso_core::CheckpointMode;
-use turso_core::Connection;
-#[allow(unused_imports)]
-use turso_core::IOExt;
-
-use rustc_hash::FxHashSet as HashSet;
-
 use turso_core::mvcc::database::checkpoint::CheckpointYieldPoint;
-
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
-
-use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
-
 use turso_core::state_machine::{StateTransition, TransitionResult};
-
-use turso_core::sync::Mutex;
-
-use std::sync::Arc;
-
-#[derive(Debug)]
-struct FixedYieldInjector {
-    remaining: Mutex<HashSet<YieldPoint>>,
-}
-
-impl FixedYieldInjector {
-    fn new(points: impl IntoIterator<Item = YieldPoint>) -> Arc<Self> {
-        Arc::new(Self {
-            remaining: Mutex::new(points.into_iter().collect()),
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.remaining.lock().is_empty()
-    }
-}
-
-impl YieldInjector for FixedYieldInjector {
-    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
-        self.remaining.lock().remove(&point)
-    }
-}
-
-fn wal_path_for_db(path: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{path}-wal"))
-}
+use turso_core::CheckpointMode;
 
 /// Truncate checkpoint must collect commits that land while waiting for `AcquireLock`, and zero the logical log.
 #[test]
@@ -248,26 +207,6 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
     assert_eq!(rows[1][0].as_int().unwrap(), 2);
     assert_eq!(rows[1][1].to_string(), "after-snapshot");
     assert_integrity_ok(&conn);
-}
-
-use turso_core::Value;
-
-fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
-    let mut stmt = conn.prepare(query).unwrap();
-    let mut rows = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        rows.push(values);
-        Ok(())
-    })
-    .unwrap();
-    rows
-}
-
-fn assert_integrity_ok(conn: &Arc<Connection>) {
-    let rows = get_rows(conn, "PRAGMA integrity_check");
-    assert_eq!(rows.len(), 1, "integrity_check rows: {rows:?}");
-    assert_eq!(rows[0][0].to_string(), "ok");
 }
 
 /// These cases came from an adversarial DDL/DML matrix. They did not find a
