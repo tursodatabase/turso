@@ -2905,7 +2905,6 @@ impl PostgreSQLTranslator {
                 select: function_select(
                     qualified_name,
                     args,
-                    None,
                     vec![(ast::Expr::Id(exact_name("unnest")), column_name)],
                 ),
                 alias,
@@ -2935,15 +2934,10 @@ impl PostgreSQLTranslator {
                 vec![column("value"), column("start"), column("step")],
             ));
             let alias = alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)));
-            // Evaluate the arguments in their own VALUES row so that names like `value` or
-            // `start` resolve to columns on the left, not to generate_series's own columns.
-            // VALUES, unlike a SELECT, still rejects aggregate and window functions.
-            let (arguments, args) = function_arguments_subquery(args);
             return Ok(ast::SelectTable::Select {
                 select: function_select(
                     qualified_name,
                     args,
-                    Some(arguments),
                     [column("value"), ordinality]
                         .into_iter()
                         .zip(names)
@@ -5591,27 +5585,26 @@ impl PostgreSQLTranslator {
     }
 }
 
+/// A SELECT of `columns` from a call of the table function `function`.
+///
+/// The arguments are evaluated in their own VALUES row, so that a name in them
+/// such as `value` or `input` is a column of the query and not one of the
+/// function's own columns. VALUES, unlike a SELECT, still rejects aggregate
+/// and window functions.
 #[allow(clippy::vec_box)]
 fn function_select(
     function: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
-    arguments: Option<ast::SelectTable>,
     columns: Vec<(ast::Expr, String)>,
 ) -> ast::Select {
-    let call = ast::SelectTable::TableCall(function, args, None);
-    let from = match arguments {
-        Some(arguments) => ast::FromClause {
-            select: Box::new(arguments),
-            joins: vec![ast::JoinedSelectTable {
-                operator: ast::JoinOperator::Comma,
-                table: Box::new(call),
-                constraint: None,
-            }],
-        },
-        None => ast::FromClause {
-            select: Box::new(call),
-            joins: vec![],
-        },
+    let (arguments, args) = function_arguments_subquery(args);
+    let from = ast::FromClause {
+        select: Box::new(arguments),
+        joins: vec![ast::JoinedSelectTable {
+            operator: ast::JoinOperator::Comma,
+            table: Box::new(ast::SelectTable::TableCall(function, args, None)),
+            constraint: None,
+        }],
     };
     ast::Select {
         with: None,

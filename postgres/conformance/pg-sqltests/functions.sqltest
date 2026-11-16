@@ -1080,6 +1080,18 @@ expect {
     0
 }
 
+test unnest-argument-is-a-table-column-with-the-name-of-a-column-of-unnest {
+    CREATE TABLE unnest_names (input int[], unnest int[]);
+    INSERT INTO unnest_names VALUES ('{1,2}', '{7}');
+    SELECT u FROM unnest_names, unnest(input) AS u;
+    SELECT u FROM unnest_names, unnest(unnest) AS u;
+}
+expect {
+    1
+    2
+    7
+}
+
 test unnest-pgdump-correlated {
     CREATE TABLE unnest_tags (id int, tags text[]);
     INSERT INTO unnest_tags VALUES (1, ARRAY['a', 'b']), (2, ARRAY['c']), (3, NULL);
