@@ -660,3 +660,17 @@ pub trait Dialect: Send + Sync + 'static {
         true
     }
 }
+
+/// Returns true if `sql` parses as a `CREATE VIRTUAL TABLE` statement.
+///
+/// Like SQLite (whose `sqlite3InitCallback` feeds schema SQL to the real
+/// parser, so a row is a virtual table purely as a byproduct of the
+/// `create_vtab` grammar rule), classification is done by parsing rather than
+/// by substring or token matching, which would misclassify regular tables
+/// whose SQL merely contains the text (e.g. in a DEFAULT literal).
+pub fn sql_is_create_virtual_table(sql: &str) -> bool {
+    matches!(
+        engine::parse_statement(sql),
+        Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
+    )
+}
