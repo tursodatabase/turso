@@ -2752,9 +2752,6 @@ impl PostgreSQLTranslator {
                 "ROWS FROM with several functions",
             ));
         }
-        if range_func.ordinality {
-            return Err(ParseError::not_supported("WITH ORDINALITY"));
-        }
         let func_item = range_func
             .functions
             .first()
@@ -2825,6 +2822,7 @@ impl PostgreSQLTranslator {
         // column comes back as bytea.
         if args.is_empty() && matches!(func_name, "current_schema" | "current_database" | "version")
         {
+            reject_ordinality(range_func, func_name)?;
             reject_column_aliases(&range_func.alias, "a function")?;
             let column_name = match &alias {
                 Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
@@ -2904,12 +2902,11 @@ impl PostgreSQLTranslator {
                 None => "unnest".into(),
             };
             return Ok(ast::SelectTable::Select {
-                select: single_column_function_select(
+                select: function_select(
                     qualified_name,
                     args,
                     None,
-                    "unnest",
-                    column_name,
+                    vec![(ast::Expr::Id(exact_name("unnest")), column_name)],
                 ),
                 alias,
                 lateral: true,
@@ -2927,43 +2924,36 @@ impl PostgreSQLTranslator {
             )));
         }
         if func_name == "generate_series" {
-            let column_name = match &range_func.alias {
-                Some(range_alias) => {
-                    let names = alias_column_names(range_alias)?;
-                    if names.len() > 1 {
-                        return Err(ParseError::Sqlstate {
-                            sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
-                            message: format!(
-                                "table \"{}\" has 1 columns available but {} columns specified",
-                                range_alias.aliasname,
-                                names.len()
-                            ),
-                        });
-                    }
-                    names
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| range_alias.aliasname.clone())
-                }
-                None => func_name.to_string(),
-            };
+            let value_name = range_func
+                .alias
+                .as_ref()
+                .map_or(func_name, |range_alias| range_alias.aliasname.as_str());
+            let names = range_function_column_names(range_func, vec![value_name.to_string()])?;
+            let column = |name: &str| ast::Expr::Id(exact_name(name));
+            let ordinality = bigint(function_call(
+                "pg_generate_series_ordinality",
+                vec![column("value"), column("start"), column("step")],
+            ));
             let alias = alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)));
             // Evaluate the arguments in their own VALUES row so that names like `value` or
             // `start` resolve to columns on the left, not to generate_series's own columns.
             // VALUES, unlike a SELECT, still rejects aggregate and window functions.
             let (arguments, args) = function_arguments_subquery(args);
             return Ok(ast::SelectTable::Select {
-                select: single_column_function_select(
+                select: function_select(
                     qualified_name,
                     args,
                     Some(arguments),
-                    "value",
-                    column_name,
+                    [column("value"), ordinality]
+                        .into_iter()
+                        .zip(names)
+                        .collect(),
                 ),
                 alias: Some(alias),
                 lateral: true,
             });
         }
+        reject_ordinality(range_func, func_name)?;
         reject_column_aliases(&range_func.alias, "a function")?;
 
         fn function_uses_main_schema(name: &str) -> bool {
@@ -5602,12 +5592,11 @@ impl PostgreSQLTranslator {
 }
 
 #[allow(clippy::vec_box)]
-fn single_column_function_select(
+fn function_select(
     function: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
     arguments: Option<ast::SelectTable>,
-    source_column: &str,
-    column_name: String,
+    columns: Vec<(ast::Expr, String)>,
 ) -> ast::Select {
     let call = ast::SelectTable::TableCall(function, args, None);
     let from = match arguments {
@@ -5629,10 +5618,15 @@ fn single_column_function_select(
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
                 distinctness: None,
-                columns: vec![ast::ResultColumn::Expr(
-                    Box::new(ast::Expr::Id(exact_name(source_column))),
-                    Some(ast::As::Elided(exact_name(column_name))),
-                )],
+                columns: columns
+                    .into_iter()
+                    .map(|(expr, name)| {
+                        ast::ResultColumn::Expr(
+                            Box::new(expr),
+                            Some(ast::As::Elided(exact_name(name))),
+                        )
+                    })
+                    .collect(),
                 from: Some(from),
                 where_clause: None,
                 group_by: None,
@@ -5671,6 +5665,71 @@ fn function_arguments_subquery(
         lateral: false,
     };
     (subquery, arg_refs)
+}
+
+fn bigint(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: "BIGINT".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
+fn reject_ordinality(
+    range_func: &pg_query::protobuf::RangeFunction,
+    func_name: &str,
+) -> Result<(), ParseError> {
+    if range_func.ordinality {
+        return Err(ParseError::not_supported(format!(
+            "WITH ORDINALITY on {func_name}()"
+        )));
+    }
+    Ok(())
+}
+
+/// The names of the columns of a function in FROM. `function_columns` are the
+/// names without a column alias list. WITH ORDINALITY adds a last column.
+fn range_function_column_names(
+    range_func: &pg_query::protobuf::RangeFunction,
+    function_columns: Vec<String>,
+) -> Result<Vec<String>, ParseError> {
+    let mut names = function_columns;
+    if range_func.ordinality {
+        // FIXME: PostgreSQL types this column bigint. It is reported as integer until
+        // a subquery column reports the type of its expression.
+        names.push("ordinality".to_string());
+    }
+    if let Some(alias) = &range_func.alias {
+        let aliases = alias_column_names(alias)?;
+        if aliases.len() > names.len() {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                message: format!(
+                    "table \"{}\" has {} columns available but {} columns specified",
+                    alias.aliasname,
+                    names.len(),
+                    aliases.len()
+                ),
+            });
+        }
+        for (name, alias) in names.iter_mut().zip(aliases) {
+            *name = alias;
+        }
+    }
+    let has_two_columns_with_one_name = names.iter().enumerate().any(|(i, name)| {
+        names[..i]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+    });
+    if has_two_columns_with_one_name {
+        return Err(ParseError::not_supported(
+            "two columns with the same name in a function in FROM",
+        ));
+    }
+    Ok(names)
 }
 
 fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, ParseError> {
@@ -13485,9 +13544,14 @@ mod tests {
             "several functions",
         );
         assert_not_supported(
-            "SELECT * FROM generate_series(1, 3) WITH ORDINALITY",
-            "WITH ORDINALITY",
+            "SELECT * FROM json_each('[1]') WITH ORDINALITY",
+            "WITH ORDINALITY on json_each()",
         );
+        assert_not_supported(
+            "SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS ordinality",
+            "two columns with the same name",
+        );
+        assert_translates("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS g(n, o)");
         assert_not_supported(
             "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
             "inside ROWS FROM",
