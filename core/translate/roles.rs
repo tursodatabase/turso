@@ -20,7 +20,7 @@ use crate::security::roles::RoleId;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
-use crate::translate::row_security::translate_change;
+use crate::translate::row_security::{self, translate_change};
 use crate::translate::schema::emit_schema_cookie;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{bail_parse_error, CatalogChange, LimboError, Result, MAIN_DB_ID};
@@ -159,9 +159,19 @@ pub fn check_statement_privileges(
                 _ => owner_denial(),
             }
         }
-        // Only the table's owner may create or drop its policies, as in
-        // PostgreSQL.
+        // Only the table's owner may create, alter or drop its policies, as
+        // in PostgreSQL.
         ast::Stmt::CreatePolicy(policy) => {
+            if may_act_as_owner_of_table(resolver, connection, &policy.tbl_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Alter,
+                Object::Table(policy.tbl_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::AlterPolicy(policy) => {
+            row_security::reject_unknown_roles_of_alter_policy(policy, resolver)?;
             if may_act_as_owner_of_table(resolver, connection, &policy.tbl_name) {
                 return Ok(());
             }
