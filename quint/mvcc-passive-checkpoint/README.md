@@ -35,11 +35,12 @@ These results are evidence within these bounds and this model, not proof.
 There are three specs in this folder.
 
 - Rows (`MvccPassiveCheckpoint.qnt`): version chains, the logical log, WAL
-  frames, the database file, writers, the checkpoint and GC. It checks the
-  invariants `ReadsCorrect`, `RecoveryCorrect`, `BackfillBelowReaders`,
-  `BackfillFloorBelowReaders` and `CollectsEveryChange`. The main
-  configuration has 1 key, 2 readers, 5 timestamps and 2 checkpoints. TLC
-  explores 16,786,385 states in 10 minutes on 3 workers.
+  frames, the database file, writers, the checkpoint and GC. The main
+  configuration checks the invariants `ReadsCorrect`, `RecoveryCorrect`,
+  `BackfillBelowReaders` and `BackfillFloorBelowReaders`. The dirty-key
+  variants also check `CollectsEveryChange`. The main configuration has 1 key,
+  2 readers, 5 timestamps and 2 checkpoints. TLC explores 16,786,385 states in
+  10 minutes on 3 workers.
 - Schema (`MvccPassiveSchema.qnt`): table ids, root bindings,
   `sqlite_schema`, the schema cookie, page allocation, DDL, publish and
   recovery. The main configuration has 2 tables, pages 2 and 3, 1 reader, 4
