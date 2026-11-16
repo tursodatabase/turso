@@ -1,6 +1,7 @@
 use crate::dialect::CatalogChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::view::extract_view_columns;
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
@@ -10,8 +11,7 @@ use crate::translate::{
     schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
-    escape_sql_string_literal, extract_view_columns, normalize_ident,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};

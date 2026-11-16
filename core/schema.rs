@@ -190,6 +190,8 @@ struct SequenceMetadata {
 
 use crate::util::quote_identifier as quote_ident;
 
+pub mod view;
+
 /// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
 pub fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
     let mut cloned = expr.clone();
@@ -4502,8 +4504,9 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(namespace, &select, self)?;
+                            let mut view_column_schema = crate::schema::view::extract_view_columns(
+                                namespace, &select, self,
+                            )?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
                                 view_name,

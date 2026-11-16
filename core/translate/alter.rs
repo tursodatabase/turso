@@ -3655,7 +3655,7 @@ impl<'a> ColumnRenameMode<'a> {
 struct TargetQualifiers {
     names: Vec<String>,
     unqualified_column_is_from_other_table: bool,
-    ctes: rustc_hash::FxHashMap<String, crate::util::ViewColumnSchema>,
+    ctes: rustc_hash::FxHashMap<String, crate::schema::view::ViewColumnSchema>,
 }
 
 impl TargetQualifiers {
@@ -3700,7 +3700,7 @@ impl TargetQualifiers {
                 _ => {
                     other_table_has_column |= resolver
                         .with_schema(database_id, |schema| {
-                            crate::util::select_table_column_names(
+                            crate::schema::view::select_table_column_names(
                                 NamespaceId::ROOT,
                                 select_table,
                                 schema,
@@ -4168,7 +4168,7 @@ fn apply_select_for_column_rename(
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
         ctes: resolver.with_schema(database_id, |schema| {
-            crate::util::extract_cte_columns(
+            crate::schema::view::extract_cte_columns(
                 NamespaceId::ROOT,
                 &select.with,
                 schema,
