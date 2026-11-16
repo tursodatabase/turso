@@ -1791,12 +1791,20 @@ impl ToTokens for Grant {
         context: &C,
     ) -> Result<(), S::Error> {
         s.append(TK_ID, Some(if self.revoke { "REVOKE" } else { "GRANT" }))?;
-        s.comma(&self.privileges, context)?;
-        s.append(TK_ON, None)?;
-        if self.on_sequences {
-            s.append(TK_ID, Some("SEQUENCE"))?;
+        match &self.objects {
+            GrantObjects::Relations {
+                privileges,
+                on_sequences,
+                relations,
+            } => {
+                s.comma(privileges, context)?;
+                s.append(TK_ON, None)?;
+                if *on_sequences {
+                    s.append(TK_ID, Some("SEQUENCE"))?;
+                }
+                s.comma(relations, context)?;
+            }
         }
-        s.comma(&self.relations, context)?;
         if self.revoke {
             s.append(TK_FROM, None)?;
         } else {

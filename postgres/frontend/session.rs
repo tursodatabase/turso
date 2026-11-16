@@ -1950,9 +1950,11 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
     Ok(vec![DeferredStatement {
         command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
             revoke: stmt.revoke,
-            privileges: stmt.privileges.clone(),
-            on_sequences: stmt.on_sequences,
-            relations,
+            objects: ast::GrantObjects::Relations {
+                privileges: stmt.privileges.clone(),
+                on_sequences: stmt.on_sequences,
+                relations,
+            },
             grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
         })),
         context: CommandContext::Default,

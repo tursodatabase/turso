@@ -537,8 +537,13 @@ pub fn translate_grant(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let mut changes = Vec::with_capacity(grant.relations.len());
-    for qualified_name in &grant.relations {
+    let ast::GrantObjects::Relations {
+        privileges,
+        on_sequences,
+        relations,
+    } = &grant.objects;
+    let mut changes = Vec::with_capacity(relations.len());
+    for qualified_name in relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
         // A schema that does not exist is reported as such, not as a
         // missing relation.
@@ -556,7 +561,7 @@ pub fn translate_grant(
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
         }
-        if grant.on_sequences && kind != ast::RelationKind::Sequence {
+        if *on_sequences && kind != ast::RelationKind::Sequence {
             bail_parse_error!("\"{normalized_name}\" is not a sequence");
         }
         // Only the main database has dialect schema state to store the
@@ -568,7 +573,7 @@ pub fn translate_grant(
             revoke: grant.revoke,
             namespace: namespace.id,
             name: normalized_name,
-            privileges: grant.privileges.clone(),
+            privileges: privileges.clone(),
             grantees: grant.grantees.clone(),
         });
     }
