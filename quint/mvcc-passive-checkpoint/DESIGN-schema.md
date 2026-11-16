@@ -252,7 +252,7 @@ variants use `MaxTs = 4`, except `indexes`.
 | `FixDdlRebases` | A DDL commit changes only its own table in the shared schema. It does not install its full copy of the schema. | #8004 | `issue8004` | `PagesAccounted` |
 | `FixDisjointIds` | The same fix as for #11501: no temporary id can name the page of an index. | #7960 | `issue7960` | `KindsMatch` (a row lands in a B-tree of another kind) |
 | `FixAlterPatch` | The publish patches every version of the `sqlite_schema` row that still carries the temporary id, and only a `DROP` puts the root in `dropped_root_pages`. | #8077 | `issue8077`, `issue8077Row` | `NoLiveDestroy`, `SchemaRowCurrent` |
-| `FixAlterRecovery` | Recovery maps a replayed `sqlite_schema` update whose `rootpage` is a temporary id to the table that bootstrap knows by that id. It needs `FixPersistIds`. | none. The model shows it, no Rust test does yet | `noAlterRecovery` | `RecoveryCorrect` (recovery panics) |
+| `FixAlterRecovery` | Recovery maps a replayed `sqlite_schema` update whose `rootpage` is a temporary id to the table that bootstrap knows by that id. It needs `FixPersistIds`. | #11751 | `noAlterRecovery` | `RecoveryCorrect` (recovery panics) |
 
 The id fixes and `FixAlterRecovery` are design statements, not patches.
 Each one closes its issue in the model. Other fixes can close them too, for example a log record
@@ -424,8 +424,9 @@ lead. `FINDINGS.md` gives the verdict for each one.
    the boundary. In the code today, no table has that id, so the table gets
    a new empty id and loses its page. With `FixPersistIds`, the id names the
    checkpointed table, and recovery panics as in #11501. Recovery must treat
-   such a record as an update of that table (`FixAlterRecovery`). This is not
-   verified in Rust.
+   such a record as an update of that table (`FixAlterRecovery`). Issue #11751
+   reports this. Its Rust test fails 3 of 3 runs. The fix is not verified in
+   Rust.
 7. #8087, #8091, #8092, #8093 and #8094 pass at 24c03ed9a. In the model the
    frozen read mark of the transaction (S21) protects the reader of #8087.
    The model does not check #8091 and #8092 one by one, and it cannot express
