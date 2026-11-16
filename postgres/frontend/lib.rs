@@ -14,6 +14,7 @@ mod schema_state;
 mod session;
 mod settings;
 mod statement;
+mod unique_index;
 mod unnest;
 
 pub use catalog::PostgresDialect;

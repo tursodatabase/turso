@@ -25,13 +25,14 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogChange, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn, LimboError,
-    Numeric, ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_CONSTRAINT_UNIQUE,
+    to_u32, CatalogChange, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
+    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID,
 };
 use turso_parser::ast::RoleOptions;
 use turso_pg_parser::sqlstate::SQLSTATE_DUPLICATE_OBJECT;
 
 use crate::error::sqlstate_error;
+use crate::unique_index::emit_unique_index_insert;
 
 /// The table that stores the roles created with `CREATE ROLE`.
 pub(crate) const AUTHID_TABLE_NAME: &str = "__turso_internal_authid";
@@ -336,36 +337,14 @@ fn emit_name_index_insert(
         dst_reg: key_reg + 1,
         extra_amount: 0,
     });
-    let no_conflict = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
+    emit_unique_index_insert(
+        program,
         cursor_id,
-        target_pc: no_conflict,
-        record_reg: key_reg,
-        num_regs: 1,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: SQLITE_CONSTRAINT_UNIQUE,
-        description: format!("role \"{name}\" already exists"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(no_conflict);
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(key_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: Some(AUTHID_NAME_INDEX_NAME.to_string()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id,
-        record_reg,
-        unpacked_start: Some(key_reg),
-        unpacked_count: Some(2),
-        flags: IdxInsertFlags::new(),
-    });
+        AUTHID_NAME_INDEX_NAME,
+        key_reg,
+        2,
+        format!("role \"{name}\" already exists"),
+    );
 }
 
 #[cfg(test)]

@@ -37,9 +37,8 @@ use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CatalogChange,
-    CmpInsFlags, CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn,
-    LimboError, NewOwner, Numeric, ProgramBuilder, RegisterOrLiteral, Value,
-    SQLITE_CONSTRAINT_UNIQUE,
+    CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, LimboError, NewOwner,
+    Numeric, ProgramBuilder, RegisterOrLiteral, Value,
 };
 use turso_parser::ast;
 
@@ -58,6 +57,7 @@ use crate::roles::{
     schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
 };
 use crate::schema_state::schema_state;
+use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
@@ -1810,36 +1810,14 @@ fn emit_class_name_index_insert(
         dst_reg: key_reg + 2,
         extra_amount: 0,
     });
-    let no_conflict = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
-        cursor_id: cursors.index_cursor_id,
-        target_pc: no_conflict,
-        record_reg: key_reg,
-        num_regs: 2,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: SQLITE_CONSTRAINT_UNIQUE,
-        description: format!("relation \"{name}\" already has a class row"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(no_conflict);
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(key_reg),
-        count: to_u32(3),
-        dest_reg: to_u32(record_reg),
-        index_name: Some(cursors.index_name.clone()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: cursors.index_cursor_id,
-        record_reg,
-        unpacked_start: Some(key_reg),
-        unpacked_count: Some(3),
-        flags: IdxInsertFlags::new(),
-    });
+    emit_unique_index_insert(
+        program,
+        cursors.index_cursor_id,
+        &cursors.index_name,
+        key_reg,
+        3,
+        format!("relation \"{name}\" already has a class row"),
+    );
 }
 
 /// Removes `(namespace, name, rowid)` from the name index.
