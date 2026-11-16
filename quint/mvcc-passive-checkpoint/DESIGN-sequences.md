@@ -119,7 +119,9 @@ states:
 ## Findings
 
 1. A `setval` that commits during a passive checkpoint can lose the current
-   value. TLC finds this with `setval` on (variant `setvalRace`):
+   value. TLC finds this with `setval` on (variant `setvalRace`, which breaks
+   `CompactionKeepsCurrent`). Issue #11750 reports it. Its Rust test fails 3 of
+   3 runs on main at 719fcc411. The trace:
 
    1. `nextval` commits 1 at ts 2, `nextval` commits 2 at ts 4.
    2. `setval(1)` prepares at ts 6. It ends rows 1 and 2 and inserts a new
@@ -144,8 +146,7 @@ states:
    snapshot timestamp, skip the row. With
    `FixStampSnapshotVersion = true` and `setval` on, TLC finds no error
    (variant `setvalFixed`, values 1..2, clock bound 6: 4,376,693
-   distinct states). Not verified in Rust. A
-   Rust test must show the bug first.
+   distinct states). The fix is not verified in Rust.
 2. The code gives two reasons for the clock timestamp. "Above
    `durable_txid_max_new`" matters (rule S3). "Above every concurrent
    reader's begin" can be unnecessary for the current value. The deleted
@@ -179,4 +180,5 @@ states:
   `DESIGN.md` covers the double look.
 - Collection of each key in its own step, and the `begin_tx` window between
   the read mark and the clock lock. `MvccPassiveCheckpoint.qnt` covers both.
-- The GC rules of the blocking mode. Both modes use the passive rules.
+- The GC rules of the blocking mode. The spec uses the passive rules for both
+  modes. `MODEL-GAPS.md` says that this is false for the flag off.

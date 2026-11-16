@@ -133,6 +133,7 @@ This analysis is not verified with TLC.
 
 All runs use one key, five clock timestamps and the invariants of the main
 configuration plus `CollectsEveryChange`. TLC finds no error in any of them.
+This is evidence within these bounds, not proof.
 The counts are the ones that `make variants` gives. The time is for `quint verify --backend tlc` with 3 workers.
 
 | Configuration | Readers | Checkpoints | Distinct states | Time |
@@ -148,18 +149,24 @@ The counts are the ones that `make variants` gives. The time is for `quint verif
 
 ## Findings
 
+Each finding below is a lead until a Rust test shows it. `FINDINGS.md` gives
+the verdicts.
+
 1. A rollback leaves the restored current version with `materialized_at =
    ORIGIN` (`set_end(None)` resets it). The B-tree still has that version, but
    GC Rule 3 cannot drop it. No later checkpoint stamps it again, because the
    key has no change in its range. The version stays in memory until the next
    write to the row. This also happens for every update or delete of an
    `Active` transaction that rolls back, for example after a constraint error.
-   TLC reaches this state (the `NeverLeavesUnstampedCurrent` check fails).
-   Rollback can keep the old `materialized_at`. TLC finds no error with that
-   rule (`abortsKeepMaterialized`). This is a memory leak, not a
+   TLC reaches this state (the `NeverLeavesUnstampedCurrent` check fails in
+   `aborts`). This is a reachability check, not an invariant violation.
+   Issue #11749 reports the same leak, and its Rust test shows
+   `materialized_at` reset to `ORIGIN`. Rollback can keep the old
+   `materialized_at`. TLC finds no error with that rule
+   (`abortsKeepMaterialized`). This is a memory leak, not a
    correctness bug.
 2. The generation `compare_exchange` in `clear_checkpoint_full_scan` is not
-   needed in the row model. A re-mark can fail at the same time as a clear
+   shown needed in the row model. A re-mark can fail at the same time as a clear
    only in a rollback. The stamp that it loses belongs to a version that GC
    already dropped, so there is nothing left to collect. A failed mark in
    `seqcompact_commit_delete` (mod.rs:9002) is a third source, and it is not in
