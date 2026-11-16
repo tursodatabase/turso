@@ -1001,3 +1001,37 @@ fn in_place_vacuum_replays_schema_with_source_dialect() {
         vec![vec![Value::from_i64(42)]]
     );
 }
+
+#[test]
+fn test_sql_is_create_virtual_table() {
+    assert!(sql_is_create_virtual_table(
+        "CREATE VIRTUAL TABLE x USING y;"
+    ));
+    assert!(sql_is_create_virtual_table(
+        "create virtual table x using y"
+    ));
+    assert!(sql_is_create_virtual_table(
+        "  \n\tCREATE  VIRTUAL TABLE x USING y"
+    ));
+    assert!(sql_is_create_virtual_table(
+        "-- comment\nCREATE /* c */ VIRTUAL TABLE x USING y"
+    ));
+    assert!(sql_is_create_virtual_table(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS x USING y(a, b)"
+    ));
+    // Quoted identifiers must not confuse the classifier either way.
+    assert!(sql_is_create_virtual_table(
+        "CREATE VIRTUAL TABLE \"create table\" USING y"
+    ));
+    // Regular table whose SQL merely contains the text must not match.
+    assert!(!sql_is_create_virtual_table(
+        "CREATE TABLE t(x TEXT DEFAULT 'create virtual')"
+    ));
+    assert!(!sql_is_create_virtual_table(
+        "CREATE TABLE \"create virtual\"(x)"
+    ));
+    assert!(!sql_is_create_virtual_table("CREATE TABLE t(x)"));
+    assert!(!sql_is_create_virtual_table("CREATE VIRTUALX TABLE t(x)"));
+    assert!(!sql_is_create_virtual_table("CREATE VIRTUAL"));
+    assert!(!sql_is_create_virtual_table(""));
+}

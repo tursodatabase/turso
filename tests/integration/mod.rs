@@ -1,6 +1,7 @@
 mod abandoned_create_index;
 mod abandoned_statement_pager;
 mod alloc;
+mod alter_table;
 mod assert_details;
 #[macro_use]
 mod assertions;
