@@ -5,6 +5,7 @@ mod hermitage;
 mod persistence;
 mod store;
 mod test_db;
+mod transactions;
 
 use crate::common::{ExecRows, TempDatabase};
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
