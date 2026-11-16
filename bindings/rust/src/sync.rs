@@ -339,7 +339,7 @@ impl Builder {
 
     /// Maximum number of bootstrap chunk requests in flight at once when the
     /// bootstrap is split with [`Builder::with_pull_bytes_threshold`].
-    /// Defaults to 1.
+    /// Defaults to 1. With 0, [`Builder::build`] returns an error.
     pub fn with_pull_parallel_requests(mut self, requests: usize) -> Self {
         self.pull_parallel_requests = Some(requests);
         self
@@ -385,6 +385,12 @@ impl Builder {
 
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
+        if self.pull_parallel_requests == Some(0) {
+            return Err(Error::Misuse(
+                "pull_parallel_requests must be at least 1".to_string(),
+            ));
+        }
+
         // Compose the experimental_features string from the boolean flags
         // exposed on this Builder.
         let experimental_features = self.experimental_features_string();
@@ -3123,6 +3129,20 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(polls < 100, "build was polled {polls} times");
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_zero_pull_parallel_requests_is_an_error() {
+        let result = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_pull_parallel_requests(0)
+            .build()
+            .await;
+        let message = result.err().map(|e| e.to_string());
+        assert_eq!(
+            message.as_deref(),
+            Some("pull_parallel_requests must be at least 1")
+        );
     }
 
     fn extract_bearer_token(headers: &[String]) -> Option<String> {
