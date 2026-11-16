@@ -426,6 +426,7 @@ fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: u
             func: call.func.clone(),
             arg_count: call.encode.len(),
             collation: CollationSeq::BINARY,
+            schema_expr: None,
         },
     });
 }

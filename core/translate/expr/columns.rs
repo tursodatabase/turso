@@ -85,19 +85,27 @@ pub(super) fn do_emit_table_column(
                 SelfTableContext::ForDML { .. } => None,
             };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                if end_column_emission.is_some() {
-                    translate_expr_no_constant_opt(
-                        program,
-                        referenced_tables,
-                        expr,
-                        target_register,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                } else {
-                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-                }
-                Ok(())
+                resolver.with_schema_expr(SchemaExpr::GeneratedColumn, || {
+                    if end_column_emission.is_some() {
+                        translate_expr_no_constant_opt(
+                            program,
+                            referenced_tables,
+                            expr,
+                            target_register,
+                            resolver,
+                            NoConstantOptReason::RegisterReuse,
+                        )?;
+                    } else {
+                        translate_expr(
+                            program,
+                            referenced_tables,
+                            expr,
+                            target_register,
+                            resolver,
+                        )?;
+                    }
+                    Ok(())
+                })
             })?;
             let table = match self_table_context {
                 SelfTableContext::ForSelect {

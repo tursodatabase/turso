@@ -55,6 +55,7 @@ pub(super) fn translate_like_base(
                     func: Func::Scalar(func),
                     arg_count,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             });
         }
@@ -87,6 +88,7 @@ pub(super) fn translate_like_base(
                     func,
                     arg_count,
                     collation: CollationSeq::BINARY,
+                    schema_expr: None,
                 },
             });
         }

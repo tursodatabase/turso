@@ -501,9 +501,11 @@ pub(crate) fn emit_dml_expr_index_value(
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, DmlRowForm::Stored),
         table: Arc::clone(table),
     };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, &expr, dest_reg, resolver)?;
-        Ok(())
+    resolver.with_schema_expr(SchemaExpr::Index, || {
+        resolver.with_self_table_context(program, Some(&ctx), |program, _| {
+            translate_expr(program, None, &expr, dest_reg, resolver)?;
+            Ok(())
+        })
     })?;
     Ok(())
 }

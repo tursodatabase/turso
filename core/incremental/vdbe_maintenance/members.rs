@@ -146,6 +146,7 @@ pub(super) fn emit_member_columns(
                 func: Func::Scalar(ScalarFunc::Typeof),
                 arg_count: 1,
                 collation: CollationSeq::BINARY,
+                schema_expr: None,
             },
         });
     }
