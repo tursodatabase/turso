@@ -573,13 +573,6 @@ fn test_errors_on_zero_divisor_dialect() {
         ) -> turso_core::Result<String> {
             SqliteDialect.format_table_sql(input, tbl_name, body)
         }
-        fn register_catalog(
-            &self,
-            schema: &mut turso_core::schema::Schema,
-            enable_custom_types: bool,
-        ) -> turso_core::Result<()> {
-            SqliteDialect.register_catalog(schema, enable_custom_types)
-        }
         fn resolve_function(
             &self,
             name: &str,

@@ -192,6 +192,7 @@ struct SequenceMetadata {
 use crate::util::quote_identifier as quote_ident;
 
 pub mod alter_table;
+pub mod builtin;
 pub mod view;
 
 /// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
@@ -1409,6 +1410,93 @@ impl Default for Schema {
     }
 }
 
+/// Builds the schema that a database has before any of its objects are read
+/// from the file. A dialect puts its catalog tables and built-in types in it.
+pub struct SchemaBuilder {
+    schema: Schema,
+}
+
+impl SchemaBuilder {
+    /// Starts from a schema that has only the `sqlite_schema` table.
+    pub fn new() -> crate::Result<Self> {
+        let mut root = NamespaceSchema::default();
+        #[cfg(feature = "conn_raw_api")]
+        let mut table_names_by_root_page = HashMap::default();
+        #[allow(clippy::arc_with_non_send_sync)]
+        root.tables.insert(
+            SCHEMA_TABLE_NAME.to_string(),
+            Arc::new(Table::BTree(sqlite_schema_table()?.into())),
+        );
+        #[cfg(feature = "conn_raw_api")]
+        table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
+        let mut namespaces = HashMap::default();
+        namespaces.insert(NamespaceId::ROOT, root);
+        Ok(Self {
+            schema: Schema {
+                namespaces,
+                #[cfg(feature = "conn_raw_api")]
+                table_names_by_root_page,
+                schema_version: 0,
+                analyze_stats: AnalyzeStats::default(),
+                dropped_root_pages: HashSet::default(),
+                type_registry: HashMap::default(),
+                custom_types_enabled: false,
+                supports_namespaces: false,
+                default_namespaces: &[],
+                namespace_names_loaded: true,
+                pending_materialized_views: None,
+                dialect_schema: None,
+            },
+        })
+    }
+
+    /// Whether the schema loads the types made by CREATE TYPE.
+    pub fn custom_types(mut self, enabled: bool) -> Self {
+        self.schema.custom_types_enabled = enabled;
+        self
+    }
+
+    /// Whether the schema has namespaces besides the root.
+    pub(crate) fn supports_namespaces(mut self, supported: bool) -> Self {
+        self.schema.supports_namespaces = supported;
+        self.schema.namespace_names_loaded = !supported;
+        self
+    }
+
+    /// The names of the namespaces that every database has.
+    pub(crate) fn default_namespaces(mut self, names: &'static [&'static str]) -> Self {
+        self.schema.default_namespaces = names;
+        self
+    }
+
+    /// Adds the type `type_def` under `name`. A type can have several names.
+    pub fn type_def(mut self, name: &str, type_def: Arc<TypeDef>) -> Self {
+        self.schema
+            .type_registry
+            .insert(name.to_lowercase(), type_def);
+        self
+    }
+
+    /// Adds `table` to the root namespace under `name`.
+    pub fn table(mut self, name: String, table: Arc<Table>) -> Self {
+        self.schema.insert_table(NamespaceId::ROOT, name, table);
+        self
+    }
+
+    /// Adds the virtual table `table` to the root namespace.
+    pub fn internal_vtab<T>(mut self, table: T) -> crate::Result<Self>
+    where
+        T: crate::vtab::InternalVirtualTable + 'static,
+    {
+        self.schema.register_internal_vtab(table)?;
+        Ok(self)
+    }
+
+    pub fn build(self) -> Schema {
+        self.schema
+    }
+}
+
 /// What kind of number a type's values are in a RANGE frame, which decides
 /// the offsets a frame over them may have, as PostgreSQL's `in_range`
 /// functions do. The same kind says which frames a value of the type may be
@@ -1455,79 +1543,6 @@ pub enum TypeOrigin {
     User,
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
-    use turso_parser::ast::{Cmd, Stmt};
-
-    // Whether values of the type take a COLLATE. In PostgreSQL only text
-    // types do, so of the types below only varchar does.
-    const COLLATE: bool = true;
-    const NO_COLLATE: bool = false;
-    // Whether the stored form sorts in the same order as the values.
-    const SORTS: bool = true;
-    const NO_SORT: bool = false;
-    let types: &[(bool, RangeOffsets, bool, &str)] = &[
-        #[cfg(feature = "uuid")]
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
-        #[cfg(feature = "json")]
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
-        #[cfg(feature = "json")]
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
-        (COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
-        // The ENCODEs read PostgreSQL's input forms and store one text form
-        // with a 4-digit year, which sorts in time order (see
-        // functions/datetime_input.rs).
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE date(value text) BASE text ENCODE temporal_encode(value, 'date') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE time(value text) BASE text ENCODE temporal_encode(value, 'time') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamp(value text) BASE text ENCODE temporal_encode(value, 'timestamp') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamptz(value text) BASE text ENCODE temporal_encode(value, 'timestamptz') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE bigint(value integer) BASE integer"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Numeric, NO_SORT, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
-    ];
-
-    for &(accepts_collate, range_offsets, stored_form_sorts_in_value_order, sql) in types {
-        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
-            type_name, body, ..
-        }))) = crate::dialect::engine::parse_statement(sql)
-        else {
-            return Err(crate::LimboError::InternalError(format!(
-                "failed to parse built-in type SQL: {sql}"
-            )));
-        };
-
-        let type_def = TypeDef::from_create_type(
-            &type_name,
-            &body,
-            TypeOrigin::Builtin {
-                accepts_collate,
-                range_offsets,
-                stored_form_sorts_in_value_order,
-            },
-            sql.to_string(),
-        )?;
-        registry.insert(type_name.to_lowercase(), Arc::new(type_def));
-    }
-
-    // Register aliases
-    let aliases: &[(&str, &str)] = &[
-        ("bool", "boolean"),
-        ("int2", "smallint"),
-        ("int8", "bigint"),
-    ];
-    for (alias, target) in aliases {
-        if let Some(type_def) = registry.get(*target).cloned() {
-            registry.insert(alias.to_string(), type_def);
-        }
-    }
-    Ok(())
-}
-
 impl Schema {
     fn normalize_table_lookup_name(&self, name: &str) -> String {
         let name = normalize_ident(name);
@@ -1541,53 +1556,13 @@ impl Schema {
         }
     }
 
-    /// Create a schema with custom types enabled.
-    ///
-    /// Panics if a hardcoded built-in type definition is malformed (programmer
-    /// bug). Production code that opens user databases should prefer
-    /// [`Schema::with_options`] which returns `Result`.
+    /// A schema that has only the `sqlite_schema` table. The schema of a
+    /// database comes from [`crate::dialect::Dialect::new_schema`].
     pub fn new() -> Self {
-        Self::with_options(true, &crate::dialect::EngineDialect)
-            .expect("built-in type definitions are malformed")
-    }
-
-    pub fn with_options(
-        enable_custom_types: bool,
-        dialect: &dyn crate::dialect::Dialect,
-    ) -> crate::Result<Self> {
-        let mut root = NamespaceSchema::default();
-        #[cfg(feature = "conn_raw_api")]
-        let mut table_names_by_root_page = HashMap::default();
-        #[allow(clippy::arc_with_non_send_sync)]
-        root.tables.insert(
-            SCHEMA_TABLE_NAME.to_string(),
-            Arc::new(Table::BTree(sqlite_schema_table()?.into())),
-        );
-        #[cfg(feature = "conn_raw_api")]
-        table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
-        let mut type_registry = HashMap::default();
-        if enable_custom_types {
-            bootstrap_builtin_types(&mut type_registry)?;
-        }
-        let mut namespaces = HashMap::default();
-        namespaces.insert(NamespaceId::ROOT, root);
-        let mut schema = Self {
-            namespaces,
-            #[cfg(feature = "conn_raw_api")]
-            table_names_by_root_page,
-            schema_version: 0,
-            analyze_stats: AnalyzeStats::default(),
-            dropped_root_pages: HashSet::default(),
-            type_registry,
-            custom_types_enabled: enable_custom_types,
-            supports_namespaces: dialect.supports_namespaces(),
-            default_namespaces: dialect.default_namespaces(),
-            namespace_names_loaded: !dialect.supports_namespaces(),
-            pending_materialized_views: None,
-            dialect_schema: None,
-        };
-        dialect.register_catalog(&mut schema, enable_custom_types)?;
-        Ok(schema)
+        SchemaBuilder::new()
+            .expect("failed to allocate an empty schema")
+            .custom_types(true)
+            .build()
     }
 
     /// The ids of the namespaces of the schema.

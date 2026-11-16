@@ -6,7 +6,6 @@ use turso_core::native_ext::VirtualTable;
 use turso_core::native_ext::VirtualTableCursor;
 use turso_core::native_ext::VirtualTableModule;
 use turso_core::schema::BTreeTable;
-use turso_core::schema::Schema;
 use turso_core::security::roles::SessionRole;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::sync::atomic::AtomicUsize;
@@ -115,10 +114,6 @@ impl Dialect for TestDialect {
         Ok(Value::Numeric(Numeric::Integer(v + 1)))
     }
 
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
-    }
-
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         options.native_module(
             "test_catalog",
@@ -167,10 +162,6 @@ impl Dialect for StrictTestDialect {
         _body: &CreateTableBody,
     ) -> Result<String> {
         Ok(format!("{}{input}", Self::PREFIX))
-    }
-
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
@@ -539,10 +530,6 @@ impl Dialect for NoFunctionsDialect {
         ))
     }
 
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
-    }
-
     fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
         Ok(None)
     }
@@ -581,10 +568,6 @@ impl Dialect for ShoutingUpperDialect {
         body: &CreateTableBody,
     ) -> Result<String> {
         engine::format_table_sql(tbl_name, body)
-    }
-
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
@@ -1034,4 +1017,34 @@ fn test_sql_is_create_virtual_table() {
     assert!(!sql_is_create_virtual_table("CREATE VIRTUALX TABLE t(x)"));
     assert!(!sql_is_create_virtual_table("CREATE VIRTUAL"));
     assert!(!sql_is_create_virtual_table(""));
+}
+
+#[test]
+fn schema_of_a_dialect_that_adds_to_the_builder_keeps_its_namespace_support() {
+    let schema = <dyn Dialect>::new_schema(&NamespacesAndOwnBuilderDialect, false).unwrap();
+    assert!(schema.supports_namespaces());
+}
+
+/// A dialect with namespaces that overrides `schema_builder`.
+struct NamespacesAndOwnBuilderDialect;
+
+impl Dialect for NamespacesAndOwnBuilderDialect {
+    fn name(&self) -> &'static str {
+        "namespaces-and-own-builder"
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        engine::parse(sql)
+    }
+
+    fn supports_namespaces(&self) -> bool {
+        true
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        turso_core::schema::builtin::schema_builder(enable_custom_types)
+    }
 }

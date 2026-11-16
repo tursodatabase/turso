@@ -857,10 +857,9 @@ impl Database {
             allocators,
             path,
             wal_path,
-            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                enable_custom_types,
-                dialect.as_ref(),
-            )?))),
+            schema: Arc::new(Mutex::new(Arc::new(
+                dialect.new_schema(enable_custom_types)?,
+            ))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             #[cfg(host_shared_wal)]

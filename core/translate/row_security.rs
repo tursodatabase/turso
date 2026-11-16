@@ -989,14 +989,6 @@ mod tests {
             EngineDialect.format_table_sql(input, tbl_name, body)
         }
 
-        fn register_catalog(
-            &self,
-            schema: &mut Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
-            EngineDialect.register_catalog(schema, enable_custom_types)
-        }
-
         fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
             EngineDialect.resolve_function(name, arg_count)
         }
