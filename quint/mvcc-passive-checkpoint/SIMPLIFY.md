@@ -1,4 +1,4 @@
-# Plan: a simpler passive checkpoint with the same guarantees
+# Plan: a simpler passive checkpoint that keeps the checked invariants
 
 This plan uses the model results to make the MVCC passive checkpoint simpler.
 Each step keeps the invariants that the specs check today. Each step removes
@@ -7,7 +7,7 @@ implemented yet. The model checks small bounds, so each result is evidence
 within those bounds, not proof. `FINDINGS.md` lists the verdict for each
 result, and step 4 below records one result that a Rust run refuted.
 
-## The guarantees to keep
+## The invariants to keep
 
 Every step must keep these invariants of the main configurations:
 
