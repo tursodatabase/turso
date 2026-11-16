@@ -306,7 +306,7 @@ pub(crate) fn check_blob_open(
         policy_for(
             dialect.as_ref(),
             schema,
-            role,
+            &|other| dialect.role_has_privileges_of(schema, role, other),
             dialect.role_bypass_rls(schema, role),
             NamespaceId::ROOT,
             table_name,
@@ -342,12 +342,14 @@ fn policy(
     } else {
         roles::table_reader(resolver, resolver.row_security_role)
     };
-    let bypass_rls = dialect.role_bypass_rls(resolver.schema(), role);
+    let main_schema = resolver.schema();
+    let bypass_rls = dialect.role_bypass_rls(main_schema, role);
+    let has_privileges_of = |other| dialect.role_has_privileges_of(main_schema, role, other);
     resolver.with_schema(namespace.database_id, |schema| {
         policy_for(
             dialect,
             schema,
-            role,
+            &has_privileges_of,
             bypass_rls,
             namespace.id,
             table_name,
@@ -357,16 +359,18 @@ fn policy(
 }
 
 /// Whether row-level security limits the rows of table `table_name` of
-/// `namespace` in `schema` that `role` may access for `command`, and the
-/// policies that then decide. As in PostgreSQL's `check_enable_rls`,
-/// row-level security does not limit a role that bypasses it, such as a
-/// superuser, or the table's owner. Whether `role` bypasses row-level
-/// security comes from the main database, which the role was set from, and
-/// `schema` may be another one.
+/// `namespace` in `schema` that a role may access for `command`, and the
+/// policies that then decide. `has_privileges_of` says whether the role has
+/// the privileges of another role. As in PostgreSQL, row-level security does
+/// not limit a role that bypasses it, such as a superuser, or a role with
+/// the privileges of the table's owner, and a policy applies to the roles
+/// with the privileges of its roles. What the role bypasses and whose
+/// privileges it has come from the main database, which the role was set
+/// from, and `schema` may be another one.
 fn policy_for(
     dialect: &dyn Dialect,
     schema: &Schema,
-    role: RoleId,
+    has_privileges_of: &dyn Fn(RoleId) -> bool,
     bypass_rls: bool,
     namespace: NamespaceId,
     table_name: &str,
@@ -375,7 +379,9 @@ fn policy_for(
     let table_name = normalize_ident(table_name);
     if bypass_rls
         || !dialect.table_rls_enabled(schema, namespace, &table_name)
-        || dialect.relation_owner(schema, namespace, &table_name) == Some(role)
+        || dialect
+            .relation_owner(schema, namespace, &table_name)
+            .is_some_and(has_privileges_of)
     {
         return Policy::Allow;
     }
@@ -387,7 +393,7 @@ fn policy_for(
         dialect
             .row_security_policies(schema, namespace, &table_name)
             .iter()
-            .filter(|policy| policy.applies_to(command, role))
+            .filter(|policy| policy.applies_to(command, has_privileges_of))
             .cloned()
             .collect(),
     )

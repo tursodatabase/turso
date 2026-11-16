@@ -37,9 +37,8 @@ use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CatalogChange,
-    CmpInsFlags, CollationSeq, Connection, CursorType, IdxInsertFlags, InsertFlags, Insn,
-    LimboError, NewOwner, Numeric, ProgramBuilder, RegisterOrLiteral, Value,
-    SQLITE_CONSTRAINT_UNIQUE,
+    CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, LimboError, NewOwner,
+    Numeric, ProgramBuilder, RegisterOrLiteral, Value,
 };
 use turso_parser::ast;
 
@@ -48,16 +47,20 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_GRANT_OPERATION,
     SQLSTATE_UNDEFINED_OBJECT,
 };
-use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
-use crate::catalog::{role_oid, role_oid_by_name};
+use crate::auth_members::{
+    AUTH_MEMBERS_TABLE_NAME, CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL,
+    CREATE_AUTH_MEMBERS_TABLE_SQL,
+};
+use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
 use crate::policies;
 use crate::roles::{
     schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
 };
 use crate::schema_state::schema_state;
+use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
@@ -353,6 +356,11 @@ impl ClassCatalog {
                     "CREATE ROLE reached the relation catalog".to_string(),
                 ));
             }
+            CatalogChange::GrantRole { .. } => {
+                return Err(LimboError::InternalError(
+                    "GRANT of role membership reached the relation catalog".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -503,7 +511,8 @@ pub(crate) fn owned_sequences(
 
 /// [`turso_core::Dialect::role_has_privilege`] for the PostgreSQL frontend:
 /// a role has the privileges the relation's list gives it, by oid or through
-/// PUBLIC. A relation without a list has the default one, which gives the
+/// PUBLIC, together with those it gives the roles whose privileges the role
+/// inherits. A relation without a list has the default one, which gives the
 /// owner every privilege and no one else any. As in PostgreSQL, an owner
 /// that revoked a privilege from itself no longer has it. A table without a
 /// class row is one of the engine's own, such as `__turso_internal_authid` or
@@ -521,11 +530,12 @@ pub(crate) fn role_has_privilege(
     else {
         return false;
     };
+    let roles = schema_roles(schema);
     let Some(acl) = &class.relacl else {
-        return class.relowner == role;
+        return roles.has_privileges_of(role, class.relowner);
     };
     let wanted = Privileges::named_on(class.relkind, &[privilege]);
-    !wanted.is_empty() && acl.grants(role_oid(role), wanted)
+    !wanted.is_empty() && acl.grants(&roles.oids_of_roles_used_by(role), wanted)
 }
 
 /// The access control list of relation `name` of `namespace`, or None when
@@ -878,14 +888,15 @@ pub(crate) fn translate_catalog_changes(
                     .relacl
                     .clone()
                     .unwrap_or_else(|| Acl::default_for(class.relkind, owner));
-                // Only the owner may grant or revoke, and a superuser does
-                // so as the owner. As in PostgreSQL, anyone else is refused
-                // when the list gives it nothing on the relation, and changes
-                // nothing otherwise, for want of a grant option.
-                let may_grant = connection.current_role_is_superuser()
-                    || class.relowner == connection.current_role();
-                if !may_grant {
-                    if acl.gives_anything_to(role_oid(connection.current_role())) {
+                // Only the owner may grant or revoke, and a superuser or a
+                // role with the owner's privileges does so as the owner. As
+                // in PostgreSQL, anyone else is refused when the list gives
+                // it nothing on the relation, and changes nothing otherwise,
+                // for want of a grant option.
+                let roles = schema_roles(schema);
+                let current = connection.current_role();
+                if !roles.has_privileges_of(current, class.relowner) {
+                    if acl.gives_anything_to(&roles.oids_of_roles_used_by(current)) {
                         continue;
                     }
                     return Err(LimboError::PermissionDenied(Box::new(
@@ -1013,6 +1024,11 @@ pub(crate) fn translate_catalog_changes(
                     "CREATE ROLE reached the relation catalog".to_string(),
                 ));
             }
+            CatalogChange::GrantRole { .. } => {
+                return Err(LimboError::InternalError(
+                    "GRANT of role membership reached the relation catalog".to_string(),
+                ));
+            }
         }
     }
     Ok(())
@@ -1108,10 +1124,7 @@ fn resolve_role(
     Ok(match role {
         ast::RoleSpec::CurrentRole => connection.current_role(),
         ast::RoleSpec::SessionUser => connection.session_role(),
-        ast::RoleSpec::Name(name) if name == BOOTSTRAP_SUPERUSER_NAME => RoleId::SUPERUSER,
-        ast::RoleSpec::Name(name) => schema_roles(schema)
-            .get_by_name(name)
-            .map(|role| role.id)
+        ast::RoleSpec::Name(name) => engine_role_by_name(schema_roles(schema), name)
             .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist")))?,
     })
 }
@@ -1800,36 +1813,14 @@ fn emit_class_name_index_insert(
         dst_reg: key_reg + 2,
         extra_amount: 0,
     });
-    let no_conflict = program.allocate_label();
-    program.emit_insn(Insn::NoConflict {
-        cursor_id: cursors.index_cursor_id,
-        target_pc: no_conflict,
-        record_reg: key_reg,
-        num_regs: 2,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: SQLITE_CONSTRAINT_UNIQUE,
-        description: format!("relation \"{name}\" already has a class row"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(no_conflict);
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(key_reg),
-        count: to_u32(3),
-        dest_reg: to_u32(record_reg),
-        index_name: Some(cursors.index_name.clone()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: cursors.index_cursor_id,
-        record_reg,
-        unpacked_start: Some(key_reg),
-        unpacked_count: Some(3),
-        flags: IdxInsertFlags::new(),
-    });
+    emit_unique_index_insert(
+        program,
+        cursors.index_cursor_id,
+        &cursors.index_name,
+        key_reg,
+        3,
+        format!("relation \"{name}\" already has a class row"),
+    );
 }
 
 /// Removes `(namespace, name, rowid)` from the name index.
@@ -1909,6 +1900,13 @@ pub(crate) fn initialize_schema(
     {
         statements.push(CREATE_AUTHID_TABLE_SQL.to_string());
         statements.push(CREATE_AUTHID_NAME_INDEX_SQL.to_string());
+    }
+    if schema
+        .get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
+        .is_none()
+    {
+        statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
+        statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
     }
     Ok(statements)
 }

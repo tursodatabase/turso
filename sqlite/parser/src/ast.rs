@@ -1574,20 +1574,33 @@ impl Default for RoleOptions {
     }
 }
 
-/// `GRANT privileges ON relations TO grantees`, or `REVOKE privileges ON
-/// relations FROM grantees` when `revoke` is set. The relations are named
-/// one by one: a frontend expands a form like `ALL TABLES IN SCHEMA` before
-/// it builds this.
+/// `GRANT objects TO grantees`, or `REVOKE objects FROM grantees` when
+/// `revoke` is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Grant {
     pub revoke: bool,
-    pub privileges: Vec<Privilege>,
-    /// Whether the statement grants on `SEQUENCE`s rather than on tables,
-    /// which names any relation.
-    pub on_sequences: bool,
-    pub relations: Vec<QualifiedName>,
+    pub objects: GrantObjects,
     pub grantees: Vec<Grantee>,
+}
+
+/// What a `GRANT` gives or a `REVOKE` takes away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GrantObjects {
+    /// `privileges ON relations`. The relations are named one by one: a
+    /// frontend expands a form like `ALL TABLES IN SCHEMA` before it builds
+    /// this.
+    Relations {
+        privileges: Vec<Privilege>,
+        /// Whether the statement grants on `SEQUENCE`s rather than on
+        /// tables, which names any relation.
+        on_sequences: bool,
+        relations: Vec<QualifiedName>,
+    },
+    /// `roles`: each grantee becomes a member of each of the roles, which
+    /// are named.
+    Roles(Vec<String>),
 }
 
 /// A privilege on a relation.

@@ -254,8 +254,16 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        if let [turso_core::CatalogChange::CreateRole { name, options }] = changes {
-            return crate::roles::translate_create_role(program, schema, name, options);
+        match changes {
+            [turso_core::CatalogChange::CreateRole { name, options }] => {
+                return crate::roles::translate_create_role(program, schema, name, options);
+            }
+            [change @ turso_core::CatalogChange::GrantRole { .. }] => {
+                return crate::auth_members::translate_grant_role(
+                    program, schema, connection, change,
+                );
+            }
+            _ => {}
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
@@ -269,8 +277,9 @@ impl Dialect for PostgresDialect {
         crate::schema_state::apply_catalog_change(schema, change, values)
     }
 
+    /// The built-in superuser is found by its name, `postgres`, too.
     fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
-        schema_roles(schema).get_by_name(name).map(|role| role.id)
+        engine_role_by_name(schema_roles(schema), name)
     }
 
     fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
@@ -283,6 +292,10 @@ impl Dialect for PostgresDialect {
 
     fn can_set_role(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
         schema_roles(schema).can_set_role(member, role)
+    }
+
+    fn role_has_privileges_of(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        schema_roles(schema).has_privileges_of(member, role)
     }
 
     fn relation_owner(
@@ -993,12 +1006,37 @@ pub(crate) fn role_name_by_oid(roles: &RoleCatalog, oid: i64) -> Option<String> 
 /// The PostgreSQL oid of the role named `name`, the inverse of
 /// [`role_name_by_oid`].
 pub(crate) fn role_oid_by_name(roles: &RoleCatalog, name: &str) -> Option<i64> {
+    pg_role_by_name(roles, name).map(|role| match role {
+        PgRole::Engine(id) => role_oid(id),
+        PgRole::DatabaseOwner => PG_DATABASE_OWNER_OID,
+    })
+}
+
+/// A role that `pg_roles` lists: one of the engine's roles, or
+/// `pg_database_owner`, which is not a role of the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgRole {
+    Engine(RoleId),
+    DatabaseOwner,
+}
+
+/// The engine's role named `name`, the built-in superuser `postgres`
+/// included. `pg_database_owner` is not a role of the engine.
+pub(crate) fn engine_role_by_name(roles: &RoleCatalog, name: &str) -> Option<RoleId> {
+    match pg_role_by_name(roles, name)? {
+        PgRole::Engine(id) => Some(id),
+        PgRole::DatabaseOwner => None,
+    }
+}
+
+/// The role named `name` among those `pg_roles` lists.
+pub(crate) fn pg_role_by_name(roles: &RoleCatalog, name: &str) -> Option<PgRole> {
     if name == PG_DATABASE_OWNER_NAME {
-        return Some(PG_DATABASE_OWNER_OID);
+        return Some(PgRole::DatabaseOwner);
     }
     postgres_roles(roles)
         .find(|role| role.name == name)
-        .map(|role| role_oid(role.id))
+        .map(|role| PgRole::Engine(role.id))
 }
 
 /// The roles that PostgreSQL has: its bootstrap superuser, which is the
@@ -1083,6 +1121,46 @@ fn role_row(role: &Role) -> Vec<Value> {
         Value::from_i64(role.bypassrls as i64), // rolbypassrls
         Value::Null,                            // rolconfig
     ]
+}
+
+/// Virtual table implementation for pg_catalog.pg_auth_members: the
+/// memberships that `GRANT role TO role` made.
+#[derive(Debug)]
+struct PgAuthMembersTable;
+
+impl SnapshotRows for PgAuthMembersTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_auth_members (
+            oid INTEGER,
+            roleid INTEGER,
+            member INTEGER,
+            grantor INTEGER,
+            admin_option BOOLEAN,
+            inherit_option BOOLEAN,
+            set_option BOOLEAN
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 2;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        connection_roles(conn)
+            .memberships()
+            .iter()
+            .map(|membership| {
+                vec![
+                    // Membership oids start where PostgreSQL's own objects
+                    // end, as role oids do.
+                    Value::from_i64(USER_ROLE_OID_START + membership.id),
+                    Value::from_i64(role_oid(membership.role)),
+                    Value::from_i64(role_oid(membership.member)),
+                    Value::from_i64(role_oid(membership.grantor)),
+                    Value::from_i64(membership.admin_option as i64),
+                    Value::from_i64(membership.inherit_option as i64),
+                    Value::from_i64(membership.set_option as i64),
+                ]
+            })
+            .collect()
+    }
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -2549,6 +2627,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_roles",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgRolesTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_auth_members",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgAuthMembersTable>(PhantomData),
     );
     options = options.native_module(
         "pg_am",
@@ -4367,6 +4450,7 @@ mod tests {
             "pg_namespace",
             "pg_attribute",
             "pg_roles",
+            "pg_auth_members",
             "pg_am",
             "pg_proc",
             "pg_database",

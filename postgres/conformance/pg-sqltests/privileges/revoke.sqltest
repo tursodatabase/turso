@@ -835,17 +835,6 @@ expect error {
     REVOKE on objects other than tables and sequences is not supported
 }
 
-@skip-if postgres "PostgreSQL supports role membership"
-test revoke-of-role-membership-is-not-supported {
-    CREATE ROLE rv_member;
-    CREATE ROLE rv_group;
-    REVOKE rv_group FROM rv_member;
-}
-@sqlstate 0A000
-expect error {
-    REVOKE of role membership is not supported
-}
-
 @skip-if postgres "PostgreSQL has no __turso_internal_* tables"
 test revoke-on-an-engine-table-is-not-supported {
     CREATE ROLE rv_catalog_grantee;
