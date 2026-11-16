@@ -5,7 +5,11 @@ runs, and whether a spec in this folder models it. It also sorts each
 mechanism into design (a guarantee needs it), optimization (the same result
 with less work or memory), or dead (it runs in a mode where nothing needs it).
 It comes from a read of the code. No test ran for it, so every bug lead below
-is not verified until a test shows it.
+is not verified until a test shows it. The specs in this PR do not model a
+checkpoint on the connection of an open reader or a checkpoint that stops
+partway. Rust runs later showed bugs there (#11831 and #11835), so the specs
+missed them. `FINDINGS.md` lists the verdicts, and the section "Scope and
+limits" in `README.md` lists what the specs leave out.
 
 Line numbers are from main at commit 719fcc411. Short names in this file:
 
@@ -237,8 +241,8 @@ mark), not the lock.
 | B-tree fall-through read (B only) | mod.rs:6070-6087 | If the chain has a visible or ended version, a read uses the chain. Otherwise it reads the B-tree (DESIGN.md "How a reader reads a row") | The chain value must equal the B-tree value at the read mark |
 | Index lockstep merge | mod.rs:6099, cursor.rs:524 | `query_btree_version_is_valid` per key (mod.rs:6126) | Same answer. The debug compare at cursor.rs:667-672 checks this |
 | Row map epochs | cursor.rs:907-948 | Seek the skip list again on every step | After an insert, do not reuse a cached position |
-| `compute_min_reader_mark` in the floor | mod.rs:10718 | Floor = `backfill_floor` (`floorBackfill`) or the lowest pinned read mark (`floorPinned`) | A smaller floor is always safe. It keeps more versions |
-| `rootpage_gc_protected` | mod.rs:10736 | Nothing. Per-version `materialized_at` covers it (schema S14) | None |
+| `compute_min_reader_mark` in the floor | mod.rs:10718 | Floor = the lowest pinned read mark (`floorPinned`). A floor of `backfill_floor` alone (`floorBackfill`) passes this spec, but a Rust run refuted it: a checkpoint on the connection of an open reader moves `backfill_floor` above that reader's mark (PR #11794) | A smaller floor is always safe. It keeps more versions |
+| `rootpage_gc_protected` | mod.rs:10736 | Nothing, as far as the model shows. Per-version `materialized_at` covers it (schema S14). PR #11794 adds a reachability check, a negative control and a Rust assertion. It did not run larger bounds | None |
 | CYCLE skip in compaction | csm.rs:817 | Compact every sequence (sequence S4) | The skip only saves the scan |
 | TxID to timestamp rewrite | mod.rs:7383 | A version's begin is the commit ts of its writer | Resolution through `txs`, then `finalized_tx_states`, gives the same ts |
 | `finalized_tx_states` | mod.rs:6871, mod.rs:8542 | A finished tx keeps its state forever | Prune a TxID only after no version names it (`collect_referenced_txids` mod.rs:8530) |

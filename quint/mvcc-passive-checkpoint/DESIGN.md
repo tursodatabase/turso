@@ -3,7 +3,10 @@
 This document describes the design of the passive checkpoint in MVCC mode, as
 the code implements it today. The Quint model `MvccPassiveCheckpoint.qnt` in
 this directory states the same design formally. Quint checks it with the TLC
-model checker (`quint verify --backend tlc`).
+model checker (`quint verify --backend tlc`). `FINDINGS.md` lists what the
+model found, what it only reproduced, and what a Rust run refuted. The section
+"Scope and limits" in `README.md` says what the model leaves out. The results
+are evidence within these bounds and this model, not proof.
 
 A passive checkpoint copies committed row versions from the in-memory version
 store into the B-tree. Writers keep committing and readers keep reading while
@@ -125,7 +128,9 @@ any moment. It checks these properties in every reachable state.
   all WAL frames, and the logical log records above `persistent_tx_ts_max`
   rebuild every logged commit.
 - `BackfillBelowReaders` and `BackfillFloorBelowReaders`: the WAL rules that
-  the B-tree side of a read depends on.
+  the B-tree side of a read depends on. `BackfillFloorBelowReaders` holds in
+  this model only. A checkpoint on the connection of an open reader breaks it
+  in the code (see finding 1).
 
 TLC checks a bounded model, not every possible size. The main configuration
 (module `main` in `MvccPassiveCheckpointConfigs.qnt`) has one key, two
@@ -151,33 +156,42 @@ Three more documents cover the other parts. Each has its own spec.
 | `DESIGN-schema.md` | `MvccPassiveSchema.qnt` | Table ids, root pages, the schema cookie, and the open issues they cause |
 | `DESIGN-sequences.md` | `MvccPassiveSequence.qnt` | Sequence rows and their compaction |
 
-The row model still leaves out indexes, WAL restart and write-write
-conflicts.
+The row model still leaves out indexes, WAL restart, write-write conflicts and
+a checkpoint on the connection of an open reader.
 
 ## Findings
 
-These results come from the model. Each one is a lead for a code change. Each
-change needs its own test in the Rust code before it goes in.
+Each result below is a lead for a code change. Each change needs its own test
+in the Rust code before it goes in. A result that has no Rust test stays a
+lead. Every result is evidence within the bounds of the model, not proof. The
+verdicts are in `FINDINGS.md`.
 
-1. The GC floor can be one number. `backfill_floor` is always at or below every
-   pinned read mark, because the WAL backfill stops at those marks and new
-   readers pin a mark at the end of the WAL. TLC checks this as the invariant
-   `BackfillFloorBelowReaders`. So the reader marks in the floor never lower
-   it, and `compute_min_reader_mark` adds nothing to row GC. A floor of "lowest
-   pinned read mark" is also safe and lets GC drop versions sooner. A floor of
-   "registered readers only" is not safe (rule R5).
-2. Rule 3 needs "no reader open" only because the dual cursor looks at the
-   chain twice. When one look decides both sides of a read, TLC finds no error
-   with Rule 3 under load. The variant `rule3UnderLoadOneLook` checks this
-   with one key (20,771,050 distinct states). Rule 3 idle-only is the reason that the version store grows
-   under a steady insert load, so this is the change with the largest payoff.
-   The model reads one key in one step. A real scan walks the skip list while
-   GC unlinks entries. So the cursor change needs its own
-   design and its own model before it goes in.
-3. The `begin_tx` window between `wal_pos()` and the clock lock is real. The
-   code is safe today only because `backfill_floor` is in the floor. A
-   comment in `gc_floor_reader_mark` gives the pinned read marks as the reason,
-   but the commit-path GC does not use the pinned marks.
+1. Refuted. The model said that the GC floor can be one number. The reason was
+   that `backfill_floor` is always at or below every pinned read mark, because
+   the WAL backfill stops at those marks and new readers pin a mark at the end
+   of the WAL. TLC checked this as the invariant `BackfillFloorBelowReaders`
+   and passed `floorBackfill`. Then a Rust run of `Connection::checkpoint` on
+   the connection of an open reader moved `backfill_floor` above that reader's
+   mark. The model had no such path. After the path was added (PR #11794),
+   `ownCheckpointGcBackfillFloor` fails, and a simulator assertion fired in 46
+   of 200 seeds. So the reader marks stay in the floor for now. A floor of "lowest pinned read
+   mark" passes in the model, including the new path (`ownCheckpointGcPinnedFloor`).
+   A floor of "registered readers only" is not safe (rule R5).
+2. Unverified. Rule 3 may need "no reader open" only because the dual cursor
+   looks at the chain twice. When one look decides both sides of a read, TLC
+   finds no error with Rule 3 under load. The variant `rule3UnderLoadOneLook`
+   checks this with one key (20,771,050 distinct states). Rule 3 idle-only
+   could be the reason that the version store grows under a steady insert load.
+   If so, this is the change with the largest payoff. The model reads one key
+   in one step. A real scan walks the skip list while GC unlinks entries. So
+   the model does not show that the cursor change is safe. The change needs its
+   own design and its own model before it goes in.
+3. Unverified in Rust. The `begin_tx` window between `wal_pos()` and the clock
+   lock is a real counterexample in the model: `floorRegistered` fails
+   `ReadsCorrect` (109,005 distinct states). No Rust test shows it. The code
+   looks safe today only because `backfill_floor` is in the floor. A comment in
+   `gc_floor_reader_mark` gives the pinned read marks as the reason, but the
+   commit-path GC does not use the pinned marks.
 
 ## Run the model
 

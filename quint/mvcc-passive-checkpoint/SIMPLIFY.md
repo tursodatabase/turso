@@ -3,7 +3,9 @@
 This plan uses the model results to make the MVCC passive checkpoint simpler.
 Each step keeps the invariants that the specs check today. Each step removes
 special cases from the code or closes open issues. Nothing in this plan is
-implemented yet.
+implemented yet. The model checks small bounds, so each result is evidence
+within those bounds, not proof. `FINDINGS.md` lists the verdict for each
+result, and step 4 below records one result that a Rust run refuted.
 
 ## The guarantees to keep
 
@@ -91,21 +93,31 @@ existing object can get an id derived from its root page at bootstrap. A
 one-time migration at open is the other option. Before any code, make sure
 that bootstrap can derive the id for every object in an existing file.
 
-### 4. One GC floor
+### 4. One GC floor (refuted for `backfill_floor` alone)
 
-GC uses one floor. With `backfill_floor` alone, TLC finds no error
-(`floorBackfill`), because the invariant `BackfillFloorBelowReaders` holds in
-the model. The lowest pinned read mark alone also passes and frees memory
-sooner (`floorPinned`). A floor of only the registered readers is not safe
-(`floorRegistered` fails). In the model, the backfill always stops at the
-mark of every open reader (`CheckpointBackfill`). A Rust run of
-`Connection::checkpoint` on the connection of an open reader moved
-`backfill_floor` above that reader's mark. This step must check that path
-first.
+The plan was one GC floor. First, the model said that `backfill_floor` alone is
+a safe floor. TLC found no error (`floorBackfill`), because the invariant
+`BackfillFloorBelowReaders` holds in the model. In the model, the backfill
+always stops at the mark of every open reader (`CheckpointBackfill`).
 
-- Removes: `compute_min_reader_mark` from GC, the merge of two values in
-  `gc_floor_reader_mark`, and `rootpage_gc_protected` (`noRootGcProtect`).
-- Size: medium.
+Then a Rust run showed that this is wrong. `Connection::checkpoint` on the
+connection of an open reader moved `backfill_floor` above that reader's mark.
+The model had no such path. Once the path is in the model (PR #11794),
+`ownCheckpointGcBackfillFloor` fails, and a simulator assertion fired in 46 of
+200 seeds. So the reader marks stay in the floor for now.
+
+What still passes in the model: the lowest pinned read mark alone
+(`floorPinned`, and `ownCheckpointGcPinnedFloor` on the new path). A floor of
+only the registered readers is not safe (`floorRegistered` fails). The fix for
+the checkpoint on a reader's own connection is #11831. Larger bounds were not
+run.
+
+- Removes: `rootpage_gc_protected` (`noRootGcProtect`). PR #11794 deletes it.
+  In the model it never changes a GC decision, and a Rust assertion over 200
+  seeds never fired.
+- Keeps: `compute_min_reader_mark` and the merge of two values in
+  `gc_floor_reader_mark`.
+- Size: small.
 
 ### 5. Delete guards that the model does not need
 
@@ -136,10 +148,11 @@ Step 3 can make several of these guards dead code.
 
 Today a read can look at the version chain twice, once for the version store
 and once for the B-tree. Because of that, GC Rule 3 waits until no reader
-is active. If one look decides both sides of a read, Rule 3 can run under
-load (`rule3UnderLoadOneLook` passes, `rule3UnderLoad` fails). Rule 3 then
-frees row versions while writers insert, and the version store stops growing
-without a bound under a constant insert load.
+is active. If one look decides both sides of a read, Rule 3 may be able to run under
+load (`rule3UnderLoadOneLook` passes, `rule3UnderLoad` fails). Rule 3 would
+then free row versions while writers insert, and the version store would stop
+growing without a bound under a constant insert load. This is a lead. The
+model reads one key in one step, so it does not show that a real scan is safe.
 
 - Size: large. It needs a cursor design and its own model of a scan over a
   skip list while GC removes entries.
@@ -170,7 +183,8 @@ section 3, item 1 gives the lead.
 
 ## Order
 
-The order is 1, 2, 7, 3, 4, 5, 6. Steps 1 and 2 are small and close four
+The order is 1, 2, 7, 3, 4, 5, 6. Step 4 is now only the removal of
+`rootpage_gc_protected`. Steps 1 and 2 are small and close four
 issues. Step 7 is independent of the passive design and removes work from
 the default mode.
 Step 3 removes the most code but needs a compatibility plan. Step 5 waits
