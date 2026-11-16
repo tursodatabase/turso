@@ -14,6 +14,10 @@ The test can show two things:
   predicts. The engine must fail at the same step, with the same kind of
   error. After the fix, the test changes to expect no error.
 
+The replay shows that the code can follow the paths of the model. It never
+tests paths that the code has and the model lacks. A replay that passes is
+evidence for the paths of the model only. PR #11779 builds this test.
+
 ## Where the test lives
 
 The test is a `#[cfg(test)]` module under `core/mvcc/database/mbt_tests/`.

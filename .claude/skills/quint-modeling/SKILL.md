@@ -7,8 +7,9 @@ description: Use when you model, check or simplify a Turso concurrency design wi
 The Quint specs in `quint/mvcc-passive-checkpoint/` state the design of the
 MVCC passive checkpoint and check it with TLC. Read `README.md` there for the
 tools and the make targets. Read `DESIGN.md` first for the design. Use this
-skill to add to the specs, to find bugs with them, and to make the code
-simpler without a loss of guarantees.
+skill to add to the specs, to look for bugs with them, and to make the code
+simpler. A result of the model is evidence within its bounds, not proof, so a
+simpler code needs the checks in "How to delete a guard".
 
 ## Files in the spec folder
 
@@ -19,6 +20,7 @@ simpler without a loss of guarantees.
 | `DESIGN*.md` | The design in prose, each rule mapped to code with `file:line` |
 | `SIMPLIFY.md` | The plan to make the code simpler with the same invariants |
 | `MODEL-GAPS.md` | Each code mechanism, its modes, and whether a spec models it |
+| `FINDINGS.md` | Each claim about a bug or a simplification, with its verdict and evidence |
 | `SYNC.md` | What sync expects from table ids |
 | `HARNESS.md` | The design of the trace replay test |
 
@@ -49,7 +51,20 @@ simpler without a loss of guarantees.
    an action that never fires makes every invariant pass for no reason.
 7. For each GitHub issue that the model covers, add a variant `issueNNNN`
    with the code-today constants. It must break the invariant that matches
-   the user-visible failure. Add the fix as a `Fix*` constant.
+   the user-visible failure. Add the fix as a `Fix*` constant. Call the
+   result "reproduced", because the issue exists before the variant.
+
+## How to word a result
+
+- "Found" means that the model showed the bug first, and that a Rust test
+  confirms it. A model result without a Rust test is a lead.
+- "Reproduced" means that a variant fails for an issue that people had already
+  reported. The model did not discover that issue.
+- "Not shown needed at these bounds" means that TLC finds no error with a guard
+  off. It does not mean that the guard is safe to delete.
+- Run a Rust check of a model result before you build on it. The one-number GC
+  floor passed TLC, and a Rust run then refuted it (PR #11794).
+- Add each result to `FINDINGS.md` with its verdict.
 
 ## Configuration comments
 
