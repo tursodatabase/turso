@@ -463,7 +463,8 @@ impl Connection {
                         .with_custom_types(self.db.experimental_custom_types_enabled())
                         .with_index_method(self.db.experimental_index_method_enabled())
                         .with_vacuum(self.db.experimental_vacuum_enabled())
-                        .with_without_rowid(self.db.experimental_without_rowid_enabled());
+                        .with_without_rowid(self.db.experimental_without_rowid_enabled())
+                        .with_multiprocess_wal(self.db.experimental_multiprocess_wal_enabled());
                     let is_memory_db = is_memory_like(path);
                     let io: Arc<dyn IO> = if is_memory_db {
                         Arc::new(MemoryIO::new())
