@@ -3829,6 +3829,13 @@ impl Pager {
         self.spill_yield.arm(page_id, skip);
     }
 
+    /// Whether the page is in the page cache. Unlike `cache_get`, this never removes the page.
+    pub fn cache_contains(&self, page_idx: usize) -> bool {
+        self.page_cache
+            .read()
+            .contains_key(&PageCacheKey::new(page_idx))
+    }
+
     // Get a page from the cache, if it exists.
     pub fn cache_get(&self, page_idx: usize) -> Result<Option<PageRef>> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
