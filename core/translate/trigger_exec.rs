@@ -289,6 +289,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
             Ok(ast::Stmt::Insert {
+                overriding_system_value: false,
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {

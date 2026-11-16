@@ -1991,15 +1991,16 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<_, _>>()?;
         reject_duplicate_columns(columns.iter().map(|c| c.as_str()), "INSERT")?;
-        if matches!(
-            pg_query::protobuf::OverridingKind::try_from(insert.r#override),
-            Ok(pg_query::protobuf::OverridingKind::OverridingUserValue
-                | pg_query::protobuf::OverridingKind::OverridingSystemValue)
-        ) {
-            return Err(ParseError::not_supported(
-                "INSERT ... OVERRIDING SYSTEM/USER VALUE",
-            ));
-        }
+        let overriding_system_value =
+            match pg_query::protobuf::OverridingKind::try_from(insert.r#override) {
+                Ok(pg_query::protobuf::OverridingKind::OverridingUserValue) => {
+                    return Err(ParseError::not_supported(
+                        "INSERT ... OVERRIDING USER VALUE",
+                    ));
+                }
+                Ok(pg_query::protobuf::OverridingKind::OverridingSystemValue) => true,
+                _ => false,
+            };
         let has_explicit_columns = !columns.is_empty();
 
         // Translate ON CONFLICT clause (upsert)
@@ -2012,6 +2013,7 @@ impl PostgreSQLTranslator {
                 ));
             }
             return Ok(ast::Stmt::Insert {
+                overriding_system_value,
                 with: self.translate_with_clause(&insert.with_clause)?,
                 or_conflict: None,
                 tbl_name,
@@ -2087,6 +2089,7 @@ impl PostgreSQLTranslator {
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
+            overriding_system_value,
             with,
             or_conflict: None,
             tbl_name,
@@ -13206,13 +13209,10 @@ mod tests {
 
     #[test]
     fn fail_closed_overriding() {
-        assert_not_supported(
-            "INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)",
-            "OVERRIDING",
-        );
+        assert_translates("INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)");
         assert_not_supported(
             "INSERT INTO t OVERRIDING USER VALUE VALUES (1)",
-            "OVERRIDING",
+            "OVERRIDING USER VALUE",
         );
     }
 

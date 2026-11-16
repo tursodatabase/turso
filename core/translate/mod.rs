@@ -541,6 +541,7 @@ fn translate_statement(
             columns,
             body,
             returning,
+            overriding_system_value,
         } => translate_insert(
             resolver,
             or_conflict,
@@ -549,6 +550,7 @@ fn translate_statement(
             body,
             returning,
             with,
+            overriding_system_value,
             program,
             connection,
         )?,

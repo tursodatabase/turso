@@ -304,6 +304,9 @@ pub enum Stmt {
         body: InsertBody,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
+        /// PostgreSQL `OVERRIDING SYSTEM VALUE`: the INSERT may write values to
+        /// `GENERATED ALWAYS AS IDENTITY` columns. Not printed in SQL.
+        overriding_system_value: bool,
     },
     /// `PRAGMA`: pragma name, body
     Pragma {

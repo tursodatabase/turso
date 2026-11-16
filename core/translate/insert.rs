@@ -257,6 +257,7 @@ pub fn translate_insert(
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
+    overriding_system_value: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
@@ -345,7 +346,7 @@ pub fn translate_insert(
         );
     };
 
-    if !connection.writes_stored_values() {
+    if !overriding_system_value && !connection.writes_stored_values() {
         ensure_no_always_identity_values(&table, &columns, &body)?;
     }
     let BoundInsertResult {
