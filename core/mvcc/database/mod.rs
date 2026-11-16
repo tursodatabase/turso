@@ -10248,9 +10248,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 };
                                 let has_btree = match row_type {
                                     "index" => root_page != 0,
-                                    "table" => {
-                                        !sql.is_some_and(crate::util::sql_is_create_virtual_table)
-                                    }
+                                    "table" => !sql
+                                        .is_some_and(crate::dialect::sql_is_create_virtual_table),
                                     _ => false,
                                 };
                                 if has_btree {

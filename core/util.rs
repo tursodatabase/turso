@@ -413,20 +413,6 @@ pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
     strip_quotes(ident1).eq_ignore_ascii_case(strip_quotes(ident2))
 }
 
-/// Returns true if `sql` parses as a `CREATE VIRTUAL TABLE` statement.
-///
-/// Like SQLite (whose `sqlite3InitCallback` feeds schema SQL to the real
-/// parser, so a row is a virtual table purely as a byproduct of the
-/// `create_vtab` grammar rule), classification is done by parsing rather than
-/// by substring or token matching, which would misclassify regular tables
-/// whose SQL merely contains the text (e.g. in a DEFAULT literal).
-pub fn sql_is_create_virtual_table(sql: &str) -> bool {
-    matches!(
-        crate::dialect::engine::parse_statement(sql),
-        Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
-    )
-}
-
 pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     match (lhs, rhs) {
         (Literal::Numeric(n1), Literal::Numeric(n2)) => cmp_numeric_strings(n1, n2),
@@ -2280,6 +2266,7 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::dialect::sql_is_create_virtual_table;
     use crate::schema::alter_table::{
         rewrite_select_table_refs, rewrite_view_sql_for_column_rename,
     };
