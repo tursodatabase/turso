@@ -2093,27 +2093,6 @@ pub(crate) fn commit_tx(
     Ok(())
 }
 
-pub(crate) fn commit_tx_no_conn(
-    db: &MvccTestDbNoConn,
-    tx_id: u64,
-    conn: &Arc<Connection>,
-) -> Result<(), LimboError> {
-    let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
-    // TODO: sync IO hack
-    loop {
-        let res = sm.step(&mv_store)?;
-        match res {
-            IOResult::IO(io) => {
-                io.wait(conn.db.io.as_ref())?;
-            }
-            IOResult::Done(_) => break,
-        }
-    }
-    assert!(sm.is_finalized());
-    Ok(())
-}
-
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
