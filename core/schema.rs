@@ -5564,30 +5564,22 @@ pub(crate) struct GeneratedColGraph {
 
 impl GeneratedColGraph {
     fn build(columns: &[Column]) -> Result<Self> {
-        let n = columns.len();
+        let direct_deps = direct_dependencies(columns)?;
+        Self::from_direct_dependencies(direct_deps, |i| columns[i].name.as_deref())
+    }
 
-        let mut direct_deps = try_vec![ColumnMask::default(); n]?;
+    /// Builds the graph from `direct_deps[j]`, the columns that column `j` reads
+    /// directly. `column_name` names the columns of a cycle in its error.
+    fn from_direct_dependencies<'a>(
+        direct_deps: Vec<ColumnMask>,
+        column_name: impl Fn(usize) -> Option<&'a str>,
+    ) -> Result<Self> {
+        let n = direct_deps.len();
+
         let mut direct_dependents = try_vec![ColumnMask::default(); n]?;
         let mut in_degree: Vec<u32> = try_vec![0; n]?;
-
-        // walk each generated column's expression once to extract edges
-        for (j, col) in columns.iter().enumerate() {
-            let (GeneratedType::Virtual { ref expr, .. } | GeneratedType::Stored { ref expr, .. }) =
-                col.generated_type()
-            else {
-                continue;
-            };
-            let mut direct = BitSet::default();
-            collect_column_dependencies_of_gencol(expr, columns, &mut direct);
-            if direct.get(j) {
-                bail_parse_error!(
-                    "generated column \"{}\" cannot reference itself",
-                    col.name.as_deref().unwrap_or("?")
-                );
-            }
-            let direct_mask: ColumnMask = ColumnMask::try_from_iter(direct.iter())?;
-            direct_deps[j].union_with(&direct_mask)?;
-            for i in direct.iter() {
+        for (j, deps) in direct_deps.iter().enumerate() {
+            for i in deps.iter() {
                 direct_dependents[i].set(j)?;
                 in_degree[j] += 1;
             }
@@ -5616,7 +5608,7 @@ impl GeneratedColGraph {
         if topological_sort.len() != n {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
-                .filter_map(|i| columns[i].name.as_deref())
+                .filter_map(&column_name)
                 .try_collect()?;
             bail_parse_error!(
                 "circular dependency in generated columns: {}",
@@ -5650,6 +5642,63 @@ impl GeneratedColGraph {
             topological_sort,
         })
     }
+
+    fn columns_affected_by_update(
+        &self,
+        updated_cols: impl IntoIterator<Item = usize>,
+    ) -> Result<ColumnMask> {
+        let mut affected = ColumnMask::default();
+        for i in updated_cols {
+            affected.set(i)?;
+            if i < self.dependents.len() {
+                let snapshot = self.dependents[i].try_clone()?;
+                affected.union_with(&snapshot)?;
+            }
+        }
+        Ok(affected)
+    }
+
+    fn dependencies_of_columns(
+        &self,
+        targets: impl IntoIterator<Item = usize>,
+        is_virtual_generated: impl Fn(usize) -> bool,
+    ) -> Result<ColumnMask> {
+        let mut deps = ColumnMask::default();
+        for j in targets {
+            if !is_virtual_generated(j) {
+                deps.set(j)?;
+                continue;
+            }
+            for i in self.dependencies[j].iter() {
+                if !is_virtual_generated(i) {
+                    deps.set(i)?;
+                }
+            }
+        }
+        Ok(deps)
+    }
+}
+
+/// Returns, for each column, the columns its generated expression reads directly.
+fn direct_dependencies(columns: &[Column]) -> Result<Vec<ColumnMask>> {
+    let mut direct_deps = try_vec![ColumnMask::default(); columns.len()]?;
+    for (j, col) in columns.iter().enumerate() {
+        let (GeneratedType::Virtual { ref expr, .. } | GeneratedType::Stored { ref expr, .. }) =
+            col.generated_type()
+        else {
+            continue;
+        };
+        let mut direct = BitSet::default();
+        collect_column_dependencies_of_gencol(expr, columns, &mut direct);
+        if direct.get(j) {
+            bail_parse_error!(
+                "generated column \"{}\" cannot reference itself",
+                col.name.as_deref().unwrap_or("?")
+            );
+        }
+        direct_deps[j] = ColumnMask::try_from_iter(direct.iter())?;
+    }
+    Ok(direct_deps)
 }
 
 #[derive(Clone, Debug)]
@@ -6517,36 +6566,16 @@ impl BTreeTable {
         &self,
         updated_cols: impl IntoIterator<Item = usize>,
     ) -> Result<ColumnMask> {
-        let graph = self.column_graph()?;
-        let mut affected = ColumnMask::default();
-        for i in updated_cols {
-            affected.set(i)?;
-            if i < graph.dependents.len() {
-                let snapshot = graph.dependents[i].try_clone()?;
-                affected.union_with(&snapshot)?;
-            }
-        }
-        Ok(affected)
+        self.column_graph()?
+            .columns_affected_by_update(updated_cols)
     }
 
     pub(crate) fn dependencies_of_columns(
         &self,
         targets: impl IntoIterator<Item = usize>,
     ) -> Result<ColumnMask> {
-        let graph = self.column_graph()?;
-        let mut deps = ColumnMask::default();
-        for j in targets {
-            if !self.columns[j].is_virtual_generated() {
-                deps.set(j)?;
-                continue;
-            }
-            for i in graph.dependencies[j].iter() {
-                if !self.columns[i].is_virtual_generated() {
-                    deps.set(i)?;
-                }
-            }
-        }
-        Ok(deps)
+        self.column_graph()?
+            .dependencies_of_columns(targets, |i| self.columns[i].is_virtual_generated())
     }
 }
 
@@ -9493,9 +9522,50 @@ mod tests {
         v
     }
 
+    /// The generated-column graph of a table of `n` columns, where each
+    /// `(j, i)` in `reads` says that virtual column `j` reads column `i`.
+    struct Gencols {
+        graph: GeneratedColGraph,
+        is_virtual: Vec<bool>,
+    }
+
+    fn gencols(n: usize, reads: &[(usize, usize)]) -> Result<Gencols> {
+        let mut direct_deps = try_vec![ColumnMask::default(); n]?;
+        let mut is_virtual = vec![false; n];
+        for &(j, i) in reads {
+            direct_deps[j].set(i)?;
+            is_virtual[j] = true;
+        }
+        let graph = GeneratedColGraph::from_direct_dependencies(direct_deps, |_| None)?;
+        Ok(Gencols { graph, is_virtual })
+    }
+
+    impl Gencols {
+        fn columns_affected_by_update(
+            &self,
+            updated_cols: impl IntoIterator<Item = usize>,
+        ) -> Result<ColumnMask> {
+            self.graph.columns_affected_by_update(updated_cols)
+        }
+
+        fn dependencies_of_columns(
+            &self,
+            targets: impl IntoIterator<Item = usize>,
+        ) -> Result<ColumnMask> {
+            self.graph
+                .dependencies_of_columns(targets, |i| self.is_virtual[i])
+        }
+    }
+
+    /// Each `c{i}` for `i` in `1..n` reads `c{i - 1}`.
+    fn chain(n: usize) -> Vec<(usize, usize)> {
+        (1..n).map(|i| (i, i - 1)).collect()
+    }
+
     #[test]
     fn gencol_graph_no_virtual_columns() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b)", 0)?;
+        // CREATE TABLE t(a, b)
+        let t = gencols(2, &[])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
         assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
@@ -9505,7 +9575,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_linear_chain() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)", 0)?;
+        // CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)
+        let t = gencols(3, &[(1, 0), (2, 1)])?;
         // affected-by({a}) = {a, b, c}
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1, 2]);
         // affected-by({b}) = {b, c} (b is virtual, but updating it still propagates through dependents)
@@ -9521,10 +9592,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_diamond() -> Result<()> {
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-        )?;
+        // CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)
+        let t = gencols(4, &[(1, 0), (2, 0), (3, 1), (3, 2)])?;
         assert_eq!(
             indices(&t.columns_affected_by_update([0])?),
             vec![0, 1, 2, 3]
@@ -9536,7 +9605,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_multiple_stored_roots() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)", 0)?;
+        // CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)
+        let t = gencols(3, &[(2, 0), (2, 1)])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 2]);
         assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
         assert_eq!(
@@ -9549,7 +9619,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_empty_input() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
+        // CREATE TABLE t(a, b AS (a) VIRTUAL)
+        let t = gencols(2, &[(1, 0)])?;
         assert!(t.columns_affected_by_update(std::iter::empty())?.is_empty());
         assert!(t.dependencies_of_columns(std::iter::empty())?.is_empty());
         Ok(())
@@ -9557,10 +9628,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_disjoint_components() -> Result<()> {
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
-            0,
-        )?;
+        // CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)
+        let t = gencols(4, &[(1, 0), (3, 2)])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1]);
         assert_eq!(indices(&t.columns_affected_by_update([2])?), vec![2, 3]);
         assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
@@ -9571,12 +9640,7 @@ mod tests {
     #[test]
     fn gencol_graph_deep_chain() -> Result<()> {
         // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..50 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_sql(&sql, 0)?;
+        let t = gencols(50, &chain(50))?;
         // affected-by({c0}) = {c0..c49}
         let affected = t.columns_affected_by_update([0])?;
         assert_eq!(affected.count(), 50);
@@ -9589,12 +9653,7 @@ mod tests {
     fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
         // Validates that the iterative Kahn's + DP don't blow the stack on
         // realistic worst-case generated-column depth.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..500 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_sql(&sql, 0)?;
+        let t = gencols(500, &chain(500))?;
         assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
         assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
         Ok(())
@@ -9602,7 +9661,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
+        // CREATE TABLE t(a, b AS (a) VIRTUAL)
+        let t = gencols(2, &[(1, 0)])?;
         let affected = t.columns_affected_by_update([ROWID_SENTINEL])?;
         // ROWID_SENTINEL is preserved in the mask flag but does not propagate through the graph
         // (no generated column can depend on ROWID_SENTINEL directly).
@@ -9613,11 +9673,8 @@ mod tests {
 
     #[test]
     fn gencol_graph_transpose_duality() -> Result<()> {
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
-            0,
-        )?;
-        let graph = t.column_graph()?;
+        // CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)
+        let graph = gencols(4, &[(1, 0), (2, 1), (3, 0), (3, 2)])?.graph;
         // j ∈ dependencies[i] iff i ∈ dependents[j]
         for i in 0..graph.dependencies.len() {
             for j in graph.dependencies[i].iter() {
@@ -9639,10 +9696,8 @@ mod tests {
     #[test]
     fn gencol_graph_idempotence() -> Result<()> {
         // affected_by(affected_by(xs)) == affected_by(xs).
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-        )?;
+        // CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)
+        let t = gencols(4, &[(2, 0), (3, 1), (3, 2)])?;
         let once = t.columns_affected_by_update([0, 1])?;
         let twice = t.columns_affected_by_update(once.iter())?;
         assert_eq!(indices(&twice), indices(&once));
@@ -9652,10 +9707,8 @@ mod tests {
     #[test]
     fn gencol_graph_union_monotonicity() -> Result<()> {
         // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
-            0,
-        )?;
+        // CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)
+        let t = gencols(5, &[(2, 0), (3, 1), (4, 2), (4, 3)])?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
         expected.union_with(&b_mask).unwrap();
