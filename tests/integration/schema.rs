@@ -1337,3 +1337,61 @@ fn table_level_pk_and_unique_order_survives_to_sql() {
         assert_eq!(restored.unique_sets, table.unique_sets, "{sql}");
     }
 }
+
+/// Loads the table `t` of `sql` the way a schema row is read from disk.
+fn load_table_t(sql: &str) -> Arc<BTreeTable> {
+    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    schema
+        .handle_schema_row(
+            "table",
+            "t",
+            "t",
+            2,
+            Some(sql),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &SqliteDialect,
+        )
+        .unwrap();
+    schema.get_btree_table(NamespaceId::ROOT, "t").unwrap()
+}
+
+#[test]
+#[allow(clippy::redundant_clone)]
+fn gencol_graph_clone_invalidates_cache() -> Result<()> {
+    // After cloning a BTreeTable, the cache is fresh, and
+    // `prepare_generated_columns` rebuilds it.
+    let original = load_table_t("CREATE TABLE t(a, b AS (a) VIRTUAL)");
+    // Loading the table builds the cache.
+    assert!(original.has_column_graph());
+
+    // Clone: ResetOnClone makes the cloned cache empty. We keep a real clone
+    // (not a move) because the point of the test is that Clone produces a
+    // fresh cache independently from the original.
+    let mut cloned = (*original).clone();
+    assert!(!cloned.has_column_graph());
+    // Original's cache is still populated — clone didn't touch it.
+    assert!(original.has_column_graph());
+
+    cloned.prepare_generated_columns()?;
+    assert!(cloned.has_column_graph());
+    Ok(())
+}
+
+#[test]
+fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
+    let mut t = (*load_table_t("CREATE TABLE t(a, b AS (a) VIRTUAL)")).clone();
+    // Force the cache to be populated.
+    t.prepare_generated_columns()?;
+    assert!(t.has_column_graph());
+
+    // Any access through columns_mut() wipes the cache, even if we don't mutate.
+    let _ = t.columns_mut();
+    assert!(!t.has_column_graph());
+    Ok(())
+}

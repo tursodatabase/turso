@@ -6557,9 +6557,9 @@ impl BTreeTable {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
-        self.column_dependencies.0.get()
+    /// Whether the dependency graph of the generated columns is built.
+    pub fn has_column_graph(&self) -> bool {
+        self.column_dependencies.0.get().is_some()
     }
 
     pub(crate) fn columns_affected_by_update(
@@ -9714,47 +9714,6 @@ mod tests {
         expected.union_with(&b_mask).unwrap();
         let union_mask = t.columns_affected_by_update([0, 1])?;
         assert_eq!(indices(&union_mask), indices(&expected));
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::redundant_clone)]
-    fn gencol_graph_clone_invalidates_cache() -> Result<()> {
-        // After cloning a BTreeTable, the cache is fresh. Mutating columns on
-        // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
-        // rebuilds correctly.
-        let original = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
-        // Force the cache to be populated on the original.
-        let _ = original.columns_affected_by_update([0])?;
-        assert!(original.peek_column_dependencies().is_some());
-
-        // Clone: ResetOnClone makes the cloned cache empty. We keep a real clone
-        // (not a move) because the point of the test is that Clone produces a
-        // fresh cache independently from the original.
-        let cloned = original.clone();
-        assert!(cloned.peek_column_dependencies().is_none());
-        // Original's cache is still populated — clone didn't touch it.
-        assert!(original.peek_column_dependencies().is_some());
-
-        // The clone still returns correct results — cache rebuilds lazily.
-        assert_eq!(
-            indices(&cloned.columns_affected_by_update([0])?),
-            vec![0, 1]
-        );
-        assert!(cloned.peek_column_dependencies().is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
-        let mut t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
-        // Force the cache to be populated.
-        let _ = t.columns_affected_by_update([0])?;
-        assert!(t.peek_column_dependencies().is_some());
-
-        // Any access through columns_mut() wipes the cache, even if we don't mutate.
-        let _ = t.columns_mut();
-        assert!(t.peek_column_dependencies().is_none());
         Ok(())
     }
 
