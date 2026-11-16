@@ -18,5 +18,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders AS o
-`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN customers AS c
+`--SEARCH o USING INDEX idx_orders_customer_id (customer_id=?)

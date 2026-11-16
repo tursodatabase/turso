@@ -20,6 +20,12 @@ pub struct CostModelParams {
     /// Estimated rows per table B-tree page.
     pub rows_per_table_page: f64,
 
+    /// Assumed rows per key for a join probe (the key comes from another
+    /// table) on the first column of an index when no ANALYZE stats exist
+    /// (SQLite's default for an index's first column is 10). Constant and
+    /// parameter equalities keep `sel_eq_indexed`.
+    pub rows_per_join_probe_key: f64,
+
     // === Selectivity Fallbacks ===
     /// Selectivity for equality predicate on unindexed column (e.g., `x = 5`).
     pub sel_eq_unindexed: f64,
@@ -99,6 +105,7 @@ impl CostModelParams {
             // Cardinality fallbacks
             rows_per_table_fallback: 1_000_000.0,
             rows_per_table_page: 50.0,
+            rows_per_join_probe_key: 10.0,
 
             // Selectivity fallbacks
             sel_eq_unindexed: 0.1,
@@ -230,6 +237,9 @@ impl CostModelParams {
         }
         if self.rows_per_table_page <= 0.0 {
             return Err("rows_per_table_page must be positive".into());
+        }
+        if self.rows_per_join_probe_key <= 0.0 {
+            return Err("rows_per_join_probe_key must be positive".into());
         }
         if self.in_subquery_rows <= 0.0 {
             return Err("in_subquery_rows must be positive".into());

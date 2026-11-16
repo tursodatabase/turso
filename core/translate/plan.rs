@@ -4008,10 +4008,24 @@ pub enum Search {
     },
     /// An IN-driven index seek. Iterates an ephemeral B-tree of IN values and
     /// for each value seeks into the real index (or table, if seek by rowid).
+    ///
+    /// The IN constrains the index column that follows `prefix`: given
+    /// `CREATE INDEX i ON t (a, b)` and `WHERE a = 1 AND b IN (2, 3)`, the
+    /// prefix is `[a = 1]` and the seeks are for `(1, 2)` and `(1, 3)`.
     InSeek {
         index: Option<Arc<Index>>,
         source: InSeekSource,
+        prefix: Vec<InSeekPrefix>,
     },
+}
+
+/// An equality on a leading index column that an IN seek holds fixed.
+#[derive(Clone, Debug)]
+pub struct InSeekPrefix {
+    /// The value the column must equal.
+    pub expr: ast::Expr,
+    /// The affinity applied to `expr` before it is compared with the column.
+    pub affinity: Affinity,
 }
 
 /// Where IN-seek values come from.

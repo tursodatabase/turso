@@ -2,16 +2,16 @@ use super::{
     emitter::Resolver,
     expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
-        JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
-        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
-        TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan, WhereTerm,
-        WhereTermOrigin,
+        DeletePlan, GroupBy, InSeekPrefix, InSeekSource, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
+        SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan,
+        WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
-use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::plan::{plan_is_correlated, BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic, Func},
@@ -968,7 +968,8 @@ struct TableAccessPlan {
 struct SubqueryPlanCache {
     // The original and changed forms copy the same child subqueries. Keep a
     // finished child plan so the next copy does not plan that child again.
-    from_clause: HashMap<TableInternalId, Plan>,
+    // The call count is part of the key: a plan made for N calls is wrong for M.
+    from_clause: HashMap<(TableInternalId, u64), Plan>,
     correlated: HashMap<(TableInternalId, u64), Plan>,
 }
 
@@ -1849,23 +1850,41 @@ fn optimize_subqueries(
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
+    // A correlated FROM-clause subquery runs on every call of this plan, so its
+    // join search must see the same call count. An uncorrelated one is
+    // materialized once and keeps a count of 1.
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0).max(1.0);
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            if let Some(cached) = cache.from_clause.remove(&table.internal_id) {
+            let calls = if calls > 1.0 && plan_is_correlated(&from_clause_subquery.plan) {
+                calls
+            } else {
+                1.0
+            };
+            let key = (table.internal_id, calls.to_bits());
+            if let Some(cached) = cache.from_clause.remove(&key) {
                 from_clause_subquery.plan = Box::new(cached);
                 continue;
             }
+            let set_calls = |select_plan: &mut SelectPlan| {
+                if calls > 1.0 {
+                    select_plan.input_cardinality_hint = Some(calls);
+                }
+            };
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
                 Plan::Select(select_plan) => {
+                    set_calls(select_plan);
                     optimize_select_plan_with_cache(select_plan, resolver, cache)?
                 }
                 Plan::CompoundSelect {
                     left, right_most, ..
                 } => {
+                    set_calls(right_most);
                     optimize_select_plan_with_cache(right_most, resolver, cache)?;
                     for (select_plan, _) in left {
+                        set_calls(select_plan);
                         optimize_select_plan_with_cache(select_plan, resolver, cache)?;
                     }
                 }
@@ -1892,10 +1911,9 @@ fn optimize_subqueries(
                 }
             }
             if save_plans {
-                cache.from_clause.insert(
-                    table.internal_id,
-                    from_clause_subquery.plan.as_ref().clone(),
-                );
+                cache
+                    .from_clause
+                    .insert(key, from_clause_subquery.plan.as_ref().clone());
             }
         }
     }
@@ -2192,7 +2210,7 @@ fn base_row_estimate(
         }
         Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
             Plan::Select(plan) => {
-                if let Some(rows) = plan.estimated_output_rows {
+                if let Some(rows) = rows_per_call(plan) {
                     return RowCountEstimate::AnalyzeStats(rows.max(1.0));
                 }
                 RowCountEstimate::hardcoded_fallback(params)
@@ -2205,9 +2223,9 @@ fn base_row_estimate(
                 // represents: (A op1 B) op2 C
                 // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
                 let fallback = *RowCountEstimate::hardcoded_fallback(params);
-                let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
-                let mut combined = left.first().map_or(
-                    right_most.estimated_output_rows.unwrap_or(fallback),
+                let est = |p: &SelectPlan| rows_per_call(p).unwrap_or(fallback);
+                let mut combined = left.first().map_or_else(
+                    || rows_per_call(right_most).unwrap_or(fallback),
                     |(p, _)| est(p),
                 );
                 // The estimates to the right of each operator: left[1..].est, then right_most.est
@@ -2231,6 +2249,14 @@ fn base_row_estimate(
         },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
+}
+
+/// Rows one execution of `plan` returns. `estimated_output_rows` covers all
+/// executions of a plan made for several calls, but the plan that reads a
+/// FROM-clause subquery reads it once per call.
+fn rows_per_call(plan: &SelectPlan) -> Option<f64> {
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0).max(1.0);
+    plan.estimated_output_rows.map(|rows| rows / calls)
 }
 
 /// Read a group count from ANALYZE for a simple list of table columns.
@@ -3121,10 +3147,29 @@ fn operation_for_unmatched_right_rows(
             index,
             affinity,
             where_term_idx,
+            prefix_refs,
         } => {
             let source = in_seek_source(&original_where_clause[where_term_idx].expr, affinity)?;
+            let prefix = in_seek_prefix(
+                &table_constraints.constraints,
+                &prefix_refs,
+                original_where_clause,
+                table_references,
+                resolver,
+            );
+            mark_seek_constraints_consumed(
+                &table_constraints.constraints,
+                &prefix_refs,
+                where_clause_for_unmatched_rows,
+                false,
+                false,
+            );
             where_clause_for_unmatched_rows[where_term_idx].consumed = true;
-            Ok(Operation::Search(Search::InSeek { index, source }))
+            Ok(Operation::Search(Search::InSeek {
+                index,
+                source,
+                prefix,
+            }))
         }
         AccessMethodParams::MultiIndexScan {
             branches,
@@ -3588,12 +3633,27 @@ fn apply_table_access_plan(
                 index,
                 affinity,
                 where_term_idx,
+                prefix_refs,
             } => {
                 let source = in_seek_source(&where_clause[*where_term_idx].expr, *affinity)?;
                 let is_outer_join = table_references.joined_tables()[table_idx]
                     .join_info
                     .as_ref()
                     .is_some_and(|join_info| join_info.is_outer());
+                let prefix = in_seek_prefix(
+                    &constraints_per_table[table_idx].constraints,
+                    prefix_refs,
+                    where_clause,
+                    table_references,
+                    resolver,
+                );
+                mark_seek_constraints_consumed(
+                    &constraints_per_table[table_idx].constraints,
+                    prefix_refs,
+                    where_clause,
+                    is_outer_join,
+                    hash_join_build_only_tables.get(table_idx),
+                );
                 if let Some(index) = partial_index(index.as_ref()) {
                     mark_partial_index_predicate_terms_consumed(
                         index,
@@ -3607,6 +3667,7 @@ fn apply_table_access_plan(
                     Operation::Search(Search::InSeek {
                         index: index.clone(),
                         source,
+                        prefix,
                     });
             }
         }
@@ -3788,6 +3849,32 @@ fn btree_search_operation(
             Some(resolver),
         )?,
     }))
+}
+
+/// The equalities an IN seek holds fixed, as the expressions that fix them.
+fn in_seek_prefix(
+    constraints: &[Constraint],
+    prefix_refs: &[RangeConstraintRef],
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Vec<InSeekPrefix> {
+    prefix_refs
+        .iter()
+        .map(|cref| {
+            // `in_seek_eq_prefix` only returns references that have an equality.
+            let eq = cref
+                .eq
+                .as_ref()
+                .expect("an IN seek prefix column has an equality");
+            let (_, expr, affinity) = constraints[eq.constraint_pos].get_constraining_expr(
+                where_clause,
+                Some(table_references),
+                Some(resolver),
+            );
+            InSeekPrefix { expr, affinity }
+        })
+        .collect()
 }
 
 fn in_seek_source(in_expr: &Expr, affinity: Affinity) -> Result<InSeekSource> {
