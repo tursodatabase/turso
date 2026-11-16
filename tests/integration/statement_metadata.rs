@@ -612,6 +612,89 @@ mod tests {
         assert_eq!(b_info.kind, ColumnTypeKind::Builtin);
     }
 
+    #[test]
+    fn type_info_of_a_subquery_column_is_the_type_of_its_expression() {
+        let db = fresh_db_with_custom_types("type_info_subquery_columns.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE accounts(id INTEGER PRIMARY KEY, amount cents, tags TEXT[], photo BLOB, extra ANY) STRICT",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE loose(flag BOOLEAN, day DATE, name VARCHAR(10), photo BLOB)")
+            .unwrap();
+        conn.execute("CREATE VIEW loose_view AS SELECT flag, day, name, photo FROM loose")
+            .unwrap();
+
+        let declared_names = |sql: &str| -> Vec<Option<String>> {
+            let stmt = conn.prepare(sql).unwrap();
+            (0..stmt.num_columns())
+                .map(|column| {
+                    let info = stmt.get_column_type_info(column).unwrap();
+                    info.map(|info| info.declared_name)
+                })
+                .collect()
+        };
+        let type_info = |sql: &str| -> Vec<Option<ColumnTypeInfo>> {
+            let stmt = conn.prepare(sql).unwrap();
+            (0..stmt.num_columns())
+                .map(|column| stmt.get_column_type_info(column).unwrap())
+                .collect()
+        };
+
+        let strict_columns = "amount, CAST(id AS cents) AS cast_to_cents, 2 AS literal, \
+                              id + 1 AS sum, tags, photo, extra";
+        let direct = type_info(&format!("SELECT {strict_columns} FROM accounts"));
+        assert_eq!(
+            declared_names(&format!("SELECT {strict_columns} FROM accounts")),
+            ["cents", "cents", "INTEGER", "INTEGER", "TEXT", "BLOB", "ANY"]
+                .map(|name| Some(name.to_string()))
+        );
+        for through_a_subquery in [
+            format!("SELECT * FROM (SELECT {strict_columns} FROM accounts)"),
+            format!("SELECT * FROM (SELECT * FROM (SELECT {strict_columns} FROM accounts))"),
+            format!("WITH c AS (SELECT {strict_columns} FROM accounts) SELECT * FROM c"),
+        ] {
+            assert_eq!(
+                type_info(&through_a_subquery),
+                direct,
+                "{through_a_subquery}"
+            );
+        }
+
+        let direct = type_info("SELECT flag, day, name, photo FROM loose");
+        assert_eq!(
+            declared_names("SELECT flag, day, name, photo FROM loose"),
+            ["BOOLEAN", "DATE", "VARCHAR", "BLOB"].map(|name| Some(name.to_string()))
+        );
+        for through_a_subquery in [
+            "SELECT * FROM (SELECT flag, day, name, photo FROM loose)",
+            "WITH c AS (SELECT flag, day, name, photo FROM loose) SELECT * FROM c",
+            "SELECT * FROM loose_view",
+        ] {
+            assert_eq!(
+                type_info(through_a_subquery),
+                direct,
+                "{through_a_subquery}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_info_of_a_compound_subquery_column_is_the_common_type_of_its_selects() {
+        let db = fresh_db_with_custom_types("type_info_compound_subquery_columns.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(x INTEGER, label TEXT) STRICT")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT * FROM (SELECT x, label FROM t UNION ALL SELECT 1.5, 'a')")
+            .unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "REAL");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
+    }
+
     /// `chr(n)` is the SQL standard / PostgreSQL spelling of SQLite's
     /// `char(n)`. Both must produce identical results.
     #[test]

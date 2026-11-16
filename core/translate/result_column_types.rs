@@ -6,8 +6,8 @@ use turso_parser::ast;
 
 use super::emitter::Resolver;
 use super::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
-use super::plan::{ResultSetColumn, TableReferences};
-use crate::schema::Schema;
+use super::plan::{Plan, ResultSetColumn, TableReferences};
+use crate::schema::{Schema, Table};
 use crate::statement::{ColumnTypeInfo, ColumnTypeKind};
 
 pub(crate) fn result_column_types(
@@ -15,16 +15,35 @@ pub(crate) fn result_column_types(
     table_references: &TableReferences,
     resolver: &Resolver,
 ) -> Vec<Option<ColumnTypeInfo>> {
-    let env = TypeEnv::new(Some(table_references), resolver);
     result_columns
         .iter()
-        .map(|column| match &column.expr {
-            ast::Expr::Column { table, column, .. } => {
-                table_column_type(*table, *column, table_references, resolver.schema())
-            }
-            expr => expression_type(&type_of(expr, &env), resolver.schema()),
-        })
+        .map(|column| result_column_type(&column.expr, table_references, resolver))
         .collect()
+}
+
+fn result_column_type(
+    expr: &ast::Expr,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Option<ColumnTypeInfo> {
+    if let ast::Expr::Column { table, column, .. } = expr {
+        match table_references.find_table_by_internal_id(*table) {
+            Some((_, Table::FromClauseSubquery(subquery))) => {
+                if let Plan::Select(select) = subquery.plan.as_ref() {
+                    // A column of a SELECT has the type that SELECT reports for it.
+                    return result_column_type(
+                        &select.result_columns.get(*column)?.expr,
+                        &select.table_references,
+                        resolver,
+                    );
+                }
+            }
+            Some((_, Table::RecursiveCteInput(_))) => {}
+            _ => return table_column_type(*table, *column, table_references, resolver.schema()),
+        }
+    }
+    let env = TypeEnv::new(Some(table_references), resolver);
+    expression_type(&type_of(expr, &env), resolver.schema())
 }
 
 /// A table column reports the type name it was declared with.
