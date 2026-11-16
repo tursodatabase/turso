@@ -15,8 +15,8 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value, ValueRef,
+    compare_immutable, compare_immutable_iter, IOCompletions, IOResult, ImmutableRecord,
+    ImmutableRecordRef, IndexInfo, SeekKey, SeekOp, SeekResult, Value,
 };
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
@@ -180,32 +180,33 @@ fn current_pos_is_only_row_of_seek_key(
             *current == *target
         }
         (RowKey::Record(current), SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
-            let target_values = target.get_values_inline()?;
-            index_key_matches_at_most_one_row(&target_values, index_info)
-                && compare_immutable(
-                    target_values.iter(),
-                    current.key.get_values_inline()?.iter(),
+            index_key_matches_at_most_one_row(target, index_info)?
+                && compare_immutable_iter(
+                    target.iter()?,
+                    current.key.iter()?,
                     &index_info.key_info[..target.column_count()],
-                )
+                )?
                 .is_eq()
         }
         _ => false,
     })
 }
 
-fn index_key_matches_at_most_one_row(key: &[ValueRef<'_>], index_info: &IndexInfo) -> bool {
+fn index_key_matches_at_most_one_row(
+    key: &ImmutableRecordRef<'_>,
+    index_info: &IndexInfo,
+) -> Result<bool> {
     // num_cols counts the rowid when the index stores one. So a key this long
     // ends with the rowid, and two rows never share a rowid. An index without
     // a rowid (an index method's backing B-tree) stores each whole key once.
-    if key.len() == index_info.num_cols {
-        return true;
+    let column_count = key.column_count();
+    if column_count == index_info.num_cols {
+        return Ok(true);
     }
     // In a UNIQUE index, the indexed columns alone also name one row, unless a
     // value is NULL: a UNIQUE index can hold any number of rows with NULL there.
     let indexed_columns = index_info.num_cols - usize::from(index_info.has_rowid);
-    index_info.is_unique
-        && key.len() == indexed_columns
-        && !key.iter().any(|value| matches!(value, ValueRef::Null))
+    Ok(index_info.is_unique && column_count == indexed_columns && !key.contains_null()?)
 }
 
 #[cfg(any(test, injected_yields))]
