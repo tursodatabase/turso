@@ -252,7 +252,7 @@ variants use `MaxTs = 4`, except `indexes`.
 | `FixDdlRebases` | A DDL commit changes only its own table in the shared schema. It does not install its full copy of the schema. | #8004 | `issue8004` | `PagesAccounted` |
 | `FixDisjointIds` | The same fix as for #11501: no temporary id can name the page of an index. | #7960 | `issue7960` | `KindsMatch` (a row lands in a B-tree of another kind) |
 | `FixAlterPatch` | The publish patches every version of the `sqlite_schema` row that still carries the temporary id, and only a `DROP` puts the root in `dropped_root_pages`. | #8077 | `issue8077`, `issue8077Row` | `NoLiveDestroy`, `SchemaRowCurrent` |
-| `FixAlterRecovery` | Recovery maps a replayed `sqlite_schema` update whose `rootpage` is a temporary id to the table that bootstrap knows by that id. It needs `FixPersistIds`. | none, a model finding | `noAlterRecovery` | `RecoveryCorrect` (recovery panics) |
+| `FixAlterRecovery` | Recovery maps a replayed `sqlite_schema` update whose `rootpage` is a temporary id to the table that bootstrap knows by that id. It needs `FixPersistIds`. | none. The model shows it, no Rust test does yet | `noAlterRecovery` | `RecoveryCorrect` (recovery panics) |
 
 The id fixes and `FixAlterRecovery` are design statements, not patches.
 Each one closes its issue in the model. Other fixes can close them too, for example a log record
@@ -274,25 +274,27 @@ gives 15,985,399 distinct states and no error.
 ## The rules
 
 Each row is one special case of the code today. "Needed" means this: when
-the case is off, TLC finds the error in the last column. The variant files
-are modules in `MvccPassiveSchemaConfigs.qnt`.
+the case is off, TLC finds the error in the last column. "Not shown needed"
+means that TLC finds no error with the case off at these bounds. It does not
+mean that the case is safe to delete. The variant files are modules in
+`MvccPassiveSchemaConfigs.qnt`.
 
 | Rule | Code | Without it | Variant |
 |------|------|------------|---------|
 | S1. The B-tree side opens a B-tree only at `materialized_at <= read_mark`. | `is_btree_readable_at` | Needed. `ReadsCorrect` fails: a reader pinned frame 0, began after the snapshot, and opens the page of a new table after the publish. At its mark the page is free. | `noMatCheck` |
-| S2. The binding must cover `begin_ts` from below (`begin <= begin_ts`). | `RootEntry::covers` | Not needed. A reader pins its mark before it takes `begin_ts`, so `materialized_at <= read_mark` already gives `begin <= begin_ts`. | `noCoversBegin` |
-| S3. The binding must cover `begin_ts` from above (`begin_ts < end`). | `RootEntry::covers` | Not needed. Only a reader with a stale schema can open a dropped table after its drop, and the cookie check stops it. | `noCoversEnd` |
+| S2. The binding must cover `begin_ts` from below (`begin <= begin_ts`). | `RootEntry::covers` | Not shown needed. A reader pins its mark before it takes `begin_ts`, so `materialized_at <= read_mark` already gives `begin <= begin_ts`. | `noCoversBegin` |
+| S3. The binding must cover `begin_ts` from above (`begin_ts < end`). | `RootEntry::covers` | Not shown needed. Only a reader with a stale schema can open a dropped table after its drop, and the cookie check stops it. | `noCoversEnd` |
 | S4. `BTreeDestroy` retires the binding and keeps it. | `ckpt_rootmap_retire` | Needed. `ReadsCorrect` fails: a reader opened the table before the destroy. GC dropped the row from the version store. The destroy removes the binding, so the cursor does not open the B-tree, and the read finds no row. | `noRetire` |
 | S5. `gc_rootpage_entries` drops a retired binding only at `end <= lwm`. | `gc_rootpage_entries` | Needed. `ReadsCorrect` fails in the same way as S4. | `noBindingGcLwm` |
-| S6. `record_rootpage_alloc` ends a stale live owner of the reused page. | `record_rootpage_alloc` | Not needed. Every destroy stages `Retire` or `Remove` for the old owner in the same publish window, and the window applies them before `Alloc`. | `noAllocRetiresStale` |
-| S7. An unmapped root page gives `SchemaUpdated`, not a panic. | `MvccLazyCursor::new` | Not needed. With S8 and S9 the cursor never meets an unmapped page. | `noOpenFallback` |
+| S6. `record_rootpage_alloc` ends a stale live owner of the reused page. | `record_rootpage_alloc` | Not shown needed. Every destroy stages `Retire` or `Remove` for the old owner in the same publish window, and the window applies them before `Alloc`. | `noAllocRetiresStale` |
+| S7. An unmapped root page gives `SchemaUpdated`, not a panic. | `MvccLazyCursor::new` | Not shown needed. With S8 and S9 the cursor never meets an unmapped page. | `noOpenFallback` |
 | S8. `begin_tx` returns `Busy` while a DDL commit has not published its cookie. | `exclusive_tx_has_unpublished_schema_cookie` | Needed (#9955). `ReadsCorrect` fails: a reader begins after a `DROP` took its timestamp but before the cookie changed, and reads the dropped table. | `noBusy` |
 | S9. The cookie of the header must equal the cookie of the compiled schema. | `Transaction` opcode | Needed. `ReadsCorrect` fails. This is the SQLite rule, not a passive special case. | `noCookieCheck` |
-| S10. If `schema_generation` moved, `begin_tx` returns `SchemaUpdated`. | `begin_tx_with_schema_generation_and_checkpoint_read_guard` | Not needed for reads. A statement with a negative root maps to its table id, and the cursor takes the page from the binding (S16). | `noGenerationGate` |
+| S10. If `schema_generation` moved, `begin_tx` returns `SchemaUpdated`. | `begin_tx_with_schema_generation_and_checkpoint_read_guard` | Not shown needed for reads. A statement with a negative root maps to its table id, and the cursor takes the page from the binding (S16). | `noGenerationGate` |
 | S11. The publish patches the `sqlite_schema` payload and keeps its end. | `publish_checkpointed_schema_roots` | Needed (#7956). `RecoveryCorrect` fails: a `DROP` commits after the snapshot. The publish puts back the collected row without the end. The next pass does not destroy the table, and a crash brings it back. | `noPatchKeepsEnd` |
 | S12. The publish adds the root of a created object that is already dropped to `dropped_root_pages`. | `ended_created_roots` | Needed (#7956). `PagesAccounted` fails. | `noEndedCreated` |
 | S13. The publish clears only the roots that this pass freed. | `freed_root_pages` | Needed (#7957). `PagesAccounted` fails: a `DROP` that commits after the snapshot adds its root, and the publish clears it while the page is still allocated. | `noFreedOnly` |
-| S14. GC keeps the rows of a new B-tree until every reader mark reaches its creation frame. | `rootpage_gc_protected` | Not needed. The stamp gives each written version the same `materialized_at` as the binding, and GC already checks it against the same floor. | `noRootGcProtect` |
+| S14. GC keeps the rows of a new B-tree until every reader mark reaches its creation frame. | `rootpage_gc_protected` | Not shown needed. The stamp gives each written version the same `materialized_at` as the binding, and GC already checks it against the same floor. | `noRootGcProtect` |
 | S15. A binding with `materialized_at = STAGED` is never readable. | `is_btree_readable_at` | Not modeled. `Alloc` and `publish_rootpage_visible` run in one clock-locked window, and the model applies them in one step. The check matters only for a reader without a WAL mark, whose mark is `STAGED` (`read_tx_mark`). The model has no such reader. | none |
 | S16. If the B-tree becomes readable, a cursor with a negative root takes the page from the binding. | `is_btree_allocated` (cursor.rs:833, commit 367362427) | Needed (#8537). `OpenCorrect` fails: a cursor opened before the publish seeks the negative root. | `issue8537` |
 | S17. The `TruncateWal` assert looks only at this pass's staged roots, not at the whole schema. | `CheckpointState::TruncateWal` (line 3481) | Needed. With the code's DDL commit, the shared schema can keep a negative root after the publish gave it a page. A scan of the whole schema then fires. | `reachOwnedNegative` |
@@ -311,36 +313,42 @@ checkpoint boundary (`reachReplaysRow`). A reader gets `Busy`, and it gets
 
 Each counterexample below is the trace that TLC prints for the variant.
 
-- #11501, caught (`issue11501`, `RecoveryCorrect`). `CREATE t1` gets id -2
+In this section, "reproduced" means that a variant fails the named invariant
+for an issue that people had already reported. The model did not discover
+these issues. `FINDINGS.md` lists what the model found and what it only
+reproduced.
+
+- #11501, reproduced (`issue11501`, `RecoveryCorrect`). `CREATE t1` gets id -2
   and commits. `CREATE t2` gets id -3 and prepares. A checkpoint with the
   snapshot before `t2` gives `t1` page 3. `t2` commits after the snapshot, so
   its record stays in the log. On a crash, bootstrap gives `t1` the id -3, and
   the replay of `t2` with rootpage -3 panics.
-- #11502, caught (`issue11502`, `RecoveryCorrect`). `CREATE t1` commits with
+- #11502, reproduced (`issue11502`, `RecoveryCorrect`). `CREATE t1` commits with
   id -100. A checkpoint takes its snapshot. `INSERT INTO t1` commits. `t1` has
   no root page yet, so the record carries -100. The checkpoint gives `t1`
   page 2 and commits. On a crash, bootstrap knows `t1` only as -2, and the row
   record with -100 finds no table. The row is lost. With `FixDisjointIds` off
   as well, the id can name another table, as in the issue.
-- #11499, caught (`issue11499`, `CookieNotBehind`). A checkpoint stages the
+- #11499, reproduced (`issue11499`, `CookieNotBehind`). A checkpoint stages the
   header with cookie 0 at its pager commit. A `CREATE` commits with cookie 1.
   The publish writes cookie 0. The lost `INSERT` in the issue is a second bug
   in the retry loop of `Statement`, which the model leaves out.
-- #11500, caught (`issue11500`, `ReadsCorrect`). A statement compiles against
+- #11500, reproduced (`issue11500`, `ReadsCorrect`). A statement compiles against
   `t1`. `DROP t1` commits. The statement's inner transaction begins at a new
   snapshot without a schema check and reads `t1`, which its snapshot does not
   have. With a reused page, the same path reads another table, as in the
   issue. The model shows the read side only, not the write of `nextval`.
-- #8004, caught (`issue8004`, `PagesAccounted`). `CREATE t1` commits.
+- #8004, reproduced (`issue8004`, `PagesAccounted`). `CREATE t1` commits.
   `DROP t1` runs and copies the schema, where `t1` has no page, so it records
   no dropped root. A checkpoint creates the B-tree of `t1` on page 2, because
   the drop came after its snapshot, and the publish adds 2 to
   `dropped_root_pages`. The drop commits and installs its copy. Page 2 is
   allocated, but nothing names it. The same overwrite also turns published
   roots back into negative ones (`reachOwnedNegative`).
-- #8537, caught (`issue8537`, `OpenCorrect`). The variant switches S16 off. The code on
-  this branch has S16 (commit 367362427), so the issue looks fixed here.
-- #7960, caught (`issue7960`, `KindsMatch`). `Indexes = {i1}` on table
+- #8537, reproduced only with its fix switched off (`issue8537`,
+  `OpenCorrect`). The variant switches S16 off. The code on this branch has
+  S16 (commit 367362427), so the issue looks fixed here.
+- #7960, reproduced (`issue7960`, `KindsMatch`). `Indexes = {i1}` on table
   `t1`, with `FixDisjointIds` and `FixPersistIds` off. `CREATE TABLE t1`
   commits with id -2. `CREATE INDEX i1` takes id -3 and prepares. A
   checkpoint takes its snapshot before `i1` and gives `t1` page 3. `i1`
@@ -348,11 +356,11 @@ Each counterexample below is the trace that TLC prints for the variant.
   with -3. On a crash, bootstrap gives `t1` the id -3, so the index row lands
   in the table B-tree. TLC finds this mirror image first. The issue has the
   other direction, where the index gets the page and a table row lands in
-  the index. `KindsMatch` catches both. `FixDisjointIds` alone closes it: with
+  the index. `KindsMatch` fails in both directions. `FixDisjointIds` alone closes it: with
   `FixPersistIds` still off, a probe run finds no `KindsMatch` error in
   2,232,934 distinct states. The row is then lost as in #11502, and
   `FixPersistIds` closes that. `indexes` has both fixes and no error.
-- #8077, caught (`issue8077` with `NoLiveDestroy`, and `issue8077Row`
+- #8077, reproduced (`issue8077` with `NoLiveDestroy`, and `issue8077Row`
   with `SchemaRowCurrent`). The variant has `Alters` on and `FixAlterPatch` off.
   `CREATE t1` commits at 1 with id -100. `ALTER t1` reads version 1, writes
   version 2 with rootpage -100, and prepares at 2. A checkpoint takes the
@@ -365,8 +373,8 @@ Each counterexample below is the trace that TLC prints for the variant.
 - #8087, #8091, #8092, #8093 and #8094 are fixed at 24c03ed9a. The Rust test
   of each issue passes there (five runs each). The fixing commits are not
   identified. In the model, the read mark that a transaction pins at its
-  begin protects the reader in all five cases. `noFrozenMark` switches
-  that off, and TLC finds the trace of #8087. A reader begins at 2. An
+  begin protects the reader of #8087. `noFrozenMark` switches
+  that off, and TLC reproduces the trace of #8087. A reader begins at 2. An
   `INSERT` commits at 3. A checkpoint writes the row. The reader's next
   statement reads the row from the new frame. #8091 (a replacement table on
   the reused page) and #8092 (a destroyed page) are the same kind of read
@@ -379,19 +387,24 @@ Each counterexample below is the trace that TLC prints for the variant.
 
 ## Findings
 
-These results come from the model. Each one is a lead for a code change, and
-each change needs its own test in the Rust code first.
+Some of these results reproduce issues that people had reported. Others come
+from the model alone. Each result is a lead for a code change, and each change
+needs its own test in the Rust code first. A lead that has no Rust test stays a
+lead. `FINDINGS.md` gives the verdict for each one.
 
 1. The open issues #11501, #11502, #11499, #11500 and #8004 each give a
    counterexample in the model of the code today, and each fix above closes
-   its issue in the model.
+   its issue in the model. People had reported all five before the model
+   existed, so the model reproduced them. It did not discover them.
 2. #11502 is not fixed by keeping ids and pages apart. A row record that a
    commit logs between the checkpoint snapshot and the publish still carries
    the temporary id, and after the checkpoint no table has that id at
    recovery. Recovery must know the temporary id of a checkpointed table, or
    the log record must name the table in a way that survives the checkpoint.
-3. Six special cases are not needed in the model: S2, S3, S6, S7, S10 and
-   S14. Each one has a reason in the table above. The model leaves out
+3. Six special cases are not shown needed at these bounds: S2, S3, S6, S7,
+   S10 and S14. "Not shown needed" means that TLC finds no error with the case
+   off. It does not mean that the case is safe to delete. Each one has a reason
+   in the table above. The model leaves out
    writes through stale roots, index rows and readers without a WAL mark.
    Some of these cases can still be needed there. S10 is the most likely.
 4. S7 (`try_get_table_id_from_root_page_at` returning `None`) is never
@@ -414,7 +427,9 @@ each change needs its own test in the Rust code first.
    such a record as an update of that table (`FixAlterRecovery`). This is not
    verified in Rust.
 7. #8087, #8091, #8092, #8093 and #8094 pass at 24c03ed9a. In the model the
-   frozen read mark of the transaction (S21) is what protects these readers.
+   frozen read mark of the transaction (S21) protects the reader of #8087.
+   The model does not check #8091 and #8092 one by one, and it cannot express
+   #8093 and #8094.
 
 ## Not modeled
 
