@@ -14,8 +14,9 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_GRANT_OPERATION, SQLSTATE_INVALID_NAME, SQLSTATE_INVALID_OBJECT_DEFINITION,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -5768,6 +5769,7 @@ pub struct SequenceOptions {
 }
 
 impl SequenceOptions {
+    /// The options of a sequence, with the type an `AS` option names.
     pub fn new(options: &[pg_query::protobuf::Node]) -> Result<Self, ParseError> {
         let mut start = None;
         let mut increment = None;
@@ -5776,6 +5778,9 @@ impl SequenceOptions {
         let mut cycle = false;
 
         let mut as_type = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut as_type_name = None;
+        let mut cache = None;
         for opt_node in options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
                 if matches!(
@@ -5789,6 +5794,10 @@ impl SequenceOptions {
                         elem.defname.to_uppercase()
                     )));
                 }
+                let is_repeated = !seen.insert(elem.defname.as_str());
+                if is_repeated {
+                    return Err(conflicting_options());
+                }
                 match elem.defname.as_str() {
                     "as" => {
                         let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
@@ -5798,7 +5807,7 @@ impl SequenceOptions {
                                 "CREATE SEQUENCE AS: missing type".into(),
                             ));
                         };
-                        as_type = Some(extract_type_name_from_typename(tn)?);
+                        as_type_name = Some(tn);
                     }
                     "start" => {
                         start = extract_def_elem_int(elem);
@@ -5816,26 +5825,9 @@ impl SequenceOptions {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    "cache" => match extract_def_elem_int(elem) {
-                        Some(1) => {}
-                        Some(cache) if cache < 1 => {
-                            return Err(ParseError::Sqlstate {
-                                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                                message: format!("CACHE ({cache}) must be greater than zero"),
-                            });
-                        }
-                        Some(cache) => {
-                            return Err(ParseError::not_supported(format!(
-                                "CACHE {cache} (Turso sequences do not cache values, \
-                             so CACHE must be 1)"
-                            )));
-                        }
-                        None => {
-                            return Err(ParseError::not_supported(
-                                "this CACHE value in CREATE SEQUENCE",
-                            ));
-                        }
-                    },
+                    "cache" => {
+                        cache = Some(extract_def_elem_int(elem));
+                    }
                     "owned_by"
                         if matches!(
                             elem.arg.as_ref().and_then(|n| n.node.as_ref()),
@@ -5858,6 +5850,9 @@ impl SequenceOptions {
 
         // AS smallint/integer narrows the default bound in the sequence's
         // direction; bigint is the default range.
+        if let Some(type_name) = as_type_name {
+            as_type = Some(sequence_data_type(type_name)?.to_string());
+        }
         if let Some(as_type) = as_type {
             let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
                 "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
@@ -5871,15 +5866,38 @@ impl SequenceOptions {
             };
             for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
                 if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
-                    return Err(ParseError::ParseError(format!(
-                        "{option} ({value}) is out of range for sequence data type {type_name}"
-                    )));
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                        message: format!(
+                            "{option} ({value}) is out of range for sequence data type {type_name}"
+                        ),
+                    });
                 }
             }
             if increment.unwrap_or(1) > 0 {
                 max_value.get_or_insert(type_max);
             } else {
                 min_value.get_or_insert(type_min);
+            }
+        }
+
+        match cache {
+            None | Some(Some(1)) => {}
+            Some(Some(cache)) if cache < 1 => {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                    message: format!("CACHE ({cache}) must be greater than zero"),
+                });
+            }
+            Some(Some(cache)) => {
+                return Err(ParseError::not_supported(format!(
+                    "CACHE {cache} (Turso sequences do not cache values, so CACHE must be 1)"
+                )));
+            }
+            Some(None) => {
+                return Err(ParseError::not_supported(
+                    "this CACHE value in CREATE SEQUENCE",
+                ));
             }
         }
 
@@ -5890,6 +5908,51 @@ impl SequenceOptions {
             max_value,
             cycle,
         })
+    }
+}
+
+/// The integer type that `AS type` of a sequence names.
+fn sequence_data_type(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<&'static str, ParseError> {
+    let names = extract_key_columns(&type_name.names)?;
+    let name = object_name(&type_name.names, is_default_schema, "type")?;
+    if names.len() == 2 && !is_pg_catalog(&names[0]) {
+        return Err(type_does_not_exist(&names.join(".")));
+    }
+    if name.chars().any(char::is_uppercase) {
+        return Err(type_does_not_exist(&name));
+    }
+    let integer_type = match name.as_str() {
+        "int2" | "smallint" => "smallint",
+        "int4" | "integer" | "int" => "integer",
+        "int8" | "bigint" => "bigint",
+        _ => {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                message: "sequence type must be smallint, integer, or bigint".to_string(),
+            })
+        }
+    };
+    if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
+        return Err(ParseError::ParseError(format!(
+            "CREATE SEQUENCE AS {name} with a modifier is not supported"
+        )));
+    }
+    Ok(integer_type)
+}
+
+fn type_does_not_exist(name: &str) -> ParseError {
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_OBJECT,
+        message: format!("type \"{name}\" does not exist"),
+    }
+}
+
+fn conflicting_options() -> ParseError {
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_SYNTAX_ERROR,
+        message: "conflicting or redundant options".to_string(),
     }
 }
 
@@ -9549,7 +9612,7 @@ mod tests {
             .translate(&crate::parse("CREATE SEQUENCE s AS numeric").unwrap())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("AS numeric"), "{err}");
+        assert_eq!(err, "sequence type must be smallint, integer, or bigint");
     }
 
     #[test]
@@ -13489,7 +13552,6 @@ mod tests {
     fn fail_closed_create_sequence_options() {
         assert_not_supported("CREATE TEMP SEQUENCE s", "TEMPORARY SEQUENCE");
         assert_not_supported("CREATE SEQUENCE s OWNED BY t.id", "OWNED BY");
-        assert_not_supported("CREATE SEQUENCE s AS numeric", "AS numeric");
         assert_not_supported(
             "CREATE SEQUENCE s MAXVALUE 99999999999999999999",
             "MAXVALUE value",
