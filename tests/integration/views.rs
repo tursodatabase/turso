@@ -1,8 +1,10 @@
+use super::alter_table::{column_names, schema_with_a_table_t_in_two_namespaces, select};
+use super::common::{ExecRows, TempDatabase};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use turso_core::namespace::NamespaceId;
+use turso_core::schema::view::extract_view_columns;
 use turso_core::ConnectOpts;
-
-use super::common::{ExecRows, TempDatabase};
 use turso_core::SessionRole;
 
 #[test]
@@ -73,4 +75,23 @@ fn create_materialized_view_is_rejected_in_mvcc_mode() {
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t");
     assert_eq!(rows, vec![(1, 10)]);
+}
+
+#[test]
+fn a_view_body_reads_the_tables_of_the_view_namespace() {
+    let (schema, other) = schema_with_a_table_t_in_two_namespaces();
+    let body = select("SELECT * FROM t");
+    assert_eq!(
+        column_names(&extract_view_columns(other, &body, &schema).unwrap()),
+        ["b", "c"]
+    );
+    assert_eq!(
+        column_names(&extract_view_columns(NamespaceId::ROOT, &body, &schema).unwrap()),
+        ["a"]
+    );
+    let qualified = select("SELECT * FROM main.t");
+    assert_eq!(
+        column_names(&extract_view_columns(other, &qualified, &schema).unwrap()),
+        ["a"]
+    );
 }
