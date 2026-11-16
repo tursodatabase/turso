@@ -100,6 +100,9 @@ pub fn check_statement_privileges(
             // translate_create_index resolves it.
             let mut qualified = ast::QualifiedName::single(tbl_name.clone());
             qualified.namespace.clone_from(&idx_name.namespace);
+            if namespace_of_existing_table(resolver, &qualified).is_none() {
+                return Ok(());
+            }
             if may_act_as_owner_of_table(resolver, connection, &qualified) {
                 create_in_schema_denial(idx_name)
             } else {
@@ -111,6 +114,9 @@ pub fn check_statement_privileges(
             Object::Table(tbl_name.name.as_str().to_string()),
         ),
         ast::Stmt::AlterTable(alter) => {
+            if namespace_of_existing_table(resolver, &alter.name).is_none() {
+                return Ok(());
+            }
             let owner = may_act_as_owner_of_table(resolver, connection, &alter.name);
             let owner_denial = || {
                 PermissionDenied::owner(
@@ -261,8 +267,22 @@ fn may_act_as_owner_of_table(
     connection: &Arc<Connection>,
     name: &ast::QualifiedName,
 ) -> bool {
-    let namespace = resolver.find_existing_table(name).ok().flatten();
+    let namespace = namespace_of_existing_table(resolver, name);
     may_act_as_owner(resolver, connection, namespace, name.name.as_str())
+}
+
+/// The namespace that has the table or view `name` names. None when it
+/// does not exist: the lookup of a name without a schema gives the first
+/// schema of the search path when no schema has the table.
+fn namespace_of_existing_table(
+    resolver: &Resolver,
+    name: &ast::QualifiedName,
+) -> Option<NamespaceRef> {
+    resolver
+        .find_existing_table(name)
+        .ok()
+        .flatten()
+        .filter(|namespace| resolver.table_exists_in(*namespace, name.name.as_str()))
 }
 
 /// [`may_act_as_owner_of_table`] with the relation already resolved: None

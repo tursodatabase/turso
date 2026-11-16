@@ -399,6 +399,26 @@ expect error {
     relation "rp_missing_26" does not exist
 }
 
+test policy-of-a-missing-table-is-rejected-for-a-role-that-is-not-a-superuser {
+    CREATE ROLE rp_alice_43;
+    SET ROLE rp_alice_43;
+    CREATE POLICY p ON rp_missing_43 USING (true);
+}
+@sqlstate 42P01
+expect error {
+    relation "rp_missing_43" does not exist
+}
+
+test drop-policy-of-a-missing-table-fails-for-a-role-that-is-not-a-superuser {
+    CREATE ROLE rp_alice_44;
+    SET ROLE rp_alice_44;
+    DROP POLICY p ON rp_missing_44;
+}
+@sqlstate 42P01
+expect error {
+    relation "rp_missing_44" does not exist
+}
+
 test with-check-on-select-policy-is-rejected {
     CREATE TABLE rp_docs_27 (id INT PRIMARY KEY);
     CREATE POLICY p ON rp_docs_27 FOR SELECT WITH CHECK (true);
