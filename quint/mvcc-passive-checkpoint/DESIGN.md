@@ -3,10 +3,11 @@
 This document describes the design of the passive checkpoint in MVCC mode, as
 the code implements it today. The Quint model `MvccPassiveCheckpoint.qnt` in
 this directory states the same design formally. Quint checks it with the TLC
-model checker (`quint verify --backend tlc`). `FINDINGS.md` lists what the
-model found, what it only reproduced, and what a Rust run refuted. The section
-"Scope and limits" in `README.md` says what the model leaves out. The results
-are evidence within these bounds and this model, not proof.
+model checker (`quint verify --backend tlc`). [`FINDINGS.md`](FINDINGS.md)
+lists what the model found, what it only reproduced, and what a Rust run
+refuted. [Scope and limits](README.md#scope-and-limits) says what the model
+leaves out. The results are evidence within these bounds and this model, not
+proof.
 
 A passive checkpoint copies committed row versions from the in-memory version
 store into the B-tree. Writers keep committing and readers keep reading while

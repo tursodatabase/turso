@@ -1,8 +1,10 @@
 # MVCC Passive Checkpoint Specification
 
 Quint specifications of the passive checkpoint in MVCC mode. `DESIGN.md`
-describes the design in prose, maps it to the Rust code, and lists what the
-models found.
+describes the design in prose and maps it to the Rust code. [`FINDINGS.md`](FINDINGS.md)
+lists each claim about a bug or a simplification, with a verdict and its
+evidence. Read [Scope and limits](#scope-and-limits) below before you trust a
+result.
 
 | Spec | Configurations | Design document |
 |------|----------------|-----------------|
@@ -19,10 +21,80 @@ result to expect and the invariants to check. The Makefile reads this comment.
 To add a spec, add `Spec.qnt` and `SpecConfigs.qnt` with a module `main`.
 The Makefile finds every `Mvcc*.qnt` file that has a configurations file.
 
-`SIMPLIFY.md` is a plan to make the passive checkpoint simpler with the same
-guarantees, based on the model results. `MODEL-GAPS.md` lists what the
+`SIMPLIFY.md` is a plan to make the passive checkpoint simpler, based on the
+model results. The plan keeps the invariants that the specs check. `MODEL-GAPS.md` lists what the
 specs cover and what the code does around them. `SYNC.md` describes how sync depends
 on table ids. The specs do not model sync.
+
+## Scope and limits
+
+These results are evidence within these bounds and this model, not proof.
+
+### What is modeled
+
+There are three specs in this folder.
+
+- Rows (`MvccPassiveCheckpoint.qnt`): version chains, the logical log, WAL
+  frames, the database file, writers, the checkpoint and GC. It checks the
+  invariants `ReadsCorrect`, `RecoveryCorrect`, `BackfillBelowReaders`,
+  `BackfillFloorBelowReaders` and `CollectsEveryChange`. The main
+  configuration has 1 key, 2 readers, 5 timestamps and 2 checkpoints. TLC
+  explores 16,786,385 states in 10 minutes on 3 workers.
+- Schema (`MvccPassiveSchema.qnt`): table ids, root bindings,
+  `sqlite_schema`, the schema cookie, page allocation, DDL, publish and
+  recovery. The main configuration has 2 tables, pages 2 and 3, 1 reader, 4
+  timestamps and 2 checkpoints. It has no index and no ALTER. TLC explores
+  15,985,399 states in 17 minutes.
+- Sequences (`MvccPassiveSequence.qnt`): sequence rows, `nextval`,
+  compaction and publish. The main configuration has values 1 to 3, 2
+  connections, a clock bound of 8 and 2 passes. The sequence is ascending,
+  and `setval` is off. TLC explores 4,008,777 states in 3.5 minutes on 3
+  workers.
+
+A fourth spec, `MvccRecovery.qnt`, is in PR #11832. It is not in this PR.
+
+### What is not modeled
+
+- Mode B, the default (flag off). This covers Rule 2 B form, Rule 3 with
+  `b <= ckpt_max` and the B-tree fall-through read. The "blocking" mode of
+  the sequence spec uses the passive GC rules. `MODEL-GAPS.md` says that this
+  is false for the flag off.
+- Mode T (flag on plus `PRAGMA wal_checkpoint(TRUNCATE)`). It is only partly
+  modeled, and that part is not merged. It is in PR #11837.
+- Index rows. They have their own GC loop, their own dirty map, the lockstep
+  cursor and `rootpage_gc_protected` for indexes.
+- Write-write validation against a GC that drops versions.
+- `finalized_tx_states` pruning.
+- Group commit durability and the order of fsync and `CommitEnd`. The log
+  append of the model is one atomic step.
+- Real cursor scans. The model reads one key in one step.
+- WAL restart and TRUNCATE, and `backfill_floor` across them.
+- `cleanup_dropped_commit`.
+- Reads of `sqlite_schema` through the dual cursor, and the GC of
+  `sqlite_schema`.
+- The statement retry loop.
+- A checkpoint on its own connection, and checkpoints that stop partway. The
+  specs in this PR leave both out. Specs that add them came after the bugs
+  and are not merged. For this reason, the specs here missed #11831 and
+  #11835.
+- The sync object map and stable table ids.
+
+### Bounds
+
+The bounds are small on purpose. For example, the row spec has 1 key, 2
+readers and 5 timestamps. A bug that needs 2 keys and a third reader is
+invisible to it. Larger-bound runs for the deletion of `rootpage_gc_protected`
+(PR #11794) were not done.
+
+### Parity with the code
+
+There is no `PARITY.md` yet. Parity today is the set of manual `file:line`
+tables in `DESIGN*.md` and `MODEL-GAPS.md`, made at commit 719fcc411. The
+replay harness in PR #11779 is not merged. A replay shows that the code can
+follow the paths of the model. It never tests paths that the code has and the
+model lacks.
+
+These results are evidence within these bounds and this model, not proof.
 
 ## Install the tools
 
