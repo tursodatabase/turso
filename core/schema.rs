@@ -9558,8 +9558,8 @@ mod tests {
     }
 
     /// Each `c{i}` for `i` in `1..n` reads `c{i - 1}`.
-    fn chain(n: usize) -> Vec<(usize, usize)> {
-        (1..n).map(|i| (i, i - 1)).collect()
+    fn chain(n: usize) -> Result<Vec<(usize, usize)>> {
+        Ok((1..n).map(|i| (i, i - 1)).try_collect()?)
     }
 
     #[test]
@@ -9640,7 +9640,7 @@ mod tests {
     #[test]
     fn gencol_graph_deep_chain() -> Result<()> {
         // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
-        let t = gencols(50, &chain(50))?;
+        let t = gencols(50, &chain(50)?)?;
         // affected-by({c0}) = {c0..c49}
         let affected = t.columns_affected_by_update([0])?;
         assert_eq!(affected.count(), 50);
@@ -9653,7 +9653,7 @@ mod tests {
     fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
         // Validates that the iterative Kahn's + DP don't blow the stack on
         // realistic worst-case generated-column depth.
-        let t = gencols(500, &chain(500))?;
+        let t = gencols(500, &chain(500)?)?;
         assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
         assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
         Ok(())
