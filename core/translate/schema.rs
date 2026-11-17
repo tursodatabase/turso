@@ -32,7 +32,7 @@ use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sqlite_schema_rows::{
-    emit_create_internal_table, emit_schema_entry, SchemaEntryType,
+    emit_create_internal_table, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
 };
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
@@ -1343,17 +1343,7 @@ pub fn translate_create_table(
             s.get_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
                 .is_none()
         }) {
-        let schema_master_table = resolver
-            .schema()
-            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap();
-        let sqlite_schema_cursor_id =
-            program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: sqlite_schema_cursor_id,
-            root_page: 1i64.into(),
-            db: database_id,
-        });
+        let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
         let seq_table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
@@ -1456,16 +1446,7 @@ pub fn translate_create_table(
         }
     }
 
-    let table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -1994,16 +1975,8 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: crate::MAIN_DB_ID,
-    });
+    let sqlite_schema_cursor_id =
+        open_sqlite_schema_for_write(program, resolver, crate::MAIN_DB_ID);
 
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -2163,15 +2136,7 @@ pub fn translate_drop_table(
         .schema()
         .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
-    let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
-        //  cursor 0
-        CursorType::BTreeTable(schema_table.clone()),
-    );
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id_0,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id_0 = open_sqlite_schema_for_write(program, resolver, database_id);
 
     //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
     //  loop to beginning of schema table
@@ -2291,83 +2256,72 @@ pub fn translate_drop_table(
         if !trigger_names_to_drop.is_empty() {
             let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
             program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie)?;
-            let temp_schema_table = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-                s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            let temp_cursor = open_sqlite_schema_for_write(program, resolver, crate::TEMP_DB_ID);
+            // Hoist the literal trigger names + `"trigger"` type
+            // string into constant registers before the loop.
+            let trigger_type_reg = program.emit_string8_new_reg("trigger".to_string());
+            program.mark_last_insn_constant();
+            let name_regs: Vec<usize> = trigger_names_to_drop
+                .iter()
+                .map(|name| {
+                    let reg = program.emit_string8_new_reg(name.clone());
+                    program.mark_last_insn_constant();
+                    reg
+                })
+                .collect();
+
+            let temp_end_label = program.allocate_label();
+            let temp_loop_label = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: temp_cursor,
+                pc_if_empty: temp_end_label,
             });
-            if let Some(temp_schema_table) = temp_schema_table {
-                let temp_cursor =
-                    program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
-                program.emit_insn(Insn::OpenWrite {
-                    cursor_id: temp_cursor,
-                    root_page: 1i64.into(),
-                    db: crate::TEMP_DB_ID,
-                });
-                // Hoist the literal trigger names + `"trigger"` type
-                // string into constant registers before the loop.
-                let trigger_type_reg = program.emit_string8_new_reg("trigger".to_string());
-                program.mark_last_insn_constant();
-                let name_regs: Vec<usize> = trigger_names_to_drop
-                    .iter()
-                    .map(|name| {
-                        let reg = program.emit_string8_new_reg(name.clone());
-                        program.mark_last_insn_constant();
-                        reg
-                    })
-                    .collect();
+            program.preassign_label_to_next_insn(temp_loop_label);
+            let temp_next_label = program.allocate_label();
+            let temp_delete_label = program.allocate_label();
 
-                let temp_end_label = program.allocate_label();
-                let temp_loop_label = program.allocate_label();
-                program.emit_insn(Insn::Rewind {
-                    cursor_id: temp_cursor,
-                    pc_if_empty: temp_end_label,
-                });
-                program.preassign_label_to_next_insn(temp_loop_label);
-                let temp_next_label = program.allocate_label();
-                let temp_delete_label = program.allocate_label();
+            // Skip non-trigger rows (column 0 = type).
+            let temp_type_reg = program.alloc_register();
+            program.emit_column_or_rowid(temp_cursor, 0, temp_type_reg);
+            program.emit_insn(Insn::Ne {
+                lhs: temp_type_reg,
+                rhs: trigger_type_reg,
+                target_pc: temp_next_label,
+                flags: CmpInsFlags::default(),
+                collation: CollationSeq::for_internal_values(),
+            });
 
-                // Skip non-trigger rows (column 0 = type).
-                let temp_type_reg = program.alloc_register();
-                program.emit_column_or_rowid(temp_cursor, 0, temp_type_reg);
-                program.emit_insn(Insn::Ne {
-                    lhs: temp_type_reg,
-                    rhs: trigger_type_reg,
-                    target_pc: temp_next_label,
+            // Cascade-check name (column 1) against each trigger we
+            // want to drop. First match jumps to the delete label.
+            let temp_name_reg = program.alloc_register();
+            program.emit_column_or_rowid(temp_cursor, 1, temp_name_reg);
+            for name_reg in &name_regs {
+                program.emit_insn(Insn::Eq {
+                    lhs: temp_name_reg,
+                    rhs: *name_reg,
+                    target_pc: temp_delete_label,
                     flags: CmpInsFlags::default(),
                     collation: CollationSeq::for_internal_values(),
                 });
-
-                // Cascade-check name (column 1) against each trigger we
-                // want to drop. First match jumps to the delete label.
-                let temp_name_reg = program.alloc_register();
-                program.emit_column_or_rowid(temp_cursor, 1, temp_name_reg);
-                for name_reg in &name_regs {
-                    program.emit_insn(Insn::Eq {
-                        lhs: temp_name_reg,
-                        rhs: *name_reg,
-                        target_pc: temp_delete_label,
-                        flags: CmpInsFlags::default(),
-                        collation: CollationSeq::for_internal_values(),
-                    });
-                }
-                // No name matched — skip the delete.
-                program.emit_insn(Insn::Goto {
-                    target_pc: temp_next_label,
-                });
-                program.preassign_label_to_next_insn(temp_delete_label);
-                program.emit_insn(Insn::Delete {
-                    cursor_id: temp_cursor,
-                    table_name: SQLITE_TABLEID.to_string(),
-                    is_part_of_update: false,
-                });
-                program.preassign_label_to_next_insn(temp_next_label);
-                program.emit_insn(Insn::Next {
-                    cursor_id: temp_cursor,
-                    pc_if_next: temp_loop_label,
-                    fullscan: false,
-                    is_index: false,
-                });
-                program.preassign_label_to_next_insn(temp_end_label);
             }
+            // No name matched — skip the delete.
+            program.emit_insn(Insn::Goto {
+                target_pc: temp_next_label,
+            });
+            program.preassign_label_to_next_insn(temp_delete_label);
+            program.emit_insn(Insn::Delete {
+                cursor_id: temp_cursor,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: false,
+            });
+            program.preassign_label_to_next_insn(temp_next_label);
+            program.emit_insn(Insn::Next {
+                cursor_id: temp_cursor,
+                pc_if_next: temp_loop_label,
+                fullscan: false,
+                is_index: false,
+            });
+            program.preassign_label_to_next_insn(temp_end_label);
         }
     }
 
