@@ -199,7 +199,51 @@ mod tests {
         let descriptor = BtreeDescriptor::Index(Arc::new(
             IndexInfo::new(keys, has_rowid, count, unique).unwrap(),
         ));
+        let snapshot = vec![
+            BtreeSnapshotEntry {
+                logical_id: -10,
+                root_page: 2,
+                descriptor: BtreeDescriptor::Table,
+            },
+            BtreeSnapshotEntry {
+                logical_id: -11,
+                root_page: 3,
+                descriptor: descriptor.clone(),
+            },
+        ];
         BtreeDescriptor::decode(&descriptor.encode().unwrap()).unwrap() == descriptor
+            && decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap() == snapshot
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_roots_and_incomplete_records() {
+        let bytes = encode_snapshot(&[BtreeSnapshotEntry {
+            logical_id: -10,
+            root_page: 2,
+            descriptor: BtreeDescriptor::Table,
+        }])
+        .unwrap();
+        for len in 0..bytes.len() {
+            assert!(decode_snapshot(&bytes[..len]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_snapshot(&trailing).is_err());
+        for root in [0i64, -1, i64::MIN, i64::MAX] {
+            let mut invalid = bytes.clone();
+            invalid[13..21].copy_from_slice(&root.to_le_bytes());
+            assert!(decode_snapshot(&invalid).is_err());
+            assert!(encode_snapshot(&[BtreeSnapshotEntry {
+                logical_id: -10,
+                root_page: root,
+                descriptor: BtreeDescriptor::Table
+            }])
+            .is_err());
+        }
+        let mut duplicate = bytes.clone();
+        duplicate[1..5].copy_from_slice(&2u32.to_le_bytes());
+        duplicate.extend_from_slice(&bytes[5..]);
+        assert!(decode_snapshot(&duplicate).is_err());
     }
 
     #[test]
@@ -231,4 +275,84 @@ mod tests {
         assert!(BtreeDescriptor::decode(&[2, 0]).is_err());
         assert!(BtreeDescriptor::decode(&[1, 0, 0]).is_err());
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BtreeSnapshotEntry {
+    pub(crate) logical_id: i64,
+    pub(crate) root_page: i64,
+    pub(crate) descriptor: BtreeDescriptor,
+}
+
+pub(crate) fn encode_snapshot(objects: &[BtreeSnapshotEntry]) -> crate::Result<Vec<u8>> {
+    let mut bytes = vec![1];
+    bytes.extend_from_slice(
+        &u32::try_from(objects.len())
+            .map_err(|_| invalid_descriptor())?
+            .to_le_bytes(),
+    );
+    let mut ids = rustc_hash::FxHashSet::default();
+    let mut roots = rustc_hash::FxHashSet::default();
+    for object in objects {
+        validate_snapshot_entry(object)?;
+        if !ids.insert(object.logical_id) || !roots.insert(object.root_page) {
+            return Err(invalid_descriptor());
+        }
+        let descriptor = object.descriptor.encode()?;
+        bytes.extend_from_slice(&object.logical_id.to_le_bytes());
+        bytes.extend_from_slice(&object.root_page.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(descriptor.len())
+                .map_err(|_| invalid_descriptor())?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&descriptor);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_snapshot(mut bytes: &[u8]) -> crate::Result<Vec<BtreeSnapshotEntry>> {
+    if take(&mut bytes, 1)? != [1] {
+        return Err(invalid_descriptor());
+    }
+    let count = number(&mut bytes)?;
+    if count > bytes.len() / 22 {
+        return Err(invalid_descriptor());
+    }
+    let mut objects = Vec::with_capacity(count);
+    let mut ids = rustc_hash::FxHashSet::default();
+    let mut roots = rustc_hash::FxHashSet::default();
+    for _ in 0..count {
+        let logical_id = i64::from_le_bytes(take(&mut bytes, 8)?.try_into().unwrap());
+        let root_page = i64::from_le_bytes(take(&mut bytes, 8)?.try_into().unwrap());
+        let len = number(&mut bytes)?;
+        let descriptor = BtreeDescriptor::decode(take(&mut bytes, len)?)?;
+        let object = BtreeSnapshotEntry {
+            logical_id,
+            root_page,
+            descriptor,
+        };
+        validate_snapshot_entry(&object)?;
+        if !ids.insert(logical_id) || !roots.insert(root_page) {
+            return Err(invalid_descriptor());
+        }
+        objects.push(object);
+    }
+    if !bytes.is_empty() {
+        return Err(invalid_descriptor());
+    }
+    Ok(objects)
+}
+
+fn validate_snapshot_entry(object: &BtreeSnapshotEntry) -> crate::Result<()> {
+    if object.logical_id >= 0
+        || i32::try_from(object.logical_id).is_err()
+        || object.root_page <= 0
+        || u32::try_from(object.root_page).is_err()
+        || (object.logical_id == -1) != (object.root_page == 1)
+        || (object.root_page == 1 && !matches!(object.descriptor, BtreeDescriptor::Table))
+    {
+        return Err(invalid_descriptor());
+    }
+    Ok(())
 }
