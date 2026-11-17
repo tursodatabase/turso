@@ -10,7 +10,8 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+        schema::SQLITE_TABLEID,
+        sqlite_schema_rows::{emit_schema_entry, SchemaEntryType},
     },
     util::normalize_ident,
     vdbe::{
