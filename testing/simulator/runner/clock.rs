@@ -27,7 +27,7 @@ impl SimulatorClock {
         let nanos = self
             .rng
             .borrow_mut()
-            .random_range(self.min_tick..self.max_tick);
+            .random_range(self.min_tick..=self.max_tick);
         let nanos = std::time::Duration::from_micros(nanos);
         *time += nanos;
         *time
