@@ -39,6 +39,7 @@ pub fn check_statement_privileges(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    check_usage_of_named_namespaces(stmt, resolver)?;
     let role = connection.current_role();
     let denial = match stmt {
         // The privileges on the tables a statement reads and writes are
@@ -261,6 +262,76 @@ pub fn check_statement_privileges(
         ast::Stmt::Detach { .. } => database_denial(Action::Detach),
     };
     Err(permission_denied(denial))
+}
+
+/// Fails if `stmt` names a table or a sequence with a namespace that the
+/// role may not look up names in. As in PostgreSQL, this covers the query
+/// of a new view and the expressions of a new table, which are not looked
+/// up again for the roles that use the view or the table later.
+fn check_usage_of_named_namespaces(stmt: &ast::Stmt, resolver: &Resolver) -> Result<()> {
+    let mut names = NamespaceQualifiedNames { resolver };
+    crate::util::visit_stmt(stmt, &mut names)?;
+    match stmt {
+        ast::Stmt::CreateView { select, .. } | ast::Stmt::CreateMaterializedView { select, .. } => {
+            crate::util::visit_select(select, &mut names)
+        }
+        ast::Stmt::CreateTable {
+            body:
+                ast::CreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    ..
+                },
+            ..
+        } => {
+            let column_exprs = columns
+                .iter()
+                .flat_map(|column| &column.constraints)
+                .filter_map(|constraint| match &constraint.constraint {
+                    ast::ColumnConstraint::Default(expr)
+                    | ast::ColumnConstraint::Check { expr, .. }
+                    | ast::ColumnConstraint::Generated { expr, .. } => Some(expr),
+                    _ => None,
+                });
+            let table_exprs =
+                constraints
+                    .iter()
+                    .filter_map(|constraint| match &constraint.constraint {
+                        ast::TableConstraint::Check { expr, .. } => Some(expr),
+                        _ => None,
+                    });
+            for expr in column_exprs.chain(table_exprs) {
+                crate::util::visit_expr_with_subqueries(expr, &mut names)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks every table and every sequence that a statement names with a
+/// namespace.
+struct NamespaceQualifiedNames<'r, 'a> {
+    resolver: &'r Resolver<'a>,
+}
+
+impl crate::util::AstVisitor for NamespaceQualifiedNames<'_, '_> {
+    fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
+        if let Some(namespace) = crate::translate::sequence::namespace_of_sequence_called_by(expr) {
+            self.resolver.catalog.check_namespace_usage(&namespace)?;
+        }
+        Ok(WalkControl::Continue)
+    }
+
+    fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
+        match &name.namespace {
+            Some(namespace) => self
+                .resolver
+                .catalog
+                .check_namespace_usage(namespace.as_str()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Whether the current role may run an owner-gated statement on the table or

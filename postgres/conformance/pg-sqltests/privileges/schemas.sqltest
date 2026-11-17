@@ -471,6 +471,157 @@ expect {
     4
 }
 
+test nextval-of-a-sequence-named-with-a-schema-needs-usage {
+    CREATE ROLE su_nextval;
+    CREATE SCHEMA su_nextval_s;
+    CREATE SEQUENCE su_nextval_s.q;
+    GRANT ALL ON su_nextval_s.q TO su_nextval;
+    SET ROLE su_nextval;
+    SELECT nextval('su_nextval_s.q');
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_nextval_s
+}
+
+test setval-of-a-sequence-named-with-a-schema-needs-usage {
+    CREATE ROLE su_setval;
+    CREATE SCHEMA su_setval_s;
+    CREATE SEQUENCE su_setval_s.q;
+    GRANT ALL ON su_setval_s.q TO su_setval;
+    SET ROLE su_setval;
+    SELECT setval('su_setval_s.q', 5);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_setval_s
+}
+
+test currval-of-a-sequence-named-with-a-schema-needs-usage {
+    CREATE ROLE su_currval;
+    CREATE SCHEMA su_currval_s;
+    CREATE SEQUENCE su_currval_s.q;
+    GRANT ALL ON su_currval_s.q TO su_currval;
+    SET ROLE su_currval;
+    SELECT currval('su_currval_s.q');
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_currval_s
+}
+
+test nextval-with-usage-on-the-schema-of-the-sequence {
+    CREATE ROLE su_nextval_ok;
+    CREATE SCHEMA su_nextval_ok_s;
+    CREATE SEQUENCE su_nextval_ok_s.q;
+    GRANT USAGE ON SCHEMA su_nextval_ok_s TO su_nextval_ok;
+    GRANT ALL ON su_nextval_ok_s.q TO su_nextval_ok;
+    SET ROLE su_nextval_ok;
+    SELECT nextval('su_nextval_ok_s.q');
+}
+expect {
+    1
+}
+
+test column-default-uses-a-sequence-of-a-schema-the-writer-has-no-usage-on {
+    CREATE ROLE su_coldef;
+    CREATE SCHEMA su_coldef_s;
+    CREATE SEQUENCE su_coldef_s.q;
+    CREATE TABLE su_coldef_t (id INT DEFAULT nextval('su_coldef_s.q'), x INT);
+    GRANT ALL ON su_coldef_t TO su_coldef;
+    GRANT ALL ON su_coldef_s.q TO su_coldef;
+    SET ROLE su_coldef;
+    INSERT INTO su_coldef_t (x) VALUES (7);
+    SELECT id, x FROM su_coldef_t;
+}
+expect {
+    1|7
+}
+
+test view-uses-a-sequence-of-a-schema-its-reader-has-no-usage-on {
+    CREATE ROLE su_view_seq;
+    CREATE SCHEMA su_view_seq_s;
+    CREATE SEQUENCE su_view_seq_s.q;
+    CREATE VIEW su_view_seq_v AS SELECT nextval('su_view_seq_s.q') AS n;
+    GRANT SELECT ON su_view_seq_v TO su_view_seq;
+    GRANT ALL ON su_view_seq_s.q TO su_view_seq;
+    SET ROLE su_view_seq;
+    SELECT n FROM su_view_seq_v;
+}
+expect {
+    1
+}
+
+test column-default-of-a-new-table-needs-usage-on-the-schema-of-its-sequence {
+    CREATE ROLE su_new_default;
+    CREATE SCHEMA su_new_default_s;
+    CREATE SEQUENCE su_new_default_s.q;
+    GRANT ALL ON su_new_default_s.q TO su_new_default;
+    GRANT CREATE ON SCHEMA public TO su_new_default;
+    SET ROLE su_new_default;
+    CREATE TABLE su_new_default_t (id INT DEFAULT nextval('su_new_default_s.q'));
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_default_s
+}
+
+test new-view-needs-usage-on-the-schemas-of-its-tables {
+    CREATE ROLE su_new_view;
+    CREATE SCHEMA su_new_view_s;
+    CREATE TABLE su_new_view_s.t (id INT);
+    GRANT SELECT ON su_new_view_s.t TO su_new_view;
+    GRANT CREATE ON SCHEMA public TO su_new_view;
+    SET ROLE su_new_view;
+    CREATE VIEW su_new_view_v AS SELECT id FROM su_new_view_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_view_s
+}
+
+test new-view-needs-usage-on-the-schema-of-a-table-in-a-subquery {
+    CREATE ROLE su_new_view_sub;
+    CREATE SCHEMA su_new_view_sub_s;
+    CREATE TABLE su_new_view_sub_s.t (id INT);
+    GRANT SELECT ON su_new_view_sub_s.t TO su_new_view_sub;
+    GRANT CREATE ON SCHEMA public TO su_new_view_sub;
+    SET ROLE su_new_view_sub;
+    CREATE VIEW su_new_view_sub_v AS SELECT (SELECT max(id) FROM su_new_view_sub_s.t) AS m;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_view_sub_s
+}
+
+test new-materialized-view-needs-usage-on-the-schemas-of-its-tables {
+    CREATE ROLE su_new_matview;
+    CREATE SCHEMA su_new_matview_s;
+    CREATE TABLE su_new_matview_s.t (id INT);
+    GRANT SELECT ON su_new_matview_s.t TO su_new_matview;
+    GRANT CREATE ON SCHEMA public TO su_new_matview;
+    SET ROLE su_new_matview;
+    CREATE MATERIALIZED VIEW su_new_matview_v AS SELECT id FROM su_new_matview_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_matview_s
+}
+
+test create-table-as-needs-usage-on-the-schemas-of-its-tables {
+    CREATE ROLE su_ctas;
+    CREATE SCHEMA su_ctas_s;
+    CREATE TABLE su_ctas_s.t (id INT);
+    GRANT SELECT ON su_ctas_s.t TO su_ctas;
+    GRANT CREATE ON SCHEMA public TO su_ctas;
+    SET ROLE su_ctas;
+    CREATE TABLE su_ctas_t AS SELECT id FROM su_ctas_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_ctas_s
+}
+
 test superuser-needs-no-usage {
     CREATE SCHEMA su_super_s;
     CREATE TABLE su_super_s.t (id INT);

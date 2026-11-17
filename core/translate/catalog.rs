@@ -587,15 +587,22 @@ impl<'a> CatalogContext<'a> {
         let resolved = self.resolve_namespace_without_usage_check(qualified_name)?;
         if let Some(name) = &qualified_name.namespace {
             if !self.may_use_namespace(resolved) {
-                return Err(LimboError::PermissionDenied(Box::new(
-                    PermissionDenied::privilege(
-                        Action::Use,
-                        Object::Schema(normalize_ident(name.as_str())),
-                    ),
-                )));
+                return Err(namespace_usage_denied(name.as_str()));
             }
         }
         Ok(resolved)
+    }
+
+    /// Fails if the statement may not look up names in the namespace called
+    /// `name`. A namespace that does not exist passes, so that the lookup of
+    /// the name reports it.
+    pub(crate) fn check_namespace_usage(&self, name: &str) -> Result<()> {
+        match self.namespace_named(&normalize_ident(name)) {
+            Some(namespace) if !self.may_use_namespace(namespace) => {
+                Err(namespace_usage_denied(name))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn resolve_namespace_without_usage_check(
@@ -681,4 +688,11 @@ impl<'a> CatalogContext<'a> {
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.qualifiers.name_of(namespace)
     }
+}
+
+fn namespace_usage_denied(namespace_name: &str) -> LimboError {
+    LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
+        Action::Use,
+        Object::Schema(normalize_ident(namespace_name)),
+    )))
 }

@@ -1624,6 +1624,20 @@ pub(crate) fn sequence_called_by(
     expr: &ast::Expr,
     resolver: &Resolver,
 ) -> Option<(NamespaceRef, String)> {
+    resolve_sequence_name(&sequence_name_argument(expr)?, resolver)
+}
+
+/// The name of the namespace that `expr` names the sequence with, when
+/// `expr` calls `nextval`, `currval` or `setval` on `schema.name`.
+pub(crate) fn namespace_of_sequence_called_by(expr: &ast::Expr) -> Option<String> {
+    let name = sequence_name_argument(expr)?;
+    let (namespace, _) = name.split_once('.')?;
+    Some(normalize_ident(namespace))
+}
+
+/// The sequence name that `expr` gives to `nextval`, `currval` or `setval`
+/// as a string literal.
+fn sequence_name_argument(expr: &ast::Expr) -> Option<String> {
     let ast::Expr::FunctionCall { name, args, .. } = expr else {
         return None;
     };
@@ -1633,7 +1647,7 @@ pub(crate) fn sequence_called_by(
     let ast::Expr::Literal(ast::Literal::String(text)) = args.first()?.as_ref() else {
         return None;
     };
-    resolve_sequence_name(&crate::util::dequote(text), resolver)
+    Some(crate::util::dequote(text))
 }
 
 pub(crate) fn is_sequence_function(name: &str) -> bool {

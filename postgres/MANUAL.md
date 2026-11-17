@@ -376,11 +376,12 @@ Without it, a name qualified with the schema fails with `permission denied
 for schema` (SQLSTATE 42501), even for the object's owner and even when the
 object does not exist, and a name without a schema skips the schema as if it
 was not on `search_path`, so `current_schema()` and `current_schemas()` leave
-it out too. As in PostgreSQL, the tables of a view were looked up when the
-view was created, so reading the view needs no `USAGE` on their schemas. A
-sequence that a string names with its schema, as in `nextval('api.seq')`, is
-not checked for `USAGE` on the schema yet; the privileges on the sequence
-are.
+it out too. This includes a sequence that a string names with its schema, as
+in `nextval('api.seq')`. As in
+PostgreSQL, the tables and sequences of a view and the sequences of column
+defaults were looked up when the view or the table was created: creating it
+needs `USAGE` on their schemas, and reading the view or writing the table
+does not.
 
 `CREATE` lets a role create tables, views, materialized views, sequences
 and indexes in the schema; the role owns what it creates. Without it,
