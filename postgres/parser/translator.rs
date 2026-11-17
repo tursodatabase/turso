@@ -429,7 +429,6 @@ impl PostgreSQLTranslator {
                         &tbl_name,
                         &mut serial_sequences,
                         &mut check_names,
-                        create.if_not_exists,
                     )?;
                     columns.push(col);
                 }
@@ -657,7 +656,6 @@ impl PostgreSQLTranslator {
         tbl_name: &ast::QualifiedName,
         serial_sequences: &mut Vec<SerialSequence>,
         check_names: &mut std::collections::HashSet<String>,
-        if_not_exists: bool,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -768,8 +766,7 @@ impl PostgreSQLTranslator {
                     has_identity = true;
                     let (sequence_name, option_nodes) =
                         identity_sequence_name(&constraint.options, tbl_name)?;
-                    let options =
-                        SequenceOptions::new(&option_nodes, Some(&pg_type), if_not_exists)?;
+                    let options = SequenceOptions::new(&option_nodes, Some(&pg_type))?;
                     default_expr = Some(self.serial_default(
                         tbl_name,
                         &name,
@@ -5487,7 +5484,7 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        let options = SequenceOptions::new(&seq.options, None, seq.if_not_exists)?;
+        let options = SequenceOptions::new(&seq.options, None)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
@@ -5865,15 +5862,11 @@ pub struct SequenceOptions {
 
 impl SequenceOptions {
     /// The options of a sequence of the type `data_type`, or of the type an `AS`
-    /// option names. With `if_not_exists`, the statement does nothing when the
-    /// sequence (or the table of an identity column) already exists, so the
-    /// checks of the bounds and of INCREMENT are left to core, which makes them
-    /// only when it creates the sequence; PostgreSQL likewise skips the
-    /// statement before checking them.
+    /// option names. INCREMENT, the bounds and START are checked by core
+    /// (`Sequence::new`), when it creates the sequence.
     pub fn new(
         options: &[pg_query::protobuf::Node],
         data_type: Option<&str>,
-        if_not_exists: bool,
     ) -> Result<Self, ParseError> {
         let mut cycle = false;
 
@@ -5964,35 +5957,14 @@ impl SequenceOptions {
             }
         };
 
-        // The values are read and checked in the order PostgreSQL's
-        // init_params reads them, so that the first error is the one it
-        // reports. Core checks the bounds again when it makes the sequence.
+        // The values are read in the order PostgreSQL's init_params reads
+        // them, so that of several numbers it can't read, the one it reports
+        // comes first.
         let increment = read(increment_elem)?;
-        if increment == Some(0) && !if_not_exists {
-            return Err(invalid("INCREMENT must not be zero".to_string()));
-        }
         let ascending = increment.unwrap_or(1) > 0;
         let mut max_value = read_bound("MAXVALUE", max_elem)?;
         let mut min_value = read_bound("MINVALUE", min_elem)?;
-        let min = min_value.unwrap_or(if ascending { 1 } else { type_min });
-        let max = max_value.unwrap_or(if ascending { type_max } else { -1 });
-        if min >= max && !if_not_exists {
-            return Err(invalid(format!(
-                "MINVALUE ({min}) must be less than MAXVALUE ({max})"
-            )));
-        }
         let start = read(start_elem)?;
-        let first = start.unwrap_or(if ascending { min } else { max });
-        if !if_not_exists && first < min {
-            return Err(invalid(format!(
-                "START value ({first}) cannot be less than MINVALUE ({min})"
-            )));
-        }
-        if !if_not_exists && first > max {
-            return Err(invalid(format!(
-                "START value ({first}) cannot be greater than MAXVALUE ({max})"
-            )));
-        }
         match read(cache_elem)? {
             None | Some(1) => {}
             Some(cache) if cache < 1 => {

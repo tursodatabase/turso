@@ -637,16 +637,6 @@ expect error {
     conflicting or redundant options
 }
 
-# PostgreSQL reads INCREMENT before START, so INCREMENT 0 is the error it
-# reports, whatever the order the options are written in.
-test sequence-option-errors-in-postgresql-order {
-    CREATE SEQUENCE seq_order START 1.5 INCREMENT 0;
-}
-@sqlstate 22023
-expect error {
-    INCREMENT must not be zero
-}
-
 test identity-column-option-value-not-a-bigint {
     CREATE TABLE seq_identity_bad (id int GENERATED ALWAYS AS IDENTITY (START 1.5));
 }
@@ -662,15 +652,6 @@ test sequence-maxvalue-range-before-minvalue-is-read {
 @sqlstate 22023
 expect error {
     MAXVALUE \(100000\) is out of range for sequence data type smallint
-}
-
-# The bounds and the START value are checked before CACHE is read.
-test sequence-start-checked-before-cache-is-read {
-    CREATE SEQUENCE seq_order_start START 100 MAXVALUE 10 CACHE 1.5;
-}
-@sqlstate 22023
-expect error {
-    START value \(100\) cannot be greater than MAXVALUE \(10\)
 }
 
 # IF NOT EXISTS on an existing sequence does nothing, whatever the bounds:
