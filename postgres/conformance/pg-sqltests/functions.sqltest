@@ -1388,6 +1388,93 @@ expect error {
     a column definition list is required for functions returning "record"
 }
 
+test generate-series-with-one-argument-errors {
+    SELECT * FROM generate_series(1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-with-four-arguments-errors {
+    SELECT * FROM generate_series(1, 2, 1, 1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-argument-cannot-name-the-column-of-the-function {
+    SELECT * FROM generate_series(1, generate_series);
+}
+@sqlstate 42703
+expect error {
+    generate_series
+}
+
+test unnest-argument-cannot-name-the-column-of-the-function {
+    SELECT * FROM unnest(unnest);
+}
+@sqlstate 42703
+expect error {
+    unnest
+}
+
+test generate-series-argument-cannot-name-the-function-itself {
+    SELECT * FROM generate_series(1, generate_series.generate_series);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-column-the-function-does-not-have {
+    SELECT * FROM generate_series(1, generate_series.value);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test unnest-argument-cannot-name-the-function-itself {
+    SELECT * FROM unnest(unnest.unnest);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE series_later (n int);
+    SELECT * FROM generate_series(1, series_later.n), series_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-column-of-a-table-listed-after-it {
+    CREATE TABLE series_later_column (n int);
+    SELECT * FROM generate_series(1, n), series_later_column;
+}
+@sqlstate 42703
+expect error {
+    n
+}
+
+test unnest-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE unnest_later (a int[]);
+    SELECT * FROM unnest(unnest_later.a), unnest_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-named-like-a-column-of-the-function {
+    CREATE TABLE series_args (start int, stop int, step int, value text);
+    INSERT INTO series_args VALUES (1, 7, 3, 'a');
+    SELECT series_args.value, generate_series.generate_series FROM series_args, generate_series(start, stop, step);
+}
+expect {
+    a|1
+    a|4
+    a|7
+}
+
 test json-to-record-argument-named-like-json-each-column {
     CREATE TABLE json_each_names (value text, key text, type text);
     INSERT INTO json_each_names VALUES ('[{"v":"a"},{"v":"b"}]', '{"v":"k"}', '[{"v":"t"}]');
