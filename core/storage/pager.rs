@@ -2178,6 +2178,20 @@ impl Pager {
                         page.get().id() == DatabaseHeader::PAGE_ID,
                         "incorrect header page id"
                     );
+                    if !page.has_wal_tag() && !page.is_dirty() {
+                        let contents = page.get_contents();
+                        let mut header = *bytemuck::from_bytes::<DatabaseHeader>(
+                            &contents.as_ptr()[..DatabaseHeader::SIZE],
+                        );
+                        if header.database_size.get() == 0 {
+                            let page_size = u64::from(self.get_page_size_unchecked().get());
+                            let file_pages = self.db_file.size()?.div_ceil(page_size);
+                            header.database_size = u32::try_from(file_pages)
+                                .map_err(|_| LimboError::IntegerOverflow)?
+                                .into();
+                            contents.write_database_header(&header);
+                        }
+                    }
                     *self.header_ref_state.write() = HeaderRefState::Start;
                     return Ok(IOResult::Done(page));
                 }
