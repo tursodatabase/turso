@@ -357,6 +357,11 @@ impl ClassCatalog {
                         .relpolicies = read_back_policies(relpolicies)?;
                 }
             }
+            CatalogChange::SetColumns { .. } => {
+                return Err(LimboError::InternalError(
+                    "a table's columns are not kept in memory".to_string(),
+                ));
+            }
             CatalogChange::CreateRole { .. } => {
                 return Err(LimboError::InternalError(
                     "CREATE ROLE reached the relation catalog".to_string(),
@@ -1025,6 +1030,8 @@ pub(crate) fn translate_catalog_changes(
                 };
                 emit_class_row_set_policies(program, &cursors, *namespace, name, stored, change);
             }
+            // No catalog of this frontend has the columns of a table.
+            CatalogChange::SetColumns { .. } => {}
             CatalogChange::CreateRole { .. } => {
                 return Err(LimboError::InternalError(
                     "CREATE ROLE reached the relation catalog".to_string(),

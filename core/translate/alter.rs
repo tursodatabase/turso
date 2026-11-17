@@ -1258,6 +1258,7 @@ pub fn translate_alter_table(
             }
             let mut rewrite_rows_result = Ok(());
             let mut owned_sequences_result = Ok(());
+            let mut table_columns_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1284,6 +1285,9 @@ pub fn translate_alter_table(
                         )
                         .map(|_| ())
                     });
+                    table_columns_result = emit_table_columns_change(
+                        program, resolver, connection, namespace, table_name, &btree,
+                    );
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1301,7 +1305,8 @@ pub fn translate_alter_table(
                 },
             )?;
             rewrite_rows_result?;
-            owned_sequences_result?
+            owned_sequences_result?;
+            table_columns_result?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def
@@ -1569,6 +1574,7 @@ pub fn translate_alter_table(
                 namespace,
             )?;
 
+            let mut table_columns_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1576,6 +1582,9 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
+                    table_columns_result = emit_table_columns_change(
+                        program, resolver, connection, namespace, table_name, &btree,
+                    );
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
                         cookie: Cookie::SchemaVersion,
@@ -1593,7 +1602,8 @@ pub fn translate_alter_table(
                         }),
                     });
                 },
-            )?
+            )?;
+            table_columns_result?
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
@@ -2477,6 +2487,15 @@ pub fn translate_alter_table(
                 });
             }
 
+            let table_after = match &altered_table {
+                Some(altered_table) => altered_table.clone(),
+                None => {
+                    let mut renamed_table = btree.clone();
+                    renamed_table.columns_mut()[column_index].name = Some(col_name.to_string());
+                    renamed_table
+                }
+            };
+
             if let Some(altered_table) = altered_table {
                 let altered_table = Arc::new(altered_table);
                 emit_column_constraints_validation(
@@ -2555,6 +2574,14 @@ pub fn translate_alter_table(
                     }],
                 )?;
             }
+            emit_table_columns_change(
+                program,
+                resolver,
+                connection,
+                namespace,
+                table_name,
+                &table_after,
+            )?;
 
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
@@ -2638,6 +2665,31 @@ fn translate_alter_owner(
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
+}
+
+/// Tells the dialect the columns that `table`, the altered table
+/// `table_name`, has from now on.
+fn emit_table_columns_change(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
+    table_name: &str,
+    table: &BTreeTable,
+) -> Result<()> {
+    if !schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
+        return Ok(());
+    }
+    resolver.catalog.dialect.translate_catalog_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &[CatalogChange::SetColumns {
+            namespace: namespace.id,
+            name: normalize_ident(table_name),
+            table: Arc::new(table.clone()),
+        }],
+    )
 }
 
 /// `kind` as an `ALTER ... OWNER TO` error names it.
