@@ -8,9 +8,9 @@ use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
-use crate::numeric::format_float;
 use crate::numeric::nonnan::NonNan;
 use crate::numeric::Numeric;
+use crate::numeric::{format_float, IntegerText};
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -936,7 +936,7 @@ impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, ""),
-            Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            Self::Numeric(Numeric::Integer(i)) => f.write_str(IntegerText::new(*i).as_str()),
             Self::Numeric(Numeric::Float(fl)) => f.write_str(&format_float(f64::from(*fl))),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),

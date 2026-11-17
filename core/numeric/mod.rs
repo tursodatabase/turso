@@ -950,6 +950,31 @@ fn push_ascii_digits(out: &mut String, digits: &[u8]) {
     out.push_str(unsafe { str::from_utf8_unchecked(digits) });
 }
 
+/// The decimal text of an `i64`, the same text as `i64::to_string()`, in a
+/// stack buffer.
+pub(crate) struct IntegerText {
+    buf: [u8; 20],
+    start: usize,
+}
+
+impl IntegerText {
+    pub(crate) fn new(value: i64) -> Self {
+        let mut buf = [0u8; 20];
+        let digits = write_decimal_digits(&mut buf, value.unsigned_abs()).len();
+        let mut start = buf.len() - digits;
+        if value < 0 {
+            start -= 1;
+            buf[start] = b'-';
+        }
+        Self { buf, start }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: the text is ASCII digits, after a minus sign when negative.
+        unsafe { str::from_utf8_unchecked(&self.buf[self.start..]) }
+    }
+}
+
 /// Write the decimal digits of `n` at the end of `buf`, and return them.
 // Without inline(always), the date and time functions in another module
 // call this function, and the call costs more than the loop.
@@ -994,6 +1019,22 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn integer_text_matches_to_string() {
+    for value in (-100_000i64..100_000).chain([
+        i64::MIN,
+        i64::MIN + 1,
+        i64::MAX,
+        i64::MAX - 1,
+        i64::from(i32::MIN),
+        i64::from(u32::MAX),
+        10_i64.pow(18),
+        -(10_i64.pow(18)),
+    ]) {
+        assert_eq!(IntegerText::new(value).as_str(), value.to_string());
+    }
 }
 
 #[test]
