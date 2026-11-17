@@ -37,9 +37,10 @@ use turso_core::schema::{
 use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CatalogChange,
-    CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, LimboError, NewOwner,
-    Numeric, ProgramBuilder, RegisterOrLiteral, Value,
+    emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
+    CatalogChange, CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn,
+    LimboError, NewOwner, Numeric, ProgramBuilder, RegisterOrLiteral, RelationChange, RelationName,
+    Value,
 };
 use turso_parser::ast;
 
@@ -616,53 +617,25 @@ fn read_back_policies(value: &Value) -> turso_core::Result<TablePolicies> {
     }
 }
 
-/// [`turso_core::Dialect::translate_catalog_changes`] for the PostgreSQL
+/// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
 /// frontend: a class row per created relation, owned by the current role,
 /// which is what PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row
-/// for a dropped one; a rename keeps the oid and owner; `ALTER ... OWNER TO`
-/// sets the owner, with PostgreSQL's errors for a missing role (42704) and
-/// a catalog relation (42501). A sequence a serial column owns changes
-/// owner with its table only, as in PostgreSQL: on its own it fails with
-/// `cannot change owner of sequence` (0A000). `GRANT` adds to the access
-/// control list when the owner or a superuser runs it; anyone else grants
-/// nothing, as in PostgreSQL, which only warns. `ALTER TABLE ... ENABLE ROW
-/// LEVEL SECURITY` sets `relrowsecurity` of the table's row, which a catalog
-/// table does not have (42501).
-pub(crate) fn translate_catalog_changes(
+/// for a dropped one; a rename keeps the oid and owner.
+pub(crate) fn translate_relation_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
     connection: &Arc<Connection>,
-    changes: &[CatalogChange],
+    changes: &[RelationChange<'_>],
 ) -> turso_core::Result<()> {
-    let allocates_oids = changes.iter().any(|change| {
-        matches!(
-            change,
-            CatalogChange::Create { .. } | CatalogChange::CreatePolicy { .. }
-        )
-    });
-    let changes_owner_or_privileges = changes.iter().any(|change| {
-        matches!(
-            change,
-            CatalogChange::ChangeOwner {
-                owner: NewOwner::Role(_),
-                ..
-            } | CatalogChange::Grant { .. }
-                | CatalogChange::SetRowSecurity { .. }
-                | CatalogChange::CreatePolicy { .. }
-                | CatalogChange::DropPolicy { .. }
-        )
-    });
+    let allocates_oids = changes
+        .iter()
+        .any(|change| matches!(change, RelationChange::Created { .. }));
     let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
-        if changes_owner_or_privileges {
-            return Err(LimboError::ParseError(
-                "the database has no relation catalog".to_string(),
-            ));
-        }
         return Ok(());
     };
     for change in changes {
         match change {
-            CatalogChange::Create {
+            RelationChange::Created {
                 namespace,
                 name,
                 kind,
@@ -681,20 +654,11 @@ pub(crate) fn translate_catalog_changes(
                 // the current role, which is what PostgreSQL's GetUserId()
                 // gives after SET ROLE.
                 let owner = table
-                    .as_deref()
                     .and_then(|table| relation_owner(schema, *namespace, table))
                     .unwrap_or_else(|| connection.current_role());
-                emit_class_row_insert(
-                    program,
-                    &cursors,
-                    *namespace,
-                    name,
-                    *kind,
-                    table.as_deref(),
-                    owner,
-                )
+                emit_class_row_insert(program, &cursors, *namespace, name, *kind, *table, owner)
             }
-            CatalogChange::Drop { namespace, name } => {
+            RelationChange::Dropped { namespace, name } => {
                 // An engine relation has no row and nothing to do.
                 if class_catalog(schema)
                     .and_then(|catalog| catalog.get_by_name(*namespace, name))
@@ -704,38 +668,7 @@ pub(crate) fn translate_catalog_changes(
                 }
                 emit_class_row_delete(program, &cursors, *namespace, name)
             }
-            CatalogChange::ChangeOwner {
-                namespace,
-                name,
-                owner: NewOwner::Column(owner),
-            } => {
-                let table_oid = match owner {
-                    Some(owner) => class_catalog(schema)
-                        .and_then(|catalog| catalog.get_by_name(*namespace, &owner.table))
-                        .map(|class| class.oid)
-                        .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "relation \"{}\" does not exist",
-                                owner.table
-                            ))
-                        })?,
-                    None => 0,
-                };
-                emit_class_row_set_owned_by(
-                    program,
-                    &cursors,
-                    *namespace,
-                    name,
-                    table_oid,
-                    owner.as_ref().map(|owner| owner.column.as_str()),
-                );
-                program.emit_insn(Insn::CatalogChange {
-                    db: MAIN_DB_ID,
-                    change: Box::new(change.clone()),
-                    value_regs: vec![],
-                });
-            }
-            CatalogChange::RenameColumn {
+            RelationChange::ColumnRenamed {
                 namespace,
                 table,
                 old_name,
@@ -768,11 +701,16 @@ pub(crate) fn translate_catalog_changes(
                 }
                 program.emit_insn(Insn::CatalogChange {
                     db: MAIN_DB_ID,
-                    change: Box::new(change.clone()),
+                    change: Box::new(CatalogChange::RenameColumn {
+                        namespace: *namespace,
+                        table: table.to_string(),
+                        old_name: old_name.to_string(),
+                        new_name: new_name.to_string(),
+                    }),
                     value_regs: vec![],
                 });
             }
-            CatalogChange::Rename {
+            RelationChange::Renamed {
                 namespace,
                 old_name,
                 new_name,
@@ -783,78 +721,148 @@ pub(crate) fn translate_catalog_changes(
                     emit_class_row_rename(program, &cursors, *namespace, old_name, new_name);
                 }
             }
-            CatalogChange::ChangeOwner {
-                namespace,
+        }
+    }
+    Ok(())
+}
+
+/// [`turso_core::Dialect::translate_access_statement`] for the statements
+/// that change a class row. `ALTER ... OWNER TO` sets the owner, with
+/// PostgreSQL's errors for a missing role (42704) and a catalog relation
+/// (42501). A sequence a serial column owns changes owner with its table
+/// only, as in PostgreSQL: on its own it fails with `cannot change owner of
+/// sequence` (0A000). `GRANT` adds to the access control list when the owner
+/// or a superuser runs it; anyone else grants nothing, as in PostgreSQL,
+/// which only warns. `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` sets
+/// `relrowsecurity` of the table's row, which a catalog table does not have
+/// (42501).
+pub(crate) fn translate_access_statement(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    statement: &AccessStatement<'_>,
+) -> turso_core::Result<()> {
+    let allocates_oids = matches!(statement, AccessStatement::CreatePolicy { .. });
+    let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
+        return match statement {
+            AccessStatement::ChangeOwner {
+                owner: NewOwner::Column(_),
+                ..
+            } => Ok(()),
+            AccessStatement::Grant { relations, .. } if relations.is_empty() => Ok(()),
+            _ => Err(LimboError::ParseError(
+                "the database has no relation catalog".to_string(),
+            )),
+        };
+    };
+    match statement {
+        AccessStatement::ChangeOwner {
+            namespace,
+            name,
+            owner: NewOwner::Column(owner),
+        } => {
+            let table_oid = match owner {
+                Some(owner) => class_catalog(schema)
+                    .and_then(|catalog| catalog.get_by_name(*namespace, &owner.table))
+                    .map(|class| class.oid)
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "relation \"{}\" does not exist",
+                            owner.table
+                        ))
+                    })?,
+                None => 0,
+            };
+            emit_class_row_set_owned_by(
+                program,
+                &cursors,
+                *namespace,
                 name,
-                owner: NewOwner::Role(new_owner),
-            } => {
-                let owner = resolve_new_owner(schema, connection, *namespace, name, new_owner)?;
-                let Some(class) =
-                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
-                else {
-                    continue;
-                };
-                // As in PostgreSQL: nothing changes when the owner stays, an
-                // index's owner is its table's, and a serial column's
-                // sequence changes owner with its table only.
-                if class.relowner == owner || class.relkind == RelationKind::Index {
-                    continue;
-                }
-                if class.relownedby != 0 {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot change owner of sequence \"{name}\""
-                    )));
-                }
-                // A table's indexes and what it owns, such as the sequences
-                // of its serial columns, go with it.
-                let mut with_it = vec![(*namespace, name.to_string())];
-                with_it.extend(
-                    class_catalog(schema)
-                        .into_iter()
-                        .flat_map(|catalog| catalog.owned_by(class.oid))
-                        .map(|owned| (owned.relnamespace, owned.relname.clone())),
-                );
-                with_it.extend(
-                    schema
-                        .get_indices(*namespace, name)
-                        .filter(|index| {
-                            is_user_relation_name(RelationKind::Index, &index.name)
-                                && !index.is_backing_btree_index()
-                        })
-                        .map(|index| (*namespace, index.name.clone())),
-                );
-                for (other_namespace, other_name) in with_it {
-                    // The new owner takes the old one's place in the list.
-                    let acl = class_catalog(schema)
-                        .and_then(|catalog| catalog.get_by_name(other_namespace, &other_name))
-                        .and_then(|other| other.relacl.clone())
-                        .map(|mut acl| {
-                            acl.change_owner(role_oid(class.relowner), role_oid(owner));
-                            acl
-                        });
-                    emit_class_row_set_owner(
-                        program,
-                        &cursors,
-                        other_namespace,
-                        &other_name,
-                        owner,
-                        new_owner,
-                        acl.as_ref(),
-                    );
-                }
+                table_oid,
+                owner.as_ref().map(|owner| owner.column.as_str()),
+            );
+            program.emit_insn(Insn::CatalogChange {
+                db: MAIN_DB_ID,
+                change: Box::new(CatalogChange::ChangeOwner {
+                    namespace: *namespace,
+                    name: name.to_string(),
+                    owner: NewOwner::Column(owner.clone()),
+                }),
+                value_regs: vec![],
+            });
+        }
+        AccessStatement::ChangeOwner {
+            namespace,
+            name,
+            owner: NewOwner::Role(new_owner),
+        } => {
+            let owner = resolve_new_owner(schema, connection, *namespace, name, new_owner)?;
+            let Some(class) =
+                class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+            else {
+                return Ok(());
+            };
+            // As in PostgreSQL: nothing changes when the owner stays, an
+            // index's owner is its table's, and a serial column's
+            // sequence changes owner with its table only.
+            if class.relowner == owner || class.relkind == RelationKind::Index {
+                return Ok(());
             }
-            CatalogChange::Grant {
-                revoke,
-                namespace,
-                name,
-                privileges,
-                grantees,
-            } => {
-                let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                let grantees = grantees
-                    .iter()
-                    .map(|grantee| resolve_grantee(schema, connection, grantee))
-                    .collect::<turso_core::Result<Vec<_>>>()?;
+            if class.relownedby != 0 {
+                return Err(LimboError::ParseError(format!(
+                    "cannot change owner of sequence \"{name}\""
+                )));
+            }
+            // A table's indexes and what it owns, such as the sequences
+            // of its serial columns, go with it.
+            let mut with_it = vec![(*namespace, name.to_string())];
+            with_it.extend(
+                class_catalog(schema)
+                    .into_iter()
+                    .flat_map(|catalog| catalog.owned_by(class.oid))
+                    .map(|owned| (owned.relnamespace, owned.relname.clone())),
+            );
+            with_it.extend(
+                schema
+                    .get_indices(*namespace, name)
+                    .filter(|index| {
+                        is_user_relation_name(RelationKind::Index, &index.name)
+                            && !index.is_backing_btree_index()
+                    })
+                    .map(|index| (*namespace, index.name.clone())),
+            );
+            for (other_namespace, other_name) in with_it {
+                // The new owner takes the old one's place in the list.
+                let acl = class_catalog(schema)
+                    .and_then(|catalog| catalog.get_by_name(other_namespace, &other_name))
+                    .and_then(|other| other.relacl.clone())
+                    .map(|mut acl| {
+                        acl.change_owner(role_oid(class.relowner), role_oid(owner));
+                        acl
+                    });
+                emit_class_row_set_owner(
+                    program,
+                    &cursors,
+                    other_namespace,
+                    &other_name,
+                    owner,
+                    new_owner,
+                    acl.as_ref(),
+                );
+            }
+        }
+        AccessStatement::Grant {
+            revoke,
+            relations,
+            privileges,
+            grantees: statement_grantees,
+        } => {
+            let statement = if *revoke { "REVOKE" } else { "GRANT" };
+            let grantees = statement_grantees
+                .iter()
+                .map(|grantee| resolve_grantee(schema, connection, grantee))
+                .collect::<turso_core::Result<Vec<_>>>()?;
+            for RelationName { namespace, name } in *relations {
                 // A relation without a class row has no list to store the
                 // privileges in. Only a superuser uses the engine's own
                 // tables, so a GRANT or REVOKE on one would claim a change it
@@ -931,110 +939,139 @@ pub(crate) fn translate_catalog_changes(
                 if class.relacl.as_ref() == Some(&acl) {
                     continue;
                 }
-                emit_class_row_set_acl(program, &cursors, *namespace, name, &acl, change);
-            }
-            CatalogChange::SetRowSecurity {
-                namespace,
-                name,
-                enabled,
-            } => {
-                let Some(class) =
-                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
-                else {
-                    return Err(LimboError::ParseError(format!(
-                        "permission denied: \"{name}\" is a system catalog"
-                    )));
-                };
-                if class.relrowsecurity == *enabled {
-                    continue;
-                }
-                emit_class_row_set_row_security(program, &cursors, *namespace, name, change);
-            }
-            CatalogChange::CreatePolicy {
-                namespace,
-                name,
-                policy,
-            } => {
-                let class = table_class(schema, *namespace, name)?;
-                let policy_name = policy.policy_name.as_str();
-                if class.relpolicies.contains(policy_name) {
-                    return Err(sqlstate_error(
-                        SQLSTATE_DUPLICATE_OBJECT,
-                        format!("policy \"{policy_name}\" for table \"{name}\" already exists"),
-                    ));
-                }
-                let roles = policy
-                    .roles
-                    .iter()
-                    .map(|role| resolve_policy_role(schema, connection, role))
-                    .collect::<turso_core::Result<Vec<_>>>()?;
-                let (before_oid, after_oid) = class.relpolicies.stored_text_around_new_oid(
-                    RowPolicy {
-                        name: policy_name.to_string(),
-                        permissive: policy.permissive,
-                        command: policy.command,
-                        roles,
-                        using_expr: policy.using_expr.as_deref().cloned(),
-                        check_expr: policy.check_expr.as_deref().cloned(),
-                    },
-                    policy.using_sql.clone(),
-                    policy.check_sql.clone(),
-                );
-                // The catalog reads the conditions back from the stored form,
-                // so a condition that does not read back is refused here
-                // rather than leaving a database that cannot be opened.
-                let some_oid = FIRST_NORMAL_OBJECT_ID;
-                if policies::parse(&format!("{before_oid}{some_oid}{after_oid}")).is_none() {
-                    return Err(LimboError::ParseError(format!(
-                        "the conditions of policy \"{policy_name}\" cannot be stored"
-                    )));
-                }
-                emit_class_row_set_policies(
+                emit_class_row_set_acl(
                     program,
                     &cursors,
                     *namespace,
                     name,
-                    StoredPolicies::WithNewOid {
-                        before_oid,
-                        after_oid,
+                    &acl,
+                    CatalogChange::Grant {
+                        revoke: *revoke,
+                        namespace: *namespace,
+                        name: name.clone(),
+                        privileges: privileges.to_vec(),
+                        grantees: statement_grantees.to_vec(),
                     },
-                    change,
                 );
             }
-            CatalogChange::DropPolicy {
-                namespace,
+        }
+        AccessStatement::SetRowSecurity {
+            namespace,
+            name,
+            enabled,
+        } => {
+            let Some(class) =
+                class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+            else {
+                return Err(LimboError::ParseError(format!(
+                    "permission denied: \"{name}\" is a system catalog"
+                )));
+            };
+            if class.relrowsecurity == *enabled {
+                return Ok(());
+            }
+            emit_class_row_set_row_security(program, &cursors, *namespace, name, *enabled);
+        }
+        AccessStatement::CreatePolicy {
+            namespace,
+            name,
+            policy,
+        } => {
+            let class = table_class(schema, *namespace, name)?;
+            let policy_name = policy.policy_name.as_str();
+            if class.relpolicies.contains(policy_name) {
+                return Err(sqlstate_error(
+                    SQLSTATE_DUPLICATE_OBJECT,
+                    format!("policy \"{policy_name}\" for table \"{name}\" already exists"),
+                ));
+            }
+            let roles = policy
+                .roles
+                .iter()
+                .map(|role| resolve_policy_role(schema, connection, role))
+                .collect::<turso_core::Result<Vec<_>>>()?;
+            let (before_oid, after_oid) = class.relpolicies.stored_text_around_new_oid(
+                RowPolicy {
+                    name: policy_name.to_string(),
+                    permissive: policy.permissive,
+                    command: policy.command,
+                    roles,
+                    using_expr: policy.using_expr.as_deref().cloned(),
+                    check_expr: policy.check_expr.as_deref().cloned(),
+                },
+                policy.using_sql.clone(),
+                policy.check_sql.clone(),
+            );
+            // The catalog reads the conditions back from the stored form,
+            // so a condition that does not read back is refused here
+            // rather than leaving a database that cannot be opened.
+            let some_oid = FIRST_NORMAL_OBJECT_ID;
+            if policies::parse(&format!("{before_oid}{some_oid}{after_oid}")).is_none() {
+                return Err(LimboError::ParseError(format!(
+                    "the conditions of policy \"{policy_name}\" cannot be stored"
+                )));
+            }
+            emit_class_row_set_policies(
+                program,
+                &cursors,
+                *namespace,
                 name,
-                policy_name,
-                if_exists,
-            } => {
-                let class = table_class(schema, *namespace, name)?;
-                if !class.relpolicies.contains(policy_name) {
-                    if *if_exists {
-                        continue;
-                    }
-                    return Err(sqlstate_error(
-                        SQLSTATE_UNDEFINED_OBJECT,
-                        format!("policy \"{policy_name}\" for table \"{name}\" does not exist"),
-                    ));
+                StoredPolicies::WithNewOid {
+                    before_oid,
+                    after_oid,
+                },
+                CatalogChange::CreatePolicy {
+                    namespace: *namespace,
+                    name: name.to_string(),
+                    policy: Box::new((*policy).clone()),
+                },
+            );
+        }
+        AccessStatement::DropPolicy {
+            namespace,
+            name,
+            policy_name,
+            if_exists,
+        } => {
+            let class = table_class(schema, *namespace, name)?;
+            if !class.relpolicies.contains(policy_name) {
+                if *if_exists {
+                    return Ok(());
                 }
-                let relpolicies = class.relpolicies.without(policy_name);
-                let stored = if relpolicies.is_empty() {
-                    StoredPolicies::None
-                } else {
-                    StoredPolicies::Text(relpolicies.stored_text())
-                };
-                emit_class_row_set_policies(program, &cursors, *namespace, name, stored, change);
-            }
-            CatalogChange::CreateRole { .. } => {
-                return Err(LimboError::InternalError(
-                    "CREATE ROLE reached the relation catalog".to_string(),
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    format!("policy \"{policy_name}\" for table \"{name}\" does not exist"),
                 ));
             }
-            CatalogChange::GrantRole { .. } => {
-                return Err(LimboError::InternalError(
-                    "GRANT of role membership reached the relation catalog".to_string(),
-                ));
-            }
+            let relpolicies = class.relpolicies.without(policy_name);
+            let stored = if relpolicies.is_empty() {
+                StoredPolicies::None
+            } else {
+                StoredPolicies::Text(relpolicies.stored_text())
+            };
+            emit_class_row_set_policies(
+                program,
+                &cursors,
+                *namespace,
+                name,
+                stored,
+                CatalogChange::DropPolicy {
+                    namespace: *namespace,
+                    name: name.to_string(),
+                    policy_name: policy_name.to_string(),
+                    if_exists: *if_exists,
+                },
+            );
+        }
+        AccessStatement::CreateRole { .. } => {
+            return Err(LimboError::InternalError(
+                "CREATE ROLE reached the relation catalog".to_string(),
+            ));
+        }
+        AccessStatement::GrantRole { .. } => {
+            return Err(LimboError::InternalError(
+                "GRANT of role membership reached the relation catalog".to_string(),
+            ));
         }
     }
     Ok(())
@@ -1487,7 +1524,7 @@ fn emit_class_row_set_acl(
     namespace: NamespaceId,
     name: &str,
     acl: &Acl,
-    change: &CatalogChange,
+    change: CatalogChange,
 ) {
     let acl_reg = emit_acl(program, Some(acl));
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
@@ -1507,23 +1544,20 @@ fn emit_class_row_set_acl(
     });
     program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(change.clone()),
+        change: Box::new(change),
         value_regs: vec![acl_reg],
     });
 }
 
-/// Sets `relrowsecurity` of the class row of table `name` of `namespace` as
-/// `change` says.
+/// Sets `relrowsecurity` of the class row of table `name` of `namespace` to
+/// `enabled`.
 fn emit_class_row_set_row_security(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
     namespace: NamespaceId,
     name: &str,
-    change: &CatalogChange,
+    enabled: bool,
 ) {
-    let CatalogChange::SetRowSecurity { enabled, .. } = change else {
-        unreachable!("the caller passes a row-level security change");
-    };
     emit_find_class_row(program, cursors, namespace, name, |program, row| {
         let record_reg = emit_class_record(
             program,
@@ -1533,7 +1567,7 @@ fn emit_class_row_set_row_security(
             ClassRecordColumn::Register(row.relowner_reg),
             ClassRecordColumn::Register(row.relownedby_reg),
             ClassRecordColumn::Register(row.relacl_reg),
-            ClassRecordColumn::LiteralInt(i64::from(*enabled)),
+            ClassRecordColumn::LiteralInt(i64::from(enabled)),
             ClassRecordColumn::Register(row.relpolicies_reg),
             ClassRecordColumn::Register(row.relownedbycolumn_reg),
         );
@@ -1541,7 +1575,11 @@ fn emit_class_row_set_row_security(
     });
     program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(change.clone()),
+        change: Box::new(CatalogChange::SetRowSecurity {
+            namespace,
+            name: name.to_string(),
+            enabled,
+        }),
         value_regs: vec![],
     });
 }
@@ -1567,7 +1605,7 @@ fn emit_class_row_set_policies(
     namespace: NamespaceId,
     name: &str,
     stored: StoredPolicies,
-    change: &CatalogChange,
+    change: CatalogChange,
 ) {
     let policies_reg = program.alloc_register();
     match stored {
@@ -1622,7 +1660,7 @@ fn emit_class_row_set_policies(
     });
     program.emit_insn(Insn::CatalogChange {
         db: MAIN_DB_ID,
-        change: Box::new(change.clone()),
+        change: Box::new(change),
         value_regs: vec![policies_reg],
     });
 }

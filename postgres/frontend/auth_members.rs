@@ -248,17 +248,14 @@ pub(crate) fn translate_grant_role(
     program: &mut ProgramBuilder,
     schema: &Schema,
     connection: &Arc<Connection>,
-    change: &CatalogChange,
+    revoke: bool,
+    role_names: &[String],
+    grantees: &[ast::Grantee],
 ) -> turso_core::Result<()> {
-    let CatalogChange::GrantRole {
+    let change = &CatalogChange::GrantRole {
         revoke,
-        roles: role_names,
-        grantees,
-    } = change
-    else {
-        return Err(LimboError::InternalError(format!(
-            "{change:?} reached the role membership table"
-        )));
+        roles: role_names.to_vec(),
+        grantees: grantees.to_vec(),
     };
     let roles = schema_roles(schema);
     let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
@@ -266,7 +263,7 @@ pub(crate) fn translate_grant_role(
             "the database has no role membership table".to_string(),
         ));
     };
-    let statement = if *revoke { "revoke" } else { "grant" };
+    let statement = if revoke { "revoke" } else { "grant" };
     let grantees = grantees
         .iter()
         .map(|grantee| resolve_grantee(roles, connection, grantee))
@@ -306,7 +303,7 @@ pub(crate) fn translate_grant_role(
     let mut granted_ids = (1..).map(|n: i64| -n);
     for role_name in role_names {
         let role = resolve_role_name(roles, role_name)?;
-        if role.id.is_none() && !*revoke {
+        if role.id.is_none() && !revoke {
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!("role \"{PG_DATABASE_OWNER_NAME}\" cannot have explicit members"),
@@ -323,7 +320,7 @@ pub(crate) fn translate_grant_role(
             continue;
         };
         for grantee in &grantees {
-            if *revoke {
+            if revoke {
                 let Some(member_id) = grantee.id else {
                     continue;
                 };
