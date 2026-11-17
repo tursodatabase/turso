@@ -375,6 +375,19 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     }
 
     #[inline(always)]
+    pub(crate) fn serialize_btree_changes(&mut self, payload: &[u8]) -> Result<()> {
+        log_write!(
+            self,
+            [
+                OP_BTREE_CHANGES,
+                0,
+                0i32.to_le_bytes(),
+                SqliteVarint(payload.len() as u64),
+                payload
+            ]
+        )
+    }
+
     pub(crate) fn serialize_header_entry(&mut self, header: &DatabaseHeader) -> Result<()> {
         // Header operations use tag-only addressing (table_id=0, flags=0).
         log_write!(

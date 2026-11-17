@@ -1448,7 +1448,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
-        created_table_ids: Mutex::new(Vec::new()),
+        btree_changes: Mutex::new(Vec::new()),
         portable_logical_changes: false,
     }
 }
@@ -2640,7 +2640,7 @@ fn transaction_display() {
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
-        created_table_ids: Mutex::new(Vec::new()),
+        btree_changes: Mutex::new(Vec::new()),
         portable_logical_changes: false,
     };
 
@@ -5378,4 +5378,573 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+#[test]
+fn savepoint_rollback_removes_created_btree_row_slots() {
+    let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("SAVEPOINT before_create").unwrap();
+    db.conn
+        .execute("CREATE TABLE rollback_tree (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO rollback_tree VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    let root = db
+        .conn
+        .schema
+        .read()
+        .get_btree_table(NamespaceId::ROOT, "rollback_tree")
+        .unwrap()
+        .root_page;
+    let id = db.mvcc_store.get_table_id_from_root_page(root);
+    assert!(db
+        .mvcc_store
+        .rows
+        .iter()
+        .any(|entry| entry.key().table_id == id));
+    db.conn.execute("ROLLBACK TO before_create").unwrap();
+    assert!(!db
+        .mvcc_store
+        .rows
+        .iter()
+        .any(|entry| entry.key().table_id == id));
+    db.conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn savepoint_rollback_restores_btree_operations() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE kept (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("SAVEPOINT before_drop").unwrap();
+    db.conn.execute("DROP TABLE kept").unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let tx = db.mvcc_store.txs.get(&tx_id).unwrap();
+    assert!(matches!(
+        tx.value().btree_changes.lock().as_slice(),
+        [BtreeChange::Drop(_)]
+    ));
+    db.conn.execute("SAVEPOINT nested").unwrap();
+    db.conn
+        .execute("CREATE TABLE discarded (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.conn.execute("RELEASE nested").unwrap();
+    assert_eq!(tx.value().btree_changes.lock().len(), 2);
+    db.conn.execute("ROLLBACK TO before_drop").unwrap();
+    assert!(tx.value().btree_changes.lock().is_empty());
+    db.conn.execute("INSERT INTO kept VALUES (1)").unwrap();
+    db.conn.execute("COMMIT").unwrap();
+}
+
+#[quickcheck]
+fn nested_savepoint_rollback_restores_btree_operations(releases: Vec<bool>) -> bool {
+    let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("CREATE TABLE kept (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let tx = db.mvcc_store.txs.get(&tx_id).unwrap();
+    let before = tx.value().btree_changes.lock().clone();
+    db.conn.execute("SAVEPOINT outer_savepoint").unwrap();
+    for (i, release) in releases.into_iter().take(16).enumerate() {
+        db.conn.execute(&format!("SAVEPOINT nested_{i}")).unwrap();
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE discarded_{i} (id INTEGER PRIMARY KEY)"
+            ))
+            .unwrap();
+        if release {
+            db.conn.execute(&format!("RELEASE nested_{i}")).unwrap();
+        }
+    }
+    db.conn.execute("DROP TABLE kept").unwrap();
+    db.conn.execute("ROLLBACK TO outer_savepoint").unwrap();
+    let restored = *tx.value().btree_changes.lock() == before;
+    db.conn.execute("COMMIT").unwrap();
+    restored
+}
+
+#[test]
+fn created_btrees_record_resolved_index_ordering() {
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("CREATE TABLE descriptor_t (id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, b INTEGER, UNIQUE(a DESC, b))").unwrap();
+    db.conn
+        .execute("CREATE INDEX descriptor_idx ON descriptor_t(b DESC, a COLLATE RTRIM)")
+        .unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let tx = db.mvcc_store.txs.get(&tx_id).unwrap();
+    let schema = db.conn.schema.read();
+    let changes = tx.value().btree_changes.lock();
+    let mut indexes = 0;
+    for index in schema
+        .all_indexes()
+        .filter(|index| index.table_name == "descriptor_t")
+    {
+        let id = db.mvcc_store.get_table_id_from_root_page(index.root_page);
+        let expected = BtreeDescriptor::Index(Arc::new(IndexInfo::new_from_index(index).unwrap()));
+        assert!(changes
+            .iter()
+            .any(|change| *change == BtreeChange::Create(id, expected.clone())));
+        indexes += 1;
+    }
+    assert_eq!(indexes, 2);
+    drop(changes);
+    drop(schema);
+    db.conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn checkpoint_ordering_survives_index_drop_at_a_later_snapshot() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE ordered (a TEXT, b INTEGER)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX ordered_idx ON ordered(a COLLATE NOCASE DESC, b)")
+        .unwrap();
+    let schema = db.conn.schema.read();
+    let index = schema
+        .all_indexes()
+        .find(|index| index.name == "ordered_idx")
+        .unwrap();
+    let id = db.mvcc_store.get_table_id_from_root_page(index.root_page);
+    let expected = IndexInfo::new_from_index(index).unwrap();
+    drop(schema);
+    let before = db.mvcc_store.watermarks().last_committed_tx_ts;
+    db.conn.execute("DROP INDEX ordered_idx").unwrap();
+    let after = db.mvcc_store.watermarks().last_committed_tx_ts;
+    assert_eq!(
+        db.mvcc_store
+            .checkpoint_index_infos(before)
+            .get(&id)
+            .unwrap()
+            .as_ref(),
+        &expected
+    );
+    assert!(!db
+        .mvcc_store
+        .checkpoint_index_infos(after)
+        .contains_key(&id));
+}
+
+#[test]
+fn checkpoint_btree_lifecycle_without_catalog_rows() {
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    let db = MvccTestDb::new();
+    let id = MVTableId::new(db.mvcc_store.get_next_table_id());
+    let tx = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
+    db.mvcc_store.insert_table_id_to_rootpage(id, None);
+    db.mvcc_store
+        .record_created_btree(tx, id.into(), BtreeDescriptor::Table);
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root = db
+        .mvcc_store
+        .current_root_page(&id)
+        .expect("empty B-tree creation must be checkpointed without a catalog row");
+    let tx = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(id, 1, "storage only"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(db.mvcc_store.current_root_page(&id), Some(root));
+    let tx = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
+    db.mvcc_store.record_dropped_btree(tx, root as i64);
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(db.mvcc_store.current_root_page(&id).is_none());
+}
+
+#[test]
+fn snapshot_must_include_catalog_roots() {
+    use crate::storage::btree_descriptor::{BtreeDescriptor, BtreeSnapshotEntry};
+    let db = MvccTestDb::new();
+    db.conn.execute("CREATE TABLE snapshot_table(x)").unwrap();
+    db.conn
+        .execute("CREATE INDEX snapshot_index ON snapshot_table(x)")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let schema = db.conn.schema.read();
+    let mut objects: std::vec::Vec<_> = schema
+        .btree_descriptors()
+        .unwrap()
+        .into_iter()
+        .map(|(root_page, descriptor)| BtreeSnapshotEntry {
+            logical_id: -root_page,
+            root_page,
+            descriptor,
+        })
+        .collect();
+    assert!(matches!(
+        schema.validate_btree_snapshot(&[]),
+        Err(LimboError::Corrupt(_))
+    ));
+    for omitted in 0..objects.len() {
+        if objects[omitted].root_page == 1 {
+            continue;
+        }
+        let mut incomplete = objects.clone();
+        incomplete.remove(omitted);
+        assert!(matches!(
+            schema.validate_btree_snapshot(&incomplete),
+            Err(LimboError::Corrupt(_))
+        ));
+    }
+    objects.push(BtreeSnapshotEntry {
+        logical_id: -1000,
+        root_page: 1000,
+        descriptor: BtreeDescriptor::Table,
+    });
+    schema.validate_btree_snapshot(&objects).unwrap();
+}
+
+#[test]
+fn recover_table_and_index_without_catalog_rows() {
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    use crate::translate::collate::CollationSeq;
+    use crate::types::KeyInfo;
+    use turso_parser::ast::{NullsOrder, SortOrder};
+    let mut db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_vacuum(true));
+    let info = Arc::new(
+        IndexInfo::new(
+            [
+                KeyInfo {
+                    sort_order: SortOrder::Desc,
+                    collation: CollationSeq::NOCASE,
+                    nulls_order: Some(NullsOrder::First),
+                },
+                KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::BINARY,
+                    nulls_order: None,
+                },
+            ],
+            true,
+            2,
+            false,
+        )
+        .unwrap(),
+    );
+    let (table, index, key) = {
+        let conn = db.connect();
+        let store = db.get_mvcc_store();
+        store.set_checkpoint_threshold(-1);
+        let table = MVTableId::new(store.get_next_table_id());
+        let index = MVTableId::new(store.get_next_table_id());
+        let tx = store.begin_tx(conn.get_pager()).unwrap();
+        for (id, descriptor) in [
+            (table, BtreeDescriptor::Table),
+            (index, BtreeDescriptor::Index(info.clone())),
+        ] {
+            store.insert_table_id_to_rootpage(id, None);
+            store.record_created_btree(tx, id.into(), descriptor);
+        }
+        commit_tx(store.clone(), &conn, tx).unwrap();
+        let tx = store.begin_tx(conn.get_pager()).unwrap();
+        store
+            .insert(tx, generate_simple_string_row(table, 1, "Hello"))
+            .unwrap();
+        let record =
+            ImmutableRecord::from_values(&[Value::build_text("Hello"), Value::from_i64(1)], 2)
+                .unwrap();
+        let key = Arc::new(
+            SortableIndexKey::new_from_payload_in(&record, info.clone(), TursoAllocator).unwrap(),
+        );
+        store
+            .insert_to_table_or_index(
+                tx,
+                Row::new_index_row(RowID::new(index, RowKey::Record(key.clone()))),
+                Some(index),
+            )
+            .unwrap();
+        for (rowid, value) in [
+            (2, Value::build_text("a")),
+            (3, Value::build_text("B")),
+            (4, Value::build_text("b")),
+            (5, Value::Null),
+        ] {
+            let record = ImmutableRecord::from_values(&[value, Value::from_i64(rowid)], 2).unwrap();
+            let key = Arc::new(
+                SortableIndexKey::new_from_payload_in(&record, info.clone(), TursoAllocator)
+                    .unwrap(),
+            );
+            store
+                .insert_to_table_or_index(
+                    tx,
+                    Row::new_index_row(RowID::new(index, RowKey::Record(key))),
+                    Some(index),
+                )
+                .unwrap();
+        }
+        commit_tx(store, &conn, tx).unwrap();
+        (table, index, key)
+    };
+    db.restart();
+    let conn = db.connect();
+    let store = db.get_mvcc_store();
+    assert_eq!(
+        store.btree_objects.read().get(&index).unwrap().descriptor,
+        BtreeDescriptor::Index(info.clone())
+    );
+    let tx = store.begin_tx(conn.get_pager()).unwrap();
+    assert!(store
+        .read(tx, &RowID::new(table, RowKey::Int(1)))
+        .unwrap()
+        .is_some());
+    assert!(store
+        .read_from_table_or_index(tx, &RowID::new(index, RowKey::Record(key)), Some(index))
+        .unwrap()
+        .is_some());
+    commit_tx(store.clone(), &conn, tx).unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(store.current_root_page(&table).is_some());
+    assert!(store.current_root_page(&index).is_some());
+    let table_root = store.current_root_page(&table).unwrap();
+    let index_root = store.current_root_page(&index).unwrap();
+    drop(store);
+    drop(conn);
+    db.restart();
+    let conn = db.connect();
+    let store = db.get_mvcc_store();
+    let index = store.get_table_id_from_root_page(index_root as i64);
+    assert_eq!(
+        store
+            .btree_objects
+            .read()
+            .get(&index)
+            .expect("descriptor survives log truncation")
+            .descriptor,
+        BtreeDescriptor::Index(info.clone())
+    );
+    let error = conn.execute("VACUUM").unwrap_err();
+    assert!(
+        error.to_string().contains("without catalog entries"),
+        "{error}"
+    );
+    let destination = db._temp_dir.as_ref().unwrap().path().join("opaque-copy.db");
+    let error = conn
+        .execute(format!("VACUUM INTO '{}'", destination.display()))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("without catalog entries"),
+        "{error}"
+    );
+    let pager = conn.get_pager();
+    pager.begin_read_tx().unwrap();
+    let mut table_cursor = BTreeCursor::new_table(pager.clone(), table_root as i64, 1);
+    pager.io.block(|| table_cursor.rewind()).unwrap();
+    let record = pager
+        .io
+        .block(|| {
+            table_cursor
+                .record()
+                .map(|result| result.map(|record| record.cloned()))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.get_value(0).unwrap().to_owned().unwrap(),
+        Value::build_text("Hello")
+    );
+    let mut index_cursor = BTreeCursor::new_with_index_info(
+        pager.clone(),
+        index_root as i64,
+        info.num_cols,
+        Some(info),
+    );
+    pager.io.block(|| index_cursor.rewind()).unwrap();
+    let mut rowids = Vec::new();
+    loop {
+        let record = pager
+            .io
+            .block(|| {
+                index_cursor
+                    .record()
+                    .map(|result| result.map(|record| record.cloned()))
+            })
+            .unwrap();
+        let Some(record) = record else {
+            break;
+        };
+        rowids.push(record.get_value(1).unwrap().to_owned().unwrap());
+        pager.io.block(|| index_cursor.next()).unwrap();
+    }
+    assert_eq!(rowids, [5, 1, 3, 4, 2].map(Value::from_i64));
+}
+
+#[test]
+fn legacy_catalog_frames_then_explicit_lifecycle_recover_and_checkpoint() {
+    use crate::mvcc::persistent_storage::logical_log::LogicalLog;
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let store = db.get_mvcc_store();
+        let io = conn.get_pager().io.clone();
+        let mut log = LogicalLog::new(store.storage.get_logical_log_file(), io.clone(), None);
+        let catalog = ImmutableRecord::from_values(
+            &[
+                Value::build_text("table"),
+                Value::build_text("legacy_t"),
+                Value::build_text("legacy_t"),
+                Value::from_i64(-1000),
+                Value::build_text("CREATE TABLE legacy_t(v TEXT)"),
+            ],
+            5,
+        )
+        .unwrap();
+        for (timestamp, row) in [
+            (
+                1000,
+                Row::new_table_row(
+                    RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(100)),
+                    catalog.as_blob(),
+                )
+                .unwrap(),
+            ),
+            (
+                1001,
+                generate_simple_string_row((-1000).into(), 1, "old format"),
+            ),
+        ] {
+            let version = RowVersion {
+                id: timestamp,
+                begin: PackedTs::pack(Some(TxTimestampOrID::Timestamp(timestamp))),
+                end: PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: WalPos::ORIGIN,
+            };
+            let record = LogRecord::for_test(timestamp, &[(row.id, version)], None);
+            io.wait_for_completion(log.log_tx(record).unwrap()).unwrap();
+        }
+    }
+    db.restart();
+    {
+        let conn = db.connect();
+        assert_eq!(
+            get_rows(&conn, "SELECT v FROM legacy_t"),
+            vec![vec![Value::build_text("old format")]]
+        );
+        conn.execute("INSERT INTO legacy_t VALUES ('new format')")
+            .unwrap();
+        conn.execute("CREATE INDEX legacy_i ON legacy_t(v DESC)")
+            .unwrap();
+    }
+    db.restart();
+    {
+        let conn = db.connect();
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM legacy_t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP TABLE legacy_t").unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[test]
+fn commits_before_checkpoint_root_publication_keep_stable_ids_after_reopen() {
+    for late_sql in [
+        "INSERT INTO t VALUES (2, 'B')",
+        "DROP INDEX t_v",
+        "DROP TABLE t",
+    ] {
+        let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+        let table_id;
+        {
+            let conn = db.connect();
+            let store = db.get_mvcc_store();
+            store.set_checkpoint_threshold(-1);
+            for _ in 0..8 {
+                store.get_next_table_id();
+            }
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX t_v ON t(v COLLATE NOCASE DESC)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+            table_id = store.get_table_id_from_root_page(
+                conn.schema
+                    .read()
+                    .get_btree_table(NamespaceId::ROOT, "t")
+                    .unwrap()
+                    .root_page,
+            );
+            let mut checkpoint = CheckpointStateMachine::new(
+                conn.get_pager(),
+                store.clone(),
+                conn.clone(),
+                true,
+                conn.get_sync_mode(),
+                crate::MAIN_DB_ID,
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+            );
+            while !matches!(checkpoint.state(), CheckpointState::WriteRow { .. }) {
+                match checkpoint.step(&()).unwrap() {
+                    TransitionResult::Io(io) => io.wait(conn.get_pager().io.as_ref()).unwrap(),
+                    TransitionResult::Continue => (),
+                    TransitionResult::Done(_) => panic!("checkpoint ended before allocating roots"),
+                }
+            }
+            assert!(store.current_root_page(&table_id).is_none());
+            let writer = db.connect();
+            writer.execute(late_sql).unwrap();
+            loop {
+                match checkpoint.step(&()).unwrap() {
+                    TransitionResult::Io(io) => io.wait(conn.get_pager().io.as_ref()).unwrap(),
+                    TransitionResult::Continue => (),
+                    TransitionResult::Done(_) => break,
+                }
+            }
+            let root = store.current_root_page(&table_id).unwrap();
+            assert_ne!(
+                i64::from(table_id),
+                -(root as i64),
+                "test must distinguish logical IDs from physical roots"
+            );
+        }
+        db.restart();
+        let conn = db.connect();
+        let store = db.get_mvcc_store();
+        if late_sql == "DROP TABLE t" {
+            assert!(get_rows(&conn, "SELECT name FROM sqlite_schema WHERE name = 't'").is_empty());
+        } else {
+            let root = conn
+                .schema
+                .read()
+                .get_btree_table(NamespaceId::ROOT, "t")
+                .unwrap()
+                .root_page;
+            assert_eq!(store.get_table_id_from_root_page(root), table_id);
+            let expected = if late_sql.starts_with("INSERT") { 2 } else { 1 };
+            assert_eq!(
+                get_rows(&conn, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(expected)]]
+            );
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(
+            get_rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![Value::build_text("ok")]]
+        );
+    }
 }

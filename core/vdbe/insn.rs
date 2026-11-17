@@ -14,7 +14,7 @@ use crate::function::AccumulatorFunc;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
-    storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    storage::wal::CheckpointMode,
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::TransactionMode, plan::BitSet},
     types::KeyInfo,
@@ -1691,8 +1691,8 @@ pub enum Insn {
         db: usize,
         /// The root page of the new b-tree (P2).
         root: usize,
-        /// Flags (P3).
-        flags: CreateBTreeFlags,
+        /// Storage layout and key ordering.
+        descriptor: crate::storage::btree_descriptor::BtreeDescriptor,
     },
 
     /// Create custom index method (calls [crate::index_method::IndexMethodCursor::create] under the hood)

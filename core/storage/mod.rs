@@ -40,3 +40,5 @@ macro_rules! return_corrupt {
         return Err(LimboError::Corrupt(format!($($arg)*)).into());
     };
 }
+
+pub mod btree_descriptor;

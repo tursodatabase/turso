@@ -13392,7 +13392,14 @@ pub fn op_create_btree(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(CreateBtree { db, root, flags }, insn);
+    load_insn!(
+        CreateBtree {
+            db,
+            root,
+            descriptor
+        },
+        insn
+    );
 
     check_db_write_allowed(program, state, None)?;
     if program.connection.is_readonly(*db) {
@@ -13403,7 +13410,7 @@ pub fn op_create_btree(
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-            mv_store.record_created_table_id(tx_id, root_page);
+            mv_store.record_created_btree(tx_id, root_page, descriptor.clone());
         }
         state.registers[*root].set_int(root_page);
         state.pc += 1;
@@ -13411,7 +13418,7 @@ pub fn op_create_btree(
     }
     let pager = program.get_pager_from_database_index(db)?;
     // FIXME: handle page cache is full
-    let root_page = return_if_io!(state, pager.btree_create(flags));
+    let root_page = return_if_io!(state, pager.btree_create(&descriptor.flags()));
     state.registers[*root].set_int(root_page as i64);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13578,8 +13585,12 @@ pub fn op_destroy(
     );
     check_db_write_allowed(program, state, None)?;
     let mv_store = program.connection.mv_store_for_db(*db);
-    if mv_store.is_some() {
-        // MVCC only does pager operations in checkpoint
+    if let Some(mv_store) = mv_store {
+        let tx_id = program
+            .connection
+            .get_mv_tx_id_for_db(*db)
+            .expect("Destroy requires an MVCC transaction");
+        mv_store.record_dropped_btree(tx_id, *root);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }

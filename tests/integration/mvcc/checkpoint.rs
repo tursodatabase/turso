@@ -89,10 +89,10 @@ fn collection_yields_while_walking_many_schema_rows() {
     );
     assert!(
         checkpoint
-            .machine
-            .collected_table_rows()
-            .all(|(row_id, _)| row_id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID),
-        "schema rows are walked before the rows of any table"
+            .collected_table_rowids(SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .len()
+            < MANY_ROWS,
+        "the yield must come before all catalog rows have been collected"
     );
 
     checkpoint.step_until(CheckpointState::CollectIndexRows);
@@ -1320,11 +1320,24 @@ fn test_checkpoint_drop_table_then_create_index_page_reuse() {
     // First checkpoint writes both tables to the B-tree.
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    // DROP TABLE a frees its root page; CREATE INDEX may reuse it.
+    let old_root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 'a'")[0][0]
+        .as_int()
+        .unwrap();
+    // DROP TABLE a frees its only page for the replacement index.
     conn.execute("DROP TABLE a").unwrap();
     conn.execute("CREATE INDEX new_b_v ON b(v)").unwrap();
     // Second checkpoint must handle the page reuse without panicking.
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let index_root = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'new_b_v'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert_eq!(
+        index_root, old_root,
+        "the regression must exercise physical root reuse"
+    );
     drop(conn);
 
     db.restart();

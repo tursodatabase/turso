@@ -3,7 +3,7 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
-use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::btree_descriptor::BtreeDescriptor;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
@@ -164,7 +164,7 @@ pub fn translate_create_materialized_view(
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: view_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        descriptor: BtreeDescriptor::Table,
     });
 
     // Create a proper BTreeTable for the cursor with the actual view columns
@@ -270,7 +270,7 @@ pub fn translate_create_materialized_view(
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
             root: table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
+            descriptor: BtreeDescriptor::Table,
         });
         emit_schema_entry(
             program,
@@ -290,7 +290,18 @@ pub fn translate_create_materialized_view(
             program.emit_insn(Insn::CreateBtree {
                 db: database_id,
                 root: index_root_reg,
-                flags: CreateBTreeFlags::new_index(),
+                descriptor: {
+                    let table = BTreeTable::from_sql(&hidden.create_sql, 0)?;
+                    let primary_key = table
+                        .unique_sets
+                        .iter()
+                        .find(|set| set.is_primary_key)
+                        .expect("hidden state index has a primary key");
+                    BtreeDescriptor::Index(super::schema::automatic_index_info(
+                        &table,
+                        primary_key,
+                    )?)
+                },
             });
             let index_name = format!(
                 "{}{}_1",

@@ -4,6 +4,9 @@ This is a rewrite of [dbhash](https://github.com/sqlite/sqlite/blob/ca0b14a49/to
 
 The tool hashes database content, not the physical file format, making it deterministic across different database configurations. Identical data produces identical hashes regardless of page size, text encoding, freelist state, or vacuum history.
 
+The hash excludes the internal MVCC B-tree snapshot, whose physical page numbers
+can change during checkpoint or VACUUM without changing logical data.
+
 ## Usage
 
 ```bash

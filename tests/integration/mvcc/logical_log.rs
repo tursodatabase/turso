@@ -38,6 +38,11 @@ fn test_logical_log_read() {
         let table_id: MVTableId = (-100).into();
         let tx_id = mvcc_store.begin_tx(pager).unwrap();
         // insert table id -2 into sqlite_schema table (table_id -1)
+        mvcc_store.record_created_btree(
+            tx_id,
+            table_id.into(),
+            turso_core::storage::btree_descriptor::BtreeDescriptor::Table,
+        );
         let data = ImmutableRecord::from_values(
             &[
                 Value::Text(Text::new("table")),  // type
@@ -107,6 +112,11 @@ fn test_logical_log_read_multiple_transactions() {
 
         let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
         // insert table id -2 into sqlite_schema table (table_id -1)
+        mvcc_store.record_created_btree(
+            tx_id,
+            table_id.into(),
+            turso_core::storage::btree_descriptor::BtreeDescriptor::Table,
+        );
         let data = ImmutableRecord::from_values(
             &[
                 Value::Text(Text::new("table")),  // type
@@ -215,6 +225,11 @@ fn test_logical_log_read_fuzz() {
 
         // insert table id -2 into sqlite_schema table (table_id -1)
         let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+        mvcc_store.record_created_btree(
+            tx_id,
+            table_id.into(),
+            turso_core::storage::btree_descriptor::BtreeDescriptor::Table,
+        );
         let data = ImmutableRecord::from_values(
             &[
                 Value::Text(Text::new("table")),  // type

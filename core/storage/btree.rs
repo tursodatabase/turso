@@ -1285,7 +1285,7 @@ impl BTreeCursor {
         Self::new_with_index_info(pager, root_page, num_columns, None)
     }
 
-    fn new_with_index_info(
+    pub(crate) fn new_with_index_info(
         pager: Arc<Pager>,
         root_page: i64,
         _num_columns: usize,

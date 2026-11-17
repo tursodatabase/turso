@@ -16,7 +16,7 @@ use crate::schema::{
     TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
-use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::btree_descriptor::BtreeDescriptor;
 use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
@@ -1354,7 +1354,7 @@ pub fn translate_create_table(
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
             root: seq_table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
+            descriptor: BtreeDescriptor::Table,
         });
 
         let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
@@ -1403,18 +1403,27 @@ pub fn translate_create_table(
     let parse_schema_label = program.allocate_label();
 
     let table_root_reg = program.alloc_register();
-    let btree_flags = match &body {
-        ast::CreateTableBody::ColumnsAndConstraints { options, .. }
-            if options.contains_without_rowid() =>
-        {
-            CreateBTreeFlags::new_index()
-        }
-        _ => CreateBTreeFlags::new_table(),
+    let mut storage_table = create_table(
+        &mangled_tbl_name,
+        &body,
+        0,
+        resolver.catalog.dialect.supports_namespaces(),
+    )?;
+    storage_table.resolve_custom_types(resolver.schema())?;
+    let descriptor = if storage_table.has_rowid {
+        BtreeDescriptor::Table
+    } else {
+        let primary_key = storage_table
+            .unique_sets
+            .iter()
+            .find(|set| set.is_primary_key)
+            .expect("WITHOUT ROWID table has a primary key");
+        BtreeDescriptor::Index(automatic_index_info(&storage_table, primary_key)?)
     };
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: table_root_reg,
-        flags: btree_flags,
+        descriptor,
     });
 
     // Create an automatic index B-tree if needed
@@ -1443,11 +1452,11 @@ pub fn translate_create_table(
 
     let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
     if let Some(index_regs) = index_regs.as_ref() {
-        for index_reg in index_regs.iter() {
+        for (index_reg, info) in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
                 db: database_id,
                 root: *index_reg,
-                flags: CreateBTreeFlags::new_index(),
+                descriptor: BtreeDescriptor::Index(info.clone()),
             });
         }
     }
@@ -1484,7 +1493,7 @@ pub fn translate_create_table(
 
     let mut autoindex_names = vec![];
     if let Some(index_regs) = index_regs {
-        for (idx, index_reg) in index_regs.into_iter().enumerate() {
+        for (idx, (index_reg, _)) in index_regs.into_iter().enumerate() {
             let index_name = format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
                 mangled_tbl_name,
@@ -1915,6 +1924,8 @@ pub fn emit_schema_entry(
     Ok(())
 }
 
+type AutoindexRegisters = Vec<(usize, Arc<crate::types::IndexInfo>)>;
+
 /// Check if an automatic PRIMARY KEY index is required for the table.
 /// If so, create a register for the index root page and return it.
 ///
@@ -1929,49 +1940,63 @@ fn collect_autoindexes(
     program: &mut ProgramBuilder,
     tbl_name: &str,
     resolver: &Resolver,
-) -> Result<Option<Vec<usize>>> {
-    let table = create_table(
+) -> Result<Option<AutoindexRegisters>> {
+    let mut table = create_table(
         tbl_name,
         body,
         0,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
-
-    let mut regs: Vec<usize> = Vec::new();
-
-    // include UNIQUE singles, include PK single only if not rowid alias
-    for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-        if us.is_primary_key && !table.has_rowid {
+    table.resolve_custom_types(resolver.schema())?;
+    let mut regs = Vec::new();
+    for set in table
+        .unique_sets
+        .iter()
+        .filter(|set| set.columns.len() == 1)
+        .chain(table.unique_sets.iter().filter(|set| set.columns.len() > 1))
+    {
+        if set.is_primary_key && (!table.has_rowid || table.get_rowid_alias_column().is_some()) {
             continue;
         }
-        let col_name = &us.columns.first().unwrap().name;
-        let Some((_pos, col)) = table.get_column(col_name) else {
-            bail_parse_error!("Column {col_name} not found in table {}", table.name);
-        };
-
-        let needs_index = if us.is_primary_key {
-            !(col.primary_key() && col.is_rowid_alias())
-        } else {
-            // UNIQUE single needs an index
-            true
-        };
-
-        if needs_index {
-            regs.push(program.alloc_register());
-        }
+        regs.push((program.alloc_register(), automatic_index_info(&table, set)?));
     }
+    Ok((!regs.is_empty()).then_some(regs))
+}
 
-    for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
-        if !table.has_rowid && _us.is_primary_key {
-            continue;
-        }
-        regs.push(program.alloc_register());
-    }
-    if regs.is_empty() {
-        Ok(None)
+pub(crate) fn automatic_index_info(
+    table: &BTreeTable,
+    set: &crate::schema::UniqueSet,
+) -> Result<Arc<crate::types::IndexInfo>> {
+    let index = if set.is_primary_key {
+        crate::schema::Index::automatic_from_primary_key(
+            table,
+            (String::new(), 0),
+            set.columns.len(),
+            set.conflict_clause,
+            &set.columns,
+            set.constraint_name.clone(),
+        )?
     } else {
-        Ok(Some(regs))
-    }
+        let columns = set
+            .columns
+            .iter()
+            .map(|column| {
+                let (position, _) = table
+                    .get_column(&column.name)
+                    .expect("constraint column exists");
+                (position, column.sort_order)
+            })
+            .collect();
+        crate::schema::Index::automatic_from_unique(
+            table,
+            (String::new(), 0),
+            columns,
+            set.conflict_clause,
+            &set.columns,
+            set.constraint_name.clone(),
+        )?
+    };
+    Ok(Arc::new(crate::types::IndexInfo::new_from_index(&index)?))
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
@@ -3184,7 +3209,7 @@ pub(crate) fn emit_create_internal_table(
     program.emit_insn(Insn::CreateBtree {
         db: MAIN_DB_ID,
         root: root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        descriptor: BtreeDescriptor::Table,
     });
     let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
         s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)

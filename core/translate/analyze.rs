@@ -6,7 +6,7 @@ use crate::{
     bail_parse_error,
     function::{Func, FuncCtx, ScalarFunc},
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
-    storage::pager::CreateBTreeFlags,
+    storage::btree_descriptor::BtreeDescriptor,
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
@@ -211,7 +211,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
             root: table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
+            descriptor: BtreeDescriptor::Table,
         });
         let sql = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
         // The root_page==0 is false, but we don't rely on it, and there's no

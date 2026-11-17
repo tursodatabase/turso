@@ -50,6 +50,7 @@ pub const PAGE_SIZE: usize = 4096;
 pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
 const MVCC_LOG_MAGIC: u32 = 0x4C4D4C32;
 const MVCC_LOG_VERSION: u8 = 3;
+const MVCC_LOG_VERSION_BTREE: u8 = 4;
 const MVCC_LOG_HEADER_SIZE: usize = 56;
 const MVCC_TX_FRAME_MAGIC: u32 = 0x5854564D;
 const MVCC_TX_EXT_FRAME_MAGIC: u32 = 0x5845564D;
@@ -967,7 +968,7 @@ fn validate_mvcc_log_header(buf: &[u8]) -> Result<u32> {
             "invalid MVCC logical-log header magic".to_string(),
         ));
     }
-    if buf[4] != MVCC_LOG_VERSION {
+    if buf[4] != MVCC_LOG_VERSION && buf[4] != MVCC_LOG_VERSION_BTREE {
         return Err(Error::DatabaseSyncEngineError(format!(
             "unsupported MVCC logical-log version {}",
             buf[4]
@@ -4643,6 +4644,18 @@ mod tests {
         frame.extend_from_slice(&0u32.to_le_bytes());
         frame.extend_from_slice(&super::MVCC_TX_END_MAGIC.to_le_bytes());
         frame
+    }
+
+    #[test]
+    fn raw_mvcc_header_accepts_btree_descriptor_version() {
+        let mut header = raw_mvcc_log_header(42);
+        header[4] = super::MVCC_LOG_VERSION_BTREE;
+        header[super::MVCC_LOG_HEADER_CRC_START..].fill(0);
+        let crc = crc32c::crc32c(&header);
+        header[super::MVCC_LOG_HEADER_CRC_START..].copy_from_slice(&crc.to_le_bytes());
+        assert!(super::validate_mvcc_log_header(&header).is_ok());
+        header[4] = 5;
+        assert!(super::validate_mvcc_log_header(&header).is_err());
     }
 
     fn raw_mvcc_log_header(salt: u64) -> Vec<u8> {
