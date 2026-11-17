@@ -1820,6 +1820,133 @@ expect error {
     no query solution
 }
 
+setup partial_index_iif_schema {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b = 5 OR b = 7;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL), (3, 8);
+}
+
+# Each WHERE term is true only when its condition is true, so it proves what
+# the condition proves.
+@setup partial_index_iif_schema
+test partial-index-predicate-implied-by-iif-condition {
+    SELECT 'iif(b = 5, a)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a);
+    SELECT 'if(b = 5, a)', a FROM t1 INDEXED BY t1_a WHERE if(b = 5, a);
+    SELECT 'iif(b = 5, a, NULL)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, NULL);
+    SELECT 'iif(b = 5, a, FALSE)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, FALSE);
+    SELECT 'iif(b = 5, a, -0)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, -0);
+    SELECT 'iif(iif(b = 5, a), a)', a FROM t1 INDEXED BY t1_a WHERE iif(iif(b = 5, a), a);
+    SELECT 'iif(b = 5 OR b = 7, a)', a FROM t1 INDEXED BY t1_a WHERE iif(b = 5 OR b = 7, a);
+    SELECT 'CASE WHEN b = 5 THEN a END', a FROM t1 INDEXED BY t1_a WHERE CASE WHEN b = 5 THEN a END;
+    SELECT 'CASE WHEN b = 5 THEN a ELSE 0 END', a FROM t1 INDEXED BY t1_a WHERE CASE WHEN b = 5 THEN a ELSE 0 END;
+}
+expect {
+    iif(b = 5, a)|1
+    if(b = 5, a)|1
+    iif(b = 5, a, NULL)|1
+    iif(b = 5, a, FALSE)|1
+    iif(b = 5, a, -0)|1
+    iif(iif(b = 5, a), a)|1
+    iif(b = 5 OR b = 7, a)|1
+    CASE WHEN b = 5 THEN a END|1
+    CASE WHEN b = 5 THEN a ELSE 0 END|1
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-iif-condition {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a);
+}
+expect {
+    1
+}
+
+# The condition is evaluated, so a read of the index must read b even when
+# nothing else uses it.
+test partial-index-predicate-as-iif-condition-is-evaluated {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b > 0;
+    INSERT INTO t1 VALUES (1, 1), (2, 5), (3, -1), (6, 3), (7, NULL);
+    SELECT 'iif(b > 0, 1)', a FROM t1 WHERE iif(b > 0, 1);
+    SELECT 'CASE WHEN b > 0 THEN 1 END', a FROM t1 WHERE CASE WHEN b > 0 THEN 1 END;
+    SELECT 'INDEXED BY, iif(b > 0, 1)', a FROM t1 INDEXED BY t1_a WHERE iif(b > 0, 1);
+    SELECT 'INDEXED BY, iif(b > 0, a)', a FROM t1 INDEXED BY t1_a WHERE iif(b > 0, a);
+}
+expect {
+    iif(b > 0, 1)|1
+    iif(b > 0, 1)|2
+    iif(b > 0, 1)|6
+    CASE WHEN b > 0 THEN 1 END|1
+    CASE WHEN b > 0 THEN 1 END|2
+    CASE WHEN b > 0 THEN 1 END|6
+    INDEXED BY, iif(b > 0, 1)|1
+    INDEXED BY, iif(b > 0, 1)|2
+    INDEXED BY, iif(b > 0, 1)|6
+    INDEXED BY, iif(b > 0, a)|1
+    INDEXED BY, iif(b > 0, a)|2
+    INDEXED BY, iif(b > 0, a)|6
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-as-iif-condition-is-evaluated {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b IS NOT NULL, 1);
+}
+expect {
+    1
+    3
+    4
+}
+
+# The third value can be true for a row that the index does not have.
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-iif-with-true-third-value {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, 1);
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-iif-with-real-third-value {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(b = 5, a, 0.0);
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-iif-value {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE iif(a, b = 5);
+}
+expect error {
+    no query solution
+}
+
+# coalesce(x, y) can be true when x is NULL.
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-other-function {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE coalesce(b = 5, a);
+}
+expect error {
+    no query solution
+}
+
+# With an operand, the WHEN value is compared with it, so it is not a condition.
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-case-with-operand {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE CASE a WHEN b = 5 THEN a END;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_iif_schema
+test partial-index-predicate-not-implied-by-case-with-two-conditions {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE CASE WHEN b = 5 THEN a WHEN b = 7 THEN a END;
+}
+expect error {
+    no query solution
+}
+
 setup partial_index_multi_index_or_schema {
     CREATE TABLE indexed_items(a INT, b INT, c INT);
     CREATE INDEX indexed_items_a_partial_idx ON indexed_items(a) WHERE b = 1;

@@ -3,6 +3,8 @@ use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
+    function::{Func, ScalarFunc},
+    numeric::Numeric,
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
         collate::{comparison_collation, in_list_collation, CollationSeq},
@@ -22,7 +24,8 @@ use crate::{
         },
         Resolver,
     },
-    util::exprs_are_equivalent,
+    types::Value,
+    util::{exprs_are_equivalent, parse_numeric_literal},
     vdbe::affinity::Affinity,
     Result,
 };
@@ -1748,7 +1751,7 @@ fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> boo
     if exprs_are_equivalent(query, predicate) {
         return true;
     }
-    match unwrap_parens(predicate).unwrap_or(predicate) {
+    let implied = match unwrap_parens(predicate).unwrap_or(predicate) {
         ast::Expr::Binary(left, ast::Operator::Or, right) => {
             query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
         }
@@ -1760,7 +1763,11 @@ fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> boo
             });
             same_test || (!is_null && expr_implies_not_null(query, operand, false))
         }),
-    }
+    };
+    // `iif(x, y)` is TRUE only when `x` is TRUE, so it implies what `x` implies.
+    implied
+        || iif_condition(query)
+            .is_some_and(|condition| query_term_implies_predicate(condition, predicate))
 }
 
 /// Returns `(x, true)` for `x IS NULL` and `x ISNULL`, and `(x, false)` for
@@ -1777,6 +1784,63 @@ fn null_test(expr: &ast::Expr) -> Option<(&ast::Expr, bool)> {
             Some((operand.as_ref(), false))
         }
         _ => None,
+    }
+}
+
+/// Returns `x` if `expr` is one of these, where `z` is NULL, FALSE or 0:
+///
+///   iif(x, y)    CASE WHEN x THEN y END
+///   iif(x, y, z) CASE WHEN x THEN y ELSE z END
+///
+/// Port of SQLite's `sqlite3ExprIsIIF` (expr.c).
+fn iif_condition(expr: &ast::Expr) -> Option<&ast::Expr> {
+    let (condition, otherwise) = match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::FunctionCall { name, args, .. }
+            if matches!(
+                Func::resolve_function(name.as_str(), args.len()),
+                Ok(Some(Func::Scalar(ScalarFunc::Iif)))
+            ) =>
+        {
+            match args.as_slice() {
+                [condition, _] => (condition, None),
+                [condition, _, otherwise] => (condition, Some(otherwise)),
+                _ => return None,
+            }
+        }
+        ast::Expr::Case {
+            base: None,
+            when_then_pairs,
+            else_expr,
+        } => match when_then_pairs.as_slice() {
+            [(condition, _)] => (condition, else_expr.as_ref()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    otherwise
+        .is_none_or(|otherwise| expr_is_never_true(otherwise))
+        .then_some(condition.as_ref())
+}
+
+/// Returns true if `expr` is NULL, FALSE or an integer literal 0.
+///
+/// Port of SQLite's `sqlite3ExprIsNotTrue` (expr.c).
+fn expr_is_never_true(expr: &ast::Expr) -> bool {
+    match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::Literal(ast::Literal::Null | ast::Literal::False) => true,
+        expr => expr_is_integer_zero(expr),
+    }
+}
+
+fn expr_is_integer_zero(expr: &ast::Expr) -> bool {
+    use ast::UnaryOperator::{Negative, Positive};
+    match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::Unary(Positive | Negative, inner) => expr_is_integer_zero(inner),
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => matches!(
+            parse_numeric_literal(text),
+            Ok(Value::Numeric(Numeric::Integer(0)))
+        ),
+        _ => false,
     }
 }
 
