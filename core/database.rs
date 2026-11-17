@@ -235,6 +235,7 @@ pub struct OpenOptions {
     db_opts: DatabaseOpts,
     pub native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
+    page_size: Option<PageSize>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     allocators: DatabaseAllocators,
@@ -255,6 +256,7 @@ impl OpenOptions {
             db_opts: DatabaseOpts::default(),
             native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
+            page_size: None,
             page_codec: None,
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
@@ -288,6 +290,14 @@ impl OpenOptions {
 
     pub fn encryption(mut self, encryption: impl Into<Option<EncryptionOpts>>) -> Self {
         self.encryption = encryption.into();
+        self
+    }
+
+    /// Select the page size for a new database. Existing databases retain their
+    /// stored page size, and cached opens retain the live database's page size.
+    /// An encrypted database's page size cannot change after open.
+    pub fn page_size(mut self, page_size: PageSize) -> Self {
+        self.page_size = Some(page_size);
         self
     }
 
@@ -564,6 +574,7 @@ pub struct OpenDbAsyncState {
     /// The database being built, held across the ValidatingHeader phase yields
     /// before it is wrapped in an `Arc`.
     building_db: Option<Database>,
+    initial_page_size: Option<PageSize>,
     /// Sub state machine for `header_validation`, driven in ValidatingHeader.
     header_validation_state: HeaderValidationState,
     /// The dedicated bootstrap connection used by `BootstrapMvStore`, held
@@ -602,6 +613,7 @@ impl OpenDbAsyncState {
             schema_guard: None,
             registry_key: None,
             building_db: None,
+            initial_page_size: None,
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
@@ -815,6 +827,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
+        initial_page_size: Option<PageSize>,
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
@@ -842,7 +855,10 @@ impl Database {
         };
 
         let init_page_1 = if db_size == 0 {
-            let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+            let default_page_1 = pager::default_page1_with_size(
+                encryption_cipher_mode.as_ref(),
+                initial_page_size.unwrap_or_default(),
+            );
 
             Some(default_page_1)
         } else {
@@ -1425,6 +1441,8 @@ impl Database {
             // of the same path without holding the mutex across yields.
         }
 
+        state.initial_page_size = options.page_size;
+
         // Open the database (no registry lock held; never re-consults it).
         let result = Self::do_open_async_guarded(
             state,
@@ -1507,6 +1525,7 @@ impl Database {
             )
             .into());
         };
+        state.initial_page_size = options.page_size;
         Self::do_open_async_guarded(
             state,
             io,
@@ -1611,6 +1630,7 @@ impl Database {
                         &io,
                         db_file.clone(),
                         encryption_opts.clone(),
+                        state.initial_page_size,
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),

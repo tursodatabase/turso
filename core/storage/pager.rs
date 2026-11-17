@@ -6407,8 +6407,13 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
 }
 
 pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
+    default_page1_with_size(cipher, PageSize::default())
+}
+
+pub(crate) fn default_page1_with_size(cipher: Option<&CipherMode>, size: PageSize) -> PageRef {
     // New Database header for empty Database
     let mut default_header = DatabaseHeader::default();
+    default_header.page_size = size;
 
     if let Some(cipher) = cipher {
         // we will set the reserved space bytes as required by either the encryption
