@@ -1740,9 +1740,12 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
                 running_crc = Some(stored_crc);
             }
 
+            // A frame without an extension block carries no portable changes,
+            // so its row changes cannot be replayed here.
             if extension_size == 0 {
-                pos = frame_end;
-                continue;
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "MVCC logical-log frame at range offset {frame_start} has no portable changes"
+                )));
             }
             let extension_block = &range_body[extension_start..recovery_start];
             let recovery_payload = &range_body[recovery_start..trailer_start];
