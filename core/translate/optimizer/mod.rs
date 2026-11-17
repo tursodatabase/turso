@@ -3048,8 +3048,8 @@ fn plan_unmatched_right_rows(
             params,
             resolver,
         )?;
-        // The main plan already checked the INDEXED BY index. The unmatched-row
-        // read follows the same hint, as in SQLite.
+        // The main plan already checked that the INDEXED BY index exists. The
+        // unmatched-row read follows the same hint, as in SQLite.
         if let Some(indexed) = &table.indexed {
             let forced_index = match indexed {
                 ast::Indexed::IndexedBy(name) => Some(
@@ -3059,6 +3059,16 @@ fn plan_unmatched_right_rows(
                 ),
                 ast::Indexed::NotIndexed => None,
             };
+            // The main plan can prove a partial index predicate with an ON
+            // term. This read has no ON terms, so it must prove the predicate
+            // again.
+            let forced_partial_index_unusable =
+                partial_index(forced_index.as_ref()).is_some_and(|index| {
+                    !can_use_partial_index(index, unmatched_table, &where_clause_for_unmatched_rows)
+                });
+            if forced_partial_index_unusable {
+                crate::bail_parse_error!("no query solution");
+            }
             keep_index_hint_candidates(
                 &mut constraints_for_unmatched_rows.candidates,
                 forced_index,
