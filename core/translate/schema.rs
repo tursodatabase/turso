@@ -305,6 +305,7 @@ fn resolve_check_expr_type(
                 );
             }
         }
+        ast::Expr::Collate(inner, _) => resolve_check_expr_type(inner, columns, resolver),
         ast::Expr::Cast { type_name, .. } => {
             if let Some(ref tn) = type_name {
                 resolve_type_name(&dequote(&tn.name), resolver)
