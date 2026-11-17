@@ -755,11 +755,10 @@ fn create_encrypted_db(
         Arc::new(SqliteDialect),
     )?;
 
-    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-    let cipher_mode = CipherMode::try_from(cipher)?;
     let key = EncryptionKey::from_hex_string(hexkey)?;
-    conn.set_encryption_cipher(cipher_mode)?;
-    conn.set_encryption_key(key)?;
+    let conn = db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(Some(key)),
+    )?;
 
     conn.execute(format!(
         "CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, value TEXT)"
@@ -844,20 +843,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A,
             KEY_B // wrong key!
         );
-        // Attaching may succeed (key is not validated at open time), but reading must fail
-        let attach_result = run_query(&main_db, &conn, &attach_wrong);
-        if attach_result.is_ok() {
-            let read_result = run_query_on_row(
-                &main_db,
-                &conn,
-                "SELECT value FROM aux_a.secret_a",
-                |_: &Row| {},
-            );
-            assert_that!(read_result)
-                .described_as("reading an attached database with the wrong key")
-                .is_err();
-        }
-        // If attach itself failed, that's also acceptable
+        assert_that!(run_query(&main_db, &conn, &attach_wrong))
+            .described_as("ATTACH with the wrong key")
+            .is_err();
     }
 
     // --- Test 3: Swapped keys — db_a gets key_b, db_b gets key_a ---
@@ -876,26 +864,12 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             KEY_A
         );
 
-        // Attach may succeed at open time; reading should fail for both
-        let _ = run_query(&main_db, &conn, &attach_a_wrong);
-        let _ = run_query(&main_db, &conn, &attach_b_wrong);
-
-        let read_a = run_query_on_row(
-            &main_db,
-            &conn,
-            "SELECT value FROM aux_a.secret_a",
-            |_: &Row| {},
-        );
-        let read_b = run_query_on_row(
-            &main_db,
-            &conn,
-            "SELECT value FROM aux_b.secret_b",
-            |_: &Row| {},
-        );
-        assert!(
-            read_a.is_err() || read_b.is_err(),
-            "At least one read with swapped keys must fail"
-        );
+        assert_that!(run_query(&main_db, &conn, &attach_a_wrong))
+            .described_as("ATTACH of the first database with swapped keys")
+            .is_err();
+        assert_that!(run_query(&main_db, &conn, &attach_b_wrong))
+            .described_as("ATTACH of the second database with swapped keys")
+            .is_err();
     }
 
     // --- Test 4: Missing hexkey in URI ---
@@ -948,9 +922,9 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
             CIPHER_A,
             KEY_B
         );
-        let _ = run_query(&main_db, &conn, &attach_wrong);
-        // Detach (ignore error if attach failed)
-        let _ = run_query(&main_db, &conn, "DETACH aux_a");
+        assert_that!(run_query(&main_db, &conn, &attach_wrong))
+            .described_as("ATTACH with the wrong key before retrying")
+            .is_err();
 
         // Now attach with correct key
         let attach_correct = format!(

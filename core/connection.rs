@@ -1654,7 +1654,8 @@ impl Connection {
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
-    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
+        page_size: PageSize,
+    ) -> Result<(Arc<Database>, Option<EncryptionKey>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
@@ -1674,24 +1675,27 @@ impl Connection {
             }
             (None, None) => None,
         };
-        if encryption_opts.is_some() {
-            db_opts = db_opts.with_encryption(true);
-        }
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+            .transpose()?;
+        db_opts = db_opts.with_encryption(encryption_opts.is_some());
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts)
+                .page_size(page_size),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        Ok((db, encryption_opts))
+        Ok((db, encryption_key))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {

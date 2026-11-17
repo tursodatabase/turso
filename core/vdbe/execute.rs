@@ -10757,7 +10757,12 @@ pub fn op_function(
             assert_eq!(arg_count, 3);
             let filename = state.registers[*start_reg].get_value();
             let dbname = state.registers[*start_reg + 1].get_value();
-            let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
+            let key = state.registers[*start_reg + 2].get_value();
+            if !matches!(key, Value::Null) {
+                return Err(LimboError::InvalidArgument(
+                    "ATTACH KEY is not supported; provide cipher and hexkey in the attached database URI".into(),
+                ).into());
+            }
 
             let Value::Text(filename_str) = filename else {
                 return Err(LimboError::InvalidArgument(
