@@ -1991,3 +1991,42 @@ test cmp-recursive-cte-of-time-and-string-literal-is-not-supported {
 expect error {
     cannot compare type time with type text
 }
+
+# An array compares with an array whose elements compare with its elements.
+@requires strict "uses STRICT tables"
+test cmp-date-array-with-timestamp-array-is-not-supported {
+    -- PostgreSQL has no operator for date[] = timestamp[].
+    CREATE TABLE c(id INTEGER PRIMARY KEY, da date[], ta timestamp[]) STRICT;
+    INSERT INTO c VALUES (1, ARRAY['2024-01-05'], ARRAY['2024-01-05 00:00']);
+    SELECT id FROM c WHERE da = ta;
+}
+expect error {
+    cannot compare type date\[\] with type timestamp\[\]
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-array-with-integer-is-not-supported {
+    -- PostgreSQL has no operator for date[] = integer.
+    CREATE TABLE c(id INTEGER PRIMARY KEY, da date[]) STRICT;
+    INSERT INTO c VALUES (1, ARRAY['2024-01-05']);
+    SELECT id FROM c WHERE da = 5;
+}
+expect error {
+    cannot compare type date\[\] with type integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-arrays-that-still-compare {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, da date[]) STRICT;
+    INSERT INTO c VALUES (1, ARRAY['2024-01-05']), (2, NULL);
+    SELECT 'literal', id FROM c WHERE da = '{2024-01-05}';
+    SELECT 'cast', id FROM c WHERE da = ARRAY[CAST('2024-01-05' AS date)];
+    SELECT 'same-type', count(*) FROM c x JOIN c y ON x.da = y.da;
+    SELECT 'null', id FROM c WHERE da IS NULL;
+}
+expect {
+    literal|1
+    cast|1
+    same-type|1
+    null|2
+}

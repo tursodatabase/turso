@@ -647,3 +647,23 @@ expect {
     3
     3
 }
+
+# A policy's scalar subquery is kept in a register, which can only name a
+# custom type. An array value there has no type, so tursopg can't compare it.
+test policy-with-an-array-subquery {
+    CREATE ROLE rp_array_reader;
+    CREATE TABLE rp_array_docs (id INT PRIMARY KEY, tags int[]);
+    INSERT INTO rp_array_docs VALUES (1, '{1,2}'), (2, '{3}');
+    ALTER TABLE rp_array_docs ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON rp_array_docs TO rp_array_reader;
+    CREATE POLICY same_tags ON rp_array_docs USING (tags = (SELECT ARRAY[1, 2]));
+    SET ROLE rp_array_reader;
+    SELECT id FROM rp_array_docs ORDER BY id;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type integer\[\] with type any
+}

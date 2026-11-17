@@ -349,16 +349,14 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test array-order-puts-text-that-is-not-an-array-after-arrays {
+test array-and-text-in-one-sorted-column-is-refused {
+    -- PostgreSQL reads 'x' as an integer[] and fails: malformed array literal.
     CREATE TABLE t(a integer[]) STRICT;
     INSERT INTO t VALUES ('{2}'), ('{1,2}'), (NULL);
     SELECT a FROM t UNION ALL SELECT 'x' ORDER BY 1;
 }
-expect {
-
-    {1,2}
-    {2}
-    x
+expect error {
+    cannot compare type integer\[\] with type text
 }
 
 # An index keeps the order it was created with, so ALTER COLUMN can't change
