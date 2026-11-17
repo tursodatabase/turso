@@ -1,5 +1,5 @@
-# extract and date_trunc on date, timestamp and timestamptz. The session time
-# zone is UTC on both servers.
+# extract and date_trunc on date, timestamp and timestamptz, and make_date. The
+# session time zone is UTC on both servers.
 
 @database :memory:
 
@@ -59,13 +59,60 @@ expect {
     2024-02-26 00:00:00+00
 }
 
-test extract-and-date-trunc-of-null-are-null {
-    CREATE TABLE dn (v date);
-    INSERT INTO dn VALUES (NULL);
-    SELECT (extract(year from v) IS NULL)::int, (date_trunc('day', v) IS NULL)::int FROM dn;
+test extract-date-trunc-and-make-date-of-null-are-null {
+    CREATE TABLE dn (v date, y integer);
+    INSERT INTO dn VALUES (NULL, NULL);
+    SELECT (extract(year from v) IS NULL)::int, (date_trunc('day', v) IS NULL)::int,
+        (make_date(y, 1, 1) IS NULL)::int
+    FROM dn;
 }
 expect {
-    1|1
+    1|1|1
+}
+
+test make-date-is-a-date {
+    SELECT make_date(2024, 2, 29) + 1;
+}
+expect {
+    2024-03-01
+}
+
+test make-date-of-a-day-that-does-not-exist {
+    SELECT make_date(2023, 2, 29);
+}
+@sqlstate 22008
+expect error {
+    date field value out of range: 2023-02-29
+}
+
+test make-date-of-year-0 {
+    SELECT make_date(0, 1, 1);
+}
+@sqlstate 22008
+expect error {
+    date field value out of range: 0-01-01
+}
+
+test make-date-of-year-10000-is-not-supported {
+    SELECT make_date(10000, 1, 1);
+}
+expect {
+    10000-01-01
+}
+@sqlstate 0A000
+expect @tursopg error {
+    make_date of year 10000 is not supported
+}
+
+test make-date-of-a-string-constant-is-not-supported {
+    SELECT make_date('2024', 1, 1);
+}
+expect {
+    2024-01-01
+}
+@sqlstate 0A000
+expect @tursopg error {
+    make_date takes only values of type integer
 }
 
 test extract-of-a-string-constant-is-not-supported {

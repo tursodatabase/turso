@@ -106,3 +106,5 @@ raise an error rather than reporting that those modes took effect.
 - `date_trunc` units: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`
 
 Other fields and units, a unit that is not a string constant, and an `x` that is a string constant, `NULL` or parameter (write `date '2024-01-05'`) raise an error with SQLSTATE `0A000`. So does a call in a `CHECK` constraint.
+
+`make_date(year, month, day)` works as in PostgreSQL for arguments of type `integer` and years 1 to 9999. Other arguments and years raise an error with SQLSTATE `0A000`.

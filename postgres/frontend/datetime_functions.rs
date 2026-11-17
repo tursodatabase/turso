@@ -1,14 +1,16 @@
 //! PostgreSQL's `extract` and `date_trunc` on `date`, `timestamp` and
-//! `timestamptz`, read and written with `turso_core::Temporal`. The session
-//! time zone is UTC.
+//! `timestamptz`, and `make_date`, read and written with `turso_core::Temporal`.
+//! The session time zone is UTC.
 
 use crate::error::sqlstate_error;
 use crate::functions::pg_scalar_function;
 use chrono::{Datelike, Days, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike};
 use turso_core::dialect::ScalarFuncContext;
 use turso_core::native_ext::{ArgumentType, FunctionArity, ReturnType};
-use turso_core::{LimboError, OpenOptions, Register, Result, Temporal, TemporalType, Value};
-use turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
+use turso_core::{
+    LimboError, Numeric, OpenOptions, Register, Result, Temporal, TemporalType, Value,
+};
+use turso_pg_parser::sqlstate::{SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED};
 
 pub(crate) fn register_datetime_functions(options: OpenOptions) -> OpenOptions {
     options
@@ -21,6 +23,10 @@ pub(crate) fn register_datetime_functions(options: OpenOptions) -> OpenOptions {
             pg_scalar_function("date_trunc", FunctionArity::Exact(2), true, exec_date_trunc)
                 .receiving_argument_types()
                 .choosing_result_type(date_trunc_result_type),
+        )
+        .extension_function(
+            pg_scalar_function("make_date", FunctionArity::Exact(3), true, exec_make_date)
+                .choosing_result_type(make_date_result_type),
         )
 }
 
@@ -69,6 +75,18 @@ fn source_type(function: &str, args: &[ArgumentType]) -> Result<TemporalType> {
             "{function} takes only a string constant as its unit, such as 'day'"
         ))),
     }
+}
+
+fn make_date_result_type(args: &[ArgumentType]) -> Result<ReturnType> {
+    if !args
+        .iter()
+        .all(|arg| matches!(arg, ArgumentType::Typed(name) if name == "integer"))
+    {
+        return Err(not_supported(
+            "make_date takes only values of type integer; cast other values with ::integer",
+        ));
+    }
+    Ok(ReturnType::Custom("date"))
 }
 
 /// `extract(field FROM source)` as a numeric. Seconds, and the epoch of a
@@ -144,6 +162,53 @@ fn exec_date_trunc(_: &ScalarFuncContext<'_>, args: &[Register]) -> Result<Value
     };
     let (_, value_of_result_type) = truncated_type(ty);
     Ok(Value::build_text(value_of_result_type(truncated).to_text()))
+}
+
+/// `make_date(year, month, day)`. tursopg can't store years outside
+/// `Temporal::STORABLE_YEARS`, so it refuses them; PostgreSQL makes them (a
+/// negative year is BC).
+fn exec_make_date(_: &ScalarFuncContext<'_>, args: &[Register]) -> Result<Value> {
+    let mut fields = [0; 3];
+    for (field, arg) in fields.iter_mut().zip(args) {
+        *field = match arg.get_value() {
+            Value::Null => return Ok(Value::Null),
+            Value::Numeric(Numeric::Integer(value)) => *value,
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "make_date got {other:?} for a value of type integer"
+                )))
+            }
+        };
+    }
+    let [year, month, day] = fields;
+    let out_of_range = || {
+        sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            format!("date field value out of range: {year}-{month:02}-{day:02}"),
+        )
+    };
+    // PostgreSQL has no year 0.
+    if year == 0 {
+        return Err(out_of_range());
+    }
+    let year = match i32::try_from(year) {
+        Ok(year) if Temporal::STORABLE_YEARS.contains(&year) => year,
+        Ok(_) | Err(_) => {
+            return Err(not_supported(format!(
+                "make_date of year {year} is not supported; tursopg stores only years {} to {}",
+                Temporal::STORABLE_YEARS.start(),
+                Temporal::STORABLE_YEARS.end()
+            )))
+        }
+    };
+    let date = match (u32::try_from(month), u32::try_from(day)) {
+        (Ok(month), Ok(day)) => NaiveDate::from_ymd_opt(year, month, day),
+        (Err(_), _) | (_, Err(_)) => None,
+    };
+    let Some(date) = date else {
+        return Err(out_of_range());
+    };
+    Ok(Value::build_text(Temporal::Date(date).to_text()))
 }
 
 /// The type of a call's source, from the type name that follows the arguments.
