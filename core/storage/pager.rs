@@ -3412,6 +3412,10 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> IOResultOr<()> {
+        turso_assert!(
+            self.is_authenticated(),
+            "page allocation requires an authenticated pager"
+        );
         if !self.db_initialized() {
             if let Some(_lock) = self.shared.init_lock.try_lock() {
                 return Ok(self.allocate_page1()?.map(|_| ()));
@@ -5801,6 +5805,10 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page1(&self) -> IOResultOr<PageRef> {
+        turso_assert!(
+            self.is_authenticated(),
+            "page allocation requires an authenticated pager"
+        );
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
@@ -6296,6 +6304,10 @@ impl Pager {
         // Update cached schema cookie after modification
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(result))
+    }
+
+    pub(crate) fn shares_database_state(&self, shared: &Arc<SharedPagerState>) -> bool {
+        Arc::ptr_eq(&self.shared, shared)
     }
 
     pub fn is_encryption_ctx_set(&self) -> bool {

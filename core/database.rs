@@ -1715,7 +1715,7 @@ impl Database {
                     state.header_validation_state = hv_state;
                     let pager = return_if_io!(result);
 
-                    let mut db = state
+                    let db = state
                         .building_db
                         .take()
                         .expect("building_db must be set in Init phase");
@@ -1730,8 +1730,6 @@ impl Database {
                             "Either WAL or MVStore must be enabled"
                         );
                     }
-                    let _ = &mut db;
-
                     // Wrap db in Arc before connecting
                     let db = Arc::new(db);
 
@@ -2004,6 +2002,18 @@ impl Database {
             )
             .into());
         }
+        if self.pager_state.encryption_cipher() == CipherMode::None && encryption_key.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "database was opened without encryption".into(),
+            )
+            .into());
+        }
+        if self.pager_state.encryption_cipher() != CipherMode::None && encryption_key.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database requires an encryption key".into(),
+            )
+            .into());
+        }
         loop {
             match st {
                 InitState::Start => {
@@ -2049,9 +2059,22 @@ impl Database {
 
                     *st = InitState::ReadPage1 {
                         pager: Box::new(pager),
+                        encryption_validation: EncryptionValidationState::default(),
                     };
                 }
-                InitState::ReadPage1 { pager } => {
+                InitState::ReadPage1 {
+                    pager,
+                    encryption_validation,
+                } => {
+                    match pager.validate_encryption(encryption_validation) {
+                        Ok(IOResult::Done(())) => {}
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Err(err) => {
+                            pager.end_read_tx();
+                            return Err(err);
+                        }
+                    }
+                    pager.set_page_size(pager.get_page_size_unchecked());
                     // Read page 1 within the read transaction to determine the
                     // autovacuum mode. The read tx stays open across an IO
                     // yield here (re-entry resumes the read); we only end it
@@ -2121,7 +2144,7 @@ impl Database {
                     pager.end_read_tx();
                     pager.set_auto_vacuum_mode(mode);
 
-                    let InitState::ReadPage1 { pager } = std::mem::take(st) else {
+                    let InitState::ReadPage1 { pager, .. } = std::mem::take(st) else {
                         unreachable!("state is ReadPage1");
                     };
                     return Ok(IOResult::Done(*pager));
@@ -2743,7 +2766,6 @@ impl Database {
         pager: Option<Arc<Pager>>,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
-        let role = self.resolve_session_role(&opts.role)?;
         let ConnectOpts {
             encryption_key,
             page_codec,
@@ -2769,12 +2791,16 @@ impl Database {
             // before reading page 1. This is required for reopening encrypted databases.
             Arc::new(self._init(encryption_key.as_ref(), page_codec.clone())?)
         };
+        turso_assert!(
+            pager.is_authenticated(),
+            "connection initialization must authenticate its pager"
+        );
         let default_cache_size = pager
             .io
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
-
+        let role = self.resolve_session_role(&opts.role)?;
         let conn = self.new_connection(
             role,
             is_mvcc_bootstrap_connection,
@@ -2837,6 +2863,16 @@ impl Database {
         default_cache_size: i32,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
+        if !pager.shares_database_state(&self.pager_state) {
+            return Err(LimboError::InvalidArgument(
+                "connection pager belongs to another database".into(),
+            ));
+        }
+        if !pager.is_authenticated() {
+            return Err(LimboError::InvalidArgument(
+                "connection pager has not completed authentication".into(),
+            ));
+        }
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),

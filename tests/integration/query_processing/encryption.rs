@@ -140,18 +140,15 @@ fn run_corruption_associated_data_bytes_test(
             test_db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(
-            &uri,
-            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
-            Arc::new(SqliteDialect),
-        )
-        .expect("opening the corrupted DB should not fail at the URI level");
-
-        let result = run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-
-        assert_that!(result)
-            .described_as(format!("accessing an encrypted database with corrupted associated data at position {corrupt_pos}"))
-            .is_err();
+        assert!(
+            turso_core::Connection::from_uri(
+                &uri,
+                DatabaseOpts::new().with_encryption(true),
+                Arc::new(SqliteDialect)
+            )
+            .is_err(),
+            "corrupted associated data at {corrupt_pos}"
+        );
     }
 
     Ok(())
@@ -249,11 +246,12 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-        assert_that!(result)
-            .described_as("accessing an encrypted database with the wrong key")
-            .is_err();
+        assert!(matches!(
+            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
     }
     {
         // test connecting to encrypted db using insufficient encryption parameters in URI.
@@ -277,11 +275,10 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
     {
         // test connecting to encrypted db without using URI.
-        let conn = tmp_db.connect_limbo();
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-        assert_that!(result)
-            .described_as("accessing an encrypted database without using the URI")
-            .is_err();
+        assert!(tmp_db
+            .db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .is_err());
     }
 
     Ok(())
@@ -407,14 +404,12 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
             db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-
-        assert_that!(result)
-            .described_as("accessing an encrypted database with corrupted Turso magic bytes")
-            .err()
-            .display_string()
-            .contains("Decryption failed");
+        assert!(matches!(
+            turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
     }
 
     Ok(())
