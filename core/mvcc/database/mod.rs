@@ -9188,29 +9188,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.storage.logical_log_offset()
     }
 
-    pub(crate) fn sync_logical_log(&self, sync_type: FileSyncType) -> Result<Completion> {
-        self.storage.sync(sync_type)
-    }
-
     /// Replace the logical log with a fresh valid header after the database
     /// file was restored outside MVCC.
     ///
     /// The returned completion must finish before reopening/recovering MVCC
     /// state. Otherwise recovery could replay stale local logical-log frames on
-    /// top of the restored database image.
+    /// top of the restored database image. To make the reset durable, call
+    /// `sync_logical_log` after the completion finishes.
     pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
         self.storage.reset_to_fresh_header()
     }
 
-    /// Return the durable sync completion for the freshly reset logical log.
-    ///
-    /// This is separate from `reset_logical_log_after_external_restore` so
-    /// callers can drive the reset completion cooperatively, then issue the
-    /// ordered sync only after the header/truncate group has completed.
-    pub fn sync_logical_log_after_external_restore(
-        &self,
-        connection: &Arc<Connection>,
-    ) -> Result<Option<Completion>> {
+    /// Fsync the logical log and return the completion. When `synchronous` is OFF on
+    /// `connection`, do nothing and return `None`.
+    pub fn sync_logical_log(&self, connection: &Arc<Connection>) -> Result<Option<Completion>> {
         if connection.get_sync_mode() != SyncMode::Off {
             let pager = connection.pager.load().clone();
             return Ok(Some(self.storage.sync(pager.get_sync_type())?));

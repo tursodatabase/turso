@@ -78,7 +78,7 @@ use crate::{
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
     Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, SyncMode, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -18802,15 +18802,13 @@ fn op_journal_mode_inner(
             OpJournalModeSubState::SyncLogicalLog => {
                 state.active_op_state.journal_mode().sub_state =
                     OpJournalModeSubState::UpdateHeader;
-                if program.connection.get_sync_mode() == SyncMode::Off {
-                    continue;
-                }
                 let mv_store = program
                     .connection
                     .mv_store_for_db(*db)
                     .expect("the MVCC checkpoint ran, so the database has an MV store");
-                let completion = mv_store.sync_logical_log(pager.get_sync_type())?;
-                return Ok(state.suspend_on_io(IOCompletions(completion)));
+                if let Some(completion) = mv_store.sync_logical_log(&program.connection)? {
+                    return Ok(state.suspend_on_io(IOCompletions(completion)));
+                }
             }
 
             OpJournalModeSubState::UpdateHeader => {
