@@ -2130,14 +2130,14 @@ fn materialized_subquery_ephemeral_index(
 ) -> Result<Arc<Index>> {
     let mut index_columns: crate::alloc::Vec<IndexColumn> =
         crate::alloc::Vec::try_with_capacity_ext(subquery.columns.len())?;
-    let mut seen_col_positions = std::collections::HashSet::new();
+    let mut is_key_column = vec![false; subquery.columns.len()];
 
     for &col_pos in key_col_positions {
         let column = subquery
             .columns
             .get(col_pos)
             .expect("key column position out of bounds for materialized subquery");
-        if !seen_col_positions.insert(col_pos) {
+        if std::mem::replace(&mut is_key_column[col_pos], true) {
             continue;
         }
         index_columns
@@ -2155,7 +2155,7 @@ fn materialized_subquery_ephemeral_index(
     }
 
     for (col_pos, column) in subquery.columns.iter().enumerate() {
-        if seen_col_positions.contains(&col_pos) {
+        if is_key_column[col_pos] {
             continue;
         }
         index_columns
