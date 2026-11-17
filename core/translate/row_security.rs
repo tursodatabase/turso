@@ -8,7 +8,7 @@
 //!
 //! Which tables have row-level security, and their policies, are the
 //! dialect's schema state, like the owner of a table. The module compiles the
-//! statements that change them into a [`CatalogChange`] for the dialect to
+//! statements that change them into an [`AccessStatement`] for the dialect to
 //! record.
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::CatalogChange,
+    dialect::AccessStatement,
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
@@ -591,10 +591,10 @@ pub(crate) fn translate_set_row_security(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let (namespace, table) = row_security_table(qualified_name, resolver)?;
-    translate_change(
-        CatalogChange::SetRowSecurity {
+    translate_access_statement(
+        &AccessStatement::SetRowSecurity {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
+            name: &normalize_ident(&table.declared_name),
             enabled,
         },
         resolver,
@@ -641,11 +641,11 @@ pub(crate) fn translate_create_policy(
     {
         prepare_policy_expr(expr, namespace, &table, resolver)?;
     }
-    translate_change(
-        CatalogChange::CreatePolicy {
+    translate_access_statement(
+        &AccessStatement::CreatePolicy {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            policy: Box::new(stored),
+            name: &normalize_ident(&table.declared_name),
+            policy: &stored,
         },
         resolver,
         program,
@@ -676,11 +676,11 @@ pub(crate) fn translate_drop_policy(
         return Ok(());
     }
     let (namespace, table) = row_security_table(tbl_name, resolver)?;
-    translate_change(
-        CatalogChange::DropPolicy {
+    translate_access_statement(
+        &AccessStatement::DropPolicy {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            policy_name: policy_name.as_str().to_string(),
+            name: &normalize_ident(&table.declared_name),
+            policy_name: policy_name.as_str(),
             if_exists,
         },
         resolver,
@@ -760,10 +760,10 @@ fn row_security_table(
     }
 }
 
-/// Records `change` through the dialect, in a write transaction that bumps
-/// the schema cookie so that other connections load it.
-pub(crate) fn translate_change(
-    change: CatalogChange,
+/// Has the dialect translate `statement`, in a write transaction that bumps
+/// the schema cookie so that other connections load what it stored.
+pub(crate) fn translate_access_statement(
+    statement: &AccessStatement<'_>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -773,7 +773,7 @@ pub(crate) fn translate_change(
     resolver
         .catalog
         .dialect
-        .translate_catalog_changes(program, schema, connection, &[change])?;
+        .translate_access_statement(program, schema, connection, statement)?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }
