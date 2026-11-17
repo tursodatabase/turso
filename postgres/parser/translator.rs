@@ -2757,33 +2757,47 @@ impl PostgreSQLTranslator {
             .first()
             .ok_or_else(|| ParseError::ParseError("RangeFunction has no functions".into()))?;
 
-        let func_call = match &func_item.node {
+        let (func_call, rows_from_column_definitions) = match &func_item.node {
             Some(pg_query::protobuf::node::Node::List(list)) => {
-                // The first element of the list is the FuncCall node
-                let first = list
-                    .items
-                    .first()
-                    .ok_or_else(|| ParseError::ParseError("RangeFunction list is empty".into()))?;
-                if list.items.get(1).is_some_and(|n| n.node.is_some()) {
-                    return Err(ParseError::not_supported(
-                        "a column definition list inside ROWS FROM",
+                let Some(pg_query::protobuf::node::Node::FuncCall(func_call)) =
+                    list.items.first().and_then(|item| item.node.as_ref())
+                else {
+                    return Err(ParseError::ParseError(
+                        "RangeFunction list item is not a FuncCall".into(),
                     ));
-                }
-                match &first.node {
-                    Some(pg_query::protobuf::node::Node::FuncCall(fc)) => fc,
-                    _ => {
+                };
+                let column_definitions = match list.items.get(1).and_then(|item| item.node.as_ref())
+                {
+                    None => &[][..],
+                    Some(pg_query::protobuf::node::Node::List(definitions)) => {
+                        definitions.items.as_slice()
+                    }
+                    Some(_) => {
                         return Err(ParseError::ParseError(
-                            "RangeFunction list item is not a FuncCall".into(),
+                            "invalid column definition list inside ROWS FROM".into(),
                         ));
                     }
-                }
+                };
+                (func_call, column_definitions)
             }
-            Some(pg_query::protobuf::node::Node::FuncCall(fc)) => fc,
+            Some(pg_query::protobuf::node::Node::FuncCall(func_call)) => (func_call, &[][..]),
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "Unsupported RangeFunction item: {:?}",
                     func_item.node
                 )));
+            }
+        };
+        let column_definitions = match (
+            rows_from_column_definitions,
+            range_func.coldeflist.as_slice(),
+        ) {
+            (in_rows_from, []) => in_rows_from,
+            ([], after_alias) => after_alias,
+            _ => {
+                return Err(ParseError::not_supported(
+                    "a column definition list both inside and after ROWS FROM",
+                ));
             }
         };
 
@@ -2800,6 +2814,16 @@ impl PostgreSQLTranslator {
             return Err(ParseError::not_supported(
                 "VARIADIC, *, DISTINCT, ORDER BY, FILTER or OVER on a function in FROM",
             ));
+        }
+
+        let returns_record = matches!(
+            func_name,
+            "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
+        );
+        if !returns_record && !column_definitions.is_empty() {
+            return Err(ParseError::not_supported(format!(
+                "a column definition list on {func_name}()"
+            )));
         }
 
         // Translate arguments
@@ -2912,16 +2936,14 @@ impl PostgreSQLTranslator {
                 lateral: true,
             });
         }
-        if matches!(
-            func_name,
-            "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
-        ) {
-            return self.translate_json_to_record(func_name, range_func, &args, alias);
-        }
-        if !range_func.coldeflist.is_empty() {
-            return Err(ParseError::not_supported(format!(
-                "a column definition list on {func_name}()"
-            )));
+        if returns_record {
+            return self.translate_json_to_record(
+                func_name,
+                range_func,
+                column_definitions,
+                &args,
+                alias,
+            );
         }
         if func_name == "generate_series" {
             let value_name = range_func
@@ -2962,35 +2984,47 @@ impl PostgreSQLTranslator {
         &self,
         func_name: &str,
         range_func: &pg_query::protobuf::RangeFunction,
+        column_definitions: &[pg_query::protobuf::Node],
         args: &[Box<ast::Expr>],
         alias: Option<ast::As>,
     ) -> Result<ast::SelectTable, ParseError> {
-        if range_func.ordinality || range_func.functions.len() != 1 {
-            return Err(ParseError::ParseError(format!(
-                "{func_name} does not support WITH ORDINALITY or ROWS FROM"
-            )));
-        }
+        reject_ordinality(range_func, func_name)?;
         let [arg] = args else {
             return Err(ParseError::ParseError(format!(
                 "{func_name} requires exactly one argument"
             )));
         };
-        if range_func.coldeflist.is_empty() {
+        if column_definitions.is_empty() {
             return Err(ParseError::ParseError(
                 "a column definition list is required for functions returning \"record\"".into(),
             ));
         }
-        if range_func.coldeflist.iter().any(|col| {
-            matches!(
-                &col.node,
-                Some(pg_query::protobuf::node::Node::ColumnDef(def))
-                    if def.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty())
-            )
+        let column_definitions = column_definitions
+            .iter()
+            .map(|node| match &node.node {
+                Some(pg_query::protobuf::node::Node::ColumnDef(definition)) => Ok(definition),
+                _ => Err(ParseError::ParseError(
+                    "invalid column definition list".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?;
+        if column_definitions.iter().any(|definition| {
+            definition
+                .type_name
+                .as_ref()
+                .is_some_and(|t| !t.typmods.is_empty())
         }) {
             return Err(ParseError::not_supported(
                 "a type modifier in a column definition list",
             ));
         }
+        let names = range_function_column_names(
+            range_func,
+            column_definitions
+                .iter()
+                .map(|definition| definition.colname.clone())
+                .collect(),
+        )?;
         let is_recordset = func_name.ends_with("recordset");
         let (arg_type, other_type_errors, scalar_error) = match func_name {
             "json_to_recordset" => (
@@ -3076,15 +3110,10 @@ impl PostgreSQLTranslator {
         } else {
             (arg_json, vec![])
         };
-        let columns = range_func
-            .coldeflist
+        let columns = column_definitions
             .iter()
-            .map(|node| {
-                let Some(pg_query::protobuf::node::Node::ColumnDef(col_def)) = &node.node else {
-                    return Err(ParseError::ParseError(
-                        "invalid column definition list".into(),
-                    ));
-                };
+            .zip(names)
+            .map(|(col_def, name)| {
                 let type_name = col_def.type_name.as_ref().ok_or_else(|| {
                     ParseError::ParseError(format!("column {} missing type", col_def.colname))
                 })?;
@@ -3135,7 +3164,7 @@ impl PostgreSQLTranslator {
                 };
                 Ok(ast::ResultColumn::Expr(
                     Box::new(cast),
-                    Some(ast::As::Elided(exact_name(col_def.colname.clone()))),
+                    Some(ast::As::Elided(exact_name(name))),
                 ))
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
@@ -13551,8 +13580,13 @@ mod tests {
         assert_translates("SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(x, o)");
         assert_not_supported(
             "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
-            "inside ROWS FROM",
+            "column definition list on f()",
         );
+        assert_not_supported(
+            "SELECT * FROM unnest(ARRAY[1]) AS u(a int)",
+            "column definition list on unnest()",
+        );
+        assert_translates("SELECT * FROM ROWS FROM (json_to_record('{}') AS (a int)) AS r(x)");
         assert_not_supported(
             "SELECT * FROM f() AS t(a int, b text)",
             "column definition list on f()",
