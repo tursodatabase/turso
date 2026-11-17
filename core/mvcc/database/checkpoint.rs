@@ -320,7 +320,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
     /// Tables or indexes that were created in this checkpoint
     /// key is the rowid in the sqlite_schema table
-    created_btrees: HashMap<i64, (MVTableId, RowVersion)>,
+    created_btrees: HashMap<i64, CreatedBtree>,
     /// Tables that were destroyed in this checkpoint
     destroyed_tables: HashSet<MVTableId>,
     /// Indexes that were destroyed in this checkpoint
@@ -508,6 +508,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
             checkpoint_yield_key(),
         )
     }
+}
+
+/// A table or index whose B-tree this checkpoint created.
+struct CreatedBtree {
+    table_id: MVTableId,
+    root_page: u64,
+    /// The `sqlite_schema` row of the table or index, with `root_page` as its rootpage.
+    sqlite_schema_row: RowVersion,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -1945,7 +1953,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
         // Patch sqlite_schema rows in the MV store to use positive rootpages for the btrees
         // flushed to the physical database.
-        for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
+        for (sqlite_schema_rowid, created_btree) in self.created_btrees.drain() {
+            let CreatedBtree {
+                root_page,
+                sqlite_schema_row: row_version,
+                ..
+            } = created_btree;
             let key = RowID {
                 table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
                 row_id: RowKey::Int(sqlite_schema_rowid),
@@ -1968,13 +1981,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
                 existing.data = row_version.data;
                 if existing.end().is_some() {
-                    if let Some(identity) =
-                        sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, existing)
-                    {
-                        if identity.root_page > 0 {
-                            self.ended_created_roots.insert(identity.root_page);
-                        }
-                    }
+                    self.ended_created_roots.insert(root_page as i64);
                 }
             } else {
                 self.mvstore
@@ -2834,8 +2841,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         ));
                         row_version.clone()
                     };
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (table_id, row_version));
+                    self.created_btrees.insert(
+                        sqlite_schema_rowid,
+                        CreatedBtree {
+                            table_id,
+                            root_page,
+                            sqlite_schema_row: row_version,
+                        },
+                    );
                 } else if let Some(SpecialWrite::BTreeCreateIndex {
                     index_id,
                     sqlite_schema_rowid,
@@ -2868,8 +2881,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         row_version.clone()
                     };
 
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (index_id, row_version));
+                    self.created_btrees.insert(
+                        sqlite_schema_rowid,
+                        CreatedBtree {
+                            table_id: index_id,
+                            root_page,
+                            sqlite_schema_row: row_version,
+                        },
+                    );
                 }
 
                 // Get or create cursor for this table
@@ -2897,7 +2916,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     if self
                         .created_btrees
                         .values()
-                        .any(|(table_id, _)| *table_id == row_id.table_id)
+                        .any(|created| created.table_id == row_id.table_id)
                     {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
@@ -3044,7 +3063,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     if self
                         .created_btrees
                         .values()
-                        .any(|(table_id, _)| *table_id == row_id.table_id)
+                        .any(|created| created.table_id == row_id.table_id)
                     {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
