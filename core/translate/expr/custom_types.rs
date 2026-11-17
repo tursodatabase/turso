@@ -773,15 +773,19 @@ fn emit_coerce(
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
-    // A parameter without an argument, as scale in numeric(10), is NULL.
-    let null = ast::Expr::Literal(ast::Literal::Null);
+    // CREATE TABLE and CAST refuse other counts (see TypeDef::type_args).
+    let param_count = type_def.user_params().count();
+    if type_params.len() != param_count {
+        return Err(LimboError::InternalError(format!(
+            "type \"{}\" takes {param_count} argument(s), got {}",
+            type_def.name,
+            type_params.len()
+        )));
+    }
     let bindings: Vec<(&str, &ast::Expr)> = type_def
         .user_params()
-        .enumerate()
-        .map(|(i, param)| {
-            let arg = type_params.get(i).map_or(&null, |arg| arg.as_ref());
-            (param.name.as_str(), arg)
-        })
+        .zip(type_params)
+        .map(|(param, arg)| (param.name.as_str(), arg.as_ref()))
         .collect();
     let skip_null = program.allocate_label();
     program.emit_insn(Insn::IsNull {

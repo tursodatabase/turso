@@ -673,6 +673,35 @@ mod tests {
             .contains("expected an array, but the value is not an array");
     }
 
+    /// CREATE TABLE refuses varchar(2,3), but a database may already have such
+    /// a column. Writing to it must fail, not apply varchar(2).
+    #[test]
+    fn test_write_to_column_with_too_many_type_arguments_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("varchar_with_two_arguments.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(v text) STRICT").unwrap();
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(v varchar(2,3)) STRICT' \
+                 WHERE name = 't'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        assert_that!(conn.execute("INSERT INTO t VALUES ('ab')"))
+            .err()
+            .display_string()
+            .contains("type \"varchar\" takes 1 argument(s), got 2");
+    }
+
     /// After reopening, schema changes (CREATE TABLE) that use a previously
     /// defined custom type must still work. The type must survive the schema
     /// change and new tables must encode/decode correctly.
