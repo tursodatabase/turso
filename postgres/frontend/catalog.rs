@@ -4383,7 +4383,10 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
+                return Some(format!(
+                    "CHECK ({})",
+                    check_condition_text(&chk.expr, btree)
+                ));
             }
             constraint_oid += 1;
         }
