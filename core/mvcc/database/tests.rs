@@ -42,6 +42,10 @@ impl FixedYieldInjector {
             remaining: Mutex::new(points.into_iter().collect()),
         })
     }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.lock().is_empty()
+    }
 }
 
 impl YieldInjector for FixedYieldInjector {
@@ -4156,4 +4160,1123 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+/// Counts the B-tree steps MVCC cursors take to seek and to advance, and never yields.
+#[derive(Debug, Default)]
+struct SeekBtreeSteps(AtomicU64);
+
+impl YieldInjector for SeekBtreeSteps {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CursorYieldPoint::SeekBtreeProgress.point()
+            || point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
+            || point == CursorYieldPoint::AdvanceBtreeBackwardProgress.point()
+        {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+}
+
+#[test]
+fn test_exact_index_seek_can_continue_past_shadowed_target() {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .expect("test table must be created");
+    conn.execute("CREATE INDEX t_v ON t(v)")
+        .expect("test index must be created");
+    conn.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .expect("test rows must be inserted");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("test rows must be checkpointed");
+    conn.execute("BEGIN IMMEDIATE")
+        .expect("test transaction must begin");
+    conn.execute("UPDATE t SET v=v WHERE id=2")
+        .expect("middle index entry must be replaced in MVCC");
+    let record = ImmutableRecord::from_values(&[Value::from_i64(20), Value::from_i64(2)], 2)
+        .expect("index probe must encode");
+    for op in [SeekOp::GE { eq_only: true }, SeekOp::LE { eq_only: true }] {
+        let mut cursor = test_index_cursor(&conn, "t_v");
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .expect("exact index seek must succeed");
+        assert!(matches!(result, SeekResult::Found));
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            Some(2)
+        );
+        let expected = if matches!(op, SeekOp::GE { .. }) {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance");
+            3
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat");
+            1
+        };
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            Some(expected),
+            "exact seek must preserve continuation for {op:?}"
+        );
+    }
+    conn.execute("ROLLBACK")
+        .expect("test transaction must roll back");
+}
+
+#[test]
+fn test_exact_index_seek_can_continue_across_mvcc_and_btree_rows() {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .expect("test table must be created");
+    conn.execute("CREATE INDEX t_v ON t(v)")
+        .expect("test index must be created");
+    conn.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)")
+        .expect("test rows must be inserted");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("test rows must be checkpointed");
+    conn.execute("BEGIN IMMEDIATE")
+        .expect("test transaction must begin");
+    conn.execute("UPDATE t SET v=v WHERE id IN (2,3,5)")
+        .expect("index entries must be replaced in MVCC");
+    conn.execute("INSERT INTO t VALUES (7,45)")
+        .expect("MVCC-only index entry must be inserted");
+    for (id, op, expected) in [
+        (2, SeekOp::GE { eq_only: true }, vec![2, 3, 4, 7, 5, 6]),
+        (5, SeekOp::LE { eq_only: true }, vec![5, 7, 4, 3, 2, 1]),
+    ] {
+        let points = if matches!(op, SeekOp::GE { .. }) {
+            vec![
+                CursorYieldPoint::SeekStart,
+                CursorYieldPoint::SeekBtreeProgress,
+                CursorYieldPoint::NextStart,
+                CursorYieldPoint::NextBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeForwardProgress,
+            ]
+        } else {
+            vec![
+                CursorYieldPoint::SeekStart,
+                CursorYieldPoint::SeekBtreeProgress,
+                CursorYieldPoint::PrevBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeBackwardProgress,
+            ]
+        };
+        let yields = FixedYieldInjector::new(points.into_iter().map(|point| point.point()));
+        conn.set_yield_injector(Some(yields.clone()));
+        let record =
+            ImmutableRecord::from_values(&[Value::from_i64(id * 10), Value::from_i64(id)], 2)
+                .expect("index probe must encode");
+        let mut cursor = test_index_cursor(&conn, "t_v");
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .expect("exact index seek must succeed");
+        assert!(matches!(result, SeekResult::Found));
+        let mut actual = Vec::new();
+        while let Some(rowid) = conn
+            .db
+            .io
+            .block(|| cursor.rowid())
+            .expect("rowid must decode")
+        {
+            actual.push(rowid);
+            assert!(actual.len() <= 7, "cursor must not repeat rows");
+            if matches!(op, SeekOp::GE { .. }) {
+                conn.db
+                    .io
+                    .block(|| cursor.next())
+                    .expect("cursor must advance");
+            } else {
+                conn.db
+                    .io
+                    .block(|| cursor.prev())
+                    .expect("cursor must retreat");
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "cursor must merge both sources after {op:?}"
+        );
+        assert!(
+            yields.is_empty(),
+            "all cursor yield points must be exercised"
+        );
+        conn.set_yield_injector(None);
+    }
+    conn.execute("ROLLBACK")
+        .expect("test transaction must roll back");
+}
+
+#[rstest::rstest]
+#[case::nonunique_forward(false, false, false)]
+#[case::nonunique_backward(false, false, true)]
+#[case::unique_forward(true, false, false)]
+#[case::unique_backward(true, false, true)]
+#[case::unique_prefix_forward(true, true, false)]
+#[case::unique_prefix_backward(true, true, true)]
+fn test_exact_index_seek_on_mvcc_only_key_keeps_btree_rows(
+    #[case] unique: bool,
+    #[case] prefix_only: bool,
+    #[case] backwards: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .expect("test table must be created");
+    let unique_sql = if unique { "UNIQUE" } else { "" };
+    conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+        .expect("test index must be created");
+    conn.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .expect("B-tree rows must be inserted");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("initial rows must be checkpointed");
+    conn.execute("BEGIN IMMEDIATE")
+        .expect("test transaction must begin");
+    // These index keys are absent from the B-tree, between its existing keys.
+    conn.execute("INSERT INTO t VALUES (4,15),(5,25)")
+        .expect("MVCC-only rows must be inserted");
+
+    let (value, id, op, expected) = if backwards {
+        (25, 5, SeekOp::LE { eq_only: true }, vec![5, 2, 4, 1])
+    } else {
+        (15, 4, SeekOp::GE { eq_only: true }, vec![4, 2, 5, 3])
+    };
+    let values = [Value::from_i64(value), Value::from_i64(id)];
+    let columns = if prefix_only { 1 } else { values.len() };
+    let record =
+        ImmutableRecord::from_values(&values[..columns], columns).expect("index probe must encode");
+    let mut cursor = test_index_cursor(&conn, "t_v");
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+        .expect("exact index seek must succeed");
+    assert!(matches!(result, SeekResult::Found));
+
+    let mut actual = Vec::new();
+    while let Some(rowid) = conn
+        .db
+        .io
+        .block(|| cursor.rowid())
+        .expect("rowid must decode")
+    {
+        actual.push(rowid);
+        assert!(
+            actual.len() <= expected.len(),
+            "cursor must not repeat rows"
+        );
+        if backwards {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat");
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance");
+        }
+    }
+    drop(cursor);
+    conn.execute("ROLLBACK")
+        .expect("test transaction must roll back");
+    assert_eq!(
+        actual, expected,
+        "exact seek must preserve B-tree rows: unique={unique}, prefix_only={prefix_only}, op={op:?}"
+    );
+}
+
+#[rstest::rstest]
+#[case::table(false, false, false)]
+#[case::nonunique(true, false, false)]
+#[case::unique(true, true, false)]
+#[case::unique_prefix(true, true, true)]
+fn test_exact_seek_miss_can_move_in_opposite_direction(
+    #[case] index: bool,
+    #[case] unique: bool,
+    #[case] prefix_only: bool,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] empty_btree: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .expect("test table must be created");
+    if index {
+        let unique_sql = if unique { "UNIQUE" } else { "" };
+        conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+            .expect("test index must be created");
+    }
+    conn.execute("INSERT INTO t VALUES (10,10),(30,30),(50,50)")
+        .expect("B-tree rows must be inserted");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("initial rows must be checkpointed");
+    if empty_btree {
+        conn.execute("DELETE FROM t")
+            .expect("test rows must be deleted");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("deletions must be checkpointed");
+    }
+    conn.execute("BEGIN IMMEDIATE")
+        .expect("test transaction must begin");
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0][0]
+        .as_int()
+        .expect("test table must have a root page");
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let mut visible = std::collections::BTreeSet::new();
+    if !empty_btree {
+        visible.extend([10, 30, 50]);
+    }
+    for target in [5, 20, 60] {
+        let mut cursor = if index {
+            test_index_cursor(&conn, "t_v")
+        } else {
+            MvccLazyCursor::new(
+                db.get_mvcc_store(),
+                &conn,
+                conn.get_mv_tx_id()
+                    .expect("test transaction must be active"),
+                root,
+                MvccCursorType::Table,
+                Box::new(BTreeCursor::new(conn.pager.load().clone(), root, 2)),
+            )
+            .expect("MVCC table cursor must open")
+        };
+        let values = [Value::from_i64(target), Value::from_i64(target)];
+        let columns = if prefix_only { 1 } else { values.len() };
+        let record = ImmutableRecord::from_values(&values[..columns], columns)
+            .expect("index probe must encode");
+        let key = if index {
+            SeekKey::IndexKey(record.as_record_ref())
+        } else {
+            SeekKey::TableRowId(target)
+        };
+        let yields = FixedYieldInjector::new([
+            CursorYieldPoint::SeekStart.point(),
+            CursorYieldPoint::SeekBtreeProgress.point(),
+        ]);
+        conn.set_yield_injector(Some(yields.clone()));
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(key.clone(), op))
+            .expect("missing-key seek must succeed");
+        assert!(matches!(result, SeekResult::NotFound));
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            None
+        );
+        if backwards {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance after a failed seek");
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat after a failed seek");
+        }
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            None
+        );
+        assert!(yields.is_empty(), "seek must exercise its yield points");
+        conn.set_yield_injector(None);
+
+        let inserted =
+            ImmutableRecord::from_values(&values, values.len()).expect("inserted row must encode");
+        let insert_key = if index {
+            BTreeKey::IndexKey(inserted.as_record_ref())
+        } else {
+            BTreeKey::TableRowId((target, Some(&inserted)))
+        };
+        conn.db
+            .io
+            .block(|| cursor.insert(&insert_key))
+            .expect("cursor must insert after a failed seek");
+        visible.insert(target);
+        let expected = if backwards {
+            visible.iter().rev().copied().find(|id| *id < target)
+        } else {
+            visible.iter().copied().find(|id| *id > target)
+        };
+        if backwards {
+            conn.db
+                .io
+                .block(|| cursor.prev())
+                .expect("cursor must retreat after insertion");
+        } else {
+            conn.db
+                .io
+                .block(|| cursor.next())
+                .expect("cursor must advance after insertion");
+        }
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            expected,
+            "insertion after a missed seek must preserve continuation"
+        );
+    }
+    conn.execute("ROLLBACK")
+        .expect("test transaction must roll back");
+}
+
+#[rstest::rstest]
+#[case::nonunique(false, false)]
+#[case::unique(false, true)]
+#[case::unique_prefix(true, true)]
+fn test_exact_index_seek_on_mvcc_only_keys_across_pages(
+    #[case] prefix_only: bool,
+    #[case] unique: bool,
+    #[values(false, true)] backwards: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1")
+        .expect("automatic checkpoints must be disabled");
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .expect("test table must be created");
+    let unique_sql = if unique { "UNIQUE" } else { "" };
+    conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+        .expect("test index must be created");
+    conn.execute(
+        "WITH RECURSIVE seq(x) AS (VALUES(2) UNION ALL SELECT x+2 FROM seq WHERE x<1200) \
+         INSERT INTO t SELECT x,x FROM seq",
+    )
+    .expect("B-tree rows must be inserted");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("B-tree rows must be checkpointed");
+    conn.execute("BEGIN IMMEDIATE")
+        .expect("test transaction must begin");
+    conn.execute("DELETE FROM t WHERE id%8=0")
+        .expect("some B-tree rows must be hidden");
+    conn.execute(
+        "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+2 FROM seq WHERE x<1201) \
+         INSERT INTO t SELECT x,x FROM seq",
+    )
+    .expect("MVCC-only rows must be inserted");
+
+    let visible: Vec<i64> = (1..=1201).filter(|id| id % 8 != 0).collect();
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let mut targets: Vec<_> = (1..=1201).step_by(2).collect();
+    if backwards {
+        targets.reverse();
+    }
+    for target in targets {
+        let values = [Value::from_i64(target), Value::from_i64(target)];
+        let columns = if prefix_only { 1 } else { values.len() };
+        let record = ImmutableRecord::from_values(&values[..columns], columns)
+            .expect("index probe must encode");
+        let mut cursor = test_index_cursor(&conn, "t_v");
+        let seek_yields = FixedYieldInjector::new([
+            CursorYieldPoint::SeekStart.point(),
+            CursorYieldPoint::SeekBtreeProgress.point(),
+        ]);
+        conn.set_yield_injector(Some(seek_yields.clone()));
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .expect("exact index seek must succeed");
+        assert!(matches!(result, SeekResult::Found));
+        assert_eq!(
+            conn.db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode"),
+            Some(target)
+        );
+        assert!(
+            seek_yields.is_empty(),
+            "seek must exercise its yield points"
+        );
+        conn.set_yield_injector(None);
+
+        let expected: Vec<_> = if backwards {
+            visible
+                .iter()
+                .rev()
+                .copied()
+                .filter(|id| *id < target)
+                .take(3)
+                .collect()
+        } else {
+            visible
+                .iter()
+                .copied()
+                .filter(|id| *id > target)
+                .take(3)
+                .collect()
+        };
+        let movement_yields =
+            FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+        conn.set_yield_injector(Some(movement_yields.clone()));
+        let mut actual = Vec::new();
+        for _ in 0..3 {
+            if backwards {
+                conn.db
+                    .io
+                    .block(|| cursor.prev())
+                    .expect("cursor must retreat");
+            } else {
+                conn.db
+                    .io
+                    .block(|| cursor.next())
+                    .expect("cursor must advance");
+            }
+            let Some(id) = conn
+                .db
+                .io
+                .block(|| cursor.rowid())
+                .expect("rowid must decode")
+            else {
+                break;
+            };
+            actual.push(id);
+        }
+        assert_eq!(actual, expected, "target={target}, backwards={backwards}");
+        assert!(
+            movement_yields.is_empty(),
+            "continuation must yield while preparing its B-tree candidate"
+        );
+        conn.set_yield_injector(None);
+    }
+    conn.execute("ROLLBACK")
+        .expect("test transaction must roll back");
+}
+
+fn test_index_cursor(conn: &Arc<Connection>, index_name: &str) -> crate::MvCursor {
+    let index = conn
+        .schema
+        .read()
+        .get_index(NamespaceId::ROOT, "t", index_name)
+        .expect("test index must exist")
+        .clone();
+    MvccLazyCursor::new(
+        conn.db
+            .get_mv_store()
+            .as_ref()
+            .expect("MVCC store must exist")
+            .clone(),
+        conn,
+        conn.get_mv_tx_id()
+            .expect("test transaction must be active"),
+        index.root_page,
+        MvccCursorType::Index(Arc::new(
+            IndexInfo::new_from_index(&index).expect("index metadata must load"),
+        )),
+        Box::new(
+            BTreeCursor::new_index(
+                conn.pager.load().clone(),
+                index.root_page,
+                &index,
+                index.columns.len(),
+            )
+            .expect("B-tree index cursor must open"),
+        ),
+    )
+    .expect("MVCC index cursor must open")
+}
+
+#[test]
+fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
+    use crate::types::{SeekKey, SeekOp};
+
+    for unique in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+            .expect("test table must be created");
+        let unique_sql = if unique { "UNIQUE" } else { "" };
+        conn.execute(format!(
+            "CREATE {unique_sql} INDEX t_k_v ON t(k COLLATE NOCASE DESC,v)"
+        ))
+        .expect("test index must be created");
+        conn.execute(
+            "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x < 600) \
+             INSERT INTO t SELECT x,CASE WHEN x<=300 THEN NULL ELSE 'A' END, \
+             CASE WHEN x<=300 THEN 0 ELSE x END FROM seq",
+        )
+        .expect("test rows must be inserted");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("test rows must be checkpointed");
+        conn.execute("BEGIN IMMEDIATE")
+            .expect("test transaction must begin");
+        conn.execute("DELETE FROM t WHERE id<=250 OR id BETWEEN 301 AND 550")
+            .expect("test rows must be deleted");
+        let index = conn
+            .schema
+            .read()
+            .get_index(NamespaceId::ROOT, "t", "t_k_v")
+            .expect("test index must exist")
+            .clone();
+        let steps = Arc::new(SeekBtreeSteps::default());
+        conn.set_yield_injector(Some(steps.clone()));
+        let probes = [
+            (
+                vec![Value::Null, Value::from_i64(0)],
+                Some((251, 300)),
+                false,
+            ),
+            (vec![Value::from_text("a")], Some((551, 600)), false),
+            (
+                vec![Value::from_text("a"), Value::from_i64(551)],
+                Some((551, 551)),
+                unique,
+            ),
+            (
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(1)],
+                None,
+                true,
+            ),
+            (
+                vec![
+                    Value::from_text("a"),
+                    Value::from_i64(301),
+                    Value::from_i64(301),
+                ],
+                None,
+                true,
+            ),
+            (
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(251)],
+                Some((251, 251)),
+                true,
+            ),
+        ];
+        for (values, expected, single_row) in probes {
+            let record = ImmutableRecord::from_values(&values, values.len())
+                .expect("index probe must encode");
+            for op in [SeekOp::GE { eq_only: true }, SeekOp::LE { eq_only: true }] {
+                let pager = conn.pager.load().clone();
+                let mut cursor = MvccLazyCursor::new(
+                    db.get_mvcc_store(),
+                    &conn,
+                    conn.get_mv_tx_id()
+                        .expect("test transaction must be active"),
+                    index.root_page,
+                    MvccCursorType::Index(Arc::new(
+                        IndexInfo::new_from_index(&index).expect("index metadata must load"),
+                    )),
+                    Box::new(
+                        BTreeCursor::new_index(pager, index.root_page, &index, index.columns.len())
+                            .expect("B-tree index cursor must open"),
+                    ),
+                )
+                .expect("MVCC index cursor must open");
+                steps.0.store(0, Ordering::Relaxed);
+                let result = conn
+                    .db
+                    .io
+                    .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+                    .expect("exact index seek must succeed");
+                let expected_id = expected.map(|(first, last)| {
+                    if matches!(op, SeekOp::GE { .. }) {
+                        first
+                    } else {
+                        last
+                    }
+                });
+                assert_eq!(
+                    matches!(result, SeekResult::Found),
+                    expected_id.is_some(),
+                    "unique={unique}, values={values:?}, op={op:?}"
+                );
+                if let Some(expected_id) = expected_id {
+                    assert_eq!(
+                        conn.db
+                            .io
+                            .block(|| cursor.rowid())
+                            .expect("index rowid must decode"),
+                        Some(expected_id)
+                    );
+                }
+                if single_row {
+                    let taken = steps.0.load(Ordering::Relaxed);
+                    assert!(
+                        taken <= 2,
+                        "unique={unique}, values={values:?}, op={op:?}: {taken} B-tree steps"
+                    );
+                }
+            }
+        }
+        conn.set_yield_injector(None);
+        conn.execute("ROLLBACK")
+            .expect("test transaction must roll back");
+    }
+}
+
+/// What this test checks: after `exists()` finds a row, stepping returns every row from that
+/// row on, in both directions, whether the row is in the B-tree or only in MVCC.
+#[rstest::rstest]
+#[case::btree_row_forward(10, false)]
+#[case::mvcc_row_forward(20, false)]
+#[case::btree_row_backward(50, true)]
+#[case::mvcc_row_backward(40, true)]
+fn test_cursor_steps_on_from_row_found_by_exists(
+    #[case] target: i64,
+    #[case] backwards: bool,
+    #[values(false, true)] yields: bool,
+    #[values(false, true)] already_positioned: bool,
+) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = mixed_rows_fixture(&db);
+    let mut cursor = mixed_rows_cursor(&conn, false);
+    let actual = with_cursor_yields(&conn, yields, || {
+        if already_positioned {
+            if backwards {
+                conn.db.io.block(|| cursor.last()).unwrap();
+            } else {
+                conn.db.io.block(|| cursor.rewind()).unwrap();
+            }
+        }
+        assert!(conn
+            .db
+            .io
+            .block(|| cursor.exists(&Value::from_i64(target)))
+            .unwrap());
+        rowids_from_current_row(&conn, &mut cursor, backwards)
+    });
+    let mut expected: Vec<i64> = [10, 20, 30, 40, 50]
+        .into_iter()
+        .filter(|id| {
+            if backwards {
+                *id <= target
+            } else {
+                *id >= target
+            }
+        })
+        .collect();
+    if backwards {
+        expected.reverse();
+    }
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(actual, expected);
+}
+
+/// What this test checks: after the cursor inserts a row at a key other than its current
+/// row, stepping forward continues from the inserted row.
+#[rstest::rstest]
+#[case::table(false)]
+#[case::index(true)]
+fn test_cursor_steps_on_from_row_it_inserted(
+    #[case] index: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = mixed_rows_fixture(&db);
+    let mut cursor = mixed_rows_cursor(&conn, index);
+    let record =
+        ImmutableRecord::from_values(&[Value::from_i64(10), Value::from_i64(10)], 2).unwrap();
+    let key = if index {
+        SeekKey::IndexKey(record.as_record_ref())
+    } else {
+        SeekKey::TableRowId(10)
+    };
+    let inserted =
+        ImmutableRecord::from_values(&[Value::from_i64(35), Value::from_i64(35)], 2).unwrap();
+    let inserted_key = if index {
+        BTreeKey::IndexKey(inserted.as_record_ref())
+    } else {
+        BTreeKey::TableRowId((35, Some(&inserted)))
+    };
+    let actual = with_cursor_yields(&conn, yields, || {
+        conn.db
+            .io
+            .block(|| cursor.seek(key.clone(), SeekOp::GE { eq_only: false }))
+            .unwrap();
+        conn.db.io.block(|| cursor.insert(&inserted_key)).unwrap();
+        rowids_from_current_row(&conn, &mut cursor, false)
+    });
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(actual, vec![35, 40, 50]);
+}
+
+/// What this test checks: a cursor that steps forward after a seek and then steps back
+/// returns the row it started on, after a range seek and after an exact-match seek.
+#[rstest::rstest]
+#[case::table_range(false, false)]
+#[case::index_range(true, false)]
+#[case::table_exact(false, true)]
+#[case::index_exact(true, true)]
+fn test_cursor_steps_back_after_stepping_forward(
+    #[case] index: bool,
+    #[case] exact: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = mixed_rows_fixture(&db);
+    let mut cursor = mixed_rows_cursor(&conn, index);
+    let record =
+        ImmutableRecord::from_values(&[Value::from_i64(30), Value::from_i64(30)], 2).unwrap();
+    let key = if index {
+        SeekKey::IndexKey(record.as_record_ref())
+    } else {
+        SeekKey::TableRowId(30)
+    };
+    let (next, previous) = with_cursor_yields(&conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(key.clone(), SeekOp::GE { eq_only: exact }))
+            .unwrap();
+        assert!(matches!(result, SeekResult::Found));
+        conn.db.io.block(|| cursor.next()).unwrap();
+        let next = conn.db.io.block(|| cursor.rowid()).unwrap();
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        let previous = conn.db.io.block(|| cursor.rowid()).unwrap();
+        (next, previous)
+    });
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!((next, previous), (Some(40), Some(30)));
+}
+
+/// What this test checks: an index cursor that steps back over a deleted B-tree row and then
+/// forward again returns the row after the one it stands on, not a row it already passed.
+#[rstest::rstest]
+fn test_index_cursor_steps_forward_after_stepping_back_past_deleted_row(
+    #[values(false, true)] yields: bool,
+) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = mixed_rows_fixture(&db);
+    conn.execute("DELETE FROM t WHERE id=30").unwrap();
+    let mut cursor = test_index_cursor(&conn, "t_v");
+    let id = with_cursor_yields(&conn, yields, || {
+        conn.db.io.block(|| cursor.rewind()).unwrap();
+        conn.db.io.block(|| cursor.next()).unwrap();
+        conn.db.io.block(|| cursor.next()).unwrap();
+        assert_eq!(conn.db.io.block(|| cursor.rowid()).unwrap(), Some(40));
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        conn.db.io.block(|| cursor.prev()).unwrap();
+        conn.db.io.block(|| cursor.next()).unwrap();
+        conn.db.io.block(|| cursor.rowid()).unwrap()
+    });
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(id, Some(20));
+}
+
+/// What this test checks: after an exact-match index seek, stepping past the matching rows
+/// returns the rows that follow, in both directions. The seek key is in the B-tree when
+/// `key_in_btree`, so the rows after it that are only in MVCC must not be skipped; otherwise
+/// the key is only in MVCC, so the B-tree rows after it must not be skipped.
+#[rstest::rstest]
+#[case::nonunique_forward(false, false, false)]
+#[case::nonunique_backward(false, false, true)]
+#[case::unique_forward(true, false, false)]
+#[case::unique_backward(true, false, true)]
+#[case::unique_prefix_forward(true, true, false)]
+#[case::unique_prefix_backward(true, true, true)]
+fn test_exact_index_seek_steps_past_matching_rows(
+    #[case] unique: bool,
+    #[case] prefix_only: bool,
+    #[case] backwards: bool,
+    #[values(false, true)] key_in_btree: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    let unique_sql = if unique { "UNIQUE" } else { "" };
+    conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    // These index keys are only in MVCC, between the B-tree's keys.
+    conn.execute("INSERT INTO t VALUES (4,15),(5,25)").unwrap();
+
+    // Index order by v: 10 (1), 15 (4), 20 (2), 25 (5), 30 (3).
+    let ((value, id), op, expected) = match (key_in_btree, backwards) {
+        (false, false) => ((15, 4), SeekOp::GE { eq_only: true }, vec![4, 2, 5, 3]),
+        (false, true) => ((25, 5), SeekOp::LE { eq_only: true }, vec![5, 2, 4, 1]),
+        (true, false) => ((20, 2), SeekOp::GE { eq_only: true }, vec![2, 5, 3]),
+        (true, true) => ((20, 2), SeekOp::LE { eq_only: true }, vec![2, 4, 1]),
+    };
+    let values = [Value::from_i64(value), Value::from_i64(id)];
+    let columns = if prefix_only { 1 } else { values.len() };
+    let record = ImmutableRecord::from_values(&values[..columns], columns).unwrap();
+    let mut cursor = test_index_cursor(&conn, "t_v");
+    let actual = with_cursor_yields(&conn, yields, || {
+        let result = conn
+            .db
+            .io
+            .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+            .unwrap();
+        assert!(matches!(result, SeekResult::Found));
+        rowids_from_current_row(&conn, &mut cursor, backwards)
+    });
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        actual, expected,
+        "unique={unique}, prefix_only={prefix_only}, key_in_btree={key_in_btree}, op={op:?}"
+    );
+}
+
+/// What this test checks: statements that step a cursor past the key of an exact-match seek,
+/// past a row it found with a direction change (allocating a new rowid), or through a range
+/// return the right rows when every cursor step yields once before it finishes.
+#[test]
+fn test_steps_past_seek_key_resume_after_yields() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 20), (4, 30)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (5, 20), (6, 25)")
+        .unwrap();
+    // A newer version shadows the B-tree's index entry (30, 4), right after key 25.
+    conn.execute("UPDATE t SET v = 31 WHERE id = 4").unwrap();
+
+    conn.set_yield_injector(Some(Arc::new(YieldAtEveryCursorPoint::default())));
+    let ids = |sql: &str| rows_through_yields(&conn, sql);
+    let expect = |values: &[i64]| -> Vec<Vec<Value>> {
+        values.iter().map(|v| vec![Value::from_i64(*v)]).collect()
+    };
+    assert_eq!(ids("SELECT id FROM t WHERE v = 20"), expect(&[2, 3, 5]));
+    assert_eq!(ids("SELECT id FROM t WHERE v = 25"), expect(&[6]));
+    assert_eq!(
+        ids("SELECT id FROM t WHERE v = 20 ORDER BY id DESC"),
+        expect(&[5, 3, 2])
+    );
+    assert_eq!(
+        ids("INSERT INTO t(v) VALUES (40) RETURNING id"),
+        expect(&[7])
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE v >= 20 ORDER BY v, id"),
+        expect(&[2, 3, 5, 6, 4, 7])
+    );
+    conn.set_yield_injector(None);
+}
+
+/// What this test checks: a DELETE that walks an index removes every row in its range,
+/// including checkpointed (B-tree) rows that come after keys that exist only in MVCC. The
+/// delete loop removes each index entry with an exact-match seek on the same cursor it walks
+/// with, then steps that cursor to the next entry.
+#[rstest::rstest]
+#[case::non_unique_mvcc_keys_first(false, &[(1, 10), (2, 20)], &[(3, 30), (4, 40), (5, 50)])]
+#[case::non_unique_mvcc_keys_between(false, &[(2, 20), (4, 40)], &[(1, 10), (3, 30), (5, 50)])]
+#[case::unique_mvcc_keys_first(true, &[(1, 10), (2, 20)], &[(3, 30), (4, 40), (5, 50)])]
+#[case::unique_mvcc_keys_between(true, &[(2, 20), (4, 40)], &[(1, 10), (3, 30), (5, 50)])]
+fn test_index_delete_reaches_btree_rows_after_mvcc_only_keys(
+    #[case] unique: bool,
+    #[case] mvcc_rows: &[(i64, i64)],
+    #[case] btree_rows: &[(i64, i64)],
+) {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    let unique_sql = if unique { "UNIQUE" } else { "" };
+    conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+        .unwrap();
+    let values = |rows: &[(i64, i64)]| {
+        rows.iter()
+            .map(|(id, v)| format!("({id},{v})"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    conn.execute(format!("INSERT INTO t VALUES {}", values(btree_rows)))
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute(format!("INSERT INTO t VALUES {}", values(mvcc_rows)))
+        .unwrap();
+
+    let plan = get_rows(&conn, "EXPLAIN DELETE FROM t WHERE v >= 0");
+    assert!(
+        plan.iter()
+            .any(|row| row.iter().any(|value| value.to_string() == "IdxDelete")),
+        "the DELETE must remove index entries with IdxDelete: {plan:?}"
+    );
+
+    conn.execute("DELETE FROM t WHERE v >= 0").unwrap();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t ORDER BY id"),
+        Vec::<Vec<Value>>::new(),
+        "the index-driven DELETE must remove every row in its range"
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT v FROM t WHERE v >= 0 ORDER BY v"),
+        Vec::<Vec<Value>>::new(),
+        "the index must not keep entries for deleted rows"
+    );
+}
+
+/// Table `t(id, v)` with an index on `v`: rows 10, 30 and 50 checkpointed to
+/// the B-tree, then rows 20 and 40 inserted in an open transaction, so they
+/// exist only in MVCC. Each row has `v = id`.
+fn mixed_rows_fixture(db: &MvccTestDbNoConn) -> Arc<Connection> {
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (10,10),(30,30),(50,50)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("INSERT INTO t VALUES (20,20),(40,40)")
+        .unwrap();
+    conn
+}
+
+fn mixed_rows_cursor(conn: &Arc<Connection>, index: bool) -> crate::MvCursor {
+    if index {
+        return test_index_cursor(conn, "t_v");
+    }
+    let root = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0][0]
+        .as_int()
+        .unwrap();
+    MvccLazyCursor::new(
+        conn.db.get_mv_store().as_ref().unwrap().clone(),
+        conn,
+        conn.get_mv_tx_id().unwrap(),
+        root,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(conn.pager.load().clone(), root, 2)),
+    )
+    .unwrap()
+}
+
+/// Rowids from the cursor's current row to the end, stepping in one direction.
+fn rowids_from_current_row(
+    conn: &Arc<Connection>,
+    cursor: &mut crate::MvCursor,
+    backwards: bool,
+) -> Vec<i64> {
+    let mut rowids = Vec::new();
+    while let Some(rowid) = conn.db.io.block(|| cursor.rowid()).unwrap() {
+        rowids.push(rowid);
+        assert!(rowids.len() <= 10, "the cursor repeats rows: {rowids:?}");
+        if backwards {
+            conn.db.io.block(|| cursor.prev()).unwrap();
+        } else {
+            conn.db.io.block(|| cursor.next()).unwrap();
+        }
+    }
+    rowids
+}
+
+/// Runs `steps`, with every cursor step yielding once before it finishes when
+/// `yields` is set.
+fn with_cursor_yields<T>(conn: &Arc<Connection>, yields: bool, steps: impl FnOnce() -> T) -> T {
+    if yields {
+        conn.set_yield_injector(Some(Arc::new(YieldAtEveryCursorPoint::default())));
+    }
+    let result = steps();
+    if yields {
+        conn.set_yield_injector(None);
+    }
+    result
+}
+
+fn rows_through_yields(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let io = conn.pager.load().io.clone();
+    let mut rows = Vec::new();
+    for _ in 0..1_000_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::Done => return rows,
+            crate::StepResult::Row => {
+                rows.push(stmt.row().unwrap().get_values().cloned().collect())
+            }
+            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected step result for {sql}: {other:?}"),
+        }
+    }
+    panic!("{sql} did not finish");
+}
+
+/// Yields at every cursor yield point, so each cursor step returns to the
+/// caller before it finishes and must resume from its saved state. A point
+/// that just yielded does not yield again on its next hit: a yield point only
+/// carries an ordinal and a count, so it can also match a hook of another
+/// family that runs again before doing any work when its operation resumes.
+#[derive(Debug, Default)]
+struct YieldAtEveryCursorPoint {
+    last_yield: Mutex<Option<YieldPoint>>,
+}
+
+impl YieldInjector for YieldAtEveryCursorPoint {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        let cursor_points = [
+            CursorYieldPoint::NextStart,
+            CursorYieldPoint::NextBtreeAdvance,
+            CursorYieldPoint::PrevBtreeAdvance,
+            CursorYieldPoint::SeekStart,
+            CursorYieldPoint::SeekBtreeProgress,
+            CursorYieldPoint::AdvanceBtreeForwardProgress,
+            CursorYieldPoint::AdvanceBtreeBackwardProgress,
+        ];
+        if !cursor_points.iter().any(|p| p.point() == point) {
+            return false;
+        }
+        let mut last_yield = self.last_yield.lock();
+        if *last_yield == Some(point) {
+            *last_yield = None;
+            return false;
+        }
+        *last_yield = Some(point);
+        true
+    }
 }
