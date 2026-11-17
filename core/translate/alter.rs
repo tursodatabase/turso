@@ -1,5 +1,5 @@
 use crate::alloc::TursoIteratorExt;
-use crate::dialect::{CatalogChange, NewOwner};
+use crate::dialect::{AccessStatement, NewOwner, RelationChange};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
@@ -1773,26 +1773,30 @@ pub fn translate_alter_table(
             if schema::dialect_relation_hooks_apply(connection, database_id)? {
                 // Automatic indexes are renamed with the table, because
                 // their names embed it.
-                let mut changes = vec![CatalogChange::Rename {
+                let renamed_indexes: Vec<(&str, String)> = table_indexes
+                    .iter()
+                    .filter_map(|index| {
+                        let new_name = renamed_automatic_index_name(
+                            &index.name,
+                            &mangled_table_name,
+                            &mangled_new_name,
+                        )?;
+                        Some((index.name.as_str(), new_name))
+                    })
+                    .collect();
+                let mut changes = vec![RelationChange::Renamed {
                     namespace: namespace.id,
-                    old_name: normalized_old_name,
-                    new_name: normalized_new_name,
+                    old_name: &normalized_old_name,
+                    new_name: &normalized_new_name,
                 }];
-                for index in &table_indexes {
-                    let Some(new_name) = renamed_automatic_index_name(
-                        &index.name,
-                        &mangled_table_name,
-                        &mangled_new_name,
-                    ) else {
-                        continue;
-                    };
-                    changes.push(CatalogChange::Rename {
+                for (old_name, new_name) in &renamed_indexes {
+                    changes.push(RelationChange::Renamed {
                         namespace: namespace.id,
-                        old_name: index.name.clone(),
+                        old_name,
                         new_name,
                     });
                 }
-                resolver.catalog.dialect.translate_catalog_changes(
+                resolver.catalog.dialect.translate_relation_changes(
                     program,
                     resolver.schema(),
                     connection,
@@ -2521,15 +2525,15 @@ pub fn translate_alter_table(
             if col_name != old_column_name
                 && schema::dialect_relation_hooks_apply(connection, database_id)?
             {
-                resolver.catalog.dialect.translate_catalog_changes(
+                resolver.catalog.dialect.translate_relation_changes(
                     program,
                     resolver.schema(),
                     connection,
-                    &[CatalogChange::RenameColumn {
+                    &[RelationChange::ColumnRenamed {
                         namespace: namespace.id,
-                        table: normalize_ident(table_name),
-                        old_name: old_column_name.to_string(),
-                        new_name: col_name.to_string(),
+                        table: &normalize_ident(table_name),
+                        old_name: old_column_name,
+                        new_name: col_name,
                     }],
                 )?;
             }
@@ -2600,19 +2604,20 @@ fn translate_alter_owner(
     }
     // The dialect decides what goes with the relation, such as a table's
     // indexes, and whose an index's owner is.
-    let changes = [CatalogChange::ChangeOwner {
+    let owner = NewOwner::Role(role.clone());
+    let statement = AccessStatement::ChangeOwner {
         namespace: namespace.id,
-        name: normalized_name,
-        owner: NewOwner::Role(role.clone()),
-    }];
+        name: &normalized_name,
+        owner: &owner,
+    };
 
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
+    resolver.catalog.dialect.translate_access_statement(
         program,
         resolver.schema(),
         connection,
-        &changes,
+        &statement,
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
