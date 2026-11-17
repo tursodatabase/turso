@@ -348,13 +348,16 @@ impl ExtendedQueryHandler for TursoPgHandler {
     {
         let conn = &self.conn;
         let query = &portal.statement.statement;
+        let parsed = parse_statement(query)?;
+        if turso_pg_parser::is_empty_query(&parsed) {
+            return Ok(Response::EmptyQuery);
+        }
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
-        let parsed = parse_statement(query)?;
         if stmt.result_kind() != StatementResultKind::Rows {
             return execute_non_query(&mut stmt, &parsed)
                 .map(|response| with_transaction_state(conn, response));
@@ -373,13 +376,15 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
-        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
-
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
+        if turso_pg_parser::is_empty_query(&parse_statement(&target.statement)?) {
+            return Ok(DescribeStatementResponse::new(param_types, vec![]));
+        }
+        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let fields = describe_fields(&stmt, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -394,6 +399,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
+        if turso_pg_parser::is_empty_query(&parse_statement(&portal.statement.statement)?) {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
@@ -1256,6 +1264,47 @@ mod tests {
         assert_eq!(
             turso_pg_client::parse_data_row(&rows[0].1).unwrap(),
             vec![Some("b-a".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_empty_extended_query_gets_empty_query_response() {
+        // The messages PostgreSQL 17 sends. An empty query is no error, so
+        // the transaction block stays open.
+        let (mut client, conn) = copy_test_client();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        query_messages(&mut client, "BEGIN");
+        query_messages(&mut client, "INSERT INTO t VALUES (1)");
+        for sql in ["", " ", ";", "-- c"] {
+            client.send_parse("", sql, &[]).unwrap();
+            client.send_bind("", "", &[], &[], &[]).unwrap();
+            client.send_describe_portal("").unwrap();
+            client.send_execute("", 0).unwrap();
+            client.send_sync().unwrap();
+            let messages = read_until_ready(&mut client);
+            let tags: Vec<u8> = messages.iter().map(|m| m.0).collect();
+            assert_eq!(tags, b"12nIZ", "{sql:?}: {messages:?}");
+            assert_eq!(messages.last().unwrap().1, b"T", "{sql:?}: {messages:?}");
+        }
+        client.send_parse("", "", &[]).unwrap();
+        client.send_describe_statement("").unwrap();
+        client.send_sync().unwrap();
+        let messages = read_until_ready(&mut client);
+        assert_eq!(
+            messages,
+            vec![
+                (b'1', vec![]),
+                (b't', vec![0, 0]),
+                (b'n', vec![]),
+                (b'Z', b"T".to_vec())
+            ]
+        );
+        let messages = query_messages(&mut client, "COMMIT");
+        assert_eq!(messages[0], (b'C', b"COMMIT\0".to_vec()));
+        let messages = query_messages(&mut client, "SELECT count(*) FROM t");
+        assert_eq!(
+            turso_pg_client::parse_data_row(&messages[1].1).unwrap(),
+            vec![Some("1".to_owned())]
         );
     }
 

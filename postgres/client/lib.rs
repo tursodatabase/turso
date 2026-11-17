@@ -328,6 +328,13 @@ impl PgConn {
         self.write_message(b'D', &body)
     }
 
+    /// Sends a Describe message for a prepared statement.
+    pub fn send_describe_statement(&mut self, statement: &str) -> Result<()> {
+        let mut body = vec![b'S'];
+        push_cstring(&mut body, statement);
+        self.write_message(b'D', &body)
+    }
+
     /// Sends an Execute message; `max_rows` 0 means no limit.
     pub fn send_execute(&mut self, portal: &str, max_rows: i32) -> Result<()> {
         let mut body = Vec::new();

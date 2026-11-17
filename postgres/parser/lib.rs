@@ -104,6 +104,12 @@ fn is_reserved_role_name_error(message: &str) -> bool {
         || message.ends_with(" cannot be used as a role name here")
 }
 
+/// Whether `parsed` holds no statement, as for `""`, `";"` or a query that is
+/// only a comment. PostgreSQL answers such a query with EmptyQueryResponse.
+pub fn is_empty_query(parsed: &ParseResult) -> bool {
+    parsed.protobuf.stmts.is_empty()
+}
+
 /// Whether the first statement in `parsed` sends rows to the client.
 pub fn returns_rows(parsed: &ParseResult) -> bool {
     match first_statement(parsed) {
