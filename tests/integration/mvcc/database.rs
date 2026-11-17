@@ -12550,29 +12550,13 @@ fn test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames() {
     conn.execute("UPDATE t SET v = 'new' WHERE id = 1").unwrap();
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    let durable = io.durable_files();
-    let durable_log = &durable[&format!("{db_path}-log")];
+    let durable_log_len = io.durable_files()[&format!("{db_path}-log")].len();
     assert!(
-        durable_log.len() > LOG_HDR_SIZE,
+        durable_log_len > LOG_HDR_SIZE,
         "after a power loss, the logical log must still have the INSERT frame"
     );
 
-    let dir = tempfile::TempDir::new().unwrap();
-    let recovered_path = dir.path().join("recovered.db");
-    std::fs::write(&recovered_path, &durable[db_path]).unwrap();
-    std::fs::write(dir.path().join("recovered.db-log"), durable_log).unwrap();
-    if let Some(wal) = durable.get(&format!("{db_path}-wal")) {
-        std::fs::write(dir.path().join("recovered.db-wal"), wal).unwrap();
-    }
-    let recovered_db = Database::open_file(
-        Arc::new(PlatformIO::new().unwrap()),
-        recovered_path.to_str().unwrap(),
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let recovered = recovered_db
-        .connect(ConnectOpts::new(SessionRole::Superuser))
-        .unwrap();
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
     assert_eq!(
         get_rows(&recovered, "SELECT id, v FROM t"),
         vec![vec![
@@ -12610,34 +12594,13 @@ fn test_switch_from_mvcc_to_wal_survives_power_loss() {
     // This checkpoint fsyncs the database file, so the WAL-mode header becomes durable.
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    let durable = io.durable_files();
-    let durable_db = &durable[db_path];
     assert_eq!(
-        durable_db[18..20],
+        io.durable_files()[db_path][18..20],
         [2, 2],
         "the header on disk must say WAL"
     );
 
-    let dir = tempfile::TempDir::new().unwrap();
-    let recovered_path = dir.path().join("recovered.db");
-    std::fs::write(&recovered_path, durable_db).unwrap();
-    std::fs::write(
-        dir.path().join("recovered.db-log"),
-        &durable[&format!("{db_path}-log")],
-    )
-    .unwrap();
-    if let Some(wal) = durable.get(&format!("{db_path}-wal")) {
-        std::fs::write(dir.path().join("recovered.db-wal"), wal).unwrap();
-    }
-    let recovered_db = Database::open_file(
-        Arc::new(PlatformIO::new().unwrap()),
-        recovered_path.to_str().unwrap(),
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let recovered = recovered_db
-        .connect(ConnectOpts::new(SessionRole::Superuser))
-        .unwrap();
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
     assert_eq!(
         get_rows(&recovered, "SELECT id, v FROM t"),
         vec![vec![Value::from_i64(1), Value::from_text("a".to_string())]]

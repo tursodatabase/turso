@@ -25,6 +25,7 @@
 //!
 //! To reopen a database on a materialized post-crash image, write each
 //! file's bytes to disk and open with the regular platform IO.
+//! [`UnreliableIo::crash_now_and_recover`] does this for the strictest outcome.
 //!
 //! Other kinds of storage misbehavior tests need — injected write or fsync
 //! errors, reordered writeback — belong in this module too.
@@ -33,9 +34,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use turso_core::{
-    io::FileSyncType, Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags,
-    WallClockInstant, IO,
+    io::FileSyncType, Buffer, Clock, Completion, ConnectOpts, Connection, Database, File,
+    MonotonicInstant, OpenFlags, PlatformIO, SessionRole, WallClockInstant, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 /// A single not-yet-durable file mutation.
 enum UnsyncedOp {
@@ -169,6 +171,38 @@ impl UnreliableIo {
 
     pub fn take_crash_snapshot(&self) -> Option<CrashSnapshot> {
         self.state.snapshot.lock().unwrap().take()
+    }
+
+    /// Simulates a power loss at this exact moment (every unsynced write in every
+    /// file is lost) and recovers the surviving image with a fresh database.
+    /// The image has the database file, its WAL and its MVCC logical log.
+    /// Returns the tempdir alongside the connection to keep the files alive.
+    pub fn crash_now_and_recover(
+        &self,
+        db_path_sim: &str,
+    ) -> anyhow::Result<(tempfile::TempDir, Arc<Connection>)> {
+        let files = self.durable_files();
+        let dir = tempfile::TempDir::new()?;
+        let db_path = dir.path().join("recovered.db");
+        std::fs::write(
+            &db_path,
+            files
+                .get(db_path_sim)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )?;
+        for suffix in ["-wal", "-log"] {
+            if let Some(bytes) = files.get(&format!("{db_path_sim}{suffix}")) {
+                std::fs::write(dir.path().join(format!("recovered.db{suffix}")), bytes)?;
+            }
+        }
+        let recovered_db = Database::open_file(
+            Arc::new(PlatformIO::new()?),
+            db_path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )?;
+        let recovered = recovered_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        Ok((dir, recovered))
     }
 
     /// Simulate power loss right now: return, for each file, only the bytes
