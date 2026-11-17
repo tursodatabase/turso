@@ -10595,9 +10595,15 @@ pub fn op_function(
                     let row_namespace =
                         crate::namespace::demangle_name(supports_namespaces, &name).0;
 
-                    let new_name = if let Some(index_name) =
+                    // Only the renamed table's own automatic indexes embed its
+                    // name. Another table can share the prefix (`t` and `t_x`),
+                    // so its `sqlite_autoindex_t_x_1` must stay untouched.
+                    let renamed_autoindex = if normalize_ident(&tbl_name) == rename_from {
                         crate::util::renamed_automatic_index_name(&name, &rename_from, &rename_to)
-                    {
+                    } else {
+                        None
+                    };
+                    let new_name = if let Some(index_name) = renamed_autoindex {
                         index_name
                     } else if name == rename_from {
                         rename_to.clone()
