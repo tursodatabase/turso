@@ -244,6 +244,16 @@ impl<'a> TypeEnv<'a> {
         }
     }
 
+    /// What a time keyword computes, or None for SQLite's.
+    fn time_keyword_expr(&self, keyword: &ast::Literal) -> Result<Option<ast::Expr>> {
+        match self {
+            Self::Statement { resolver, .. } => resolver.catalog.dialect.time_keyword_expr(keyword),
+            // Index expressions refuse these keywords, and a custom type's
+            // DECODE can hold them only when the SQLite dialect wrote it.
+            Self::Table { .. } | Self::TypeBody { .. } => Ok(None),
+        }
+    }
+
     fn tables(&self) -> Option<&TableReferences> {
         match self {
             Self::Statement { tables, .. } => *tables,
@@ -295,6 +305,16 @@ impl<'a> TypeEnv<'a> {
 pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
     let expr = without_wrappers(expr);
     match expr {
+        ast::Expr::Literal(
+            keyword @ (ast::Literal::CurrentTimestamp
+            | ast::Literal::CurrentDate
+            | ast::Literal::CurrentTime),
+        ) => match env.time_keyword_expr(keyword) {
+            Ok(Some(computed)) => type_of(&computed, env),
+            Ok(None) => literal_type(keyword),
+            // The dialect refuses the keyword; code generation reports why.
+            Err(_) => ExprType::Unknown,
+        },
         ast::Expr::Literal(literal) => literal_type(literal),
         ast::Expr::Column { table, column, .. } => {
             column_reference_type(*table, *column, env).unwrap_or_else(|| affinity_type(expr, env))

@@ -860,7 +860,6 @@ expect error {
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
-    AND CURRENT_TIME IS NOT NULL
     AND CURRENT_TIMESTAMP IS NOT NULL;
 }
 expect {

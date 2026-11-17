@@ -373,6 +373,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// What a `CURRENT_TIMESTAMP`, `CURRENT_DATE` or `CURRENT_TIME` keyword
+    /// computes, or None for SQLite's `datetime('now')`, `date('now')` and
+    /// `time('now')`. The keyword stays in the AST so the schema shows it as
+    /// written; SQLite likewise compiles it into a call to a function by name.
+    fn time_keyword_expr(&self, _keyword: &ast::Literal) -> Result<Option<ast::Expr>> {
+        Ok(None)
+    }
+
     /// Whether `t.c` reads only the nearest query that has a table named `t`.
     ///
     /// SQLite keeps searching outer queries when that table has no column

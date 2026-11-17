@@ -221,6 +221,20 @@ fn translate_expr_by_kind(
         ast::Expr::Like { .. } => {
             translate_like_expr(program, referenced_tables, expr, target_register, resolver)
         }
+        ast::Expr::Literal(
+            keyword @ (ast::Literal::CurrentTimestamp
+            | ast::Literal::CurrentDate
+            | ast::Literal::CurrentTime),
+        ) => match resolver.catalog.dialect.time_keyword_expr(keyword)? {
+            Some(computed) => translate_expr(
+                program,
+                referenced_tables,
+                &computed,
+                target_register,
+                resolver,
+            ),
+            None => emit_literal(program, keyword, target_register),
+        },
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("ast::Expr::Name is not supported in this position")

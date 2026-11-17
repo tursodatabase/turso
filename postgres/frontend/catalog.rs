@@ -221,6 +221,41 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// `CURRENT_TIMESTAMP` is `now()`. Sessions are always in UTC, so
+    /// `CURRENT_DATE` is the date of `now()`. Turso has no `time with time
+    /// zone` for `CURRENT_TIME`, which only a schema SQLite wrote can hold.
+    fn time_keyword_expr(&self, keyword: &ast::Literal) -> Result<Option<ast::Expr>> {
+        let now = ast::Expr::FunctionCall {
+            name: ast::Name::exact("now".to_string()),
+            distinctness: None,
+            args: vec![],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        match keyword {
+            ast::Literal::CurrentTimestamp => Ok(Some(now)),
+            ast::Literal::CurrentDate => Ok(Some(ast::Expr::cast(
+                now,
+                Some(ast::Type {
+                    name: "date".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            ))),
+            ast::Literal::CurrentTime => Err(crate::error::sqlstate_error(
+                turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "CURRENT_TIME and LOCALTIME are not supported",
+            )),
+            other => Err(LimboError::InternalError(format!(
+                "{other:?} is not a time keyword"
+            ))),
+        }
+    }
+
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }

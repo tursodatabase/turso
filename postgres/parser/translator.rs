@@ -3625,34 +3625,33 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::SqlvalueFunction(svf)) => {
                 use pg_query::protobuf::SqlValueFunctionOp;
-                if matches!(
-                    SqlValueFunctionOp::try_from(svf.op),
-                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimeN
-                        | SqlValueFunctionOp::SvfopLocaltimestampN)
-                ) && svf.typmod != 0
-                {
-                    return Err(ParseError::not_supported(
-                        "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
-                    ));
-                }
                 match SqlValueFunctionOp::try_from(svf.op) {
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
                         Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
                     }
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestamp) => {
+                        Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp))
+                    }
+                    // `now()` has microseconds, so it can't round to a
+                    // precision, 0 included.
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestampN) => {
+                        Err(ParseError::not_supported(
+                            "a fractional-second precision on CURRENT_TIMESTAMP",
+                        ))
+                    }
+                    // Turso has no `time with time zone`, and the schema
+                    // can't store LOCALTIME or LOCALTIMESTAMP as written.
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
-                        | SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopLocaltime
-                        | SqlValueFunctionOp::SvfopLocaltimeN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
+                        | SqlValueFunctionOp::SvfopCurrentTimeN,
+                    ) => Err(ParseError::not_supported("CURRENT_TIME")),
                     Ok(
-                        SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        SqlValueFunctionOp::SvfopLocaltime | SqlValueFunctionOp::SvfopLocaltimeN,
+                    ) => Err(ParseError::not_supported("LOCALTIME")),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Err(ParseError::not_supported("LOCALTIMESTAMP")),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
                     // keyword that was written.
@@ -11367,7 +11366,7 @@ mod tests {
     #[test]
     fn test_current_timestamp_translation() {
         let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME FROM t";
+        let sql = "SELECT CURRENT_TIMESTAMP, CURRENT_DATE FROM t";
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
 
@@ -11382,7 +11381,6 @@ mod tests {
         let expected = [
             ast::Expr::Literal(ast::Literal::CurrentTimestamp),
             ast::Expr::Literal(ast::Literal::CurrentDate),
-            ast::Expr::Literal(ast::Literal::CurrentTime),
         ];
 
         assert_eq!(columns.len(), expected.len());
@@ -13621,8 +13619,9 @@ mod tests {
     #[test]
     fn fail_closed_current_timestamp_precision() {
         assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
-        assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
-        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        assert_not_supported("SELECT CURRENT_TIMESTAMP(0)", "fractional-second precision");
+        assert_not_supported("SELECT LOCALTIME", "LOCALTIME is not supported");
+        assert_translates("SELECT CURRENT_DATE, CURRENT_TIMESTAMP");
     }
 
     #[test]

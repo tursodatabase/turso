@@ -1623,6 +1623,96 @@ expect {
     1
 }
 
+test now-and-statement-timestamp-stay-fixed-while-clock-timestamp-moves {
+    SELECT count(DISTINCT now()), count(DISTINCT statement_timestamp()),
+        CASE WHEN count(DISTINCT clock_timestamp()) > 1 THEN 'moves' END
+    FROM generate_series(1, 20000);
+}
+expect {
+    1|1|moves
+}
+
+test now-is-the-transaction-start-and-statement-timestamp-the-statement-start {
+    CREATE TABLE stamps (tx timestamptz, stmt timestamptz);
+    BEGIN;
+    INSERT INTO stamps VALUES (now(), statement_timestamp());
+    INSERT INTO stamps SELECT now(), statement_timestamp() FROM generate_series(1, 1000);
+    COMMIT;
+    SELECT count(DISTINCT tx), count(DISTINCT stmt) FROM stamps;
+}
+expect {
+    1|2
+}
+
+test add-column-default-now-gives-existing-rows-one-time {
+    CREATE TABLE tw (x int);
+    INSERT INTO tw SELECT g FROM generate_series(1, 20000) g;
+    ALTER TABLE tw ADD COLUMN d timestamptz DEFAULT now();
+    SELECT count(DISTINCT d) FROM tw;
+}
+expect {
+    1
+}
+
+test current-timestamp-and-current-date-read-now {
+    CREATE TABLE days (day date DEFAULT CURRENT_DATE CHECK (day >= CURRENT_DATE));
+    INSERT INTO days DEFAULT VALUES;
+    SELECT day - now()::date, CURRENT_DATE - now()::date FROM days
+    WHERE CURRENT_TIMESTAMP = now() AND CURRENT_TIMESTAMP > 'Jan 1 2000';
+}
+expect {
+    0|0
+}
+
+test current-date-check-refuses-an-earlier-date {
+    CREATE TABLE past (day date CHECK (day >= CURRENT_DATE));
+    INSERT INTO past VALUES ('2000-01-01');
+}
+@sqlstate 23514
+expect error {}
+
+test current-timestamp-default-shows-as-written {
+    CREATE TABLE stamped (at timestamptz DEFAULT CURRENT_TIMESTAMP, day date DEFAULT CURRENT_DATE);
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    CURRENT_TIMESTAMP
+    CURRENT_DATE
+}
+
+test localtimestamp-is-not-supported {
+    SELECT LOCALTIMESTAMP IS NOT NULL;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    LOCALTIMESTAMP is not supported
+}
+
+test now-with-an-argument-errors {
+    SELECT now(1);
+}
+@sqlstate 42883
+expect error {
+    function now\(integer\) does not exist
+}
+expect @tursopg error {
+    no such function: now
+}
+
+test current-timestamp-with-a-precision-is-not-supported {
+    SELECT CURRENT_TIMESTAMP(0) IS NOT NULL;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a fractional-second precision on .* is not supported
+}
+
 test now-plus-an-integer-errors {
     SELECT now() + 1;
 }
