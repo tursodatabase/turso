@@ -9413,20 +9413,16 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
     contents.write_fragmented_bytes_count(0);
     contents.write_rightmost_ptr(0);
 
-    #[cfg(debug_assertions)]
-    {
-        // we might get already used page from the pool. generally this is not a problem because
-        // b tree access is very controlled. However, for encrypted pages (and also checksums) we want
-        // to ensure that there are no reserved bytes that contain old data.
-        let buf = contents.as_ptr();
-        let buffer_len = buf.len();
-        turso_assert!(
-            usable_space <= buffer_len,
-            "usable_space must be <= buffer_len"
-        );
-        // this is no op if usable_space == buffer_len
-        buf[usable_space..buffer_len].fill(0);
-    }
+    let header_size = contents.header_size();
+    let buf = contents.as_ptr();
+    let buffer_len = buf.len();
+    turso_assert!(
+        usable_space <= buffer_len,
+        "usable_space must be <= buffer_len"
+    );
+    // Zero out all unallocated space and reserved area to prevent leaking stale memory
+    // and to ensure deterministic on-disk representation.
+    buf[offset + header_size..].fill(0);
 }
 
 fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {
