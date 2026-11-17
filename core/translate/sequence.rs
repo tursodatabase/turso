@@ -21,7 +21,7 @@ use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
-use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::btree_descriptor::BtreeDescriptor;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
@@ -81,7 +81,7 @@ pub fn emit_sequence_backing_table(
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        descriptor: BtreeDescriptor::Table,
     });
 
     emit_schema_entry(

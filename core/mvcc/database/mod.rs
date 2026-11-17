@@ -971,9 +971,9 @@ impl<A: RowVersionAllocator> WriteSet<A> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BtreeChange {
-    Create(MVTableId),
+    Create(MVTableId, crate::storage::btree_descriptor::BtreeDescriptor),
     Drop(MVTableId),
 }
 
@@ -2390,7 +2390,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let created: HashSet<_> = btree_changes
             .iter()
             .filter_map(|change| match change {
-                BtreeChange::Create(id) => Some(*id),
+                BtreeChange::Create(id, _) => Some(*id),
                 BtreeChange::Drop(_) => None,
             })
             .collect();
@@ -2398,7 +2398,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             .iter()
             .filter_map(|change| match change {
                 BtreeChange::Drop(id) => Some(*id),
-                BtreeChange::Create(_) => None,
+                BtreeChange::Create(_, _) => None,
             })
             .collect();
         drop(btree_changes);
@@ -5369,7 +5369,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Records that `tx_id` allocated `table_id` with `CreateBtree`, so rollback can drop
     /// everything stored under it.
-    pub fn record_created_table_id(&self, tx_id: TxID, table_id: i64) {
+    pub(crate) fn record_created_btree(
+        &self,
+        tx_id: TxID,
+        table_id: i64,
+        descriptor: crate::storage::btree_descriptor::BtreeDescriptor,
+    ) {
         let tx = self
             .txs
             .get(&tx_id)
@@ -5377,7 +5382,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx.value()
             .btree_changes
             .lock()
-            .push(BtreeChange::Create(MVTableId::new(table_id)));
+            .push(BtreeChange::Create(MVTableId::new(table_id), descriptor));
     }
 
     pub(crate) fn record_dropped_btree(&self, tx_id: TxID, root_page: i64) {
@@ -7200,7 +7205,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // and rolled back over and over would leave one full set of keys per attempt.
         let changes = std::mem::take(&mut *tx.btree_changes.lock());
         for change in changes {
-            if let BtreeChange::Create(id) = change {
+            if let BtreeChange::Create(id, _) = change {
                 self.drop_created_btree(id);
             }
         }
@@ -7630,7 +7635,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         Self::remove_rolled_back_chains_from_write_set(tx, write_set_len_at_begin);
         for change in tx.btree_changes.lock().drain(btree_changes_len_at_begin..) {
-            if let BtreeChange::Create(id) = change {
+            if let BtreeChange::Create(id, _) = change {
                 self.drop_created_btree(id);
             }
         }

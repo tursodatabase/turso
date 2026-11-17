@@ -35,7 +35,7 @@ use crate::{
         is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
         SchemaObjectType,
     },
-    storage::pager::CreateBTreeFlags,
+    storage::btree_descriptor::BtreeDescriptor,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -330,7 +330,9 @@ pub fn translate_create_index(
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
             root: root_page_reg,
-            flags: CreateBTreeFlags::new_index(),
+            descriptor: BtreeDescriptor::Index(Arc::new(crate::types::IndexInfo::new_from_index(
+                &idx,
+            )?)),
         });
     }
 

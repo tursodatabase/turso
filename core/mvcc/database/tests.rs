@@ -5468,3 +5468,34 @@ fn nested_savepoint_rollback_restores_btree_operations(releases: Vec<bool>) -> b
     db.conn.execute("COMMIT").unwrap();
     restored
 }
+
+#[test]
+fn created_btrees_record_resolved_index_ordering() {
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("CREATE TABLE descriptor_t (id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, b INTEGER, UNIQUE(a DESC, b))").unwrap();
+    db.conn
+        .execute("CREATE INDEX descriptor_idx ON descriptor_t(b DESC, a COLLATE RTRIM)")
+        .unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let tx = db.mvcc_store.txs.get(&tx_id).unwrap();
+    let schema = db.conn.schema.read();
+    let changes = tx.value().btree_changes.lock();
+    let mut indexes = 0;
+    for index in schema
+        .all_indexes()
+        .filter(|index| index.table_name == "descriptor_t")
+    {
+        let id = db.mvcc_store.get_table_id_from_root_page(index.root_page);
+        let expected = BtreeDescriptor::Index(Arc::new(IndexInfo::new_from_index(index).unwrap()));
+        assert!(changes
+            .iter()
+            .any(|change| *change == BtreeChange::Create(id, expected.clone())));
+        indexes += 1;
+    }
+    assert_eq!(indexes, 2);
+    drop(changes);
+    drop(schema);
+    db.conn.execute("ROLLBACK").unwrap();
+}

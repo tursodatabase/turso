@@ -1833,14 +1833,14 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dst_reg}]=r[{src_reg}]"),
             ),
-            Insn::CreateBtree { db, root, flags } => (
+            Insn::CreateBtree { db, root, descriptor } => (
                 "CreateBtree",
                 *db as i64,
                 *root as i64,
-                flags.get_flags() as i64,
+                descriptor.flags().get_flags() as i64,
                 Value::build_text(""),
                 0,
-                format!("r[{}]=root iDb={} flags={}", root, db, flags.get_flags()),
+                format!("r[{}]=root iDb={} flags={}", root, db, descriptor.flags().get_flags()),
             ),
             Insn::IndexMethodCreate { db, cursor_id } => (
                 "IndexMethodCreate",
