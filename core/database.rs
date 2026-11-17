@@ -1172,19 +1172,58 @@ impl Database {
         };
         drop(registry);
 
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
-        }
+        db.validate_encryption_options(encryption_opts.as_ref())?;
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
 
         Ok(Some(db))
+    }
+
+    fn validate_encryption_options(&self, options: Option<&EncryptionOpts>) -> Result<()> {
+        match options {
+            Some(options) => {
+                if self.page_codec_id.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "built-in encryption cannot be combined with an external page codec"
+                            .to_string(),
+                    ));
+                }
+                if !self.opts.enable_encryption {
+                    return Err(LimboError::InvalidArgument(
+                        "encryption is an opt in feature".to_string(),
+                    ));
+                }
+                let cipher = CipherMode::try_from(options.cipher.as_str())?;
+                let key = EncryptionKey::from_hex_string(&options.hexkey)?;
+                let current = self.pager_state.encryption_cipher();
+                if current == CipherMode::None {
+                    return Err(LimboError::InvalidArgument(
+                        "database is already open without encryption".into(),
+                    ));
+                }
+                if current != cipher {
+                    return Err(LimboError::InvalidArgument(
+                        "encryption cipher does not match the database".into(),
+                    ));
+                }
+                let encoded = self
+                    .pager_state
+                    .encryption_verifier()
+                    .expect("authenticated encrypted database has a verifier");
+                let context = EncryptionContext::new(cipher, &key, encoded.len())?;
+                context.decrypt_page(encoded, 1).map_err(|_| {
+                    LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
+                })?;
+                Ok(())
+            }
+            None if self.pager_state.encryption_cipher() != CipherMode::None => {
+                Err(LimboError::InvalidArgument(
+                    "encrypted database requires an encryption key".to_string(),
+                ))
+            }
+            None => Ok(()),
+        }
     }
 
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
@@ -1407,15 +1446,7 @@ impl Database {
                             drop(registry);
                             tracing::debug!("took database {path:?} from the registry");
 
-                            let db_is_encrypted =
-                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-                            if db_is_encrypted && options.encryption.is_none() {
-                                return Err(LimboError::InvalidArgument(
-                                    "Database is encrypted but no encryption options provided"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                            db.validate_encryption_options(options.encryption.as_ref())?;
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));

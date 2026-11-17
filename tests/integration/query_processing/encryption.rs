@@ -637,11 +637,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         assert_eq!(row_count, 1, "Should read data with correct key");
     }
 
-    // Step 3: Opening with wrong key succeeds, but reading data fails with decryption error
+    // Step 3: A cached database still validates the key when connecting
     {
-        let wrong_encryption_key = turso_core::EncryptionKey::from_hex_string(wrong_key).unwrap();
-
-        let db = Database::open_file_with_flags(
+        let result = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             OpenFlags::default(),
@@ -651,34 +649,14 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
                 hexkey: wrong_key.to_string(),
             }),
             Arc::new(SqliteDialect),
-        )?;
-
-        // opening succeeds - the key is not validated at open time
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(wrong_encryption_key)?;
-
-        // Reading data should fail with a decryption error
-        let read_failed = match conn.query("SELECT * FROM secret_data") {
-            Err(_) => true,
-            Ok(Some(mut rows)) => loop {
-                match rows.step() {
-                    Err(_) => break true,                            // Error - read failed
-                    Ok(turso_core::StepResult::Done) => break false, // Completed without error
-                    Ok(turso_core::StepResult::Interrupt) => break false,
-                    Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
-                    Ok(turso_core::StepResult::Busy)
-                    | Ok(turso_core::StepResult::IO)
-                    | Ok(turso_core::StepResult::Yield)
-                    | Ok(turso_core::StepResult::Sleep { .. }) => continue,
-                }
-            },
-            Ok(None) => false,
-        };
-        assert!(
-            read_failed,
-            "Reading data with wrong key should fail with decryption error"
         );
+
+        assert!(matches!(
+            result,
+            Err(LimboError::CompletionError(
+                CompletionError::DecryptionError { .. }
+            ))
+        ));
     }
 
     // Step 4: Opening without encryption options should fail immediately
@@ -696,7 +674,7 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             .described_as("opening an encrypted database with no encryption options")
             .err()
             .display_string()
-            .contains("Database is encrypted but no encryption options provided");
+            .contains("encrypted database requires an encryption key");
     }
 
     // Step 5: verify correct key still works after wrong key attempt
