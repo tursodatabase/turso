@@ -567,12 +567,17 @@ impl ConnectOpts {
 
 /// Resumable state for [`Database::connect_async`]. Create one per
 /// connect and pass it to every call until `IOResult::Done`.
+/// Options from the first call remain in effect until completion.
+/// Resuming it on another database returns an error without consuming the state.
 #[derive(Default)]
 pub struct ConnectAsyncState {
     /// The connection, once created; handed out when the stats refresh ends.
     conn: Option<Arc<Connection>>,
     /// The in-flight `sqlite_stat1` scan.
     refresh: RefreshAnalyzeStatsState,
+    opts: Option<ConnectOpts>,
+    init: InitState,
+    database: Option<Arc<Database>>,
 }
 
 impl ConnectAsyncState {
@@ -2707,7 +2712,7 @@ impl Database {
 
     /// Non-blocking [`Self::connect`].
     ///
-    /// Creating the connection itself never waits, but the connect-time
+    /// Pager initialization and key verification can wait on page I/O. The connect-time
     /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
     /// statement can have to wait: on page I/O, or on another transaction
     /// (a read that speculatively saw a version whose writer is still
@@ -2725,36 +2730,67 @@ impl Database {
     /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
     /// logged and the connection is returned without stats.
     ///
-    /// Only the first call, which creates the connection, uses `opts`; later
-    /// calls with the same `state` only resume the stats refresh.
+    /// Only the first call uses `opts`; later calls resume initialization or
+    /// the stats refresh on the same database.
     pub fn connect_async(
         self: &Arc<Database>,
         opts: ConnectOpts,
         state: &mut ConnectAsyncState,
     ) -> IOResultOr<Arc<Connection>> {
-        let conn = match &state.conn {
-            Some(conn) => conn.clone(),
-            None => {
-                let conn = self._connect(
-                    opts,
-                    ConnectionContext::default(),
-                    false,
-                    None,
-                    StatsRefresh::Deferred,
-                )?;
-                state.conn = Some(conn.clone());
-                conn
-            }
-        };
-        match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
-            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-            Ok(IOResult::Done(())) => {}
-            Err(err) => {
-                tracing::warn!("Failed to refresh analyze stats on connect: {err}");
-            }
+        if state
+            .database
+            .as_ref()
+            .is_some_and(|database| !Arc::ptr_eq(database, self))
+        {
+            return Err(LimboError::InvalidArgument(
+                "connect state belongs to another database".into(),
+            )
+            .into());
         }
-        *state = ConnectAsyncState::default();
-        Ok(IOResult::Done(conn))
+        let result = (|| {
+            let conn = match &state.conn {
+                Some(conn) => conn.clone(),
+                None => {
+                    if state.opts.is_none() {
+                        self.validate_page_codec(opts.page_codec.as_deref())?;
+                        state.database = Some(self.clone());
+                        state.opts = Some(opts);
+                    }
+                    let opts = state
+                        .opts
+                        .as_ref()
+                        .expect("initial connect options are set");
+                    let pager = return_if_io!(self._init_nonblock(
+                        &mut state.init,
+                        opts.encryption_key.as_ref(),
+                        opts.page_codec.as_ref()
+                    ));
+                    let opts = state.opts.take().expect("initial connect options are set");
+                    let conn = self._connect(
+                        opts,
+                        ConnectionContext::default(),
+                        false,
+                        Some(Arc::new(pager)),
+                        StatsRefresh::Deferred,
+                    )?;
+                    state.conn = Some(conn.clone());
+                    conn
+                }
+            };
+            match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
+                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                Ok(IOResult::Done(())) => {}
+                Err(err) => {
+                    tracing::warn!("Failed to refresh analyze stats on connect: {err}");
+                }
+            }
+            *state = ConnectAsyncState::default();
+            Ok(IOResult::Done(conn))
+        })();
+        if result.is_err() {
+            *state = ConnectAsyncState::default();
+        }
+        result
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
