@@ -414,7 +414,16 @@ fn prepare_one_select_plan(
                 offset: None,
                 contains_constant_false_condition: false,
                 query_destination,
-                distinctness: Distinctness::from_ast(distinctness.as_ref()),
+                distinctness: match distinctness {
+                    Some(ast::SelectDistinctness::Distinct) => Distinctness::Distinct {
+                        ctx: None,
+                        ordered: false,
+                    },
+                    Some(ast::SelectDistinctness::All) | None => Distinctness::NonDistinct,
+                    Some(ast::SelectDistinctness::DistinctOn(_)) => {
+                        crate::bail_parse_error!("SELECT DISTINCT ON is not supported")
+                    }
+                },
                 values: vec![],
                 window: None,
                 non_from_clause_subqueries: vec![],

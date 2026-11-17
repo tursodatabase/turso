@@ -1463,6 +1463,27 @@ impl ToTokens for FromClause {
     }
 }
 
+impl_display_for_to_tokens!(SelectDistinctness);
+impl ToTokens for SelectDistinctness {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Distinct => s.append(TK_DISTINCT, None),
+            Self::All => s.append(TK_ALL, None),
+            Self::DistinctOn(exprs) => {
+                s.append(TK_DISTINCT, None)?;
+                s.append(TK_ON, None)?;
+                s.append(TK_LP, None)?;
+                comma(exprs, s, context)?;
+                s.append(TK_RP, None)
+            }
+        }
+    }
+}
+
 impl_display_for_to_tokens!(Distinctness);
 impl ToTokens for Distinctness {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(

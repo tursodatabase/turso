@@ -9946,14 +9946,14 @@ fn compound_operator(
 
 fn translate_distinct_clause(
     distinct_clause: &[pg_query::protobuf::Node],
-) -> Result<Option<ast::Distinctness>, ParseError> {
+) -> Result<Option<ast::SelectDistinctness>, ParseError> {
     if distinct_clause.is_empty() {
         return Ok(None);
     }
     if distinct_clause.iter().any(|n| n.node.is_some()) {
         return Err(ParseError::not_supported("SELECT DISTINCT ON"));
     }
-    Ok(Some(ast::Distinctness::Distinct))
+    Ok(Some(ast::SelectDistinctness::Distinct))
 }
 
 fn reject_column_aliases(
@@ -10975,7 +10975,7 @@ mod tests {
         if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { distinctness, .. } = &select.body.select {
                 assert!(
-                    matches!(distinctness, Some(ast::Distinctness::Distinct)),
+                    matches!(distinctness, Some(ast::SelectDistinctness::Distinct)),
                     "Should have DISTINCT"
                 );
             } else {

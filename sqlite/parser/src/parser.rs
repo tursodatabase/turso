@@ -7,10 +7,10 @@ use crate::ast::{
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
     Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
-    UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
+    ResultColumn, Select, SelectBody, SelectDistinctness, SelectTable, Set, SortOrder,
+    SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
+    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
+    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -3268,7 +3268,7 @@ impl<'a> Parser<'a> {
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
             TK_SELECT => {
-                let distinct = self.parse_distinct()?;
+                let distinct = self.parse_select_distinct()?;
                 let collist = self.parse_select_columns()?;
                 let from = self.parse_from_clause_opt()?;
                 let where_clause = self.parse_where()?;
@@ -3309,6 +3309,23 @@ impl<'a> Parser<'a> {
                 Ok(OneSelect::Values(values))
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn parse_select_distinct(&mut self) -> Result<Option<SelectDistinctness>> {
+        match self.parse_distinct()? {
+            None => Ok(None),
+            Some(Distinctness::All) => Ok(Some(SelectDistinctness::All)),
+            Some(Distinctness::Distinct) => {
+                if !matches!(self.peek()?, Some(tok) if tok.token_type == TK_ON) {
+                    return Ok(Some(SelectDistinctness::Distinct));
+                }
+                eat_assert!(self, TK_ON);
+                eat_expect!(self, TK_LP);
+                let exprs = self.parse_nexpr_list()?;
+                eat_expect!(self, TK_RP);
+                Ok(Some(SelectDistinctness::DistinctOn(exprs)))
+            }
         }
     }
 
@@ -5671,6 +5688,52 @@ mod tests {
         ] {
             let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
             assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_distinct_on() {
+        for sql in [
+            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC",
+            "SELECT DISTINCT ON (a, b + 1) * FROM t",
+            "SELECT DISTINCT ON (1) a FROM t UNION ALL SELECT DISTINCT ON (c COLLATE NOCASE) c FROM u",
+            "CREATE VIEW v AS SELECT DISTINCT ON (t.a) t.a, t.b FROM t ORDER BY t.a",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_distinct_on_keeps_its_expressions() {
+        let cmd = Parser::new(b"SELECT DISTINCT ON (a, b) c FROM t")
+            .next_cmd()
+            .unwrap()
+            .unwrap();
+        let Cmd::Stmt(Stmt::Select(select)) = cmd else {
+            panic!("expected a SELECT");
+        };
+        let OneSelect::Select { distinctness, .. } = select.body.select else {
+            panic!("expected a SELECT core");
+        };
+        let Some(SelectDistinctness::DistinctOn(exprs)) = distinctness else {
+            panic!("expected DISTINCT ON, got {distinctness:?}");
+        };
+        assert_eq!(exprs.len(), 2);
+    }
+
+    #[test]
+    fn test_distinct_on_needs_a_parenthesized_expression_list() {
+        for sql in [
+            "SELECT DISTINCT ON a a FROM t",
+            "SELECT DISTINCT ON () a FROM t",
+            "SELECT ALL ON (a) a FROM t",
+            "SELECT count(DISTINCT ON (a) a) FROM t",
+        ] {
+            assert!(
+                Parser::new(sql.as_bytes()).next_cmd().is_err(),
+                "parsed: {sql}"
+            );
         }
     }
 

@@ -1105,7 +1105,7 @@ pub enum OneSelect {
     /// `SELECT`
     Select {
         /// `DISTINCT`
-        distinctness: Option<Distinctness>,
+        distinctness: Option<SelectDistinctness>,
         /// columns
         columns: Vec<ResultColumn>,
         /// `FROM` clause
@@ -1132,7 +1132,7 @@ pub struct FromClause {
     pub joins: Vec<JoinedSelectTable>,
 }
 
-/// `SELECT` distinctness
+/// Distinctness of the arguments of a function call
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Distinctness {
@@ -1140,6 +1140,18 @@ pub enum Distinctness {
     Distinct,
     /// `ALL`
     All,
+}
+
+/// `SELECT` distinctness
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SelectDistinctness {
+    /// `DISTINCT`
+    Distinct,
+    /// `ALL`
+    All,
+    /// `DISTINCT ON (exprs)`: the first row of each group of rows where the expressions are equal
+    DistinctOn(Vec<Box<Expr>>),
 }
 
 /// `SELECT` or `RETURNING` result column
