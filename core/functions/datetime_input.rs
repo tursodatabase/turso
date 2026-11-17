@@ -13,13 +13,25 @@
 use crate::types::Value;
 use crate::{LimboError, Result};
 use chrono::{Datelike, Duration, Month, NaiveDate, NaiveDateTime, Timelike};
+use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TemporalType {
+pub enum TemporalType {
     Date,
     Time,
     Timestamp,
     Timestamptz,
+}
+
+/// A date, time or timestamp in the range tursopg stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Temporal {
+    /// A date in the years 1 to 9999.
+    Date(NaiveDate),
+    /// Microseconds since midnight, up to `24:00:00`.
+    Time(i64),
+    /// A timestamp, or a timestamptz in UTC, in the years 1 to 9999.
+    Timestamp(NaiveDateTime),
 }
 
 impl TemporalType {
@@ -35,6 +47,9 @@ impl TemporalType {
 }
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// The years of the dates and timestamps tursopg stores.
+const YEARS: RangeInclusive<i32> = 1..=9999;
 
 /// `temporal_encode(value, type)`, the ENCODE of the built-in type `type`:
 /// NULL stays NULL, text is read as `type`, anything else is an error, as
@@ -61,8 +76,50 @@ pub fn exec_temporal_encode(value: &Value, type_name: &Value) -> Result<Value> {
             )))
         }
     };
-    let fields = Fields::read(input, ty)?;
-    Ok(Value::build_text(fields.format(input, ty)?))
+    Ok(Value::build_text(read_temporal(input, ty)?.text()))
+}
+
+/// Reads `input` as a value of type `ty`.
+pub fn read_temporal(input: &str, ty: TemporalType) -> Result<Temporal> {
+    Fields::read(input, ty)?.value(input, ty)
+}
+
+impl Temporal {
+    /// `date`, if its year is 1 to 9999.
+    pub fn date(date: NaiveDate) -> Option<Self> {
+        YEARS.contains(&date.year()).then_some(Self::Date(date))
+    }
+
+    /// The time `micros` microseconds after midnight, if it is at most
+    /// `24:00:00`.
+    pub fn time(micros: i64) -> Option<Self> {
+        (0..=MICROS_PER_DAY)
+            .contains(&micros)
+            .then_some(Self::Time(micros))
+    }
+
+    /// A timestamp, or a timestamptz in UTC, if its year is 1 to 9999.
+    pub fn timestamp(timestamp: NaiveDateTime) -> Option<Self> {
+        YEARS
+            .contains(&timestamp.year())
+            .then_some(Self::Timestamp(timestamp))
+    }
+
+    /// The value in its type's fixed text form.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        match self {
+            Self::Date(date) => out.push_str(&date.format("%Y-%m-%d").to_string()),
+            Self::Time(micros) => push_time(&mut out, *micros),
+            Self::Timestamp(timestamp) => {
+                out.push_str(&timestamp.format("%Y-%m-%d ").to_string());
+                let micros = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
+                    + i64::from(timestamp.nanosecond() / 1000);
+                push_time(&mut out, micros);
+            }
+        }
+        out
+    }
 }
 
 /// PostgreSQL's frontend reports these as `invalid_datetime_format`. Values
@@ -212,8 +269,8 @@ impl Fields {
         reader.finish()
     }
 
-    /// The value in `ty`'s fixed text form.
-    fn format(self, input: &str, ty: TemporalType) -> Result<String> {
+    /// The value of type `ty` that the parsed fields describe.
+    fn value(self, input: &str, ty: TemporalType) -> Result<Temporal> {
         let date = match self.date {
             Some((year, month, day)) => {
                 Some(NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| range_error(input))?)
@@ -227,26 +284,17 @@ impl Fields {
             (None, TemporalType::Time) => return Err(syntax_error(input, ty)),
             (None, _) => 0,
         };
-        let (date, ty) = match (date, ty) {
-            (_, TemporalType::Time) => {
-                let mut out = String::new();
-                push_time(&mut out, time);
-                return Ok(out);
-            }
+        let date = match (date, ty) {
+            (_, TemporalType::Time) => return Ok(Temporal::Time(time)),
             (None, _) => return Err(syntax_error(input, ty)),
-            (Some(date), TemporalType::Date) => return Ok(date.format("%Y-%m-%d").to_string()),
-            (Some(date), ty) => (date, ty),
+            (Some(date), TemporalType::Date) => return Ok(Temporal::Date(date)),
+            (Some(date), TemporalType::Timestamp | TemporalType::Timestamptz) => date,
         };
         let mut timestamp = NaiveDateTime::from(date) + Duration::microseconds(time);
         if let (TemporalType::Timestamptz, Some(offset)) = (ty, self.offset) {
             timestamp -= Duration::seconds(offset);
         }
-        check_year(timestamp.year(), input, ty)?;
-        let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
-            + i64::from(timestamp.nanosecond() / 1000);
-        let mut out = timestamp.format("%Y-%m-%d ").to_string();
-        push_time(&mut out, time);
-        Ok(out)
+        Temporal::timestamp(timestamp).ok_or_else(|| year_error(input, ty))
     }
 }
 
@@ -524,18 +572,17 @@ fn year(text: &str, input: &str, ty: TemporalType) -> Result<i32> {
         )));
     }
     let year = text.parse().map_err(|_| syntax_error(input, ty))?;
-    check_year(year, input, ty)?;
+    if !YEARS.contains(&year) {
+        return Err(year_error(input, ty));
+    }
     Ok(year)
 }
 
-fn check_year(year: i32, input: &str, ty: TemporalType) -> Result<()> {
-    match year {
-        1..=9999 => Ok(()),
-        _ => Err(LimboError::DatetimeFieldOverflow(format!(
-            "{} values must be between years 0001 and 9999: \"{input}\"",
-            ty.name()
-        ))),
-    }
+fn year_error(input: &str, ty: TemporalType) -> LimboError {
+    LimboError::DatetimeFieldOverflow(format!(
+        "{} values must be between years 0001 and 9999: \"{input}\"",
+        ty.name()
+    ))
 }
 
 /// `H:M[:S[.fraction]]` as hour, minute, second and microseconds. The fraction
