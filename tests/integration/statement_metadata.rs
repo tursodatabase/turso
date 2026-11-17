@@ -767,6 +767,7 @@ mod tests {
         conn.execute("ATTACH ':memory:' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t (a DECIMAL(10,2))")
             .unwrap();
+        conn.execute("CREATE TEMP TABLE tt (z INT)").unwrap();
 
         let users_name = origin("main", "users", "name", Some("VARCHAR(40)"));
         let cases = [
@@ -783,6 +784,7 @@ mod tests {
                 "SELECT x FROM (SELECT name AS x FROM users)",
                 vec![users_name.clone()],
             ),
+            ("SELECT (name) FROM users", vec![users_name.clone()]),
             ("SELECT n, dbl FROM v", vec![users_name.clone(), None]),
             (
                 "WITH c AS (SELECT name AS n FROM users) SELECT n FROM c",
@@ -803,6 +805,14 @@ mod tests {
             (
                 "SELECT rowid FROM posts",
                 vec![origin("main", "posts", "rowid", Some("INTEGER"))],
+            ),
+            (
+                "SELECT z FROM tt",
+                vec![origin("temp", "tt", "z", Some("INT"))],
+            ),
+            (
+                "SELECT value FROM json_each('[1]')",
+                vec![origin("main", "json_each", "value", None)],
             ),
             ("EXPLAIN SELECT name FROM users", vec![None; 8]),
         ];

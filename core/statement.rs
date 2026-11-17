@@ -1305,7 +1305,8 @@ impl Statement {
     /// `sqlite3_column_decltype()` together: a column of a FROM-clause
     /// subquery, view or CTE is followed to the table column it reads, and an
     /// expression has no origin. A compound subquery is followed through its
-    /// last SELECT, as in SQLite.
+    /// last SELECT, as in SQLite. Unlike SQLite, a scalar subquery such as
+    /// `(SELECT name FROM users)` has no origin.
     ///
     /// See: <https://sqlite.org/c3ref/column_database_name.html>
     pub fn get_column_origin(&self, idx: usize) -> Option<ColumnOrigin> {
@@ -1324,6 +1325,9 @@ impl Statement {
         let (table_id, column_idx) = match expr {
             turso_parser::ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
             turso_parser::ast::Expr::RowId { table, .. } => (*table, None),
+            turso_parser::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                return self.column_origin(&exprs[0], tables);
+            }
             _ => return None,
         };
         let (namespace, table) = tables
@@ -1357,8 +1361,15 @@ impl Statement {
             ),
             None => ("rowid".to_string(), Some("INTEGER".to_string())),
         };
+        let database_id = match table {
+            // SQLite keeps table-valued functions such as json_each() in main.
+            Table::Virtual(vtab) if vtab.kind == turso_ext::VTabKind::TableValuedFunction => {
+                crate::MAIN_DB_ID
+            }
+            _ => namespace.database_id,
+        };
         Some(ColumnOrigin {
-            database: self.connection.namespace_name(namespace.database_id)?,
+            database: self.connection.namespace_name(database_id)?,
             table: table.get_name().to_string(),
             column,
             declared_type,
