@@ -3,15 +3,16 @@ use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
-use std::{fmt, sync::Arc};
+use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    exec_temporal_encode, format_timestamptz, Connection, ExternalFunc, IOResult, LimboError,
+    Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
@@ -26,13 +27,14 @@ use turso_pg_parser::sqlstate::{
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
 /// the body returns.
 macro_rules! scalar_functions {
-    ($options:expr, |$connection:ident, $args:ident| {
+    ($options:expr, |$context:ident, $connection:ident, $args:ident| {
         $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $($(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
+                let $connection = $context.connection;
                 Ok($body)
             };
             options = options.extension_function(pg_scalar_function(
@@ -60,7 +62,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
-    scalar_functions!(options, |connection, args| {
+    scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
@@ -147,9 +149,15 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(context.statement_times().transaction)?)
+        },
+        "statement_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(context.statement_times().statement)?)
+        },
+        "clock_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(context.io.current_time_wall_clock())?)
+        },
     })
 }
 
@@ -157,7 +165,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
@@ -171,7 +179,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 }
 
 impl<O> fmt::Debug for PgScalarFunction<O> {
@@ -194,8 +202,8 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
 impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
-        Ok(IOResult::Done((self.step)(connection, args)?))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<O> {
+        Ok(IOResult::Done((self.step)(context, args)?))
     }
 }
 

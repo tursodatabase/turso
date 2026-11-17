@@ -11,7 +11,7 @@
 //! 9999, years not written with 4 digits and `infinity`.
 
 use crate::types::Value;
-use crate::{LimboError, Result};
+use crate::{LimboError, Result, WallClockInstant};
 use chrono::{Datelike, Duration, Month, NaiveDate, NaiveDateTime, Timelike};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +63,17 @@ pub fn exec_temporal_encode(value: &Value, type_name: &Value) -> Result<Value> {
     };
     let fields = Fields::read(input, ty)?;
     Ok(Value::build_text(fields.format(input, ty)?))
+}
+
+/// `instant` in the text a `timestamptz` column stores, so that it compares
+/// and sorts with the column's values.
+pub fn format_timestamptz(instant: WallClockInstant) -> Result<String> {
+    let input = "the current time";
+    let timestamp = chrono::DateTime::from_timestamp(instant.secs, instant.micros * 1000)
+        .ok_or_else(|| range_error(input))?
+        .naive_utc();
+    check_year(timestamp.year(), input, TemporalType::Timestamptz)?;
+    Ok(format_timestamp(timestamp))
 }
 
 /// PostgreSQL's frontend reports these as `invalid_datetime_format`. Values
@@ -242,12 +253,18 @@ impl Fields {
             timestamp -= Duration::seconds(offset);
         }
         check_year(timestamp.year(), input, ty)?;
-        let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
-            + i64::from(timestamp.nanosecond() / 1000);
-        let mut out = timestamp.format("%Y-%m-%d ").to_string();
-        push_time(&mut out, time);
-        Ok(out)
+        Ok(format_timestamp(timestamp))
     }
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.fraction]`, the text `timestamp` and `timestamptz`
+/// store.
+fn format_timestamp(timestamp: NaiveDateTime) -> String {
+    let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
+        + i64::from(timestamp.nanosecond() / 1000);
+    let mut out = timestamp.format("%Y-%m-%d ").to_string();
+    push_time(&mut out, time);
+    out
 }
 
 /// What a field of the input says about the date and time. A field can be
@@ -626,6 +643,16 @@ mod tests {
                 "{input} as {ty}"
             );
         }
+    }
+
+    #[test]
+    fn formats_an_instant_as_a_timestamptz_column_stores_it() {
+        let instant = WallClockInstant {
+            secs: 1_704_448_800,
+            micros: 123_450,
+        };
+        let stored = encode("2024-01-05 10:00:00.12345+00", "timestamptz");
+        assert_eq!(Ok(format_timestamptz(instant).unwrap()), stored);
     }
 
     /// Input the .sqltest files do not cover.
