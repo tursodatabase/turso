@@ -40,14 +40,6 @@ pub fn open_database_async(
                     IOResult::IO(completions) => return Ok(IOResult::IO(completions)),
                 };
                 crate::session::refuse_tables_in_no_schema(&conn)?;
-                // Catalog initialization is the first commit of a new
-                // database, and the first commit picks the MVCC logical log's
-                // format. Writing it with portable changes starts the log as
-                // version 3, which later commits with portable changes need.
-                // Otherwise the log starts as version 2 and its header is
-                // later rewritten in place, which a copy holding only
-                // appended log bytes never sees.
-                conn.set_portable_logical_changes_enabled(true);
                 if crate::classes::initialize_schema(&conn.current_schema(), db.is_readonly())?
                     .is_empty()
                 {

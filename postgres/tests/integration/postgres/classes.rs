@@ -54,9 +54,8 @@ fn postgres_async_open_initializes_the_postgres_catalog() {
 
 /// Byte 4 of the MVCC logical log header is its format version. Version 2
 /// (LML2) logs cannot hold portable logical-change frames, so a PostgreSQL
-/// log that starts as LML2 must later rewrite its header in place. Storage
-/// that only ships appended log bytes (such as an S3 copy) never sees that
-/// rewrite.
+/// log that starts as LML2 must later rewrite its header in place. A copy of
+/// the log built only from appended bytes never sees that rewrite.
 #[test]
 fn postgres_async_open_starts_the_logical_log_as_version_3() {
     let dir = tempfile::tempdir().unwrap();
