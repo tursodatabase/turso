@@ -5,7 +5,7 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, IndexRowsEntry, MVTableId, MvStore, RowID, RowKey, RowVersion,
     RowVersions, SortableIndexKey, TxTimestampOrID, WalPos, WriteRowStateMachine,
-    MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
+    MVCC_META_KEY_BTREE_SNAPSHOT, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -302,6 +302,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
     /// Storage changes visible at the checkpoint snapshot.
     btree_work: std::vec::Vec<BtreeWork>,
+    snapshot_written: bool,
     catalog: crate::schema::mvcc::CatalogCheckpoint,
     /// Tables that were destroyed in this checkpoint
     destroyed_tables: HashSet<MVTableId>,
@@ -799,6 +800,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             delete_row_state_machine: None,
             cursors: HashMap::default(),
             btree_work: std::vec::Vec::new(),
+            snapshot_written: false,
             catalog: crate::schema::mvcc::CatalogCheckpoint::default(),
             destroyed_tables: HashSet::default(),
             destroyed_indexes: HashSet::default(),
@@ -1644,6 +1646,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         })?;
         self.mvstore.global_header.write().replace(header);
+        if self.snapshot_written {
+            self.mvstore
+                .has_btree_snapshot
+                .store(true, Ordering::Release);
+        }
         crate::without_allocation_faults!(self
             .catalog
             .publish(
@@ -1869,6 +1876,72 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.written_table_rowids.insert((row_id.table_id, n));
     }
 
+    fn needs_btree_snapshot(&self) -> bool {
+        self.durable_mvcc_metadata
+            && (!self.mvstore.has_btree_snapshot.load(Ordering::Acquire)
+                || !self.btree_work.is_empty())
+    }
+
+    fn stage_btree_snapshot(&mut self) -> Result<()> {
+        if !self.needs_btree_snapshot() {
+            return Ok(());
+        }
+        let mut objects = self
+            .mvstore
+            .btree_objects
+            .read()
+            .iter()
+            .filter(|(_, object)| {
+                object.begin <= self.snapshot_ts
+                    && object.end.is_none_or(|end| end > self.snapshot_ts)
+            })
+            .map(|(id, object)| {
+                let root = self
+                    .resolve_checkpoint_root(*id)
+                    .expect("live B-tree must have a checkpoint root");
+                crate::storage::btree_descriptor::BtreeSnapshotEntry {
+                    logical_id: (*id).into(),
+                    root_page: root as i64,
+                    descriptor: object.descriptor.clone(),
+                }
+            })
+            .collect::<std::vec::Vec<_>>();
+        objects.sort_by_key(|object| object.logical_id);
+        let payload = crate::storage::btree_descriptor::encode_snapshot(&objects)?;
+        let record = ImmutableRecord::from_values(
+            &[
+                Value::build_text(format!(
+                    "{MVCC_META_KEY_BTREE_SNAPSHOT}{}",
+                    hex::encode(payload)
+                )),
+                Value::from_i64(1),
+            ],
+            2,
+        )?;
+        let (table, _) = self
+            .mvcc_meta_table
+            .expect("durable MVCC metadata table must exist");
+        let data = crate::alloc::try_arc_slice_from_slice_in(
+            record.get_payload(),
+            self.mvstore.allocator(),
+        )?;
+        self.write_set.try_push((
+            RowID::new(table, RowKey::Int(2)),
+            RowVersion {
+                id: 0,
+                begin: super::PackedTs::pack(Some(TxTimestampOrID::Timestamp(
+                    self.durable_txid_max_new,
+                ))),
+                end: super::PackedTs::pack(None),
+                data: Some(data),
+                btree_resident: true,
+                materialized_at: WalPos::ORIGIN,
+            },
+        ))?;
+        self.snapshot_written = true;
+        Ok(())
+    }
+
     /// Stages synthetic `persistent_tx_ts_max` row into the checkpoint write set
     /// so it is committed atomically with all other data in the same pager transaction.
     /// This is the mechanism that advances the durable replay boundary; on recovery, only
@@ -2037,6 +2110,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if self.write_set.is_empty()
                     && self.index_write_set.is_empty()
                     && self.btree_work.is_empty()
+                    && !self.needs_btree_snapshot()
                 {
                     // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
                     self.state = CheckpointState::CheckpointWal;
@@ -2073,6 +2147,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::ApplyBtreeChanges { next } => {
                 let next = *next;
                 let Some(work) = self.btree_work.get(next).cloned() else {
+                    self.stage_btree_snapshot()?;
                     self.state = CheckpointState::WriteRow {
                         write_set_index: 0,
                         requires_seek: true,

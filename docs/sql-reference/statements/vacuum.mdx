@@ -155,6 +155,7 @@ VACUUM;
 | `ReadOnly` | In-place `VACUUM` on a read-only database. |
 | `cannot VACUUM while experimental multiprocess WAL is active in another process` | In-place `VACUUM` while another process holds the multi-process WAL. |
 | `cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first` | In-place `VACUUM` on an MVCC database with pending log entries. |
+| `VACUUM cannot copy B-trees without catalog entries` | An MVCC database contains storage objects outside the SQL catalog. Applies to both forms; those objects cannot be omitted safely. |
 | `output file already exists: <path>` | The destination for `VACUUM INTO` already exists and is not empty. |
 | `unable to open database: <path>` | The `VACUUM INTO` URI has `mode=ro` or `mode=rw`, which cannot create the destination. |
 | `VACUUM INTO does not support the cipher and hexkey URI parameters` | The `VACUUM INTO` URI asks for an encrypted destination. |

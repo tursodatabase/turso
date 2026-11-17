@@ -101,10 +101,16 @@ version selection. The schema adapter rewrites logical root placeholders after
 allocation and updates the SQL schema cache after publication. Portable-log consumers
 use a separate schema adapter to attach SQL names and primary keys.
 
-The SQLite database file remains unchanged. On opening a checkpointed database,
-bootstrap imports descriptors from the already-loaded schema once. This is also the
-compatibility boundary for databases created before descriptor logging; the SQLite
-file does not contain a separate persistent B-tree descriptor catalog.
+The SQLite file format remains unchanged. Checkpoint writes a versioned B-tree
+snapshot of stable logical IDs, physical roots, and descriptors into the internal
+MVCC metadata table in the same pager transaction as the root changes and durable
+replay boundary. The snapshot is hex-encoded in a prefixed text key, preserving the
+existing metadata table's TEXT/INTEGER column types. Version 4 log records retain
+logical IDs across root publication. Bootstrap loads those IDs, physical roots,
+and comparison descriptors from the snapshot, including objects without catalog rows.
+For an older database without a snapshot, the schema adapter imports descriptors
+once from the loaded SQL catalog. Its next checkpoint persists the snapshot.
+In-place VACUUM rebuilds the snapshot for the compacted target's root pages.
 
 ## Current Limitations
 

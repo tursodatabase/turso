@@ -107,7 +107,7 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
             (Some(old_row), Some(new_row)) => {
                 if is_portable_table_schema_row(old_row) {
                     table_refs_by_id.insert(
-                        portable_table_id_from_rootpage(old_row.rootpage),
+                        portable_table_id_from_rootpage(mvcc_store, old_row.rootpage),
                         PortableTableRef {
                             name: old_row.name.clone(),
                         },
@@ -115,7 +115,7 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
                 }
                 if is_portable_table_schema_row(new_row) {
                     table_refs_by_id.insert(
-                        portable_table_id_from_rootpage(new_row.rootpage),
+                        portable_table_id_from_rootpage(mvcc_store, new_row.rootpage),
                         PortableTableRef {
                             name: new_row.name.clone(),
                         },
@@ -125,7 +125,7 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
             (None, Some(new_row)) => {
                 if is_portable_table_schema_row(new_row) {
                     table_refs_by_id.insert(
-                        portable_table_id_from_rootpage(new_row.rootpage),
+                        portable_table_id_from_rootpage(mvcc_store, new_row.rootpage),
                         PortableTableRef {
                             name: new_row.name.clone(),
                         },
@@ -135,7 +135,7 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
             (Some(old_row), None) => {
                 if is_portable_table_schema_row(old_row) {
                     table_refs_by_id.insert(
-                        portable_table_id_from_rootpage(old_row.rootpage),
+                        portable_table_id_from_rootpage(mvcc_store, old_row.rootpage),
                         PortableTableRef {
                             name: old_row.name.clone(),
                         },
@@ -146,32 +146,8 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
         }
     }
 
-    // A data table id parsed back out of the serialized payload is
-    // already in its log form: either the schema's negative rootpage
-    // placeholder (table not yet checkpointed) or the canonical
-    // -(root_page) written by `canonicalize_table_id`. Interpret it
-    // directly as a rootpage first. Consulting `table_id_to_rootpage`
-    // first is wrong: its keys are the original in-memory counter ids,
-    // so a canonical id like -159 can alias an unrelated object whose
-    // counter id happened to be -159 (and now has a checkpointed root
-    // page), sending resolution to the wrong rootpage. The map is only
-    // a fallback for a payload id serialized before a concurrent
-    // checkpoint published new roots.
-    let rootpage_for_table_id = |table_id: MVTableId| -> i64 {
-        let direct = i64::from(table_id);
-        if table_name_for_rootpage(connection, direct)
-            .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
-            .is_some()
-        {
-            return direct;
-        }
-        mvcc_store
-            .table_id_to_rootpage
-            .get(&table_id)
-            .and_then(|entry| entry.value().root_page)
-            .map(|rootpage| rootpage as i64)
-            .unwrap_or(direct)
-    };
+    let rootpage_for_table_id =
+        |table_id: MVTableId| rootpage_for_mv_table_id(mvcc_store, table_id);
 
     let mut unresolved_data_tables = Vec::new();
     let mut needed_rootpages = HashSet::default();
@@ -183,7 +159,7 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
         if rootpage == 0 {
             continue;
         }
-        let root_table_id = portable_table_id_from_rootpage(rootpage);
+        let root_table_id = portable_table_id_from_rootpage(mvcc_store, rootpage);
         if let Some(table_ref) = table_refs_by_id.get(&root_table_id).cloned() {
             table_refs_by_id.insert(*table_id, table_ref);
             continue;
@@ -199,8 +175,8 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
             else {
                 continue;
             };
-            let resolved_rootpage = if rootpage < 0 { -rootpage } else { rootpage };
-            let resolved_table_id = portable_table_id_from_rootpage(resolved_rootpage);
+            let resolved_rootpage = rootpage;
+            let resolved_table_id = portable_table_id_from_rootpage(mvcc_store, resolved_rootpage);
             let table_ref = PortableTableRef { name };
             table_refs_by_id.insert(resolved_table_id, table_ref);
         }
@@ -243,12 +219,11 @@ pub(crate) fn populate_changes<Clock: LogicalClock, A: ConcurrentAllocator>(
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn portable_table_id_from_rootpage(rootpage: i64) -> MVTableId {
-    if rootpage > 0 {
-        MVTableId::from(-rootpage)
-    } else {
-        MVTableId::from(rootpage)
-    }
+fn portable_table_id_from_rootpage<Clock: LogicalClock, A: ConcurrentAllocator>(
+    mvcc_store: &MvStore<Clock, A>,
+    rootpage: i64,
+) -> MVTableId {
+    mvcc_store.get_table_id_from_root_page(rootpage)
 }
 
 #[derive(Clone, Debug)]
@@ -335,22 +310,7 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
     mvcc_store: &MvStore<Clock, A>,
     table_id: MVTableId,
 ) -> Option<String> {
-    // `table_id` is the id as serialized into the log (see
-    // `canonicalize_table_id`), so interpret it directly as a rootpage first;
-    // `table_id_to_rootpage` is keyed by in-memory counter ids and a canonical
-    // -(root_page) id can alias an unrelated object's counter id. The map is
-    // only a fallback for a stale id serialized before a concurrent checkpoint
-    // published new roots.
-    let direct = i64::from(table_id);
-    if let Some(name) = table_name_for_rootpage(connection, direct)
-        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, direct))
-    {
-        return Some(name);
-    }
     let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
-    if rootpage == direct {
-        return None;
-    }
     table_name_for_rootpage(connection, rootpage)
         .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
 }

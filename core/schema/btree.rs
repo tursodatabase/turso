@@ -40,3 +40,32 @@ impl Schema {
         Ok(objects)
     }
 }
+
+impl Schema {
+    pub(crate) fn validate_btree_snapshot(
+        &self,
+        objects: &[crate::storage::btree_descriptor::BtreeSnapshotEntry],
+    ) -> Result<()> {
+        let roots: std::collections::HashSet<_> =
+            objects.iter().map(|object| object.root_page).collect();
+        let catalog_roots = self
+            .all_tables()
+            .filter_map(|table| match table.as_ref() {
+                Table::BTree(table) => Some(table.root_page),
+                _ => None,
+            })
+            .chain(
+                self.all_indexes()
+                    .filter(|index| index.is_btree_backed())
+                    .map(|index| index.root_page),
+            );
+        for root in catalog_roots {
+            if root != 1 && !roots.contains(&root) {
+                return Err(crate::LimboError::Corrupt(format!(
+                    "B-tree snapshot is missing catalog root {root}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}

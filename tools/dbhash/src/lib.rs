@@ -202,6 +202,12 @@ fn hash_table(
 ) -> Result<usize, LimboError> {
     // Quote table name for safety (escape internal double quotes)
     let sql = format!("SELECT * FROM \"{}\"", table_name.replace('"', "\"\""));
+    // Physical roots change during VACUUM without changing logical contents.
+    let sql = if table_name == "__turso_internal_mvcc_meta" {
+        format!("{sql} WHERE substr(k, 1, 15) <> 'btree_snapshot:'")
+    } else {
+        sql
+    };
     let mut stmt = conn.prepare(&sql)?;
     hash_rows(&mut stmt, io, hasher, debug)
 }

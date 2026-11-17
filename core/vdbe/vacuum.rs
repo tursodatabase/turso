@@ -526,16 +526,22 @@ pub(crate) enum VacuumTargetBuildPhase {
     #[default]
     Init,
     /// Step through schema query to collect rows
-    CollectSchemaRows { schema_stmt: Box<crate::Statement> },
+    CollectSchemaRows {
+        schema_stmt: Box<crate::Statement>,
+    },
     /// Prepare CREATE TABLE statement on the target (idx into tables_to_create)
-    PrepareCreateTable { idx: usize },
+    PrepareCreateTable {
+        idx: usize,
+    },
     /// Step through CREATE TABLE statement on the target (async)
     StepCreateTable {
         target_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
     /// Start copying a table's data
-    StartCopyTable { table_idx: usize },
+    StartCopyTable {
+        table_idx: usize,
+    },
     /// Delete the rows that the earlier table copies wrote into an
     /// AUTOINCREMENT counter table on the target.
     ClearCounterTable {
@@ -543,7 +549,9 @@ pub(crate) enum VacuumTargetBuildPhase {
         table_idx: usize,
     },
     /// Prepare the SELECT on the source and the INSERT on the target.
-    PrepareCopyRows { table_idx: usize },
+    PrepareCopyRows {
+        table_idx: usize,
+    },
     /// Select rows from source table and insert into the target.
     CopyRows {
         select_stmt: Box<crate::Statement>,
@@ -557,18 +565,26 @@ pub(crate) enum VacuumTargetBuildPhase {
         table_idx: usize,
     },
     /// Prepare CREATE INDEX statement on the target (idx into indexes_to_create)
-    PrepareCreateIndex { idx: usize },
+    PrepareCreateIndex {
+        idx: usize,
+    },
     /// Step through CREATE INDEX statement on the target.
     StepCreateIndex {
         target_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
     /// Prepare post-data schema objects (triggers, views, rootpage = 0 entries)
-    PreparePostData { idx: usize },
+    PreparePostData {
+        idx: usize,
+    },
     /// Step through post-data CREATE statement on the target.
     StepPostData {
         target_schema_stmt: Box<crate::Statement>,
         idx: usize,
+    },
+    PrepareBtreeSnapshot,
+    WriteBtreeSnapshot {
+        stmt: Box<crate::Statement>,
     },
     /// Finalize database header metadata before committing the target database.
     FinalizeTargetHeader,
@@ -605,6 +621,24 @@ pub(crate) fn vacuum_target_build_step(
 
         match current_phase {
             VacuumTargetBuildPhase::Init => {
+                let source_db = config.source_conn.get_source_database(config.source_db_id);
+                if let Some(store) = source_db.get_mv_store().as_ref() {
+                    let schema = config.source_conn.clone_shared_schema(config.source_db_id);
+                    let catalog_ids = schema
+                        .btree_descriptors()?
+                        .into_iter()
+                        .map(|(root, _)| store.get_table_id_from_root_page(root))
+                        .collect::<std::collections::HashSet<_>>();
+                    if store.live_btree_ids().into_iter().any(|id| {
+                        id != crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID
+                            && !catalog_ids.contains(&id)
+                    }) {
+                        return Err(LimboError::ParseError(
+                            "VACUUM cannot copy B-trees without catalog entries".into(),
+                        )
+                        .into());
+                    }
+                }
                 // Mirror source custom type definitions into the target schema
                 // so that STRICT tables with custom type columns can resolve
                 // those types during CREATE TABLE replay.
@@ -1108,7 +1142,7 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PreparePostData { idx } => {
                 let entries_len = state.post_data_entries.len();
                 if idx >= entries_len {
-                    state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader;
+                    state.phase = VacuumTargetBuildPhase::PrepareBtreeSnapshot;
                     continue;
                 }
 
@@ -1149,6 +1183,53 @@ pub(crate) fn vacuum_target_build_step(
                     return Err(LimboError::Busy.into());
                 }
             },
+
+            VacuumTargetBuildPhase::PrepareBtreeSnapshot => {
+                if !config.copy_mvcc_metadata_table {
+                    state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader;
+                    continue;
+                }
+                let objects = state
+                    .target_conn
+                    .schema
+                    .read()
+                    .btree_descriptors()?
+                    .into_iter()
+                    .map(|(root_page, descriptor)| {
+                        crate::storage::btree_descriptor::BtreeSnapshotEntry {
+                            logical_id: -root_page,
+                            root_page,
+                            descriptor,
+                        }
+                    })
+                    .collect::<std::vec::Vec<_>>();
+                let snapshot = crate::storage::btree_descriptor::encode_snapshot(&objects)?;
+                let table = crate::mvcc::database::MVCC_META_TABLE_NAME;
+                let key = crate::mvcc::database::MVCC_META_KEY_BTREE_SNAPSHOT;
+                let mut stmt = prepare_on_target(
+                    &state.target_conn,
+                    table,
+                    &format!("INSERT OR REPLACE INTO {table}(rowid, k, v) VALUES (2, ?1, 1)"),
+                )?;
+                stmt.bind_at(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    crate::Value::build_text(format!("{key}{}", hex::encode(snapshot))),
+                )?;
+                state.phase = VacuumTargetBuildPhase::WriteBtreeSnapshot {
+                    stmt: Box::new(stmt),
+                };
+            }
+            VacuumTargetBuildPhase::WriteBtreeSnapshot { mut stmt } => {
+                match stmt.run_ignore_rows_nonblock()? {
+                    crate::IOResult::Done(()) => {
+                        state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader
+                    }
+                    crate::IOResult::IO(io) => {
+                        state.phase = VacuumTargetBuildPhase::WriteBtreeSnapshot { stmt };
+                        return Ok(crate::IOResult::IO(io));
+                    }
+                }
+            }
 
             VacuumTargetBuildPhase::FinalizeTargetHeader => {
                 match finalize_vacuum_target_header(&state.target_conn, &config.header_meta)? {

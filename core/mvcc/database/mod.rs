@@ -2203,20 +2203,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             .collect();
         drop(btree_changes);
 
-        // Remap a table_id to its canonical form for the log. After checkpoint,
-        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
-        // (e.g. -58). On recovery, bootstrap reconstructs the map using
-        // -(root_page), so log records must use that canonical form to be found.
-        let canonical_log_id = |id: &RowID| -> RowID {
-            let mut log_id = id.clone();
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&log_id.table_id) {
-                if let Some(root_page) = entry.value().root_page {
-                    log_id.table_id = MVTableId::from(-(root_page as i64));
-                }
-            }
-            log_id
-        };
-
         let collect_versions = |id: &RowID,
                                 row_versions: &RowVersions<A>,
                                 log_record: &mut LogRecord|
@@ -2396,7 +2382,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
                 entry_versions.push(committed_version);
             }
-            let log_id = canonical_log_id(id);
+            let log_id = id.clone();
             for committed_version in &entry_versions {
                 #[cfg(feature = "conn_raw_api")]
                 let portable_extension = crate::schema::portable::delete_extension(
@@ -2455,12 +2441,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 if created.contains(&id) && dropped.contains(&id) {
                     return None;
                 }
-                let canonical = canonical_log_id(&RowID::new(id, RowKey::Int(0))).table_id;
+
                 Some(match change {
                     BtreeChange::Create(_, descriptor) => {
-                        BtreeChange::Create(canonical, descriptor.clone())
+                        BtreeChange::Create(id, descriptor.clone())
                     }
-                    BtreeChange::Drop(_) => BtreeChange::Drop(canonical),
+                    BtreeChange::Drop(_) => BtreeChange::Drop(id),
                 })
             })
             .collect();
@@ -3535,6 +3521,9 @@ pub(crate) const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
 /// Used to determine the replay boundary for recovery; only records with a higher timestamp
 /// are replayed.
 pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
+/// Snapshot bytes are hex-encoded in the key to preserve the metadata table's
+/// TEXT/INTEGER column types; the value is the encoding version.
+pub(crate) const MVCC_META_KEY_BTREE_SNAPSHOT: &str = "btree_snapshot:";
 
 #[derive(Debug)]
 pub struct RowidAllocator {
@@ -3691,6 +3680,7 @@ pub enum ReadPersistentTxTsMaxState {
     Running {
         stmt: Box<crate::Statement>,
         value: Option<i64>,
+        snapshot: Option<std::vec::Vec<u8>>,
     },
 }
 
@@ -3925,6 +3915,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
     pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
     btree_objects: RwLock<HashMap<MVTableId, BtreeObject>>,
+    has_btree_snapshot: AtomicBool,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4175,6 +4166,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
             btree_objects: RwLock::new(HashMap::default()),
+            has_btree_snapshot: AtomicBool::new(false),
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
@@ -4309,8 +4301,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(WalPos::STAGED)
     }
 
-    /// Bump `next_table_id` below `table_id` (and below `-root_page` for a checkpointed root) so
-    /// recovery's `table_id = -root_page` assignment can never collide with an existing id.
+    /// Reserve IDs below existing objects and legacy root-derived identities.
     fn bump_next_table_id_below(&self, table_id: MVTableId, root_page: Option<u64>) {
         let minimum: i64 = if let Some(root_page) = root_page {
             let root_page_as_table_id = MVTableId::from(-(root_page as i64));
@@ -4610,8 +4601,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             match st {
                 ReadPersistentTxTsMaxState::Start => {
                     let query_result = connection.query(format!(
-                        "SELECT v FROM {MVCC_META_TABLE_NAME}
-                         WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
+                        "SELECT k, v FROM {MVCC_META_TABLE_NAME}
+                         WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}' OR substr(k, 1, 15) = '{MVCC_META_KEY_BTREE_SNAPSHOT}'"
                     ));
                     let maybe_stmt = match query_result {
                         Ok(stmt) => stmt,
@@ -4630,6 +4621,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             *st = ReadPersistentTxTsMaxState::Running {
                                 stmt: Box::new(stmt),
                                 value: None,
+                                snapshot: None,
                             };
                         }
                         // No statement to run — fall through to the missing-row
@@ -4641,24 +4633,63 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         }
                     }
                 }
-                ReadPersistentTxTsMaxState::Running { stmt, value } => {
+                ReadPersistentTxTsMaxState::Running {
+                    stmt,
+                    value,
+                    snapshot,
+                } => {
                     return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        *value = Some(row.get::<i64>(0)?);
+                        match row.get::<String>(0)?.as_str() {
+                            MVCC_META_KEY_PERSISTENT_TX_TS_MAX => *value = Some(row.get::<i64>(1)?),
+                            key if key.starts_with(MVCC_META_KEY_BTREE_SNAPSHOT) => {
+                                if snapshot.is_some() {
+                                    return Err(LimboError::Corrupt(
+                                        "duplicate B-tree snapshot".into(),
+                                    ));
+                                }
+                                if row.get::<i64>(1)? != 1 {
+                                    return Err(LimboError::Corrupt(
+                                        "unsupported B-tree snapshot version".into(),
+                                    ));
+                                }
+                                *snapshot = Some(
+                                    hex::decode(&key[MVCC_META_KEY_BTREE_SNAPSHOT.len()..])
+                                        .map_err(|_| {
+                                            LimboError::Corrupt(
+                                                "invalid B-tree snapshot encoding".into(),
+                                            )
+                                        })?,
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
                         Ok(())
                     }));
                     let value = *value;
+                    let validated_value = Self::validate_persistent_tx_ts_max(value)?;
+                    if let Some(snapshot) = snapshot.take() {
+                        let snapshot =
+                            crate::storage::btree_descriptor::decode_snapshot(&snapshot)?;
+                        connection
+                            .schema
+                            .read()
+                            .validate_btree_snapshot(&snapshot)?;
+                        self.table_id_to_rootpage.clear();
+                        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
+                        self.btree_objects.write().clear();
+                        self.bootstrap_btrees(snapshot);
+                        self.has_btree_snapshot.store(true, Ordering::Release);
+                    }
                     *st = ReadPersistentTxTsMaxState::Start;
-                    return Self::validate_persistent_tx_ts_max(value)
-                        .map(IOResult::Done)
-                        .map_err(Into::into);
+                    return Ok(IOResult::Done(validated_value));
                 }
             }
         }
     }
 
-    /// Bootstrap the MV store from the SQLite schema table and logical log.
-    /// 1. Get all root pages from the already parsed schema object
-    /// 2. Assign table IDs to the root pages (table_id = -1 * root_page)
+    /// Bootstrap the MV store from checkpoint metadata and the logical log.
+    /// 1. Load B-tree descriptors from the snapshot, or import an older database catalog.
+    /// 2. Assign table IDs to the physical roots (table_id = -root_page)
     /// 3. Complete interrupted WAL/log checkpoint reconciliation, if needed
     /// 4. Promote the bootstrap connection to a regular connection so that it reads from the MV store again
     /// 5. Recover the logical log
@@ -4904,36 +4935,53 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(None)
     }
 
-    /// Sync prelude to logical-log recovery: map all existing checkpointed
-    /// sqlite_schema root pages to MVCC table ids (root_page=R → table_id=-R).
-    /// Recovery itself (and the connection promotion) is driven separately by
-    /// the bootstrap state machine's `Recover` phase so it can yield IO.
+    /// Import storage descriptors from the catalog for databases without a snapshot.
     fn bootstrap_map_root_pages(&self, bootstrap_conn: &Arc<Connection>) -> Result<()> {
-        let schema = bootstrap_conn.schema.read();
-        let sqlite_schema_root_pages = {
-            schema
-                .all_tables()
-                .filter_map(|t| {
-                    if let Table::BTree(btree) = t.as_ref() {
-                        Some(btree.root_page)
-                    } else {
-                        None
-                    }
-                })
-                .chain(
-                    schema
-                        .all_indexes()
-                        .filter(|index| index.is_btree_backed())
-                        .map(|index| index.root_page),
-                )
-        };
-        for root_page in sqlite_schema_root_pages {
-            turso_assert!(root_page > 0, "root_page={root_page} must be positive");
-            let root_page_as_table_id = MVTableId::from(-(root_page));
-            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
+        if !self.has_btree_snapshot.load(Ordering::Acquire) {
+            self.bootstrap_btrees(
+                bootstrap_conn
+                    .schema
+                    .read()
+                    .btree_descriptors()?
+                    .into_iter()
+                    .map(|(root_page, descriptor)| {
+                        crate::storage::btree_descriptor::BtreeSnapshotEntry {
+                            logical_id: -root_page,
+                            root_page,
+                            descriptor,
+                        }
+                    })
+                    .collect(),
+            );
         }
-        self.restore_btree_snapshot(schema.btree_descriptors()?, 0);
         Ok(())
+    }
+
+    pub(crate) fn live_btree_ids(&self) -> std::vec::Vec<MVTableId> {
+        self.btree_objects
+            .read()
+            .iter()
+            .filter_map(|(id, object)| object.end.is_none().then_some(*id))
+            .collect()
+    }
+
+    fn bootstrap_btrees(
+        &self,
+        objects: std::vec::Vec<crate::storage::btree_descriptor::BtreeSnapshotEntry>,
+    ) {
+        let mut descriptors = self.btree_objects.write();
+        for object in objects {
+            let id = MVTableId::new(object.logical_id);
+            self.insert_table_id_to_rootpage(id, Some(object.root_page as u64));
+            descriptors.insert(
+                id,
+                BtreeObject {
+                    descriptor: object.descriptor,
+                    begin: 0,
+                    end: None,
+                },
+            );
+        }
     }
 
     /// MVCC does not use the pager/btree cursors to create pages until checkpoint.

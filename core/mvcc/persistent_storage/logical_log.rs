@@ -116,8 +116,8 @@
 //! - `OP_BTREE_CHANGES` (version 4): `count: u32`, then lifecycle entries:
 //!   - create: `1: u8 || object_id: i64 || descriptor_len: u32 || descriptor_bytes`
 //!   - drop: `2: u8 || object_id: i64`
-//!   Object IDs must be less than -1 and fit the row operation's signed 32-bit domain.
-//!   Descriptors have their own version byte and store stable comparison names.
+//!     Object IDs must be less than -1 and fit the row operation's signed 32-bit domain.
+//!     Descriptors have their own version byte and store stable comparison names.
 //!
 //! Every newly written transaction has one lifecycle batch, even when it is empty.
 //! Replay applies that batch before row operations. Frames without a batch use the
