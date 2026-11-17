@@ -3023,6 +3023,8 @@ fn plan_unmatched_right_rows(
             1.0,
             base_row_count,
             params,
+            // This read is planned once, so there is no work to share.
+            None,
         )?
         else {
             // The rowid candidate, or the INDEXED BY candidate, can always scan the table.

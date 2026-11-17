@@ -9,6 +9,7 @@ use super::{
     access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
+    multi_index::MultiIndexTableWork,
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
 };
@@ -486,7 +487,7 @@ impl JoinN {
 /// - Probe->build chaining is only allowed when the build input is materialized from the
 ///   join prefix; rebuilding from the full table would ignore prior join filters.
 #[allow(clippy::too_many_arguments)]
-fn join_lhs_and_rhs<'a>(
+fn join_lhs_and_rhs<'a, 'w>(
     lhs: Option<&JoinN>,
     initial_input_cardinality: f64,
     rhs_table_reference: &JoinedTable,
@@ -498,7 +499,8 @@ fn join_lhs_and_rhs<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
-    where_clause: &mut [WhereTerm],
+    where_clause: &'w [WhereTerm],
+    multi_index_work: &[MultiIndexTableWork<'w>],
     where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -532,6 +534,10 @@ fn join_lhs_and_rhs<'a>(
         rhs_table_reference.internal_id,
     );
 
+    turso_assert_eq!(
+        joined_tables[rhs_table_number].internal_id,
+        rhs_table_reference.internal_id
+    );
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
         rhs_constraints,
@@ -548,6 +554,7 @@ fn join_lhs_and_rhs<'a>(
         input_cardinality,
         rhs_base_rows,
         params,
+        Some(&multi_index_work[rhs_table_number]),
     )?
     else {
         return Ok(None);
@@ -1304,6 +1311,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
     let num_tables = joined_tables.len();
 
+    // The search does not change the WHERE terms, so the multi-index planning
+    // work that depends only on a table and the terms is done once per table.
+    let where_clause: &[WhereTerm] = where_clause;
+    let multi_index_work: Vec<MultiIndexTableWork> = joined_tables
+        .iter()
+        .map(|_| MultiIndexTableWork::default())
+        .collect();
+
     // For large queries, use greedy join ordering instead of exhaustive DP.
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
@@ -1323,6 +1338,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             base_table_rows,
             access_methods_arena,
             where_clause,
+            &multi_index_work,
             &where_terms,
             subqueries,
             index_method_candidates,
@@ -1343,6 +1359,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         access_methods_arena,
         constraints,
         where_clause,
+        &multi_index_work,
         &where_terms,
         subqueries,
         index_method_candidates,
@@ -1437,6 +1454,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             cost_upper_bound,
             joined_tables,
             where_clause,
+            &multi_index_work,
             &where_terms,
             subqueries,
             index_method_candidates,
@@ -1582,6 +1600,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         cost_upper_bound,
                         joined_tables,
                         where_clause,
+                        &multi_index_work,
                         &where_terms,
                         subqueries,
                         index_method_candidates,
@@ -1746,14 +1765,15 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 ///
 /// Respects outer join ordering constraints.
 #[allow(clippy::too_many_arguments)]
-fn compute_greedy_join_order<'a>(
+fn compute_greedy_join_order<'a, 'w>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
-    where_clause: &mut [WhereTerm],
+    where_clause: &'w [WhereTerm],
+    multi_index_work: &[MultiIndexTableWork<'w>],
     where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -1808,6 +1828,7 @@ fn compute_greedy_join_order<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
+        multi_index_work,
         where_terms,
         subqueries,
         index_method_candidates,
@@ -1867,6 +1888,7 @@ fn compute_greedy_join_order<'a>(
                 Cost(f64::MAX),
                 joined_tables,
                 where_clause,
+                multi_index_work,
                 where_terms,
                 subqueries,
                 index_method_candidates,
@@ -2199,14 +2221,15 @@ fn get_best_seek_score(
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
 #[allow(clippy::too_many_arguments)]
-fn compute_naive_left_deep_plan<'a>(
+fn compute_naive_left_deep_plan<'a, 'w>(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     planning_context: JoinPlanningContext<'_>,
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
-    where_clause: &mut [WhereTerm],
+    where_clause: &'w [WhereTerm],
+    multi_index_work: &[MultiIndexTableWork<'w>],
     where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -2243,6 +2266,7 @@ fn compute_naive_left_deep_plan<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
+        multi_index_work,
         where_terms,
         subqueries,
         index_method_candidates,
@@ -2271,6 +2295,7 @@ fn compute_naive_left_deep_plan<'a>(
             Cost(f64::MAX),
             joined_tables,
             where_clause,
+            multi_index_work,
             where_terms,
             subqueries,
             index_method_candidates,

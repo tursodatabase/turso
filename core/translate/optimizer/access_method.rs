@@ -49,6 +49,7 @@ use super::{
     join::JoinPlanningContext,
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        MultiIndexTableWork,
     },
     order::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
@@ -766,13 +767,13 @@ fn replace_if_cheaper(
 
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
-pub fn find_best_access_method_for_join_order(
+pub fn find_best_access_method_for_join_order<'a>(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -782,6 +783,7 @@ pub fn find_best_access_method_for_join_order(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -802,6 +804,7 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
             planning_context.resolver,
+            multi_index_work,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
@@ -843,14 +846,14 @@ pub fn find_best_access_method_for_join_order(
 
 #[allow(clippy::too_many_arguments)]
 /// Return the best B-tree access method, or `None` if `INDEXED BY` leaves no valid method.
-fn find_best_access_method_for_btree(
+fn find_best_access_method_for_btree<'a>(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -861,6 +864,7 @@ fn find_best_access_method_for_btree(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     resolver: &Resolver,
+    multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     let Some(best) = choose_best_btree_candidate(
@@ -1090,6 +1094,7 @@ fn find_best_access_method_for_btree(
             lhs_mask,
             analyze_stats,
             resolver,
+            multi_index_work,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1118,6 +1123,7 @@ fn find_best_access_method_for_btree(
             lhs_mask,
             analyze_stats,
             resolver,
+            multi_index_work,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1385,7 +1391,7 @@ pub fn try_hash_join_access_method(
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
     joined_before_probe_mask: &TableMask,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
     build_cardinality: f64,
