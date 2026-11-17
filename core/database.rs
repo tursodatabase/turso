@@ -32,7 +32,7 @@ use crate::{
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
-        encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX},
+        encryption::{EncryptionContext, SQLITE_HEADER, TURSO_HEADER_PREFIX},
         journal_mode,
         page_cache::PageCache,
         page_transform::PageTransform,
@@ -726,8 +726,6 @@ pub struct Database<
     /// database is registered. `Drop` uses it to remove the entry.
     registry_key: OnceLock<DatabaseKey>,
 
-    // Encryption
-    encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
 }
 
@@ -837,7 +835,7 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts {
+        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts.as_ref() {
             Some(CipherMode::try_from(encryption_opts.cipher.as_str())?)
         } else {
             None
@@ -852,6 +850,10 @@ impl Database {
         };
 
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|options| EncryptionKey::from_hex_string(&options.hexkey))
+            .transpose()?;
 
         let db = Database {
             mv_store,
@@ -886,12 +888,13 @@ impl Database {
                 NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
 
-            pager_state: Arc::new(SharedPagerState::new(init_page_1)),
+            pager_state: Arc::new(SharedPagerState::with_encryption(
+                init_page_1,
+                encryption_cipher_mode.unwrap_or(CipherMode::None),
+                encryption_key.as_ref(),
+            )?),
             registry_key: OnceLock::new(),
 
-            encryption_cipher_mode: AtomicCipherMode::new(
-                encryption_cipher_mode.unwrap_or(CipherMode::None),
-            ),
             page_codec_id,
 
             durable_storage: None,
@@ -1945,7 +1948,7 @@ impl Database {
                     // - Bytes 100+: Encrypted content
                     // The encryption context is needed to properly decrypt page 1 when reopening.
                     if let Some(key) = encryption_key {
-                        let cipher_mode = self.encryption_cipher_mode.get();
+                        let cipher_mode = self.pager_state.encryption_cipher();
                         pager.set_encryption_context(cipher_mode, key)?;
                     } else if let Some(codec) = page_codec {
                         pager.set_page_codec(codec.clone())?;
@@ -2471,6 +2474,10 @@ impl Database {
                 Err(_) => self.path.to_string(),
             }
         }
+    }
+
+    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+        self.pager_state.encryption_cipher()
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -3400,7 +3407,7 @@ impl Database {
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> IOResultOr<Pager> {
-        let cipher = self.encryption_cipher_mode.get();
+        let cipher = self.pager_state.encryption_cipher();
         let encrypted = encryption_key.is_some() || !matches!(cipher, CipherMode::None);
 
         // For an existing (initialized) database, read the 512-byte header

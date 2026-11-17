@@ -1579,22 +1579,65 @@ impl Savepoint {
 pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
+    // Encryption
+    encryption_cipher: CipherMode,
+    /// Encrypted sample for checking keys before the first write and on cached opens.
+    encryption_verifier: Option<Box<[u8]>>,
     page_size: AtomicU32,
 }
 
 impl SharedPagerState {
     pub fn new(init_page_1: Option<PageRef>) -> Self {
+        Self::with_encryption(init_page_1, CipherMode::None, None)
+            .expect("plaintext pager initialization is infallible")
+    }
+
+    pub(crate) fn with_encryption(
+        init_page_1: Option<PageRef>,
+        cipher: CipherMode,
+        key: Option<&EncryptionKey>,
+    ) -> Result<Self> {
         let page_size = init_page_1.as_ref().map_or(0, |page| {
             let contents = page.get_contents();
             bytemuck::from_bytes::<DatabaseHeader>(&contents.as_ptr()[0..DatabaseHeader::SIZE])
                 .page_size
                 .get()
         });
-        Self {
+        let encryption_verifier = if cipher != CipherMode::None {
+            let page = default_page1(Some(&cipher));
+            let contents = page.get_contents();
+            let context = EncryptionContext::new(
+                cipher,
+                key.expect("encrypted pager initialization requires a key"),
+                contents.as_ptr().len(),
+            )?;
+            Some(
+                context
+                    .encrypt_page(contents.as_ptr(), 1)?
+                    .into_boxed_slice(),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
+            encryption_cipher: cipher,
+            encryption_verifier,
             page_size: AtomicU32::new(page_size),
-        }
+        })
+    }
+
+    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+        self.encryption_cipher
+    }
+
+    pub(crate) fn encryption_verifier(&self) -> Option<&[u8]> {
+        self.encryption_verifier.as_deref()
+    }
+
+    pub(crate) fn page_size(&self) -> Option<PageSize> {
+        PageSize::new(self.page_size.load(Ordering::SeqCst))
     }
 
     pub(crate) fn initialized(&self) -> bool {
