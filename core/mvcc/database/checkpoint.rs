@@ -4116,6 +4116,30 @@ mod tests {
         assert!(!is_schema_metadata_only_rewrite(&tombstone, None).unwrap());
     }
 
+    #[test]
+    fn sqlite_schema_identity_reports_a_malformed_row_as_corrupt() {
+        let record =
+            ImmutableRecord::from_values(&[Value::build_text("table"), Value::build_text("t")], 2)
+                .unwrap();
+        let malformed = RowVersion {
+            id: 1,
+            begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
+            end: crate::mvcc::database::PackedTs::pack(None),
+            data: Row::new_table_row(
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+                record.as_blob(),
+            )
+            .unwrap()
+            .data,
+            btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        };
+
+        let err =
+            sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, &malformed).unwrap_err();
+        assert!(matches!(err, LimboError::Corrupt(_)), "{err:?}");
+    }
+
     fn index_row_version(
         key_text: &str,
         rowid: i64,
