@@ -50,6 +50,9 @@ use turso_pg_parser::sqlstate::{
 };
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
+use crate::attributes::{
+    emit_delete_table_columns, emit_set_table_columns, is_stored_catalog_table, TableOid,
+};
 use crate::auth_members::{
     AUTH_MEMBERS_TABLE_NAME, CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL,
     CREATE_AUTH_MEMBERS_TABLE_SQL,
@@ -170,6 +173,9 @@ impl ClassCatalog {
     pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let catalog = Self::new(rows)?;
         for (namespace, name, _) in schema.user_relations() {
+            if is_stored_catalog_table(namespace, &name) {
+                continue;
+            }
             if catalog.get_by_name(namespace, &name).is_none() {
                 return Err(LimboError::Corrupt(format!(
                     "relation \"{name}\" of namespace {} has no row in {CLASSES_TABLE_NAME}",
@@ -536,6 +542,9 @@ pub(crate) fn role_has_privilege(
     role: RoleId,
     privilege: ast::Privilege,
 ) -> bool {
+    if is_stored_catalog_table(namespace, name) {
+        return privilege == ast::Privilege::Select;
+    }
     let Some(class) =
         class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
     else {
@@ -665,6 +674,8 @@ pub(crate) fn translate_catalog_changes(
         }
         return Ok(());
     };
+    // The oid registers of the tables these changes create.
+    let mut created_table_oid_regs: HashMap<(NamespaceId, &str), usize> = HashMap::new();
     for change in changes {
         match change {
             CatalogChange::Create {
@@ -689,7 +700,7 @@ pub(crate) fn translate_catalog_changes(
                     .as_deref()
                     .and_then(|table| relation_owner(schema, *namespace, table))
                     .unwrap_or_else(|| connection.current_role());
-                emit_class_row_insert(
+                let oid_reg = emit_class_row_insert(
                     program,
                     &cursors,
                     *namespace,
@@ -697,15 +708,42 @@ pub(crate) fn translate_catalog_changes(
                     *kind,
                     table.as_deref(),
                     owner,
-                )
+                );
+                if let (RelationKind::Table, Some(oid_reg)) = (kind, oid_reg) {
+                    created_table_oid_regs.insert((*namespace, name.as_str()), oid_reg);
+                }
+            }
+            CatalogChange::SetColumns {
+                namespace,
+                name,
+                table,
+            } => {
+                let oid = match created_table_oid_regs.get(&(*namespace, name.as_str())) {
+                    Some(oid_reg) => TableOid::Register(*oid_reg),
+                    None => {
+                        // An engine table has no row and no columns here.
+                        let Some(class) = class_catalog(schema)
+                            .and_then(|catalog| catalog.get_by_name(*namespace, name))
+                        else {
+                            continue;
+                        };
+                        TableOid::Stored(class.oid)
+                    }
+                };
+                emit_set_table_columns(program, schema, oid, table);
             }
             CatalogChange::Drop { namespace, name } => {
                 // An engine relation has no row and nothing to do.
-                if class_catalog(schema)
-                    .and_then(|catalog| catalog.get_by_name(*namespace, name))
-                    .is_none()
-                {
+                let Some(class) =
+                    class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
+                else {
                     continue;
+                };
+                if matches!(
+                    class.relkind,
+                    RelationKind::Table | RelationKind::MaterializedView
+                ) {
+                    emit_delete_table_columns(program, schema, class.oid);
                 }
                 emit_class_row_delete(program, &cursors, *namespace, name)
             }
@@ -870,7 +908,9 @@ pub(crate) fn translate_catalog_changes(
                 let Some(class) =
                     class_catalog(schema).and_then(|catalog| catalog.get_by_name(*namespace, name))
                 else {
-                    if schema.get_btree_table(*namespace, name).is_some() {
+                    if schema.get_btree_table(*namespace, name).is_some()
+                        && !is_stored_catalog_table(*namespace, name)
+                    {
                         return Err(sqlstate_error(
                             SQLSTATE_FEATURE_NOT_SUPPORTED,
                             format!("{statement} on internal table {name} is not supported"),
@@ -1030,8 +1070,6 @@ pub(crate) fn translate_catalog_changes(
                 };
                 emit_class_row_set_policies(program, &cursors, *namespace, name, stored, change);
             }
-            // No catalog of this frontend has the columns of a table.
-            CatalogChange::SetColumns { .. } => {}
             CatalogChange::CreateRole { .. } => {
                 return Err(LimboError::InternalError(
                     "CREATE ROLE reached the relation catalog".to_string(),
@@ -1212,8 +1250,8 @@ fn open_class_table_for_writing(
 }
 
 /// Inserts the class row of relation `name` of `namespace` under the next
-/// oid, owned by `owner`; `table` is the table an index is on. Engine
-/// relations get no row.
+/// oid, owned by `owner`; `table` is the table an index is on. Returns the
+/// register that holds the oid. Engine relations get no row and no oid.
 fn emit_class_row_insert(
     program: &mut ProgramBuilder,
     cursors: &ClassTableCursors,
@@ -1222,9 +1260,9 @@ fn emit_class_row_insert(
     kind: RelationKind,
     table: Option<&str>,
     owner: RoleId,
-) {
+) -> Option<usize> {
     if !is_user_relation_name(kind, name) {
-        return;
+        return None;
     }
     let oid_reg = emit_allocate_oid(program, cursors);
 
@@ -1298,6 +1336,7 @@ fn emit_class_row_insert(
         }),
         value_regs: vec![oid_reg, first_column_reg + 4],
     });
+    Some(oid_reg)
 }
 
 /// Puts the next oid in the returned register and records it as the
@@ -1966,5 +2005,6 @@ pub(crate) fn initialize_schema(
         statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
         statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
     }
+    statements.extend(crate::attributes::initialize_statements(schema));
     Ok(statements)
 }
