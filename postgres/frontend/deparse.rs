@@ -619,7 +619,7 @@ fn number_text(value: &str) -> Option<Printed> {
 /// The negation of the number `positive`, which PostgreSQL prints quoted
 /// with its type, such as `'-1'::integer`. The type is the one the negative
 /// number fits in: `-2147483648` is an `integer`, though `2147483648` is a
-/// `bigint`. `-0` is printed as `0`.
+/// `bigint`. `-0` is printed as `0`, and `-0.0` as `0.0`.
 fn negative_number_text(positive: &str) -> Option<Printed> {
     if let Ok(number) = format!("-{positive}").parse::<i64>() {
         if number == 0 {
@@ -635,6 +635,10 @@ fn negative_number_text(positive: &str) -> Option<Printed> {
     let positive = number_text(positive)?;
     if positive.ty != PgType::Numeric {
         return None;
+    }
+    let is_zero = positive.text.chars().all(|c| c == '0' || c == '.');
+    if is_zero {
+        return Some(positive);
     }
     Some(Printed::constant(
         format!("'-{}'::numeric", positive.text),
@@ -713,6 +717,9 @@ mod tests {
             ("current_user () = 'x'", "(CURRENT_USER = 'x'::name)"),
             ("\"id\" = 2147483648", "(id = '2147483648'::bigint)"),
             ("\"id\" > - 0", "(id > 0)"),
+            ("\"price\" > - 0.0", "(price > 0.0)"),
+            ("\"price\" > - 0.00", "(price > 0.00)"),
+            ("\"price\" > - 0.10", "(price > '-0.10'::numeric)"),
             ("\"id\" > - 2147483648", "(id > '-2147483648'::integer)"),
             ("\"n\" > - 2147483649", "(n > '-2147483649'::bigint)"),
             (
@@ -767,6 +774,9 @@ mod tests {
             ("-3000000000", "'-3000000000'::bigint"),
             ("-9223372036854775808", "'-9223372036854775808'::bigint"),
             ("-1.5", "'-1.5'::numeric"),
+            ("-0.0", "0.0"),
+            ("-0.00", "0.00"),
+            ("-0.10", "'-0.10'::numeric"),
         ] {
             let default = ast::Expr::Literal(ast::Literal::Numeric(stored.to_string()));
             assert_eq!(
