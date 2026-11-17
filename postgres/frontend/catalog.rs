@@ -274,8 +274,15 @@ impl Dialect for PostgresDialect {
                     program, schema, connection, change,
                 );
             }
-            // The frontend stores nothing for a schema itself.
-            [turso_core::CatalogChange::DropNamespace { .. }] => return Ok(()),
+            [turso_core::CatalogChange::Grant {
+                target: turso_core::GrantTarget::Namespace(_),
+                ..
+            }
+            | turso_core::CatalogChange::DropNamespace { .. }, ..] => {
+                return crate::namespaces::translate_namespace_changes(
+                    program, schema, connection, changes,
+                );
+            }
             _ => {}
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
@@ -844,17 +851,22 @@ impl SnapshotRows for PgNamespaceTable {
             .map(|(id, name)| (name.to_string(), id))
             .collect();
         stored.sort();
+        let roles = connection_roles(conn);
         for (name, id) in stored {
-            let (owner, acl) = if name == "public" {
-                (
-                    PG_DATABASE_OWNER_OID,
-                    Value::build_text(
-                        "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
-                    ),
-                )
+            // As in PostgreSQL, initdb gave public its list, and any other
+            // schema has none until a GRANT or REVOKE changes it.
+            let acl = if name == "public" {
+                Some(crate::namespaces::namespace_acl(&schema, id, &name))
             } else {
-                (10, Value::Null)
+                crate::namespaces::stored_namespace_acl(&schema, id).cloned()
             };
+            let acl = match acl {
+                Some(acl) => Value::build_text(acl.display_text(&|oid| {
+                    role_name_by_oid(&roles, oid).unwrap_or_else(|| oid.to_string())
+                })),
+                None => Value::Null,
+            };
+            let owner = crate::namespaces::namespace_owner_oid(&name);
             rows.push(vec![
                 Value::from_i64(namespace_oid(&schema, id)),
                 Value::build_text(name),

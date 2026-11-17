@@ -554,16 +554,6 @@ expect error {
     GRANT ... GRANTED BY is not supported
 }
 
-@skip-if postgres "PostgreSQL supports GRANT on schemas"
-test grant-on-a-schema-is-not-supported {
-    CREATE ROLE gx_schema_user;
-    GRANT USAGE ON SCHEMA public TO gx_schema_user;
-}
-@sqlstate 0A000
-expect error {
-    GRANT on objects other than tables and sequences is not supported
-}
-
 @skip-if postgres "PostgreSQL supports GRANT on functions"
 test grant-on-a-function-is-not-supported {
     CREATE ROLE gx_function_user;
@@ -571,7 +561,7 @@ test grant-on-a-function-is-not-supported {
 }
 @sqlstate 0A000
 expect error {
-    GRANT on objects other than tables and sequences is not supported
+    GRANT on objects other than tables, sequences and schemas is not supported
 }
 
 @skip-if postgres "PostgreSQL supports ALTER DEFAULT PRIVILEGES"

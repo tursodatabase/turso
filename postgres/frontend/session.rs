@@ -1887,9 +1887,27 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
 /// the tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
 /// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
-/// there are none.
+/// there are none. `ON SCHEMA` names the schemas themselves.
 fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<DeferredStatement>> {
+    let grant_statement = |objects| DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            revoke: stmt.revoke,
+            objects,
+            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
+        })),
+        context: CommandContext::Default,
+    };
     let relations = match &stmt.tables {
+        PgGrantTables::Schemas(schemas) => {
+            let namespaces = schemas
+                .iter()
+                .map(|schema| grantable_schema(conn, stmt, schema))
+                .collect::<Result<_>>()?;
+            return Ok(vec![grant_statement(ast::GrantObjects::Namespaces {
+                privileges: stmt.privileges.clone(),
+                namespaces,
+            })]);
+        }
         PgGrantTables::Named(tables) => tables.clone(),
         PgGrantTables::AllInSchemas(schemas) => {
             let mut relations = Vec::new();
@@ -1947,18 +1965,27 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
         }
         return Ok(Vec::new());
     }
-    Ok(vec![DeferredStatement {
-        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
-            revoke: stmt.revoke,
-            objects: ast::GrantObjects::Relations {
-                privileges: stmt.privileges.clone(),
-                on_sequences: stmt.on_sequences,
-                relations,
-            },
-            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
-        })),
-        context: CommandContext::Default,
-    }])
+    Ok(vec![grant_statement(ast::GrantObjects::Relations {
+        privileges: stmt.privileges.clone(),
+        on_sequences: stmt.on_sequences,
+        relations,
+    })])
+}
+
+/// The namespace of `schema`, which a GRANT or REVOKE names after `ON
+/// SCHEMA`. The schemas of the system catalogs are not stored, so they have
+/// no privileges to change: every role uses them.
+fn grantable_schema(conn: &Connection, stmt: &PgGrantStmt, schema: &str) -> Result<ast::Name> {
+    check_schema_exists(conn, schema)?;
+    let schema = schema.to_lowercase();
+    if matches!(schema.as_str(), "pg_catalog" | "information_schema") {
+        let statement = if stmt.revoke { "REVOKE" } else { "GRANT" };
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{statement} on system schema {schema} is not supported"),
+        ));
+    }
+    Ok(ast::Name::exact(schema))
 }
 
 fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {

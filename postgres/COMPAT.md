@@ -429,7 +429,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT` and `REVOKE ... ON ALL TABLES IN SCHEMA` and `... ON ALL SEQUENCES IN SCHEMA` change the privileges in each relation's `pg_class.relacl`; functions are not supported |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | 🟡 Partial | `GRANT` and `REVOKE ... ON ALL TABLES IN SCHEMA` and `... ON ALL SEQUENCES IN SCHEMA` change the privileges in each relation's `pg_class.relacl`; `GRANT` and `REVOKE ... ON SCHEMA` change the schema's `USAGE` and `CREATE` privileges in `pg_namespace.nspacl`; functions are not supported |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |

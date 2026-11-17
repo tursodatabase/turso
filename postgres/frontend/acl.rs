@@ -72,6 +72,10 @@ impl Privileges {
     /// `ACL_ALL_RIGHTS_SEQUENCE`.
     pub(crate) const SEQUENCE: Self = Self::SELECT.union(Self::UPDATE).union(Self::USAGE);
 
+    /// The privileges a schema's owner has by default: PostgreSQL's
+    /// `ACL_ALL_RIGHTS_SCHEMA`.
+    pub(crate) const SCHEMA: Self = Self::USAGE.union(Self::CREATE);
+
     /// Every privilege that a relation of `kind` has.
     fn all_on(kind: RelationKind) -> Self {
         match kind {
@@ -88,7 +92,11 @@ impl Privileges {
     /// privilege of the kind, and a privilege the kind does not have, such
     /// as INSERT on a sequence, is left out.
     pub(crate) fn named_on(kind: RelationKind, privileges: &[ast::Privilege]) -> Self {
-        let all = Self::all_on(kind);
+        Self::named_among(Self::all_on(kind), privileges)
+    }
+
+    /// [`Self::named_on`] for an object that has the privileges `all`.
+    pub(crate) fn named_among(all: Self, privileges: &[ast::Privilege]) -> Self {
         let named = privileges.iter().fold(Self::empty(), |named, privilege| {
             named
                 | match privilege {
@@ -178,7 +186,7 @@ pub(crate) fn acl_role_name(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// The access control list of a relation.
+/// The access control list of a relation or of a schema.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Acl {
     items: Vec<AclItem>,
@@ -188,10 +196,16 @@ impl Acl {
     /// The list a relation has before any `GRANT`, which PostgreSQL's
     /// `acldefault` gives: the owner holds every privilege of the kind.
     pub(crate) fn default_for(kind: RelationKind, owner: i64) -> Self {
+        Self::of_owner(owner, Privileges::all_on(kind))
+    }
+
+    /// The list in which `owner` gave itself `privileges` and nobody else
+    /// has any.
+    pub(crate) fn of_owner(owner: i64, privileges: Privileges) -> Self {
         Self {
             items: vec![AclItem {
                 grantee: owner,
-                privileges: Privileges::all_on(kind),
+                privileges,
                 grantor: owner,
             }],
         }

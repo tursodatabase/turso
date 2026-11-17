@@ -1,7 +1,12 @@
-# What the privileges on a schema let a role do through the PostgreSQL
-# frontend. Creating, renaming or indexing a table needs CREATE on its schema.
+# GRANT and REVOKE on schemas through the PostgreSQL frontend, and what the
+# privileges on a schema let a role do. Creating, renaming or indexing a table
+# needs CREATE on its schema.
 # PostgreSQL roles belong to the whole server, not to one database, so every
 # test uses its own role names.
+#
+# The privileges are stored in the schema's access control list, which
+# pg_namespace.nspacl shows in PostgreSQL's aclitem[] form: U is USAGE and C
+# is CREATE.
 
 @database :memory:
 
@@ -56,4 +61,199 @@ test owner-may-not-index-without-create-on-the-schema {
 @sqlstate 42501
 expect error {
     permission denied for schema public
+}
+
+test grant-usage-on-schema-is-stored-in-its-list {
+    CREATE ROLE sg_usage;
+    CREATE SCHEMA sg_usage_s;
+    GRANT USAGE ON SCHEMA sg_usage_s TO sg_usage;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_usage_s';
+}
+expect {
+    {postgres=UC/postgres,sg_usage=U/postgres}
+}
+
+test grant-create-on-schema-is-stored-in-its-list {
+    CREATE ROLE sg_create;
+    CREATE SCHEMA sg_create_s;
+    GRANT CREATE ON SCHEMA sg_create_s TO sg_create;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_create_s';
+}
+expect {
+    {postgres=UC/postgres,sg_create=C/postgres}
+}
+
+test grant-all-on-schema-gives-usage-and-create {
+    CREATE ROLE sg_all;
+    CREATE SCHEMA sg_all_s;
+    GRANT ALL PRIVILEGES ON SCHEMA sg_all_s TO sg_all;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_all_s';
+}
+expect {
+    {postgres=UC/postgres,sg_all=UC/postgres}
+}
+
+test grant-on-several-schemas-to-several-roles {
+    CREATE ROLE sg_many_a;
+    CREATE ROLE sg_many_b;
+    CREATE SCHEMA sg_many_s;
+    CREATE SCHEMA sg_many_t;
+    GRANT USAGE ON SCHEMA sg_many_s, sg_many_t TO sg_many_a, sg_many_b, PUBLIC;
+    SELECT nspname, nspacl FROM pg_namespace WHERE nspname LIKE 'sg_many_%' ORDER BY nspname;
+}
+expect {
+    sg_many_s|{postgres=UC/postgres,sg_many_a=U/postgres,sg_many_b=U/postgres,=U/postgres}
+    sg_many_t|{postgres=UC/postgres,sg_many_a=U/postgres,sg_many_b=U/postgres,=U/postgres}
+}
+
+test second-grant-adds-to-the-entry-of-the-role {
+    CREATE ROLE sg_twice;
+    CREATE SCHEMA sg_twice_s;
+    GRANT USAGE ON SCHEMA sg_twice_s TO sg_twice;
+    GRANT CREATE ON SCHEMA sg_twice_s TO sg_twice;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_twice_s';
+}
+expect {
+    {postgres=UC/postgres,sg_twice=UC/postgres}
+}
+
+test schema-has-no-list-before-any-grant {
+    CREATE SCHEMA sg_untouched_s;
+    SELECT coalesce(nspacl::text, 'null') FROM pg_namespace WHERE nspname = 'sg_untouched_s';
+}
+expect {
+    null
+}
+
+test grant-on-public-adds-to-its-list {
+    CREATE ROLE sg_public;
+    GRANT CREATE ON SCHEMA public TO sg_public;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'public';
+}
+expect {
+    {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,sg_public=C/pg_database_owner}
+}
+
+test revoke-on-schema-takes-the-privilege-out-of-the-list {
+    CREATE ROLE sv_revoke;
+    CREATE SCHEMA sv_revoke_s;
+    GRANT ALL ON SCHEMA sv_revoke_s TO sv_revoke;
+    REVOKE CREATE ON SCHEMA sv_revoke_s FROM sv_revoke;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sv_revoke_s';
+}
+expect {
+    {postgres=UC/postgres,sv_revoke=U/postgres}
+}
+
+test revoke-of-every-privilege-drops-the-entry {
+    CREATE ROLE sv_revoke_all;
+    CREATE SCHEMA sv_revoke_all_s;
+    GRANT USAGE ON SCHEMA sv_revoke_all_s TO sv_revoke_all;
+    REVOKE ALL ON SCHEMA sv_revoke_all_s FROM sv_revoke_all;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sv_revoke_all_s';
+}
+expect {
+    {postgres=UC/postgres}
+}
+
+test revoke-of-a-privilege-never-granted-stores-the-default-list {
+    CREATE ROLE sv_never;
+    CREATE SCHEMA sv_never_s;
+    REVOKE USAGE ON SCHEMA sv_never_s FROM sv_never;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sv_never_s';
+}
+expect {
+    {postgres=UC/postgres}
+}
+
+test revoke-usage-on-public-from-public {
+    REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'public';
+}
+expect {
+    {pg_database_owner=UC/pg_database_owner}
+}
+
+test schema-created-after-a-drop-does-not-get-the-dropped-list {
+    CREATE ROLE sg_dropped;
+    CREATE SCHEMA sg_dropped_s;
+    GRANT USAGE ON SCHEMA sg_dropped_s TO sg_dropped;
+    DROP SCHEMA sg_dropped_s;
+    CREATE SCHEMA sg_dropped_t;
+    SELECT coalesce(nspacl::text, 'null') FROM pg_namespace WHERE nspname = 'sg_dropped_t';
+}
+expect {
+    null
+}
+
+test grant-on-missing-schema-fails {
+    CREATE ROLE sg_missing_schema;
+    GRANT USAGE ON SCHEMA sg_no_such_schema TO sg_missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    schema "sg_no_such_schema" does not exist
+}
+
+test grant-on-schema-to-missing-role-fails {
+    CREATE SCHEMA sg_missing_role_s;
+    GRANT USAGE ON SCHEMA sg_missing_role_s TO sg_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "sg_no_such_role" does not exist
+}
+
+test grant-on-schema-checks-the-schema-before-the-role {
+    GRANT USAGE ON SCHEMA sg_no_such_schema_2 TO sg_no_such_role_2;
+}
+@sqlstate 3F000
+expect error {
+    schema "sg_no_such_schema_2" does not exist
+}
+
+test grant-of-a-table-privilege-on-schema-fails {
+    CREATE ROLE sg_select;
+    CREATE SCHEMA sg_select_s;
+    GRANT SELECT ON SCHEMA sg_select_s TO sg_select;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type SELECT for schema
+}
+
+test role-without-privileges-on-schema-may-not-grant {
+    CREATE ROLE sg_stranger;
+    CREATE ROLE sg_stranger_friend;
+    CREATE SCHEMA sg_stranger_s;
+    SET ROLE sg_stranger;
+    GRANT USAGE ON SCHEMA sg_stranger_s TO sg_stranger_friend;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sg_stranger_s
+}
+
+test role-with-usage-but-no-grant-option-grants-nothing {
+    CREATE ROLE sg_user;
+    CREATE ROLE sg_user_friend;
+    CREATE SCHEMA sg_user_s;
+    GRANT USAGE ON SCHEMA sg_user_s TO sg_user;
+    SET ROLE sg_user;
+    GRANT USAGE ON SCHEMA sg_user_s TO sg_user_friend;
+    RESET ROLE;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_user_s';
+}
+expect {
+    {postgres=UC/postgres,sg_user=U/postgres}
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its system schemas"
+test grant-on-a-system-schema-is-not-supported {
+    CREATE ROLE sg_system;
+    GRANT USAGE ON SCHEMA pg_catalog TO sg_system;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on system schema pg_catalog is not supported
 }

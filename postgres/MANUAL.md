@@ -314,7 +314,7 @@ SELECT rolname FROM pg_roles;
 (2 rows)
 ```
 
-### `GRANT` — give roles privileges on tables
+### `GRANT` — give roles privileges on tables, sequences and schemas
 
 **Synopsis:**
 
@@ -328,13 +328,17 @@ GRANT { { USAGE | SELECT | UPDATE } [, ...] | ALL [ PRIVILEGES ] }
     ON { SEQUENCE sequence_name [, ...] | ALL SEQUENCES IN SCHEMA schema_name [, ...] }
     TO role_specification [, ...]
 
+GRANT { { USAGE | CREATE } [, ...] | ALL [ PRIVILEGES ] }
+    ON SCHEMA schema_name [, ...]
+    TO role_specification [, ...]
+
 where role_specification is:
     role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
 ```
 
 **Description:**
 
-`GRANT` gives roles privileges on tables and sequences. `GRANT SELECT`
+`GRANT` gives roles privileges on tables, sequences and schemas. `GRANT SELECT`
 lets roles read tables. A role that is not a superuser reads
 a table, view or materialized view only when it owns it or `SELECT` on it
 was granted to it or to `PUBLIC`, and an owner that revoked `SELECT` from
@@ -356,6 +360,16 @@ the first `GRANT` or `REVOKE`, when the owner has every privilege and nobody
 else has any, as in PostgreSQL. `pg_class` does not list views yet, so a view's list
 is stored but not shown.
 
+`GRANT ... ON SCHEMA` gives roles the privileges of schemas, `USAGE` and
+`CREATE`. They are stored in the database file, in the schema's access
+control list, which `pg_namespace.nspacl` shows: after `GRANT USAGE ON
+SCHEMA api TO reader`, it reads `{postgres=UC/postgres,reader=U/postgres}`.
+As in PostgreSQL, the list is `NULL` until the first `GRANT` or `REVOKE`,
+when the owner has both privileges and nobody else has any, except that
+`public` starts with
+`{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`, in which
+every role has `USAGE`.
+
 **Parameters:**
 
 - `table_name`: The name of an existing table, view, materialized view or
@@ -365,9 +379,11 @@ is stored but not shown.
   with its schema. A relation that is not a sequence fails with `is not a
   sequence` (SQLSTATE 42809).
 - `schema_name`: The name of an existing schema. `ALL TABLES IN SCHEMA` names
-  every table in it, and `ALL SEQUENCES IN SCHEMA` every sequence.
-- `ALL [ PRIVILEGES ]`: Every privilege of the relation's kind: `arwdDxtm`
-  for a table, and `rwU` (`SELECT`, `UPDATE`, `USAGE`) for a sequence. As in
+  every table in it, `ALL SEQUENCES IN SCHEMA` every sequence, and `SCHEMA`
+  the schema itself.
+- `ALL [ PRIVILEGES ]`: Every privilege of the object's kind: `arwdDxtm`
+  for a table, `rwU` (`SELECT`, `UPDATE`, `USAGE`) for a sequence, and `UC`
+  (`USAGE`, `CREATE`) for a schema. As in
   PostgreSQL, a privilege that a sequence does not have, such as `INSERT`, is
   left out when it is granted on one.
 - `role_name`: The name of an existing role.
@@ -380,7 +396,8 @@ PostgreSQL. The tables are checked before the roles. A privilege that tables
 do not have, `USAGE`, fails with `invalid privilege type` (SQLSTATE 0LP01)
 on a table, though `GRANT USAGE ON s`, without `SEQUENCE`, works for a
 sequence `s`, as in PostgreSQL. A privilege that sequences do not have, such
-as `INSERT`, fails the same way with `SEQUENCE`.
+as `INSERT`, fails the same way with `SEQUENCE`, and so does a privilege
+that schemas do not have, such as `SELECT`, with `SCHEMA`.
 
 As in PostgreSQL, the table's owner may grant, and a superuser grants as the
 owner, so the owner is the grantor in the list either way. Any other role
@@ -393,6 +410,15 @@ nothing is stored for it, since every role reads it already. `GRANT` on one
 of the engine's own tables, such as `pg_catalog.__turso_internal_authid`,
 fails as not supported (SQLSTATE 0A000). `ALTER ... OWNER TO` puts the new owner in the
 new owner's place in the list, and a rename keeps it.
+
+Only a superuser creates a schema, so a schema's owner is the built-in
+superuser, or `pg_database_owner` for `public`, and a superuser grants on a
+schema as its owner. Any other role gets `permission denied for schema`
+(SQLSTATE 42501), unless the list gives it a privilege on the schema, when
+the statement succeeds and stores nothing, as in PostgreSQL, which warns.
+`GRANT ... ON SCHEMA` `pg_catalog` or `information_schema` fails as not
+supported (SQLSTATE 0A000): every role uses them, and they have no list.
+`DROP SCHEMA` drops the schema's list with it.
 
 `SELECT`, `INSERT`, `UPDATE` and `DELETE` let a role read and write the
 table, as in PostgreSQL. A statement that reads the table's columns also
@@ -432,9 +458,11 @@ CREATE ROLE reader;
 CREATE TABLE accounts (id int);
 GRANT SELECT ON accounts TO reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC;
+CREATE SCHEMA api;
+GRANT USAGE ON SCHEMA api TO reader;
 ```
 
-### `REVOKE` — take privileges on tables away from roles
+### `REVOKE` — take privileges on tables, sequences and schemas away from roles
 
 **Synopsis:**
 
@@ -450,6 +478,11 @@ REVOKE { { USAGE | SELECT | UPDATE } [, ...] | ALL [ PRIVILEGES ] }
     FROM role_specification [, ...]
     [ CASCADE | RESTRICT ]
 
+REVOKE { { USAGE | CREATE } [, ...] | ALL [ PRIVILEGES ] }
+    ON SCHEMA schema_name [, ...]
+    FROM role_specification [, ...]
+    [ CASCADE | RESTRICT ]
+
 where role_specification is:
     role_name | PUBLIC | CURRENT_ROLE | CURRENT_USER | SESSION_USER
 ```
@@ -458,14 +491,14 @@ where role_specification is:
 
 `REVOKE` takes privileges that `GRANT` gave away from roles. It names the
 same tables, sequences, schemas and roles as `GRANT`, with the same errors,
-and changes the same access control list, which `pg_class.relacl` shows. As
-in PostgreSQL:
+and changes the same access control list, which `pg_class.relacl` shows for
+a relation and `pg_namespace.nspacl` for a schema. As in PostgreSQL:
 
 - Privileges that a role was never given are left alone, without an error.
 - An entry left without privileges is dropped from the list, so revoking
   every privilege from the owner leaves the list empty, `{}`.
-- A relation whose list is `NULL` first gets the default list, in which
-  the owner has every privilege, so the list is no longer `NULL` even when
+- A relation or schema whose list is `NULL` first gets the default list, in
+  which the owner has every privilege, so the list is no longer `NULL` even when
   nothing was taken away. A statement that names no privilege of the
   relation, such as `REVOKE INSERT ON s` on a sequence `s`, leaves the list
   as it is.
@@ -500,6 +533,7 @@ list that a `REVOKE` could change.
 ```sql
 REVOKE INSERT, UPDATE ON accounts FROM reader;
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
+REVOKE CREATE ON SCHEMA api FROM reader;
 REVOKE USAGE ON SEQUENCE accounts_id_seq FROM reader;
 ```
 
