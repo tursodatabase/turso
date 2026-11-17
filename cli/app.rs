@@ -100,6 +100,14 @@ pub struct Opts {
         help = "Most databases held open at once under --sync-dir, one connection each; more may exist on disk"
     )]
     pub sync_max_databases: usize,
+    #[clap(
+        long,
+        requires = "sync_server",
+        default_value_t = default_sync_workers(),
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=MAX_SYNC_WORKERS),
+        help = "Threads handling sync server requests at once; requests to the same database still run one at a time"
+    )]
+    pub sync_workers: usize,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -130,6 +138,16 @@ pub struct Opts {
         help = "Enable unsafe testing features (e.g. sqlite_dbpage writes)"
     )]
     pub unsafe_testing: bool,
+}
+
+const MAX_SYNC_WORKERS: u64 = 1024;
+
+fn default_sync_workers() -> usize {
+    const MAX_DEFAULT_WORKERS: usize = 16;
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_DEFAULT_WORKERS)
 }
 
 const PROMPT: &str = "turso> ";
@@ -2406,6 +2424,22 @@ fn normalize_db_path(db_file: String) -> String {
 mod tests {
     use super::*;
     use turso_core::SessionRole;
+
+    #[test]
+    fn sync_workers_above_the_maximum_are_rejected_at_parse_time() {
+        let parse = |workers: &str| {
+            Opts::try_parse_from([
+                "tursodb",
+                "--sync-server",
+                "127.0.0.1:0",
+                "--sync-workers",
+                workers,
+            ])
+        };
+        assert_eq!(parse("1024").unwrap().sync_workers, 1024);
+        assert!(parse("1025").is_err());
+        assert!(parse("18446744073709551615").is_err());
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
