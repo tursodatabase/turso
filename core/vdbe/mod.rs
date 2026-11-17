@@ -1364,8 +1364,16 @@ impl ProgramState {
         Some(format!("{:?}", self.registers[i]))
     }
 
+    /// Stops the statement at the next instruction it runs, after any IO it
+    /// is waiting for finishes. SQLite makes the same check at the start of
+    /// sqlite3VdbeExec. Does nothing once Halt has started finishing the
+    /// statement (see `halt_in_progress`): a commit that has started finishes.
     pub fn interrupt(&mut self) {
+        if self.halt_in_progress {
+            return;
+        }
         self.execution_state = ProgramExecutionState::Interrupting;
+        self.check_countdown = 1;
     }
 
     pub fn is_interrupted(&self) -> bool {
@@ -2592,7 +2600,11 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
-        state.execution_state = ProgramExecutionState::Running;
+        // An interrupt requested between two steps stays pending until the
+        // next instruction checks it.
+        if !state.is_interrupted() {
+            state.execution_state = ProgramExecutionState::Running;
+        }
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         let result = if enable_tracing || vdbe_trace {
