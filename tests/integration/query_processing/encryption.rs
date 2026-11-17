@@ -1031,17 +1031,15 @@ fn test_attach_encrypted_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
 /// database that can be read without any encryption keys.
 #[turso_macros::test]
 fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     use tempfile::TempDir;
 
     let _ = env_logger::try_init();
     let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
-    let cipher = "aegis256";
 
     // 1. Create an encrypted source database and insert data
     {
         let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, content TEXT)")?;
         conn.execute("INSERT INTO secret_data (content) VALUES ('this was encrypted')")?;
@@ -1054,33 +1052,23 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // 2. Demonstrate that the encrypted source CANNOT be read or vacuumed without keys
     {
-        let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
-        let unauthorized_conn = unauthorized_db.connect_limbo();
-
-        // Reading should fail
-        let result = unauthorized_conn.execute("SELECT * FROM secret_data");
+        let result = Database::open(
+            tmp_db.io.clone(),
+            tmp_db.path.to_str().unwrap(),
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(tmp_db.db_opts),
+        );
         assert_that!(result)
-            .described_as("reading an encrypted database as plaintext")
             .err()
             .display_string()
-            .contains("Corrupt database");
-
-        // VACUUM INTO should also fail because it cannot read the source schema/data
-        let fail_path = dest_dir.path().join("should_fail.db");
-        let fail_path_str = fail_path.to_str().unwrap();
-        let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
-        assert_that!(result)
-            .described_as("VACUUM INTO from an encrypted database with no keys")
-            .err()
-            .display_string()
-            .contains("Corrupt database");
+            .contains("encrypted database requires an encryption key");
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
     {
-        let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+        let conn = tmp_db.db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(EncryptionKey::from_hex_string(hexkey)?)),
+        )?;
         conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
     }
 
@@ -1095,15 +1083,14 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
 
     // 5. Prove the destination has the same content as the encrypted source.
-    // Close the source first: it was encrypted with PRAGMAs, so its open `Database`
-    // has no cipher set and cannot take a key from a new connection.
+    // Close the source first.
     let source_path = tmp_db.path.clone();
     drop(tmp_db);
     let source_hash = turso_dbhash::hash_database(
         source_path.to_str().unwrap(),
         &turso_dbhash::DbHashOptions {
             encryption: Some(EncryptionOpts {
-                cipher: cipher.to_string(),
+                cipher: CIPHER_A.to_string(),
                 hexkey: hexkey.to_string(),
             }),
             ..Default::default()
@@ -1487,15 +1474,11 @@ fn test_inplace_vacuum_non_4k_encryption(_tmp_db: TempDatabase) -> anyhow::Resul
     let _ = env_logger::try_init();
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_page_size(512)
         .build();
 
     let conn = tmp_db.connect_limbo();
-    // This test covers VACUUM, so create the source DB without using the issue
-    // #7375 PRAGMA order.
-    conn.execute("PRAGMA page_size = 512")?;
-    conn.execute(format!("PRAGMA cipher = '{CIPHER_A}'"))?;
-    conn.execute(format!("PRAGMA hexkey = '{KEY_A}'"))?;
-
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")?;
     for i in 0..100i64 {
         conn.execute(format!("INSERT INTO t VALUES({i}, randomblob(300))"))?;
