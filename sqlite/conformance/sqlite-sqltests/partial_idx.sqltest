@@ -1947,6 +1947,89 @@ expect error {
     no query solution
 }
 
+setup partial_index_delete_all_schema {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b > 0;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+}
+
+# SQLite erases the whole table without planning a scan, so it never checks
+# whether the INDEXED BY index is usable.
+@setup partial_index_delete_all_schema
+@cross-check-integrity
+test partial-index-indexed-by-delete-without-where-erases-table {
+    DELETE FROM t1 INDEXED BY t1_a;
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test partial-index-indexed-by-delete-without-where-ignores-unenforced-foreign-key {
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE t1(a PRIMARY KEY, b);
+    CREATE INDEX t1_b ON t1(b) WHERE b > 0;
+    CREATE TABLE t2(a REFERENCES t1(a));
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    DELETE FROM t1 INDEXED BY t1_b;
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
+# SQLite plans a scan for each of the DELETEs below, and the scan cannot use
+# the index.
+@setup partial_index_delete_all_schema
+test partial-index-indexed-by-delete-with-constant-where-rejected {
+    DELETE FROM t1 INDEXED BY t1_a WHERE 1;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_delete_all_schema
+test partial-index-indexed-by-delete-returning-rejected {
+    DELETE FROM t1 INDEXED BY t1_a RETURNING a;
+}
+expect error {
+    no query solution
+}
+
+@requires trigger "the trigger makes SQLite delete row by row"
+@setup partial_index_delete_all_schema
+test partial-index-indexed-by-delete-with-trigger-rejected {
+    CREATE TABLE t2(a);
+    CREATE TRIGGER t1_delete AFTER DELETE ON t1 BEGIN INSERT INTO t2 VALUES (old.a); END;
+    DELETE FROM t1 INDEXED BY t1_a;
+}
+expect error {
+    no query solution
+}
+
+test partial-index-indexed-by-delete-from-foreign-key-parent-rejected {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t1(a PRIMARY KEY, b);
+    CREATE INDEX t1_b ON t1(b) WHERE b > 0;
+    CREATE TABLE t2(a REFERENCES t1(a));
+    DELETE FROM t1 INDEXED BY t1_b;
+}
+expect error {
+    no query solution
+}
+
+test partial-index-indexed-by-delete-from-foreign-key-child-rejected {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t1(a PRIMARY KEY);
+    CREATE TABLE t2(a REFERENCES t1(a), b);
+    CREATE INDEX t2_b ON t2(b) WHERE b > 0;
+    DELETE FROM t2 INDEXED BY t2_b;
+}
+expect error {
+    no query solution
+}
+
 setup partial_index_multi_index_or_schema {
     CREATE TABLE indexed_items(a INT, b INT, c INT);
     CREATE INDEX indexed_items_a_partial_idx ON indexed_items(a) WHERE b = 1;

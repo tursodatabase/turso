@@ -297,7 +297,7 @@ pub fn prepare_delete_plan(
     } else {
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
-    let indexes = resolver.with_schema(database_id, |schema| {
+    let indexes: Vec<_> = resolver.with_schema(database_id, |schema| {
         schema
             .get_indices(namespace.id, table.get_name())
             .cloned()
@@ -381,6 +381,27 @@ pub fn prepare_delete_plan(
             )
         })
         .unwrap_or(false);
+
+    let has_foreign_keys = connection.foreign_keys_enabled()
+        && btree_table_for_triggers.as_ref().is_some_and(|bt| {
+            resolver.with_schema(database_id, |s| s.has_foreign_keys(namespace.id, &bt.name))
+        });
+    // SQLite erases the whole table with OP_Clear in this case. It does not
+    // call sqlite3WhereBegin() then, so it never checks whether it can use
+    // the INDEXED BY index.
+    let sqlite_erases_table_without_scan = where_clause.is_none()
+        && result_columns.is_empty()
+        && !has_delete_triggers
+        && !has_foreign_keys;
+    let joined_table = &mut table_references.joined_tables_mut()[0];
+    if let Some(ast::Indexed::IndexedBy(name)) = &joined_table.indexed {
+        let names_partial_index = indexes.iter().any(|index| {
+            index.where_clause.is_some() && index.name.eq_ignore_ascii_case(name.as_str())
+        });
+        if sqlite_erases_table_without_scan && names_partial_index {
+            joined_table.indexed = None;
+        }
+    }
 
     let mut safety = DmlSafety::default();
     if has_delete_triggers {

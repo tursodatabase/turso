@@ -63,11 +63,9 @@ fn table_has_fks(
     table_name: &str,
 ) -> bool {
     connection.foreign_keys_enabled()
-        && (resolver.with_schema(namespace.database_id, |s| {
-            s.has_child_fks(namespace.id, table_name)
-        }) || resolver.with_schema(namespace.database_id, |s| {
-            s.any_resolved_fks_referencing(namespace.id, table_name)
-        }))
+        && resolver.with_schema(namespace.database_id, |s| {
+            s.has_foreign_keys(namespace.id, table_name)
+        })
 }
 
 /// Check whether a table has dependent incremental materialized views.
