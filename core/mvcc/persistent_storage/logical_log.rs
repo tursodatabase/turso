@@ -153,11 +153,14 @@
 //! 3. checkpoint WAL pages into DB file;
 //! 4. fsync DB file (unless `SyncMode::Off`);
 //! 5. truncate logical log to 0 (regenerates salt in memory; header written with next frame);
-//! 6. fsync logical log (unless `SyncMode::Off`);
-//! 7. truncate WAL last.
+//! 6. truncate WAL last.
 //!
 //! WAL-last is intentional: if crash happens mid-checkpoint, WAL remains a safety net until
-//! logical-log cleanup is complete.
+//! the DB file is durable.
+//!
+//! The logical log needs no fsync after step 5. If a crash loses the truncation, the old
+//! frames come back, but their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery
+//! skips them.
 //!
 //! ### Frame Layout: Unencrypted vs Encrypted
 //!

@@ -182,8 +182,10 @@ fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> any
         before.get(AUX_PATH),
         "an attached MVCC checkpoint must write and fsync the attached database"
     );
-    assert!(
-        !io.has_unsynced_writes(&format!("{AUX_PATH}-log")),
+    let aux_log_path = format!("{AUX_PATH}-log");
+    assert_ne!(
+        after.get(&aux_log_path),
+        before.get(&aux_log_path),
         "an attached MVCC commit must fsync using aux.synchronous=FULL"
     );
     Ok(())

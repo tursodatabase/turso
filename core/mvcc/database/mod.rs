@@ -3537,7 +3537,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
             CommitState::SyncLogicalLog { end_ts } => {
                 // Skip fsync unless this transaction or a written group member uses FULL.
-                // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
+                // In NORMAL mode, the commit becomes durable when a checkpoint writes it to
+                // the database file and fsyncs that file.
                 if !self.log_sync_required() {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
