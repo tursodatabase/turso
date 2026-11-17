@@ -6835,11 +6835,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file(
-                "non-portable-first-write.db-log",
-                OpenFlags::Create,
-                false,
-            )
+            .open_file("non-portable-first-write.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -6909,6 +6905,17 @@ mod tests {
         );
     }
 
+    /// A log whose first write will use a version 2 (LML2) header, as logs
+    /// created by older versions do.
+    #[cfg(feature = "conn_raw_api")]
+    fn lml2_logical_log(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> LogicalLog {
+        let mut log = LogicalLog::new(file, io.clone(), None);
+        let header = LogHeader::new_with_version(io, LOG_VERSION_V2);
+        log.running_crc = derive_initial_crc(header.salt);
+        log.header = Some(header);
+        log
+    }
+
     #[cfg(feature = "conn_raw_api")]
     #[test]
     fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
@@ -6921,7 +6928,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
@@ -6984,7 +6991,7 @@ mod tests {
             inner: inner.clone(),
             fail_header_write: std::sync::atomic::AtomicBool::new(false),
         });
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
