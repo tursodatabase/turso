@@ -847,6 +847,98 @@ fn cached_page_codec_database_requires_codec_at_connection_time() {
 
 #[cfg(feature = "fs")]
 #[test]
+fn authenticated_wal_import_uses_the_target_page_codec() {
+    let directory = tempfile::tempdir().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let source_path = directory.path().join("source.db");
+    let target_path = directory.path().join("target.db");
+    let source_codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+        mask: 0x51,
+        reserved_bytes: 1,
+    });
+    let target_codec: Arc<dyn PageCodec> = Arc::new(XorPageCodec {
+        mask: 0xa3,
+        reserved_bytes: 1,
+    });
+    let source = open_with_page_codec(
+        io.clone(),
+        source_path.to_str().unwrap(),
+        source_codec.clone(),
+    );
+    let source_conn = source
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(source_codec))
+        .unwrap();
+    source_conn
+        .execute("CREATE TABLE test(value TEXT)")
+        .unwrap();
+    source_conn
+        .execute("INSERT INTO test VALUES ('imported through codec')")
+        .unwrap();
+    let target = open_with_page_codec(
+        io.clone(),
+        target_path.to_str().unwrap(),
+        target_codec.clone(),
+    );
+    let importer = target
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(target_codec.clone()))
+        .unwrap();
+    importer.execute("CREATE TABLE old(value)").unwrap();
+    importer
+        .checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    importer.wal_insert_begin().unwrap();
+    let mut frame = vec![0; 24 + importer.get_page_size().get() as usize];
+    for index in 1..=source_conn.wal_state().unwrap().max_frame {
+        source_conn.wal_get_frame(index, &mut frame).unwrap();
+        if u32::from_be_bytes(frame[..4].try_into().unwrap()) == 1 {
+            let reserved = frame[24 + 20];
+            frame[24 + 20] = reserved + 1;
+            let before = std::fs::read(format!("{}-wal", target_path.display())).unwrap();
+            assert!(importer.wal_insert_frame(index, &frame).is_err());
+            assert_eq!(
+                std::fs::read(format!("{}-wal", target_path.display())).unwrap(),
+                before
+            );
+            frame[24 + 20] = reserved;
+        }
+        importer.wal_insert_frame(index, &frame).unwrap();
+    }
+    importer.wal_insert_end(false).unwrap();
+    importer.force_reparse_schema().unwrap();
+    let rows = importer
+        .prepare("SELECT value FROM test")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![turso_core::Value::Text(
+            "imported through codec".into()
+        )]]
+    );
+    importer.close().unwrap();
+    drop((importer, target));
+    let target = open_with_page_codec(io, target_path.to_str().unwrap(), target_codec.clone());
+    let connection = target
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(target_codec))
+        .unwrap();
+    let rows = connection
+        .prepare("SELECT value FROM test")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![turso_core::Value::Text(
+            "imported through codec".into()
+        )]]
+    );
+}
+
+#[cfg(feature = "fs")]
+#[test]
 fn page_codec_transaction_recovers_after_wal_encode_failure() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir.path().join("codec-commit-retry.db");

@@ -4152,8 +4152,9 @@ mod database_tests {
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{PageCodec, PageCodecContext, PageCodecId};
     use crate::{
-        storage::database::DatabaseFile, DatabaseStorage, IOResult, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, IO,
+        storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
+        DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
+        OpenFlags, OpenOptions, PlatformIO, IO,
     };
 
     #[test]
@@ -4164,6 +4165,82 @@ mod database_tests {
         assert!(is_memory_like(""));
         assert!(!is_memory_like("memory.db"));
         assert!(!is_memory_like("file:memory.db"));
+    }
+
+    #[test]
+    fn new_connection_requires_completed_pager_authentication() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open(
+            io.clone(),
+            ":memory:publication-key",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(EncryptionOpts {
+                    cipher: "aegis256".into(),
+                    hexkey: "01".repeat(32),
+                }),
+        )
+        .unwrap();
+        for (byte, accepted) in [(None, false), (Some(1), true), (Some(2), false)] {
+            let key = byte.map(|byte| EncryptionKey::new_256([byte; 32]));
+            let mut state = super::DbHeaderReadState::default();
+            let pager = crate::util::IOExt::block(io.as_ref(), || {
+                db.init_pager(None, &mut state, key.as_ref(), None)
+            })
+            .unwrap();
+            if let Some(key) = &key {
+                pager.enable_encryption(true);
+                pager
+                    .set_encryption_context(crate::CipherMode::Aegis256, key)
+                    .unwrap();
+            }
+            assert!(!pager.is_authenticated());
+            assert!(db
+                .new_connection(
+                    crate::security::roles::RoleId::SUPERUSER,
+                    false,
+                    Arc::new(pager),
+                    key.clone(),
+                    0,
+                    super::ConnectionContext::default()
+                )
+                .is_err());
+
+            let pager = db._init(key.as_ref(), None);
+            assert_eq!(pager.is_ok(), accepted);
+            if let Ok(pager) = pager {
+                assert!(pager.is_authenticated());
+                assert!(db
+                    .new_connection(
+                        crate::security::roles::RoleId::SUPERUSER,
+                        false,
+                        Arc::new(pager),
+                        key,
+                        0,
+                        super::ConnectionContext::default()
+                    )
+                    .is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn pager_cannot_change_the_database_encryption_identity() {
+        let db = Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:immutable",
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true)),
+        )
+        .unwrap();
+        let pager = db._init(None, None).unwrap();
+        assert!(pager
+            .set_encryption_context(
+                crate::CipherMode::Aegis256,
+                &EncryptionKey::new_256([1; 32])
+            )
+            .is_err());
+        assert_eq!(db.encryption_cipher(), crate::CipherMode::None);
     }
 
     #[cfg(feature = "fs")]

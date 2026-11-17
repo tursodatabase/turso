@@ -249,6 +249,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encryption_encoder_rejects_changed_page_one_layout_before_writing_output() {
+        use crate::storage::encryption::{CipherMode, EncryptionKey};
+        let key = EncryptionKey::new_256([7; 32]);
+        let ctx = EncryptionContext::new(CipherMode::Aegis256, &key, 4096).unwrap();
+        let codec = EncryptionPageCodec { context: ctx };
+        let mut page = vec![0; 4096];
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        page[20] = codec.required_reserved_bytes();
+        for location in [PageLocation::Database, PageLocation::Wal] {
+            let context = PageCodecContext::new(1, location);
+            let mut encoded = vec![0; 4096];
+            codec.encode_page(context, &page, &mut encoded).unwrap();
+            let mut decoded = vec![0; 4096];
+            codec.decode_page(context, &encoded, &mut decoded).unwrap();
+            assert_eq!(&decoded[..4096 - 48], &page[..4096 - 48]);
+            for changed_size in [false, true] {
+                let mut invalid = page.clone();
+                if changed_size {
+                    invalid[16..18].copy_from_slice(&8192u16.to_be_bytes());
+                } else {
+                    invalid[20] = 0;
+                }
+                let mut output = vec![0xab; 4096];
+                assert!(codec.encode_page(context, &invalid, &mut output).is_err());
+                assert!(output.iter().all(|byte| *byte == 0xab));
+            }
+        }
+    }
+
+    #[test]
     fn visible_sqlite_header_requires_layout_fields() {
         let err = PageCodecHeaderInfo::from_visible_sqlite_header(&[0; 20]).unwrap_err();
         assert!(matches!(
