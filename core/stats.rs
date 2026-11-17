@@ -64,6 +64,11 @@ impl AnalyzeStats {
     }
     /// Get the statistics for a table, if present.
     pub fn table_stats(&self, namespace: NamespaceId, table_name: &str) -> Option<&TableStat> {
+        // The lookup needs a normalized copy of the name. Skip it when there
+        // are no statistics.
+        if self.tables.is_empty() {
+            return None;
+        }
         let table_name = normalize_ident(table_name);
         self.tables.get(&(namespace, table_name))
     }
