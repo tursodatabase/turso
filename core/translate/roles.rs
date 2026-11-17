@@ -8,7 +8,8 @@
 //!
 //! A role that is not a superuser reads and writes the tables it owns or was
 //! granted privileges on, which row-level security limits, and switches
-//! roles. It may not use a sequence or change the schema it does not own.
+//! roles. It creates relations in the namespaces it has CREATE on. It may
+//! not use a sequence or change the schema it does not own.
 
 use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
@@ -38,6 +39,7 @@ pub fn check_statement_privileges(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let role = connection.current_role();
     let denial = match stmt {
         // The privileges on the tables a statement reads and writes are
         // checked when it resolves them, with check_privilege.
@@ -62,11 +64,17 @@ pub fn check_statement_privileges(
             Action::CreateTemporary,
             Object::Database(MAIN_SCHEMA_NAME.to_string()),
         ),
-        ast::Stmt::CreateTable { tbl_name, .. } => create_in_schema_denial(tbl_name),
+        ast::Stmt::CreateTable { tbl_name, .. } => {
+            return check_create_in_namespace_of(resolver, role, tbl_name)
+        }
         ast::Stmt::CreateView { view_name, .. }
-        | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
+        | ast::Stmt::CreateMaterializedView { view_name, .. } => {
+            return check_create_in_namespace_of(resolver, role, view_name)
+        }
         ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
-        ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
+        ast::Stmt::CreateSequence { seq_name, .. } => {
+            return check_create_in_namespace_of(resolver, role, seq_name)
+        }
         ast::Stmt::AlterSequenceOwnedBy { seq_name, .. } => {
             let namespace = crate::translate::sequence::sequence_namespace(seq_name, resolver)
                 .ok()
@@ -91,8 +99,7 @@ pub fn check_statement_privileges(
         // not exist is reported as such.
         ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
-        // on the index's schema, which only a superuser has until GRANT
-        // exists, as for CREATE TABLE.
+        // on the index's schema, as for CREATE TABLE.
         ast::Stmt::CreateIndex {
             idx_name, tbl_name, ..
         } => {
@@ -101,7 +108,7 @@ pub fn check_statement_privileges(
             let mut qualified = ast::QualifiedName::single(tbl_name.clone());
             qualified.namespace.clone_from(&idx_name.namespace);
             if may_act_as_owner_of_table(resolver, connection, &qualified) {
-                create_in_schema_denial(idx_name)
+                return check_create_in_namespace_of(resolver, role, idx_name);
             } else {
                 PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
             }
@@ -122,32 +129,37 @@ pub fn check_statement_privileges(
                 // The owner may give its relation to a role it may set
                 // itself, such as a role it is a member of, as in
                 // PostgreSQL. Anyone else must be the owner.
-                ast::AlterTableBody::OwnerTo { role, .. } if owner => {
-                    match settable_role(resolver, connection, role) {
-                        // As in PostgreSQL, a new owner also needs CREATE on
-                        // the relation's schema, which only a superuser has
-                        // until GRANT on schemas exists. Giving the relation
-                        // to the role that owns it changes nothing.
+                ast::AlterTableBody::OwnerTo {
+                    role: new_owner, ..
+                } if owner => {
+                    match settable_role(resolver, connection, new_owner) {
+                        // Giving the relation to the role that owns it
+                        // changes nothing.
                         Some(new_owner)
-                            if resolver
-                                .catalog
-                                .dialect
-                                .role_is_superuser(resolver.schema(), new_owner)
-                                || table_owner(resolver, &alter.name) == Some(new_owner) =>
+                            if table_owner(resolver, &alter.name) == Some(new_owner) =>
                         {
                             return Ok(())
                         }
-                        Some(_) => create_in_schema_denial(&alter.name),
+                        // As in PostgreSQL, a new owner also needs CREATE on
+                        // the relation's schema.
+                        Some(new_owner) => {
+                            return check_create_in_namespace_of_relation(
+                                resolver,
+                                new_owner,
+                                &alter.name,
+                            )
+                        }
                         None => PermissionDenied::privilege(
                             Action::SetRole,
-                            Object::Role(role_spec_name(role)),
+                            Object::Role(role_spec_name(new_owner)),
                         ),
                     }
                 }
                 ast::AlterTableBody::OwnerTo { .. } => owner_denial(),
-                // Renaming also needs CREATE on the schema, as in
-                // PostgreSQL, which only a superuser has until GRANT exists.
-                ast::AlterTableBody::RenameTo(_) if owner => create_in_schema_denial(&alter.name),
+                // Renaming also needs CREATE on the schema, as in PostgreSQL.
+                ast::AlterTableBody::RenameTo(_) if owner => {
+                    return check_create_in_namespace_of_relation(resolver, role, &alter.name)
+                }
                 // The owner may run every other ALTER on its relation.
                 _ if owner => return Ok(()),
                 _ => owner_denial(),
@@ -551,6 +563,62 @@ pub(crate) fn check_pragma_function(resolver: &Resolver, pragma_name: &str) -> R
     Err(permission_denied(PermissionDenied::privilege(
         Action::Read,
         Object::Setting(pragma_name.to_string()),
+    )))
+}
+
+/// Fails unless `role` has CREATE on the namespace that a new object named
+/// `name` goes to. A name whose namespace does not resolve is let through,
+/// so the statement fails in translation with its usual error.
+fn check_create_in_namespace_of(
+    resolver: &Resolver,
+    role: RoleId,
+    name: &ast::QualifiedName,
+) -> Result<()> {
+    match resolver.resolve_namespace_for_create(name) {
+        Ok(namespace) => check_create_in_namespace(resolver, role, namespace),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Fails unless `role` has CREATE on the namespace of the existing table or
+/// view that `name` names. A relation that does not resolve is let through,
+/// so the statement fails in translation with its usual error.
+fn check_create_in_namespace_of_relation(
+    resolver: &Resolver,
+    role: RoleId,
+    name: &ast::QualifiedName,
+) -> Result<()> {
+    match resolver.find_existing_table(name) {
+        Ok(Some(namespace)) => check_create_in_namespace(resolver, role, namespace),
+        Ok(None) | Err(_) => Ok(()),
+    }
+}
+
+/// Fails unless `role` has CREATE on `namespace`. Only the namespaces of the
+/// main database have privileges that a dialect stores; a role that is not
+/// a superuser creates nothing in another database.
+fn check_create_in_namespace(
+    resolver: &Resolver,
+    role: RoleId,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    if namespace.database_id == MAIN_DB_ID
+        && resolver.catalog.dialect.role_has_namespace_privilege(
+            resolver.schema(),
+            namespace.id,
+            role,
+            ast::Privilege::Create,
+        )
+    {
+        return Ok(());
+    }
+    let name = resolver
+        .catalog
+        .name_of_namespace(namespace)
+        .unwrap_or_else(|| MAIN_SCHEMA_NAME.to_string());
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Create,
+        Object::Schema(name),
     )))
 }
 

@@ -382,6 +382,16 @@ sequence that a string names with its schema, as in `nextval('api.seq')`, is
 not checked for `USAGE` on the schema yet; the privileges on the sequence
 are.
 
+`CREATE` lets a role create tables, views, materialized views, sequences
+and indexes in the schema; the role owns what it creates. Without it,
+creating one fails with `permission denied for schema` (SQLSTATE 42501).
+As in PostgreSQL, renaming a relation and creating an index on a table need
+`CREATE` on the schema besides owning the relation, the new owner of
+`ALTER ... OWNER TO` needs it too, and a statement that names the schema
+needs no `USAGE` on it to create there. A name without a schema is created
+in the first schema of `search_path` that the role has `USAGE` on. Only a
+superuser creates schemas, types, domains and triggers.
+
 **Parameters:**
 
 - `table_name`: The name of an existing table, view, materialized view or
@@ -661,17 +671,18 @@ keeps the role, and `DISCARD ALL` resets it.
 **Notes:**
 
 Ownership is supported (see `ALTER TABLE ... OWNER TO`), and `GRANT` and
-`REVOKE` on tables (see `GRANT` and `REVOKE`). A role that is not a superuser may read and write the
-tables it owns or was granted privileges on, and it may alter and drop the
+`REVOKE` on tables, sequences and schemas (see `GRANT` and `REVOKE`). A role that is not a superuser may read and write the
+tables it owns or was granted privileges on, in the schemas it has `USAGE`
+on, and it may alter and drop the
 relations it owns, except that renaming a relation or creating an index on
-it also needs CREATE on the schema, which only a superuser has; it may call
+it also needs `CREATE` on the schema; it may call
 `nextval` and `setval` on the sequences it owns or was granted privileges
-on; it cannot create objects or roles, or `COPY FROM` a file. A role with
+on; it may create tables, views, materialized views, sequences and indexes
+in the schemas it has `CREATE` on, and owns what it creates; it cannot
+create schemas, types, domains, triggers or roles, or `COPY FROM` a file. A role with
 `INHERIT` may also do all of this with what the roles it is a member of own
 or were granted.
-Creating objects stays superuser-only because PostgreSQL gates it on the
-schema's CREATE privilege, which does not exist yet. Catalog tables and
-sequences read as tables are not checked.
+Catalog tables and sequences read as tables are not checked.
 
 **Examples:**
 
@@ -756,10 +767,9 @@ of another kind, for example `"t" is not a sequence` (SQLSTATE `42809`).
 A superuser may give a relation to any role. The relation's owner, or a
 role with the owner's privileges, may give it to a role it may `SET ROLE`
 to, such as a role it is a member of. As in PostgreSQL, the new owner also
-needs `CREATE` on the relation's schema, which only a superuser has, so
-anyone else gets `permission denied for schema public` (SQLSTATE 42501)
-unless it gives the relation to a superuser role or to the role that
-already owns it.
+needs `CREATE` on the relation's schema (see `GRANT`), and otherwise the
+statement fails with `permission denied for schema` (SQLSTATE 42501),
+unless it gives the relation to the role that already owns it.
 
 **Examples:**
 

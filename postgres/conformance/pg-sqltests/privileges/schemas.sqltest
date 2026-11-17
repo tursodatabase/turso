@@ -494,3 +494,190 @@ test current-schemas-leaves-out-a-schema-without-usage {
 expect {
     su_current_shown|{su_current_shown}
 }
+
+test create-on-the-schema-lets-a-role-create-a-table {
+    CREATE ROLE sc_creator;
+    GRANT CREATE ON SCHEMA public TO sc_creator;
+    SET ROLE sc_creator;
+    CREATE TABLE sc_creator_t (id INT);
+    INSERT INTO sc_creator_t VALUES (1);
+    SELECT id FROM sc_creator_t;
+}
+expect {
+    1
+}
+
+test role-owns-the-table-it-creates {
+    CREATE ROLE sc_owner;
+    GRANT CREATE ON SCHEMA public TO sc_owner;
+    SET ROLE sc_owner;
+    CREATE TABLE sc_owner_t (id INT);
+    RESET ROLE;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'sc_owner_t';
+}
+expect {
+    sc_owner
+}
+
+test all-on-a-schema-lets-a-role-create-and-read-in-it {
+    CREATE ROLE sc_all;
+    CREATE SCHEMA sc_all_s;
+    GRANT ALL ON SCHEMA sc_all_s TO sc_all;
+    SET ROLE sc_all;
+    CREATE TABLE sc_all_s.t (id INT);
+    INSERT INTO sc_all_s.t VALUES (2);
+    SELECT id FROM sc_all_s.t;
+}
+expect {
+    2
+}
+
+test create-on-the-schema-lets-a-role-create-a-view-a-sequence-and-an-index {
+    CREATE ROLE sc_kinds;
+    GRANT CREATE ON SCHEMA public TO sc_kinds;
+    SET ROLE sc_kinds;
+    CREATE TABLE sc_kinds_t (id INT);
+    CREATE INDEX sc_kinds_i ON sc_kinds_t (id);
+    CREATE VIEW sc_kinds_v AS SELECT id FROM sc_kinds_t;
+    CREATE SEQUENCE sc_kinds_s;
+    INSERT INTO sc_kinds_t VALUES (nextval('sc_kinds_s'));
+    SELECT id FROM sc_kinds_v;
+}
+expect {
+    1
+}
+
+test create-on-the-schema-lets-a-role-create-a-table-with-a-serial-column {
+    CREATE ROLE sc_serial;
+    GRANT CREATE ON SCHEMA public TO sc_serial;
+    SET ROLE sc_serial;
+    CREATE TABLE sc_serial_t (id SERIAL, x INT);
+    INSERT INTO sc_serial_t (x) VALUES (10), (20);
+    SELECT id, x FROM sc_serial_t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+test create-on-the-schema-lets-the-owner-rename-its-table {
+    CREATE ROLE sc_renamer;
+    GRANT CREATE ON SCHEMA public TO sc_renamer;
+    SET ROLE sc_renamer;
+    CREATE TABLE sc_rename_old (id INT);
+    ALTER TABLE sc_rename_old RENAME TO sc_rename_new;
+    SELECT count(*) FROM sc_rename_new;
+}
+expect {
+    0
+}
+
+test owner-gives-its-table-to-a-role-with-create-on-the-schema {
+    CREATE ROLE sc_giver;
+    CREATE ROLE sc_taker;
+    GRANT sc_taker TO sc_giver;
+    GRANT CREATE ON SCHEMA public TO sc_taker;
+    CREATE TABLE sc_given_t (id INT);
+    ALTER TABLE sc_given_t OWNER TO sc_giver;
+    SET ROLE sc_giver;
+    ALTER TABLE sc_given_t OWNER TO sc_taker;
+    RESET ROLE;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'sc_given_t';
+}
+expect {
+    sc_taker
+}
+
+test owner-may-not-give-its-table-to-a-role-without-create-on-the-schema {
+    CREATE ROLE sc_giver2;
+    CREATE ROLE sc_taker2;
+    GRANT sc_taker2 TO sc_giver2;
+    CREATE TABLE sc_given2_t (id INT);
+    ALTER TABLE sc_given2_t OWNER TO sc_giver2;
+    SET ROLE sc_giver2;
+    ALTER TABLE sc_given2_t OWNER TO sc_taker2;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test usage-on-the-schema-does-not-let-a-role-create-in-it {
+    CREATE ROLE sc_usage_only;
+    CREATE SCHEMA sc_usage_only_s;
+    GRANT USAGE ON SCHEMA sc_usage_only_s TO sc_usage_only;
+    SET ROLE sc_usage_only;
+    CREATE TABLE sc_usage_only_s.t (id INT);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_usage_only_s
+}
+
+test revoke-create-stops-a-role-creating-in-the-schema {
+    CREATE ROLE sc_revoked;
+    CREATE SCHEMA sc_revoked_s;
+    GRANT ALL ON SCHEMA sc_revoked_s TO sc_revoked;
+    REVOKE CREATE ON SCHEMA sc_revoked_s FROM sc_revoked;
+    SET ROLE sc_revoked;
+    CREATE TABLE sc_revoked_s.t (id INT);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_revoked_s
+}
+
+test qualified-create-needs-no-usage-but-reading-the-table-does {
+    CREATE ROLE sc_no_usage;
+    CREATE SCHEMA sc_no_usage_s;
+    GRANT CREATE ON SCHEMA sc_no_usage_s TO sc_no_usage;
+    SET ROLE sc_no_usage;
+    CREATE TABLE sc_no_usage_s.t (id INT);
+    SELECT id FROM sc_no_usage_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_no_usage_s
+}
+
+test create-without-a-schema-names-the-schema-of-the-search-path-it-is-refused-in {
+    CREATE ROLE sc_path;
+    CREATE SCHEMA sc_path_s;
+    GRANT USAGE ON SCHEMA sc_path_s TO sc_path;
+    SET search_path TO sc_path_s;
+    SET ROLE sc_path;
+    CREATE TABLE sc_path_t (id INT);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_path_s
+}
+
+test create-without-a-schema-goes-to-the-first-schema-with-usage {
+    CREATE ROLE sc_first;
+    CREATE SCHEMA sc_first_hidden;
+    CREATE SCHEMA sc_first_shown;
+    GRANT CREATE ON SCHEMA sc_first_hidden TO sc_first;
+    GRANT ALL ON SCHEMA sc_first_shown TO sc_first;
+    SET search_path TO sc_first_hidden, sc_first_shown;
+    SET ROLE sc_first;
+    CREATE TABLE sc_first_t (id INT);
+    RESET ROLE;
+    SELECT schemaname FROM pg_tables WHERE tablename = 'sc_first_t';
+}
+expect {
+    sc_first_shown
+}
+
+test create-without-a-schema-fails-when-no-schema-of-the-search-path-has-usage {
+    CREATE ROLE sc_none;
+    CREATE SCHEMA sc_none_s;
+    GRANT CREATE ON SCHEMA sc_none_s TO sc_none;
+    SET search_path TO sc_none_s;
+    SET ROLE sc_none;
+    CREATE TABLE sc_none_t (id INT);
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
+}
