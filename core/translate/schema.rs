@@ -2132,7 +2132,7 @@ pub fn translate_create_virtual_table(
     let parse_schema_where_clause =
         format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: crate::MAIN_DB_ID,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
     });
