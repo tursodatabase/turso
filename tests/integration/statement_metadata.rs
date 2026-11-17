@@ -819,6 +819,20 @@ mod tests {
         for (sql, expected) in cases {
             let stmt = conn.prepare(sql).unwrap();
             assert_eq!(origins(&stmt), expected, "{sql}");
+            for (i, origin) in expected.iter().enumerate() {
+                assert_eq!(
+                    stmt.get_column_table_name(i).as_deref(),
+                    origin.as_ref().map(|o| o.table.as_str()),
+                    "{sql}"
+                );
+                if origin.is_some() {
+                    assert_eq!(
+                        stmt.get_column_decltype(i),
+                        origin.as_ref().and_then(|o| o.declared_type.clone()),
+                        "{sql}"
+                    );
+                }
+            }
         }
     }
 }

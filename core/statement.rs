@@ -139,7 +139,7 @@ impl StatementOrigin {
 pub struct ColumnTypeInfo {
     /// The declared type name as written in CREATE TABLE — e.g. `"INTEGER"`,
     /// `"VARCHAR"`, or the name of a `CREATE TYPE` / `CREATE DOMAIN` such as
-    /// `"cents"`. This is the same string `get_column_decltype` returns.
+    /// `"cents"`. `get_column_decltype` returns it with the type's parameters.
     pub declared_name: String,
     /// Array dimensionality: `0` for scalar columns, `1` for `INTEGER[]`,
     /// `2` for `TEXT[][]`, etc.
@@ -1233,30 +1233,15 @@ impl Statement {
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
-        if matches!(
-            self.query_mode,
-            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
-        ) {
-            return None;
-        }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column { table, .. } => self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
-            _ => None,
-        }
+        self.get_column_origin(idx)
+            .map(|origin| Cow::Owned(origin.table))
     }
 
     /// Returns the declared type of a result column.
     ///
-    /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:
-    /// If the Nth column of the returned result set of a SELECT is a table column
-    /// (not an expression or subquery) then the declared type of the table column
-    /// is returned. If the Nth column of the result set is an expression or subquery,
-    /// then None is returned. The returned string is always UTF-8 encoded.
+    /// This behaves like SQLite's `sqlite3_column_decltype()`: the declared type,
+    /// with its parameters, of the table column that the result column reads (see
+    /// [Self::get_column_origin]), or None for an expression.
     ///
     /// See: <https://sqlite.org/c3ref/column_decltype.html>
     pub fn get_column_decltype(&self, idx: usize) -> Option<String> {
@@ -1275,27 +1260,7 @@ impl Statement {
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
-                }
-            }
-            _ => None,
-        }
+        self.get_column_origin(idx)?.declared_type
     }
 
     /// Returns the table column that a result column reads.
