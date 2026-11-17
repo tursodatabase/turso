@@ -6,14 +6,20 @@
 //! dialect wherever the meaning of SQL text is dialect-specific: parsing
 //! statements into the engine AST and interpreting persisted schema text.
 //! The frontends live in their own crates: the SQLite dialect in
-//! `turso_sqlite` and the PostgreSQL dialect in `turso_pg`. The [`engine`]
-//! module has what they share: the parser entry points, the built-in
-//! functions, the catalog tables that ship with every Turso build
-//! (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`, `btree_dump`,
-//! `sqlite_turso_types`), and the dialect of the statements the engine
-//! runs for itself.
+//! `turso_sqlite` and the PostgreSQL dialect in `turso_pg`. Both compose
+//! with what ships with every Turso build: the built-in functions
+//! ([`resolve_builtin_function`], [`call_builtin_scalar`]) and the catalog
+//! tables (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
+//! `btree_dump`, `sqlite_turso_types`) that
+//! [`crate::schema::builtin::schema_builder`] installs. The [`engine`]
+//! module has the parser entry points and the dialect of the statements
+//! the engine runs for itself.
 
 pub mod engine;
+
+pub use crate::functions::builtin::{
+    call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
+};
 
 pub(crate) use engine::EngineDialect;
 
@@ -285,20 +291,20 @@ pub trait Dialect: Send + Sync + 'static {
     /// The dialect owns its scalar function surface: the SQLite dialect
     /// resolves the built-in set, another dialect resolves its own —
     /// mapping names onto engine primitives where it wants them (usually
-    /// by composing with [`engine::resolve_builtin_function`]) and onto
+    /// by composing with [`resolve_builtin_function`]) and onto
     /// [`Func::Dialect`] for functions it executes
     /// itself via [`Dialect::exec_scalar_function`]. Consulted
     /// before extension functions; engine-generated helper statements
     /// always resolve with SQLite semantics instead.
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        engine::resolve_builtin_function(name, arg_count)
+        resolve_builtin_function(name, arg_count)
     }
 
     /// Run built-in scalar function `func` on the registers that hold its
     /// arguments.
     ///
     /// The default runs the shared implementation in
-    /// [`engine::call_builtin_scalar`]; a dialect overrides it for the
+    /// [`call_builtin_scalar`]; a dialect overrides it for the
     /// functions whose behavior differs and delegates the rest.
     fn call_scalar(
         &self,
@@ -306,7 +312,7 @@ pub trait Dialect: Send + Sync + 'static {
         func: &ScalarFunc,
         args: &[Register],
     ) -> Result<Value> {
-        engine::call_builtin_scalar(context, func, args)
+        call_builtin_scalar(context, func, args)
     }
 
     /// Execute a dialect scalar function at runtime.

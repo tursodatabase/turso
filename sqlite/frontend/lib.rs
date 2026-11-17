@@ -6,7 +6,7 @@
 
 use turso_core::Dialect;
 
-pub use turso_core::dialect::engine::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
+pub use turso_core::dialect::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 
 /// The SQLite dialect.
 pub struct SqliteDialect;

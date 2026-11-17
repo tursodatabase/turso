@@ -91,12 +91,12 @@ impl Dialect for TestDialect {
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         if name.eq_ignore_ascii_case("nvl") {
-            return engine::resolve_builtin_function("coalesce", arg_count);
+            return turso_core::dialect::resolve_builtin_function("coalesce", arg_count);
         }
         if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
             return Ok(Some(Func::Dialect("test_add_one".to_string())));
         }
-        engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
     fn exec_scalar_function(
@@ -165,7 +165,7 @@ impl Dialect for StrictTestDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 }
 
@@ -571,7 +571,7 @@ impl Dialect for ShoutingUpperDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
     fn call_scalar(
@@ -580,7 +580,7 @@ impl Dialect for ShoutingUpperDialect {
         func: &ScalarFunc,
         args: &[Register],
     ) -> Result<Value> {
-        let value = engine::call_builtin_scalar(context, func, args)?;
+        let value = turso_core::dialect::call_builtin_scalar(context, func, args)?;
         if !matches!(func, ScalarFunc::Upper) {
             return Ok(value);
         }
