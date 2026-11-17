@@ -193,7 +193,7 @@ impl Fields {
             }
             word @ ("infinity" | "-infinity" | "epoch" | "now" | "today" | "tomorrow"
             | "yesterday" | "allballs") => {
-                return Err(error(format!(
+                return Err(LimboError::NotSupported(format!(
                     "the {} value \"{word}\" is not supported",
                     ty.name()
                 )))

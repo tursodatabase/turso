@@ -211,6 +211,9 @@ pub enum LimboError {
     CheckpointFailed(String),
     #[error("Unsupported text encoding: {0}. Only UTF-8 is supported.")]
     UnsupportedEncoding(String),
+    /// Valid input that Turso does not support.
+    #[error("{0}")]
+    NotSupported(String),
     #[error("Out of memory")]
     OutOfMemory,
     /// An error that code of a dialect raised, for example one of its

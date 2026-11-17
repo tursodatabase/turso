@@ -1691,6 +1691,17 @@ expect @tursopg error {
     LOCALTIMESTAMP is not supported
 }
 
+test now-input-is-not-supported {
+    SELECT 'now'::timestamptz = now();
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the timestamp with time zone value "now" is not supported
+}
+
 test now-with-an-argument-errors {
     SELECT now(1);
 }
