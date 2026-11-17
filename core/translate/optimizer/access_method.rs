@@ -555,6 +555,9 @@ pub(super) fn choose_best_in_seek_candidate(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
     };
+    if !has_in_seek_constraint(rhs_constraints) {
+        return Ok(None);
+    }
 
     let base = *base_row_count;
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
@@ -677,6 +680,14 @@ pub(super) fn choose_best_in_seek_candidate(
     }
 
     Ok(best_in_seek)
+}
+
+/// Whether a constraint of the table is an `IN` that can drive an IN seek.
+pub(super) fn has_in_seek_constraint(constraints: &TableConstraints) -> bool {
+    constraints
+        .constraints
+        .iter()
+        .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
 }
 
 #[allow(clippy::too_many_arguments)]

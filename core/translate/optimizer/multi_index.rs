@@ -12,8 +12,8 @@ use crate::stats::AnalyzeStats;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
-    choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate,
+    choose_best_btree_candidate, choose_best_in_seek_candidate, has_in_seek_constraint,
+    AccessMethod, AccessMethodParams, BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
     analyze_binary_term_for_index, can_use_partial_index, partial_index_predicate_terms,
@@ -376,6 +376,16 @@ fn choose_multi_index_branch_access(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<Option<MultiIdxBranch>> {
+    // A branch needs an index seek or an IN seek. Without a constraint that
+    // an index can use, and without an IN constraint, it has neither.
+    if table_constraints
+        .candidates
+        .iter()
+        .all(|candidate| candidate.refs.is_empty())
+        && !has_in_seek_constraint(table_constraints)
+    {
+        return Ok(None);
+    }
     let chosen_seek = choose_best_btree_candidate(
         rhs_table,
         table_constraints,
