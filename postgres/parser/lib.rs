@@ -3,6 +3,7 @@ pub mod copy;
 mod create_function;
 pub mod functions;
 mod names;
+mod policy_condition;
 use pg_query::NodeEnum;
 pub use pg_query::ParseResult;
 use thiserror::Error;
