@@ -2131,6 +2131,7 @@ impl Database {
                     // `is_readonly` across the `_init` yields is stable.
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
+                    self.buffer_pool = pager.buffer_pool.clone();
                     let log_exists =
                         journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
@@ -3464,44 +3465,48 @@ impl Database {
         // For an existing (initialized) database, read the 512-byte header
         // once (non-blocking) and recover both the reserved-space byte and the
         // on-disk page size from it.
-        let (header_reserved_bytes, header_page_size) = if self.initialized() {
-            let header = return_if_io!(self.read_db_header_buf(hdr_st));
-            if let Some(codec) = page_codec {
-                // A codec may transform the magic bytes, so a short codec
-                // file cannot be judged here.
-                if let Some(err) = header.short_read() {
-                    return Err(err.into());
+        let frozen_size = self.pager_state.page_size();
+        let (header_reserved_bytes, header_page_size) =
+            if cipher != CipherMode::None && frozen_size.is_some() {
+                (Some(cipher.metadata_size() as u8), frozen_size)
+            } else if self.initialized() {
+                let header = return_if_io!(self.read_db_header_buf(hdr_st));
+                if let Some(codec) = page_codec {
+                    // A codec may transform the magic bytes, so a short codec
+                    // file cannot be judged here.
+                    if let Some(err) = header.short_read() {
+                        return Err(err.into());
+                    }
+                    let header_info = codec.bootstrap_page_info(header.bytes())?;
+                    let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
+                        LimboError::InvalidArgument(format!(
+                            "page codec reported invalid page size {}",
+                            header_info.page_size
+                        ))
+                    })?;
+                    let Some(page_size) = PageSize::new(page_size_u32) else {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "page codec reported invalid page size {}",
+                            header_info.page_size
+                        ))
+                        .into());
+                    };
+                    if !page_size.has_valid_reserved_space(header_info.reserved_space) {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "page codec reported invalid reserved space {} for page size {}",
+                            header_info.reserved_space,
+                            page_size.get()
+                        ))
+                        .into());
+                    }
+                    (Some(header_info.reserved_space), Some(page_size))
+                } else {
+                    let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
+                    (Some(reserved), Some(page_size))
                 }
-                let header_info = codec.bootstrap_page_info(header.bytes())?;
-                let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
-                    LimboError::InvalidArgument(format!(
-                        "page codec reported invalid page size {}",
-                        header_info.page_size
-                    ))
-                })?;
-                let Some(page_size) = PageSize::new(page_size_u32) else {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "page codec reported invalid page size {}",
-                        header_info.page_size
-                    ))
-                    .into());
-                };
-                if !page_size.has_valid_reserved_space(header_info.reserved_space) {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "page codec reported invalid reserved space {} for page size {}",
-                        header_info.reserved_space,
-                        page_size.get()
-                    ))
-                    .into());
-                }
-                (Some(header_info.reserved_space), Some(page_size))
             } else {
-                let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
-                (Some(reserved), Some(page_size))
-            }
-        } else {
-            (None, None)
-        };
+                (None, None)
+            };
         if let (Some(codec), Some(reserved_bytes)) = (page_codec, header_reserved_bytes) {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {
@@ -3531,7 +3536,12 @@ impl Database {
         let page_size =
             self.determine_actual_page_size(&shared_wal, requested_page_size, header_page_size)?;
 
-        let buffer_pool = self.buffer_pool.clone();
+        let buffer_pool =
+            if cipher != CipherMode::None && self.initialized() && frozen_size.is_none() {
+                BufferPool::begin_init(&self.io, BufferPool::DEFAULT_ARENA_SIZE)
+            } else {
+                self.buffer_pool.clone()
+            };
         if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
@@ -3554,7 +3564,7 @@ impl Database {
             self.pager_state.clone(),
         )?;
         if self.initialized() {
-            pager.set_page_size(page_size);
+            pager.stage_page_size(page_size);
         }
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);

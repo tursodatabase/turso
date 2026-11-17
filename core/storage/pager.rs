@@ -1713,6 +1713,7 @@ pub struct Pager {
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
+    staged_page_size: AtomicU32,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     /// Whether this pager holds an ephemeral table or index, whose file no
@@ -2024,6 +2025,7 @@ impl Pager {
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
             io_ctx: RwLock::new(IOContext::default()),
+            staged_page_size: AtomicU32::new(0),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
             shared,
@@ -3252,7 +3254,12 @@ impl Pager {
 
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
-        let value = self.shared.page_size.load(Ordering::SeqCst);
+        let value = self.staged_page_size.load(Ordering::SeqCst);
+        let value = if value == 0 {
+            self.shared.page_size.load(Ordering::SeqCst)
+        } else {
+            value
+        };
         if value == 0 {
             None
         } else {
@@ -3262,9 +3269,12 @@ impl Pager {
 
     /// Get the current page size, panicking if not set.
     pub fn get_page_size_unchecked(&self) -> PageSize {
-        let value = self.shared.page_size.load(Ordering::SeqCst);
-        turso_assert_ne!(value, 0);
-        PageSize::new(value).expect("invalid page size stored")
+        let page_size = self.get_page_size();
+        turso_assert!(
+            page_size.is_some(),
+            "page size must be initialized and valid"
+        );
+        page_size.expect("invalid page size stored")
     }
 
     pub(crate) fn has_wal(&self) -> bool {
@@ -3284,6 +3294,11 @@ impl Pager {
     /// Set the page size. Used internally when page size is determined.
     pub fn set_page_size(&self, size: PageSize) {
         self.shared.page_size.store(size.get(), Ordering::SeqCst);
+        self.staged_page_size.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn stage_page_size(&self, size: PageSize) {
+        self.staged_page_size.store(size.get(), Ordering::SeqCst);
     }
 
     /// Get the current reserved space. Returns None if not set yet.
@@ -5788,6 +5803,7 @@ impl Pager {
             AllocatePage1State::Start => {
                 turso_assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
+                self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
                     panic!("DB should not be initialized and should not do any IO");
