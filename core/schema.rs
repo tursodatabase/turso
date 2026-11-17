@@ -8492,6 +8492,38 @@ impl Column {
     pub fn ty(&self) -> Type {
         self.info.ty()
     }
+    /// The declared type with its parameters, as `PRAGMA table_info` shows it,
+    /// e.g. `VARCHAR(40)`. Empty for a column declared without a type.
+    pub fn declared_type(&self) -> String {
+        let mut declared_type = self.ty_str.clone();
+        let written_type = self.written_ty_str.as_deref().unwrap_or(&self.ty_str);
+        if !self.ty_params.is_empty()
+            && !matches!(
+                written_type.as_bytes().first(),
+                Some(b'"' | b'\'' | b'`' | b'[')
+            )
+        {
+            declared_type.push('(');
+            for (i, param) in self.ty_params.iter().enumerate() {
+                if i > 0 {
+                    declared_type.push(',');
+                }
+                match param.as_ref() {
+                    Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                        declared_type.push('-');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                        declared_type.push('+');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    _ => declared_type.push_str(&param.to_string()),
+                }
+            }
+            declared_type.push(')');
+        }
+        declared_type
+    }
     #[inline]
     pub fn set_ty(&mut self, ty: Type) {
         self.info.set_ty(ty)
