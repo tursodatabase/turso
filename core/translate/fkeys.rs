@@ -2477,7 +2477,8 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 
 /// Fire FK actions for UPDATE on parent table using Program opcode.
 /// This is called after the UPDATE is performed but before AFTER triggers.
-/// `old_values_start` is the register where OLD column values are stored (loaded before Delete+Insert).
+/// `old_values_start` is the register where OLD column values are stored (loaded before Delete+Insert),
+/// in the order that `old_image_layout` gives.
 #[allow(clippy::too_many_arguments)]
 pub fn fire_fk_update_actions(
     program: &mut ProgramBuilder,
@@ -2485,6 +2486,7 @@ pub fn fire_fk_update_actions(
     parent_table_name: &str,
     old_rowid_reg: usize,
     old_values_start: usize,
+    old_image_layout: &ColumnLayout,
     new_values_start: usize,
     new_rowid_reg: usize,
     connection: &Arc<Connection>,
@@ -2498,11 +2500,7 @@ pub fn fire_fk_update_actions(
         })
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
-    // OLD-image registers are allocated one-per-schema-column in declaration order; the NEW image
-    // lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
-    let old_image_layout = ColumnLayout::Identity {
-        column_count: parent_bt.columns().len(),
-    };
+    // The NEW image lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
     let new_image_layout = ColumnLayout::from_btree(&parent_bt)?;
 
     for fk_ref in affected_parent_fks {
@@ -2520,7 +2518,7 @@ pub fn fire_fk_update_actions(
             &parent_bt,
             parent_cols,
             old_values_start,
-            &old_image_layout,
+            old_image_layout,
             old_rowid_reg,
             old_key_start,
         )?;
