@@ -13,9 +13,9 @@
 use super::test_db::MvccTestDbNoConn;
 use crate::common::{ExecRows, TempDatabase};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use turso_core::io::IO;
+use turso_core::io::{PlatformIO, IO};
 use turso_core::mvcc::cursor::CursorYieldPoint;
 use turso_core::mvcc::database::checkpoint::{CheckpointYieldPoint, COLLECT_PREEMPTION_THRESHOLD};
 use turso_core::mvcc::database::*;
@@ -25,9 +25,10 @@ use turso_core::state_machine::{StateTransition, TransitionResult};
 use turso_core::sync::Mutex;
 use turso_core::vdbe::execute::TransactionYieldPoint;
 use turso_core::{
-    CheckpointMode, ConnectOpts, Connection, DatabaseOpts, LimboError, SessionRole,
-    StatementStatusCounter, StepResult, Value,
+    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
+    SessionRole, StatementStatusCounter, StepResult, Value,
 };
+use turso_sqlite::SqliteDialect;
 
 /// More rows than a checkpoint visits before it yields.
 const MANY_ROWS: usize = COLLECT_PREEMPTION_THRESHOLD + 10;
@@ -4879,4 +4880,714 @@ fn index_version_count(store: &Store, index: MVTableId) -> usize {
             .map(|entry| entry.value().read().len())
             .sum()
     })
+}
+
+#[test]
+fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    use turso_core::StepResult;
+
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    let writer = db.connect();
+    writer
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    writer
+        .execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+    let aux_db_id = writer.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = writer
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    aux_mv_store.set_checkpoint_threshold(-1);
+    writer
+        .execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO aux.t VALUES (1, 'seed')")
+        .unwrap();
+    aux_mv_store.set_checkpoint_threshold(0);
+
+    let checkpoint_io = writer
+        .get_pager_from_database_index(&aux_db_id)
+        .unwrap()
+        .io
+        .clone();
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpointing_insert = writer
+        .prepare("INSERT INTO aux.t VALUES (2, 'checkpointed')")
+        .unwrap();
+    step_until_checkpoint_before_pager_commit_yield(
+        &mut checkpointing_insert,
+        &checkpoint_injector,
+        &checkpoint_io,
+        "attached insert",
+    );
+
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    let reader_aux_db_id = reader.get_database_id_by_name("aux").unwrap();
+    let reader_aux_pager = reader
+        .get_pager_from_database_index(&reader_aux_db_id)
+        .unwrap();
+    let read_mark_probe = FixedYieldInjector::new([TransactionYieldPoint::BeforeMvccBegin.point()]);
+    reader.set_yield_injector(Some(read_mark_probe.clone()));
+    let mut read = reader.prepare("SELECT v FROM aux.t WHERE id = 1").unwrap();
+    assert!(
+        matches!(read.step().unwrap(), StepResult::Yield) && read_mark_probe.is_empty(),
+        "attached reader should yield before opening its MVCC transaction"
+    );
+    assert!(
+        !reader_aux_pager.holds_read_lock(),
+        "attached reader must not pin a pager read mark before MVCC begin is allowed"
+    );
+
+    match read.step() {
+        Ok(StepResult::Busy) | Err(LimboError::Busy) => {}
+        other => panic!("attached reader should be Busy before pinning a read mark, got {other:?}"),
+    }
+    assert!(
+        !reader_aux_pager.holds_read_lock(),
+        "Busy attached reader must not leave a pager read mark pinned"
+    );
+    drop(read);
+    reader.set_yield_injector(None);
+
+    writer.set_yield_injector(None);
+    step_until_done(&mut checkpointing_insert, &checkpoint_io, "attached insert");
+}
+
+#[test]
+fn drop_attached_checkpoint_paused_at_before_pager_commit() {
+    let (db, writer, aux_path_str, _aux_dir) =
+        drop_attached_statement_paused_at_checkpoint_before_pager_commit(
+            "INSERT INTO aux.t VALUES (2, 'checkpointed')",
+        );
+    writer
+        .execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT id, v FROM aux.t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("seed")],
+            vec![Value::from_i64(2), Value::build_text("checkpointed")],
+        ]
+    );
+}
+
+#[test]
+fn drop_attached_ddl_checkpoint_paused_at_before_pager_commit_keeps_new_schema() {
+    let (db, writer, aux_path_str, _aux_dir) =
+        drop_attached_statement_paused_at_checkpoint_before_pager_commit("CREATE TABLE aux.t2(x)");
+    assert_eq!(
+        get_rows(&writer, "SELECT id, v FROM aux.t ORDER BY id"),
+        vec![vec![Value::from_i64(1), Value::build_text("seed")]]
+    );
+    assert!(get_rows(&writer, "SELECT x FROM aux.t2").is_empty());
+    writer.execute("INSERT INTO aux.t2 VALUES (7)").unwrap();
+    writer
+        .execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    for conn in [&writer, &reader] {
+        assert_eq!(
+            get_rows(conn, "SELECT id, v FROM aux.t ORDER BY id"),
+            vec![vec![Value::from_i64(1), Value::build_text("seed")]]
+        );
+        assert_eq!(
+            get_rows(conn, "SELECT x FROM aux.t2"),
+            vec![vec![Value::from_i64(7)]]
+        );
+    }
+}
+
+fn drop_attached_statement_paused_at_checkpoint_before_pager_commit(
+    sql: &str,
+) -> (MvccTestDbNoConn, Arc<Connection>, String, tempfile::TempDir) {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    let writer = db.connect();
+    writer
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    writer
+        .execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+    let aux_db_id = writer.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = writer
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    aux_mv_store.set_checkpoint_threshold(-1);
+    writer
+        .execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO aux.t VALUES (1, 'seed')")
+        .unwrap();
+    aux_mv_store.set_checkpoint_threshold(0);
+
+    let aux_pager = writer.get_pager_from_database_index(&aux_db_id).unwrap();
+    let checkpoint_io = aux_pager.io.clone();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(injector.clone()));
+    let mut stmt = writer.prepare(sql).unwrap();
+    step_until_checkpoint_before_pager_commit_yield(&mut stmt, &injector, &checkpoint_io, sql);
+    assert!(aux_pager.holds_write_lock());
+    drop(stmt);
+    writer.set_yield_injector(None);
+
+    assert!(
+        !aux_pager.holds_write_lock(),
+        "dropped checkpoint must release the aux write lock"
+    );
+    (db, writer, aux_path_str, aux_dir)
+}
+
+#[test]
+fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integrity() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(payload BLOB, id INTEGER UNIQUE)")
+        .unwrap();
+
+    for id in 1..=600 {
+        conn.execute(format!(
+            "INSERT INTO t(rowid, payload, id) VALUES ({id}, x'70796c6f6164', {id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for id in 1..=600 {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO t(rowid, payload, id) VALUES ({id}, x'7265696e73657274', {id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+
+    conn.close().unwrap();
+    drop(conn);
+    db.close();
+
+    let sqlite = rusqlite::Connection::open(db_path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+/// Reproducer for an MVCC crash-restart bug in checkpointing.
+///
+/// Sequence:
+/// 1. Create a wide-table style schema and write one row.
+/// 2. Simulate an abrupt process death (no clean connection close).
+/// 3. Restart, drop the old schema, recreate it, write one new row.
+/// 4. Checkpoint.
+///
+/// Checkpoint should retire the dropped table before creating the replacement table,
+/// even when sqlite_schema rowids are reused across a crash + restart cycle.
+#[test]
+fn test_checkpoint_recovers_after_crash_restart_drop_recreate_table() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        create_wide_table_like_schema(&conn);
+        insert_wide_table_like_batch(&conn, 1, 1);
+    }
+
+    db.close();
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    drop_wide_table_like_schema(&conn);
+    create_wide_table_like_schema(&conn);
+    insert_wide_table_like_batch(&conn, 1, 1);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT row_number, sheet_id, created_by FROM core ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][2].to_string(), "seed");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    conn.close().unwrap();
+    drop(conn);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT row_number, sheet_id, created_by FROM core ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][2].to_string(), "seed");
+}
+
+/// Reproducer for the original index-side panic:
+/// "Index struct for index_id ... must exist when checkpointing index rows".
+///
+/// Sequence:
+/// 1. Create and checkpoint a table with one row.
+/// 2. Create an index on that existing table.
+/// 3. Simulate an abrupt process death before the index is checkpointed.
+/// 4. Restart, drop and recreate the index, insert one more row.
+/// 5. Checkpoint.
+///
+/// Checkpoint should retire the dropped index before processing recovered index rows,
+/// even when sqlite_schema reuses the same rowid for the recreated index.
+#[test]
+fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, portable_changes TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed_1', hex(randomblob(16)))")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    }
+
+    db.close();
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_t_v").unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'post_2', hex(randomblob(16)))")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "post_2");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    conn.close().unwrap();
+    drop(conn);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "post_2");
+}
+
+fn create_wide_table_like_schema(conn: &Arc<Connection>) {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS core(
+            id INTEGER PRIMARY KEY,
+            row_number INTEGER NOT NULL,
+            sheet_id INTEGER NOT NULL,
+            created_by TEXT,
+            updated_by TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            col_1 TEXT,
+            col_2 TEXT,
+            col_3 TEXT,
+            col_4 TEXT,
+            col_5 TEXT,
+            col_6 TEXT,
+            col_7 TEXT,
+            col_8 TEXT
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_sheet_row ON core(sheet_id, row_number)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_created ON core(created_at)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_updated ON core(updated_at, sheet_id)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_created_by ON core(created_by, sheet_id)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS metadata(
+            sheet_id INTEGER PRIMARY KEY,
+            next_row_number INTEGER NOT NULL DEFAULT 1,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log(
+            id INTEGER PRIMARY KEY,
+            sheet_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            row_id INTEGER,
+            row_number INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            details TEXT
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trigger_gate(
+            id INTEGER PRIMARY KEY,
+            sheet_id INTEGER NOT NULL,
+            trigger_type TEXT NOT NULL,
+            portable_changes TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(sheet_id, next_row_number, row_count, updated_at)
+         VALUES (1, 1, 0, datetime('now'))",
+    )
+    .unwrap();
+}
+
+fn drop_wide_table_like_schema(conn: &Arc<Connection>) {
+    conn.execute("DROP TABLE IF EXISTS trigger_gate").unwrap();
+    conn.execute("DROP TABLE IF EXISTS audit_log").unwrap();
+    conn.execute("DROP TABLE IF EXISTS metadata").unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_sheet_row")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_created")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_updated")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_created_by")
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS core").unwrap();
+}
+
+fn insert_wide_table_like_batch(conn: &Arc<Connection>, start_row_number: i64, rows: usize) {
+    conn.execute("BEGIN").unwrap();
+
+    for offset in 0..rows {
+        let row_number = start_row_number + offset as i64;
+        conn.execute(format!(
+            "INSERT INTO core(
+                row_number, sheet_id, created_by, updated_by,
+                created_at, updated_at,
+                col_1, col_2, col_3, col_4, col_5, col_6, col_7, col_8
+             ) VALUES (
+                {row_number}, 1, 'seed', 'seed',
+                datetime('now'), datetime('now'),
+                hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)),
+                hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8))
+             )",
+        ))
+        .unwrap();
+
+        conn.execute(format!(
+            "INSERT INTO audit_log(sheet_id, action, row_number, details, created_at)
+             VALUES (1, 'INSERT', {row_number}, 'wide table repro', datetime('now'))",
+        ))
+        .unwrap();
+    }
+
+    conn.execute(format!(
+        "UPDATE metadata
+         SET next_row_number = next_row_number + {rows},
+             row_count = row_count + {rows},
+             updated_at = datetime('now')
+         WHERE sheet_id = 1",
+    ))
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, portable_changes, created_at)
+         VALUES (1, 'ROW_INSERT', '{\"count\": 1}', datetime('now'))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, portable_changes, created_at)
+         VALUES (1, 'RECALC', '{\"sheet_id\": 1}', datetime('now'))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, portable_changes, created_at)
+         VALUES (1, 'WEBHOOK', '{\"event\": \"rows_added\"}', datetime('now'))",
+    )
+    .unwrap();
+
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
+    use turso_core::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join("prune-mark-again-oom.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true);
+    let fault = Arc::new(OneShotAllocFault::default());
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open(
+            io,
+            &path,
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(opts)
+                .allocators(turso_core::DatabaseAllocators {
+                    mv_store: turso_core::alloc::DynAllocator::new(OneShotFaultAlloc(
+                        fault.clone(),
+                    )),
+                    fts: turso_core::alloc::DynAllocator::default(),
+                }),
+        )
+        .unwrap();
+        let checkpointer = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        checkpointer
+            .execute("PRAGMA journal_mode = 'mvcc'")
+            .unwrap();
+        checkpointer
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        checkpointer
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        checkpointer
+            .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        checkpointer
+            .execute("INSERT INTO t VALUES (1, 'old')")
+            .unwrap();
+        let mvstore = db.get_mv_store().clone().unwrap();
+        let root_page = get_rows(
+            &checkpointer,
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        let key = RowID::new(
+            mvstore.get_table_id_from_root_page(root_page),
+            RowKey::Int(1),
+        );
+        let dirty_stamp = |key: &RowID| {
+            mvstore
+                .checkpoint_dirty_table_keys
+                .get(key)
+                .map(|entry| entry.value().load(Ordering::Acquire))
+        };
+        assert!(dirty_stamp(&key).is_some());
+
+        let writer = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("UPDATE t SET v = 'new' WHERE id = 1")
+            .unwrap();
+        let update_tx = writer.get_mv_tx().unwrap().0;
+
+        let checkpoint_hooks = Arc::new(ParkAfterCollectThenArmFault {
+            parked: AtomicBool::new(false),
+            fault: fault.clone(),
+        });
+        checkpointer.set_yield_injector(Some(checkpoint_hooks.clone()));
+        let pager_io = checkpointer.get_pager().io.clone();
+        mvstore.set_checkpoint_threshold(0);
+        let mut first_checkpoint = checkpointer
+            .prepare("INSERT INTO driver VALUES (1)")
+            .unwrap();
+        loop {
+            match first_checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield
+                    if checkpoint_hooks.parked.load(Ordering::SeqCst) =>
+                {
+                    break
+                }
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                other => {
+                    panic!("the auto-checkpoint ended before it collected table rows: {other:?}")
+                }
+            }
+        }
+        mvstore.set_checkpoint_threshold(-1);
+
+        let log_written =
+            FixedYieldInjector::new([CommitYieldPoint::LogRecordMarkedWritten.point()]);
+        writer.set_yield_injector(Some(log_written.clone()));
+        let mut commit = writer.prepare("COMMIT").unwrap();
+        loop {
+            match commit.step().unwrap() {
+                StepResult::IO | StepResult::Yield if log_written.is_empty() => break,
+                StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+                other => panic!("COMMIT ended before LogRecordMarkedWritten: {other:?}"),
+            }
+        }
+        let preparing_end_ts = || match mvstore.tx_snapshot(update_tx).map(|tx| tx.state) {
+            Some(TransactionState::Preparing(end_ts)) => end_ts,
+            other => panic!("the UPDATE must still be Preparing, got {other:?}"),
+        };
+        let update_end_ts = preparing_end_ts();
+        assert_eq!(dirty_stamp(&key), Some(update_end_ts));
+
+        drive_statement_to_done(&mut first_checkpoint, &pager_io);
+        drop(first_checkpoint);
+        checkpointer.set_yield_injector(None);
+        fault.armed.store(false, Ordering::SeqCst);
+        assert_eq!(fault.fired.load(Ordering::SeqCst), 1);
+        let failed_allocation = fault.failed_allocation.lock().take().unwrap();
+        assert!(
+            failed_allocation.contains("prune_dirty_keys")
+                && failed_allocation.contains("mark_checkpoint_dirty_key"),
+            "the failed allocation must be the second mark in prune_dirty_keys:\n{failed_allocation}"
+        );
+
+        assert!(mvstore.checkpoint_snapshot_ts() < update_end_ts);
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        assert_eq!(preparing_end_ts(), update_end_ts);
+
+        drive_statement_to_done(&mut commit, &pager_io);
+        drop(commit);
+        writer.set_yield_injector(None);
+
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+    }
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        &path,
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let rows = get_rows(
+        &db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap(),
+        "SELECT v FROM t WHERE id = 1",
+    );
+    assert_eq!(
+        rows[0][0].to_string(),
+        "new",
+        "the committed UPDATE was lost after restart"
+    );
+}
+
+#[derive(Debug)]
+struct ParkAfterCollectThenArmFault {
+    parked: AtomicBool,
+    fault: Arc<OneShotAllocFault>,
+}
+
+impl YieldInjector for ParkAfterCollectThenArmFault {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CheckpointYieldPoint::AfterCollectTableRows.point() {
+            return !self.parked.swap(true, Ordering::SeqCst);
+        }
+        if point == CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point() {
+            self.fault.armed.store(true, Ordering::SeqCst);
+        }
+        false
+    }
+}
+
+#[derive(Debug, Default)]
+struct OneShotAllocFault {
+    armed: AtomicBool,
+    fired: AtomicU64,
+    failed_allocation: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct OneShotFaultAlloc(Arc<OneShotAllocFault>);
+
+unsafe impl turso_core::alloc::ApiAllocator for OneShotFaultAlloc {
+    fn allocate(
+        &self,
+        layout: turso_core::alloc::Layout,
+    ) -> std::result::Result<std::ptr::NonNull<[u8]>, turso_core::alloc::AllocError> {
+        if self.0.armed.swap(false, Ordering::SeqCst) {
+            self.0.fired.fetch_add(1, Ordering::SeqCst);
+            *self.0.failed_allocation.lock() =
+                Some(std::backtrace::Backtrace::force_capture().to_string());
+            return Err(turso_core::alloc::AllocError);
+        }
+        <turso_core::alloc::TursoAllocator as turso_core::alloc::ApiAllocator>::allocate(
+            &turso_core::alloc::TursoAllocator,
+            layout,
+        )
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: turso_core::alloc::Layout) {
+        unsafe {
+            <turso_core::alloc::TursoAllocator as turso_core::alloc::ApiAllocator>::deallocate(
+                &turso_core::alloc::TursoAllocator,
+                ptr,
+                layout,
+            )
+        }
+    }
 }
