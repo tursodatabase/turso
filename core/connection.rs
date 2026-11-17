@@ -30,7 +30,7 @@ use crate::{
     translate,
     translate::collate::TextCollation,
     util::IOExt,
-    vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
+    vdbe, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
     ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
@@ -515,8 +515,7 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
-    pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
-    pub(super) encryption_cipher_mode: AtomicCipherMode,
+    pub(crate) encryption_key: Option<EncryptionKey>,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
@@ -4431,20 +4430,16 @@ impl Connection {
         Arc::as_ptr(&self.db) as usize
     }
 
-    pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
-        tracing::trace!("setting encryption key for connection");
-        self.ensure_can_change_encryption_settings()?;
-        *self.encryption_key.write() = Some(key);
-        self.bump_prepare_context_generation();
-        self.set_encryption_context()
+    pub fn set_encryption_key(&self, _key: EncryptionKey) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "encryption must be configured when opening the database".into(),
+        ))
     }
 
-    pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
-        tracing::trace!("setting encryption cipher for connection");
-        self.ensure_can_change_encryption_settings()?;
-        self.encryption_cipher_mode.set(cipher_mode);
-        self.bump_prepare_context_generation();
-        self.set_encryption_context()
+    pub fn set_encryption_cipher(&self, _cipher_mode: CipherMode) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "encryption must be configured when opening the database".into(),
+        ))
     }
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
@@ -4472,47 +4467,10 @@ impl Connection {
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        match self.encryption_cipher_mode.get() {
+        match self.pager.load().encryption_cipher() {
             CipherMode::None => None,
             mode => Some(mode),
         }
-    }
-
-    fn ensure_can_change_encryption_settings(&self) -> Result<()> {
-        let pager = self.pager.load();
-        if pager.is_encryption_ctx_set() {
-            return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
-            ));
-        }
-        if pager.has_external_page_codec() {
-            return Err(LimboError::InvalidArgument(
-                "cannot configure built-in encryption while an external page codec is installed"
-                    .to_string(),
-            ));
-        }
-        if self.db.get_mv_store().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    // if both key and cipher are set, set encryption context on pager
-    fn set_encryption_context(&self) -> Result<()> {
-        let key_guard = self.encryption_key.read();
-        let Some(key) = key_guard.as_ref() else {
-            return Ok(());
-        };
-        let cipher_mode = self.get_encryption_cipher_mode();
-        let Some(cipher_mode) = cipher_mode else {
-            return Ok(());
-        };
-        tracing::trace!("setting encryption ctx for connection");
-        let pager = self.pager.load();
-        pager.set_encryption_context(cipher_mode, key)
     }
 
     /// Sets a custom busy handler callback.

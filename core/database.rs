@@ -1095,6 +1095,11 @@ impl Database {
                 "built-in encryption cannot be combined with an external page codec".to_string(),
             ));
         }
+        if options.encryption.is_some() && !options.db_opts.enable_encryption {
+            return Err(LimboError::InvalidArgument(
+                "encryption is an opt in feature".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2942,7 +2947,6 @@ impl Database {
                 "connection pager has not completed authentication".into(),
             ));
         }
-        let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
             context: context.value,
@@ -3001,8 +3005,7 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key),
-            encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
+            encryption_key,
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
@@ -3707,8 +3710,8 @@ impl Database {
     /// that is not handled by a page codec.
     ///
     /// The magic bytes are not judged here: an encrypted database carries the
-    /// Turso prefix instead, and its key may arrive only after connect (PRAGMA
-    /// key). The magic is checked at open validation, where the key is known.
+    /// Turso prefix instead. The magic is checked at open validation, where
+    /// the key is known.
     fn plain_header_page_info(header: &DbHeaderRead, encrypted: bool) -> Result<(u8, PageSize)> {
         // SQLite zero-fills a file shorter than a page before judging its
         // header (btree.c lockBtree), so a short file is judged the same way.

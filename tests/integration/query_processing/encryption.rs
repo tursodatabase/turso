@@ -318,12 +318,12 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
     ))
     .err()
     .display_string()
-    .contains("configure encryption before PRAGMA journal_mode='mvcc'");
+    .contains("encryption must be configured when opening the database");
 
     assert_that!(run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';"))
         .err()
         .display_string()
-        .contains("configure encryption before PRAGMA journal_mode='mvcc'");
+        .contains("encryption must be configured when opening the database");
 
     // Data inserted before the rejected pragmas must still be readable.
     let mut pre_count = 0;

@@ -285,7 +285,7 @@ fn vacuum_temp_db_encryption(
     let Some(cipher_mode) = source_conn.get_encryption_cipher_mode() else {
         return Ok((None, None));
     };
-    let encryption_key = source_conn.encryption_key.read().clone().ok_or_else(|| {
+    let encryption_key = source_conn.encryption_key.clone().ok_or_else(|| {
         LimboError::InternalError(
             "encrypted in-place VACUUM temp database requires source encryption key".to_string(),
         )
@@ -3203,7 +3203,7 @@ mod tests {
             temp.conn.get_encryption_cipher_mode(),
             source_conn.get_encryption_cipher_mode()
         );
-        assert!(temp.conn.encryption_key.read().is_some());
+        assert!(temp.conn.encryption_key.is_some());
         assert_eq!(temp.conn.get_reserved_bytes(), Some(reserved_space));
 
         Ok(())

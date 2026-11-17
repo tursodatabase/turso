@@ -6426,7 +6426,7 @@ impl Pager {
         self.enable_encryption.load(Ordering::SeqCst)
     }
 
-    pub fn set_encryption_context(
+    pub(crate) fn set_encryption_context(
         &self,
         cipher_mode: CipherMode,
         key: &EncryptionKey,
@@ -6434,8 +6434,7 @@ impl Pager {
         // we will set the encryption context only if the encryption is opted-in.
         if !self.enable_encryption.load(Ordering::SeqCst) {
             return Err(LimboError::InvalidArgument(
-                "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
-                    .into(),
+                "encryption is an opt in feature".into(),
             ));
         }
         if self.has_external_page_codec() {
@@ -6444,29 +6443,31 @@ impl Pager {
                     .into(),
             ));
         }
-
-        let page_size = self.get_page_size_unchecked().get() as usize;
-        let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
-        {
-            let mut io_ctx = self.io_ctx.write();
-            io_ctx.set_encryption(encryption_ctx);
+        if cipher_mode == CipherMode::None || cipher_mode != self.encryption_cipher() {
+            return Err(LimboError::InvalidArgument(
+                "encryption cipher does not match the database".into(),
+            ));
         }
-        let Some(wal) = self.wal.as_ref() else {
-            return Ok(());
-        };
-        wal.set_io_context(self.io_ctx.read().clone());
-        // whenever we set the encryption context, lets reset the page cache. The page cache
-        // might have been loaded with page 1 to initialise the connection. During initialisation,
-        // we only read the header which is unencrypted, but the rest of the page is. If so, lets
-        // clear the cache.
-        self.clear_page_cache(false);
-        // Also invalidate cached schema cookie to force re-read of page 1 with encryption
-        self.set_schema_cookie(None);
+        let mut io_ctx = self.io_ctx.write();
+        if io_ctx.encryption_context().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "encryption context is already set".into(),
+            ));
+        }
+        let context = EncryptionContext::new(
+            cipher_mode,
+            key,
+            self.get_page_size_unchecked().get() as usize,
+        )?;
+        io_ctx.set_encryption(context);
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_io_context(io_ctx.clone());
+        }
         Ok(())
     }
 
     pub(crate) fn set_page_codec(&self, codec: Arc<dyn PageCodec>) -> Result<()> {
-        if self.is_encryption_ctx_set() {
+        if self.is_encryption_ctx_set() || self.shared.encryption_cipher() != CipherMode::None {
             return Err(LimboError::InvalidArgument(
                 "cannot install an external page codec while built-in encryption is configured"
                     .into(),
@@ -6520,7 +6521,7 @@ impl Pager {
 
     /// Encryption is an opt-in feature. If the flag is passed, then enable the encryption on
     /// pager, which is then used to set it on the IOContext.
-    pub fn enable_encryption(&self, enable: bool) {
+    pub(crate) fn enable_encryption(&self, enable: bool) {
         self.enable_encryption.store(enable, Ordering::SeqCst);
     }
 }
