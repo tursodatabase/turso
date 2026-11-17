@@ -31,3 +31,16 @@ expect {
 expect @tursopg error {
     cannot compare type time with type text
 }
+
+test coalesce-of-date-and-timestamp {
+    CREATE TABLE a (id int, d date, ts timestamp);
+    INSERT INTO a VALUES (1, '2024-01-05', '2024-01-06 10:00');
+    SELECT coalesce(d, ts) FROM a;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type date with type timestamp
+}

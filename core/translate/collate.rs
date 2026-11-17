@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
-    function::ExternalCollation,
+    function::{ExternalCollation, ResultType},
     schema::{Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
@@ -14,8 +14,8 @@ use crate::{
         emitter::Resolver,
         expr::{
             expr_type::{
-                primitive_value_type, query_column_type, same_type_def, type_of, type_ordering,
-                BuiltinType, ExprType,
+                iif_values, primitive_value_type, query_column_type, same_type_def, type_of,
+                type_ordering, BuiltinType, ExprType,
             },
             is_untyped_operand, row_value_component_expr, row_value_len,
         },
@@ -969,22 +969,47 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             common_type_ordering(operands.map(|expr| (expr, context)))?;
             Ok(())
         }
-        // Compiled as `base = when` for each WHEN.
         Expr::Case {
-            base: Some(base),
+            base,
             when_then_pairs,
-            ..
-        } => when_then_pairs
-            .iter()
-            .try_for_each(|(when, _)| check_comparison(base, when, context)),
+            else_expr,
+        } => {
+            // Compiled as `base = when` for each WHEN.
+            if let Some(base) = base {
+                for (when, _) in when_then_pairs {
+                    check_comparison(base, when, context)?;
+                }
+            }
+            let results = when_then_pairs.iter().map(|(_, then)| then.as_ref());
+            check_returned_values(results.chain(else_expr.as_deref()), context)
+        }
         Expr::FunctionCall { name, args, .. } => {
             let func = context
                 .catalog()
                 .resolve_function(name.as_str(), args.len())?;
-            if func.is_some_and(|func| func.needs_collation()) {
+            // An unknown function is reported when it is compiled.
+            let Some(func) = func else {
+                return Ok(());
+            };
+            if func.needs_collation() {
                 common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
             }
-            Ok(())
+            match func.result_type() {
+                ResultType::OneOfTheArguments => {
+                    check_returned_values(args.iter().map(|arg| arg.as_ref()), context)
+                }
+                ResultType::OneOfTheIifValues => {
+                    check_returned_values(iif_values(args).map(|arg| arg.as_ref()), context)
+                }
+                ResultType::Declared(_)
+                | ResultType::FirstArgument
+                | ResultType::NumberOfTheFirstArgumentsType
+                | ResultType::AbsOfTheFirstArgument
+                | ResultType::RealForARealArgument
+                | ResultType::TextOrBlobLikeTheFirstArgument
+                | ResultType::ElementOfTheFirstArgument
+                | ResultType::Unknown => Ok(()),
+            }
         }
         // These compare a value with the values of a subquery, whose types are
         // known only once it is planned. Planning it checks the comparison
@@ -992,7 +1017,6 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
         Expr::InSelect { .. } | Expr::InTable { .. } | Expr::SubqueryResult { .. } => Ok(()),
         // These compare nothing with a collation.
         Expr::Binary(..)
-        | Expr::Case { base: None, .. }
         | Expr::Cast { .. }
         | Expr::Column { .. }
         | Expr::Default
@@ -1019,6 +1043,19 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
     }
+}
+
+/// Fails when an expression returns one of `values` and their types don't
+/// compare, as in `coalesce(d, ts)` for a date d and a timestamp ts: such an
+/// expression has no single type.
+fn check_returned_values<'a>(
+    values: impl Iterator<Item = &'a Expr>,
+    context: &ExprContext<'_, '_>,
+) -> Result<()> {
+    let types = values
+        .map(|value| operand_type(value, context))
+        .collect::<Result<SmallVec<[ExprType; 2]>>>()?;
+    check_types_compare(&types, context.schema())
 }
 
 /// The check of [check_expr_collation] for `lhs` compared with `rhs`. Row

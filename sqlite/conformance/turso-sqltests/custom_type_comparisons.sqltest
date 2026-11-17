@@ -1786,7 +1786,7 @@ test cmp-coalesce-with-text-and-two-custom-types-is-an-error {
     SELECT coalesce(tm, d, '10:00') FROM t;
 }
 expect error {
-    cannot tell which type to read a string literal or parameter as
+    cannot compare type time with type date
 }
 
 # One rule decides which types compare. A custom type compares with its own
@@ -1919,6 +1919,7 @@ test cmp-pairs-that-still-compare {
     SELECT 'same-type', count(*) FROM a x JOIN a y ON x.d = y.d;
     SELECT 'numbers', id FROM a WHERE n = i;
     SELECT 'varchar-text', id FROM a WHERE v = t;
+    SELECT 'coalesce-literal', coalesce(d, '2024-01-01') FROM a WHERE id = 1;
 }
 expect {
     literal|1
@@ -1926,6 +1927,7 @@ expect {
     same-type|2
     numbers|1
     varchar-text|1
+    coalesce-literal|2024-01-05
 }
 
 # A table-valued function's argument is passed to the function, not compared,
@@ -2029,4 +2031,45 @@ expect {
     cast|1
     same-type|1
     null|2
+}
+
+# The types are checked when the statement is prepared, even for a value that
+# is never computed.
+@requires strict "uses STRICT tables"
+test cmp-coalesce-of-date-and-timestamp-under-false-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    SELECT id FROM a WHERE 0 AND coalesce(d, ts) IS NOT NULL;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-iif-of-date-and-timestamp-under-false-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    SELECT id FROM a WHERE 0 AND iif(id = 1, d, ts) IS NOT NULL;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-case-of-date-and-timestamp-under-false-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    SELECT id FROM a WHERE 0 AND CASE WHEN id = 1 THEN d ELSE ts END IS NOT NULL;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+# A trigger's WHEN clause is compiled with the statement that fires it.
+@requires strict "uses STRICT tables"
+test cmp-coalesce-of-date-and-timestamp-in-trigger-when-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    CREATE TABLE log(id INTEGER) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON a WHEN coalesce(NEW.d, NEW.ts) IS NOT NULL BEGIN INSERT INTO log VALUES (NEW.id); END;
+    INSERT INTO a VALUES (1, '2024-01-05', NULL);
+}
+expect error {
+    cannot compare type date with type timestamp
 }

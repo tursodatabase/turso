@@ -245,14 +245,23 @@ pub(crate) fn untyped_values_type<'e>(
     if schema.type_registry.is_empty() {
         return Ok(None);
     }
+    let env = TypeEnv::new(referenced_tables, resolver);
+    // The values must be of types that compare, as the expression has one
+    // type: coalesce(d, ts) for a date d and a timestamp ts is refused.
     let mut has_untyped_value = false;
+    let mut types: Vec<ExprType> = Vec::new();
     for value in values.clone() {
-        has_untyped_value |= is_untyped_operand(value)?;
+        let is_untyped = is_untyped_operand(value)?;
+        has_untyped_value |= is_untyped;
+        types.push(match is_untyped {
+            true => ExprType::Untyped,
+            false => type_of(value, &env),
+        });
     }
+    check_types_compare(&types, schema)?;
     if !has_untyped_value {
         return Ok(None);
     }
-    let env = TypeEnv::new(referenced_tables, resolver);
     let common = common_type(values.clone(), &env);
     match common {
         ExprType::Custom { .. } => untyped_operands_read_as(schema, common),
