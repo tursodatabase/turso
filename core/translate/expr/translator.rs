@@ -2142,6 +2142,8 @@ fn translate_function_call_expr(
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
                 | ScalarFunc::TemporalEncode
+                | ScalarFunc::IntervalEncode
+                | ScalarFunc::IntervalDecode
                 | ScalarFunc::NumericEncode
                 | ScalarFunc::NumericFit
                 | ScalarFunc::NumericDecode

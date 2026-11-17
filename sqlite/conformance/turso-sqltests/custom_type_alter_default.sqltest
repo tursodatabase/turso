@@ -344,7 +344,7 @@ test create-table-refuses-numeric-array {
     CREATE TABLE t(id INTEGER PRIMARY KEY, b numeric[]) STRICT;
 }
 expect error {
-    arrays of type numeric are not supported, because their elements would not compare in the order of numeric
+    an array of type numeric, whose elements would not compare in the order of numeric, is not supported
 }
 
 @requires strict "uses STRICT tables"
@@ -353,7 +353,7 @@ test add-column-refuses-numeric-array {
     ALTER TABLE t ADD COLUMN b numeric[];
 }
 expect error {
-    arrays of type numeric are not supported, because their elements would not compare in the order of numeric
+    an array of type numeric, whose elements would not compare in the order of numeric, is not supported
 }
 
 @requires strict "uses STRICT tables"
@@ -362,7 +362,7 @@ test alter-column-refuses-numeric-array {
     ALTER TABLE t ALTER COLUMN a TO b numeric[];
 }
 expect error {
-    arrays of type numeric are not supported, because their elements would not compare in the order of numeric
+    an array of type numeric, whose elements would not compare in the order of numeric, is not supported
 }
 
 @requires strict "uses STRICT tables"

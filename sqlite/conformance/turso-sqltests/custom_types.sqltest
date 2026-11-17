@@ -348,6 +348,7 @@ expect {
     cidr(value text)|text|value||value||
     date(value text)|text|temporal_encode (value, 'date')||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
+    interval(value text)|blob|interval_encode (value)||interval_decode (value)||
     json(value text)|text|json (value)||value||
     jsonb(value text)|blob|jsonb (value)||json (value)||
     macaddr(value text)|text|value||value||
@@ -381,6 +382,7 @@ expect {
     cidr(value text)|text|value||value||
     date(value text)|text|temporal_encode (value, 'date')||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
+    interval(value text)|blob|interval_encode (value)||interval_decode (value)||
     json(value text)|text|json (value)||value||
     jsonb(value text)|blob|jsonb (value)||json (value)||
     macaddr(value text)|text|value||value||

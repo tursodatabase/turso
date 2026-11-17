@@ -29,7 +29,9 @@ fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
     const SORTS: bool = true;
     const NO_SORT: bool = false;
     // Whether SQLite's functions, such as sum and abs, may read the values.
+    // They would misread an interval.
     const READS: bool = true;
+    const NO_READS: bool = false;
     let types: &[(bool, RangeOffsets, bool, bool, &str)] = &[
         #[cfg(feature = "uuid")]
         (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
@@ -54,6 +56,8 @@ fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
         (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
         (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::Numeric, NO_SORT, READS, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
+        // Stored as PostgreSQL's 16 bytes; TypeOrdering::Interval orders it.
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, NO_READS, "CREATE TYPE interval(value text) BASE blob ENCODE interval_encode(value) DECODE interval_decode(value)"),
     ];
 
     let aliases: &[(&str, &str)] = &[

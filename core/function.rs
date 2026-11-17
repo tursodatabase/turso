@@ -1049,6 +1049,9 @@ pub enum ScalarFunc {
     IntToBoolean,
     ValidateIpAddr,
     TemporalEncode,
+    // Interval type functions
+    IntervalEncode,
+    IntervalDecode,
     // Numeric type functions
     NumericEncode,
     NumericFit,
@@ -1179,6 +1182,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::TemporalEncode
+            | ScalarFunc::IntervalEncode
+            | ScalarFunc::IntervalDecode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
@@ -1310,6 +1315,7 @@ impl ScalarFunc {
             | Self::Lpad
             | Self::Rpad
             | Self::TemporalEncode
+            | Self::IntervalDecode
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1330,6 +1336,7 @@ impl ScalarFunc {
             | Self::Unhex
             | Self::SetByte
             | Self::NumericEncode
+            | Self::IntervalEncode
             | Self::NumericFit
             | Self::StatInit
             | Self::StatPush => ResultType::Declared(ReturnType::Blob),
@@ -1445,6 +1452,8 @@ impl Display for ScalarFunc {
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::TemporalEncode => "temporal_encode",
+            Self::IntervalEncode => "interval_encode",
+            Self::IntervalDecode => "interval_decode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
@@ -1595,7 +1604,9 @@ impl ScalarFunc {
             | Self::ValidateIpAddr
             | Self::NumericEncode
             | Self::NumericDecode
-            | Self::NumericNeg => &[1],
+            | Self::NumericNeg
+            | Self::IntervalEncode
+            | Self::IntervalDecode => &[1],
             Self::TemporalEncode
             | Self::NumericAdd
             | Self::NumericSub

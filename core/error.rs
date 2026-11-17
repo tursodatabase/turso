@@ -122,6 +122,9 @@ pub enum LimboError {
     DatetimeFieldOverflow(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
+    /// A field of an interval's text is too large, such as `'2147483648 days'`.
+    #[error("interval field value out of range: \"{0}\"")]
+    IntervalFieldOverflow(String),
     /// Something PostgreSQL has that Turso does not implement, such as
     /// `sum(interval)`.
     #[error("{0} is not supported")]

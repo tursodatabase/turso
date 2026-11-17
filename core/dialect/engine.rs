@@ -19,6 +19,7 @@ use crate::functions::datetime::{
     exec_strftime, exec_time, exec_timediff, exec_unixepoch,
 };
 use crate::functions::datetime_input::exec_temporal_encode;
+use crate::functions::interval::{exec_interval_decode, exec_interval_encode};
 use crate::functions::math::{exec_gcd, exec_lcm};
 use crate::functions::printf::exec_printf;
 use crate::functions::string::{exec_lpad, exec_repeat, exec_rpad};
@@ -523,6 +524,8 @@ pub(crate) fn resolve_builtin_function_name(
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
         "temporal_encode" => Ok(Some(Func::Scalar(ScalarFunc::TemporalEncode))),
+        "interval_encode" => Ok(Some(Func::Scalar(ScalarFunc::IntervalEncode))),
+        "interval_decode" => Ok(Some(Func::Scalar(ScalarFunc::IntervalDecode))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
         "numeric_fit" => Ok(Some(Func::Scalar(ScalarFunc::NumericFit))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
@@ -1249,6 +1252,14 @@ pub fn call_builtin_scalar(
         ScalarFunc::TemporalEncode => {
             check_arg_count(args, 2)?;
             exec_temporal_encode(args[0].get_value(), args[1].get_value())
+        }
+        ScalarFunc::IntervalEncode => {
+            check_arg_count(args, 1)?;
+            exec_interval_encode(args[0].get_value())
+        }
+        ScalarFunc::IntervalDecode => {
+            check_arg_count(args, 1)?;
+            exec_interval_decode(args[0].get_value())
         }
         ScalarFunc::NumericFit => {
             check_arg_count(args, 3)?;

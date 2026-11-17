@@ -2681,6 +2681,7 @@ mod tests {
             builtin("jsonb", "'{}'"),
             builtin("inet", "'10.0.0.1'"),
             builtin("numeric(10,2)", "1.5"),
+            builtin("interval", "'1 day'"),
         ];
         // User types with every combination of no, an unchanging and a changing
         // ENCODE and DECODE, and a domain over each.
@@ -2760,12 +2761,13 @@ mod tests {
             let create = format!(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, v {ty}, w {ty}, a {ty}[], m {ty}[][]) STRICT"
             );
-            if kind.name == "numeric" {
-                // numeric's order is not the order of its stored values.
+            if kind.name == "numeric" || kind.name == "interval" {
+                // Their order is not the order of their stored values.
+                let refusal = format!("an array of type {}, whose elements", kind.name);
                 assert_that!(conn.execute(&create))
                     .err()
                     .display_string()
-                    .contains("arrays of type numeric are not supported");
+                    .contains(refusal.as_str());
                 continue;
             }
             conn.execute(&create).unwrap();

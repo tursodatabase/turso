@@ -1063,7 +1063,7 @@ test cmp-array-of-ordered-type-column-is-an-error {
     CREATE TABLE t(a numeric(10,2)[]) STRICT;
 }
 expect error {
-    arrays of type numeric are not supported
+    an array of type numeric, whose elements
 }
 
 @requires strict "uses STRICT tables"
@@ -1072,14 +1072,14 @@ test cmp-array-of-ordered-type-added-column-is-an-error {
     ALTER TABLE t ADD COLUMN a numeric[];
 }
 expect error {
-    arrays of type numeric are not supported
+    an array of type numeric, whose elements
 }
 
 test cmp-array-of-ordered-type-cast-is-an-error {
     SELECT CAST('{1}' AS numeric(5,1)[]);
 }
 expect error {
-    arrays of type numeric are not supported
+    an array of type numeric, whose elements
 }
 
 @requires strict "uses STRICT tables"

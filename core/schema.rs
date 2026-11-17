@@ -319,11 +319,13 @@ pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<"
 pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
 /// The order of a built-in type whose stored values do not sort in the type's
-/// order: numeric is stored as a blob. Every other type, and every user type,
+/// order: numeric is stored as a blob, and equal intervals can have different
+/// fields. Every other type, and every user type,
 /// sorts and compares by its stored value as SQLite does.
 fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
     match type_name {
         "numeric" => Some(TypeOrdering::Numeric),
+        "interval" => Some(TypeOrdering::Interval),
         _ => None,
     }
 }
@@ -337,7 +339,9 @@ fn builtin_value_type(type_name: &str) -> crate::Result<BuiltinType> {
     Ok(match type_name {
         "boolean" | "smallint" | "bigint" => BuiltinType::Integer,
         "uuid" | "json" | "jsonb" | "numeric" | "varchar" | "date" | "time" | "timestamp"
-        | "timestamptz" | "inet" | "cidr" | "macaddr" | "macaddr8" => BuiltinType::Text,
+        | "timestamptz" | "interval" | "inet" | "cidr" | "macaddr" | "macaddr8" => {
+            BuiltinType::Text
+        }
         "bytea" => BuiltinType::Blob,
         _ => {
             return Err(LimboError::InternalError(format!(
@@ -2225,11 +2229,10 @@ impl Schema {
             };
         };
         if self.type_ordering(type_def).is_some() {
-            crate::bail_parse_error!(
-                "arrays of type {} are not supported, because their elements would not compare in the order of {}",
-                type_def.name,
-                type_def.name
-            );
+            return Err(LimboError::NotSupported(format!(
+                "an array of type {}, whose elements would not compare in the order of {},",
+                type_def.name, type_def.name
+            )));
         }
         Ok(())
     }
