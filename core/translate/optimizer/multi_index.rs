@@ -16,9 +16,9 @@ use crate::translate::optimizer::access_method::{
     BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
-    partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
-    TableConstraints,
+    analyze_binary_term_for_index, can_use_partial_index, partial_index_predicate_terms,
+    summarize_binary_term_for_index, table_constraints_from_where_clause, Constraint,
+    RangeConstraintRef, TableConstraints,
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
@@ -148,7 +148,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 ///   for global predicate consumption or join rewrites.
 ///
 /// FIXME: stop synthesizing `WhereTerm`s here just to reuse
-/// `constraints_from_where_clause()`. Branch-local planning should have a
+/// `table_constraints_from_where_clause()`. Branch-local planning should have a
 /// direct constraint-extraction path that does not fabricate top-level planner
 /// terms.
 #[expect(clippy::too_many_arguments)]
@@ -172,19 +172,18 @@ fn get_table_local_constraints_for_branch(
             consumed: false,
         })
         .collect::<Vec<_>>();
-    let table_constraints = constraints_from_where_clause(
+    let mut term_collations = vec![None; synthetic_where_terms.len()];
+    let mut table_constraints = table_constraints_from_where_clause(
+        table_reference,
         &synthetic_where_terms,
+        &mut term_collations,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
         resolver,
-    )?
-    .into_iter()
-    .find(|constraints| constraints.table_id == table_reference.internal_id)
-    .expect("constraints_from_where_clause must return constraints for every joined table");
-    let mut table_constraints = table_constraints;
+    )?;
     // Branch-local constraints originate from synthetic `WhereTerm`s, so copy
     // out their constraining expressions while those temporary terms still
     // exist.
