@@ -14,7 +14,10 @@
 //! `(tag, body)` frames for callers that need full control over rendering
 //! (the regression runner reproduces psql transcripts byte-for-byte), and
 //! [`PgConn::read_event`] / [`PgConn::simple_query`] decode the frames for
-//! callers that just want rows and errors.
+//! callers that just want rows and errors. Wire-level tests can also send the
+//! extended query protocol messages one by one (`send_parse`, `send_bind`,
+//! `send_describe_portal`, `send_execute`, `send_sync`) and read the replies
+//! with [`PgConn::read_message`].
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -272,6 +275,72 @@ impl PgConn {
         }
     }
 
+    /// Sends a Parse message. `param_types` are type OIDs, 0 for unspecified.
+    pub fn send_parse(&mut self, statement: &str, sql: &str, param_types: &[u32]) -> Result<()> {
+        let mut body = Vec::new();
+        push_cstring(&mut body, statement);
+        push_cstring(&mut body, sql);
+        body.extend_from_slice(&(param_types.len() as i16).to_be_bytes());
+        for oid in param_types {
+            body.extend_from_slice(&oid.to_be_bytes());
+        }
+        self.write_message(b'P', &body)
+    }
+
+    /// Sends a Bind message with the given format codes (0 text, 1 binary)
+    /// and parameter values (`None` is NULL), sent exactly as given.
+    pub fn send_bind(
+        &mut self,
+        portal: &str,
+        statement: &str,
+        param_formats: &[i16],
+        params: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) -> Result<()> {
+        let mut body = Vec::new();
+        push_cstring(&mut body, portal);
+        push_cstring(&mut body, statement);
+        body.extend_from_slice(&(param_formats.len() as i16).to_be_bytes());
+        for format in param_formats {
+            body.extend_from_slice(&format.to_be_bytes());
+        }
+        body.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for param in params {
+            match param {
+                Some(value) => {
+                    body.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                    body.extend_from_slice(value);
+                }
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        body.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
+        for format in result_formats {
+            body.extend_from_slice(&format.to_be_bytes());
+        }
+        self.write_message(b'B', &body)
+    }
+
+    /// Sends a Describe message for a portal.
+    pub fn send_describe_portal(&mut self, portal: &str) -> Result<()> {
+        let mut body = vec![b'P'];
+        push_cstring(&mut body, portal);
+        self.write_message(b'D', &body)
+    }
+
+    /// Sends an Execute message; `max_rows` 0 means no limit.
+    pub fn send_execute(&mut self, portal: &str, max_rows: i32) -> Result<()> {
+        let mut body = Vec::new();
+        push_cstring(&mut body, portal);
+        body.extend_from_slice(&max_rows.to_be_bytes());
+        self.write_message(b'E', &body)
+    }
+
+    /// Sends a Sync message.
+    pub fn send_sync(&mut self) -> Result<()> {
+        self.write_message(b'S', &[])
+    }
+
     fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         self.writer.write_all(&[tag])?;
         self.writer
@@ -280,6 +349,11 @@ impl PgConn {
         self.writer.flush()?;
         Ok(())
     }
+}
+
+fn push_cstring(body: &mut Vec<u8>, value: &str) {
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
 }
 
 /// Parses a `RowDescription` message body.
