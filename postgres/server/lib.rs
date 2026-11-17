@@ -1,15 +1,20 @@
 use std::fmt::Debug;
 use std::num::NonZero;
+use std::ops::RangeInclusive;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
 use async_trait::async_trait;
+use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{ConnectOpts, Database, LimboError, StepResult, Value};
+use turso_core::{
+    read_temporal, ConnectOpts, Database, LimboError, NonNan, Numeric, StepResult, Temporal,
+    TemporalType, Value,
+};
 use turso_pg::{
     split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
     TransactionState,
@@ -17,7 +22,9 @@ use turso_pg::{
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INVALID_BINARY_REPRESENTATION, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_PROTOCOL_VIOLATION,
 };
 use turso_pg_parser::ParseResult;
 
@@ -421,7 +428,7 @@ fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> PgWireResult
             if !binary[i] {
                 return Ok(FieldInfo::new(name, None, None, pg_type, FieldFormat::Text));
             }
-            if BinaryEncoding::of(&pg_type).is_none() {
+            if BinaryEncoding::of_result(&pg_type).is_none() {
                 return Err(binary_not_supported(
                     &format!("result column {name}"),
                     &pg_type,
@@ -485,9 +492,13 @@ enum BinaryEncoding {
     /// bytes as their text format.
     Text,
     Bool,
+    /// Read in parameters only: tursopg describes no result column as int2.
+    Int2,
     Int4,
     Int8,
     Float8,
+    /// date, time, timestamp and timestamptz.
+    Temporal(TemporalType),
     Bytea,
 }
 
@@ -497,11 +508,27 @@ impl BinaryEncoding {
         match *pg_type {
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
             Type::BOOL => Some(Self::Bool),
+            Type::INT2 => Some(Self::Int2),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
             Type::FLOAT8 => Some(Self::Float8),
+            Type::DATE => Some(Self::Temporal(TemporalType::Date)),
+            Type::TIME => Some(Self::Temporal(TemporalType::Time)),
+            Type::TIMESTAMP => Some(Self::Temporal(TemporalType::Timestamp)),
+            Type::TIMESTAMPTZ => Some(Self::Temporal(TemporalType::Timestamptz)),
             Type::BYTEA => Some(Self::Bytea),
             _ => None,
+        }
+    }
+
+    /// None for a result column type that tursopg cannot send in binary
+    /// format. A time column is one: tursopg stores a timetz as a time
+    /// without its offset, so the column may be a timetz, which PostgreSQL
+    /// sends as type timetz with the offset.
+    fn of_result(pg_type: &Type) -> Option<Self> {
+        match *pg_type {
+            Type::TIME => None,
+            _ => Self::of(pg_type),
         }
     }
 }
@@ -726,22 +753,129 @@ fn bind_portal_parameters(
 }
 
 /// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
-/// declared for it. A type whose binary format is its text is read as in text
-/// format. A parameter whose type Parse left out or left unspecified (OID 0)
-/// has type `unknown` and is refused: PostgreSQL works out its type from the
-/// query, and tursopg cannot.
+/// declared for it. As in PostgreSQL, the type's receive function reads the
+/// bytes it needs, and bytes left over are an error. A type whose binary
+/// format is its text is read as in text format. A parameter whose type Parse
+/// left out or left unspecified (OID 0) has type `unknown` and is refused:
+/// PostgreSQL works out its type from the query, and tursopg cannot.
 fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Value> {
-    match BinaryEncoding::of(pg_type) {
-        Some(BinaryEncoding::Text) => pg_bytes_to_value(bytes, pg_type),
-        Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
-        Some(
-            BinaryEncoding::Bool
-            | BinaryEncoding::Int4
-            | BinaryEncoding::Int8
-            | BinaryEncoding::Float8,
-        )
-        | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
+    let Some(encoding) = BinaryEncoding::of(pg_type) else {
+        return Err(binary_not_supported(&format!("parameter ${n}"), pg_type));
+    };
+    let mut rest = bytes;
+    let value = match encoding {
+        BinaryEncoding::Text => return pg_bytes_to_value(bytes, pg_type),
+        BinaryEncoding::Bytea => return Ok(Value::from_blob(bytes.to_vec())),
+        BinaryEncoding::Bool => {
+            let message = "no data left in message";
+            let (byte, tail) = rest
+                .split_first()
+                .ok_or_else(|| wire_error(SQLSTATE_PROTOCOL_VIOLATION, message.to_owned()))?;
+            rest = tail;
+            // As in PostgreSQL, every byte but 0 is true.
+            Value::from_i64(i64::from(*byte != 0))
+        }
+        BinaryEncoding::Int2 => Value::from_i64(i16::from_be_bytes(take_bytes(&mut rest)?).into()),
+        BinaryEncoding::Int4 => Value::from_i64(i32::from_be_bytes(take_bytes(&mut rest)?).into()),
+        BinaryEncoding::Int8 => Value::from_i64(i64::from_be_bytes(take_bytes(&mut rest)?)),
+        // tursopg stores no NaN.
+        BinaryEncoding::Float8 => match NonNan::new(f64::from_be_bytes(take_bytes(&mut rest)?)) {
+            Some(float) => Value::Numeric(Numeric::Float(float)),
+            None => {
+                let message = format!("NaN is not supported for parameter ${n} of type float8");
+                return Err(wire_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message));
+            }
+        },
+        // Bound as PostgreSQL's text for the value in time zone UTC, so that
+        // `SELECT $1` returns what PostgreSQL returns. ENCODE reads the `+00`.
+        BinaryEncoding::Temporal(ty) => {
+            let zone = match ty {
+                TemporalType::Timestamptz => "+00",
+                TemporalType::Date | TemporalType::Time | TemporalType::Timestamp => "",
+            };
+            let text = receive_temporal(&mut rest, ty, pg_type)?.text();
+            Value::build_text(format!("{text}{zone}"))
+        }
+    };
+    if !rest.is_empty() {
+        let message = format!("incorrect binary data format in bind parameter {n}");
+        return Err(wire_error(SQLSTATE_INVALID_BINARY_REPRESENTATION, message));
     }
+    Ok(value)
+}
+
+/// Removes the first `N` bytes of `rest` and returns them. As in PostgreSQL,
+/// fewer bytes is a protocol violation.
+fn take_bytes<const N: usize>(rest: &mut &[u8]) -> PgWireResult<[u8; N]> {
+    let message = "insufficient data left in message";
+    let (bytes, tail) = rest
+        .split_first_chunk::<N>()
+        .ok_or_else(|| wire_error(SQLSTATE_PROTOCOL_VIOLATION, message.to_owned()))?;
+    *rest = tail;
+    Ok(*bytes)
+}
+
+/// Reads a binary date (days since 2000-01-01), time (microseconds since
+/// midnight), or timestamp or timestamptz (microseconds since 2000-01-01
+/// 00:00:00 UTC). As in PostgreSQL, a value outside its type's range is
+/// refused. Infinity and the years outside 1 to 9999 are in PostgreSQL's
+/// range, but tursopg does not store them.
+fn receive_temporal(rest: &mut &[u8], ty: TemporalType, pg_type: &Type) -> PgWireResult<Temporal> {
+    let unsupported = || {
+        let message = format!(
+            "only {} values in the years 0001 to 9999 are supported",
+            pg_type.name()
+        );
+        wire_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message)
+    };
+    let out_of_range = |name: &str| {
+        wire_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            format!("{name} out of range"),
+        )
+    };
+    match ty {
+        TemporalType::Date => {
+            // PostgreSQL sends -infinity and infinity as the smallest and
+            // largest values.
+            let days = match i32::from_be_bytes(take_bytes(rest)?) {
+                i32::MIN | i32::MAX => return Err(unsupported()),
+                days if PG_DAYS.contains(&days) => days,
+                _ => return Err(out_of_range("date")),
+            };
+            pg_epoch()
+                .checked_add_signed(TimeDelta::days(days.into()))
+                .and_then(Temporal::date)
+                .ok_or_else(unsupported)
+        }
+        TemporalType::Time => Temporal::time(i64::from_be_bytes(take_bytes(rest)?))
+            .ok_or_else(|| out_of_range("time")),
+        TemporalType::Timestamp | TemporalType::Timestamptz => {
+            let micros = match i64::from_be_bytes(take_bytes(rest)?) {
+                i64::MIN | i64::MAX => return Err(unsupported()),
+                micros if PG_MICROS.contains(&micros) => micros,
+                _ => return Err(out_of_range("timestamp")),
+            };
+            NaiveDateTime::from(pg_epoch())
+                .checked_add_signed(TimeDelta::microseconds(micros))
+                .and_then(Temporal::timestamp)
+                .ok_or_else(unsupported)
+        }
+    }
+}
+
+/// PostgreSQL's dates, 4714-11-24 BC to 5874897-12-31, as days since
+/// 2000-01-01 (`IS_VALID_DATE`).
+const PG_DAYS: RangeInclusive<i32> = -2_451_545..=2_145_031_948;
+
+/// PostgreSQL's timestamps, 4714-11-24 00:00:00 BC to 294276-12-31
+/// 23:59:59.999999, as microseconds since 2000-01-01 00:00:00
+/// (`IS_VALID_TIMESTAMP`).
+const PG_MICROS: RangeInclusive<i64> = -211_813_488_000_000_000..=9_223_371_331_199_999_999;
+
+/// Day 0 of PostgreSQL's binary dates and timestamps.
+fn pg_epoch() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2000, 1, 1).expect("2000-01-01 is a date")
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
@@ -917,7 +1051,7 @@ fn encode_binary(
     pg_type: &Type,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    let encoding = BinaryEncoding::of(pg_type)
+    let encoding = BinaryEncoding::of_result(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let options = FormatOptions::default();
     let binary = FieldFormat::Binary;
@@ -944,11 +1078,31 @@ fn encode_binary(
         (BinaryEncoding::Bytea, Value::Blob(b)) => {
             encoder.encode_field_with_type_and_format(&b.as_slice(), pg_type, binary, &options)
         }
+        (BinaryEncoding::Temporal(ty), Value::Text(text)) => {
+            match stored_temporal(text.as_str(), ty, pg_type)? {
+                Temporal::Date(date) => {
+                    let days = i32::try_from((date - pg_epoch()).num_days())
+                        .expect("the days between the years 1 and 9999 fit in i32");
+                    encoder.encode_field_with_type_and_format(&days, pg_type, binary, &options)
+                }
+                Temporal::Time(_) => {
+                    unreachable!("BinaryEncoding::of_result gives no encoding for time")
+                }
+                Temporal::Timestamp(timestamp) => {
+                    let micros = (timestamp - NaiveDateTime::from(pg_epoch()))
+                        .num_microseconds()
+                        .expect("the microseconds between the years 1 and 9999 fit in i64");
+                    encoder.encode_field_with_type_and_format(&micros, pg_type, binary, &options)
+                }
+            }
+        }
         (
             BinaryEncoding::Bool
+            | BinaryEncoding::Int2
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
             | BinaryEncoding::Float8
+            | BinaryEncoding::Temporal(_)
             | BinaryEncoding::Bytea,
             _,
         ) => {
@@ -963,6 +1117,23 @@ fn encode_binary(
         }
     };
     encoded.map_err(|e| LimboError::InternalError(e.to_string()))
+}
+
+/// The value of `text`, which a column of type `ty` holds. Text that is not
+/// exactly what the type's ENCODE stores is refused, such as `'2024-1-5'` in
+/// the date column of `SELECT CAST('2024-01-05' AS date) UNION ALL SELECT
+/// '2024-1-5'`.
+fn stored_temporal(text: &str, ty: TemporalType, pg_type: &Type) -> turso_core::Result<Temporal> {
+    match read_temporal(text, ty) {
+        Ok(value) if value.text() == text => Ok(value),
+        _ => Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!(
+                "cannot send \"{text}\" in binary format as type {0}: it is not in the form a {0} column stores",
+                pg_type.name()
+            ),
+        )),
+    }
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
@@ -1385,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_numbers_follow_the_column_type() {
+    fn binary_results_follow_the_column_type() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
             None,
@@ -1455,6 +1626,25 @@ mod tests {
                 b"\0\0\0\x031.5",
             ),
             ("SELECT true", Type::BOOL, b"\0\0\0\x01\x01", b"\0\0\0\x01t"),
+            // The bytes PostgreSQL 14 sends, with time zone UTC.
+            (
+                "SELECT CAST('2024-01-05' AS date)",
+                Type::DATE,
+                b"\0\0\0\x04\0\0\x22\x42",
+                b"\0\0\0\x0a2024-01-05",
+            ),
+            (
+                "SELECT CAST('2024-01-05 10:00:00.5' AS timestamp)",
+                Type::TIMESTAMP,
+                b"\0\0\0\x08\0\x02\xb1\x2e\xae\x12\xc9\x20",
+                b"\0\0\0\x152024-01-05 10:00:00.5",
+            ),
+            (
+                "SELECT CAST('2024-01-05 10:00:00.5+02' AS timestamptz)",
+                Type::TIMESTAMPTZ,
+                b"\0\0\0\x08\0\x02\xb1\x2d\0\xeb\x81\x20",
+                b"\0\0\0\x182024-01-05 08:00:00.5+00",
+            ),
             // The column's type, not the stored value, picks the encoding.
             (
                 "SELECT count(*) FROM t",
@@ -1491,8 +1681,22 @@ mod tests {
     #[test]
     fn binary_formats_are_refused_where_the_bytes_would_be_wrong() {
         let conn = memory_connection();
-        let date = conn.prepare("SELECT CAST('2024-01-05' AS date)").unwrap();
-        let error = build_field_info(&date, &Format::UnifiedBinary).unwrap_err();
+        conn.execute("CREATE TABLE u (u uuid)").unwrap();
+        // PostgreSQL sends the timetz as 23:30:00 with offset -03.
+        for sql in ["SELECT u FROM u", "SELECT CAST('23:30:00-03' AS timetz)"] {
+            let stmt = conn.prepare(sql).unwrap();
+            let error = build_field_info(&stmt, &Format::UnifiedBinary).unwrap_err();
+            assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
+        }
+
+        // UNION ALL types the column by its first SELECT, so a date column
+        // can hold text that a date column never stores.
+        let sql = "SELECT CAST('2024-01-05' AS date) UNION ALL SELECT '2024-1-5'";
+        let mut union = conn.prepare(sql).unwrap();
+        let fields = Arc::new(build_field_info(&union, &Format::UnifiedBinary).unwrap());
+        let Err(error) = execute_query(&mut union, fields) else {
+            panic!("{sql} must fail");
+        };
         assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED);
 
         let codes = |codes: Vec<i16>, count| binary_formats(&Format::Individual(codes), count, "x");
@@ -1505,34 +1709,89 @@ mod tests {
         assert_eq!(sqlstate(error), SQLSTATE_INVALID_PARAMETER_VALUE);
 
         // Parameter types declared in Parse, the binary bytes, and the value
-        // bound, or None for a refused parameter.
+        // bound or the SQLSTATE of PostgreSQL 14's error.
+        let one = |pg_type: Type| vec![Some(pg_type)];
+        let (be4, be8) = (
+            |i: i32| i.to_be_bytes().to_vec(),
+            |i: i64| i.to_be_bytes().to_vec(),
+        );
+        let text = |text: &'static str| Ok(Value::from_text(text));
+        let unsupported = SQLSTATE_FEATURE_NOT_SUPPORTED;
+        let range = SQLSTATE_DATETIME_FIELD_OVERFLOW;
         for (declared, bytes, expected) in [
-            (
-                vec![Some(Type::TEXT)],
-                &b"42"[..],
-                Some(Value::from_text("42")),
-            ),
+            (one(Type::TEXT), b"42".to_vec(), text("42")),
             // Type OID 0: PostgreSQL reads `SELECT $1::int4` with these bytes
             // as 42.
-            (vec![None], b"\0\0\0\x2a", None),
+            (vec![None], be4(42), Err(unsupported)),
             (
-                vec![Some(Type::BYTEA)],
-                b"\\x41",
-                Some(Value::from_blob(b"\\x41".to_vec())),
+                one(Type::BYTEA),
+                b"\\x41".to_vec(),
+                Ok(Value::from_blob(b"\\x41".to_vec())),
             ),
-            (vec![Some(Type::INT8)], b"\0\0\0\0\0\0\0\x2a", None),
-            (vec![Some(Type::DATE)], b"\0\0\x22\x42", None),
-            (vec![], b"42", None),
+            (one(Type::UUID), vec![0; 16], Err(unsupported)),
+            (vec![], b"42".to_vec(), Err(unsupported)),
+            (one(Type::BOOL), vec![], Err(SQLSTATE_PROTOCOL_VIOLATION)),
+            (one(Type::BOOL), vec![2], Ok(Value::from_i64(1))),
+            (one(Type::INT2), vec![0x80, 0], Ok(Value::from_i64(-32768))),
+            (one(Type::INT4), be4(-1), Ok(Value::from_i64(-1))),
+            (one(Type::INT8), be8(42), Ok(Value::from_i64(42))),
+            (
+                one(Type::INT4),
+                vec![0; 3],
+                Err(SQLSTATE_PROTOCOL_VIOLATION),
+            ),
+            (
+                one(Type::INT4),
+                vec![0; 5],
+                Err(SQLSTATE_INVALID_BINARY_REPRESENTATION),
+            ),
+            (
+                one(Type::FLOAT8),
+                1.5f64.to_be_bytes().to_vec(),
+                Ok(Value::from_f64(1.5)),
+            ),
+            (
+                one(Type::FLOAT8),
+                f64::NAN.to_be_bytes().to_vec(),
+                Err(unsupported),
+            ),
+            (one(Type::DATE), be4(8770), text("2024-01-05")),
+            // infinity
+            (one(Type::DATE), be4(i32::MAX), Err(unsupported)),
+            (one(Type::DATE), be4(i32::MAX - 1), Err(range)),
+            // 0000-12-31, the day before 0001-01-01
+            (one(Type::DATE), be4(-730_120), Err(unsupported)),
+            (one(Type::TIME), be8(86_400_000_000), text("24:00:00")),
+            (one(Type::TIME), be8(86_400_000_001), Err(range)),
+            (
+                one(Type::TIMESTAMP),
+                be8(757_764_000_500_000),
+                text("2024-01-05 10:00:00.5"),
+            ),
+            // -infinity
+            (one(Type::TIMESTAMP), be8(i64::MIN), Err(unsupported)),
+            (one(Type::TIMESTAMP), be8(i64::MAX - 1), Err(range)),
+            // 10000-01-01 00:00:00
+            (
+                one(Type::TIMESTAMP),
+                be8(252_455_616_000_000_000),
+                Err(unsupported),
+            ),
+            (
+                one(Type::TIMESTAMPTZ),
+                be8(757_756_800_500_000),
+                text("2024-01-05 08:00:00.5+00"),
+            ),
         ] {
             let mut portal = Portal::<String>::default();
             portal.statement =
                 Arc::new(StoredStatement::new(String::new(), String::new(), declared));
             portal.parameter_format = Format::UnifiedBinary;
-            portal.parameters = vec![Some(bytes.to_vec().into())];
+            portal.parameters = vec![Some(bytes.clone().into())];
             let mut stmt = conn.prepare("SELECT $1").unwrap();
             match (bind_portal_parameters(&mut stmt, &portal), expected) {
-                (Ok(()), Some(value)) => assert_eq!(stmt.run_collect_rows().unwrap(), [[value]]),
-                (Err(error), None) => assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED),
+                (Ok(()), Ok(value)) => assert_eq!(stmt.run_collect_rows().unwrap(), [[value]]),
+                (Err(error), Err(expected)) => assert_eq!(sqlstate(error), expected, "{bytes:?}"),
                 (result, expected) => panic!("{bytes:?}: {result:?}, expected {expected:?}"),
             }
         }

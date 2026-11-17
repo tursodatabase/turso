@@ -7415,6 +7415,7 @@ version = "0.9.0-pre.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "pgwire",
  "tempfile",

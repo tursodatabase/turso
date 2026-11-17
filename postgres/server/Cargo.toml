@@ -12,6 +12,7 @@ path = "lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 pgwire = "0.36"
