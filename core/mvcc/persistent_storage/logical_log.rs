@@ -160,7 +160,9 @@
 //!
 //! The logical log needs no fsync after step 5. If a crash loses the truncation, the old
 //! frames come back, but their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery
-//! skips them.
+//! skips them. A switch from MVCC to WAL mode is different: it fsyncs the log after the
+//! checkpoint, before it writes the WAL-mode header, because a database in WAL mode does not
+//! open while its logical log has frames.
 //!
 //! ### Frame Layout: Unencrypted vs Encrypted
 //!

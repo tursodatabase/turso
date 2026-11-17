@@ -9188,6 +9188,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.storage.logical_log_offset()
     }
 
+    pub(crate) fn sync_logical_log(&self, sync_type: FileSyncType) -> Result<Completion> {
+        self.storage.sync(sync_type)
+    }
+
     /// Replace the logical log with a fresh valid header after the database
     /// file was restored outside MVCC.
     ///

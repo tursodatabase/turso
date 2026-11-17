@@ -12583,6 +12583,67 @@ fn test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames() {
     assert_integrity_ok(&recovered);
 }
 
+/// What this test checks: A switch from MVCC to WAL mode makes the truncation of the logical log
+/// durable before the header says WAL.
+/// Why this matters: A database in WAL mode does not open while its logical log has frames.
+#[test]
+fn test_switch_from_mvcc_to_wal_survives_power_loss() {
+    let db_path = "mvcc-power-loss-after-switch-to-wal.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    // This checkpoint fsyncs the database file, so the WAL-mode header becomes durable.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let durable = io.durable_files();
+    let durable_db = &durable[db_path];
+    assert_eq!(
+        durable_db[18..20],
+        [2, 2],
+        "the header on disk must say WAL"
+    );
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let recovered_path = dir.path().join("recovered.db");
+    std::fs::write(&recovered_path, durable_db).unwrap();
+    std::fs::write(
+        dir.path().join("recovered.db-log"),
+        &durable[&format!("{db_path}-log")],
+    )
+    .unwrap();
+    if let Some(wal) = durable.get(&format!("{db_path}-wal")) {
+        std::fs::write(dir.path().join("recovered.db-wal"), wal).unwrap();
+    }
+    let recovered_db = Database::open_file(
+        Arc::new(PlatformIO::new().unwrap()),
+        recovered_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let recovered = recovered_db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::from_text("a".to_string())]]
+    );
+}
+
 /// Replay gate uses metadata boundary and never applies frames at or below it.
 #[test]
 #[cfg_attr(

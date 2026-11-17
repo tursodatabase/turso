@@ -78,7 +78,7 @@ use crate::{
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
     Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    Statement, SyncMode, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
 };
 use crate::{
     error::{
@@ -18505,6 +18505,10 @@ pub enum OpJournalModeSubState {
     Start,
     /// Checkpointing WAL/MVCC before mode change
     Checkpoint,
+    /// Fsync the logical log that the MVCC checkpoint truncated. A database in WAL mode does
+    /// not open while its logical log has frames, so the truncation must be durable before
+    /// the header says WAL.
+    SyncLogicalLog,
     /// Update the header with new version and get page reference
     UpdateHeader,
     /// Write page 1 to disk
@@ -18779,7 +18783,7 @@ fn op_journal_mode_inner(
                     return_if_io!(state, ckpt_sm.step(&()));
                     state.active_op_state.journal_mode().checkpoint_sm = None;
                     state.active_op_state.journal_mode().sub_state =
-                        OpJournalModeSubState::UpdateHeader;
+                        OpJournalModeSubState::SyncLogicalLog;
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(
@@ -18793,6 +18797,20 @@ fn op_journal_mode_inner(
                     state.active_op_state.journal_mode().sub_state =
                         OpJournalModeSubState::UpdateHeader;
                 }
+            }
+
+            OpJournalModeSubState::SyncLogicalLog => {
+                state.active_op_state.journal_mode().sub_state =
+                    OpJournalModeSubState::UpdateHeader;
+                if program.connection.get_sync_mode() == SyncMode::Off {
+                    continue;
+                }
+                let mv_store = program
+                    .connection
+                    .mv_store_for_db(*db)
+                    .expect("the MVCC checkpoint ran, so the database has an MV store");
+                let completion = mv_store.sync_logical_log(pager.get_sync_type())?;
+                return Ok(state.suspend_on_io(IOCompletions(completion)));
             }
 
             OpJournalModeSubState::UpdateHeader => {

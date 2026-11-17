@@ -76,6 +76,11 @@ The logical log needs no fsync after step 8. If a crash loses the truncation,
 the old frames come back, but their `commit_ts` is at or below
 `persistent_tx_ts_max`, so recovery skips them (invariant 5).
 
+A switch from MVCC to WAL mode (`PRAGMA journal_mode = 'wal'`) is different. It
+fsyncs the logical log after the checkpoint, before it writes the WAL-mode
+header, because a database in WAL mode does not open while its logical log has
+frames.
+
 ## Correctness Invariants
 
 1. Startup reaches one consistent state or fails closed; no best-effort ambiguity.
