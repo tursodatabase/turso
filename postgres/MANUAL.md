@@ -193,6 +193,14 @@ is shown as the engine stores it, which PostgreSQL may not read back: `LIKE`
 with a pattern that is not a constant, for example, is shown with the
 engine's own functions and operators.
 
+`pg_get_expr(adbin, adrelid)` prints the column defaults and the expressions
+of generated columns in `pg_attrdef` the same way too. As in PostgreSQL, the
+cast of the whole default to the column's type is not printed, so
+`DEFAULT 7` in a `bigint` column is shown as `7`, and a quoted constant
+takes the type of its `text` or `varchar` column: `DEFAULT 'x'` is shown as
+`'x'::text`. A quoted constant in a column of another type, such as
+`DEFAULT '2020-01-01'` in a `date` column, is shown as the engine stores it.
+
 Materialized views store the rows of their query when they are refreshed, so
 a role that reads a materialized view built on a table with row-level
 security sees the rows that were stored, as in PostgreSQL.
