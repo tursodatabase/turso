@@ -8265,7 +8265,7 @@ pub fn unnamed_index_name<E>(
 
 /// PostgreSQL keeps only the first 63 bytes (NAMEDATALEN - 1) of an
 /// identifier, and refuses an enum label longer than that.
-const MAX_IDENTIFIER_BYTES: usize = 63;
+pub const MAX_IDENTIFIER_BYTES: usize = 63;
 
 /// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
 /// of the table and column parts shortened first until the name fits in

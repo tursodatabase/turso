@@ -9,13 +9,17 @@ use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{ConnectOpts, Database, Value};
+use turso_core::{ConnectOpts, Database, LimboError, Value};
 use turso_pg::{
-    split_statements, sql_parse_error, PgConnection, StatementResultKind, TransactionState,
+    split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
+    TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
-use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_PROTOCOL_VIOLATION};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_NAME_TOO_LONG, SQLSTATE_PROTOCOL_VIOLATION,
+};
 use turso_pg_parser::ParseResult;
 
 use pgwire::api::auth::StartupHandler;
@@ -36,7 +40,7 @@ use pgwire::api::{
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
-use pgwire::messages::data::DataRow;
+use pgwire::messages::data::{DataRow, FORMAT_CODE_BINARY, FORMAT_CODE_TEXT};
 use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Sync as PgSync};
 use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
@@ -198,7 +202,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             if stmt.result_kind() != StatementResultKind::Rows {
                 responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                let header = Arc::new(text_fields(&stmt));
                 responses.push(execute_query(&mut stmt, header)?);
             }
         }
@@ -375,8 +379,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
             return execute_non_query(&mut stmt, &parsed);
         }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        let header = apply_result_formats(text_fields(&stmt), &portal.result_column_format)
+            .map_err(|e| pg_error(e.into()))?;
+        execute_query(&mut stmt, Arc::new(header))
     }
 
     async fn do_describe_statement<C>(
@@ -398,8 +403,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
-        let fields = describe_fields(&stmt, &Format::UnifiedText);
-        Ok(DescribeStatementResponse::new(param_types, fields))
+        // A statement has no result formats until it is bound to a portal.
+        Ok(DescribeStatementResponse::new(
+            param_types,
+            describe_fields(&stmt),
+        ))
     }
 
     async fn do_describe_portal<C>(
@@ -418,7 +426,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
 
-        let fields = describe_fields(&stmt, &portal.result_column_format);
+        if stmt.result_kind() != StatementResultKind::Rows {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
+        let fields = apply_result_formats(text_fields(&stmt), &portal.result_column_format)
+            .map_err(|e| pg_error(e.into()))?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -437,6 +449,7 @@ where
     let Some(statement) = client.portal_store().get_statement(name) else {
         return Err(PgWireError::StatementNotFound(name.to_owned()));
     };
+    check_bind_formats(message, &statement.parameter_types).map_err(|e| pg_error(e.into()))?;
     let portal = Portal::try_new(message, statement)?;
     client.portal_store().put_portal(Arc::new(portal));
     client
@@ -445,27 +458,183 @@ where
     Ok(())
 }
 
-/// The fields of an ordinary result set, or none for commands and COPY.
-fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+/// Refuses the format codes of a Bind message that tursopg cannot follow:
+/// codes other than text and binary, a parameter format count that matches
+/// neither all parameters nor each one, and a parameter value in binary
+/// format of a type tursopg cannot read in binary. A NULL has no bytes to
+/// read. pgwire reads every code other than binary as text, so this must look
+/// at the message itself.
+fn check_bind_formats(bind: &Bind, parameter_types: &[Option<Type>]) -> Result<(), LimboError> {
+    let param_formats = &bind.parameter_format_codes;
+    let params = bind.parameters.len();
+    if param_formats.len() > 1 && param_formats.len() != params {
+        return Err(sqlstate_error(
+            SQLSTATE_PROTOCOL_VIOLATION,
+            format!(
+                "bind message has {} parameter formats but {params} parameters",
+                param_formats.len()
+            ),
+        ));
+    }
+    for (i, value) in bind.parameters.iter().enumerate() {
+        let code = match param_formats.as_slice() {
+            [] => FORMAT_CODE_TEXT,
+            [code] => *code,
+            codes => codes[i],
+        };
+        check_format_code(code)?;
+        if code == FORMAT_CODE_BINARY && value.is_some() {
+            let pg_type = parameter_type(parameter_types, i);
+            if BinaryType::of(pg_type).is_none_or(|binary_type| !binary_type.can_read()) {
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "binary format is not supported for parameter ${} of type {}; send it in text format",
+                        i + 1,
+                        pg_type.name()
+                    ),
+                ));
+            }
+        }
+    }
+    // PostgreSQL checks a result format code only when it sends a row in
+    // that format; checking every code here refuses more, never less.
+    for &code in &bind.result_column_format_codes {
+        check_format_code(code)?;
+    }
+    Ok(())
+}
+
+fn check_format_code(code: i16) -> Result<(), LimboError> {
+    if code != FORMAT_CODE_TEXT && code != FORMAT_CODE_BINARY {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            format!("unsupported format code: {code}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The type of parameter `i`, as Parse gave it. A parameter Parse gave no
+/// type for is of type unknown, as in PostgreSQL before it infers one.
+fn parameter_type(parameter_types: &[Option<Type>], i: usize) -> &Type {
+    match parameter_types.get(i) {
+        Some(Some(pg_type)) => pg_type,
+        Some(None) | None => &Type::UNKNOWN,
+    }
+}
+
+/// The text-format fields of an ordinary result set, or none for commands
+/// and COPY.
+fn describe_fields(stmt: &turso_pg::Statement) -> Vec<FieldInfo> {
     if stmt.result_kind() != StatementResultKind::Rows {
         return vec![];
     }
-    build_field_info(stmt, format)
+    text_fields(stmt)
 }
 
 fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
     turso_pg_parser::parse(sql).map_err(|error| pg_error(sql_parse_error(error).into()))
 }
 
-/// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+/// RowDescription fields in text format, from a prepared statement's column
+/// information.
+fn text_fields(stmt: &turso_pg::Statement) -> Vec<FieldInfo> {
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
             let pg_type = resolve_pg_type_for_column(stmt, i);
-            FieldInfo::new(name, None, None, pg_type, format.format_for(i))
+            FieldInfo::new(name, None, None, pg_type, FieldFormat::Text)
         })
         .collect()
+}
+
+/// Gives each field the result format a Bind asked for. Refuses a format
+/// count that matches neither all columns nor each one, as PostgreSQL does,
+/// and binary format for a type tursopg cannot send in binary.
+fn apply_result_formats(
+    fields: Vec<FieldInfo>,
+    format: &Format,
+) -> Result<Vec<FieldInfo>, LimboError> {
+    if let Format::Individual(codes) = format {
+        if codes.len() != fields.len() {
+            return Err(sqlstate_error(
+                SQLSTATE_PROTOCOL_VIOLATION,
+                format!(
+                    "bind message has {} result formats but query has {} columns",
+                    codes.len(),
+                    fields.len()
+                ),
+            ));
+        }
+    }
+    fields
+        .into_iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let format = format.format_for(i);
+            let pg_type = field.datatype();
+            if format == FieldFormat::Binary && BinaryType::of(pg_type).is_none() {
+                return Err(sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "binary format is not supported for result column \"{}\" of type {}",
+                        field.name(),
+                        pg_type.name()
+                    ),
+                ));
+            }
+            Ok(FieldInfo::new(
+                field.name().to_owned(),
+                None,
+                None,
+                pg_type.clone(),
+                format,
+            ))
+        })
+        .collect()
+}
+
+/// The types that tursopg can send in binary format, and of those the ones
+/// it can read in binary format.
+#[derive(Clone, Copy)]
+enum BinaryType {
+    Bool,
+    Int2,
+    Int4,
+    Int8,
+    Float8,
+    /// text, varchar and bpchar, whose binary format is the text's UTF-8
+    /// bytes. tursopg refuses bpchar with a length, so it never stores the
+    /// padding PostgreSQL adds.
+    Text,
+    /// Binary format like `Text`, at most 63 bytes.
+    Name,
+    Bytea,
+}
+
+impl BinaryType {
+    fn of(pg_type: &Type) -> Option<Self> {
+        match *pg_type {
+            Type::BOOL => Some(Self::Bool),
+            Type::INT2 => Some(Self::Int2),
+            Type::INT4 => Some(Self::Int4),
+            Type::INT8 => Some(Self::Int8),
+            Type::FLOAT8 => Some(Self::Float8),
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR => Some(Self::Text),
+            Type::NAME => Some(Self::Name),
+            Type::BYTEA => Some(Self::Bytea),
+            _ => None,
+        }
+    }
+
+    /// Whether tursopg can read a parameter of this type in binary format.
+    fn can_read(self) -> bool {
+        match self {
+            Self::Text | Self::Name | Self::Bytea => true,
+            Self::Bool | Self::Int2 | Self::Int4 | Self::Int8 | Self::Float8 => false,
+        }
+    }
 }
 
 /// Decide the PG wire type for a result column.
@@ -473,14 +642,15 @@ fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInf
 /// `get_column_type_info` is the single source of truth: it handles direct
 /// table-column references (declared name, array depth, custom-type kind,
 /// resolved primitive), bare literals (`SELECT 42` -> INTEGER), and typed
-/// expressions like CAST. When it returns `Ok(None)` (no determined primitive)
-/// or `Err` (custom types not enabled — won't happen in PG mode, but the wire
-/// layer shouldn't panic if it does), the safe default is TEXT;
-/// `encode_value` already handles per-value type mismatches.
+/// expressions like CAST. A column it has no type for is described as TEXT,
+/// and its values are sent as text in both formats.
 fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     use turso_core::ColumnTypeKind;
 
-    let Some(info) = stmt.get_column_type_info(idx).ok().flatten() else {
+    let info = stmt
+        .get_column_type_info(idx)
+        .expect("the PostgreSQL dialect always enables custom types");
+    let Some(info) = info else {
         return Type::TEXT;
     };
     // STRUCT and UNION columns live as BLOBs on disk, but exposing them as
@@ -540,12 +710,13 @@ fn execute_query(
 
     stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
-        for (i, val) in row.get_values().enumerate() {
-            let (pg_type, format) = header_clone
-                .get(i)
-                .map(|fi| (fi.datatype().clone(), fi.format()))
-                .unwrap_or((Type::TEXT, FieldFormat::Text));
-            encode_value(&mut encoder, val, &pg_type, format)?;
+        assert_eq!(
+            row.len(),
+            header_clone.len(),
+            "a row has one value per result column"
+        );
+        for (val, field) in row.get_values().zip(header_clone.iter()) {
+            encode_value(&mut encoder, val, field)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -624,13 +795,13 @@ fn bind_portal_parameters(
         let value = match bytes {
             None => Value::Null,
             Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                let pg_type = parameter_type(&portal.statement.parameter_types, i);
+                match portal.parameter_format.format_for(i) {
+                    FieldFormat::Text => pg_bytes_to_value(bytes, pg_type)?,
+                    FieldFormat::Binary => {
+                        decode_binary_parameter(bytes, pg_type).map_err(|e| pg_error(e.into()))?
+                    }
+                }
             }
         };
         // tursopg compiles `$N` as `?N`, so parameter i binds at index i + 1.
@@ -640,14 +811,72 @@ fn bind_portal_parameters(
     Ok(())
 }
 
+/// Reads a parameter in binary format. `check_bind_formats` has refused the
+/// types that tursopg cannot read in binary format.
+fn decode_binary_parameter(bytes: &[u8], pg_type: &Type) -> Result<Value, LimboError> {
+    let binary_type = BinaryType::of(pg_type)
+        .filter(|binary_type| binary_type.can_read())
+        .expect("check_bind_formats refuses binary parameters of this type");
+    match binary_type {
+        BinaryType::Text => Ok(Value::from_text(parameter_text(bytes)?.to_owned())),
+        BinaryType::Name => {
+            let name = parameter_text(bytes)?;
+            if name.len() > turso_pg_parser::translator::MAX_IDENTIFIER_BYTES {
+                return Err(sqlstate_error(
+                    SQLSTATE_NAME_TOO_LONG,
+                    "identifier too long",
+                ));
+            }
+            Ok(Value::from_text(name.to_owned()))
+        }
+        BinaryType::Bytea => Ok(Value::from_blob(bytes.to_vec())),
+        BinaryType::Bool
+        | BinaryType::Int2
+        | BinaryType::Int4
+        | BinaryType::Int8
+        | BinaryType::Float8 => unreachable!("tursopg cannot read {pg_type} in binary format"),
+    }
+}
+
+/// The text of a parameter. Like PostgreSQL, it must be valid UTF-8 without
+/// NUL, and the error shows the bytes of the first character that is not.
+fn parameter_text(bytes: &[u8]) -> Result<&str, LimboError> {
+    let valid_up_to = match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let bad_at = match bytes[..valid_up_to].iter().position(|&byte| byte == 0) {
+        Some(nul_at) => nul_at,
+        None if valid_up_to == bytes.len() => {
+            let text = std::str::from_utf8(bytes).expect("all bytes are valid UTF-8");
+            return Ok(text);
+        }
+        None => valid_up_to,
+    };
+    // PostgreSQL shows as many bytes as the first byte says the character
+    // has, or the bytes that are left if there are fewer (pg_utf_mblen).
+    let character_len = match bytes[bad_at] {
+        0x00..=0x7f => 1,
+        byte if byte & 0xe0 == 0xc0 => 2,
+        byte if byte & 0xf0 == 0xe0 => 3,
+        byte if byte & 0xf8 == 0xf0 => 4,
+        _ => 1,
+    };
+    let shown = &bytes[bad_at..(bad_at + character_len).min(bytes.len())];
+    let shown: Vec<String> = shown.iter().map(|byte| format!("0x{byte:02x}")).collect();
+    Err(sqlstate_error(
+        SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE,
+        format!(
+            "invalid byte sequence for encoding \"UTF8\": {}",
+            shown.join(" ")
+        ),
+    ))
+}
+
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
-    let text = std::str::from_utf8(bytes).map_err(|e| {
-        PgWireError::UserError(Box::new(error_info(&format!(
-            "invalid UTF-8 in parameter: {e}"
-        ))))
-    })?;
+    let text = parameter_text(bytes).map_err(|e| pg_error(e.into()))?;
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
@@ -733,35 +962,55 @@ fn decode_hex_digit(byte: u8, position: usize) -> Result<u8, String> {
     }
 }
 
+/// Encodes one value of a row in the format of its result column.
 fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
-    pg_type: &Type,
-    format: FieldFormat,
+    field: &FieldInfo,
 ) -> turso_core::Result<()> {
+    let pg_type = field.datatype();
+    match field.format() {
+        FieldFormat::Text => encode_text(encoder, val, pg_type),
+        FieldFormat::Binary => {
+            let binary_type = BinaryType::of(pg_type)
+                .expect("apply_result_formats refuses binary format for this type");
+            encode_binary(encoder, val, binary_type, pg_type)
+        }
+    }
+}
+
+/// Encodes a value in text format. Binary text, varchar and name columns
+/// use it too: their binary format is the same bytes.
+fn encode_text(
+    encoder: &mut DataRowEncoder,
+    val: &Value,
+    pg_type: &Type,
+) -> turso_core::Result<()> {
+    let options = FormatOptions::default();
     match val {
         Value::Null => encoder
-            .encode_field(&None::<i8>)
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
-        Value::Numeric(n) if format == FieldFormat::Binary => {
-            encode_binary_number(encoder, n, pg_type)
-                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
-        }
+            .encode_field_with_type_and_format(&None::<i8>, pg_type, FieldFormat::Text, &options)
+            .map_err(encode_error),
         Value::Numeric(turso_core::Numeric::Integer(i)) => {
             // Boolean columns: encode as true/false instead of 0/1
             if *pg_type == Type::BOOL {
                 encoder
-                    .encode_field(&(*i != 0))
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                    .encode_field_with_type_and_format(
+                        &(*i != 0),
+                        pg_type,
+                        FieldFormat::Text,
+                        &options,
+                    )
+                    .map_err(encode_error)
             } else {
                 encoder
-                    .encode_field(i)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                    .encode_field_with_type_and_format(i, pg_type, FieldFormat::Text, &options)
+                    .map_err(encode_error)
             }
         }
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
-            .encode_field(&f64::from(*f))
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+            .encode_field_with_type_and_format(&f64::from(*f), pg_type, FieldFormat::Text, &options)
+            .map_err(encode_error),
         Value::Text(t) => {
             let text = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
@@ -774,8 +1023,13 @@ fn encode_value(
             {
                 let with_tz = format!("{text}+00");
                 encoder
-                    .encode_field(&with_tz.as_str())
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                    .encode_field_with_type_and_format(
+                        &with_tz.as_str(),
+                        pg_type,
+                        FieldFormat::Text,
+                        &options,
+                    )
+                    .map_err(encode_error)
             } else if pg_type.name().starts_with('_') {
                 // Array types: pgwire's to_sql_text quotes strings containing
                 // {, }, or commas when the type is Kind::Array. Since we store
@@ -786,66 +1040,109 @@ fn encode_value(
                         &text,
                         &Type::TEXT,
                         FieldFormat::Text,
-                        &FormatOptions::default(),
+                        &options,
                     )
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                    .map_err(encode_error)
             } else {
                 encoder
-                    .encode_field(&text)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                    .encode_field_with_type_and_format(&text, pg_type, FieldFormat::Text, &options)
+                    .map_err(encode_error)
             }
         }
         Value::Blob(b) => encoder
-            .encode_field(&b.as_slice())
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+            .encode_field_with_type_and_format(&b.as_slice(), pg_type, FieldFormat::Text, &options)
+            .map_err(encode_error),
     }
 }
 
-/// Binary format writes a number with the width of its Rust type, so the
-/// encoding follows the column's type, not the stored value: `count(*)` is
-/// typed text, and `coalesce(NULL::float8, 1)` holds an integer. For a type
-/// without a binary number encoding here, the value is sent as its text, the
-/// same bytes as in text format.
-fn encode_binary_number(
+/// Encodes a value in binary format. The encoding follows the column's type,
+/// not the stored value: `coalesce(NULL::float8, 1)` holds an integer, and
+/// `count(*)` is typed text. A value that the type's binary format cannot
+/// hold is refused, because the client would misread any bytes sent for it.
+fn encode_binary(
     encoder: &mut DataRowEncoder,
-    n: &turso_core::Numeric,
+    val: &Value,
+    binary_type: BinaryType,
     pg_type: &Type,
-) -> PgWireResult<()> {
+) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    match *n {
-        Integer(i) if *pg_type == Type::BOOL => encoder.encode_field(&(i != 0)),
-        Integer(i) if *pg_type == Type::INT2 => match i16::try_from(i) {
-            Ok(i) => encoder.encode_field(&i),
-            Err(_) => Err(pg_error(
-                turso_pg::sqlstate_error(
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    format!("cannot send {i} in binary format as type int2: it is out of range"),
-                )
-                .into(),
-            )),
-        },
-        // A value outside the i32 range, stored in an int column, keeps
-        // the i64 encoding as before, which binary clients still misread.
-        Integer(i) if *pg_type == Type::INT4 => match i32::try_from(i) {
-            Ok(i) => encoder.encode_field(&i),
-            Err(_) => encoder.encode_field(&i),
-        },
-        Integer(i) if *pg_type == Type::INT8 => encoder.encode_field(&i),
-        Integer(i) if *pg_type == Type::FLOAT8 => encoder.encode_field(&(i as f64)),
-        Float(f) if *pg_type == Type::FLOAT8 => encoder.encode_field(&f64::from(f)),
-        Integer(i) => encoder.encode_field_with_type_and_format(
-            &i,
-            pg_type,
-            FieldFormat::Text,
-            &FormatOptions::default(),
-        ),
-        Float(f) => encoder.encode_field_with_type_and_format(
-            &f64::from(f),
-            pg_type,
-            FieldFormat::Text,
-            &FormatOptions::default(),
-        ),
+    let options = FormatOptions::default();
+    let binary = FieldFormat::Binary;
+    if let Value::Null = val {
+        return encoder
+            .encode_field_with_type_and_format(&None::<i8>, pg_type, binary, &options)
+            .map_err(encode_error);
     }
+    let encoded = match (binary_type, val) {
+        (BinaryType::Bool, Value::Numeric(Integer(0))) => {
+            encoder.encode_field_with_type_and_format(&false, pg_type, binary, &options)
+        }
+        (BinaryType::Bool, Value::Numeric(Integer(1))) => {
+            encoder.encode_field_with_type_and_format(&true, pg_type, binary, &options)
+        }
+        (BinaryType::Bool, Value::Numeric(Integer(i))) => {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("cannot send {i} in binary format as type bool: only 0 and 1 are booleans"),
+            ))
+        }
+        (BinaryType::Int2, Value::Numeric(Integer(i))) => {
+            let i = i16::try_from(*i).map_err(|_| out_of_range(*i, pg_type))?;
+            encoder.encode_field_with_type_and_format(&i, pg_type, binary, &options)
+        }
+        (BinaryType::Int4, Value::Numeric(Integer(i))) => {
+            let i = i32::try_from(*i).map_err(|_| out_of_range(*i, pg_type))?;
+            encoder.encode_field_with_type_and_format(&i, pg_type, binary, &options)
+        }
+        (BinaryType::Int8, Value::Numeric(Integer(i))) => {
+            encoder.encode_field_with_type_and_format(i, pg_type, binary, &options)
+        }
+        (BinaryType::Float8, Value::Numeric(Integer(i))) => {
+            encoder.encode_field_with_type_and_format(&(*i as f64), pg_type, binary, &options)
+        }
+        (BinaryType::Float8, Value::Numeric(Float(f))) => {
+            encoder.encode_field_with_type_and_format(&f64::from(*f), pg_type, binary, &options)
+        }
+        // The binary format of text is its UTF-8 bytes, the same bytes as
+        // its text format.
+        (BinaryType::Text | BinaryType::Name, _) => return encode_text(encoder, val, pg_type),
+        (BinaryType::Bytea, Value::Blob(b)) => {
+            encoder.encode_field_with_type_and_format(&b.as_slice(), pg_type, binary, &options)
+        }
+        (
+            BinaryType::Bool
+            | BinaryType::Int2
+            | BinaryType::Int4
+            | BinaryType::Int8
+            | BinaryType::Float8
+            | BinaryType::Bytea,
+            _,
+        ) => {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "cannot send a value of storage class {} in binary format as type {}",
+                    val.value_type(),
+                    pg_type.name()
+                ),
+            ))
+        }
+    };
+    encoded.map_err(encode_error)
+}
+
+fn out_of_range(i: i64, pg_type: &Type) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!(
+            "cannot send {i} in binary format as type {}: it is out of range",
+            pg_type.name()
+        ),
+    )
+}
+
+fn encode_error(error: PgWireError) -> LimboError {
+    LimboError::InternalError(error.to_string())
 }
 
 fn error_info(message: &str) -> ErrorInfo {
@@ -1395,6 +1692,402 @@ mod tests {
         assert_eq!(messages.last().unwrap().1, b"T", "{messages:?}");
     }
 
+    #[test]
+    fn binary_parameters_of_other_types_are_refused() {
+        let (mut client, _) = copy_test_client();
+        let int8 = 42i64.to_be_bytes();
+        for (sql, types, formats, params, message) in [
+            (
+                "SELECT $1::int8",
+                &[20][..],
+                &[1][..],
+                &[Some(&int8[..])][..],
+                "binary format is not supported for parameter $1 of type int8; send it in text format",
+            ),
+            (
+                "SELECT $1::int8, $2::int8",
+                &[20, 20],
+                &[0, 1],
+                &[Some(b"1"), Some(&int8)],
+                "binary format is not supported for parameter $2 of type int8; send it in text format",
+            ),
+            // PostgreSQL reads a parameter that Parse gave no type in the
+            // binary format of the type it infers; tursopg infers none.
+            (
+                "SELECT $1 AS v",
+                &[],
+                &[1],
+                &[Some(b"x")],
+                "binary format is not supported for parameter $1 of type unknown; send it in text format",
+            ),
+        ] {
+            let messages = formatted_messages(&mut client, sql, types, formats, params, &[]);
+            assert_eq!(tags(&messages), "1EZ", "{message}");
+            assert_eq!(
+                error_of(&messages),
+                (SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(), message.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn text_parameters_and_binary_nulls_are_accepted() {
+        let (mut client, _) = copy_test_client();
+        for formats in [&[][..], &[0]] {
+            let messages = formatted_messages(
+                &mut client,
+                "SELECT $1::int8 AS n",
+                &[],
+                formats,
+                &[Some(b"7")],
+                &[],
+            );
+            assert_eq!(tags(&messages), "12TDCZ", "{formats:?}");
+            assert_eq!(data_row(&messages), vec![Some("7".to_owned())]);
+        }
+        let messages = formatted_messages(
+            &mut client,
+            "SELECT $1::int8 AS a, $2::int8 AS b",
+            &[],
+            &[0, 0],
+            &[Some(b"7"), Some(b"8")],
+            &[],
+        );
+        assert_eq!(
+            data_row(&messages),
+            vec![Some("7".to_owned()), Some("8".to_owned())]
+        );
+        // A NULL has no bytes, so its format does not matter.
+        let messages = formatted_messages(
+            &mut client,
+            "SELECT $1::int8 AS n",
+            &[20],
+            &[1],
+            &[None],
+            &[],
+        );
+        assert_eq!(tags(&messages), "12TDCZ");
+        assert_eq!(data_row(&messages), vec![None]);
+        // One format code with no parameters applies to nothing.
+        let messages = formatted_messages(&mut client, "SELECT 1 AS n", &[], &[1], &[], &[]);
+        assert_eq!(tags(&messages), "12TDCZ");
+    }
+
+    #[test]
+    fn binary_text_and_bytea_parameters_are_their_bytes() {
+        let (mut client, conn) = copy_test_client();
+        // text, varchar, bpchar and name.
+        for oid in [25, 1043, 1042, 19] {
+            let messages = formatted_messages(
+                &mut client,
+                "SELECT $1 AS v",
+                &[oid],
+                &[1],
+                &[Some("héllo ".as_bytes())],
+                &[],
+            );
+            assert_eq!(tags(&messages), "12TDCZ", "{oid}: {messages:?}");
+            assert_eq!(
+                data_row(&messages),
+                vec![Some("héllo ".to_owned())],
+                "{oid}"
+            );
+        }
+
+        // A name holds at most 63 bytes.
+        let name = "a".repeat(63);
+        let messages = formatted_messages(
+            &mut client,
+            "SELECT $1 AS v",
+            &[19],
+            &[1],
+            &[Some(name.as_bytes())],
+            &[],
+        );
+        assert_eq!(data_row(&messages), vec![Some(name)]);
+        let name = "a".repeat(64);
+        let messages = formatted_messages(
+            &mut client,
+            "SELECT $1 AS v",
+            &[19],
+            &[1],
+            &[Some(name.as_bytes())],
+            &[],
+        );
+        assert_eq!(
+            error_of(&messages),
+            (
+                SQLSTATE_NAME_TOO_LONG.to_owned(),
+                "identifier too long".to_owned()
+            )
+        );
+
+        // A bytea column stores only blobs, and bytea bytes need not be UTF-8.
+        conn.execute("CREATE TABLE b (v bytea)").unwrap();
+        let messages = formatted_messages(
+            &mut client,
+            "INSERT INTO b VALUES ($1)",
+            &[17],
+            &[1],
+            &[Some(b"\0\xff")],
+            &[],
+        );
+        assert_eq!(tags(&messages), "12nCZ", "{messages:?}");
+        let messages = formatted_messages(&mut client, "SELECT v FROM b", &[], &[], &[], &[1]);
+        assert_eq!(tags(&messages), "12TDCZ");
+        assert_eq!(messages[3].1, b"\0\x01\0\0\0\x02\0\xff");
+    }
+
+    #[test]
+    fn parameters_must_be_utf8_without_nul() {
+        let (mut client, _) = copy_test_client();
+        // PostgreSQL shows the bytes of the first character that is not
+        // valid, as many as its first byte says it has.
+        for (bytes, shown) in [
+            (&b"\xe2\x82"[..], "0xe2 0x82"),
+            (b"\xe2\x82\x41", "0xe2 0x82 0x41"),
+            (b"x\xc3", "0xc3"),
+            (b"\xf0\x9f\x98", "0xf0 0x9f 0x98"),
+            (b"\xed\xa0\x80", "0xed 0xa0 0x80"),
+            (b"\xc0\x80", "0xc0 0x80"),
+            (b"a\xffb", "0xff"),
+            (b"\xff\x00", "0xff"),
+            (b"a\0b", "0x00"),
+            (b"a\0\xff", "0x00"),
+        ] {
+            for format in [0, 1] {
+                let messages = formatted_messages(
+                    &mut client,
+                    "SELECT $1 AS v",
+                    &[25],
+                    &[format],
+                    &[Some(bytes)],
+                    &[],
+                );
+                assert_eq!(
+                    error_of(&messages),
+                    (
+                        SQLSTATE_CHARACTER_NOT_IN_REPERTOIRE.to_owned(),
+                        format!("invalid byte sequence for encoding \"UTF8\": {shown}")
+                    ),
+                    "{bytes:?} in format {format}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_results_are_sent_as_postgresql_sends_them() {
+        let (mut client, conn) = copy_test_client();
+        conn.execute(
+            "CREATE TABLE r (s smallint, v varchar(10), b bytea);
+             INSERT INTO r VALUES (-2, 'héllo', 'abc'::bytea)",
+        )
+        .unwrap();
+        let sql = "SELECT true AS t, false AS f, s, 42::int4 AS i, 42::int8 AS l, \
+                   1.5::float8 AS d, 'x'::text AS x, v, b FROM r";
+        let messages = formatted_messages(&mut client, sql, &[], &[], &[], &[1]);
+        assert_eq!(tags(&messages), "12TDCZ", "{messages:?}");
+        // Each value is a 4-byte length followed by the value.
+        let mut expected = 9i16.to_be_bytes().to_vec();
+        for value in [
+            &[1][..],
+            &[0],
+            &[0xff, 0xfe],
+            &[0, 0, 0, 42],
+            &[0, 0, 0, 0, 0, 0, 0, 42],
+            &[63, 248, 0, 0, 0, 0, 0, 0],
+            b"x",
+            "héllo".as_bytes(),
+            b"abc",
+        ] {
+            expected.extend((value.len() as i32).to_be_bytes());
+            expected.extend(value);
+        }
+        assert_eq!(messages[3].1, expected);
+
+        let sql = "SELECT 42::int8 AS a, 'x'::text AS b";
+        let messages = formatted_messages(&mut client, sql, &[], &[], &[], &[1, 0]);
+        assert_eq!(tags(&messages), "12TDCZ");
+        assert_eq!(
+            messages[3].1,
+            [0, 2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 1, b'x']
+        );
+        let messages =
+            formatted_messages(&mut client, "SELECT NULL::int8 AS n", &[], &[], &[], &[1]);
+        assert_eq!(tags(&messages), "12TDCZ");
+        assert_eq!(messages[3].1, [0, 1, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn binary_results_of_other_types_are_refused_before_any_row() {
+        let (mut client, conn) = copy_test_client();
+        conn.execute(
+            "CREATE TABLE typed (d date, u uuid, n numeric(10,2));
+             INSERT INTO typed VALUES
+               ('2024-01-02', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 1.5)",
+        )
+        .unwrap();
+        for (column, pg_type) in [("d", "date"), ("u", "uuid"), ("n", "numeric")] {
+            let sql = format!("SELECT {column} FROM typed");
+            let expected = (
+                SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
+                format!(
+                    "binary format is not supported for result column \"{column}\" of type {pg_type}"
+                ),
+            );
+            let messages = formatted_messages(&mut client, &sql, &[], &[], &[], &[1]);
+            assert_eq!(tags(&messages), "12EZ", "{sql}");
+            assert_eq!(error_of(&messages), expected, "{sql}");
+
+            // Without a Describe, Execute refuses before its first row.
+            client.send_parse("", &sql, &[]).unwrap();
+            client.send_bind("", "", &[], &[], &[1]).unwrap();
+            client.send_execute("", 0).unwrap();
+            client.send_sync().unwrap();
+            let messages = read_until_ready(&mut client);
+            assert_eq!(tags(&messages), "12EZ", "{sql}");
+            assert_eq!(error_of(&messages), expected, "{sql}");
+        }
+        let messages = formatted_messages(
+            &mut client,
+            "SELECT 42::int8 AS a, d FROM typed",
+            &[],
+            &[],
+            &[],
+            &[0, 1],
+        );
+        assert_eq!(tags(&messages), "12EZ");
+        assert_eq!(
+            error_of(&messages).1,
+            "binary format is not supported for result column \"d\" of type date"
+        );
+    }
+
+    #[test]
+    fn format_codes_and_counts_are_checked_as_in_postgresql() {
+        let (mut client, _) = copy_test_client();
+        let int8 = "SELECT $1::int8";
+        for (sql, param_formats, params, result_formats, expected_tags, sqlstate, message) in [
+            (
+                int8,
+                vec![0, 0],
+                vec![Some(&b"1"[..])],
+                vec![],
+                "1EZ",
+                SQLSTATE_PROTOCOL_VIOLATION,
+                "bind message has 2 parameter formats but 1 parameters",
+            ),
+            (
+                int8,
+                vec![2, 0],
+                vec![Some(b"1")],
+                vec![],
+                "1EZ",
+                SQLSTATE_PROTOCOL_VIOLATION,
+                "bind message has 2 parameter formats but 1 parameters",
+            ),
+            (
+                int8,
+                vec![2],
+                vec![Some(b"1")],
+                vec![],
+                "1EZ",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "unsupported format code: 2",
+            ),
+            (
+                int8,
+                vec![-1],
+                vec![None],
+                vec![],
+                "1EZ",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "unsupported format code: -1",
+            ),
+            // PostgreSQL refuses a result format code when it sends the
+            // first row in it; tursopg refuses it at Bind.
+            (
+                "SELECT 1",
+                vec![],
+                vec![],
+                vec![2],
+                "1EZ",
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "unsupported format code: 2",
+            ),
+            // PostgreSQL refuses a wrong result format count at Bind; tursopg
+            // knows the columns only at Describe or Execute, after
+            // BindComplete.
+            (
+                "SELECT 1",
+                vec![],
+                vec![],
+                vec![0, 0],
+                "12EZ",
+                SQLSTATE_PROTOCOL_VIOLATION,
+                "bind message has 2 result formats but query has 1 columns",
+            ),
+        ] {
+            let messages = formatted_messages(
+                &mut client,
+                sql,
+                &[],
+                &param_formats,
+                &params,
+                &result_formats,
+            );
+            assert_eq!(tags(&messages), expected_tags, "{message}");
+            assert_eq!(
+                error_of(&messages),
+                (sqlstate.to_owned(), message.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn refused_formats_abort_the_transaction_block() {
+        let (mut client, conn) = copy_test_client();
+        conn.execute("CREATE TABLE o (i int)").unwrap();
+        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
+        let int8 = 42i64.to_be_bytes();
+        for (sql, param_types, param_formats, params, result_formats) in [
+            (
+                "SELECT $1::int8",
+                &[20][..],
+                &[1][..],
+                &[Some(&int8[..])][..],
+                &[][..],
+            ),
+            (
+                "SELECT CAST('2024-01-02' AS date) AS d",
+                &[],
+                &[],
+                &[],
+                &[1],
+            ),
+            // Refused while the row is encoded.
+            ("SELECT i FROM o", &[], &[], &[], &[1]),
+        ] {
+            query_messages(&mut client, "BEGIN");
+            let messages = formatted_messages(
+                &mut client,
+                sql,
+                param_types,
+                param_formats,
+                params,
+                result_formats,
+            );
+            assert_eq!(
+                error_of(&messages).0,
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "{sql}"
+            );
+            assert_eq!(messages.last().unwrap().1, b"E", "{sql}");
+            assert_block_aborted(&mut client, sql);
+        }
+    }
+
     fn query_messages(client: &mut PgConn, sql: &str) -> Vec<(u8, Vec<u8>)> {
         client.send_query(sql).unwrap();
         read_until_ready(client)
@@ -1431,6 +2124,38 @@ mod tests {
         client.send_execute("", 0).unwrap();
         client.send_sync().unwrap();
         read_until_ready(client)
+    }
+
+    /// Runs `sql` with the extended query protocol, the given parameter types
+    /// and format codes, and a Describe of the portal before Execute.
+    fn formatted_messages(
+        client: &mut PgConn,
+        sql: &str,
+        param_types: &[u32],
+        param_formats: &[i16],
+        params: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) -> Vec<(u8, Vec<u8>)> {
+        client.send_parse("", sql, param_types).unwrap();
+        client
+            .send_bind("", "", param_formats, params, result_formats)
+            .unwrap();
+        client.send_describe_portal("").unwrap();
+        client.send_execute("", 0).unwrap();
+        client.send_sync().unwrap();
+        read_until_ready(client)
+    }
+
+    /// The message types, such as "12TDCZ" for ParseComplete, BindComplete,
+    /// RowDescription, DataRow, CommandComplete and ReadyForQuery.
+    fn tags(messages: &[(u8, Vec<u8>)]) -> String {
+        messages.iter().map(|message| message.0 as char).collect()
+    }
+
+    fn data_row(messages: &[(u8, Vec<u8>)]) -> Vec<Option<String>> {
+        let rows: Vec<_> = messages.iter().filter(|m| m.0 == b'D').collect();
+        assert_eq!(rows.len(), 1, "{messages:?}");
+        turso_pg_client::parse_data_row(&rows[0].1).unwrap()
     }
 
     /// Checks that the open transaction block is aborted: the next statement
@@ -1507,13 +2232,6 @@ mod tests {
                 b"\0\0\0\x08\0\0\0\x02\x18\x71\x1a\0",
                 b"\0\0\0\x0a9000000000",
             ),
-            // Out of the int4 range: still 8 bytes, until #10826.
-            (
-                "SELECT i FROM o",
-                Type::INT4,
-                b"\0\0\0\x08\0\0\0\0\xb2\xd0\x5e\0",
-                b"\0\0\0\x0a3000000000",
-            ),
             (
                 "SELECT 1.5::float8",
                 Type::FLOAT8,
@@ -1537,21 +2255,115 @@ mod tests {
         ] {
             for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
             {
-                let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
-                assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
-                let rows = stmt.run_collect_rows().unwrap();
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(
-                    &mut encoder,
-                    &rows[0][0],
-                    fields[0].datatype(),
-                    fields[0].format(),
-                )
-                .unwrap();
-                assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
+                let (pg_type, data) = encode_first_value(&conn, sql, &format).unwrap();
+                assert_eq!(pg_type, expected_type, "{sql}");
+                assert_eq!(data, expected, "{sql}");
             }
         }
+
+        // An int4 value outside the i32 range has no 4-byte binary encoding.
+        let error = encode_first_value(&conn, "SELECT i FROM o", &Format::UnifiedBinary)
+            .map(|_| ())
+            .unwrap_err();
+        let error = turso_pg::Error::from(error);
+        assert_eq!(error.sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED);
+        assert_eq!(
+            error.message,
+            "cannot send 3000000000 in binary format as type int4: it is out of range"
+        );
+        let (_, text) = encode_first_value(&conn, "SELECT i FROM o", &Format::UnifiedText).unwrap();
+        assert_eq!(text, b"\0\0\0\x0a3000000000");
+
+        for (value, pg_type, message) in [
+            (
+                Value::from_text("abc".to_owned()),
+                Type::INT8,
+                "cannot send a value of storage class TEXT in binary format as type int8",
+            ),
+            (
+                Value::from_i64(2),
+                Type::BOOL,
+                "cannot send 2 in binary format as type bool: only 0 and 1 are booleans",
+            ),
+            (
+                Value::from_text("abc".to_owned()),
+                Type::BYTEA,
+                "cannot send a value of storage class TEXT in binary format as type bytea",
+            ),
+            (
+                Value::from_i64(32768),
+                Type::INT2,
+                "cannot send 32768 in binary format as type int2: it is out of range",
+            ),
+            (
+                Value::from_i64(-2147483649),
+                Type::INT4,
+                "cannot send -2147483649 in binary format as type int4: it is out of range",
+            ),
+        ] {
+            let error = encode_binary_value(&value, &pg_type).unwrap_err();
+            let error = turso_pg::Error::from(error);
+            assert_eq!(error.sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED, "{message}");
+            assert_eq!(error.message, message);
+        }
+        for (value, pg_type, expected) in [
+            (Value::from_i64(0), Type::BOOL, &b"\0\0\0\x01\0"[..]),
+            (Value::from_i64(1), Type::BOOL, b"\0\0\0\x01\x01"),
+            (Value::Null, Type::BOOL, b"\xff\xff\xff\xff"),
+            (Value::from_i64(-32768), Type::INT2, b"\0\0\0\x02\x80\0"),
+            (Value::from_i64(32767), Type::INT2, b"\0\0\0\x02\x7f\xff"),
+            (
+                Value::from_i64(-2147483648),
+                Type::INT4,
+                b"\0\0\0\x04\x80\0\0\0",
+            ),
+            (
+                Value::from_i64(2147483647),
+                Type::INT4,
+                b"\0\0\0\x04\x7f\xff\xff\xff",
+            ),
+            (
+                Value::from_blob(vec![0, 0xff]),
+                Type::BYTEA,
+                b"\0\0\0\x02\0\xff",
+            ),
+        ] {
+            assert_eq!(
+                encode_binary_value(&value, &pg_type).unwrap(),
+                expected,
+                "{value:?} as {pg_type}"
+            );
+        }
+    }
+
+    /// The type of a query's first column and the DataRow bytes of the first
+    /// value in the given result format.
+    fn encode_first_value(
+        conn: &PgConnection,
+        sql: &str,
+        format: &Format,
+    ) -> Result<(Type, Vec<u8>), LimboError> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let fields = Arc::new(apply_result_formats(text_fields(&stmt), format)?);
+        let rows = stmt.run_collect_rows().unwrap();
+        let mut encoder = DataRowEncoder::new(fields.clone());
+        encode_value(&mut encoder, &rows[0][0], &fields[0])?;
+        let data = encoder.finish().unwrap().data.to_vec();
+        Ok((fields[0].datatype().clone(), data))
+    }
+
+    /// The DataRow bytes of `value` in binary format as type `pg_type`.
+    fn encode_binary_value(value: &Value, pg_type: &Type) -> Result<Vec<u8>, LimboError> {
+        let field = FieldInfo::new(
+            "v".to_owned(),
+            None,
+            None,
+            pg_type.clone(),
+            FieldFormat::Binary,
+        );
+        let mut encoder = DataRowEncoder::new(Arc::new(vec![field.clone()]));
+        encode_value(&mut encoder, value, &field)?;
+        Ok(encoder.finish().unwrap().data.to_vec())
     }
 
     #[test]
@@ -1570,7 +2382,7 @@ mod tests {
         )
         .unwrap();
         let stmt = conn.prepare("SELECT * FROM typed").unwrap();
-        let types: Vec<Type> = build_field_info(&stmt, &Format::UnifiedText)
+        let types: Vec<Type> = text_fields(&stmt)
             .iter()
             .map(|field| field.datatype().clone())
             .collect();
@@ -1626,27 +2438,15 @@ mod tests {
             "SELECT pg_is_in_recovery() AS recovery",
             "SELECT (PG_IS_IN_RECOVERY())",
         ] {
+            // The column is typed text, whose binary format is the same text.
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
-                let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
-                assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
-                let rows = stmt.run_collect_rows().unwrap();
-                assert_eq!(rows.len(), 1);
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                encode_value(
-                    &mut encoder,
-                    &rows[0][0],
-                    fields[0].datatype(),
-                    fields[0].format(),
-                )
-                .unwrap();
-                let row = encoder.finish().unwrap();
-                assert_eq!(row.field_count, 1);
-                assert_eq!(&row.data[..], b"\0\0\0\x01t");
+                let (pg_type, data) = encode_first_value(&conn, sql, &format).unwrap();
+                assert_eq!(pg_type, Type::TEXT, "{sql}");
+                assert_eq!(data, b"\0\0\0\x01t", "{sql}");
             }
         }
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = text_fields(&stmt);
         assert_eq!(*fields[0].datatype(), Type::INT4);
     }
 
@@ -1705,7 +2505,7 @@ mod tests {
             "SELECT coalesce(x, 2) FROM t",
         ] {
             let stmt = conn.prepare(sql).unwrap();
-            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            let fields = text_fields(&stmt);
             assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
         }
     }
@@ -1734,24 +2534,13 @@ mod tests {
             ("SELECT random() * 10", Type::FLOAT8),
             ("SELECT array_to_json(ARRAY[1])", Type::JSON),
         ] {
-            let mut stmt = conn.prepare(sql).unwrap();
-            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-            assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
-            let _ = stmt.run_collect_rows().unwrap();
+            let (pg_type, _) = encode_first_value(&conn, sql, &Format::UnifiedText).unwrap();
+            assert_eq!(pg_type, expected_type, "{sql}");
         }
 
-        let mut stmt = conn.prepare("SELECT booleq(true, true)").unwrap();
-        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-        let rows = stmt.run_collect_rows().unwrap();
-        let mut encoder = DataRowEncoder::new(fields.clone());
-        encode_value(
-            &mut encoder,
-            &rows[0][0],
-            fields[0].datatype(),
-            fields[0].format(),
-        )
-        .unwrap();
-        assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");
+        let (_, data) =
+            encode_first_value(&conn, "SELECT booleq(true, true)", &Format::UnifiedText).unwrap();
+        assert_eq!(data, b"\0\0\0\x01t");
     }
 
     #[test]
@@ -1772,13 +2561,11 @@ mod tests {
             "COPY items TO STDOUT",
         ] {
             let stmt = conn.prepare(sql).unwrap();
-            for format in [Format::UnifiedText, Format::UnifiedBinary] {
-                assert!(describe_fields(&stmt, &format).is_empty(), "{sql}");
-            }
+            assert!(describe_fields(&stmt).is_empty(), "{sql}");
         }
         let sql = "SELECT 'LOCK TABLE items'";
         let query = conn.prepare(sql).unwrap();
-        assert_eq!(describe_fields(&query, &Format::UnifiedText).len(), 1);
+        assert_eq!(describe_fields(&query).len(), 1);
     }
 
     #[test]
