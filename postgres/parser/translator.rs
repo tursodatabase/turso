@@ -2822,12 +2822,11 @@ impl PostgreSQLTranslator {
         // column comes back as bytea.
         if args.is_empty() && matches!(func_name, "current_schema" | "current_database" | "version")
         {
-            reject_ordinality(range_func, func_name)?;
-            reject_column_aliases(&range_func.alias, "a function")?;
-            let column_name = match &alias {
-                Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
-                _ => exact_name(func_name),
-            };
+            let result_name = range_func
+                .alias
+                .as_ref()
+                .map_or(func_name, |range_alias| range_alias.aliasname.as_str());
+            let names = range_function_column_names(range_func, vec![result_name.to_string()])?;
             let call = ast::Expr::FunctionCall {
                 name: exact_name(func_name),
                 distinctness: None,
@@ -2852,10 +2851,19 @@ impl PostgreSQLTranslator {
                 body: ast::SelectBody {
                     select: ast::OneSelect::Select {
                         distinctness: None,
-                        columns: vec![ast::ResultColumn::Expr(
-                            Box::new(cast),
-                            Some(ast::As::Elided(column_name)),
-                        )],
+                        columns: [
+                            cast,
+                            bigint(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                        ]
+                        .into_iter()
+                        .zip(names)
+                        .map(|(expr, name)| {
+                            ast::ResultColumn::Expr(
+                                Box::new(expr),
+                                Some(ast::As::Elided(exact_name(name))),
+                            )
+                        })
+                        .collect(),
                         from: None,
                         where_clause: None,
                         group_by: None,
@@ -13505,9 +13513,11 @@ mod tests {
             "column alias list on a function",
         );
         assert_not_supported(
-            "SELECT * FROM current_schema() AS s(x)",
+            "SELECT * FROM json_each('[1]') AS s(x)",
             "column alias list on a function",
         );
+        assert_translates("SELECT * FROM current_schema() AS s(x)");
+        assert_translates("SELECT * FROM version() WITH ORDINALITY AS v(a, b)");
         assert_translates("SELECT u.x FROM unnest(ARRAY[1, 2]) AS u(x)");
         assert_translates("SELECT x.a FROM t AS x");
         assert_translates("SELECT s.p FROM (SELECT 1, 2) AS s(p, q)");

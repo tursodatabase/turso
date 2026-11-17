@@ -385,6 +385,32 @@ expect {
     6|2
 }
 
+test ordinality-of-a-function-that-returns-one-value-is-one {
+    SELECT * FROM current_schema() WITH ORDINALITY;
+    SELECT cs.cs, cs.ordinality FROM current_schema() WITH ORDINALITY AS cs;
+    SELECT b FROM version() WITH ORDINALITY AS v(a, b) WHERE length(a) > 0;
+}
+expect {
+    public|1
+    public|1
+    1
+}
+
+test column-alias-list-on-a-function-that-returns-one-value {
+    SELECT s.x FROM current_schema() AS s(x);
+}
+expect {
+    public
+}
+
+test column-alias-list-longer-than-one-value-and-ordinality-errors {
+    SELECT * FROM current_schema() WITH ORDINALITY AS s(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+    table "s" has 2 columns available but 3 columns specified
+}
+
 test with-ordinality-after-the-alias-is-a-syntax-error {
     SELECT * FROM generate_series(1, 2) AS g WITH ORDINALITY;
 }
