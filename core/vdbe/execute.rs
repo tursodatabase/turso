@@ -18538,6 +18538,7 @@ pub struct OpJournalModeState {
 
 impl OpJournalModeState {
     pub(super) fn cleanup_checkpoint(&mut self) -> Result<()> {
+        self.bootstrap_state.cancel();
         let Some(mut checkpoint_sm) = self.checkpoint_sm.take() else {
             return Ok(());
         };
@@ -18610,6 +18611,7 @@ pub fn op_journal_mode(
         }
         Err(err) => {
             // Reset state on error
+            state.active_op_state.cleanup_journal_mode_checkpoint()?;
             state.active_op_state.clear();
             Err(err)
         }
@@ -18796,6 +18798,9 @@ fn op_journal_mode_inner(
             }
 
             OpJournalModeSubState::UpdateHeader => {
+                if !program.connection.db.is_in_memory_db() {
+                    return_if_io!(state, pager.maybe_allocate_page1());
+                }
                 let new_mode = state
                     .active_op_state
                     .journal_mode()
