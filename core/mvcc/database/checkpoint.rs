@@ -4,10 +4,12 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    types_table_root_page, DeleteRowStateMachine, IndexRowsEntry, MVTableId, MvStore, RowID,
-    RowKey, RowVersion, RowVersions, SortableIndexKey, TxTimestampOrID, WalPos,
-    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
-    SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, IndexRowsEntry, MVTableId, MvStore, RowID, RowKey, RowVersion,
+    RowVersions, SortableIndexKey, TxTimestampOrID, WalPos, WriteRowStateMachine,
+    MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+};
+use crate::mvcc::sqlite_schema_row::{
+    types_table_root_page, SqliteSchemaRow, SQLITE_SCHEMA_COLUMN_COUNT,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -55,8 +57,6 @@ macro_rules! with_mvcc_checkpoint_allocation_site {
 
 /// Root page of the `sqlite_schema` B-tree in the database file.
 const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
-/// Column count of a `sqlite_schema` record (type, name, tbl_name, rootpage, sql).
-const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollectTablePhase {
@@ -2822,11 +2822,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 )
                             })?;
                         let record =
-                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
-
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                            SqliteSchemaRow::from_record_bytes(row_version.payload(row_id))?
+                                .with_root_page(root_page as i64)
+                                .to_record()?;
                         // Btree creation has already happened by this point; an injected fault
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
@@ -2857,10 +2855,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 )
                             })?;
                         let record =
-                            ImmutableRecordRef::from_bin_record(row_version.payload(row_id));
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                            SqliteSchemaRow::from_record_bytes(row_version.payload(row_id))?
+                                .with_root_page(root_page as i64)
+                                .to_record()?;
                         // Btree creation has already happened by this point; an injected fault
                         // while publishing the sqlite_schema root page can leave retry state with
                         // a durable btree and a stale rootpage=0 schema row.
@@ -3903,7 +3900,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
             BuildLocalSchemaViewState::StartTypesScan => {
                 let schema_rows = std::mem::take(&mut self.rows);
                 let types_table_root_page = if self.connection.experimental_custom_types_enabled() {
-                    schema_rows.values().find_map(types_table_root_page)
+                    types_table_root_page(schema_rows.values().map(|record| record.get_payload()))?
                 } else {
                     None
                 };
