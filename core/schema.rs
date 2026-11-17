@@ -988,22 +988,53 @@ impl TypeDef {
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
     }
 
-    /// Fails if `type_name` has a modifier such as the `(3)` in `date(3)` and
-    /// this type has no parameters. PostgreSQL gives some of these a meaning
-    /// Turso does not implement, such as the precision of `timestamp(3)`.
-    pub fn check_type_modifier(&self, type_name: &ast::Type) -> Result<()> {
-        if type_name.size.is_some() && self.user_params().next().is_none() {
+    /// The arguments `type_name`, a use of this type, gives the type's
+    /// parameters: `10, 2` in `numeric(10, 2)`, and none for a type without
+    /// parameters. None when the type has parameters and `type_name` gives no
+    /// arguments, as `numeric` does. Any other number of arguments is an
+    /// error. PostgreSQL gives a modifier on some types without parameters a
+    /// meaning Turso does not implement, such as the precision in
+    /// `timestamp(3)`.
+    #[allow(clippy::vec_box)]
+    pub fn type_args(
+        &self,
+        type_name: &ast::Type,
+    ) -> Result<Option<std::vec::Vec<Box<ast::Expr>>>> {
+        let args = written_type_args(type_name);
+        let param_count = self.user_params().count();
+        if args.len() == param_count {
+            return Ok(Some(args));
+        }
+        if args.is_empty() {
+            return Ok(None);
+        }
+        if param_count == 0 {
             return Err(LimboError::NotSupported(format!(
                 "a type modifier on type \"{}\"",
                 self.name
             )));
         }
-        Ok(())
+        Err(LimboError::ParseError(format!(
+            "type \"{}\" requires {} parameter(s), got {}",
+            self.name,
+            param_count,
+            args.len()
+        )))
     }
 
     /// Returns the original SQL used to create this type or domain.
     pub fn to_sql(&self) -> &str {
         &self.sql
+    }
+}
+
+/// The arguments written after a type name: `10, 2` in `numeric(10, 2)`.
+#[allow(clippy::vec_box)]
+pub(crate) fn written_type_args(type_name: &ast::Type) -> std::vec::Vec<Box<ast::Expr>> {
+    match &type_name.size {
+        Some(ast::TypeSize::MaxSize(e)) => std::vec![e.clone()],
+        Some(ast::TypeSize::TypeSize(e1, e2)) => std::vec![e1.clone(), e2.clone()],
+        None => std::vec::Vec::new(),
     }
 }
 
@@ -7391,16 +7422,9 @@ pub fn create_table(
                     .map(|t| column_declared_type(&t.name))
                     .unwrap_or_default();
 
-                let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
-                    Some(ast::Type {
-                        size: Some(ast::TypeSize::MaxSize(ref expr)),
-                        ..
-                    }) => std::vec![expr.clone()],
-                    Some(ast::Type {
-                        size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
-                        ..
-                    }) => std::vec![e1.clone(), e2.clone()],
-                    _ => std::vec::Vec::new(),
+                let ty_params = match &col_type {
+                    Some(written_type) => written_type_args(written_type),
+                    None => std::vec::Vec::new(),
                 };
 
                 let mut typename_exactly_integer = false;
@@ -8269,16 +8293,9 @@ impl Column {
             None => (Type::Null, false),
         };
 
-        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
-            Some(ast::Type {
-                size: Some(ast::TypeSize::MaxSize(ref expr)),
-                ..
-            }) => std::vec![expr.clone()],
-            Some(ast::Type {
-                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
-                ..
-            }) => std::vec![e1.clone(), e2.clone()],
-            _ => std::vec::Vec::new(),
+        let ty_params = match &value.col_type {
+            Some(written_type) => written_type_args(written_type),
+            None => std::vec::Vec::new(),
         };
 
         coldef

@@ -762,3 +762,27 @@ test domain-type-modifier-is-refused-in-cast {
 expect error {
     a type modifier on type "dd" is not supported
 }
+
+# A CAST must give a type with parameters all of its arguments, or none.
+test varchar-cast-with-too-many-arguments-is-refused {
+    SELECT CAST('abcdef' AS varchar(2,3));
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
+# PostgreSQL reads numeric(10) as numeric(10,0) and gives 2. Turso's numeric
+# takes a precision and a scale, so a CAST that gives one of them is an error.
+test numeric-cast-with-too-few-arguments-is-refused {
+    SELECT CAST(1.5 AS numeric(10));
+}
+expect error {
+    type "numeric" requires 2 parameter\(s\), got 1
+}
+
+test varchar-array-cast-with-too-many-arguments-is-refused {
+    SELECT CAST('{abcdef}' AS varchar(2,3)[]);
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}

@@ -831,14 +831,23 @@ fn translate_cast_expr(
                 array_dimensions: 0,
                 ..tn.clone()
             };
-            if let Some(resolved) = custom_type_cast_chain(&element_type, resolver.schema())? {
+            if let Some((resolved, args)) =
+                custom_type_cast_chain(&element_type, resolver.schema())?
+            {
                 emit_array_leaf_loop(
                     program,
                     target_register,
                     tn.array_dimensions,
                     ArrayInput::Text(&crate::vdbe::insn::ArrayEncodeTarget::Cast),
                     |program, leaf_reg| {
-                        emit_custom_type_cast(program, resolved, &element_type, leaf_reg, resolver)
+                        emit_custom_type_cast(
+                            program,
+                            resolved,
+                            &args,
+                            &element_type,
+                            leaf_reg,
+                            resolver,
+                        )
                     },
                 )?;
                 return Ok(target_register);
@@ -873,8 +882,8 @@ fn translate_cast_expr(
             )?;
             return Ok(target_register);
         }
-        if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
-            emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
+        if let Some((resolved, args)) = custom_type_cast_chain(tn, resolver.schema())? {
+            emit_custom_type_cast(program, resolved, &args, tn, target_register, resolver)?;
             return Ok(target_register);
         }
     }
@@ -891,25 +900,17 @@ fn translate_cast_expr(
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
-/// types are `resolved` (see `custom_type_cast_chain`).
+/// types are `resolved` and whose arguments are `args` (see
+/// `custom_type_cast_chain`).
 fn emit_custom_type_cast(
     program: &mut ProgramBuilder,
     resolved: crate::schema::ResolvedType,
+    args: &[Box<ast::Expr>],
     type_name: &ast::Type,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     let chain = &resolved.chain;
-    // Build ty_params from AST TypeSize so parametric types
-    // (e.g. numeric(10,2)) get their parameters passed through.
-    let ty_params: Vec<Box<ast::Expr>> = match &type_name.size {
-        Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
-        Some(ast::TypeSize::TypeSize(e1, e2)) => {
-            vec![e1.clone(), e2.clone()]
-        }
-        None => Vec::new(),
-    };
-
     // A cast to a domain over boolean gives true for every nonzero
     // integer in dialects whose integer-to-boolean cast does, before
     // boolean's ENCODE sees the value.
@@ -932,13 +933,7 @@ fn emit_custom_type_cast(
         }),
         StrictType::Any => {}
     }
-    emit_store_value(
-        program,
-        &resolved,
-        reg,
-        Coerce::WithArgs(&ty_params),
-        resolver,
-    )?;
+    emit_store_value(program, &resolved, reg, Coerce::WithArgs(args), resolver)?;
     emit_decode(program, &resolved, reg, resolver)?;
     // The domain's CHECKs see the value after DECODE, as they do on a
     // column of the domain.
@@ -949,16 +944,17 @@ fn emit_custom_type_cast(
 }
 
 /// The custom types a CAST to `type_name` stores its value as, the way a
-/// column of the type stores it, or None when the CAST is SQLite's CAST. A
-/// domain stores through every type under it, then checks its constraints on
-/// the stored value. A CAST with type arguments applies their limits too:
-/// CAST('3.504' AS numeric(10,2)) is 3.50. A modifier on a type with no
-/// parameters is an error: CAST(x AS timestamp(3)). Array types are not
-/// covered here.
+/// column of the type stores it, with the arguments the CAST gives the type,
+/// or None when the CAST is SQLite's CAST. A domain stores through every type
+/// under it, then checks its constraints on the stored value. A CAST with type
+/// arguments applies their limits too: CAST('3.504' AS numeric(10,2)) is 3.50.
+/// Arguments that don't fit the type's parameters are an error (see
+/// [TypeDef::type_args]). Array types are not covered here.
+#[allow(clippy::vec_box)]
 fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
-) -> Result<Option<crate::schema::ResolvedType>> {
+) -> Result<Option<(crate::schema::ResolvedType, Vec<Box<ast::Expr>>)>> {
     if type_name.array_dimensions > 0 {
         return Ok(None);
     }
@@ -967,28 +963,15 @@ fn custom_type_cast_chain(
     else {
         return Ok(None);
     };
-    resolved.leaf().check_type_modifier(type_name)?;
-    if resolved.is_domain() {
-        return Ok(Some(resolved));
-    }
-    if is_sqlite_cast_to(resolved.leaf(), type_name) {
+    // A CAST that gives no arguments to a type that takes some is SQLite's
+    // CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
+    let Some(args) = resolved.leaf().type_args(type_name)? else {
         return Ok(None);
-    }
-    resolved.chain.truncate(1);
-    Ok(Some(resolved))
-}
-
-/// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
-/// instead: the type takes arguments and `type_name` doesn't give all of them.
-/// CAST(x AS NUMERIC) is a common SQLite idiom.
-pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
-    let type_arg_count = match &type_name.size {
-        Some(ast::TypeSize::MaxSize(_)) => 1,
-        Some(ast::TypeSize::TypeSize(..)) => 2,
-        None => 0,
     };
-    let user_param_count = type_def.user_params().count();
-    !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
+    if !resolved.is_domain() {
+        resolved.chain.truncate(1);
+    }
+    Ok(Some((resolved, args)))
 }
 
 /// True when a cast to `type_def` turns every nonzero integer into true.

@@ -547,7 +547,7 @@ impl ColumnCustomType {
             .unwrap_or_else(|| panic!("custom type {} must exist", type_name.name));
         Self {
             type_def: Arc::clone(type_def),
-            params: written_type_params(type_name),
+            params: crate::schema::written_type_args(type_name),
         }
     }
 }
@@ -745,10 +745,9 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
 }
 
 fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
-    let name = crate::util::dequote(&type_name.name);
-    let scalar = match custom_cast_target(&name, type_name, schema) {
-        Some(custom) => custom,
-        None => match Affinity::of_written_type(&name) {
+    let scalar = match custom_cast_target(type_name, schema) {
+        Ok(Some(custom)) => custom,
+        Ok(None) => match Affinity::of_written_type(&crate::util::dequote(&type_name.name)) {
             // A CAST to BLOB always gives a blob.
             Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
             affinity @ (Affinity::Integer
@@ -757,29 +756,30 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
             | Affinity::Text
             | Affinity::None) => ExprType::Builtin(builtin_type_of_affinity(affinity)),
         },
+        // The arguments don't fit the type, so compiling the CAST fails.
+        Err(_) => return ExprType::Unknown,
     };
     ExprType::array(scalar, type_name.array_dimensions)
 }
 
-fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
-    let type_def = schema.get_type_def_unchecked(name)?;
-    if super::is_sqlite_cast_to(type_def, type_name) {
-        return None;
-    }
-    Some(ExprType::Custom {
-        type_def: Arc::clone(type_def),
-        params: written_type_params(type_name),
-    })
-}
-
-/// The arguments written after a type name: `10, 2` in `numeric(10, 2)`.
-#[allow(clippy::vec_box)]
-fn written_type_params(type_name: &ast::Type) -> Vec<Box<ast::Expr>> {
-    match &type_name.size {
-        Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
-        Some(ast::TypeSize::TypeSize(e1, e2)) => vec![e1.clone(), e2.clone()],
-        None => Vec::new(),
-    }
+/// The custom type a CAST to `type_name` gives, or None when the CAST is
+/// SQLite's CAST: no custom type has the name, or the CAST gives no arguments
+/// to a type that takes some, as CAST(x AS NUMERIC) does. Fails when the
+/// arguments don't fit the type (see [TypeDef::type_args]).
+pub(super) fn custom_cast_target(
+    type_name: &ast::Type,
+    schema: &Schema,
+) -> Result<Option<ExprType>> {
+    let Some(type_def) = schema.get_type_def_unchecked(&crate::util::dequote(&type_name.name))
+    else {
+        return Ok(None);
+    };
+    Ok(type_def
+        .type_args(type_name)?
+        .map(|params| ExprType::Custom {
+            type_def: Arc::clone(type_def),
+            params,
+        }))
 }
 
 /// The type a function returns. Unlike a CAST target, a custom type needs no

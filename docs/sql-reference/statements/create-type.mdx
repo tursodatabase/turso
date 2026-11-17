@@ -340,7 +340,7 @@ Turso provides the following built-in custom types in STRICT tables:
 | `json` | text | -- | Validated JSON text. |
 | `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
 
-A type with no parameters takes no type modifier. `timestamp(3)` in a column or a CAST fails with `a type modifier on type "timestamp" is not supported`: PostgreSQL rounds a `timestamp(3)` to milliseconds, and Turso does not implement that precision.
+A type with no parameters takes no type modifier. `timestamp(3)` in a column or a CAST fails with `a type modifier on type "timestamp" is not supported`: PostgreSQL rounds a `timestamp(3)` to milliseconds, and Turso does not implement that precision. A CAST to a type with parameters gives all of them or none: `CAST(x AS varchar(2,3))` fails, and so does `CAST(x AS numeric(10))`, with `type "numeric" requires 2 parameter(s), got 1`, though PostgreSQL reads it as `numeric(10,0)`. `CAST(x AS numeric)` is SQLite's CAST.
 
 `date`, `time`, `timestamp` and `timestamptz` read the text forms PostgreSQL reads, such as `'2024-1-5 9:30'`, `'2024-01-05T09:30:00+02'`, `'Jan 5 2024'`, `'20240105'` and `'10:00 PM'`, and keep up to 6 digits of fractional seconds. A date that does not exist, such as `'2024-02-30'`, is an error. The stored text sorts in time order, so `<`, `>` and `BETWEEN` on an indexed column use the index. To keep that order, values PostgreSQL accepts but whose text would not sort are errors: BC dates, years after 9999, years not written with 4 digits (write `0999`, not `999`), `'infinity'`, `'epoch'`, `'now'`, `'today'`, `'tomorrow'` and `'yesterday'`. Forms such as `'01/05/2024'`, two-digit years and named time zones such as `'UTC'` are not read yet.
 
