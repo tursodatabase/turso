@@ -1761,8 +1761,7 @@ fn reject_catalog_ddl(stmt: &ast::Stmt) -> Result<()> {
     Err(sqlstate_error(
         SQLSTATE_INSUFFICIENT_PRIVILEGE,
         format!("permission denied: \"{table_name}\" is a system catalog"),
-    )
-    .into())
+    ))
 }
 
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
