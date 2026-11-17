@@ -188,7 +188,10 @@ same way.
 
 `pg_get_expr(conbin, conrelid)` prints the `CHECK` constraints in
 `pg_constraint` the same way: `CHECK (owner LIKE 'a%')` is shown as
-`(owner ~~ 'a%'::text)`. A `CHECK` condition with a form outside that list
+`(owner ~~ 'a%'::text)`, and `pg_get_constraintdef` shows it as
+`CHECK ((owner ~~ 'a%'::text))`. `pg_get_constraintdef(oid, true)` prints the
+same text, without removing parentheses as PostgreSQL's pretty printing
+does. A `CHECK` condition with a form outside that list
 is shown as the engine stores it, which PostgreSQL may not read back: `LIKE`
 with a pattern that is not a constant, for example, is shown with the
 engine's own functions and operators.
