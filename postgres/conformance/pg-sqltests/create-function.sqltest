@@ -543,6 +543,33 @@ expect @tursopg error {
     a function parameter of array type _int4 is not supported
 }
 
+# `_int4` is an array type, and PostgreSQL has no array type of an array
+# type.
+test array-of-array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_int4[]) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type _int4\[\] does not exist
+}
+
+test record-array-of-array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_record[]) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type _record\[\] does not exist
+}
+
+test enum-array-of-array-parameter-named-with-underscore {
+    CREATE TYPE mood AS ENUM ('sad');
+    CREATE FUNCTION f(_mood[]) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type _mood\[\] does not exist
+}
+
 test any-parameter {
     CREATE FUNCTION f("any") RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
@@ -661,6 +688,14 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     a function result of array type _int4 is not supported
+}
+
+test returns-array-of-array-named-with-underscore {
+    CREATE FUNCTION pair() RETURNS _int4[] AS $$ SELECT ARRAY[1, 2] $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type "_int4\[\]" does not exist
 }
 
 test returns-column-type {

@@ -545,9 +545,16 @@ fn classify_type(
     }
     let (schema, name) = schema_and_name(type_name)?;
     let brackets = "[]".repeat(type_name.array_bounds.len());
+    let missing = || TypeClass::Missing {
+        schema: schema.map(str::to_string),
+    };
     // PostgreSQL has arrays of base types and of some pseudo-types, such as
-    // record[], but not of polymorphic types.
+    // record[], but not of polymorphic types. It has no array type of an
+    // array type such as `_int4`.
     Ok(match type_kind(type_lookup, schema, name) {
+        Some(TypeKind::BuiltInArray(_) | TypeKind::CatalogArray(_)) if !brackets.is_empty() => {
+            missing()
+        }
         Some(TypeKind::BuiltIn(BuiltInType::Base)) if brackets.is_empty() => TypeClass::Base,
         Some(TypeKind::BuiltIn(BuiltInType::Base) | TypeKind::BuiltInArray(BuiltInType::Base)) => {
             TypeClass::Array(type_name_text(type_name)?)
@@ -559,18 +566,16 @@ fn classify_type(
             let element = name
                 .strip_prefix('_')
                 .expect("the name of an array type starts with an underscore");
-            TypeClass::Pseudo(pseudo_type_text(element) + "[]" + &brackets)
+            TypeClass::Pseudo(pseudo_type_text(element) + "[]")
         }
         Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) if brackets.is_empty() => {
             TypeClass::Polymorphic(name.to_string())
         }
-        Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) | None => TypeClass::Missing {
-            schema: schema.map(str::to_string),
-        },
+        Some(TypeKind::BuiltIn(BuiltInType::Polymorphic)) | None => missing(),
         Some(TypeKind::BuiltInArray(BuiltInType::Polymorphic)) => {
             unreachable!("type_kind gives no array type of a polymorphic type")
         }
-        Some(TypeKind::System | TypeKind::Catalog(_)) => {
+        Some(TypeKind::System | TypeKind::Catalog(_) | TypeKind::CatalogArray(_)) => {
             TypeClass::Catalog(type_name_text(type_name)?)
         }
     })

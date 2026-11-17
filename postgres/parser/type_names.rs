@@ -31,14 +31,19 @@ pub(crate) enum TypeKind {
     BuiltInArray(BuiltInType),
     /// A type that PostgreSQL defines outside the lists of built-in types.
     System,
-    /// A type of the catalog, as `type_lookup` finds it.
+    /// A type of the catalog, as `type_lookup` finds it by the name as it
+    /// is written.
     Catalog(PgType),
+    /// The array type of a type of the catalog, written with an
+    /// underscore, such as `_mood`. `type_lookup` finds only the element
+    /// type, `mood`.
+    CatalogArray(PgType),
 }
 
 /// What `name` of `schema` names, or None when it names no type.
 /// `_int4` names the array type of `int4`, and `_mood` the array type of
-/// `mood`. PostgreSQL has array types of the base types, and of the
-/// pseudo-types `record` and `cstring` only.
+/// `mood`, unless a type has the name `_mood`. PostgreSQL has array types
+/// of the base types, and of the pseudo-types `record` and `cstring` only.
 pub(crate) fn type_kind(
     type_lookup: &TypeLookup<'_>,
     schema: Option<&str>,
@@ -57,18 +62,12 @@ pub(crate) fn type_kind(
         Some(TypeKind::BuiltInArray(kind))
     } else if is_system_type(schema, name) {
         Some(TypeKind::System)
+    } else if let Some(pg_type) = type_lookup(schema, name) {
+        Some(TypeKind::Catalog(pg_type))
     } else {
-        catalog_type(type_lookup, schema, name).map(TypeKind::Catalog)
+        let element = name.strip_prefix('_')?;
+        type_lookup(schema, element).map(TypeKind::CatalogArray)
     }
-}
-
-/// What `name` of `schema` names among the types that are not built in, as
-/// `type_lookup` finds it. `_mood` also names the array type of `mood`.
-fn catalog_type(type_lookup: &TypeLookup<'_>, schema: Option<&str>, name: &str) -> Option<PgType> {
-    type_lookup(schema, name).or_else(|| {
-        name.strip_prefix('_')
-            .and_then(|element| type_lookup(schema, element))
-    })
 }
 
 /// The kind of a built-in type.

@@ -5676,11 +5676,12 @@ impl PostgreSQLTranslator {
                 TypeKind::BuiltIn(_)
                 | TypeKind::BuiltInArray(_)
                 | TypeKind::System
-                | TypeKind::Catalog(PgType::Custom),
+                | TypeKind::Catalog(PgType::Custom)
+                | TypeKind::CatalogArray(PgType::Custom),
             ) => Ok(()),
-            Some(TypeKind::Catalog(PgType::Row)) => Err(ParseError::not_supported(
-                used_as.row_type_feature(&type_name_text(type_name)?),
-            )),
+            Some(TypeKind::Catalog(PgType::Row) | TypeKind::CatalogArray(PgType::Row)) => Err(
+                ParseError::not_supported(used_as.row_type_feature(&type_name_text(type_name)?)),
+            ),
             None => Err(ParseError::Sqlstate {
                 sqlstate: SQLSTATE_UNDEFINED_OBJECT,
                 message: format!("type \"{}\" does not exist", type_name_text(type_name)?),
