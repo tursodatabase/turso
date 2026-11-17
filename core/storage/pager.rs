@@ -1,4 +1,5 @@
 use crate::assert::assert_send_sync;
+use crate::database::EncryptionValidationState;
 #[cfg(target_vendor = "apple")]
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
@@ -1714,6 +1715,7 @@ pub struct Pager {
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
     staged_page_size: AtomicU32,
+    encryption_verified: AtomicBool,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     /// Whether this pager holds an ephemeral table or index, whose file no
@@ -2026,6 +2028,7 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             staged_page_size: AtomicU32::new(0),
+            encryption_verified: AtomicBool::new(false),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
             shared,
@@ -6297,6 +6300,106 @@ impl Pager {
 
     pub fn is_encryption_ctx_set(&self) -> bool {
         self.io_ctx.read().encryption_context().is_some()
+    }
+
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.shared.encryption_cipher() == CipherMode::None
+            || self.encryption_verified.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn encryption_cipher(&self) -> CipherMode {
+        self.shared.encryption_cipher()
+    }
+
+    pub(crate) fn validate_encryption(
+        &self,
+        state: &mut EncryptionValidationState,
+    ) -> IOResultOr<()> {
+        if self.shared.encryption_cipher() != CipherMode::None {
+            self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
+        }
+        if self.is_authenticated() {
+            return Ok(IOResult::Done(()));
+        }
+        if !self.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database requires an encryption key".to_string(),
+            )
+            .into());
+        }
+        {
+            let _lock = self.shared.init_lock.lock();
+            if !self.db_initialized() {
+                let encrypted = self
+                    .shared
+                    .encryption_verifier()
+                    .expect("encrypted database has a verifier");
+                let mut context = self
+                    .io_ctx
+                    .read()
+                    .encryption_context()
+                    .expect("encryption context was checked above")
+                    .clone();
+                context.set_page_size(
+                    PageSize::new(encrypted.len() as u32)
+                        .expect("encryption verifier has a valid page size"),
+                );
+                context.decrypt_page(encrypted, 1).map_err(|_| {
+                    LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
+                })?;
+                self.encryption_verified.store(true, Ordering::Release);
+                return Ok(IOResult::Done(()));
+            }
+        }
+        loop {
+            match state {
+                EncryptionValidationState::Start => {
+                    self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
+                    let end_read_tx = !self.holds_read_lock();
+                    if end_read_tx {
+                        self.begin_read_tx()?;
+                    }
+                    let (page, completion) = match self.read_page_no_cache(1, None, false, None) {
+                        Ok(read) => read,
+                        Err(err) => {
+                            if end_read_tx {
+                                self.end_read_tx();
+                            }
+                            return Err(err.into());
+                        }
+                    };
+                    *state = EncryptionValidationState::Reading {
+                        page,
+                        completion,
+                        end_read_tx,
+                    };
+                }
+                EncryptionValidationState::Reading {
+                    page,
+                    completion,
+                    end_read_tx,
+                } => {
+                    if let Some(err) = completion.get_error() {
+                        if *end_read_tx {
+                            self.end_read_tx();
+                        }
+                        *state = EncryptionValidationState::Start;
+                        return Err(err.into());
+                    }
+                    if !completion.succeeded() {
+                        io_yield_one!(completion.clone());
+                    }
+                    turso_assert!(page.is_loaded());
+                    let end_read_tx = *end_read_tx;
+                    *state = EncryptionValidationState::Start;
+                    self.encryption_verified.store(true, Ordering::Release);
+                    if end_read_tx {
+                        self.end_read_tx();
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
     }
 
     pub(crate) fn has_external_page_codec(&self) -> bool {

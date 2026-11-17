@@ -413,10 +413,9 @@ pub(crate) enum DbHeaderReadState {
     },
 }
 
-/// Sub state machine for [`Database::_init`], driven from
-/// [`HeaderValidationState::Start`]. Builds the `Pager` (reading page-size /
-/// reserved bytes from the DB header), begins a read transaction, then reads
-/// page 1 to determine the autovacuum mode — all without blocking.
+/// Resumable pager initialization for opens, connections, and attachments.
+/// Reads the page layout, authenticates encryption, and reads the autovacuum
+/// mode while holding a read transaction.
 #[derive(Default)]
 pub(crate) enum InitState {
     #[default]
@@ -424,7 +423,30 @@ pub(crate) enum InitState {
     /// Driving `init_pager` (its only IO is the DB-header read).
     InitPager(DbHeaderReadState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
-    ReadPage1 { pager: Box<Pager> },
+    ReadPage1 {
+        pager: Box<Pager>,
+        encryption_validation: EncryptionValidationState,
+    },
+}
+
+impl InitState {
+    pub(crate) fn cancel(&mut self) {
+        if let Self::ReadPage1 { pager, .. } = self {
+            pager.end_read_tx();
+        }
+        *self = Self::default();
+    }
+}
+
+#[derive(Default)]
+pub(crate) enum EncryptionValidationState {
+    #[default]
+    Start,
+    Reading {
+        page: PageRef,
+        completion: Completion,
+        end_read_tx: bool,
+    },
 }
 
 /// Sub state machine for [`Database::header_validation`], driven from
