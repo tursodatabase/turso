@@ -1672,15 +1672,15 @@ pub(crate) fn database_of(conn: &Connection, namespace: &Qualifier) -> String {
         .expect("the database of a namespace has a name")
 }
 
-/// The first schema of `search_path` that exists, which is what PostgreSQL's
-/// current_schema() returns. None when no schema of `search_path` exists.
-/// The default search_path, "$user", public, gives public, since there is no
-/// schema named after a user.
+/// The first schema of `search_path` that exists and that the current role
+/// has USAGE on, which is what PostgreSQL's current_schema() returns. None
+/// when `search_path` has no such schema. The default search_path, "$user",
+/// public, gives public, since there is no schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     conn.search_order()
         .into_iter()
-        .next()
         .map(|namespace| namespace.name)
+        .find(|name| crate::namespaces::current_role_may_use_schema(conn, name))
 }
 
 pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<String> {
@@ -1689,7 +1689,10 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
         .search_path()
         .unwrap_or_else(|| vec!["public".to_owned()])
     {
-        if catalog::namespace_exists(conn, &name) && !schemas.contains(&name) {
+        if catalog::namespace_exists(conn, &name)
+            && crate::namespaces::current_role_may_use_schema(conn, &name)
+            && !schemas.contains(&name)
+        {
             schemas.push(name);
         }
     }

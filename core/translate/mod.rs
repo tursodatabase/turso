@@ -177,6 +177,9 @@ pub fn translate(
             .role_is_superuser(resolver.schema(), connection.current_role())
     {
         resolver.role_is_not_superuser = true;
+        resolver
+            .catalog
+            .set_namespace_user(Some(connection.current_role()));
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
 

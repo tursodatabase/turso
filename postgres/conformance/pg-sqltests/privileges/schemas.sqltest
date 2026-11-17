@@ -257,3 +257,240 @@ test grant-on-a-system-schema-is-not-supported {
 expect error {
     GRANT on system schema pg_catalog is not supported
 }
+
+test select-on-a-table-is-not-enough-without-usage-on-its-schema {
+    CREATE ROLE su_no_usage;
+    CREATE SCHEMA su_no_usage_s;
+    CREATE TABLE su_no_usage_s.t (id INT);
+    GRANT ALL ON su_no_usage_s.t TO su_no_usage;
+    SET ROLE su_no_usage;
+    SELECT id FROM su_no_usage_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_no_usage_s
+}
+
+test usage-on-the-schema-lets-a-role-read-its-table {
+    CREATE ROLE su_usage;
+    CREATE SCHEMA su_usage_s;
+    CREATE TABLE su_usage_s.t (id INT);
+    INSERT INTO su_usage_s.t VALUES (1), (2);
+    GRANT SELECT ON su_usage_s.t TO su_usage;
+    GRANT USAGE ON SCHEMA su_usage_s TO su_usage;
+    SET ROLE su_usage;
+    SELECT id FROM su_usage_s.t ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test usage-on-the-schema-does-not-give-its-tables {
+    CREATE ROLE su_only_usage;
+    CREATE SCHEMA su_only_usage_s;
+    CREATE TABLE su_only_usage_s.t (id INT);
+    GRANT USAGE ON SCHEMA su_only_usage_s TO su_only_usage;
+    SET ROLE su_only_usage;
+    SELECT id FROM su_only_usage_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table t
+}
+
+test usage-granted-to-public-lets-every-role-read {
+    CREATE ROLE su_public;
+    CREATE SCHEMA su_public_s;
+    CREATE TABLE su_public_s.t (id INT);
+    INSERT INTO su_public_s.t VALUES (7);
+    GRANT SELECT ON su_public_s.t TO su_public;
+    GRANT USAGE ON SCHEMA su_public_s TO PUBLIC;
+    SET ROLE su_public;
+    SELECT id FROM su_public_s.t;
+}
+expect {
+    7
+}
+
+test member-has-the-usage-of-the-role-it-inherits-from {
+    CREATE ROLE su_group;
+    CREATE ROLE su_member;
+    GRANT su_group TO su_member;
+    CREATE SCHEMA su_group_s;
+    CREATE TABLE su_group_s.t (id INT);
+    INSERT INTO su_group_s.t VALUES (3);
+    GRANT SELECT ON su_group_s.t TO su_group;
+    GRANT USAGE ON SCHEMA su_group_s TO su_group;
+    SET ROLE su_member;
+    SELECT id FROM su_group_s.t;
+}
+expect {
+    3
+}
+
+test revoke-usage-stops-a-role-reading-the-schemas-tables {
+    CREATE ROLE su_revoked;
+    CREATE SCHEMA su_revoked_s;
+    CREATE TABLE su_revoked_s.t (id INT);
+    GRANT SELECT ON su_revoked_s.t TO su_revoked;
+    GRANT USAGE ON SCHEMA su_revoked_s TO su_revoked;
+    REVOKE USAGE ON SCHEMA su_revoked_s FROM su_revoked;
+    SET ROLE su_revoked;
+    SELECT id FROM su_revoked_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_revoked_s
+}
+
+test writes-need-usage-on-the-schema-too {
+    CREATE ROLE su_writer;
+    CREATE SCHEMA su_writer_s;
+    CREATE TABLE su_writer_s.t (id INT);
+    GRANT ALL ON su_writer_s.t TO su_writer;
+    SET ROLE su_writer;
+    INSERT INTO su_writer_s.t VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_writer_s
+}
+
+test missing-table-in-a-schema-without-usage-is-a-permission-error {
+    CREATE ROLE su_missing;
+    CREATE SCHEMA su_missing_s;
+    SET ROLE su_missing;
+    SELECT * FROM su_missing_s.no_such_table;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_missing_s
+}
+
+test owner-of-a-table-needs-usage-on-its-schema {
+    CREATE ROLE su_owner;
+    CREATE SCHEMA su_owner_s;
+    CREATE TABLE su_owner_s.t (id INT);
+    ALTER TABLE su_owner_s.t OWNER TO su_owner;
+    SET ROLE su_owner;
+    SELECT id FROM su_owner_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_owner_s
+}
+
+test search-path-skips-a-schema-without-usage {
+    CREATE ROLE su_path;
+    CREATE SCHEMA su_path_s;
+    CREATE TABLE su_path_s.su_path_t (id INT);
+    GRANT SELECT ON su_path_s.su_path_t TO su_path;
+    SET search_path TO su_path_s;
+    SET ROLE su_path;
+    SELECT id FROM su_path_t;
+}
+@sqlstate 42P01
+expect error {
+    relation "su_path_t" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such object: su_path_t
+}
+
+test search-path-finds-a-table-in-a-schema-with-usage {
+    CREATE ROLE su_path_ok;
+    CREATE SCHEMA su_path_ok_s;
+    CREATE TABLE su_path_ok_s.su_path_ok_t (id INT);
+    INSERT INTO su_path_ok_s.su_path_ok_t VALUES (5);
+    GRANT SELECT ON su_path_ok_s.su_path_ok_t TO su_path_ok;
+    GRANT USAGE ON SCHEMA su_path_ok_s TO su_path_ok;
+    SET search_path TO su_path_ok_s;
+    SET ROLE su_path_ok;
+    SELECT id FROM su_path_ok_t;
+}
+expect {
+    5
+}
+
+test search-path-goes-on-to-the-next-schema-with-usage {
+    CREATE ROLE su_next;
+    CREATE SCHEMA su_next_hidden;
+    CREATE SCHEMA su_next_shown;
+    CREATE TABLE su_next_hidden.su_next_t (id INT);
+    CREATE TABLE su_next_shown.su_next_t (id INT);
+    INSERT INTO su_next_hidden.su_next_t VALUES (1);
+    INSERT INTO su_next_shown.su_next_t VALUES (2);
+    GRANT SELECT ON su_next_hidden.su_next_t, su_next_shown.su_next_t TO su_next;
+    GRANT USAGE ON SCHEMA su_next_shown TO su_next;
+    SET search_path TO su_next_hidden, su_next_shown;
+    SET ROLE su_next;
+    SELECT id FROM su_next_t;
+}
+expect {
+    2
+}
+
+test every-role-has-usage-on-public-by-default {
+    CREATE ROLE su_default;
+    CREATE TABLE su_default_t (id INT);
+    INSERT INTO su_default_t VALUES (9);
+    GRANT SELECT ON su_default_t TO su_default;
+    SET ROLE su_default;
+    SELECT id FROM public.su_default_t;
+}
+expect {
+    9
+}
+
+test revoke-usage-on-public-from-public-hides-its-tables {
+    CREATE ROLE su_public_revoked;
+    CREATE TABLE su_public_revoked_t (id INT);
+    GRANT SELECT ON su_public_revoked_t TO su_public_revoked;
+    REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+    SET ROLE su_public_revoked;
+    SELECT id FROM public.su_public_revoked_t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test view-reads-a-table-of-a-schema-its-reader-has-no-usage-on {
+    CREATE ROLE su_view_reader;
+    CREATE SCHEMA su_view_s;
+    CREATE TABLE su_view_s.t (id INT);
+    INSERT INTO su_view_s.t VALUES (4);
+    CREATE VIEW su_view_v AS SELECT id FROM su_view_s.t;
+    GRANT SELECT ON su_view_v TO su_view_reader;
+    SET ROLE su_view_reader;
+    SELECT id FROM su_view_v;
+}
+expect {
+    4
+}
+
+test superuser-needs-no-usage {
+    CREATE SCHEMA su_super_s;
+    CREATE TABLE su_super_s.t (id INT);
+    INSERT INTO su_super_s.t VALUES (6);
+    REVOKE ALL ON SCHEMA su_super_s FROM postgres;
+    SELECT id FROM su_super_s.t;
+}
+expect {
+    6
+}
+
+test current-schemas-leaves-out-a-schema-without-usage {
+    CREATE ROLE su_current;
+    CREATE SCHEMA su_current_hidden;
+    CREATE SCHEMA su_current_shown;
+    GRANT USAGE ON SCHEMA su_current_shown TO su_current;
+    SET search_path TO su_current_hidden, su_current_shown;
+    SET ROLE su_current;
+    SELECT current_schema(), current_schemas(false);
+}
+expect {
+    su_current_shown|{su_current_shown}
+}

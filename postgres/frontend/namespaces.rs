@@ -28,6 +28,7 @@ use turso_core::{
     to_u32, CatalogChange, Connection, CursorType, GrantTarget, InsertFlags, Insn, LimboError,
     Numeric, ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID,
 };
+use turso_parser::ast;
 
 use crate::acl::{Acl, Privileges, PUBLIC_OID};
 use crate::catalog::{role_oid, PG_DATABASE_OWNER_OID};
@@ -137,6 +138,45 @@ pub(crate) fn namespace_acl(schema: &Schema, namespace: NamespaceId, name: &str)
         acl.grant(PUBLIC_OID, Privileges::USAGE, owner);
     }
     acl
+}
+
+/// [`turso_core::Dialect::role_has_namespace_privilege`] for the PostgreSQL
+/// frontend: a role has the privileges the schema's list gives it, by oid or
+/// through PUBLIC, together with those it gives the roles whose privileges
+/// the role inherits, and a superuser has every privilege. A namespace
+/// without a name is not a schema, and only a superuser uses it.
+pub(crate) fn role_has_namespace_privilege(
+    schema: &Schema,
+    namespace: NamespaceId,
+    role: RoleId,
+    privilege: ast::Privilege,
+) -> bool {
+    let roles = schema_roles(schema);
+    if roles.is_superuser(role) {
+        return true;
+    }
+    let Some(name) = schema.namespace_name(namespace) else {
+        return false;
+    };
+    let wanted = Privileges::named_among(Privileges::SCHEMA, &[privilege]);
+    !wanted.is_empty()
+        && namespace_acl(schema, namespace, name).grants(&roles.oids_of_roles_used_by(role), wanted)
+}
+
+/// Whether the current role of `conn` has `USAGE` on the schema called
+/// `name`. Every role uses the schemas of the system catalogs, which are not
+/// namespaces.
+pub(crate) fn current_role_may_use_schema(conn: &Connection, name: &str) -> bool {
+    let Some(namespace) = conn.qualifier(name) else {
+        return true;
+    };
+    if namespace.is_database() {
+        return true;
+    }
+    let role = conn.current_role();
+    conn.with_schema(MAIN_DB_ID, |schema| {
+        role_has_namespace_privilege(schema, namespace.target.id, role, ast::Privilege::Usage)
+    })
 }
 
 /// The access control list that a `GRANT` or `REVOKE` stored for schema

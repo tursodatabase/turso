@@ -531,6 +531,29 @@ fn relacl(conn: &turso_pg::Connection, relname: &str) -> Option<String> {
     }
 }
 
+/// The access control list of schema `nspname`, as `pg_namespace.nspacl`
+/// shows it, read through `conn`.
+fn nspacl(conn: &turso_pg::Connection, nspname: &str) -> Option<String> {
+    let rows = conn
+        .query(format!(
+            "SELECT nspacl FROM pg_namespace WHERE nspname = '{nspname}'"
+        ))
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "{nspname} has one pg_namespace row: {rows:?}"
+    );
+    match &rows[0][0] {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str().to_string()),
+        other => panic!("nspacl is text or NULL, got {other:?}"),
+    }
+}
+
 /// The stored access control list of `relname`, read from the catalog
 /// table, where roles are oids: 10 is the superuser and the first created
 /// role is 16385.
@@ -632,6 +655,80 @@ fn grant_select_stores_the_list_in_the_file_and_it_survives_a_reopen(db: TempDat
         relacl(&pg, "t").as_deref(),
         Some("{postgres=arwdDxtm/postgres,reader=r/postgres,=r/postgres}")
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn grant_on_schema_is_stored_in_the_file_and_survives_a_reopen(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE SCHEMA api").unwrap();
+    pg.execute("CREATE TABLE api.t (x INTEGER)").unwrap();
+    pg.execute("GRANT SELECT ON api.t TO reader").unwrap();
+    assert_eq!(nspacl(&pg, "api"), None);
+
+    pg.execute("GRANT USAGE ON SCHEMA api TO reader").unwrap();
+    let list = "{postgres=UC/postgres,reader=U/postgres}";
+    assert_eq!(nspacl(&pg, "api").as_deref(), Some(list));
+
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    assert_eq!(nspacl(&pg, "api").as_deref(), Some(list));
+    pg.execute("SET ROLE reader").unwrap();
+    pg.execute("SELECT x FROM api.t").unwrap();
+    // The reopened database keeps changing the stored list.
+    pg.execute("RESET ROLE").unwrap();
+    pg.execute("REVOKE USAGE ON SCHEMA api FROM reader")
+        .unwrap();
+    assert_eq!(
+        nspacl(&pg, "api").as_deref(),
+        Some("{postgres=UC/postgres}")
+    );
+    pg.execute("SET ROLE reader").unwrap();
+    assert_eq!(
+        pg.execute("SELECT x FROM api.t").unwrap_err().to_string(),
+        "permission denied for schema api"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn a_grant_on_schema_is_seen_by_another_connection(db: TempDatabase) {
+    let granting = db.connect_postgres();
+    let watching = db.connect_postgres();
+    granting.execute("CREATE ROLE reader").unwrap();
+    granting.execute("CREATE SCHEMA api").unwrap();
+    granting.execute("CREATE TABLE api.t (x INTEGER)").unwrap();
+    granting.execute("GRANT SELECT ON api.t TO reader").unwrap();
+    watching.execute("SET ROLE reader").unwrap();
+    assert_eq!(
+        watching
+            .execute("SELECT x FROM api.t")
+            .unwrap_err()
+            .to_string(),
+        "permission denied for schema api"
+    );
+
+    granting
+        .execute("GRANT USAGE ON SCHEMA api TO reader")
+        .unwrap();
+    watching.execute("SELECT x FROM api.t").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn a_rolled_back_grant_on_schema_leaves_the_list_as_it_was(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    pg.execute("CREATE ROLE reader").unwrap();
+    pg.execute("CREATE SCHEMA api").unwrap();
+
+    pg.execute("BEGIN").unwrap();
+    pg.execute("GRANT USAGE ON SCHEMA api TO reader").unwrap();
+    assert_eq!(
+        nspacl(&pg, "api").as_deref(),
+        Some("{postgres=UC/postgres,reader=U/postgres}"),
+        "the transaction sees its own grant"
+    );
+    pg.execute("ROLLBACK").unwrap();
+    assert_eq!(nspacl(&pg, "api"), None);
 }
 
 #[turso_macros::test(mvcc)]

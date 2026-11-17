@@ -557,6 +557,21 @@ pub trait Dialect: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Whether `role` has `privilege` on `namespace` of the main database,
+    /// from the privileges the dialect stores: USAGE to look up the objects
+    /// in the namespace by name, CREATE to make new ones there. A dialect
+    /// without privileges gives every role both.
+    fn role_has_namespace_privilege(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        role: RoleId,
+        privilege: Privilege,
+    ) -> bool {
+        let _ = (schema, namespace, role, privilege);
+        true
+    }
+
     /// Whether `role` has `privilege` on relation `name` of `namespace`,
     /// from the privileges the dialect stores. A dialect without privileges
     /// gives every role every privilege.

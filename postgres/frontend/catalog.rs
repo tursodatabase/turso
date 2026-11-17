@@ -348,6 +348,16 @@ impl Dialect for PostgresDialect {
         crate::classes::role_has_privilege(schema, namespace, name, role, privilege)
     }
 
+    fn role_has_namespace_privilege(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        role: RoleId,
+        privilege: ast::Privilege,
+    ) -> bool {
+        crate::namespaces::role_has_namespace_privilege(schema, namespace, role, privilege)
+    }
+
     fn table_rls_enabled(&self, schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
         crate::classes::table_rls_enabled(schema, namespace, name)
     }

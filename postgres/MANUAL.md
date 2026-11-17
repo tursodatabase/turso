@@ -370,6 +370,18 @@ when the owner has both privileges and nobody else has any, except that
 `{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`, in which
 every role has `USAGE`.
 
+`USAGE` lets a role look up the objects of the schema by name. A role that
+is not a superuser needs it besides the privilege on the object itself.
+Without it, a name qualified with the schema fails with `permission denied
+for schema` (SQLSTATE 42501), even for the object's owner and even when the
+object does not exist, and a name without a schema skips the schema as if it
+was not on `search_path`, so `current_schema()` and `current_schemas()` leave
+it out too. As in PostgreSQL, the tables of a view were looked up when the
+view was created, so reading the view needs no `USAGE` on their schemas. A
+sequence that a string names with its schema, as in `nextval('api.seq')`, is
+not checked for `USAGE` on the schema yet; the privileges on the sequence
+are.
+
 **Parameters:**
 
 - `table_name`: The name of an existing table, view, materialized view or
