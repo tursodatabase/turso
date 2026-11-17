@@ -1,6 +1,6 @@
 use crate::alloc::{
-    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
-    TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
+    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator, TursoVecInExt,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
@@ -44,11 +44,8 @@ use crate::PageSize;
 use crate::Result;
 #[cfg(feature = "conn_raw_api")]
 use crate::Value;
-use crate::ValueRef;
 use crate::{io::FileSyncType, io_yield_one, return_if_io};
-use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
-};
+use crate::{turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable};
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -4246,8 +4243,7 @@ pub enum RecoverLogicalLogState {
 pub struct RecoverCtx {
     reader: Box<StreamingLogicalLogReader>,
     preserved_table_valued_functions: Vec<Arc<crate::vtab::VirtualTable>>,
-    /// Fallback schema cookie (pre-read) used by `recover_build_schema` only
-    /// when `global_header` is unset.
+    /// Schema cookie of the database file header, for when `global_header` is unset.
     cookie: u32,
     persistent_tx_ts_max: u64,
     replay_cutoff_ts: u64,
@@ -9519,133 +9515,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(root_page)
     }
 
-    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid)
-    /// and the CREATE TYPE statements `type_sqls`. Used by the checkpoint's
-    /// snapshot-consistent `BuildLocalSchemaView` (btree + MVCC-delta merge at
-    /// snapshot_ts).
-    pub(crate) fn build_schema_from_rows(
-        &self,
-        connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecordRef<'static>>,
-        type_sqls: &[String],
-        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) -> Result<Arc<Schema>> {
-        let pager = connection.pager.load().clone();
-        let cookie = self
-            .global_header
-            .read()
-            .as_ref()
-            .map(|header| header.schema_cookie.get())
-            .unwrap_or(
-                pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie))?
-                    .get(),
-            );
-        let mut fresh = connection
-            .db
-            .dialect()
-            .new_schema(connection.db.experimental_custom_types_enabled())?;
-        fresh.schema_version = cookie;
-        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
-        let mut from_sql_indexes = crate::alloc::vec![];
-        let mut automatic_indices = HashMap::default();
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
-            HashMap::default();
-        let syms = connection.syms.read();
-        let mv_store = connection.db.get_mv_store().clone();
-
-        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-        sorted_rowids.sort_unstable();
-        for rowid in &sorted_rowids {
-            let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
-            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
-            // has since materialized this object, resolve to its real positive root so the
-            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
-            // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
-            let attached_resolver = |alias: &str| -> Option<usize> {
-                connection
-                    .current_qualifiers()
-                    .database_id(&crate::util::normalize_ident(alias))
-            };
-            fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
-                root_page,
-                sql,
-                &syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                &attached_resolver,
-                connection.dialect().as_ref(),
-            )?;
-        }
-        fresh.populate_types_views_then_indices(
-            &syms,
-            type_sqls,
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-
-        Ok(Arc::new(fresh))
-    }
-
     /// Replays committed logical-log frames into the in-memory MVCC store.
     /// Only frames with `commit_ts > persistent_tx_ts_max` (the durable replay
     /// boundary from the metadata table) are applied; earlier frames were
@@ -10079,13 +9948,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let schema_after = match schema_rows_after.as_ref() {
                 Some(schema_rows_after) => {
                     let type_sqls_after = type_sqls_after.as_ref().unwrap_or(&type_sqls);
-                    Some(self.recover_build_schema(
-                        connection,
-                        schema_rows_after,
-                        &type_sqls_after.values().cloned().collect::<Vec<_>>(),
-                        cookie,
-                        &ctx.preserved_table_valued_functions,
-                    )?)
+                    Some(
+                        self.build_schema_from_rows(
+                            connection,
+                            schema_rows_after
+                                .iter()
+                                .map(|(rowid, record)| (*rowid, record.get_payload())),
+                            &type_sqls_after.values().cloned().collect::<Vec<_>>(),
+                            self.global_schema_cookie().unwrap_or(cookie),
+                            &ctx.preserved_table_valued_functions,
+                        )?,
+                    )
                 }
                 None => None,
             };
@@ -10519,34 +10392,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
-    /// CREATE TYPE statements `type_sqls`. Sync: the schema cookie comes from
-    /// `global_header` (in-memory) or `fallback_cookie` (pre-read by the
-    /// caller); no IO here.
-    fn recover_build_schema(
-        &self,
-        connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecord>,
-        type_sqls: &[String],
-        fallback_cookie: u32,
-        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) -> Result<Arc<Schema>> {
-        let cookie = self
-            .global_header
+    /// The schema cookie in `global_header`, if a header has been loaded.
+    pub(crate) fn global_schema_cookie(&self) -> Option<u32> {
+        self.global_header
             .read()
             .as_ref()
             .map(|header| header.schema_cookie.get())
-            .unwrap_or(fallback_cookie);
+    }
+
+    /// Build a `Schema` from `sqlite_schema` records, given as (rowid, record),
+    /// and the CREATE TYPE statements `type_sqls`.
+    pub(crate) fn build_schema_from_rows<'r>(
+        &self,
+        connection: &Arc<Connection>,
+        schema_rows: impl IntoIterator<Item = (i64, &'r [u8])>,
+        type_sqls: &[String],
+        schema_cookie: u32,
+        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
+    ) -> Result<Arc<Schema>> {
         let mut fresh = connection
             .db
             .dialect()
             .new_schema(connection.db.experimental_custom_types_enabled())?;
-        fresh.schema_version = cookie;
+        fresh.schema_version = schema_cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
-        let mut from_sql_indexes =
-            crate::alloc::Vec::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG);
-        let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
-            HashMap::default();
+        let mut from_sql_indexes = crate::alloc::vec![];
+        let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
@@ -10554,71 +10425,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
-        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-        sorted_rowids.sort_unstable();
-        for rowid in &sorted_rowids {
-            let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
+        let mut schema_rows: Vec<(i64, &[u8])> = schema_rows.into_iter().collect();
+        schema_rows.sort_unstable_by_key(|(rowid, _)| *rowid);
+        for (_, record) in schema_rows {
+            let row = SqliteSchemaRow::from_record_bytes(record)?;
             // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
             // has since materialized this object, resolve to its real positive root so the
             // rebuilt schema reflects the btree page — otherwise integrity_check skips the
             // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
+            let root_page = self.resolve_root_page(row.root_page);
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
                     .current_qualifiers()
                     .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                row.row_type,
+                row.name,
+                row.table_name,
                 root_page,
-                sql,
+                row.sql,
                 &syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,

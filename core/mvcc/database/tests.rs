@@ -19,7 +19,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Completion, ConnectOpts, DatabaseOpts, EncryptionKey, LimboError, OpenFlags};
+use crate::{Completion, ConnectOpts, DatabaseOpts, EncryptionKey, LimboError, Numeric, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::SeedableRng;

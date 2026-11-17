@@ -3940,10 +3940,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                 let tvfs = MvStore::<Clock, A>::capture_table_valued_functions(
                     &self.connection.schema.read(),
                 );
+                let schema_cookie = match self.mvstore.global_schema_cookie() {
+                    Some(schema_cookie) => schema_cookie,
+                    None => {
+                        let pager = self.connection.pager.load().clone();
+                        pager
+                            .io
+                            .block(|| pager.with_header(|header| header.schema_cookie))?
+                            .get()
+                    }
+                };
                 let schema = self.mvstore.build_schema_from_rows(
                     &self.connection,
-                    schema_rows,
+                    schema_rows
+                        .iter()
+                        .map(|(rowid, record)| (*rowid, record.get_payload())),
                     &type_sqls,
+                    schema_cookie,
                     &tvfs,
                 )?;
                 Ok(TransitionResult::Done(schema))
