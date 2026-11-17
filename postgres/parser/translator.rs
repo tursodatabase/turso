@@ -6593,6 +6593,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "TIME" | "TIMETZ" => "time".into(),
         "TIMESTAMP" => "timestamp".into(),
         "TIMESTAMPTZ" => "timestamptz".into(),
+        "INTERVAL" => "interval".into(),
         "BYTEA" => "bytea".into(),
         "INET" => "inet".into(),
         "JSON" => "json".into(),
@@ -6620,8 +6621,6 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
-        // PG types without Turso equivalents → base SQLite types
-        "INTERVAL" => "TEXT".into(),
         // Network types → custom types for proper PG wire OIDs
         "CIDR" => "cidr".into(),
         "MACADDR" => "macaddr".into(),
@@ -7208,10 +7207,9 @@ fn pg_type_name_to_ast_type(
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
-        | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
-            "TEXT"
-        }
+        "INTERVAL" => "interval",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
+        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => &pg_type,
     };

@@ -839,6 +839,7 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "TIME" | "TIMETZ" => Type::TIME,
         "TIMESTAMP" => Type::TIMESTAMP,
         "TIMESTAMPTZ" => Type::TIMESTAMPTZ,
+        "INTERVAL" => Type::INTERVAL,
         "INET" => Type::INET,
         "CIDR" => Type::CIDR,
         "MACADDR" => Type::MACADDR,
