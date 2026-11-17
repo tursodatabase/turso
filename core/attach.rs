@@ -237,6 +237,15 @@ pub struct AttachDatabaseBootstrapState {
     bootstrap_st: crate::mvcc::database::BootstrapState,
 }
 
+#[cfg(feature = "fs")]
+impl Drop for AttachDatabaseState {
+    fn drop(&mut self) {
+        if let Self::Init(init) = self {
+            init.init_st.cancel();
+        }
+    }
+}
+
 impl Connection {
     /// Returns the reserved-space value inherited from the main connection's pager.
     /// (This reads the main database pager, not the pager of db to be attached)
