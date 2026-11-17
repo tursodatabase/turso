@@ -809,6 +809,11 @@ pub(super) fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
     let synthetic_root = -(max_root_page + 100);
     let synthetic_table_id = MVTableId::new(synthetic_root);
     let tx_id = mvcc_store.begin_tx(conn.get_pager()).unwrap();
+    mvcc_store.record_created_btree(
+        tx_id,
+        synthetic_root,
+        turso_core::storage::btree_descriptor::BtreeDescriptor::Table,
+    );
     let data = ImmutableRecord::from_values(
         &[
             Value::Text(Text::new("table")),

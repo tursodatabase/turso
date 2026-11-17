@@ -296,6 +296,7 @@ pub type OnSerializationComplete<'a> =
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION_V2: u8 = 2;
 const LOG_VERSION: u8 = 3;
+const LOG_VERSION_BTREE: u8 = 4;
 pub const LOG_HDR_SIZE: usize = 56;
 const LOG_HDR_SALT_START: usize = 8;
 const LOG_HDR_SALT_SIZE: usize = 8;
@@ -318,6 +319,7 @@ const OP_UPSERT_INDEX: u8 = 2;
 const OP_DELETE_INDEX: u8 = 3;
 /// Frame-local database-header mutation (payload = serialized `DatabaseHeader`).
 const OP_UPDATE_HEADER: u8 = 4;
+const OP_BTREE_CHANGES: u8 = 5;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 const OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
@@ -464,7 +466,7 @@ impl LogHeader {
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
         turso_assert!(
-            version == LOG_VERSION_V2 || version == LOG_VERSION,
+            version == LOG_VERSION_V2 || version == LOG_VERSION || version == LOG_VERSION_BTREE,
             "unsupported logical log header version: {version}"
         );
         Self {
@@ -503,7 +505,7 @@ impl LogHeader {
             return Err(LimboError::Corrupt("Invalid logical log magic".to_string()));
         }
         let version = buf[4];
-        if version != LOG_VERSION && version != LOG_VERSION_V2 {
+        if version != LOG_VERSION && version != LOG_VERSION_V2 && version != LOG_VERSION_BTREE {
             return Err(LimboError::Corrupt(format!(
                 "Unsupported logical log version {version}"
             )));
@@ -716,7 +718,9 @@ impl LogicalLog {
         // portable extensions can still roll back to readers that only know LML2.
         let is_first_write = self.offset == 0;
         if is_first_write && self.header.is_none() {
-            let version = if portable_changes_enabled {
+            let version = if tx.has_btree_changes {
+                LOG_VERSION_BTREE
+            } else if portable_changes_enabled {
                 LOG_VERSION
             } else {
                 LOG_VERSION_V2
@@ -724,6 +728,17 @@ impl LogicalLog {
             let header = LogHeader::new_with_version(&self.io, version);
             self.running_crc = derive_initial_crc(header.salt);
             self.header = Some(header);
+        }
+        if tx.has_btree_changes {
+            let header = self.header.as_mut().expect("log header exists");
+            if header.version < LOG_VERSION_BTREE {
+                if !is_first_write {
+                    return Err(LimboError::InternalError(
+                        "B-tree records require a logical log header upgrade".into(),
+                    ));
+                }
+                header.version = LOG_VERSION_BTREE;
+            }
         }
         if portable_changes_enabled {
             let header = self
@@ -917,7 +932,14 @@ impl LogicalLog {
             false
         };
 
-        if !portable_changes_enabled || self.offset == 0 {
+        let required_version = if tx.has_btree_changes {
+            LOG_VERSION_BTREE
+        } else if portable_changes_enabled {
+            LOG_VERSION
+        } else {
+            LOG_VERSION_V2
+        };
+        if required_version == LOG_VERSION_V2 || self.offset == 0 {
             return Ok(None);
         }
 
@@ -931,11 +953,11 @@ impl LogicalLog {
                 "Logical log header not initialized before portable upgrade".to_string(),
             )
         })?;
-        if header.version != LOG_VERSION_V2 {
+        if header.version >= required_version {
             return Ok(None);
         }
         let mut upgraded_header = header.clone();
-        upgraded_header.version = LOG_VERSION;
+        upgraded_header.version = required_version;
 
         let c = self.write_header_and_publish_on_success(upgraded_header, None)?;
         Ok(Some(c))
@@ -1392,7 +1414,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             }
             Some(MVTableId::from(table_id_i32 as i64))
         }
-        OP_UPDATE_HEADER => {
+        OP_UPDATE_HEADER | OP_BTREE_CHANGES => {
             if flags != 0 || table_id_i32 != 0 {
                 return Err(LimboError::Corrupt(
                     "Invalid UPDATE_HEADER flags/table_id".into(),
@@ -1439,6 +1461,10 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     };
 
     let parsed_op = match tag {
+        OP_BTREE_CHANGES => ParsedOp::BtreeChanges {
+            changes: decode_btree_changes(payload)?,
+            commit_ts,
+        },
         OP_UPSERT_TABLE => {
             let table_id = table_id.expect("table op must have table_id");
             let (rowid_u64, rowid_len) = read_varint(payload)
@@ -1517,6 +1543,9 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
 
 #[derive(Debug)]
 pub enum StreamingResult {
+    BtreeChanges {
+        commit_ts: u64,
+    },
     UpsertTableRow {
         row: Row,
         rowid: RowID,
@@ -2041,7 +2070,7 @@ impl StreamingLogicalLogReader {
 
         match buf[0] {
             OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX
-            | OP_UPDATE_HEADER => {}
+            | OP_UPDATE_HEADER | OP_BTREE_CHANGES => {}
             tag => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
         }
 
@@ -2491,7 +2520,7 @@ impl StreamingLogicalLogReader {
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
-                OP_UPDATE_HEADER => {
+                OP_UPDATE_HEADER | OP_BTREE_CHANGES => {
                     if flags != 0 || table_id_i32 != 0 {
                         return Err(LimboError::Corrupt(format!(
                             "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
@@ -2552,6 +2581,10 @@ impl StreamingLogicalLogReader {
                 .ok_or_else(|| LimboError::Corrupt("payload_bytes_read overflow".to_string()))?;
 
             let parsed_op = match tag {
+                OP_BTREE_CHANGES => ParsedOp::BtreeChanges {
+                    changes: decode_btree_changes(&payload)?,
+                    commit_ts,
+                },
                 OP_UPSERT_TABLE => {
                     let table_id = table_id.expect("table op must carry table id");
                     let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
@@ -3390,6 +3423,9 @@ impl StreamingLogicalLogReader {
         alloc: A,
     ) -> Result<StreamingResult> {
         match parsed_op {
+            ParsedOp::BtreeChanges { commit_ts, .. } => {
+                Ok(StreamingResult::BtreeChanges { commit_ts })
+            }
             ParsedOp::UpsertTable {
                 table_id,
                 rowid,
@@ -3431,6 +3467,11 @@ impl StreamingLogicalLogReader {
             } => {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
+                if key_record.column_count() != index_info.num_cols {
+                    return Err(LimboError::Corrupt(
+                        "index key width differs from its descriptor".into(),
+                    ));
+                }
                 let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
@@ -3451,6 +3492,11 @@ impl StreamingLogicalLogReader {
             } => {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
+                if key_record.column_count() != index_info.num_cols {
+                    return Err(LimboError::Corrupt(
+                        "index key width differs from its descriptor".into(),
+                    ));
+                }
                 let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
@@ -3780,8 +3826,103 @@ pub struct ParsedFrame {
     pub end_offset: usize,
 }
 
+pub(crate) fn append_btree_changes(
+    record: &mut crate::mvcc::database::LogRecord,
+    changes: &[crate::mvcc::database::BtreeChange],
+) -> Result<()> {
+    use crate::mvcc::database::BtreeChange;
+    let mut payload = std::vec::Vec::new();
+    payload.extend_from_slice(
+        &u32::try_from(changes.len())
+            .map_err(|_| LimboError::InternalError("too many B-tree changes".into()))?
+            .to_le_bytes(),
+    );
+    for change in changes {
+        let id = match change {
+            BtreeChange::Create(id, _) | BtreeChange::Drop(id) => i64::from(*id),
+        };
+        if id >= -1 || i32::try_from(id).is_err() {
+            return Err(LimboError::InternalError(
+                "B-tree identity exceeds logical-log range".into(),
+            ));
+        }
+        match change {
+            BtreeChange::Create(id, descriptor) => {
+                let bytes = descriptor.encode()?;
+                payload.push(1);
+                payload.extend_from_slice(&i64::from(*id).to_le_bytes());
+                payload.extend_from_slice(
+                    &u32::try_from(bytes.len())
+                        .map_err(|_| {
+                            LimboError::InternalError("B-tree descriptor is too large".into())
+                        })?
+                        .to_le_bytes(),
+                );
+                payload.extend_from_slice(&bytes);
+            }
+            BtreeChange::Drop(id) => {
+                payload.push(2);
+                payload.extend_from_slice(&i64::from(*id).to_le_bytes());
+            }
+        }
+    }
+    LogSerializer::new(&mut record.buf).serialize_btree_changes(&payload)?;
+    record.op_count = record
+        .op_count
+        .checked_add(1)
+        .ok_or_else(|| LimboError::InternalError("too many log operations".into()))?;
+    record.has_btree_changes = true;
+    Ok(())
+}
+
+fn decode_btree_changes(
+    mut bytes: &[u8],
+) -> Result<std::vec::Vec<crate::mvcc::database::BtreeChange>> {
+    use crate::mvcc::database::BtreeChange;
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
+        if count > bytes.len() {
+            return Err(LimboError::Corrupt("truncated B-tree change".into()));
+        }
+        let (head, rest) = bytes.split_at(count);
+        *bytes = rest;
+        Ok(head)
+    }
+    let count = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
+    if count > bytes.len() / 9 {
+        return Err(LimboError::Corrupt("invalid B-tree change count".into()));
+    }
+    let mut changes = std::vec::Vec::with_capacity(count);
+    for _ in 0..count {
+        let tag = take(&mut bytes, 1)?[0];
+        let id = i64::from_le_bytes(take(&mut bytes, 8)?.try_into().unwrap());
+        if id >= -1 || i32::try_from(id).is_err() {
+            return Err(LimboError::Corrupt("invalid B-tree identity".into()));
+        }
+        changes.push(match tag {
+            1 => {
+                let len = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
+                BtreeChange::Create(
+                    MVTableId::from(id),
+                    BtreeDescriptor::decode(take(&mut bytes, len)?)?,
+                )
+            }
+            2 => BtreeChange::Drop(MVTableId::from(id)),
+            _ => return Err(LimboError::Corrupt("invalid B-tree operation".into())),
+        });
+    }
+    if !bytes.is_empty() {
+        return Err(LimboError::Corrupt("trailing B-tree change bytes".into()));
+    }
+    Ok(changes)
+}
+
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) enum ParsedOp {
+    BtreeChanges {
+        changes: std::vec::Vec<crate::mvcc::database::BtreeChange>,
+        commit_ts: u64,
+    },
     UpsertTable {
         table_id: MVTableId,
         rowid: RowID,
@@ -8082,5 +8223,33 @@ mod tests {
 
         // Keep the last chunk variable used so the compiler notices if the range math changes.
         assert!(last_chunk.end > last_chunk.start);
+    }
+}
+
+#[cfg(test)]
+mod btree_record_tests {
+    use super::*;
+    #[test]
+    fn btree_changes_reject_invalid_ids_and_truncation() {
+        for id in [i64::MIN, i32::MIN as i64 - 1, -1, 0, 1, i64::MAX] {
+            let mut bytes = 1u32.to_le_bytes().to_vec();
+            bytes.push(2);
+            bytes.extend_from_slice(&id.to_le_bytes());
+            assert!(decode_btree_changes(&bytes).is_err());
+        }
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.push(2);
+        bytes.extend_from_slice(&(-2i64).to_le_bytes());
+        assert_eq!(
+            decode_btree_changes(&bytes).unwrap(),
+            vec![crate::mvcc::database::BtreeChange::Drop(MVTableId::from(
+                -2
+            ))]
+        );
+        for end in 0..bytes.len() {
+            assert!(decode_btree_changes(&bytes[..end]).is_err());
+        }
+        bytes.push(0);
+        assert!(decode_btree_changes(&bytes).is_err());
     }
 }

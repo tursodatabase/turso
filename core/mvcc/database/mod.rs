@@ -510,6 +510,7 @@ pub struct LogRecord {
     /// True once a `DatabaseHeader` op has been appended. At most one
     /// header op is allowed per transaction.
     pub has_header: bool,
+    pub(crate) has_btree_changes: bool,
     /// Portable logical-change metadata stored alongside the MVCC recovery log.
     ///
     /// Recovery ignores this field. Raw-log consumers use it to resolve the
@@ -548,6 +549,7 @@ impl LogRecord {
             buf,
             op_count: 0,
             has_header: false,
+            has_btree_changes: false,
             #[cfg(feature = "conn_raw_api")]
             portable_changes: crate::alloc::vec![],
             #[cfg(feature = "conn_raw_api")]
@@ -563,6 +565,7 @@ impl LogRecord {
             buf: <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(alloc),
             op_count: 0,
             has_header: false,
+            has_btree_changes: false,
             #[cfg(feature = "conn_raw_api")]
             portable_changes: crate::alloc::vec![],
             #[cfg(feature = "conn_raw_api")]
@@ -979,7 +982,7 @@ pub(crate) struct BtreeObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BtreeChange {
+pub(crate) enum BtreeChange {
     Create(MVTableId, crate::storage::btree_descriptor::BtreeDescriptor),
     Drop(MVTableId),
 }
@@ -2674,6 +2677,30 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             &mut ctx.log_record,
             LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
         );
+        let changes: std::vec::Vec<_> = tx
+            .btree_changes
+            .lock()
+            .iter()
+            .filter_map(|change| {
+                let id = match change {
+                    BtreeChange::Create(id, _) | BtreeChange::Drop(id) => *id,
+                };
+                if created.contains(&id) && dropped.contains(&id) {
+                    return None;
+                }
+                let canonical = canonical_log_id(&RowID::new(id, RowKey::Int(0))).table_id;
+                Some(match change {
+                    BtreeChange::Create(_, descriptor) => {
+                        BtreeChange::Create(canonical, descriptor.clone())
+                    }
+                    BtreeChange::Drop(_) => BtreeChange::Drop(canonical),
+                })
+            })
+            .collect();
+        crate::mvcc::persistent_storage::logical_log::append_btree_changes(
+            &mut log_record,
+            &changes,
+        )?;
         self.populate_portable_changes(mvcc_store, &mut log_record)?;
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
@@ -2817,7 +2844,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     }
                     ParsedOp::UpsertIndex { .. }
                     | ParsedOp::DeleteIndex { .. }
-                    | ParsedOp::UpdateHeader { .. } => {}
+                    | ParsedOp::UpdateHeader { .. }
+                    | ParsedOp::BtreeChanges { .. } => {}
                 }
             }
 
@@ -5385,7 +5413,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Records that `tx_id` allocated `table_id` with `CreateBtree`, so rollback can drop
     /// everything stored under it.
-    pub(crate) fn record_created_btree(
+    pub fn record_created_btree(
         &self,
         tx_id: TxID,
         table_id: i64,
@@ -9977,7 +10005,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         connection: &Arc<Connection>,
         ctx: &mut RecoverCtx,
-        frame: Vec<ParsedOp>,
+        mut frame: Vec<ParsedOp>,
     ) -> Result<()> {
         let mut max_commit_ts_seen = ctx.max_commit_ts_seen;
         let replay_cutoff_ts = ctx.replay_cutoff_ts;
@@ -10019,7 +10047,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             | ParsedOp::DeleteTable { commit_ts, .. }
             | ParsedOp::UpsertIndex { commit_ts, .. }
             | ParsedOp::DeleteIndex { commit_ts, .. }
-            | ParsedOp::UpdateHeader { commit_ts, .. } => *commit_ts,
+            | ParsedOp::UpdateHeader { commit_ts, .. }
+            | ParsedOp::BtreeChanges { commit_ts, .. } => *commit_ts,
         };
         'frame: {
             let frame_commit_ts = parsed_op_commit_ts(
@@ -10031,6 +10060,51 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if frame_commit_ts <= replay_cutoff_ts {
                 break 'frame;
             }
+
+            let mut explicit_btrees = false;
+            for op in &frame {
+                if let ParsedOp::BtreeChanges { changes, .. } = op {
+                    if explicit_btrees {
+                        return Err(LimboError::Corrupt(
+                            "duplicate B-tree changes in log frame".into(),
+                        ));
+                    }
+                    explicit_btrees = true;
+                    let mut objects = self.btree_objects.write();
+                    for change in changes {
+                        match change {
+                            BtreeChange::Create(id, descriptor) => {
+                                if objects.contains_key(id) {
+                                    return Err(LimboError::Corrupt(
+                                        "duplicate B-tree identity".into(),
+                                    ));
+                                }
+                                objects.insert(
+                                    *id,
+                                    BtreeObject {
+                                        descriptor: descriptor.clone(),
+                                        begin: frame_commit_ts,
+                                        end: None,
+                                    },
+                                );
+                                self.insert_table_id_to_rootpage(*id, None);
+                            }
+                            BtreeChange::Drop(id) => {
+                                let object = objects.get_mut(id).ok_or_else(|| {
+                                    LimboError::Corrupt("dropped B-tree has no descriptor".into())
+                                })?;
+                                if object.end.is_some() {
+                                    return Err(LimboError::Corrupt(
+                                        "B-tree was already dropped".into(),
+                                    ));
+                                }
+                                object.end = Some(frame_commit_ts);
+                            }
+                        }
+                    }
+                }
+            }
+            frame.retain(|op| !matches!(op, ParsedOp::BtreeChanges { .. }));
 
             // Work out what sqlite_schema will look like after this transaction,
             // before applying any row/index changes from the transaction.
@@ -10156,6 +10230,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             {
                 let should_skip_index_op = |parsed_op: &ParsedOp| -> bool {
+                    if explicit_btrees {
+                        let (id, timestamp) = match parsed_op {
+                            ParsedOp::UpsertIndex { table_id, .. } => (table_id, frame_commit_ts),
+                            ParsedOp::DeleteIndex { table_id, .. } => {
+                                (table_id, frame_commit_ts.saturating_sub(1))
+                            }
+                            _ => return false,
+                        };
+                        return self.btree_objects.read().get(id).is_some_and(|object| {
+                            object.begin > timestamp
+                                || object.end.is_some_and(|end| end <= timestamp)
+                        });
+                    }
                     let Some(schema_after) = schema_after.as_ref() else {
                         return false;
                     };
@@ -10176,6 +10263,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let mut get_index_info = |index_id: MVTableId,
                                           op_kind: IndexOpKind|
                  -> Result<Arc<IndexInfo>> {
+                    if explicit_btrees {
+                        return match self
+                            .btree_objects
+                            .read()
+                            .get(&index_id)
+                            .map(|object| &object.descriptor)
+                        {
+                            Some(crate::storage::btree_descriptor::BtreeDescriptor::Index(
+                                info,
+                            )) => Ok(info.clone()),
+                            _ => Err(LimboError::Corrupt(
+                                "index log entry has no comparison descriptor".into(),
+                            )),
+                        };
+                    }
                     if let Some(index_info) = index_infos.get(&(index_id, op_kind)) {
                         return Ok(index_info.clone());
                     }
@@ -10224,6 +10326,34 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 };
 
                 for parsed_op in frame {
+                    if explicit_btrees {
+                        let table_write = match &parsed_op {
+                            ParsedOp::UpsertTable { table_id, .. } => {
+                                Some((*table_id, frame_commit_ts))
+                            }
+                            ParsedOp::DeleteTable { rowid, .. } => {
+                                Some((rowid.table_id, frame_commit_ts.saturating_sub(1)))
+                            }
+                            _ => None,
+                        };
+                        if let Some((id, timestamp)) =
+                            table_write.filter(|(id, _)| *id != SQLITE_SCHEMA_MVCC_TABLE_ID)
+                        {
+                            let objects = self.btree_objects.read();
+                            let valid = objects.get(&id).is_some_and(|object| {
+                                matches!(
+                                    object.descriptor,
+                                    crate::storage::btree_descriptor::BtreeDescriptor::Table
+                                ) && object.begin <= timestamp
+                                    && object.end.is_none_or(|end| end > timestamp)
+                            });
+                            if !valid {
+                                return Err(LimboError::Corrupt(
+                                    "table log entry has no live table descriptor".into(),
+                                ));
+                            }
+                        }
+                    }
                     // Some index writes are real while the transaction is
                     // running, but have no meaning at either durable boundary.
                     //
@@ -10576,6 +10706,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             // staged to pager page-1 during checkpoint.
                             self.global_header.write().replace(header);
                         }
+                        StreamingResult::BtreeChanges { .. } => {
+                            unreachable!("B-tree records handled before row replay")
+                        }
                         StreamingResult::Eof => {
                             unreachable!("next_frame does not return EOF records");
                         }
@@ -10595,7 +10728,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if let Some(type_sqls_after) = type_sqls_after {
                     type_sqls = type_sqls_after;
                 }
-                self.restore_btree_snapshot(schema_after.btree_descriptors()?, frame_commit_ts);
+                if !explicit_btrees {
+                    self.restore_btree_snapshot(schema_after.btree_descriptors()?, frame_commit_ts);
+                }
                 install_schema(schema_after.clone());
                 current_schema = schema_after;
                 // The frame may have decoded DROP INDEX entries using the
