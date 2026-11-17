@@ -1236,6 +1236,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.state = None;
             return Ok(IOResult::Done(()));
         }
+        let at_most_one_match = op.eq_only()
+            && match (&seek_key, &self.mv_cursor_type) {
+                (SeekKey::TableRowId(_), MvccCursorType::Table) => true,
+                (SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
+                    index_key_matches_at_most_one_row(target, index_info)?
+                }
+                _ => false,
+            };
 
         loop {
             let Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(btree_seek_state), direction)) =
@@ -1273,14 +1281,25 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     }
                 }
                 SeekBtreeState::AdvanceBTree => {
-                    return_if_io!(match direction {
-                        IterationDirection::Forwards => {
-                            self.advance_btree_forward_from_current()
-                        }
-                        IterationDirection::Backwards => {
-                            self.advance_btree_backward_from_current()
-                        }
-                    });
+                    if at_most_one_match {
+                        // Such a seek lands here only for an index key stored in an interior
+                        // page, one row past where the B-tree seek stopped. That row is the only
+                        // possible match: step to it and let CheckRow decide, instead of walking
+                        // past every shadowed row.
+                        return_if_io!(match direction {
+                            IterationDirection::Forwards => self.btree_cursor.next(),
+                            IterationDirection::Backwards => self.btree_cursor.prev(),
+                        });
+                    } else {
+                        return_if_io!(match direction {
+                            IterationDirection::Forwards => {
+                                self.advance_btree_forward_from_current()
+                            }
+                            IterationDirection::Backwards => {
+                                self.advance_btree_backward_from_current()
+                            }
+                        });
+                    }
                     self.state.replace(MvccLazyCursorState::Seek(
                         SeekState::SeekBtree(SeekBtreeState::CheckRow),
                         direction,
@@ -1289,16 +1308,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
-                    // An exact rowid seek has at most one B-tree match: once that row is shadowed,
-                    // or the row reached is past it, the B-tree holds no visible match, and
-                    // advancing would walk every shadowed row after it.
-                    let exact_target = match (op.eq_only(), &seek_key) {
-                        (true, SeekKey::TableRowId(target)) => Some(RowKey::Int(*target)),
-                        _ => None,
-                    };
+                    // A seek that can match at most one row has at most one B-tree match: once
+                    // that row is shadowed, or the row reached is not it, the B-tree holds no
+                    // visible match, and advancing would walk every shadowed row after it.
                     match key {
                         Some(k)
-                            if exact_target.as_ref().is_none_or(|target| *target == k)
+                            if (!at_most_one_match
+                                || current_pos_is_only_row_of_seek_key(
+                                    &k,
+                                    &seek_key,
+                                    &self.mv_cursor_type,
+                                )?)
                                 && self.query_btree_version_is_valid(&k)? =>
                         {
                             self.dual_peek.btree_peek = CursorPeek::Row {
@@ -1307,7 +1327,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             };
                             return Ok(IOResult::Done(()));
                         }
-                        Some(_) if exact_target.is_none() => {
+                        Some(_) if !at_most_one_match => {
                             // shadowed by MVCC, continue to next
                             self.state.replace(MvccLazyCursorState::Seek(
                                 SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
@@ -1315,7 +1335,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             ));
                             inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                         }
-                        _ => {
+                        Some(_) => {
+                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            return Ok(IOResult::Done(()));
+                        }
+                        None => {
                             self.dual_peek.btree_peek = CursorPeek::Exhausted;
                             return Ok(IOResult::Done(()));
                         }
