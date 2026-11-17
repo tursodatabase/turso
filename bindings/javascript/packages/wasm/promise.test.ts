@@ -396,3 +396,13 @@ test('hash-join-wasm', { timeout: 60_000 }, async () => {
     expect(await (await db.prepare("SELECT length(a) as a, length(b) as b FROM (SELECT a.v as a, b.v as b FROM a INNER JOIN b ON a.k = b.k)")).all()).toEqual(new Array(1024).fill({ a: 100 * 1024, b: 100 * 1024 }));
     await db.close();
 })
+
+test('a whole number binds as INTEGER only inside the int64 range', async () => {
+    const db = await connect(":memory:");
+    const stmt = await db.prepare("SELECT typeof(?1) AS type, ?1 > 9223372036854775807 AS above_max");
+    expect(await stmt.get(2 ** 63)).toEqual({ type: "real", above_max: 1 });
+    expect(await stmt.get(2 ** 64)).toEqual({ type: "real", above_max: 1 });
+    expect(await stmt.get(2 ** 63 - 1024)).toEqual({ type: "integer", above_max: 0 });
+    expect(await stmt.get(-(2 ** 63))).toEqual({ type: "integer", above_max: 0 });
+    await db.close();
+})
