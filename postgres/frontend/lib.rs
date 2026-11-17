@@ -18,7 +18,7 @@ mod statement;
 mod unique_index;
 mod unnest;
 
-pub use catalog::PostgresDialect;
+pub use catalog::{pg_array_type_oid, sqlite_type_to_pg_oid, PostgresDialect};
 pub use copy::CopyTextEncoder;
 pub use error::{sql_parse_error, sqlstate_error, Error, ErrorReport, Result};
 pub use open::{open_database_async, OpenDatabaseState};

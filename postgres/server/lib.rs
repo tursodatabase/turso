@@ -15,6 +15,7 @@ use turso_pg::{
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
+use turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
 use turso_pg_parser::ParseResult;
 
 use pgwire::api::auth::StartupHandler;
@@ -448,11 +449,11 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
             // declared name isn't in the lookup table.
-            let mapped = sqlite_type_to_pg_type(&info.declared_name);
+            let mapped = declared_type_to_pg_type(&info.declared_name);
             if mapped == Type::TEXT {
                 info.base_type
                     .as_deref()
-                    .map(sqlite_type_to_pg_type)
+                    .map(declared_type_to_pg_type)
                     .unwrap_or(Type::TEXT)
             } else {
                 mapped
@@ -460,54 +461,30 @@ fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
         }
     };
     if info.array_dimensions > 0 {
-        base = scalar_pg_type_to_array_type(&base);
+        base = array_type_of(&base);
     }
     base
 }
 
-/// Map a scalar PG type to its array counterpart.
-fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
-    if *scalar == Type::INT4 {
-        Type::INT4_ARRAY
-    } else if *scalar == Type::INT8 {
-        Type::INT8_ARRAY
-    } else if *scalar == Type::FLOAT8 {
-        Type::FLOAT8_ARRAY
-    } else if *scalar == Type::BOOL {
-        Type::BOOL_ARRAY
-    } else if *scalar == Type::TEXT || *scalar == Type::VARCHAR {
-        Type::TEXT_ARRAY
-    } else if *scalar == Type::UUID {
-        Type::UUID_ARRAY
-    } else if *scalar == Type::JSON {
-        Type::JSON_ARRAY
-    } else if *scalar == Type::JSONB {
-        Type::JSONB_ARRAY
-    } else if *scalar == Type::DATE {
-        Type::DATE_ARRAY
-    } else if *scalar == Type::TIME {
-        Type::TIME_ARRAY
-    } else if *scalar == Type::TIMESTAMP {
-        Type::TIMESTAMP_ARRAY
-    } else if *scalar == Type::TIMESTAMPTZ {
-        Type::TIMESTAMPTZ_ARRAY
-    } else if *scalar == Type::INET {
-        Type::INET_ARRAY
-    } else if *scalar == Type::CIDR {
-        Type::CIDR_ARRAY
-    } else if *scalar == Type::MACADDR {
-        Type::MACADDR_ARRAY
-    } else if *scalar == Type::MACADDR8 {
-        Type::MACADDR8_ARRAY
-    } else if *scalar == Type::NUMERIC {
-        Type::NUMERIC_ARRAY
-    } else if *scalar == Type::BYTEA {
-        Type::BYTEA_ARRAY
-    } else if *scalar == Type::FLOAT4 {
-        Type::FLOAT4_ARRAY
-    } else {
-        Type::TEXT_ARRAY
-    }
+/// The PostgreSQL type of a declared type name, from the catalog's type
+/// table, so RowDescription and `pg_attribute` agree.
+fn declared_type_to_pg_type(declared: &str) -> Type {
+    pg_type_of_oid(turso_pg::sqlite_type_to_pg_oid(declared))
+}
+
+/// The array type whose elements have type `element`, from the catalog's
+/// `pg_type` rows.
+fn array_type_of(element: &Type) -> Type {
+    let oid = turso_pg::pg_array_type_oid(i64::from(element.oid()))
+        .unwrap_or_else(|| panic!("type {element} has no row in pg_type"));
+    pg_type_of_oid(oid)
+}
+
+fn pg_type_of_oid(oid: i64) -> Type {
+    u32::try_from(oid)
+        .ok()
+        .and_then(Type::from_oid)
+        .unwrap_or_else(|| panic!("type OID {oid} is not a PostgreSQL type"))
 }
 
 /// Execute a query that returns rows and build a Query response.
@@ -798,6 +775,16 @@ fn encode_binary_number(
     use turso_core::Numeric::{Float, Integer};
     match *n {
         Integer(i) if *pg_type == Type::BOOL => encoder.encode_field(&(i != 0)),
+        Integer(i) if *pg_type == Type::INT2 => match i16::try_from(i) {
+            Ok(i) => encoder.encode_field(&i),
+            Err(_) => Err(pg_error(
+                turso_pg::sqlstate_error(
+                    SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    format!("cannot send {i} in binary format as type int2: it is out of range"),
+                )
+                .into(),
+            )),
+        },
         // A value outside the i32 range, stored in an int column, keeps
         // the i64 encoding as before, which binary clients still misread.
         Integer(i) if *pg_type == Type::INT4 => match i32::try_from(i) {
@@ -819,40 +806,6 @@ fn encode_binary_number(
             FieldFormat::Text,
             &FormatOptions::default(),
         ),
-    }
-}
-
-fn sqlite_type_to_pg_type(type_str: &str) -> Type {
-    let upper = type_str.to_uppercase();
-    match upper.as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
-        "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
-        "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
-        "BLOB" | "BYTEA" => Type::BYTEA,
-        "BOOLEAN" | "BOOL" => Type::BOOL,
-        "UUID" => Type::UUID,
-        "JSON" => Type::JSON,
-        "JSONB" => Type::JSONB,
-        "DATE" => Type::DATE,
-        "TIME" | "TIMETZ" => Type::TIME,
-        "TIMESTAMP" => Type::TIMESTAMP,
-        "TIMESTAMPTZ" => Type::TIMESTAMPTZ,
-        "INET" => Type::INET,
-        "CIDR" => Type::CIDR,
-        "MACADDR" => Type::MACADDR,
-        "MACADDR8" => Type::MACADDR8,
-        _ => {
-            // Handle parameterized types like varchar(50), numeric(10,2)
-            if upper.starts_with("VARCHAR") || upper.starts_with("CHAR") {
-                Type::VARCHAR
-            } else if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
-                Type::NUMERIC
-            } else {
-                Type::TEXT
-            }
-        }
     }
 }
 
@@ -1250,13 +1203,21 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
         conn.execute("CREATE TABLE o (i int)").unwrap();
         conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
+        conn.execute("CREATE TABLE s (v smallint)").unwrap();
+        conn.execute("INSERT INTO s VALUES (-2)").unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
+                "SELECT v FROM s",
+                Type::INT2,
+                &b"\0\0\0\x02\xff\xfe"[..],
+                &b"\0\0\0\x02-2"[..],
+            ),
+            (
                 "SELECT 42::int4",
                 Type::INT4,
-                &b"\0\0\0\x04\0\0\0\x2a"[..],
-                &b"\0\0\0\x0242"[..],
+                b"\0\0\0\x04\0\0\0\x2a",
+                b"\0\0\0\x0242",
             ),
             (
                 "SELECT -1::int4",
@@ -1333,6 +1294,63 @@ mod tests {
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
         }
+    }
+
+    #[test]
+    fn row_description_types_match_pg_attribute() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE typed (a smallint, b numeric(10,2), c varchar(10), d macaddr8, \
+             e integer, f text, g double precision, h smallint[], i varchar(10)[])",
+        )
+        .unwrap();
+        let stmt = conn.prepare("SELECT * FROM typed").unwrap();
+        let types: Vec<Type> = build_field_info(&stmt, &Format::UnifiedText)
+            .iter()
+            .map(|field| field.datatype().clone())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                Type::INT2,
+                Type::NUMERIC,
+                Type::VARCHAR,
+                Type::MACADDR8,
+                Type::INT4,
+                Type::TEXT,
+                Type::FLOAT8,
+                Type::INT2_ARRAY,
+                Type::VARCHAR_ARRAY,
+            ]
+        );
+        // pg_attribute gives the element type for the array columns h and i
+        // (#11937), so only the scalar columns a to g are compared.
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.atttypid FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+                 WHERE c.relname = 'typed' AND a.attname IN ('a', 'b', 'c', 'd', 'e', 'f', 'g') \
+                 ORDER BY a.attnum",
+            )
+            .unwrap();
+        let oids: Vec<Value> = stmt
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect();
+        let scalar_column_types = &types[..7];
+        let expected: Vec<Value> = scalar_column_types
+            .iter()
+            .map(|t| Value::from_i64(i64::from(t.oid())))
+            .collect();
+        assert_eq!(oids, expected);
     }
 
     #[test]
@@ -1632,25 +1650,33 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_type_to_pg_type() {
-        assert_eq!(sqlite_type_to_pg_type("INTEGER"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("INT"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("INT4"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
-        assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
-        assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
-        assert_eq!(sqlite_type_to_pg_type("TEXT"), Type::TEXT);
-        assert_eq!(sqlite_type_to_pg_type("BLOB"), Type::BYTEA);
-        assert_eq!(sqlite_type_to_pg_type("BOOLEAN"), Type::BOOL);
-        assert_eq!(sqlite_type_to_pg_type("TIMESTAMP"), Type::TIMESTAMP);
-        assert_eq!(sqlite_type_to_pg_type("TIMESTAMPTZ"), Type::TIMESTAMPTZ);
-        assert_eq!(sqlite_type_to_pg_type("DATE"), Type::DATE);
-        assert_eq!(sqlite_type_to_pg_type("JSON"), Type::JSON);
-        assert_eq!(sqlite_type_to_pg_type("JSONB"), Type::JSONB);
-        assert_eq!(sqlite_type_to_pg_type("UUID"), Type::UUID);
-        // Unknown types map to TEXT
-        assert_eq!(sqlite_type_to_pg_type("UNKNOWN"), Type::TEXT);
+    fn declared_type_names_map_to_pg_types() {
+        for (declared, expected) in [
+            ("INTEGER", Type::INT4),
+            ("smallint", Type::INT2),
+            ("bigint", Type::INT8),
+            ("REAL", Type::FLOAT8),
+            ("TEXT", Type::TEXT),
+            ("varchar(10)", Type::VARCHAR),
+            ("numeric(10,2)", Type::NUMERIC),
+            ("BLOB", Type::BYTEA),
+            ("bytea", Type::BYTEA),
+            ("boolean", Type::BOOL),
+            ("uuid", Type::UUID),
+            ("json", Type::JSON),
+            ("jsonb", Type::JSONB),
+            ("date", Type::DATE),
+            ("time", Type::TIME),
+            ("timestamp", Type::TIMESTAMP),
+            ("timestamptz", Type::TIMESTAMPTZ),
+            ("inet", Type::INET),
+            ("cidr", Type::CIDR),
+            ("macaddr", Type::MACADDR),
+            ("macaddr8", Type::MACADDR8),
+            ("mood", Type::TEXT),
+        ] {
+            assert_eq!(declared_type_to_pg_type(declared), expected, "{declared}");
+        }
     }
 
     #[test]

@@ -496,9 +496,10 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// Map a SQLite type string to a PostgreSQL type OID.
+/// Map a column's declared type name to a PostgreSQL type OID. Both the
+/// catalog tables and the server's RowDescription use this one table.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
-fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+pub fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
@@ -525,9 +526,19 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "INET" => 869,
         "CIDR" => 650,
         "MACADDR" => 829,
+        "MACADDR8" => 774,
         "OID" => 26,
         _ => 25, // default to text
     }
+}
+
+/// The OID of the array type whose elements have type `element_oid`
+/// (`pg_type.typarray`), or None for a type that has no row in `pg_type`.
+pub fn pg_array_type_oid(element_oid: i64) -> Option<i64> {
+    PG_BASE_TYPES
+        .iter()
+        .find(|t| t.oid == element_oid)
+        .map(|t| t.typarray)
 }
 
 /// The oid of relation `name` of `namespace`, from its stored class row.
@@ -1752,6 +1763,18 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typstorage: "p",
     },
     PgTypeInfo {
+        oid: 774,
+        name: "macaddr8",
+        typtype: "b",
+        typcategory: "U",
+        typlen: 8,
+        typarray: 775,
+        typelem: 0,
+        typbyval: false,
+        typalign: "i",
+        typstorage: "p",
+    },
+    PgTypeInfo {
         oid: 829,
         name: "macaddr",
         typtype: "b",
@@ -1878,6 +1901,7 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
 const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (199, "_json", 114),
     (651, "_cidr", 650),
+    (775, "_macaddr8", 774),
     (1000, "_bool", 16),
     (1001, "_bytea", 17),
     (1005, "_int2", 21),

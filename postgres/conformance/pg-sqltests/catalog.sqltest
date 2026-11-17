@@ -978,6 +978,22 @@ expect {
     price|int4
 }
 
+test pg-attribute-network-and-sized-column-types {
+    CREATE TABLE sized_columns (a smallint, b numeric(10,2), c varchar(10), d macaddr8, e macaddr);
+    SELECT a.attname, t.typname, t.typstorage FROM pg_attribute a
+    JOIN pg_class c ON a.attrelid = c.oid
+    JOIN pg_type t ON a.atttypid = t.oid
+    WHERE c.relname = 'sized_columns' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    a|int2|p
+    b|numeric|m
+    c|varchar|x
+    d|macaddr8|p
+    e|macaddr|p
+}
+
 test pg-create-table-insert-and-select {
     CREATE TABLE kv (k TEXT, v INT);
     INSERT INTO kv VALUES ('hello', 42);
