@@ -1196,6 +1196,58 @@ fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
 }
 
 #[test]
+fn test_interrupt_between_steps_rolls_back_returning_insert() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare("INSERT INTO t VALUES (1) RETURNING id")
+        .unwrap();
+    assert_eq!(step_returning_id(&mut stmt), 1);
+    stmt.interrupt();
+    match stmt.step().unwrap() {
+        turso_core::StepResult::Interrupt => {}
+        other => panic!("expected the interrupted statement to stop; got {other:?}"),
+    }
+    drop(stmt);
+
+    assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 0);
+}
+
+#[test]
+fn test_interrupt_while_mvcc_commit_waits_on_fsync_lets_commit_finish() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io.clone(), "mvcc-interrupt.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1)")?;
+    let mut interrupted = false;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => {
+                let event = io.step_one()?.expect("the statement waits on queued IO");
+                if event.kind == QueuedIoOpKind::Sync && !interrupted {
+                    stmt.interrupt();
+                    interrupted = true;
+                }
+            }
+            StepResult::Done => break,
+            other => panic!("expected the started commit to finish; got {other:?}"),
+        }
+    }
+    assert!(interrupted, "the commit never waited on an fsync");
+    assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 1);
+    Ok(())
+}
+
+#[test]
 fn test_drop_table_while_returning_active_is_table_locked() {
     let env = SameConnectionMvcc::new(":memory:drop-table-returning-active-locked");
     env.conn
