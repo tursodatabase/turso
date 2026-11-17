@@ -5003,6 +5003,15 @@ impl Pager {
         id = "wal_insert_frame_marks_cached_page_with_frame_number"
     )]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        turso_assert!(
+            self.is_authenticated(),
+            "WAL frame insertion requires an authenticated pager"
+        );
+        if frame.len() < crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE {
+            return Err(LimboError::InvalidArgument(
+                "WAL frame is shorter than its header".into(),
+            ));
+        }
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -5010,6 +5019,25 @@ impl Pager {
             ));
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
+        if self.encryption_cipher() != CipherMode::None || self.has_external_page_codec() {
+            if raw_page.len() != self.get_page_size_unchecked().get() as usize {
+                return Err(LimboError::InvalidArgument(
+                    "WAL import cannot change the protected page size".into(),
+                ));
+            }
+            if header.page_number == 1 {
+                let imported: &DatabaseHeader =
+                    bytemuck::from_bytes(&raw_page[..DatabaseHeader::SIZE]);
+                let reserved = self.io_ctx.read().get_reserved_space_bytes();
+                if imported.page_size.get() != self.get_page_size_unchecked().get()
+                    || imported.reserved_space != reserved
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "WAL import cannot change the protected page layout".into(),
+                    ));
+                }
+            }
+        }
         let frame_is_new = frame_no > wal.get_max_frame();
 
         wal.write_frame_raw(
