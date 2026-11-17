@@ -1427,9 +1427,18 @@ fn name_foreign_key_tables<'a>(
     let mut sql = sql.into_owned();
     for table in tables.iter().rev() {
         let namespace = match table.schema.as_deref() {
-            Some(schema) => conn.qualifier(&schema.to_lowercase()).ok_or_else(|| {
-                LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
-            })?,
+            Some(schema) => {
+                let schema = schema.to_lowercase();
+                let namespace = conn.qualifier(&schema).ok_or_else(|| {
+                    LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
+                })?;
+                if !crate::namespaces::current_role_may_use_schema(conn, &schema) {
+                    return Err(LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(Action::Use, Object::Schema(schema)),
+                    )));
+                }
+                namespace
+            }
             None => foreign_key_table_namespace(conn, &table.name, created.as_ref()).ok_or_else(
                 || LimboError::ParseError("no schema has been selected to create in".to_string()),
             )?,
@@ -1458,7 +1467,8 @@ fn created_table(
 /// The schema that a foreign key target named without a schema is in: the
 /// first schema of the search path that has a table of that name, counting
 /// the table the statement creates, which PostgreSQL makes before its
-/// foreign keys; or else the first schema of the search path.
+/// foreign keys; or else the first schema of the search path. Schemas that
+/// the current role has no USAGE on are left out.
 fn foreign_key_table_namespace(
     conn: &Arc<Connection>,
     name: &str,
@@ -1469,6 +1479,7 @@ fn foreign_key_table_namespace(
         .search_order()
         .into_iter()
         .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
+        .filter(|namespace| crate::namespaces::current_role_may_use_schema(conn, &namespace.name))
         .collect();
     candidates
         .iter()

@@ -622,6 +622,20 @@ expect error {
     permission denied for schema su_ctas_s
 }
 
+test foreign-key-needs-usage-on-the-schema-of-the-table-it-references {
+    CREATE ROLE su_fk;
+    CREATE SCHEMA su_fk_s;
+    CREATE TABLE su_fk_s.t (id INT PRIMARY KEY);
+    GRANT ALL ON su_fk_s.t TO su_fk;
+    GRANT CREATE ON SCHEMA public TO su_fk;
+    SET ROLE su_fk;
+    CREATE TABLE su_fk_t (id INT REFERENCES su_fk_s.t (id));
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_fk_s
+}
+
 test superuser-needs-no-usage {
     CREATE SCHEMA su_super_s;
     CREATE TABLE su_super_s.t (id INT);
