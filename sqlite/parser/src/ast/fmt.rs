@@ -568,6 +568,7 @@ impl ToTokens for Stmt {
                 columns,
                 body,
                 returning,
+                ..
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -2118,6 +2119,7 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
+            Self::Identity(_) => Ok(()),
         }
     }
 }
