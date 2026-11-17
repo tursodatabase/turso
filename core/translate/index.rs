@@ -1,5 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
-use crate::dialect::CatalogChange;
+use crate::dialect::RelationChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -358,15 +358,15 @@ pub fn translate_create_index(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: idx_name.clone(),
+                name: &idx_name,
                 kind: crate::schema::RelationKind::Index,
-                table: Some(tbl_name),
+                table: Some(&tbl_name),
             }],
         )?;
     }
@@ -1500,13 +1500,13 @@ pub fn translate_drop_index(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Drop {
+            &[RelationChange::Dropped {
                 namespace: namespace.id,
-                name: idx_name.clone(),
+                name: &idx_name,
             }],
         )?;
     }

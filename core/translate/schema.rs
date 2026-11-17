@@ -1,4 +1,4 @@
-use crate::dialect::CatalogChange;
+use crate::dialect::RelationChange;
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -1489,21 +1489,21 @@ pub fn translate_create_table(
     }
 
     if dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![CatalogChange::Create {
+        let mut changes = vec![RelationChange::Created {
             namespace: namespace.id,
-            name: normalized_tbl_name.clone(),
+            name: &normalized_tbl_name,
             kind: RelationKind::Table,
             table: None,
         }];
-        for index_name in autoindex_names {
-            changes.push(CatalogChange::Create {
+        for index_name in &autoindex_names {
+            changes.push(RelationChange::Created {
                 namespace: namespace.id,
                 name: index_name,
                 kind: RelationKind::Index,
-                table: Some(normalized_tbl_name.clone()),
+                table: Some(&normalized_tbl_name),
             });
         }
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
@@ -2138,22 +2138,23 @@ pub fn translate_drop_table(
     // Dropping a table also drops its indexes, the automatic ones among
     // them, so the dialect hears about all of them.
     if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
+        let table_name = normalize_ident(name);
         let mut changes: Vec<_> = owned_sequences
             .iter()
-            .map(|sequence| CatalogChange::Drop {
+            .map(|sequence| RelationChange::Dropped {
                 namespace: namespace.id,
-                name: sequence.clone(),
+                name: sequence,
             })
             .collect();
-        changes.push(CatalogChange::Drop {
+        changes.push(RelationChange::Dropped {
             namespace: namespace.id,
-            name: normalize_ident(name),
+            name: &table_name,
         });
-        changes.extend(indices.iter().map(|index| CatalogChange::Drop {
+        changes.extend(indices.iter().map(|index| RelationChange::Dropped {
             namespace: namespace.id,
-            name: index.name.clone(),
+            name: &index.name,
         }));
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,

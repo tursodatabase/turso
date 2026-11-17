@@ -24,7 +24,9 @@ mod engine;
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
-pub use catalog::{CatalogChange, NewOwner, OwnerColumn};
+pub use catalog::{
+    AccessStatement, CatalogChange, NewOwner, OwnerColumn, RelationChange, RelationName,
+};
 
 #[cfg(test)]
 pub(crate) use engine::EngineDialect;
@@ -319,69 +321,37 @@ pub trait Dialect: Send + Sync + 'static {
         ))
     }
 
-    /// Translates `changes`, which the statement being compiled makes, into
-    /// the bytecode that records them in the dialect's own schema state, in
-    /// the same transaction as the statement's `sqlite_schema` rows. A table
-    /// comes with its automatic indexes in one call. Does nothing for a
-    /// dialect without schema state of its own, except that such a dialect
-    /// has no roles, ownership, privileges or row-level security and refuses
-    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
-    /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_catalog_changes(
+    /// Translates `changes`, which the statement being compiled makes to
+    /// relations, into the bytecode that records them in the dialect's own
+    /// schema state, in the same transaction as the statement's
+    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
+    /// call. Does nothing for a dialect without schema state of its own.
+    fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[CatalogChange],
+        changes: &[RelationChange<'_>],
+    ) -> Result<()> {
+        let _ = (program, schema, connection, changes);
+        Ok(())
+    }
+
+    /// Translates `statement` into the bytecode that changes the roles,
+    /// owners, privileges or policies the dialect stores. A dialect that
+    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
+    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
+    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
+    /// `CREATE POLICY` and `DROP POLICY`.
+    fn translate_access_statement(
+        &self,
+        program: &mut ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        statement: &AccessStatement<'_>,
     ) -> Result<()> {
         let _ = (program, schema, connection);
-        for change in changes {
-            match change {
-                CatalogChange::ChangeOwner {
-                    owner: NewOwner::Role(_),
-                    ..
-                } => {
-                    return Err(LimboError::ParseError(
-                        "ALTER ... OWNER TO is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::ChangeOwner {
-                    owner: NewOwner::Column(_),
-                    ..
-                } => {
-                    return Err(LimboError::ParseError(
-                        "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::Grant { revoke, .. } => {
-                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                    return Err(LimboError::ParseError(format!(
-                        "{statement} is not supported"
-                    )));
-                }
-                CatalogChange::SetRowSecurity { .. }
-                | CatalogChange::CreatePolicy { .. }
-                | CatalogChange::DropPolicy { .. } => {
-                    return Err(LimboError::ParseError(
-                        "row-level security is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::CreateRole { .. } => {
-                    return Err(LimboError::ParseError(
-                        "CREATE ROLE is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::GrantRole { revoke, .. } => {
-                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                    return Err(LimboError::ParseError(format!(
-                        "{statement} of role membership is not supported"
-                    )));
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        Err(statement.not_supported())
     }
 
     /// Applies `change`, which the running statement wrote to the dialect's

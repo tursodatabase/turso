@@ -275,25 +275,36 @@ impl Dialect for PostgresDialect {
         crate::schema_state::build_schema_state(schema, results)
     }
 
-    fn translate_catalog_changes(
+    fn translate_relation_changes(
         &self,
         program: &mut turso_core::ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[turso_core::CatalogChange],
+        changes: &[turso_core::RelationChange<'_>],
     ) -> turso_core::Result<()> {
-        match changes {
-            [turso_core::CatalogChange::CreateRole { name, options }] => {
-                return crate::roles::translate_create_role(program, schema, name, options);
+        crate::classes::translate_relation_changes(program, schema, connection, changes)
+    }
+
+    fn translate_access_statement(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        statement: &turso_core::AccessStatement<'_>,
+    ) -> turso_core::Result<()> {
+        match statement {
+            turso_core::AccessStatement::CreateRole { name, options } => {
+                crate::roles::translate_create_role(program, schema, name, options)
             }
-            [change @ turso_core::CatalogChange::GrantRole { .. }] => {
-                return crate::auth_members::translate_grant_role(
-                    program, schema, connection, change,
-                );
-            }
-            _ => {}
+            turso_core::AccessStatement::GrantRole {
+                revoke,
+                roles,
+                grantees,
+            } => crate::auth_members::translate_grant_role(
+                program, schema, connection, *revoke, roles, grantees,
+            ),
+            _ => crate::classes::translate_access_statement(program, schema, connection, statement),
         }
-        crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
 
     fn apply_catalog_change(

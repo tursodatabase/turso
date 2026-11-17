@@ -1,4 +1,4 @@
-use crate::dialect::CatalogChange;
+use crate::dialect::RelationChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;
@@ -241,13 +241,13 @@ pub fn translate_create_materialized_view(
     // The view is a relation of the dialect's; its hidden state tables are
     // engine objects and are not.
     if schema::dialect_relation_hooks_apply(&connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             &connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_view_name,
+                name: &normalized_view_name,
                 kind: crate::schema::RelationKind::MaterializedView,
                 table: None,
             }],
@@ -461,13 +461,13 @@ pub fn translate_create_view(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_view_name,
+                name: &normalized_view_name,
                 kind: crate::schema::RelationKind::View,
                 table: None,
             }],
@@ -650,13 +650,13 @@ pub fn translate_drop_view(
     }
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Drop {
+            &[RelationChange::Dropped {
                 namespace: namespace.id,
-                name: normalized_view_name.clone(),
+                name: &normalized_view_name,
             }],
         )?;
     }
