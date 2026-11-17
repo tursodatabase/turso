@@ -77,6 +77,18 @@ impl Replica {
         })
     }
 
+    pub fn checkpoint(&self) -> Result<()> {
+        drive(&self.io, async |coro| self.engine.checkpoint(coro).await)
+    }
+
+    pub fn logical_log_bytes(&self) -> Result<u64> {
+        match std::fs::metadata(self._dir.path().join("replica.db-log")) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         let conn = drive(&self.io, async |coro| self.engine.connect_rw(coro).await)?;
         Snapshot::capture(&conn)
