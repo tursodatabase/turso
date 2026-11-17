@@ -605,7 +605,6 @@ fn join_lhs_and_rhs<'a, 'w>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -642,7 +641,7 @@ fn join_lhs_and_rhs<'a, 'w>(
             })
         });
 
-        for build_table_idx in lhs_table_numbers {
+        for build_table_idx in &lhs_mask {
             if build_table_idx != last_lhs_table_idx {
                 continue;
             }
@@ -1105,7 +1104,9 @@ fn join_lhs_and_rhs<'a, 'w>(
     access_methods_arena.push(best_access_method);
 
     let mut best_access_methods = Vec::with_capacity(join_order.len());
-    best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
+    if let Some(lhs) = lhs {
+        best_access_methods.extend_from_slice(&lhs.data);
+    }
     best_access_methods.push((rhs_table_number, access_methods_arena.len() - 1));
     let mut prefix_cardinalities = Vec::with_capacity(join_order.len());
     if let Some(lhs) = lhs {
