@@ -9,12 +9,16 @@ use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{ConnectOpts, Database, Value};
+use turso_core::{ConnectOpts, Database, LimboError, StepResult, Value};
 use turso_pg::{
-    split_statements, sql_parse_error, PgConnection, StatementResultKind, TransactionState,
+    split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
+    TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_PROTOCOL_VIOLATION,
+};
 use turso_pg_parser::ParseResult;
 
 use pgwire::api::auth::StartupHandler;
@@ -175,8 +179,7 @@ impl SimpleQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self.run_simple_query(client, query).await;
-        let status = wire_transaction_status(&self.conn);
-        finish_query(client, result, false, status).await
+        finish_query(client, result, false, &self.conn).await
     }
 
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -197,7 +200,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             if stmt.result_kind() != StatementResultKind::Rows {
                 responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText)?);
                 responses.push(execute_query(&mut stmt, header)?);
             }
         }
@@ -218,13 +221,8 @@ impl TursoPgHandler {
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
         let conn = &self.conn;
-        // Errors raised here never reach PgConnection::prepare, so report
-        // them to the session: any error inside a transaction block aborts
-        // the block.
-        let parse_error = |error: turso_pg_parser::ParseError| {
-            conn.abort_transaction_block_on_error();
-            pg_error(sql_parse_error(error).into())
-        };
+        let parse_error =
+            |error: turso_pg_parser::ParseError| pg_error(sql_parse_error(error).into());
         turso_pg_parser::parse(&query.query).map_err(parse_error)?;
         let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;
         if statements.is_empty() {
@@ -315,8 +313,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self._on_execute(client, message).await;
-        let status = wire_transaction_status(&self.conn);
-        finish_query(client, result, true, status).await
+        finish_query(client, result, true, &self.conn).await
     }
 
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
@@ -327,8 +324,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self._on_describe(client, message).await;
-        let status = wire_transaction_status(&self.conn);
-        finish_query(client, result, true, status).await
+        finish_query(client, result, true, &self.conn).await
     }
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
@@ -358,7 +354,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
                 .map(|response| with_transaction_state(conn, response));
         }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
+        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format)?);
         execute_query(&mut stmt, header)
     }
 
@@ -379,7 +375,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = describe_fields(&stmt, &Format::UnifiedText);
+        let fields = describe_fields(&stmt, &Format::UnifiedText)?;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -396,15 +392,15 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
 
-        let fields = describe_fields(&stmt, &portal.result_column_format);
+        let fields = describe_fields(&stmt, &portal.result_column_format)?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
 /// The fields of an ordinary result set, or none for commands and COPY.
-fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
     if stmt.result_kind() != StatementResultKind::Rows {
-        return vec![];
+        return Ok(vec![]);
     }
     build_field_info(stmt, format)
 }
@@ -414,14 +410,100 @@ fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+/// A column the client asks for in binary format is refused, before any row
+/// is produced, when tursopg cannot send its type in binary format.
+fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
+    let binary = binary_formats(format, stmt.num_columns(), "result column")?;
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
             let pg_type = resolve_pg_type_for_column(stmt, i);
-            FieldInfo::new(name, None, None, pg_type, format.format_for(i))
+            if !binary[i] {
+                return Ok(FieldInfo::new(name, None, None, pg_type, FieldFormat::Text));
+            }
+            if BinaryEncoding::of(&pg_type).is_none() {
+                return Err(binary_not_supported(
+                    &format!("result column {name}"),
+                    &pg_type,
+                ));
+            }
+            Ok(FieldInfo::new(
+                name,
+                None,
+                None,
+                pg_type,
+                FieldFormat::Binary,
+            ))
         })
         .collect()
+}
+
+/// For each of `count` parameters or result columns, whether the client
+/// asked for binary format (code 1) rather than text (code 0).
+fn binary_formats(format: &Format, count: usize, kind: &str) -> PgWireResult<Vec<bool>> {
+    let codes = match format {
+        Format::UnifiedText => return Ok(vec![false; count]),
+        Format::UnifiedBinary => return Ok(vec![true; count]),
+        Format::Individual(codes) => codes,
+    };
+    if codes.len() != count {
+        let message = format!(
+            "bind message has {} {kind} formats but {count} {kind}s",
+            codes.len()
+        );
+        return Err(wire_error(SQLSTATE_PROTOCOL_VIOLATION, message));
+    }
+    codes
+        .iter()
+        .map(|code| match code {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(wire_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                format!("unsupported format code: {code}"),
+            )),
+        })
+        .collect()
+}
+
+fn binary_not_supported(what: &str, pg_type: &Type) -> PgWireError {
+    let message = format!(
+        "binary format is not supported for {what} of type {}; use text format",
+        pg_type.name()
+    );
+    wire_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message)
+}
+
+fn wire_error(sqlstate: &'static str, message: String) -> PgWireError {
+    pg_error(sqlstate_error(sqlstate, message).into())
+}
+
+/// How tursopg reads or writes a value of a type in binary format.
+#[derive(Clone, Copy)]
+enum BinaryEncoding {
+    /// The binary format of these types is the text's UTF-8 bytes, the same
+    /// bytes as their text format.
+    Text,
+    Bool,
+    Int4,
+    Int8,
+    Float8,
+    Bytea,
+}
+
+impl BinaryEncoding {
+    /// None for a type whose binary format tursopg neither reads nor writes.
+    fn of(pg_type: &Type) -> Option<Self> {
+        match *pg_type {
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(Self::Text),
+            Type::BOOL => Some(Self::Bool),
+            Type::INT4 => Some(Self::Int4),
+            Type::INT8 => Some(Self::Int8),
+            Type::FLOAT8 => Some(Self::Float8),
+            Type::BYTEA => Some(Self::Bytea),
+            _ => None,
+        }
+    }
 }
 
 /// Decide the PG wire type for a result column.
@@ -517,20 +599,34 @@ fn execute_query(
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
+    let mut encoding_failed = false;
 
-    stmt.run_with_row_callback(|row| {
+    let result = stmt.run_with_row_callback(|row| {
         let mut encoder = DataRowEncoder::new(header_clone.clone());
         for (i, val) in row.get_values().enumerate() {
             let (pg_type, format) = header_clone
                 .get(i)
                 .map(|fi| (fi.datatype().clone(), fi.format()))
                 .unwrap_or((Type::TEXT, FieldFormat::Text));
-            encode_value(&mut encoder, val, &pg_type, format)?;
+            encode_value(&mut encoder, val, &pg_type, format)
+                .inspect_err(|_| encoding_failed = true)?;
         }
         rows.push(encoder.finish());
         Ok(())
-    })
-    .map_err(pg_error)?;
+    });
+    if encoding_failed {
+        // The statement stopped at a row it could not send. Interrupt it so
+        // that it fails like any other statement: its writes are rolled
+        // back and a transaction block is aborted. Resetting it instead
+        // would commit the writes of an INSERT ... RETURNING.
+        stmt.interrupt();
+        let interrupted = stmt.step().map_err(pg_error)?;
+        assert!(
+            matches!(interrupted, StepResult::Interrupt),
+            "an interrupted statement stops, got {interrupted:?}"
+        );
+    }
+    result.map_err(pg_error)?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -597,17 +693,22 @@ fn bind_portal_parameters(
     stmt: &mut turso_pg::Statement,
     portal: &Portal<String>,
 ) -> PgWireResult<()> {
-    for i in 0..portal.parameter_len() {
-        let value = match &portal.parameters[i] {
+    let binary = binary_formats(
+        &portal.parameter_format,
+        portal.parameter_len(),
+        "parameter",
+    )?;
+    for (i, (bytes, binary)) in portal.parameters.iter().zip(binary).enumerate() {
+        let declared = portal.statement.parameter_types.get(i);
+        let value = match bytes {
             None => Value::Null,
             Some(bytes) => {
-                let pg_type = portal
-                    .statement
-                    .parameter_types
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                let pg_type = declared.and_then(|t| t.as_ref()).unwrap_or(&Type::UNKNOWN);
+                if binary {
+                    binary_parameter_value(bytes, pg_type, i + 1)?
+                } else {
+                    pg_bytes_to_value(bytes, pg_type)?
+                }
             }
         };
         // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
@@ -622,6 +723,25 @@ fn bind_portal_parameters(
         let _ = stmt.bind_at(idx, value);
     }
     Ok(())
+}
+
+/// Reads parameter `$n` sent in binary format as `pg_type`, the type Parse
+/// declared for it. A type whose binary format is its text is read as in text
+/// format. A parameter whose type Parse left out or left unspecified (OID 0)
+/// has type `unknown` and is refused: PostgreSQL works out its type from the
+/// query, and tursopg cannot.
+fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Value> {
+    match BinaryEncoding::of(pg_type) {
+        Some(BinaryEncoding::Text) => pg_bytes_to_value(bytes, pg_type),
+        Some(BinaryEncoding::Bytea) => Ok(Value::from_blob(bytes.to_vec())),
+        Some(
+            BinaryEncoding::Bool
+            | BinaryEncoding::Int4
+            | BinaryEncoding::Int8
+            | BinaryEncoding::Float8,
+        )
+        | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
+    }
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
@@ -723,103 +843,126 @@ fn encode_value(
     pg_type: &Type,
     format: FieldFormat,
 ) -> turso_core::Result<()> {
-    match val {
-        Value::Null => encoder
-            .encode_field(&None::<i8>)
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
-        Value::Numeric(n) if format == FieldFormat::Binary => {
-            encode_binary_number(encoder, n, pg_type)
-                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+    match format {
+        FieldFormat::Text => encode_text(encoder, val, pg_type),
+        FieldFormat::Binary => encode_binary(encoder, val, pg_type),
+    }
+}
+
+/// Encodes a value in text format, also in a column sent in binary format.
+fn encode_text(
+    encoder: &mut DataRowEncoder,
+    val: &Value,
+    pg_type: &Type,
+) -> turso_core::Result<()> {
+    let options = FormatOptions::default();
+    let text = FieldFormat::Text;
+    let encoded = match val {
+        Value::Null => {
+            encoder.encode_field_with_type_and_format(&None::<i8>, pg_type, text, &options)
         }
         Value::Numeric(turso_core::Numeric::Integer(i)) => {
             // Boolean columns: encode as true/false instead of 0/1
             if *pg_type == Type::BOOL {
-                encoder
-                    .encode_field(&(*i != 0))
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                encoder.encode_field_with_type_and_format(&(*i != 0), pg_type, text, &options)
             } else {
-                encoder
-                    .encode_field(i)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                encoder.encode_field_with_type_and_format(i, pg_type, text, &options)
             }
         }
-        Value::Numeric(turso_core::Numeric::Float(f)) => encoder
-            .encode_field(&f64::from(*f))
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+        Value::Numeric(turso_core::Numeric::Float(f)) => {
+            encoder.encode_field_with_type_and_format(&f64::from(*f), pg_type, text, &options)
+        }
         Value::Text(t) => {
-            let text = t.value.as_ref();
+            let value = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
             // parse the value correctly (as UTC, not local time).
             // TIMESTAMP (without TZ) should NOT have timezone suffix.
             if *pg_type == Type::TIMESTAMPTZ
-                && !text.contains('+')
-                && !text.contains('Z')
-                && !text.ends_with("-00")
+                && !value.contains('+')
+                && !value.contains('Z')
+                && !value.ends_with("-00")
             {
-                let with_tz = format!("{text}+00");
-                encoder
-                    .encode_field(&with_tz.as_str())
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                let with_tz = format!("{value}+00");
+                encoder.encode_field_with_type_and_format(
+                    &with_tz.as_str(),
+                    pg_type,
+                    text,
+                    &options,
+                )
             } else if pg_type.name().starts_with('_') {
                 // Array types: pgwire's to_sql_text quotes strings containing
                 // {, }, or commas when the type is Kind::Array. Since we store
                 // array values as pre-formatted PG array literals (e.g.
                 // "{1,2,3}"), encode with Type::TEXT to bypass the quoting.
-                encoder
-                    .encode_field_with_type_and_format(
-                        &text,
-                        &Type::TEXT,
-                        FieldFormat::Text,
-                        &FormatOptions::default(),
-                    )
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                encoder.encode_field_with_type_and_format(&value, &Type::TEXT, text, &options)
             } else {
-                encoder
-                    .encode_field(&text)
-                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+                encoder.encode_field_with_type_and_format(&value, pg_type, text, &options)
             }
         }
-        Value::Blob(b) => encoder
-            .encode_field(&b.as_slice())
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
-    }
+        Value::Blob(b) => {
+            encoder.encode_field_with_type_and_format(&b.as_slice(), pg_type, text, &options)
+        }
+    };
+    encoded.map_err(|e| LimboError::InternalError(e.to_string()))
 }
 
-/// Binary format writes a number with the width of its Rust type, so the
-/// encoding follows the column's type, not the stored value: `count(*)` is
-/// typed text, and `coalesce(NULL::float8, 1)` holds an integer. For a type
-/// without a binary number encoding here, the value is sent as its text, the
-/// same bytes as in text format.
-fn encode_binary_number(
+/// Encodes a value in binary format. The encoding follows the column's type,
+/// not the stored value: `count(*)` is typed text, and
+/// `coalesce(NULL::float8, 1)` holds an integer. A value that the type's
+/// binary format cannot hold is refused, because the client would misread
+/// any bytes sent for it.
+fn encode_binary(
     encoder: &mut DataRowEncoder,
-    n: &turso_core::Numeric,
+    val: &Value,
     pg_type: &Type,
-) -> PgWireResult<()> {
+) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    match *n {
-        Integer(i) if *pg_type == Type::BOOL => encoder.encode_field(&(i != 0)),
-        // A value outside the i32 range, stored in an int column, keeps
-        // the i64 encoding as before, which binary clients still misread.
-        Integer(i) if *pg_type == Type::INT4 => match i32::try_from(i) {
-            Ok(i) => encoder.encode_field(&i),
-            Err(_) => encoder.encode_field(&i),
-        },
-        Integer(i) if *pg_type == Type::INT8 => encoder.encode_field(&i),
-        Integer(i) if *pg_type == Type::FLOAT8 => encoder.encode_field(&(i as f64)),
-        Float(f) if *pg_type == Type::FLOAT8 => encoder.encode_field(&f64::from(f)),
-        Integer(i) => encoder.encode_field_with_type_and_format(
-            &i,
-            pg_type,
-            FieldFormat::Text,
-            &FormatOptions::default(),
-        ),
-        Float(f) => encoder.encode_field_with_type_and_format(
-            &f64::from(f),
-            pg_type,
-            FieldFormat::Text,
-            &FormatOptions::default(),
-        ),
-    }
+    let encoding = BinaryEncoding::of(pg_type)
+        .expect("build_field_info refuses binary format for a type without a binary encoding");
+    let options = FormatOptions::default();
+    let binary = FieldFormat::Binary;
+    let encoded = match (encoding, val) {
+        (BinaryEncoding::Text, _) => return encode_text(encoder, val, pg_type),
+        (_, Value::Null) => {
+            encoder.encode_field_with_type_and_format(&None::<i8>, pg_type, binary, &options)
+        }
+        (BinaryEncoding::Bool, Value::Numeric(Integer(i))) => {
+            encoder.encode_field_with_type_and_format(&(*i != 0), pg_type, binary, &options)
+        }
+        (BinaryEncoding::Int4, Value::Numeric(Integer(i))) if i32::try_from(*i).is_ok() => {
+            encoder.encode_field_with_type_and_format(&(*i as i32), pg_type, binary, &options)
+        }
+        (BinaryEncoding::Int8, Value::Numeric(Integer(i))) => {
+            encoder.encode_field_with_type_and_format(i, pg_type, binary, &options)
+        }
+        (BinaryEncoding::Float8, Value::Numeric(Integer(i))) => {
+            encoder.encode_field_with_type_and_format(&(*i as f64), pg_type, binary, &options)
+        }
+        (BinaryEncoding::Float8, Value::Numeric(Float(f))) => {
+            encoder.encode_field_with_type_and_format(&f64::from(*f), pg_type, binary, &options)
+        }
+        (BinaryEncoding::Bytea, Value::Blob(b)) => {
+            encoder.encode_field_with_type_and_format(&b.as_slice(), pg_type, binary, &options)
+        }
+        (
+            BinaryEncoding::Bool
+            | BinaryEncoding::Int4
+            | BinaryEncoding::Int8
+            | BinaryEncoding::Float8
+            | BinaryEncoding::Bytea,
+            _,
+        ) => {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "cannot send the {} value {val} in binary format as type {}; use text format",
+                    val.value_type(),
+                    pg_type.name()
+                ),
+            ))
+        }
+    };
+    encoded.map_err(|e| LimboError::InternalError(e.to_string()))
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
@@ -883,13 +1026,17 @@ async fn finish_query<C>(
     client: &mut C,
     result: PgWireResult<()>,
     wait_for_sync: bool,
-    status: TransactionStatus,
+    conn: &PgConnection,
 ) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
+    if result.is_err() {
+        // Any error inside a transaction block aborts the block, as in PostgreSQL.
+        conn.abort_transaction_block_on_error();
+    }
     let Err(PgWireError::ApiError(error)) = result else {
         return result;
     };
@@ -917,6 +1064,7 @@ where
             fields,
         )))
         .await?;
+    let status = wire_transaction_status(conn);
     client.set_transaction_status(status);
     if wait_for_sync {
         client.set_state(PgWireConnectionState::AwaitingSync);
@@ -1246,10 +1394,10 @@ mod tests {
         )
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
-        conn.execute("CREATE TABLE t (i int, b bigint)").unwrap();
-        conn.execute("INSERT INTO t VALUES (42, 42)").unwrap();
-        conn.execute("CREATE TABLE o (i int)").unwrap();
-        conn.execute("INSERT INTO o VALUES (3000000000)").unwrap();
+        conn.execute("CREATE TABLE t (i int, b bigint, x bytea)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (42, 42, 'abc'::bytea)")
+            .unwrap();
         // Each field is a 4-byte length followed by the value.
         for (sql, expected_type, binary, text) in [
             (
@@ -1288,12 +1436,17 @@ mod tests {
                 b"\0\0\0\x08\0\0\0\x02\x18\x71\x1a\0",
                 b"\0\0\0\x0a9000000000",
             ),
-            // Out of the int4 range: still 8 bytes, until #10826.
             (
-                "SELECT i FROM o",
+                "SELECT NULL::int4",
                 Type::INT4,
-                b"\0\0\0\x08\0\0\0\0\xb2\xd0\x5e\0",
-                b"\0\0\0\x0a3000000000",
+                b"\xff\xff\xff\xff",
+                b"\xff\xff\xff\xff",
+            ),
+            (
+                "SELECT x FROM t",
+                Type::BYTEA,
+                b"\0\0\0\x03abc",
+                b"\0\0\0\x08\\x616263",
             ),
             (
                 "SELECT 1.5::float8",
@@ -1319,7 +1472,7 @@ mod tests {
             for (format, expected) in [(Format::UnifiedBinary, binary), (Format::UnifiedText, text)]
             {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
+                let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
                 assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 let mut encoder = DataRowEncoder::new(fields.clone());
@@ -1333,6 +1486,128 @@ mod tests {
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
             }
         }
+    }
+
+    #[test]
+    fn binary_formats_are_refused_where_the_bytes_would_be_wrong() {
+        let conn = memory_connection();
+        let date = conn.prepare("SELECT CAST('2024-01-05' AS date)").unwrap();
+        let error = build_field_info(&date, &Format::UnifiedBinary).unwrap_err();
+        assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED);
+
+        let codes = |codes: Vec<i16>, count| binary_formats(&Format::Individual(codes), count, "x");
+        assert_eq!(codes(vec![0, 1], 2).unwrap(), [false, true]);
+        assert_eq!(
+            sqlstate(codes(vec![1, 1], 1).unwrap_err()),
+            SQLSTATE_PROTOCOL_VIOLATION
+        );
+        let error = codes(vec![0, 2], 2).unwrap_err();
+        assert_eq!(sqlstate(error), SQLSTATE_INVALID_PARAMETER_VALUE);
+
+        // Parameter types declared in Parse, the binary bytes, and the value
+        // bound, or None for a refused parameter.
+        for (declared, bytes, expected) in [
+            (
+                vec![Some(Type::TEXT)],
+                &b"42"[..],
+                Some(Value::from_text("42")),
+            ),
+            // Type OID 0: PostgreSQL reads `SELECT $1::int4` with these bytes
+            // as 42.
+            (vec![None], b"\0\0\0\x2a", None),
+            (
+                vec![Some(Type::BYTEA)],
+                b"\\x41",
+                Some(Value::from_blob(b"\\x41".to_vec())),
+            ),
+            (vec![Some(Type::INT8)], b"\0\0\0\0\0\0\0\x2a", None),
+            (vec![Some(Type::DATE)], b"\0\0\x22\x42", None),
+            (vec![], b"42", None),
+        ] {
+            let mut portal = Portal::<String>::default();
+            portal.statement =
+                Arc::new(StoredStatement::new(String::new(), String::new(), declared));
+            portal.parameter_format = Format::UnifiedBinary;
+            portal.parameters = vec![Some(bytes.to_vec().into())];
+            let mut stmt = conn.prepare("SELECT $1").unwrap();
+            match (bind_portal_parameters(&mut stmt, &portal), expected) {
+                (Ok(()), Some(value)) => assert_eq!(stmt.run_collect_rows().unwrap(), [[value]]),
+                (Err(error), None) => assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED),
+                (result, expected) => panic!("{bytes:?}: {result:?}, expected {expected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_refused_in_binary_format_leaves_no_write() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE o (i int)").unwrap();
+        // 3000000000 is outside the range of int4's 4-byte binary format.
+        let insert = "INSERT INTO o VALUES (3000000000) RETURNING i";
+        for in_block in [false, true] {
+            if in_block {
+                conn.execute("BEGIN").unwrap();
+            }
+            let mut stmt = conn.prepare(insert).unwrap();
+            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedBinary).unwrap());
+            let Err(error) = execute_query(&mut stmt, fields) else {
+                panic!("{insert} must fail");
+            };
+            assert_eq!(sqlstate(error), SQLSTATE_FEATURE_NOT_SUPPORTED);
+            drop(stmt);
+            if in_block {
+                assert_eq!(wire_transaction_status(&conn), TransactionStatus::Error);
+                conn.execute("COMMIT").unwrap();
+            }
+            let mut count = conn.prepare("SELECT count(*) FROM o").unwrap();
+            assert_eq!(count.run_collect_rows().unwrap(), [[Value::from_i64(0)]]);
+        }
+    }
+
+    #[test]
+    fn a_refused_binary_format_aborts_the_transaction_block() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE u (u uuid)").unwrap();
+        client.simple_query("BEGIN").unwrap();
+        // Parse, Bind asking for the result in binary format, Execute, Sync.
+        client
+            .write_message(b'P', b"\0SELECT u FROM u\0\0\0")
+            .unwrap();
+        client
+            .write_message(b'B', b"\0\0\0\0\0\0\0\x01\0\x01")
+            .unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+        client.write_message(b'S', b"").unwrap();
+        let mut events = Vec::new();
+        while !matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))) {
+            events.push(client.read_event().unwrap());
+        }
+        let [_, _, BackendEvent::ErrorResponse(fields), BackendEvent::ReadyForQuery(b'E')] =
+            &events[..]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(fields[&b'C'], SQLSTATE_FEATURE_NOT_SUPPORTED);
+        let events = client.simple_query("COMMIT").unwrap();
+        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
+    }
+
+    fn memory_connection() -> PgConnection {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        PgConnection::connect(&db).unwrap()
+    }
+
+    fn sqlstate(error: PgWireError) -> &'static str {
+        let PgWireError::ApiError(error) = error else {
+            panic!("not an SQL error: {error:?}");
+        };
+        error.downcast::<turso_pg::Error>().unwrap().sqlstate
     }
 
     #[test]
@@ -1352,7 +1627,7 @@ mod tests {
         ] {
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
+                let fields = Arc::new(build_field_info(&stmt, &format).unwrap());
                 assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
@@ -1370,7 +1645,7 @@ mod tests {
             }
         }
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = build_field_info(&stmt, &Format::UnifiedText).unwrap();
         assert_eq!(*fields[0].datatype(), Type::INT4);
     }
 
@@ -1435,7 +1710,7 @@ mod tests {
             "SELECT coalesce(x, 2) FROM t",
         ] {
             let stmt = conn.prepare(sql).unwrap();
-            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            let fields = build_field_info(&stmt, &Format::UnifiedText).unwrap();
             assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
         }
     }
@@ -1465,13 +1740,13 @@ mod tests {
             ("SELECT array_to_json(ARRAY[1])", Type::JSON),
         ] {
             let mut stmt = conn.prepare(sql).unwrap();
-            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText).unwrap());
             assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
             let _ = stmt.run_collect_rows().unwrap();
         }
 
         let mut stmt = conn.prepare("SELECT booleq(true, true)").unwrap();
-        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText).unwrap());
         let rows = stmt.run_collect_rows().unwrap();
         let mut encoder = DataRowEncoder::new(fields.clone());
         encode_value(
@@ -1503,12 +1778,15 @@ mod tests {
         ] {
             let stmt = conn.prepare(sql).unwrap();
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
-                assert!(describe_fields(&stmt, &format).is_empty(), "{sql}");
+                assert!(describe_fields(&stmt, &format).unwrap().is_empty(), "{sql}");
             }
         }
         let sql = "SELECT 'LOCK TABLE items'";
         let query = conn.prepare(sql).unwrap();
-        assert_eq!(describe_fields(&query, &Format::UnifiedText).len(), 1);
+        assert_eq!(
+            describe_fields(&query, &Format::UnifiedText).unwrap().len(),
+            1
+        );
     }
 
     #[test]
