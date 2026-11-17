@@ -15,7 +15,7 @@ use turso_pg::{
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
-use turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
+use turso_pg_parser::sqlstate::{SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_PROTOCOL_VIOLATION};
 use turso_pg_parser::ParseResult;
 
 use pgwire::api::auth::StartupHandler;
@@ -32,6 +32,7 @@ use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    DEFAULT_NAME,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
@@ -565,17 +566,34 @@ fn wire_transaction_status(conn: &PgConnection) -> TransactionStatus {
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
-///
-/// PostgreSQL parameters ($1, $2, ...) map to portal parameters 0, 1, ...
-/// The bytecode compiler may allocate internal parameter indices in a different
-/// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
-/// look up each parameter's internal index by name.
+/// PostgreSQL parameters ($1, $2, ...) are portal parameters 0, 1, ...
 fn bind_portal_parameters(
     stmt: &mut turso_pg::Statement,
     portal: &Portal<String>,
 ) -> PgWireResult<()> {
-    for i in 0..portal.parameter_len() {
-        let value = match &portal.parameters[i] {
+    // Like PostgreSQL, a statement takes as many parameters as the larger of
+    // its highest `$N` and the number of types Parse gave.
+    let required = stmt
+        .parameters_count()
+        .max(portal.statement.parameter_types.len());
+    let supplied = portal.parameter_len();
+    if supplied != required {
+        let name = match portal.statement.id.as_str() {
+            DEFAULT_NAME => "",
+            name => name,
+        };
+        return Err(pg_error(
+            turso_pg::sqlstate_error(
+                SQLSTATE_PROTOCOL_VIOLATION,
+                format!(
+                    "bind message supplies {supplied} parameters, but prepared statement \"{name}\" requires {required}"
+                ),
+            )
+            .into(),
+        ));
+    }
+    for (i, bytes) in portal.parameters.iter().enumerate() {
+        let value = match bytes {
             None => Value::Null,
             Some(bytes) => {
                 let pg_type = portal
@@ -587,16 +605,9 @@ fn bind_portal_parameters(
                 pg_bytes_to_value(bytes, pg_type)?
             }
         };
-        // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
-        // Look up the internal index that the bytecode compiler assigned to $N.
-        let pg_param_name = format!("${}", i + 1);
-        let idx = stmt
-            .parameter_index(&pg_param_name)
-            .unwrap_or_else(|| NonZero::new(i + 1).expect("parameter index must be non-zero"));
-        // Ignore bind errors: parameter index mismatches or value coercion
-        // failures surface as wire-protocol errors during the subsequent
-        // execute, with a more useful message than a generic Bind failure.
-        let _ = stmt.bind_at(idx, value);
+        // tursopg compiles `$N` as `?N`, so parameter i binds at index i + 1.
+        let index = NonZero::new(i + 1).expect("i + 1 is never zero");
+        stmt.bind_at(index, value).map_err(pg_error)?;
     }
     Ok(())
 }
@@ -1176,8 +1187,84 @@ mod tests {
         assert_eq!(messages[1].1, b"\0\x01\0\0\0\x010");
     }
 
+    #[test]
+    fn bind_must_supply_as_many_parameters_as_the_statement_takes() {
+        let (mut client, _) = copy_test_client();
+        // A statement takes as many parameters as the larger of its highest
+        // `$N` and the number of types Parse gave. Messages are PostgreSQL 17's.
+        let one: &[u8] = b"1";
+        for (statement, types, params, message) in [
+            (
+                "",
+                &[][..],
+                &[][..],
+                "bind message supplies 0 parameters, but prepared statement \"\" requires 1",
+            ),
+            (
+                "",
+                &[],
+                &[Some(one), Some(b"2")],
+                "bind message supplies 2 parameters, but prepared statement \"\" requires 1",
+            ),
+            (
+                "s1",
+                &[23, 23],
+                &[Some(one)],
+                "bind message supplies 1 parameters, but prepared statement \"s1\" requires 2",
+            ),
+        ] {
+            client
+                .send_parse(statement, "SELECT $1::int", types)
+                .unwrap();
+            client.send_bind("", statement, &[], params, &[]).unwrap();
+            client.send_execute("", 0).unwrap();
+            client.send_sync().unwrap();
+            let messages = read_until_ready(&mut client);
+            assert_eq!(
+                error_of(&messages),
+                (SQLSTATE_PROTOCOL_VIOLATION.to_owned(), message.to_owned()),
+                "{messages:?}"
+            );
+        }
+
+        client.send_parse("", "SELECT $1::int", &[23, 23]).unwrap();
+        client
+            .send_bind("", "", &[], &[Some(one), Some(b"2")], &[])
+            .unwrap();
+        client.send_execute("", 0).unwrap();
+        client.send_sync().unwrap();
+        let messages = read_until_ready(&mut client);
+        let rows: Vec<_> = messages.iter().filter(|m| m.0 == b'D').collect();
+        assert_eq!(rows.len(), 1, "{messages:?}");
+        assert_eq!(
+            turso_pg_client::parse_data_row(&rows[0].1).unwrap(),
+            vec![Some("1".to_owned())]
+        );
+
+        // The i-th Bind value is `$i`, wherever `$i` appears in the SQL.
+        client
+            .send_parse("", "SELECT $2::text || '-' || $1::text", &[])
+            .unwrap();
+        client
+            .send_bind("", "", &[], &[Some(b"a"), Some(b"b")], &[])
+            .unwrap();
+        client.send_execute("", 0).unwrap();
+        client.send_sync().unwrap();
+        let messages = read_until_ready(&mut client);
+        let rows: Vec<_> = messages.iter().filter(|m| m.0 == b'D').collect();
+        assert_eq!(rows.len(), 1, "{messages:?}");
+        assert_eq!(
+            turso_pg_client::parse_data_row(&rows[0].1).unwrap(),
+            vec![Some("b-a".to_owned())]
+        );
+    }
+
     fn query_messages(client: &mut PgConn, sql: &str) -> Vec<(u8, Vec<u8>)> {
         client.send_query(sql).unwrap();
+        read_until_ready(client)
+    }
+
+    fn read_until_ready(client: &mut PgConn) -> Vec<(u8, Vec<u8>)> {
         let mut messages = Vec::new();
         loop {
             let message = client.read_message().unwrap();
@@ -1187,6 +1274,14 @@ mod tests {
                 return messages;
             }
         }
+    }
+
+    /// The SQLSTATE and message of the only ErrorResponse among the messages.
+    fn error_of(messages: &[(u8, Vec<u8>)]) -> (String, String) {
+        let errors: Vec<_> = messages.iter().filter(|m| m.0 == b'E').collect();
+        assert_eq!(errors.len(), 1, "{messages:?}");
+        let fields = turso_pg_client::parse_error_fields(&errors[0].1).unwrap();
+        (fields[&b'C'].clone(), fields[&b'M'].clone())
     }
 
     #[test]
