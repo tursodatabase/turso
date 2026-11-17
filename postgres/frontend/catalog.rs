@@ -589,7 +589,7 @@ fn relation_owner_name(
 }
 
 /// The user tables with their oids, sorted like [`user_tables_sorted`].
-fn user_tables_with_oids(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>, i64)> {
+pub(crate) fn user_tables_with_oids(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>, i64)> {
     user_tables_sorted(schema)
         .into_iter()
         .map(|(namespace, name, table)| {

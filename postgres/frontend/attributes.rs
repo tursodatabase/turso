@@ -9,6 +9,9 @@
 //! [`CatalogChange::SetColumns`](turso_core::CatalogChange::SetColumns).
 //!
 //! Nothing in memory holds these rows. A query reads the table.
+//!
+//! A database that an earlier version made has no such table. Opening it
+//! creates the table and writes the rows of the tables it has.
 
 use std::sync::Arc;
 
@@ -20,7 +23,7 @@ use turso_core::{
 };
 use turso_parser::ast;
 
-use crate::catalog::{sqlite_type_to_pg_oid, type_storage, user_type_oid};
+use crate::catalog::{sqlite_type_to_pg_oid, type_storage, user_tables_with_oids, user_type_oid};
 
 pub(crate) const ATTRIBUTE_TABLE_NAME: &str = "pg_attribute";
 
@@ -105,7 +108,8 @@ pub(crate) fn hide_tableoid_column(table: &mut BTreeTable) {
     }
 }
 
-/// The statement that creates the table. None when `schema` has the table.
+/// The statements that create the table and write the rows of the tables
+/// that `schema` has. None when `schema` has the table.
 pub(crate) fn initialize_statements(schema: &Schema) -> Vec<String> {
     if schema
         .get_btree_table(NamespaceId::ROOT, ATTRIBUTE_TABLE_NAME)
@@ -119,10 +123,47 @@ pub(crate) fn initialize_statements(schema: &Schema) -> Vec<String> {
         .iter()
         .map(|(name, ty)| format!("{name} {ty}"))
         .collect();
-    vec![format!(
+    let mut statements = vec![format!(
         "CREATE TABLE {ATTRIBUTE_TABLE_NAME} ({})",
         column_definitions.join(", ")
-    )]
+    )];
+    // A statement that names no columns gives no value to a hidden column.
+    let column_names: Vec<&str> = ATTRIBUTE_COLUMNS.iter().map(|(name, _)| *name).collect();
+    let column_names = column_names.join(", ");
+    for (_, _, table, oid) in user_tables_with_oids(schema) {
+        let table = table
+            .btree()
+            .expect("user_tables_with_oids returns stored tables");
+        let rows: Vec<String> = (0..table.columns().len())
+            .map(|position| {
+                let values: Vec<String> = attribute_row(schema, &table, position)
+                    .iter()
+                    .map(|value| value.to_sql_literal(oid))
+                    .collect();
+                format!("({})", values.join(", "))
+            })
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        statements.push(format!(
+            "INSERT INTO {ATTRIBUTE_TABLE_NAME} ({column_names}) VALUES {}",
+            rows.join(", ")
+        ));
+    }
+    statements
+}
+
+impl AttributeValue {
+    /// The value as SQL text, in a row of the table with oid `table_oid`.
+    fn to_sql_literal(&self, table_oid: i64) -> String {
+        match self {
+            AttributeValue::Integer(value) => value.to_string(),
+            AttributeValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
+            AttributeValue::Null => "NULL".to_string(),
+            AttributeValue::TableOid => table_oid.to_string(),
+        }
+    }
 }
 
 /// Writes the rows of the columns of `table`, whose oid is `oid`. The rows
