@@ -4012,6 +4012,65 @@ mod tests {
         });
     }
 
+    #[test]
+    fn btree_batches_upgrade_and_replay_legacy_frames() {
+        for portable in [false, true] {
+            if portable && !cfg!(feature = "conn_raw_api") {
+                continue;
+            }
+            let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+            let file = io
+                .open_file("btree-upgrade.db-log", OpenFlags::Create, false)
+                .unwrap();
+            let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+            let old = crate::mvcc::database::LogRecord::for_test(
+                10,
+                &[make_test_row_version((-2).into(), 1, "old", 10)],
+                None,
+            );
+            #[cfg(feature = "conn_raw_api")]
+            let old = { let mut old = old; old.portable_changes_enabled = portable; old };
+            io.wait_for_completion(log.log_tx(old).unwrap()).unwrap();
+            for timestamp in [20, 30] {
+                let mut next = crate::mvcc::database::LogRecord::for_test(timestamp, &[], None);
+                let changes = if timestamp == 20 {
+                    vec![crate::mvcc::database::BtreeChange::Create(
+                        (-3).into(),
+                        crate::storage::btree_descriptor::BtreeDescriptor::Table,
+                    )]
+                } else {
+                    vec![]
+                };
+                super::append_btree_changes(&mut next, &changes).unwrap();
+                if let Some(completion) = log.upgrade_header_for_log_tx(&next).unwrap() {
+                    io.wait_for_completion(completion).unwrap();
+                }
+                assert!(log.upgrade_header_for_log_tx(&next).unwrap().is_none());
+                io.wait_for_completion(log.log_tx(next).unwrap()).unwrap();
+            }
+            let mut reader = StreamingLogicalLogReader::new(file, None);
+            reader.read_header(&io).unwrap();
+            let first = io.block(|| reader.parse_next_transaction()).unwrap();
+            assert!(
+                matches!(first, ParseResult::Frame(frame) if matches!(frame.ops[0], ParsedOp::UpsertTable { commit_ts: 10, .. }))
+            );
+            for timestamp in [20, 30] {
+                let ParseResult::Frame(frame) =
+                    io.block(|| reader.parse_next_transaction()).unwrap()
+                else {
+                    panic!("expected B-tree frame")
+                };
+                assert!(
+                    matches!(&frame.ops[0], ParsedOp::BtreeChanges { commit_ts, changes } if *commit_ts == timestamp && changes.len() == usize::from(timestamp == 20))
+                );
+            }
+            assert!(matches!(
+                io.block(|| reader.parse_next_transaction()).unwrap(),
+                ParseResult::Eof
+            ));
+        }
+    }
+
     fn write_single_table_tx(
         io: &Arc<dyn crate::IO>,
         file_name: &str,

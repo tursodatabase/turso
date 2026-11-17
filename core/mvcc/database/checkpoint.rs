@@ -1,18 +1,16 @@
 use crate::alloc::{
-    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
-    ALLOC_ERR_MSG,
+    ConcurrentAllocator, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec, ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, IndexRowsEntry, MVTableId, MvStore, RowID, RowKey, RowVersion,
     RowVersions, SortableIndexKey, TxTimestampOrID, WalPos, WriteRowStateMachine,
-    MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::{mangle_name, NamespaceId};
-use crate::schema::Schema;
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::comparator::{BasicComparator, Comparator};
 use crate::skiplist::{SkipMap, SkiplistAllocator};
@@ -24,11 +22,11 @@ use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
-use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::types::{IOResultOr, IndexInfo};
 use crate::{
-    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
-    SyncMode, TransactionState, Value, ValueRef,
+    CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Pager, Result, SyncMode,
+    TransactionState, Value,
 };
 use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -302,10 +300,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     /// Cursors for the B-trees
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
-    /// Tables or indexes that were created in this checkpoint
-    /// key is the rowid in the sqlite_schema table
+    /// Storage changes visible at the checkpoint snapshot.
     btree_work: std::vec::Vec<BtreeWork>,
-    created_btrees: HashMap<i64, (MVTableId, RowVersion)>,
+    catalog: crate::schema::mvcc::CatalogCheckpoint,
     /// Tables that were destroyed in this checkpoint
     destroyed_tables: HashSet<MVTableId>,
     /// Indexes that were destroyed in this checkpoint
@@ -365,7 +362,6 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Positive roots materialized this pass whose schema version was already ended
     /// (e.g. DROP after our snapshot). Tracked in `dropped_root_pages` until a later
     /// checkpoint frees the btree.
-    ended_created_roots: HashSet<i64>,
     /// Positive roots whose btrees were destroyed in this checkpoint's pager write.
     /// Only these may be removed from `dropped_root_pages` at publish.
     freed_root_pages: HashSet<i64>,
@@ -495,70 +491,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
 enum BtreeWork {
     Create(MVTableId, crate::storage::btree_descriptor::BtreeDescriptor),
     Drop(MVTableId, u64, u64),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SqliteSchemaBtreeKind {
-    Table,
-    Index,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SqliteSchemaBtreeIdentity {
-    kind: SqliteSchemaBtreeKind,
-    pub root_page: i64,
-}
-
-/// Identity of a sqlite_schema row version that refers to a B-tree-backed object.
-/// Schema rewrites that preserve this identity are metadata-only and should not be
-/// treated as create/drop lifecycle changes.
-#[aristo::intent(
-    "Recovery never replays a sqlite_schema delete as an empty payload; it keeps the row's pre-delete record, so every recovered schema row still has a decodable (type, rootpage)",
-    id = "mvcc_recovered_schema_record_wellformed",
-    verify = "full"
-)]
-pub fn sqlite_schema_btree_identity(
-    table_id: MVTableId,
-    version: &RowVersion,
-) -> Option<SqliteSchemaBtreeIdentity> {
-    if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-        return None;
-    }
-
-    // Recovery can synthesize payload-less sqlite_schema tombstones when the
-    // pre-delete record is no longer available. Those versions do not carry
-    // enough information to recover B-tree identity.
-    let payload = version
-        .data
-        .as_deref()
-        .expect("sqlite_schema rows are table rows");
-    if payload.is_empty() {
-        return None;
-    }
-
-    let row_data = ImmutableRecordRef::from_bin_record(payload);
-    let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
-        return None;
-    };
-
-    let kind = match col0 {
-        ValueRef::Text(type_str) => match type_str.as_str() {
-            "table" => SqliteSchemaBtreeKind::Table,
-            "index" => SqliteSchemaBtreeKind::Index,
-            _ => return None,
-        },
-        _ => panic!("sqlite_schema.type column must be TEXT, got {col0:?}"),
-    };
-
-    let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 else {
-        panic!("sqlite_schema.rootpage column must be INTEGER, got {col3:?}");
-    };
-
-    if root_page == 0 {
-        return None;
-    }
-
-    Some(SqliteSchemaBtreeIdentity { kind, root_page })
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
@@ -867,7 +799,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             delete_row_state_machine: None,
             cursors: HashMap::default(),
             btree_work: std::vec::Vec::new(),
-            created_btrees: HashMap::default(),
+            catalog: crate::schema::mvcc::CatalogCheckpoint::default(),
             destroyed_tables: HashSet::default(),
             destroyed_indexes: HashSet::default(),
             index_write_set: crate::alloc::vec![],
@@ -900,7 +832,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             snapshot_ts: u64::MAX,
             owns_checkpoint_in_progress: false,
             staged_roots: crate::alloc::vec![],
-            ended_created_roots: HashSet::default(),
             freed_root_pages: HashSet::default(),
             written_table_rowids: HashSet::default(),
             written_index_slots: HashSet::default(),
@@ -1566,12 +1497,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     /// Mutably get the current row version to write to the B-tree
-    fn get_current_row_version_mut(
-        &mut self,
-        write_set_index: usize,
-    ) -> Option<&mut (RowID, RowVersion)> {
-        self.write_set.get_mut(write_set_index)
-    }
 
     /// Check if we have more rows to write
     fn has_more_rows(&self, write_set_index: usize) -> bool {
@@ -1674,168 +1599,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         wal.publish_backfill(max_frame);
     }
 
-    fn has_unpublished_schema_changes(&self) -> bool {
-        let schema = self.database.schema.lock();
-        if !schema.dropped_root_pages.is_empty() {
-            return true;
-        }
-        // A negative root page is "unpublished" only if THIS checkpoint materialized the
-        // object (has a real root page in `table_id_to_rootpage` not yet written back to
-        // the schema). Objects created after our snapshot are deferred to a later
-        // checkpoint and have no mapping yet, so their placeholders aren't our work —
-        // counting them was the false-positive that panicked the TruncateWal assert.
-        let owned_negative = |root_page: i64| -> bool {
-            root_page < 0
-                && self
-                    .mvstore
-                    .table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .and_then(|entry| entry.value().root_page)
-                    .is_some()
-        };
-        schema.all_tables().any(|table| {
-            table
-                .btree()
-                .is_some_and(|btree| owned_negative(btree.root_page))
-        }) || schema
-            .all_indexes()
-            .any(|index| owned_negative(index.root_page))
-    }
-
-    fn has_pending_root_publication(&self) -> bool {
-        !self.created_btrees.is_empty() || self.has_unpublished_schema_changes()
-    }
-
-    fn publish_checkpointed_schema_roots(&mut self) -> Result<(), TryReserveError> {
-        if !self.has_pending_root_publication() {
-            return Ok(());
-        }
-
-        // Patch sqlite_schema rows in the MV store to use positive rootpages for the btrees
-        // flushed to the physical database.
-        for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
-            let key = RowID {
-                table_id: SQLITE_SCHEMA_MVCC_TABLE_ID,
-                row_id: RowKey::Int(sqlite_schema_rowid),
-            };
-            let sqlite_schema_row = self
-                .mvstore
-                .rows
-                .get(&key)
-                .expect("sqlite_schema row not found");
-            let mut row_versions = sqlite_schema_row.value().write();
-            // Patch payload in place (same version id), don't append: a duplicate
-            // (id, begin, end) would leave a phantom current version after a later
-            // DELETE (which ends only the first match), causing spurious write-write
-            // conflicts at commit time.
-            //
-            // Only replace the row payload (positive rootpage). Preserve begin/end so a
-            // DROP that committed after our snapshot keeps its end stamp — wholesale
-            // replace of the collected clone would resurrect the table (#7956).
-            let vid = row_version.id;
-            if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                existing.data = row_version.data;
-                if existing.end().is_some() {
-                    if let Some(identity) =
-                        sqlite_schema_btree_identity(SQLITE_SCHEMA_MVCC_TABLE_ID, existing)
-                    {
-                        if identity.root_page > 0 {
-                            self.ended_created_roots.insert(identity.root_page);
-                        }
-                    }
-                }
-            } else {
-                self.mvstore
-                    .insert_version_raw(&mut row_versions, row_version)?;
-            }
-        }
-
-        if !self.has_unpublished_schema_changes()
-            && self.ended_created_roots.is_empty()
-            && self.freed_root_pages.is_empty()
-        {
-            return Ok(());
-        }
-
-        // Patch the live db.schema (not local_schema, the checkpoint's private snapshot) so
-        // clone_schema() propagates real root pages; negative placeholders would orphan the
-        // new btree pages.
-        let mut schema_ref = self.database.schema.lock();
-        let schema = Schema::try_make_mut(&mut schema_ref)?;
-        #[cfg(feature = "conn_raw_api")]
-        let mut moved_root_pages = Vec::new();
-        for (_, name, table) in schema.all_tables_mut() {
-            #[cfg(not(feature = "conn_raw_api"))]
-            let _ = name;
-            let table = Arc::get_mut(table).expect("this should be the only reference");
-            let Some(btree_table) = table.btree_mut() else {
-                continue;
-            };
-            let btree_table = Arc::make_mut(btree_table);
-            if btree_table.root_page < 0 {
-                #[cfg(feature = "conn_raw_api")]
-                let old_root_page = btree_table.root_page;
-                let table_id = MVTableId::from(btree_table.root_page);
-                // Only tables this pass materialized; ones created after our snapshot stay
-                // negative for a later pass.
-                if let Some(root_page) = self
-                    .mvstore
-                    .table_id_to_rootpage
-                    .get(&table_id)
-                    .and_then(|entry| entry.value().root_page)
-                {
-                    btree_table.root_page = root_page as i64;
-                    #[cfg(feature = "conn_raw_api")]
-                    moved_root_pages.push((old_root_page, btree_table.root_page, name.to_string()));
-                }
-            }
-        }
-        #[cfg(feature = "conn_raw_api")]
-        for (old_root_page, new_root_page, name) in moved_root_pages {
-            schema.table_names_by_root_page.remove(&old_root_page);
-            schema.table_names_by_root_page.insert(new_root_page, name);
-        }
-        for index in schema.all_indexes_mut() {
-            if index.root_page < 0 {
-                let table_id = MVTableId::from(index.root_page);
-                // Same as tables: skip indexes not materialized by this pass.
-                if let Some(root_page) = self
-                    .mvstore
-                    .table_id_to_rootpage
-                    .get(&table_id)
-                    .and_then(|entry| entry.value().root_page)
-                {
-                    let index = Arc::make_mut(index);
-                    index.root_page = root_page as i64;
-                }
-            }
-        }
-
-        // Only forget roots whose btrees this checkpoint actually freed. A concurrent
-        // DROP after our snapshot may have added roots we did not destroy (#7957).
-        for root in std::mem::take(&mut self.freed_root_pages) {
-            schema.dropped_root_pages.remove(&root);
-        }
-        // Roots we materialized whose schema versions were already ended are still
-        // allocated and must stay accounted for until a later destroy (#7956).
-        schema
-            .dropped_root_pages
-            .extend(std::mem::take(&mut self.ended_created_roots));
-        drop(schema_ref);
-        let schema = self.database.clone_schema();
-        if self.database_id == crate::MAIN_DB_ID {
-            *self.connection.schema.write() = schema;
-        } else {
-            self.connection
-                .database_schemas()
-                .write()
-                .insert(self.database_id, schema);
-        }
-        self.connection.bump_prepare_context_generation();
-        self.mvstore.bump_schema_generation();
-        Ok(())
-    }
-
     /// Apply deferred root-map mutations, advance `durable_txid_max`, and publish the staged
     /// page-1 header + schema roots. Caller must either hold `blocking_checkpoint_lock` write
     /// (truncate / explicit passive) or run inside `MvStore::finish_passive_publish_window`.
@@ -1886,7 +1649,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         })?;
         self.mvstore.global_header.write().replace(header);
         crate::without_allocation_faults!(self
-            .publish_checkpointed_schema_roots()
+            .catalog
+            .publish(
+                &self.mvstore,
+                &self.database,
+                &self.connection,
+                self.database_id,
+                &mut self.freed_root_pages
+            )
             .expect(crate::alloc::ALLOC_ERR_MSG));
         Ok(())
     }
@@ -2402,39 +2172,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
 
-                let catalog_root = {
-                    let (id, version) = self.get_current_row_version(write_set_index).unwrap();
-                    if version.end().is_none() {
-                        sqlite_schema_btree_identity(id.table_id, version)
-                            .filter(|identity| identity.root_page < 0)
-                            .map(|identity| {
-                                (
-                                    id.row_id.to_int_or_panic(),
-                                    MVTableId::new(identity.root_page),
-                                )
-                            })
-                    } else {
-                        None
-                    }
-                };
-                if let Some((schema_rowid, id)) = catalog_root {
-                    let root = self
-                        .resolve_checkpoint_root(id)
-                        .expect("catalog B-tree must have an allocated root");
-                    let alloc = self.mvstore.allocator();
-                    let (row_id, version) =
-                        self.get_current_row_version_mut(write_set_index).unwrap();
-                    let record = ImmutableRecordRef::from_bin_record(version.payload(row_id));
-                    let mut values = record.get_values_owned()?;
-                    values[3] = Value::from_i64(root as i64);
-                    let record = ImmutableRecord::from_values(&values, values.len())?;
-                    version.data = Some(crate::alloc::try_arc_slice_from_slice_in(
-                        record.get_payload(),
-                        alloc,
-                    )?);
-                    let version = version.clone();
-                    self.created_btrees.insert(schema_rowid, (id, version));
-                }
+                let (row_id, version) = &mut self.write_set[write_set_index];
+                self.catalog
+                    .rewrite(row_id, version, &self.mvstore, &self.pending_alloc_roots)?;
 
                 // Get or create cursor for this table
                 let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
@@ -2944,7 +2684,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // a root positive but couldn't patch the (not-yet-adopted) live schema — benign,
                 // since cursors resolve negative->positive via table_id_to_rootpage.
                 turso_assert!(
-                    self.created_btrees.is_empty() && self.staged_roots.is_empty(),
+                    self.catalog.is_empty() && self.staged_roots.is_empty(),
                     "checkpoint finalized with un-published staged schema roots"
                 );
                 self.mvstore
@@ -3247,8 +2987,10 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
+    use crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID;
     use crate::mvcc::database::{Row, SortableIndexKey};
     use crate::translate::collate::CollationSeq;
+    use crate::types::ImmutableRecordRef;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
 

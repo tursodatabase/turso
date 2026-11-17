@@ -5562,3 +5562,87 @@ fn checkpoint_btree_lifecycle_without_catalog_rows() {
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     assert!(db.mvcc_store.current_root_page(&id).is_none());
 }
+
+#[test]
+fn recover_table_and_index_without_catalog_rows() {
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    use crate::translate::collate::CollationSeq;
+    use crate::types::KeyInfo;
+    use turso_parser::ast::{NullsOrder, SortOrder};
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let info = Arc::new(
+        IndexInfo::new(
+            [
+                KeyInfo {
+                    sort_order: SortOrder::Desc,
+                    collation: CollationSeq::NOCASE,
+                    nulls_order: Some(NullsOrder::Last),
+                },
+                KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::BINARY,
+                    nulls_order: None,
+                },
+            ],
+            true,
+            2,
+            false,
+        )
+        .unwrap(),
+    );
+    let (table, index, key) = {
+        let conn = db.connect();
+        let store = db.get_mvcc_store();
+        store.set_checkpoint_threshold(-1);
+        let table = MVTableId::new(store.get_next_table_id());
+        let index = MVTableId::new(store.get_next_table_id());
+        let tx = store.begin_tx(conn.get_pager()).unwrap();
+        for (id, descriptor) in [
+            (table, BtreeDescriptor::Table),
+            (index, BtreeDescriptor::Index(info.clone())),
+        ] {
+            store.insert_table_id_to_rootpage(id, None);
+            store.record_created_btree(tx, id.into(), descriptor);
+        }
+        commit_tx(store.clone(), &conn, tx).unwrap();
+        let tx = store.begin_tx(conn.get_pager()).unwrap();
+        store
+            .insert(tx, generate_simple_string_row(table, 1, "Hello"))
+            .unwrap();
+        let record =
+            ImmutableRecord::from_values(&[Value::build_text("Hello"), Value::from_i64(1)], 2)
+                .unwrap();
+        let key = Arc::new(
+            SortableIndexKey::new_from_payload_in(&record, info.clone(), TursoAllocator).unwrap(),
+        );
+        store
+            .insert_to_table_or_index(
+                tx,
+                Row::new_index_row(RowID::new(index, RowKey::Record(key.clone()))),
+                Some(index),
+            )
+            .unwrap();
+        commit_tx(store, &conn, tx).unwrap();
+        (table, index, key)
+    };
+    db.restart();
+    let conn = db.connect();
+    let store = db.get_mvcc_store();
+    assert_eq!(
+        store.btree_objects.read().get(&index).unwrap().descriptor,
+        BtreeDescriptor::Index(info)
+    );
+    let tx = store.begin_tx(conn.get_pager()).unwrap();
+    assert!(store
+        .read(tx, &RowID::new(table, RowKey::Int(1)))
+        .unwrap()
+        .is_some());
+    assert!(store
+        .read_from_table_or_index(tx, &RowID::new(index, RowKey::Record(key)), Some(index))
+        .unwrap()
+        .is_some());
+    commit_tx(store.clone(), &conn, tx).unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(store.current_root_page(&table).is_some());
+    assert!(store.current_root_page(&index).is_some());
+}

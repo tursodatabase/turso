@@ -1,4 +1,5 @@
 mod btree;
+pub(crate) mod mvcc;
 
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
