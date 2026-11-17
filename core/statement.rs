@@ -14,9 +14,14 @@ use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
-    schema::Trigger,
+    schema::{Table, Trigger},
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
-    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    translate::{
+        self,
+        display::PlanContext,
+        emitter::TransactionMode,
+        plan::{BitSet, Plan, TableReferences},
+    },
     turso_assert, turso_soft_unreachable,
     vdbe::{
         self,
@@ -190,6 +195,20 @@ pub enum ColumnTypeKind {
     /// Values are stored as BLOBs containing a tag and a payload; the
     /// declared name carries the variant schema.
     Union,
+}
+
+/// The table column that a result column reads.
+///
+/// Returned by [`Statement::get_column_origin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnOrigin {
+    /// `main`, `temp`, or the name an attached database was given.
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    /// The declared type with its parameters, e.g. `VARCHAR(40)`. `None` for
+    /// a column declared without a type.
+    pub declared_type: Option<String>,
 }
 
 pub struct Statement {
@@ -1277,6 +1296,73 @@ impl Statement {
             }
             _ => None,
         }
+    }
+
+    /// Returns the table column that a result column reads.
+    ///
+    /// This behaves like SQLite's `sqlite3_column_database_name()`,
+    /// `sqlite3_column_table_name()`, `sqlite3_column_origin_name()` and
+    /// `sqlite3_column_decltype()` together: a column of a FROM-clause
+    /// subquery, view or CTE is followed to the table column it reads, and an
+    /// expression has no origin. A compound subquery is followed through its
+    /// last SELECT, as in SQLite.
+    ///
+    /// See: <https://sqlite.org/c3ref/column_database_name.html>
+    pub fn get_column_origin(&self, idx: usize) -> Option<ColumnOrigin> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = self.program.result_columns.get(idx).expect("No column");
+        self.column_origin(&column.expr, &self.program.table_references)
+    }
+
+    fn column_origin(
+        &self,
+        expr: &turso_parser::ast::Expr,
+        tables: &TableReferences,
+    ) -> Option<ColumnOrigin> {
+        let (table_id, column_idx) = match expr {
+            turso_parser::ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
+            turso_parser::ast::Expr::RowId { table, .. } => (*table, None),
+            _ => return None,
+        };
+        let (namespace, table) = tables
+            .find_joined_table_by_internal_id(table_id)
+            .map(|joined| (joined.namespace, &joined.table))
+            .or_else(|| {
+                tables
+                    .find_outer_query_ref_by_internal_id(table_id)
+                    .map(|outer| (outer.namespace, &outer.table))
+            })?;
+        let table_column = match (table, column_idx) {
+            (Table::FromClauseSubquery(subquery), Some(column_idx)) => {
+                let select = match subquery.plan.as_ref() {
+                    Plan::Select(select) => select,
+                    Plan::CompoundSelect { right_most, .. } => right_most,
+                    _ => return None,
+                };
+                let result_column = select.result_columns.get(column_idx)?;
+                return self.column_origin(&result_column.expr, &select.table_references);
+            }
+            (Table::BTree(_) | Table::Virtual(_), Some(column_idx)) => {
+                Some(table.get_column_at(column_idx)?)
+            }
+            (Table::BTree(btree), None) => btree.get_rowid_alias_column().map(|(_, c)| c),
+            _ => return None,
+        };
+        let (column, declared_type) = match table_column {
+            Some(table_column) => (
+                table_column.name.clone()?,
+                Some(table_column.declared_type()).filter(|ty| !ty.is_empty()),
+            ),
+            None => ("rowid".to_string(), Some("INTEGER".to_string())),
+        };
+        Some(ColumnOrigin {
+            database: self.connection.namespace_name(namespace.database_id)?,
+            table: table.get_name().to_string(),
+            column,
+            declared_type,
+        })
     }
 
     /// Returns rich type information for a result column.
