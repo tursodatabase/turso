@@ -14,7 +14,8 @@ use crate::{
         emitter::Resolver,
         expr::{
             expr_type::{
-                query_column_type, same_type_def, type_of, type_ordering, BuiltinType, ExprType,
+                primitive_value_type, query_column_type, same_type_def, type_of, type_ordering,
+                BuiltinType, ExprType,
             },
             is_untyped_operand, row_value_component_expr, row_value_len,
         },
@@ -785,8 +786,7 @@ fn compared_type(ty: &ExprType, schema: &Schema) -> Result<ExprType> {
         return Ok(ty.clone());
     };
     Ok(match schema.without_domains(type_def)? {
-        // A STRUCT or UNION has no DECODE, so it compares as itself too.
-        Some(base) if base.is_builtin || base.is_struct() || base.is_union() => ExprType::Custom {
+        Some(base) if base.compares_as_itself() => ExprType::Custom {
             type_def: base,
             params: Vec::new(),
         },
@@ -820,10 +820,8 @@ fn compares_with(custom: &TypeDef, other: &ExprType) -> bool {
             plain,
             BuiltinType::Integer | BuiltinType::Real | BuiltinType::Decimal | BuiltinType::Numeric
         );
-    let takes_plain_as_input = custom.encode().is_none()
-        && custom
-            .value_input_type()
-            .eq_ignore_ascii_case(plain.sqlite_name());
+    let takes_plain_as_input =
+        custom.encode().is_none() && primitive_value_type(custom.value_input_type()) == Some(plain);
     both_numbers || takes_plain_as_input
 }
 

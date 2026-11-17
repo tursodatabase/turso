@@ -581,6 +581,17 @@ impl TypeDef {
         matches!(self.kind, TypeDefKind::Union(_))
     }
 
+    /// Whether values of the type compare as values of the type itself. A
+    /// built-in type has its own rule for what it compares with, and a STRUCT
+    /// or UNION has no DECODE. A user type compares as the kind of value its
+    /// DECODE gives.
+    pub fn compares_as_itself(&self) -> bool {
+        match self.kind {
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => true,
+            TypeDefKind::Custom { .. } => self.is_builtin,
+        }
+    }
+
     /// Returns the StructDef if this is a STRUCT type.
     pub fn struct_def(&self) -> Option<&StructDef> {
         match &self.kind {
