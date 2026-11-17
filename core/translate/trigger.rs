@@ -1,16 +1,17 @@
 use crate::namespace::is_reserved_object_name;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::SQLITE_TABLEID;
-use crate::translate::sqlite_schema_rows::{emit_schema_entry, SchemaEntryType};
+use crate::translate::sqlite_schema_rows::{
+    emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
+};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
-use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
@@ -255,18 +256,7 @@ pub fn translate_create_trigger(
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
-    // Open cursor to sqlite_schema table (in the trigger's database)
-    let table = resolver
-        .with_schema(database_id, |s| {
-            s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        })
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     // Add the trigger entry to sqlite_schema
     emit_schema_entry(
@@ -581,17 +571,7 @@ pub fn translate_drop_trigger(
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
-    // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let table = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let search_loop_label = program.allocate_label();
     let skip_non_trigger_label = program.allocate_label();
