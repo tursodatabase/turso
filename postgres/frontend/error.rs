@@ -55,7 +55,7 @@ impl From<LimboError> for Error {
 /// An engine error with the message `message`, which reports SQLSTATE
 /// `sqlstate` to the client. Use it for errors that the PostgreSQL frontend
 /// raises itself, also in the PostgreSQL functions that the engine runs.
-pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
+pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
         code: sqlstate,
         message: message.into(),

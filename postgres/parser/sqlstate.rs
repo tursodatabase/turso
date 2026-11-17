@@ -1,6 +1,7 @@
 //! SQLSTATE codes of PostgreSQL errors, from Appendix A of the PostgreSQL
 //! documentation.
 
+pub const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 pub const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 pub const SQLSTATE_INVALID_GRANT_OPERATION: &str = "0LP01";
 pub const SQLSTATE_CARDINALITY_VIOLATION: &str = "21000";
