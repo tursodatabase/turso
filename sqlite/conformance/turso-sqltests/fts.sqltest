@@ -926,7 +926,7 @@ test match-operator-non-fts-table-select-error {
     SELECT * FROM t WHERE a MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -936,7 +936,7 @@ test match-operator-non-fts-table-delete-error {
     DELETE FROM t WHERE a MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -946,7 +946,7 @@ test match-operator-non-fts-table-update-error {
     UPDATE t SET b = 'updated' WHERE a MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -968,7 +968,7 @@ test not-match-operator-non-fts-table-error {
     SELECT * FROM t WHERE a NOT MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -983,7 +983,7 @@ test match-operator-multi-table-join-wrong-table-error {
     SELECT * FROM users, documents WHERE users.name MATCH 'alice';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -1086,4 +1086,37 @@ expect {
     4|1
     4|3
     5|1
+}
+
+@backend cli
+test fts-names-that-need-quoting {
+    CREATE TABLE "my docs" (id INTEGER PRIMARY KEY, "my col" TEXT, "order" TEXT);
+    CREATE INDEX docs_fts ON "my docs" USING fts ("my col", "order") WITH (weights = 'my col=2.0');
+    INSERT INTO "my docs" VALUES (1, 'hello world', 'x'), (2, 'x', 'hello');
+    SELECT id FROM "my docs" WHERE fts_match("my col", "order", 'hello') ORDER BY id;
+    SELECT id FROM "my docs" WHERE fts_match("my col", "order", 'hello') ORDER BY fts_score("my col", "order", 'hello') DESC;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+@backend cli
+test fts-column-name-starting-with-dash-error {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, "-x" TEXT);
+    CREATE INDEX t_fts ON t USING fts ("-x");
+}
+expect error {
+    FTS cannot index a column named "-x"
+}
+
+@backend cli
+test fts-column-named-like-internal-field-error {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, rowid TEXT);
+    CREATE INDEX t_fts ON t USING fts (rowid);
+}
+expect error {
+    FTS cannot index a column named "rowid"
 }

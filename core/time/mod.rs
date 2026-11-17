@@ -4,66 +4,73 @@ use chrono::prelude::*;
 use core::cmp::Ordering;
 use thiserror::Error;
 
+use std::ffi::CStr;
+
 use crate::ext::register_scalar_function;
-use turso_ext::{scalar, ExtensionApi, ResultCode, Value, ValueType};
+use crate::function::ReturnType;
+use turso_ext::{scalar, ExtensionApi, ResultCode, ScalarFunction, Value, ValueType};
 
 mod internal;
 
 use internal::*;
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
-    unsafe {
-        register_scalar_function(ext_api.ctx, c"time_now".as_ptr(), time_now);
-        register_scalar_function(ext_api.ctx, c"time_date".as_ptr(), time_date);
-        register_scalar_function(ext_api.ctx, c"make_date".as_ptr(), make_date);
-        register_scalar_function(ext_api.ctx, c"make_timestamp".as_ptr(), make_timestamp);
-        register_scalar_function(ext_api.ctx, c"time_get".as_ptr(), time_get);
-        register_scalar_function(ext_api.ctx, c"time_get_year".as_ptr(), time_get_year);
-        register_scalar_function(ext_api.ctx, c"time_get_month".as_ptr(), time_get_month);
-        register_scalar_function(ext_api.ctx, c"time_get_day".as_ptr(), time_get_day);
-        register_scalar_function(ext_api.ctx, c"time_get_hour".as_ptr(), time_get_hour);
-        register_scalar_function(ext_api.ctx, c"time_get_minute".as_ptr(), time_get_minute);
-        register_scalar_function(ext_api.ctx, c"time_get_second".as_ptr(), time_get_second);
-        register_scalar_function(ext_api.ctx, c"time_get_nano".as_ptr(), time_get_nano);
-        register_scalar_function(ext_api.ctx, c"time_get_weekday".as_ptr(), time_get_weekday);
-        register_scalar_function(ext_api.ctx, c"time_get_yearday".as_ptr(), time_get_yearday);
-        register_scalar_function(ext_api.ctx, c"time_get_isoyear".as_ptr(), time_get_isoyear);
-        register_scalar_function(ext_api.ctx, c"time_get_isoweek".as_ptr(), time_get_isoweek);
-        register_scalar_function(ext_api.ctx, c"time_unix".as_ptr(), time_unix);
-        register_scalar_function(ext_api.ctx, c"to_timestamp".as_ptr(), to_timestamp);
-        register_scalar_function(ext_api.ctx, c"time_milli".as_ptr(), time_milli);
-        register_scalar_function(ext_api.ctx, c"time_micro".as_ptr(), time_micro);
-        register_scalar_function(ext_api.ctx, c"time_nano".as_ptr(), time_nano);
-        register_scalar_function(ext_api.ctx, c"time_to_unix".as_ptr(), time_to_unix);
-        register_scalar_function(ext_api.ctx, c"time_to_milli".as_ptr(), time_to_milli);
-        register_scalar_function(ext_api.ctx, c"time_to_micro".as_ptr(), time_to_micro);
-        register_scalar_function(ext_api.ctx, c"time_to_nano".as_ptr(), time_to_nano);
-        register_scalar_function(ext_api.ctx, c"time_after".as_ptr(), time_after);
-        register_scalar_function(ext_api.ctx, c"time_before".as_ptr(), time_before);
-        register_scalar_function(ext_api.ctx, c"time_compare".as_ptr(), time_compare);
-        register_scalar_function(ext_api.ctx, c"time_equal".as_ptr(), time_equal);
-        register_scalar_function(ext_api.ctx, c"dur_ns".as_ptr(), dur_ns);
-        register_scalar_function(ext_api.ctx, c"dur_us".as_ptr(), dur_us);
-        register_scalar_function(ext_api.ctx, c"dur_ms".as_ptr(), dur_ms);
-        register_scalar_function(ext_api.ctx, c"dur_s".as_ptr(), dur_s);
-        register_scalar_function(ext_api.ctx, c"dur_m".as_ptr(), dur_m);
-        register_scalar_function(ext_api.ctx, c"dur_h".as_ptr(), dur_h);
-        register_scalar_function(ext_api.ctx, c"time_add".as_ptr(), time_add);
-        register_scalar_function(ext_api.ctx, c"time_add_date".as_ptr(), time_add_date);
-        register_scalar_function(ext_api.ctx, c"time_sub".as_ptr(), time_sub);
-        register_scalar_function(ext_api.ctx, c"time_since".as_ptr(), time_since);
-        register_scalar_function(ext_api.ctx, c"time_until".as_ptr(), time_until);
-        register_scalar_function(ext_api.ctx, c"time_trunc".as_ptr(), time_trunc);
-        register_scalar_function(ext_api.ctx, c"time_round".as_ptr(), time_round);
-        register_scalar_function(ext_api.ctx, c"time_fmt_iso".as_ptr(), time_fmt_iso);
-        register_scalar_function(
-            ext_api.ctx,
-            c"time_fmt_datetime".as_ptr(),
-            time_fmt_datetime,
-        );
-        register_scalar_function(ext_api.ctx, c"time_fmt_date".as_ptr(), time_fmt_date);
-        register_scalar_function(ext_api.ctx, c"time_fmt_time".as_ptr(), time_fmt_time);
-        register_scalar_function(ext_api.ctx, c"time_parse".as_ptr(), time_parse);
+    use ReturnType::{Blob, Integer, Text};
+    // time_get gives a REAL for the second and epoch fields and an INTEGER
+    // for the others, so its type is not known before it runs.
+    let functions: [(&CStr, ScalarFunction, Option<ReturnType>); 47] = [
+        (c"time_now", time_now, Some(Blob)),
+        (c"time_date", time_date, Some(Blob)),
+        (c"make_date", make_date, Some(Blob)),
+        (c"make_timestamp", make_timestamp, Some(Blob)),
+        (c"time_get", time_get, None),
+        (c"time_get_year", time_get_year, Some(Integer)),
+        (c"time_get_month", time_get_month, Some(Integer)),
+        (c"time_get_day", time_get_day, Some(Integer)),
+        (c"time_get_hour", time_get_hour, Some(Integer)),
+        (c"time_get_minute", time_get_minute, Some(Integer)),
+        (c"time_get_second", time_get_second, Some(Integer)),
+        (c"time_get_nano", time_get_nano, Some(Integer)),
+        (c"time_get_weekday", time_get_weekday, Some(Integer)),
+        (c"time_get_yearday", time_get_yearday, Some(Integer)),
+        (c"time_get_isoyear", time_get_isoyear, Some(Integer)),
+        (c"time_get_isoweek", time_get_isoweek, Some(Integer)),
+        (c"time_unix", time_unix, Some(Blob)),
+        (c"to_timestamp", to_timestamp, Some(Blob)),
+        (c"time_milli", time_milli, Some(Blob)),
+        (c"time_micro", time_micro, Some(Blob)),
+        (c"time_nano", time_nano, Some(Blob)),
+        (c"time_to_unix", time_to_unix, Some(Integer)),
+        (c"time_to_milli", time_to_milli, Some(Integer)),
+        (c"time_to_micro", time_to_micro, Some(Integer)),
+        (c"time_to_nano", time_to_nano, Some(Integer)),
+        (c"time_after", time_after, Some(Integer)),
+        (c"time_before", time_before, Some(Integer)),
+        (c"time_compare", time_compare, Some(Integer)),
+        (c"time_equal", time_equal, Some(Integer)),
+        (c"dur_ns", dur_ns, Some(Integer)),
+        (c"dur_us", dur_us, Some(Integer)),
+        (c"dur_ms", dur_ms, Some(Integer)),
+        (c"dur_s", dur_s, Some(Integer)),
+        (c"dur_m", dur_m, Some(Integer)),
+        (c"dur_h", dur_h, Some(Integer)),
+        (c"time_add", time_add, Some(Blob)),
+        (c"time_add_date", time_add_date, Some(Blob)),
+        (c"time_sub", time_sub, Some(Integer)),
+        (c"time_since", time_since, Some(Integer)),
+        (c"time_until", time_until, Some(Integer)),
+        (c"time_trunc", time_trunc, Some(Blob)),
+        (c"time_round", time_round, Some(Blob)),
+        (c"time_fmt_iso", time_fmt_iso, Some(Text)),
+        (c"time_fmt_datetime", time_fmt_datetime, Some(Text)),
+        (c"time_fmt_date", time_fmt_date, Some(Text)),
+        (c"time_fmt_time", time_fmt_time, Some(Text)),
+        (c"time_parse", time_parse, Some(Blob)),
+    ];
+    for (name, function, return_type) in functions {
+        unsafe {
+            register_scalar_function(ext_api.ctx, name.as_ptr(), function, return_type);
+        }
     }
 }
 
@@ -187,13 +194,23 @@ fn time_date_internal(args: &[Value]) -> Value {
     }
 
     if args.len() == 8 {
-        let offset_sec = ok_tri!(args[7].to_integer()) as i32;
-        seconds -= offset_sec as i64;
+        let offset_sec = ok_tri!(args[7].to_integer());
+        if i32::try_from(offset_sec).is_err() {
+            return Value::null();
+        }
+        seconds = match seconds.checked_sub(offset_sec) {
+            Some(s) => s,
+            None => return Value::null(),
+        };
     }
 
+    let (Ok(year), Ok(month)) = (i32::try_from(year), i32::try_from(month)) else {
+        return Value::null();
+    };
+
     let t = Time::time_date(
-        year as i32,
-        month as i32,
+        year,
+        month,
         day,
         hour,
         minutes,
@@ -708,7 +725,10 @@ fn time_add(args: &[Value]) -> Value {
 
     let d = Duration::from(d);
 
-    t.add_duration(d).into_blob()
+    match t.add_duration(d) {
+        Some(t) => t.into_blob(),
+        None => Value::null(),
+    }
 }
 
 #[scalar(name = "time_add_date")]
@@ -750,7 +770,11 @@ fn time_add_date(args: &[Value]) -> Value {
         days = ok_tri!(args[3].to_integer());
     }
 
-    let t: Time = tri!(t.time_add_date(years as i32, months as i32, days));
+    let (Ok(years), Ok(months)) = (i32::try_from(years), i32::try_from(months)) else {
+        return Value::error_with_message(TimeError::CreationError.to_string());
+    };
+
+    let t: Time = tri!(t.time_add_date(years, months, days));
 
     t.into_blob()
 }
@@ -1021,4 +1045,33 @@ fn time_parse(args: &[Value]) -> Value {
         .unwrap();
 
     Time::from_datetime(dt.and_utc()).into_blob()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ints(v: &[i64]) -> Vec<Value> {
+        v.iter().map(|&i| Value::from_integer(i)).collect()
+    }
+
+    #[test]
+    fn time_date_overflowing_args_return_null() {
+        // seconds - offset_sec overflows i64
+        let v = time_date_internal(&ints(&[2000, 1, 1, 0, 0, i64::MIN, 0, 1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        let v = time_date_internal(&ints(&[2024, 1, 1, 0, 0, i64::MAX, 0, -1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        // year / month that don't fit in i32 must not be truncated
+        let v = time_date_internal(&ints(&[4294969297, 1, 1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        let v = time_date_internal(&ints(&[2024, 4294967297, 1]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        // offset that doesn't fit in i32
+        let v = time_date_internal(&ints(&[2024, 1, 1, 0, 0, 0, 0, 4294967296]));
+        assert_eq!(v.value_type(), ValueType::Null);
+        // sanity: normal call still returns a blob
+        let v = time_date_internal(&ints(&[2024, 1, 1, 0, 0, 0, 0, 3600]));
+        assert_eq!(v.value_type(), ValueType::Blob);
+    }
 }

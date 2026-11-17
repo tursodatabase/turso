@@ -58,6 +58,8 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         | LimboError::InvalidArgument(..)
         | LimboError::ParseError(..)
         | LimboError::TxError(..)
+        | LimboError::TransactionAlreadyActive
+        | LimboError::NoActiveTransaction { .. }
         | LimboError::OutOfMemory => recoverable_error_action(in_tx),
         LimboError::SequenceExhausted { .. } => recoverable_error_action(in_tx),
         LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => ErrorAction::Respawn,

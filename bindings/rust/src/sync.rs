@@ -15,7 +15,7 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use turso_sdk_kit::IoBackend;
 
 use crate::{connection::Connection, Error, Result};
@@ -27,8 +27,8 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
-const CHECKPOINT_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
-const CHECKPOINT_BUSY_MAX_ATTEMPTS: usize = 100;
+const SYNC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const SYNC_BUSY_MAX_ATTEMPTS: usize = 100;
 
 /// Future returned by an auth token provider. Resolves to a bearer token string
 /// (without the `Bearer ` prefix — that prefix is added when building the header).
@@ -112,6 +112,10 @@ pub struct Builder {
     // from the first pull-updates response; Some(true) forces MVCC logical-log
     // pulls; Some(false) forces page-stream pulls.
     logical_mvcc_pull: Option<bool>,
+    // Bootstrap chunk size in bytes; None bootstraps in one request.
+    pull_bytes_threshold: Option<usize>,
+    // Maximum number of bootstrap chunk requests in flight; None means 1.
+    pull_parallel_requests: Option<usize>,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -123,7 +127,7 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
-    enable_generated_columns: bool,
+    enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
 }
@@ -142,12 +146,14 @@ impl Builder {
             remote_encryption_key: None,
             remote_encryption_cipher: None,
             logical_mvcc_pull: None,
+            pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
-            enable_generated_columns: false,
+            enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
         }
@@ -192,11 +198,15 @@ impl Builder {
         self
     }
 
-    /// Enable the experimental `generated_columns` engine feature for the
-    /// synced database. Mirrors the local
-    /// [`crate::Builder::experimental_generated_columns`].
-    pub fn experimental_generated_columns(mut self, enable: bool) -> Self {
-        self.enable_generated_columns = enable;
+    /// Enable the experimental `autovacuum` engine feature for the synced database.
+    /// Mirrors the local [`crate::Builder::experimental_autovacuum`].
+    pub fn experimental_autovacuum(mut self, enable: bool) -> Self {
+        self.enable_autovacuum = enable;
+        self
+    }
+
+    /// Kept for backwards compatibility. Generated columns are now always enabled.
+    pub fn experimental_generated_columns(self, _enable: bool) -> Self {
         self
     }
 
@@ -306,6 +316,22 @@ impl Builder {
         self
     }
 
+    /// Split the initial bootstrap download into `/pull-updates` requests of
+    /// at least `bytes` each. By default the bootstrap is one request. Has no
+    /// effect with the query partial-sync bootstrap strategy.
+    pub fn with_pull_bytes_threshold(mut self, bytes: usize) -> Self {
+        self.pull_bytes_threshold = Some(bytes);
+        self
+    }
+
+    /// Maximum number of bootstrap chunk requests in flight at once when the
+    /// bootstrap is split with [`Builder::with_pull_bytes_threshold`].
+    /// Defaults to 1. With 0, [`Builder::build`] returns an error.
+    pub fn with_pull_parallel_requests(mut self, requests: usize) -> Self {
+        self.pull_parallel_requests = Some(requests);
+        self
+    }
+
     /// Compose the `experimental_features` comma-separated string consumed by
     /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
     /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
@@ -328,8 +354,8 @@ impl Builder {
         if self.enable_vacuum {
             features.push("vacuum");
         }
-        if self.enable_generated_columns {
-            features.push("generated_columns");
+        if self.enable_autovacuum {
+            features.push("autovacuum");
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
@@ -346,6 +372,12 @@ impl Builder {
 
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
+        if self.pull_parallel_requests == Some(0) {
+            return Err(Error::Misuse(
+                "pull_parallel_requests must be at least 1".to_string(),
+            ));
+        }
+
         // Compose the experimental_features string from the boolean flags
         // exposed on this Builder.
         let experimental_features = self.experimental_features_string();
@@ -391,7 +423,8 @@ impl Builder {
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
-            pull_bytes_threshold: None,
+            pull_bytes_threshold: self.pull_bytes_threshold,
+            pull_parallel_requests: self.pull_parallel_requests,
             logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
@@ -401,7 +434,7 @@ impl Builder {
                 .map_err(Error::from)?;
 
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
-        let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone());
+        let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone()).await?;
 
         // Create (bootstrap + open) database in one go.
         let op = sync.create();
@@ -410,20 +443,28 @@ impl Builder {
         Ok(Database {
             sync,
             io: io_worker,
+            operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }
 
-// Synced Database handle.
+/// Synced database handle.
+///
+/// Sync operations on one database run one at a time: a call made while
+/// another is in progress waits its turn. `pull` holds that turn for the
+/// whole wait, so with a long-poll timeout a queued operation can wait up
+/// to that timeout.
 #[derive(Clone)]
 pub struct Database {
     sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
     io: Arc<IoWorker>,
+    operation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Database {
     // Push local changes to the remote.
     pub async fn push(&self) -> Result<()> {
+        let _operation = self.operation_lock.lock().await;
         let op = self.sync.push_changes();
         drive_operation(op, self.io.clone()).await?;
         Ok(())
@@ -431,6 +472,47 @@ impl Database {
 
     // Pull remote changes; returns true if any changes were applied.
     pub async fn pull(&self) -> Result<bool> {
+        for attempt in 0..SYNC_BUSY_MAX_ATTEMPTS {
+            // Applying changes fails with Busy while a user connection is writing. The failed
+            // apply consumed the downloaded changes, so the retry downloads them again; the
+            // revision was not advanced, so the server answers at once.
+            let result = {
+                let _operation = self.operation_lock.lock().await;
+                self.pull_once().await
+            };
+            match result {
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < SYNC_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(SYNC_BUSY_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the last attempt returns its result")
+    }
+
+    // Force WAL checkpoint for the main database.
+    pub async fn checkpoint(&self) -> Result<()> {
+        for attempt in 0..SYNC_BUSY_MAX_ATTEMPTS {
+            let result = {
+                let _operation = self.operation_lock.lock().await;
+                drive_operation(self.sync.checkpoint(), self.io.clone()).await
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < SYNC_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(SYNC_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn pull_once(&self) -> Result<bool> {
         // First, wait for changes...
         let op = self.sync.wait_changes();
         let result = drive_operation_result(op, self.io.clone()).await?;
@@ -453,26 +535,9 @@ impl Database {
         Ok(has_changes)
     }
 
-    // Force WAL checkpoint for the main database.
-    pub async fn checkpoint(&self) -> Result<()> {
-        for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
-            let op = self.sync.checkpoint();
-            let result = drive_operation(op, self.io.clone()).await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if is_sync_busy_error(&error) && attempt + 1 < CHECKPOINT_BUSY_MAX_ATTEMPTS =>
-                {
-                    tokio::time::sleep(CHECKPOINT_BUSY_RETRY_DELAY).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-
     // Retrieve sync statistics for the database.
     pub async fn stats(&self) -> Result<DatabaseSyncStats> {
+        let _operation = self.operation_lock.lock().await;
         let op = self.sync.stats();
         let result = drive_operation_result(op, self.io.clone()).await?;
         match result {
@@ -487,6 +552,7 @@ impl Database {
 
     // Create a SQL connection to the synced database.
     pub async fn connect(&self) -> Result<Connection> {
+        let _operation = self.operation_lock.lock().await;
         let op = self.sync.connect();
         let result = drive_operation_result(op, self.io.clone()).await?;
         match result {
@@ -675,12 +741,13 @@ struct IoWorker {
 }
 
 impl IoWorker {
-    fn spawn(
+    async fn spawn(
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
         auth_token: Option<AuthTokenFn>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let wakers = Arc::new(Mutex::new(Vec::new()));
         let weak_sync = Arc::downgrade(&sync);
 
@@ -694,18 +761,47 @@ impl IoWorker {
         std::thread::Builder::new()
             .name("turso-sync-io".to_string())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("failed to build IO runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(Error::Error(format!(
+                            "failed to build IO runtime: {err}"
+                        ))));
+                        return;
+                    }
+                };
 
                 rt.block_on(async move {
-                    IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers).await
+                    let tls = match sync_tls_config() {
+                        Ok(tls) => tls,
+                        Err(err) => {
+                            let _ = ready_tx.send(Err(Error::Error(format!(
+                                "failed to load native root CA certificates: {err}"
+                            ))));
+                            return;
+                        }
+                    };
+                    let https = HttpsConnector::<HttpConnector>::builder()
+                        .with_tls_config(tls)
+                        .https_or_http()
+                        .enable_http1()
+                        .build();
+                    let client = Client::builder(TokioExecutor::new()).build(https);
+                    if ready_tx.send(Ok(())).is_ok() {
+                        IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers, client)
+                            .await;
+                    }
                 });
             })
-            .expect("failed to spawn IO worker thread");
+            .map_err(|err| Error::Error(format!("failed to spawn IO worker thread: {err}")))?;
 
-        worker
+        ready_rx
+            .await
+            .map_err(|err| Error::Error(format!("IO worker stopped during startup: {err}")))??;
+        Ok(worker)
     }
 
     // Register a waker to be awakened upon IO progress.
@@ -736,19 +832,9 @@ impl IoWorker {
         auth_token: Option<AuthTokenFn>,
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
+        client: Client<HttpsConnector<HttpConnector>, ChunkedBody>,
     ) {
-        // Create HTTPS-capable Hyper client.
-        let mut http_connector = HttpConnector::new();
-        http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::<HttpConnector>::builder()
-            .with_native_roots()
-            .expect("failed to load native root CA certificates")
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client: Client<HttpsConnector<HttpConnector>, ChunkedBody> =
-            Client::builder(TokioExecutor::new()).build::<_, ChunkedBody>(https);
-
+        let open_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while rx.recv().await.is_some() {
             let Some(sync) = sync.upgrade() else {
                 break;
@@ -759,7 +845,12 @@ impl IoWorker {
                 let item = sync.take_io_item();
                 let Some(item) = item else {
                     sync.step_io_callbacks();
-                    IoWorker::notify_progress(&wakers);
+                    // An open HTTP request wakes the waiting futures itself
+                    // when it has progress. Waking them here as well would
+                    // make them poll and kick this loop without pause.
+                    if open_requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        IoWorker::notify_progress(&wakers);
+                    }
                     break;
                 };
 
@@ -776,20 +867,33 @@ impl IoWorker {
                         body,
                         headers,
                     } => {
-                        IoWorker::process_http(
-                            &sync,
-                            base_url.as_deref(),
-                            auth_token.as_ref(),
-                            &wakers,
-                            &client,
-                            url.as_deref(),
-                            &method,
-                            &path,
-                            body.map(Bytes::from),
-                            &headers,
-                            completion,
-                        )
-                        .await;
+                        // Each request streams its body on its own task, so
+                        // requests the engine issues together run in parallel.
+                        let sync = sync.clone();
+                        let base_url = base_url.clone();
+                        let auth_token = auth_token.clone();
+                        let wakers = wakers.clone();
+                        let client = client.clone();
+                        let open_requests = open_requests.clone();
+                        open_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::spawn(async move {
+                            IoWorker::process_http(
+                                &sync,
+                                base_url.as_deref(),
+                                auth_token.as_ref(),
+                                &wakers,
+                                &client,
+                                url.as_deref(),
+                                &method,
+                                &path,
+                                body.map(Bytes::from),
+                                &headers,
+                                completion,
+                            )
+                            .await;
+                            open_requests.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            IoWorker::notify_progress(&wakers);
+                        });
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
                         IoWorker::process_full_read(&path, completion, &sync).await;
@@ -973,6 +1077,50 @@ impl IoWorker {
     }
 }
 
+fn sync_tls_config() -> std::io::Result<rustls::ClientConfig> {
+    use hyper_rustls::ConfigBuilderExt;
+
+    let native = rustls::ClientConfig::builder().with_native_roots();
+    #[cfg(target_os = "android")]
+    if native.is_err()
+        && std::env::var_os("SSL_CERT_FILE").is_none()
+        && std::env::var_os("SSL_CERT_DIR").is_none()
+    {
+        let apex = std::path::Path::new("/apex/com.android.conscrypt/cacerts");
+        let system = std::path::Path::new("/system/etc/security/cacerts");
+        let has_apex_certs = apex
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        return android_tls_config(if has_apex_certs { apex } else { system });
+    }
+
+    Ok(native?.with_no_client_auth())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_tls_config(cert_dir: &std::path::Path) -> std::io::Result<rustls::ClientConfig> {
+    let loaded = rustls_native_certs::load_certs_from_paths(None, Some(cert_dir));
+    if !loaded.errors.is_empty() {
+        tracing::warn!(errors = ?loaded.errors, "Android root CA certificate loading errors");
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(loaded.certs);
+    if roots.is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "no valid root CA certificates in {} (errors: {:?})",
+                cert_dir.display(),
+                loaded.errors
+            ),
+        ));
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context, Result};
@@ -993,6 +1141,193 @@ mod tests {
 
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
+
+    #[test]
+    fn missing_native_roots_returns_build_error() {
+        const CHILD: &str = "TURSO_TEST_MISSING_NATIVE_ROOTS";
+        if env::var_os(CHILD).is_none() {
+            let dir = TempDir::new().unwrap();
+            let cert_file = dir.path().join("empty.pem");
+            std::fs::write(&cert_file, "").unwrap();
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sync::tests::missing_native_roots_returns_build_error",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("SSL_CERT_FILE", cert_file)
+                .env("SSL_CERT_DIR", dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("local.db");
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::sync::Builder::new_remote(path.to_str().unwrap())
+                    .with_remote_url("https://localhost:1")
+                    .bootstrap_if_empty(false)
+                    .build(),
+            )
+            .await
+            .expect("build must return a certificate error instead of hanging");
+            let Err(err) = result else {
+                panic!("build must reject an empty root certificate store");
+            };
+            assert!(
+                err.to_string()
+                    .contains("failed to load native root CA certificates"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn native_tls_preserves_certificate_overrides() {
+        const CHILD: &str = "TURSO_TEST_CERTIFICATE_OVERRIDE";
+        if env::var_os(CHILD).is_none() {
+            for mode in ["file", "directory", "untrusted"] {
+                let dir = TempDir::new().unwrap();
+                let cert = if mode == "untrusted" {
+                    include_str!("../tests/fixtures/tls/untrusted-ca.pem")
+                } else {
+                    include_str!("../tests/fixtures/tls/ca.pem")
+                };
+                let cert_file = dir.path().join("ca.pem");
+                std::fs::write(&cert_file, cert).unwrap();
+                let mut child = Command::new(env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "sync::tests::native_tls_preserves_certificate_overrides",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .env_remove("SSL_CERT_FILE")
+                    .env_remove("SSL_CERT_DIR");
+                if mode == "directory" {
+                    child.env("SSL_CERT_DIR", dir.path());
+                } else {
+                    child.env("SSL_CERT_FILE", cert_file);
+                }
+                assert!(child.status().unwrap().success(), "override mode: {mode}");
+            }
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let tls = super::sync_tls_config().unwrap();
+            let result = test_https_request(tls.clone(), "localhost").await;
+            if env::var(CHILD).unwrap() == "untrusted" {
+                assert!(result.is_err(), "an untrusted server must be rejected");
+            } else {
+                assert_eq!(result.unwrap(), hyper::StatusCode::OK);
+                assert!(test_https_request(tls, "127.0.0.1").await.is_err());
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn android_tls_verifies_certificates() {
+        let dir = TempDir::new().unwrap();
+        let cert_file = dir.path().join("ca.pem");
+        assert!(super::android_tls_config(dir.path()).is_err());
+        std::fs::write(&cert_file, "not a certificate").unwrap();
+        assert!(super::android_tls_config(dir.path()).is_err());
+        std::fs::write(&cert_file, include_str!("../tests/fixtures/tls/ca.pem")).unwrap();
+        let tls = super::android_tls_config(dir.path()).unwrap();
+        assert_eq!(
+            test_https_request(tls.clone(), "localhost").await.unwrap(),
+            hyper::StatusCode::OK
+        );
+        assert!(test_https_request(tls, "127.0.0.1").await.is_err());
+        std::fs::write(
+            &cert_file,
+            include_str!("../tests/fixtures/tls/untrusted-ca.pem"),
+        )
+        .unwrap();
+        let tls = super::android_tls_config(dir.path()).unwrap();
+        assert!(test_https_request(tls, "localhost").await.is_err());
+    }
+
+    #[cfg(target_os = "android")]
+    #[tokio::test]
+    async fn sync_build_uses_android_system_roots() {
+        assert!(env::var_os("SSL_CERT_FILE").is_none());
+        assert!(env::var_os("SSL_CERT_DIR").is_none());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("local.db");
+        let db = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::sync::Builder::new_remote(path.to_str().unwrap())
+                .with_remote_url("https://localhost:1")
+                .bootstrap_if_empty(false)
+                .build(),
+        )
+        .await
+        .expect("Android sync build must not hang")
+        .expect("Android system certificates must load without environment overrides");
+        let conn = db.connect().await.unwrap();
+        conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+    }
+
+    async fn test_https_request(
+        tls: rustls::ClientConfig,
+        host: &str,
+    ) -> std::result::Result<hyper::StatusCode, hyper_util::client::legacy::Error> {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert =
+            CertificateDer::from_pem_slice(include_bytes!("../tests/fixtures/tls/localhost.pem"))
+                .unwrap();
+        let key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../tests/fixtures/tls/localhost.key"))
+                .unwrap();
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(https);
+        let request = hyper::Request::get(format!("https://{host}:{port}/"))
+            .body(super::ChunkedBody::new(bytes::Bytes::new()))
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+            .await
+            .expect("loopback HTTPS request must finish")
+            .map(|response| response.status());
+        server.abort();
+        result
+    }
 
     fn random_str() -> String {
         rand::rng()
@@ -1067,6 +1402,14 @@ mod tests {
             None
         );
 
+        // Generated columns are always enabled, so the method adds nothing.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_generated_columns(true)
+                .experimental_features_string(),
+            None
+        );
+
         // A single feature.
         assert_eq!(
             Builder::new_remote(":memory:")
@@ -1085,13 +1428,13 @@ mod tests {
                 .experimental_index_method(true)
                 .experimental_materialized_views(true)
                 .experimental_vacuum(true)
-                .experimental_generated_columns(true)
+                .experimental_autovacuum(true)
                 .experimental_multiprocess_wal(true)
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
             Some(
-                "attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid"
+                "attach,custom_types,index_method,views,vacuum,autovacuum,multiprocess_wal,without_rowid"
             )
         );
     }
@@ -1344,6 +1687,169 @@ mod tests {
         Ok(result)
     }
 
+    #[test]
+    pub fn test_sync_concurrent_operations_do_not_deadlock() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = TursoServer::new().await.unwrap();
+            server.db_sql("CREATE TABLE t(x)").await.unwrap();
+            server
+        });
+        let db_url = server.db_url().to_string();
+
+        run_with_deadline(2, Duration::from_secs(30), || async move {
+            let db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(db_url)
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+                .await
+                .unwrap();
+
+            let mut tasks = Vec::new();
+            for i in 0..16 {
+                let db = db.clone();
+                tasks.push(tokio::spawn(async move {
+                    match i % 4 {
+                        0 => db.push().await,
+                        1 => db.pull().await.map(|_| ()),
+                        2 => db.connect().await.map(|_| ()),
+                        _ => db.stats().await.map(|_| ()),
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+        });
+
+        let rows = server_runtime
+            .block_on(server.db_sql("SELECT count(*) FROM t"))
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::Text("3".to_string())]]);
+    }
+
+    #[test]
+    pub fn test_sync_every_operation_started_during_push_fails_fast() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = TursoServer::new().await.unwrap();
+            server.db_sql("CREATE TABLE t(x)").await.unwrap();
+            server
+        });
+        let db_url = server.db_url().to_string();
+
+        run_with_deadline(1, Duration::from_secs(30), || async move {
+            let db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(db_url)
+                .build()
+                .await
+                .unwrap();
+
+            let push = db.sync.push_changes();
+            assert!(matches!(
+                push.resume().unwrap(),
+                turso_sdk_kit::rsapi::TursoStatusCode::Io
+            ));
+
+            for (name, op) in [
+                ("checkpoint", db.sync.checkpoint()),
+                ("wait_changes", db.sync.wait_changes()),
+                ("push_changes", db.sync.push_changes()),
+                ("connect", db.sync.connect()),
+                ("stats", db.sync.stats()),
+            ] {
+                let error = op.resume().err().unwrap_or_else(|| {
+                    panic!("{name} started while a push was in progress");
+                });
+                assert!(
+                    error
+                        .to_string()
+                        .contains("another sync operation is in progress"),
+                    "{name} failed with an unexpected error: {error}"
+                );
+            }
+
+            super::drive_operation(push, db.io.clone()).await.unwrap();
+            super::drive_operation_result(db.sync.connect(), db.io.clone())
+                .await
+                .unwrap();
+            super::drive_operation_result(db.sync.stats(), db.io.clone())
+                .await
+                .unwrap();
+            db.push().await.unwrap();
+        });
+    }
+
+    #[test]
+    pub fn test_sync_dropping_a_started_operation_releases_the_gate() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = TursoServer::new().await.unwrap();
+            server.db_sql("CREATE TABLE t(x)").await.unwrap();
+            server
+        });
+        let db_url = server.db_url().to_string();
+
+        run_with_deadline(1, Duration::from_secs(30), || async move {
+            let db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(db_url)
+                .build()
+                .await
+                .unwrap();
+
+            for op in [
+                db.sync.push_changes(),
+                db.sync.wait_changes(),
+                db.sync.checkpoint(),
+            ] {
+                let _ = op.resume();
+                drop(op);
+                db.push().await.unwrap();
+            }
+        });
+    }
+
+    fn run_with_deadline<F, Fut>(worker_threads: usize, deadline: Duration, test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(test());
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(deadline) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("sync operations deadlocked: test did not finish within {deadline:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("test panicked on its runtime thread")
+            }
+        }
+    }
+
     #[tokio::test]
     pub async fn test_sync_bootstrap() {
         let _ = tracing_subscriber::fmt::try_init();
@@ -1370,6 +1876,64 @@ mod tests {
                 vec![Value::Text("sync".to_string())],
             ]
         );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_bootstrap_parallel_chunks() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server
+            .db_sql("CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT value, randomblob(1024) FROM generate_series(1, 200)")
+            .await
+            .unwrap();
+        // The token provider runs at the start of every HTTP request. It
+        // stays open for 20 ms and records how many calls were open together.
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .with_pull_bytes_threshold(8192)
+            .with_pull_parallel_requests(4)
+            .with_auth_token_fn({
+                let open = open.clone();
+                let max_open = max_open.clone();
+                move || {
+                    let open = open.clone();
+                    let max_open = max_open.clone();
+                    async move {
+                        let now = open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_open.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        open.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok("token".to_string())
+                    }
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(max_open.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let conn = db.connect().await.unwrap();
+        let rows = conn
+            .query("SELECT COUNT(*), SUM(x), SUM(length(y)) FROM t", ())
+            .await
+            .unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![vec![
+                Value::Integer(200),
+                Value::Integer(20100),
+                Value::Integer(200 * 1024)
+            ]]
+        );
+        let rows = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(all, vec![vec![Value::Text("ok".to_string())]]);
     }
 
     #[tokio::test]
@@ -1848,7 +2412,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "flaky, see https://github.com/tursodatabase/turso/issues/7087"]
     pub async fn test_sync_parallel_writes_with_sync_ops() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1946,12 +2509,24 @@ mod tests {
         // Sequential writes: 3 more large inserts
         for i in 0..after_cnt {
             let data = format!("sequential_{i}_{payload}");
-            conn.execute(
-                "INSERT INTO test_data (payload) VALUES (?)",
-                crate::params::Params::Positional(vec![Value::Text(data)]),
-            )
-            .await
-            .unwrap();
+            // A running pull or checkpoint makes inserts fail with Busy right away.
+            loop {
+                let result = conn
+                    .execute(
+                        "INSERT INTO test_data (payload) VALUES (?)",
+                        crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                    )
+                    .await;
+                match result {
+                    Err(crate::Error::Busy(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    result => {
+                        result.unwrap();
+                        break;
+                    }
+                }
+            }
         }
 
         // Signal sync task to stop and wait for it
@@ -2416,6 +2991,42 @@ mod tests {
         (url, captured, notify)
     }
 
+    #[tokio::test]
+    pub async fn test_sync_open_request_does_not_poll_in_a_loop() {
+        // The first request stays open for 500 ms in the token provider,
+        // then fails.
+        let build = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_auth_token_fn(|| async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Err(crate::Error::Error("no token".to_string()))
+            })
+            .build();
+        let mut build = std::pin::pin!(build);
+        let mut polls = 0;
+        let result = std::future::poll_fn(|cx| {
+            polls += 1;
+            std::future::Future::poll(build.as_mut(), cx)
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(polls < 100, "build was polled {polls} times");
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_zero_pull_parallel_requests_is_an_error() {
+        let result = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url("http://127.0.0.1:9")
+            .with_pull_parallel_requests(0)
+            .build()
+            .await;
+        let message = result.err().map(|e| e.to_string());
+        assert_eq!(
+            message.as_deref(),
+            Some("pull_parallel_requests must be at least 1")
+        );
+    }
+
     fn extract_bearer_token(headers: &[String]) -> Option<String> {
         let auth = headers
             .iter()
@@ -2555,5 +3166,360 @@ mod tests {
             tokens.len(),
             "tokens must be unique per request: {tokens:?}"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_connect_and_stats_never_run_inside_apply_or_checkpoint() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x BLOB)").await.unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let prober = tokio::spawn({
+            let db = db.clone();
+            let stop = stop.clone();
+            let errors = errors.clone();
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let connect =
+                        super::drive_operation_result(db.sync.connect(), db.io.clone()).await;
+                    record_error(&errors, "connect", connect);
+                    let stats = super::drive_operation_result(db.sync.stats(), db.io.clone()).await;
+                    record_error(&errors, "stats", stats);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+
+        let rounds = 4;
+        let rows_per_round = 1500;
+        for _ in 0..rounds {
+            server
+                .db_sql(&format!(
+                    "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {rows_per_round}) \
+                     INSERT INTO t SELECT randomblob(1000) FROM c"
+                ))
+                .await
+                .unwrap();
+            record_error(&errors, "pull", retry_while_refused(|| db.pull()).await);
+            record_error(
+                &errors,
+                "checkpoint",
+                retry_while_refused(|| db.checkpoint()).await,
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        prober.await.unwrap();
+
+        db.pull().await.unwrap();
+        let conn = db.connect().await.unwrap();
+        let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get_value(0).unwrap(),
+            Value::Integer(rounds * rows_per_round)
+        );
+
+        let errors = errors.lock().unwrap();
+        assert!(errors.is_empty(), "{}", summarize_errors(&errors));
+    }
+
+    fn record_error<T>(
+        errors: &std::sync::Mutex<Vec<String>>,
+        operation: &str,
+        result: crate::Result<T>,
+    ) {
+        if let Err(error) = result {
+            if !refused_because_another_operation_runs(&error) {
+                errors.lock().unwrap().push(format!("{operation}: {error}"));
+            }
+        }
+    }
+
+    async fn retry_while_refused<T, F, Fut>(mut operation: F) -> crate::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = crate::Result<T>>,
+    {
+        for _ in 0..10_000 {
+            match operation().await {
+                Err(error) if refused_because_another_operation_runs(&error) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                result => return result,
+            }
+        }
+        panic!("operation was refused for 10 seconds");
+    }
+
+    fn refused_because_another_operation_runs(error: &crate::Error) -> bool {
+        error
+            .to_string()
+            .contains("another sync operation is in progress")
+    }
+
+    fn summarize_errors(errors: &[String]) -> String {
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for error in errors {
+            *counts.entry(error).or_default() += 1;
+        }
+        counts
+            .iter()
+            .map(|(error, count)| format!("{count} x {error}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // A pull that starts while a user transaction is writing must wait for it, not fail
+    // with "database is busy".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    pub async fn test_sync_pull_waits_for_open_write_transaction() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+        let conn = db.connect().await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('local')", ())
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('remote')")
+            .await
+            .unwrap();
+
+        conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('in transaction')", ())
+            .await
+            .unwrap();
+        let pull = tokio::spawn({
+            let db = db.clone();
+            async move { db.pull().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        conn.execute("COMMIT", ()).await.unwrap();
+
+        assert!(pull.await.unwrap().unwrap());
+        let rows = all_rows(conn.query("SELECT x FROM t ORDER BY x", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("in transaction".into())],
+                vec![Value::Text("local".into())],
+                vec![Value::Text("remote".into())],
+            ]
+        );
+    }
+
+    // Each task does what a web request would: open a connection, write a row, push.
+    // Only user statements may see Busy; sync operations must wait their turn instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    pub async fn test_sync_connect_write_push_per_task() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(id INTEGER)").await.unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+
+        const TASKS: i64 = 30;
+        let mut tasks = Vec::new();
+        for i in 0..TASKS {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                let conn = db.connect().await.unwrap();
+                loop {
+                    match conn.execute("INSERT INTO t VALUES (?)", (i,)).await {
+                        Ok(_) => break,
+                        Err(e) if super::is_sync_busy_error(&e) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(e) => panic!("insert failed: {e}"),
+                    }
+                }
+                db.push().await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let rows = server.db_sql("SELECT count(*) FROM t").await.unwrap();
+        assert_eq!(rows, vec![vec![Value::Text(TASKS.to_string())]]);
+    }
+
+    // Sync calls are cancelled at random points (tokio::time::timeout), as a server would
+    // do with per-request deadlines, while local and remote writes happen concurrently.
+    // Afterwards every row must exist exactly once on both sides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_cancelled_operations_lose_no_rows() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = Arc::new(TursoServer::new().await.unwrap());
+        server
+            .db_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, origin TEXT)")
+            .await
+            .unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = |errors: &Arc<Mutex<Vec<String>>>, what: &str, r: crate::Result<()>| {
+            if let Err(e) = r {
+                errors.lock().unwrap().push(format!("{what}: {e}"));
+            }
+        };
+
+        const LOCAL_ROWS: i64 = 200;
+        const REMOTE_ROWS: i64 = 50;
+
+        let local_writer = tokio::spawn({
+            let db = db.clone();
+            let errors = errors.clone();
+            async move {
+                let conn = db.connect().await.unwrap();
+                for i in 0..LOCAL_ROWS {
+                    let started = Instant::now();
+                    loop {
+                        match conn
+                            .execute("INSERT INTO t VALUES (?, 'local')", (i,))
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(e)
+                                if super::is_sync_busy_error(&e)
+                                    && started.elapsed() < Duration::from_secs(5) =>
+                            {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            Err(e) => panic!("local insert failed: {e}"),
+                        }
+                    }
+                    if i % 3 == 0 {
+                        let ms = rand::rng().random_range(0..8);
+                        if let Ok(r) =
+                            tokio::time::timeout(Duration::from_millis(ms), db.push()).await
+                        {
+                            record(&errors, "push", r);
+                        }
+                    }
+                }
+            }
+        });
+
+        let remote_writer = tokio::spawn({
+            let server = server.clone();
+            async move {
+                for j in 0..REMOTE_ROWS {
+                    server
+                        .db_sql(&format!(
+                            "INSERT INTO t VALUES ({}, 'remote')",
+                            1_000_000 + j
+                        ))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+
+        let puller = tokio::spawn({
+            let db = db.clone();
+            let stop = stop.clone();
+            let errors = errors.clone();
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let ms = rand::rng().random_range(0..8);
+                    if let Ok(r) = tokio::time::timeout(Duration::from_millis(ms), db.pull()).await
+                    {
+                        record(&errors, "pull", r.map(|_| ()));
+                    }
+                    let ms = rand::rng().random_range(0..8);
+                    if let Ok(r) =
+                        tokio::time::timeout(Duration::from_millis(ms), db.checkpoint()).await
+                    {
+                        record(&errors, "checkpoint", r);
+                    }
+                }
+            }
+        });
+
+        local_writer.await.unwrap();
+        remote_writer.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        puller.await.unwrap();
+
+        db.push().await.unwrap();
+        db.pull().await.unwrap();
+
+        let conn = db.connect().await.unwrap();
+        let local = all_rows(
+            conn.query(
+                "SELECT origin, count(*) FROM t GROUP BY origin ORDER BY origin",
+                (),
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let integrity = all_rows(conn.query("PRAGMA integrity_check", ()).await.unwrap())
+            .await
+            .unwrap();
+        let remote = server
+            .db_sql("SELECT origin, count(*) FROM t GROUP BY origin ORDER BY origin")
+            .await
+            .unwrap();
+        let expected = vec![
+            vec![Value::Text("local".into()), Value::Integer(LOCAL_ROWS)],
+            vec![Value::Text("remote".into()), Value::Integer(REMOTE_ROWS)],
+        ];
+        let errors = errors.lock().unwrap();
+        eprintln!("non-timeout errors:\n{}", summarize_errors(&errors));
+        assert_eq!(integrity, vec![vec![Value::Text("ok".into())]]);
+        assert_eq!(local, expected, "local rows");
+        assert_eq!(
+            remote,
+            vec![
+                vec![
+                    Value::Text("local".into()),
+                    Value::Text(LOCAL_ROWS.to_string())
+                ],
+                vec![
+                    Value::Text("remote".into()),
+                    Value::Text(REMOTE_ROWS.to_string())
+                ],
+            ],
+            "remote rows"
+        );
+        assert!(errors.is_empty(), "{}", summarize_errors(&errors));
     }
 }

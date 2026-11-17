@@ -22,6 +22,8 @@ DROP SEQUENCE [IF EXISTS] [schema-name.]sequence-name;
 
 DROP SEQUENCE removes the named sequence from the database schema. The sequence must exist unless the `IF EXISTS` clause is specified.
 
+A sequence that is still used cannot be dropped. A sequence is used when a column default, a CHECK constraint, a view or a trigger calls `nextval()`, `currval()` or `setval()` on it. This includes tables in the temporary database and in attached databases. Drop or change those objects first, then drop the sequence.
+
 ### Clauses
 
 | Clause | Description |
@@ -70,11 +72,26 @@ SELECT nextval('counter');
 -- 1
 ```
 
+### Drop a Sequence That a Table Uses
+
+```sql
+CREATE SEQUENCE order_ids;
+CREATE TABLE orders (id INTEGER DEFAULT (nextval('order_ids')), item TEXT);
+
+DROP SEQUENCE order_ids;
+-- Error: cannot drop sequence order_ids because other objects depend on it:
+-- the default of column id in table orders depends on sequence order_ids
+
+DROP TABLE orders;
+DROP SEQUENCE order_ids;
+```
+
 ## Errors
 
 | Error | Cause |
 |-------|-------|
 | `sequence "name" does not exist` | No sequence with that name exists and `IF EXISTS` was not specified. |
+| `cannot drop sequence name because other objects depend on it` | A column default, CHECK constraint, view or trigger still calls the sequence. |
 
 ## See Also
 

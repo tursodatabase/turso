@@ -54,6 +54,8 @@ SELECT 1;    -- true
 SELECT 0;    -- false
 ```
 
+The PostgreSQL frontend supports `TRUE` and `FALSE` literals. Boolean literals and boolean-valued `CASE` expressions are sent to PostgreSQL clients as booleans (`t` or `f` in text format).
+
 ## Operators
 
 ### Arithmetic Operators
@@ -87,6 +89,8 @@ SELECT CAST(10 AS REAL) / 3;  -- 3.333...
 | `>=` | Greater than or equal | `x >= 5` |
 
 All comparison operators return `1` (true), `0` (false), or `NULL` (if either operand is NULL).
+
+Comparison operators, `IN` and `BETWEEN` also accept row values, which compare element by element: `(a, b) = (1, 2)`, `(a, b) < (1, 3)`, `(a, b) IN ((1, 2), (3, 4))`, `(a, b) BETWEEN (1, 1) AND (2, 0)`. The PostgreSQL frontend also accepts the `ROW(a, b)` spelling. As an expression, a `ROW` constructor needs at least two values. Anywhere a single value is expected, such as a result column, an inserted value, a function argument, a window key, or an element of another row value, a row value is an error (`row value misused`). The source of a multiple-column `SET`, as in `SET (a) = ROW(1)`, may have one value.
 
 ### Logical Operators
 
@@ -373,7 +377,7 @@ A subquery enclosed in parentheses that returns a single value can be used as an
 (select-statement)
 ```
 
-The subquery must return exactly one column and at most one row. If the subquery returns no rows, the expression evaluates to NULL.
+The subquery must return exactly one column. If the subquery returns no rows, the expression evaluates to NULL. If it returns more than one row, the expression uses the first row, as in SQLite. Through the PostgreSQL frontend, reading the value of a subquery that returns more than one row raises the error `more than one row returned by a subquery used as an expression` (SQLSTATE 21000), as PostgreSQL does. A subquery whose value is not read, such as one in a `CASE` branch that is not taken, raises no error. A view or a subquery in `FROM` computes each of its columns for each row, so a subquery in one of its columns raises the error even when the outer query does not read that column. PostgreSQL removes that column and raises no error.
 
 ```sql
 SELECT name,

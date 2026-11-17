@@ -63,7 +63,6 @@ impl Args {
                 .with_index_method(true)
                 .with_encryption(true)
                 .with_attach(true)
-                .with_generated_columns(true)
         };
 
         builder = quote! {

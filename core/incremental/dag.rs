@@ -526,7 +526,7 @@ mod tests {
                 input,
                 group_exprs: vec![count.clone()],
                 group_keys: vec![KeyColumn {
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                     ambiguous: false,
                 }],
                 aggregates: vec![aggregate(), aggregate()],

@@ -10,7 +10,7 @@ use std::fmt::Debug;
 #[cfg(test)]
 mod discard_pending_tests;
 pub mod logical_log;
-use crate::mvcc::database::{LogRecord, RowVersion};
+use crate::mvcc::database::{LogRecord, RowID, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
     LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
@@ -28,6 +28,7 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn serialize_row_version(
         &self,
         log_record: &mut LogRecord,
+        row_id: &RowID,
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> Result<()>;
@@ -167,11 +168,15 @@ impl DurableStorage for Storage {
     fn serialize_row_version(
         &self,
         log_record: &mut LogRecord,
+        row_id: &RowID,
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> Result<()> {
-        LogSerializer::new(&mut log_record.buf)
-            .serialize_op_entry(row_version, portable_extension)?;
+        LogSerializer::new(&mut log_record.buf).serialize_op_entry(
+            row_id,
+            row_version,
+            portable_extension,
+        )?;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;

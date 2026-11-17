@@ -77,6 +77,19 @@ DELETE FROM accounts WHERE balance < 0;
 ROLLBACK;
 ```
 
+## Errors Inside a Transaction
+
+When a statement inside an explicit transaction fails, only that statement is undone: the transaction stays open with all earlier changes intact, and you choose whether to COMMIT the rest or ROLLBACK everything. This matches SQLite.
+
+```sql
+BEGIN;
+INSERT INTO accounts (name, balance) VALUES ('Alice', 1000);
+INSERT INTO accounts (name, balance) VALUES ('Alice', 500); -- fails: duplicate name
+COMMIT; -- Alice with balance 1000 is committed
+```
+
+A few failures cannot be undone statement-by-statement (for example running out of space mid-write); those roll back the whole transaction, and a later COMMIT reports that no transaction is active.
+
 ## Implicit Transactions
 
 When no explicit transaction is active, Turso wraps each individual statement in an implicit transaction. This is called autocommit mode. Each statement is automatically committed after it executes successfully, or automatically rolled back if it fails.

@@ -75,12 +75,13 @@ expect pattern { ... }   # Regex pattern match
 expect unordered { ... } # Set comparison
 expect raw { ... }       # Raw output
 expect @rust { ... }     # Backend-specific expectation
+@sqlstate 42P01          # SQLSTATE that the next expect error block requires
 ```
 
 ## Features
 
 - Full SQL syntax highlighting inside `setup`, `test`, and `snapshot` blocks (via embedded SQL grammar)
-- Keyword highlighting for `@database`, `@setup`, `@skip`, `@skip-if`, `@backend`, `@requires`, `test`, `expect`, `snapshot`
+- Keyword highlighting for `@database`, `@setup`, `@skip`, `@skip-if`, `@backend`, `@requires`, `@sqlstate`, `test`, `expect`, `snapshot`
 - Constant highlighting for database types (`:memory:`, `:temp:`, etc.)
 - Constant highlighting for skip conditions (`mvcc`, `sqlite`) and capabilities (`trigger`, `strict`, `materialized_views`)
 - String highlighting for skip/requires reasons

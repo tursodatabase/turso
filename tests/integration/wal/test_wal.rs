@@ -2,7 +2,7 @@ use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase}
 use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{ConnectOpts, Connection, LimboError, Result};
+use turso_core::{ConnectOpts, Connection, LimboError, Result, SessionRole};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -39,6 +39,31 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     // A checkpoint must not change the database content.
     assert_that!(hash_after.hash).is_equal_to(hash_before.hash);
 
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_passive_checkpoint_between_read_and_write_does_not_fail_the_write(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    let writer = tmp_db.connect_limbo();
+    let checkpointer = tmp_db.connect_limbo();
+    writer.execute("CREATE TABLE t (x)")?;
+    writer.execute("INSERT INTO t VALUES (1)")?;
+
+    writer.execute("BEGIN")?;
+    assert_eq!(execute_and_get_ints(&writer, "SELECT x FROM t")?, vec![1]);
+    let res = execute_and_get_ints(&checkpointer, "PRAGMA wal_checkpoint(PASSIVE)")?;
+    assert_eq!(res[0], 0, "checkpoint must not be busy");
+    assert_eq!(res[1], res[2], "checkpoint must backfill every frame");
+    writer.execute("INSERT INTO t VALUES (2)")?;
+    writer.execute("COMMIT")?;
+
+    assert_eq!(
+        execute_and_get_ints(&checkpointer, "SELECT x FROM t ORDER BY x")?,
+        vec![1, 2]
+    );
     Ok(())
 }
 
@@ -194,7 +219,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     let db = tmp_db.lock().unwrap().limbo_database();
 
     {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         match conn.query("CREATE TABLE t (id)")? {
             Some(ref mut rows) => {
                 rows.run_with_row_callback(|_| Ok(())).unwrap();
@@ -208,7 +235,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     const ROWS_WRITE: usize = 1000;
     let tmp_db_w = db.clone();
     let writer_thread = std::thread::spawn(move || {
-        let conn = tmp_db_w.connect(ConnectOpts::new()).unwrap();
+        let conn = tmp_db_w
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         for i in 0..ROWS_WRITE {
             conn.execute(format!("INSERT INTO t values({i})").as_str())
                 .unwrap();
@@ -218,7 +247,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     });
     let rows_ = rows.clone();
     let reader_thread = std::thread::spawn(move || {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         loop {
             let rows = *rows_.lock().unwrap();
             let mut i = 0;
@@ -292,14 +323,20 @@ fn test_wal_read_lock_released_on_conn_drop() {
     let db = tmp_db.limbo_database();
 
     // Setup: create table and insert data so WAL has content
-    let setup_conn = db.connect(ConnectOpts::new()).unwrap();
+    let setup_conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     setup_conn
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
     setup_conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
-    let conn1 = db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     // conn1 starts a read transaction and panics while holding the read lock
     let join_result = std::thread::spawn(move || {
@@ -340,7 +377,9 @@ fn test_deferred_transaction_first_write_retries_stale_snapshot() {
     let writer_stop = stop.clone();
     let writer_db = db.clone();
     let writer = std::thread::spawn(move || {
-        let conn = writer_db.connect(ConnectOpts::new()).unwrap();
+        let conn = writer_db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         while !writer_stop.load(Ordering::Relaxed) {
             match conn.execute("INSERT INTO t(source) VALUES ('writer')") {
                 Ok(()) | Err(LimboError::Busy) => {}
@@ -376,8 +415,12 @@ fn test_wal_write_lock_released_on_conn_drop() {
     let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
     let db = tmp_db.limbo_database();
 
-    let conn1 = db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
 
     let join_result = std::thread::spawn(move || {
         conn1.execute("BEGIN IMMEDIATE").unwrap();

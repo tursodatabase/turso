@@ -270,7 +270,7 @@ SELECT total(amount) * 1.1 AS with_tax FROM sales;
 ```
 
 <Info>
-`sum(X)` returns an integer result when all inputs are integers and the result fits within a 64-bit signed integer. If the sum overflows, it automatically switches to REAL. Use `total(X)` when you always want a floating-point result.
+`sum(X)` returns an integer result when all inputs are integers and the result fits within a 64-bit signed integer. If the sum of integers (or of text that is an integer) overflows, `sum(X)` raises an "integer overflow" error, unless a later non-NULL input is not an integer: then the result is a REAL. Use `total(X)` when you always want a floating-point result.
 </Info>
 
 ## Using Aggregates with GROUP BY
@@ -391,6 +391,8 @@ percentile_disc(fraction) WITHIN GROUP (ORDER BY sort_expr)
 ```
 
 The `ORDER BY` expression is the value being aggregated. For the percentile functions, the argument before `WITHIN GROUP` is the percentile *fraction*. NULL values of the `ORDER BY` expression are ignored; if there are no non-NULL values, the result is NULL.
+
+Text values are compared with the collation of the `ORDER BY` expression. A custom collation registered by the application is not supported there and is an error.
 
 ### mode()
 

@@ -1,30 +1,7 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
-import { SqliteError } from "./sqlite-error.js";
+import { convertError, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
-
-const convertibleErrorTypes = { TypeError };
-const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
-
-function convertError(err) {
-  if ((err.code ?? "").startsWith(CONVERTIBLE_ERROR_PREFIX)) {
-    return createErrorByName(
-      err.code.substring(CONVERTIBLE_ERROR_PREFIX.length),
-      err.message,
-    );
-  }
-
-  return new SqliteError(err.message, err.code, err.rawCode);
-}
-
-function createErrorByName(name, message) {
-  const ErrorConstructor = convertibleErrorTypes[name];
-  if (!ErrorConstructor) {
-    throw new Error(`unknown error type ${name} from Turso`);
-  }
-
-  return new ErrorConstructor(message);
-}
 
 // The engine returned STEP_SLEEP: it wants the statement stepped again after a
 // delay (busy-handler backoff, or a yield with no pending I/O). Park the step
@@ -341,7 +318,11 @@ class Database {
    */
   async connect() {
     if (this.connected) { return; }
-    await this.db.connectAsync();
+    try {
+      await this.db.connectAsync();
+    } catch (err) {
+      throw convertError(err);
+    }
     this.connected = true;
   }
 
@@ -360,14 +341,10 @@ class Database {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
-    try {
-      if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
-      } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
-      }
-    } catch (err) {
-      throw convertError(err);
+    if (this.connected) {
+      return new Statement(maybeValue(prepareStatement(this.db, sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+    } else {
+      return new Statement(maybePromise(() => this.connect().then(() => prepareStatement(this.db, sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
     }
   }
 
@@ -694,7 +671,7 @@ class Database {
     const exec = this.db.executor(sql, queryOptions);
     try {
       while (true) {
-        const [stepResult, sleepMs] = exec.stepSync();
+        const [stepResult, sleepMs] = stepSync(exec);
         if (stepResult === STEP_IO) {
           await this.io();
           continue;
@@ -764,7 +741,7 @@ async function executeBatch(
     const exec = native.executor(sql);
     try {
       while (true) {
-        const [stepResult, sleepMs] = exec.stepSync();
+        const [stepResult, sleepMs] = stepSync(exec);
         if (stepResult === STEP_IO) {
           await io();
           continue;
@@ -842,7 +819,7 @@ async function executeBatch(
       const rows: any[] = [];
       try {
         while (true) {
-          const [stepResult, sleepMs] = await nativeStmt.stepSync();
+          const [stepResult, sleepMs] = await stepSync(nativeStmt);
           if (stepResult === STEP_IO) {
             await io();
             continue;
@@ -865,7 +842,7 @@ async function executeBatch(
         const lastInsertRowid = rowidAfter !== rowidBefore ? rowidAfter : undefined;
         return makeResultSet(columnNames, columnTypes, rows, rowsAffected, lastInsertRowid);
       } finally {
-        nativeStmt.reset();
+        resetStatement(nativeStmt);
       }
     } finally {
       nativeStmt.finalize();
@@ -995,7 +972,7 @@ class Transaction {
       const exec = this.db.executor(sql, queryOptions);
       try {
         while (true) {
-          const [stepResult, sleepMs] = exec.stepSync();
+          const [stepResult, sleepMs] = stepSync(exec);
           if (stepResult === STEP_IO) {
             await this.ioStep();
             continue;
@@ -1031,11 +1008,7 @@ class Transaction {
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
-    try {
-      return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.gate, this.ioStep) as unknown as Promise<Statement>;
-    } catch (err) {
-      throw convertError(err);
-    }
+    return new Statement(maybeValue(prepareStatement(this.db, sql)), this.db, this.gate, this.ioStep) as unknown as Promise<Statement>;
   }
 
   /**
@@ -1250,7 +1223,7 @@ class Statement {
       bindParams(stmt, toBindArgs(params));
       const totalChangesBefore = this.db.totalChanges();
       while (true) {
-        const [stepResult, sleepMs] = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
           await this.io();
           continue;
@@ -1273,7 +1246,7 @@ class Statement {
 
       return { changes, lastInsertRowid };
     } finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }
@@ -1293,7 +1266,7 @@ class Statement {
       stmt.setQueryTimeout(queryOptions);
       bindParams(stmt, toBindArgs(params));
       while (true) {
-        const [stepResult, sleepMs] = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
           await this.io();
           continue;
@@ -1312,7 +1285,7 @@ class Statement {
       }
       return row;
     } finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }
@@ -1331,7 +1304,7 @@ class Statement {
       stmt.setQueryTimeout(queryOptions);
       bindParams(stmt, toBindArgs(params));
       while (true) {
-        const [stepResult, sleepMs] = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
           await this.io();
           continue;
@@ -1348,7 +1321,7 @@ class Statement {
         }
       }
     } finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }
@@ -1369,7 +1342,7 @@ class Statement {
       stmt.setQueryTimeout(queryOptions);
       bindParams(stmt, toBindArgs(params));
       while (true) {
-        const [stepResult, sleepMs] = await stmt.stepSync();
+        const [stepResult, sleepMs] = await stepSync(stmt);
         if (stepResult === STEP_IO) {
           await this.io();
           continue;
@@ -1388,7 +1361,7 @@ class Statement {
       return rows;
     }
     finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }

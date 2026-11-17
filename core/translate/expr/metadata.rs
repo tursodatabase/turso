@@ -28,18 +28,16 @@ pub(super) fn translate_between_expr(
         unreachable!("translate_between_expr expects Expr::Between");
     };
 
-    let lhs_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
+    let lhs_len = expr_vector_size(lhs)?;
+    let lhs_reg = program.alloc_registers(lhs_len);
+    translate_row_value(program, referenced_tables, lhs, lhs_len, lhs_reg, resolver)?;
 
     let mut between_resolver = resolver.fork_with_expr_cache();
     between_resolver.enable_expr_to_reg_cache();
-    #[allow(clippy::or_fun_call)]
-    between_resolver.cache_scalar_expr_reg(
-        std::borrow::Cow::Owned(*lhs.to_owned()),
-        lhs_reg,
-        false,
-        referenced_tables.unwrap_or(&TableReferences::default()),
-    )?;
+    for idx in 0..lhs_len {
+        let component = row_value_component_expr(lhs, idx)?.into_owned();
+        between_resolver.cache_expr_reg(std::borrow::Cow::Owned(component), lhs_reg + idx, false);
+    }
 
     let (lower_expr, upper_expr, combine_op) = build_between_terms(
         std::mem::take(lhs),
@@ -123,24 +121,6 @@ pub(super) fn emit_cond_jump(
             target_pc: cond_meta.jump_target_when_false,
             jump_if_null: true,
         });
-    }
-}
-
-pub(super) fn assert_register_range_allocated(
-    program: &mut ProgramBuilder,
-    start_register: usize,
-    count: usize,
-) -> Result<()> {
-    // Invariant: callers must have pre-allocated [start_register, start_register + count)
-    // before asking expression translation to write a vector into that range.
-    let required_next = start_register + count;
-    let next_free = program.peek_next_register();
-    if required_next <= next_free {
-        Ok(())
-    } else {
-        crate::bail_parse_error!(
-            "insufficient registers allocated for expression vector write (start={start_register}, count={count}, next_free={next_free})"
-        )
     }
 }
 

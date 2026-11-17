@@ -33,7 +33,7 @@ pub fn where_node_steps(expr: &ast::Expr) -> usize {
         ast::Expr::Case {
             when_then_pairs, ..
         } => when_then_pairs.len().max(1),
-        ast::Expr::Register(_)
+        ast::Expr::Register { .. }
         | ast::Expr::Collate(..)
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Id(_)
@@ -444,7 +444,9 @@ fn estimate_rows_from_analyze_stats(
 
     let table_name = ctx.rhs_table.table.get_name();
 
-    let table_stats = ctx.stats.table_stats(table_name)?;
+    let table_stats = ctx
+        .stats
+        .table_stats(ctx.rhs_table.namespace.id, table_name)?;
     let idx_stats = table_stats.index_stats.get(&index.name)?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {

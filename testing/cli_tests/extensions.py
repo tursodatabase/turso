@@ -291,7 +291,7 @@ def test_crypto():
     # assert no function before extension loads
     turso.run_test_fn(
         "SELECT crypto_blake('a');",
-        lambda res: "Parse error" in res,
+        lambda res: "no such function: crypto_blake" in res,
         "crypto_blake3 returns null when ext not loaded",
     )
     turso.execute_dot(f".load {extension_path}")
@@ -427,6 +427,8 @@ def _test_series(limbo: TestTursoShell):
 def test_kv():
     _test_kv(exec_name=None, ext_path=f"{DEBUG_DIR}/libturso_ext_tests")
     _test_kv(exec_name="sqlite3", ext_path=f"{DEBUG_DIR}/liblimbo_sqlite_test_ext")
+    _test_kv_change_counts(exec_name=None, ext_path=f"{DEBUG_DIR}/libturso_ext_tests")
+    _test_kv_change_counts(exec_name="sqlite3", ext_path=f"{DEBUG_DIR}/liblimbo_sqlite_test_ext")
 
 
 def _test_kv(exec_name, ext_path):
@@ -541,13 +543,52 @@ def _test_kv(exec_name, ext_path):
     turso.quit()
 
 
+def _test_kv_change_counts(exec_name, ext_path):
+    """Writes to a virtual table count in changes() and total_changes() like
+    writes to a table, and an INSERT sets last_insert_rowid() to the new row."""
+    console.info(f"Running test_kv_change_counts for {ext_path} in {exec_name}")
+
+    # Skip the default setup, which inserts rows and so adds to total_changes().
+    turso = TestTursoShell(init_commands=".nullvalue TURSO", exec_name=exec_name)
+    turso.execute_dot(f".load {ext_path}")
+    turso.execute_dot("CREATE TABLE other(x);")
+    turso.execute_dot("INSERT INTO other(rowid, x) VALUES (100, 1);")
+    turso.execute_dot("CREATE VIRTUAL TABLE t USING kv_store;")
+    turso.execute_dot("INSERT INTO t(key, value) VALUES ('k1', 'x');")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes(), last_insert_rowid() = (SELECT rowid FROM t WHERE key = 'k1');",
+        lambda res: res == "1|2|1",
+        "virtual table INSERT counts a change and sets last_insert_rowid()",
+    )
+    turso.execute_dot("UPDATE t SET value = 'y';")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes();",
+        lambda res: res == "1|3",
+        "virtual table UPDATE counts a change",
+    )
+    turso.execute_dot("INSERT INTO t(key, value) VALUES ('k2', 'z');")
+    turso.execute_dot("UPDATE t SET value = 'w';")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes();",
+        lambda res: res == "2|6",
+        "virtual table UPDATE counts each row",
+    )
+    turso.execute_dot("DELETE FROM t WHERE key = 'k1';")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes();",
+        lambda res: res == "1|7",
+        "virtual table DELETE counts a change",
+    )
+    turso.quit()
+
+
 def test_ipaddr():
     turso = TestTursoShell()
     ext_path = f"{DEBUG_DIR}/liblimbo_ipaddr"
 
     turso.run_test_fn(
         "SELECT ipfamily('192.168.1.1');",
-        lambda res: "error: no such function: " in res,
+        lambda res: "no such function: ipfamily" in res,
         "ipfamily function returns null when ext not loaded",
     )
     turso.execute_dot(f".load {ext_path}")
@@ -670,7 +711,7 @@ def test_fuzzy():
     ext_path = f"{DEBUG_DIR}/liblimbo_fuzzy"
     turso.run_test_fn(
         "SELECT fuzzy_leven('awesome', 'aewsme');",
-        lambda res: "error: no such function: " in res,
+        lambda res: "no such function: fuzzy_leven" in res,
         "fuzzy levenshtein function returns null when ext not loaded",
     )
     turso.execute_dot(f".load {ext_path}")
@@ -896,7 +937,7 @@ def test_csv():
     turso.run_test_fn("DROP TABLE csv;", null, "Drop CSV table")
     turso.run_test_fn(
         "SELECT * FROM csv;",
-        lambda res: "Parse error: no such table: csv" in res,
+        lambda res: "no such table: csv" in res,
         "Query dropped CSV table should fail",
     )
     turso.run_test_fn(
@@ -913,7 +954,7 @@ def test_csv():
     )
     turso.run_test_fn(
         "SELECT c1 FROM t1;",
-        lambda res: "Parse error: no such column: c1" in res,
+        lambda res: "no such column: c1" in res,
         "Empty CSV table without header should not have columns other than 'c0'",
     )
 
@@ -929,7 +970,7 @@ def test_csv():
     )
     turso.run_test_fn(
         "SELECT c0 FROM t2;",
-        lambda res: "Parse error: no such column: c0" in res,
+        lambda res: "no such column: c0" in res,
         "Empty CSV table with header should not have columns other than '(NULL)'",
     )
 

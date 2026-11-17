@@ -461,7 +461,8 @@ test matview-parity-collated-min-to-join {
         FROM familiar_names
         GROUP BY school
       ) AS grouped
-      JOIN exact_familiars AS exact ON grouped.chosen = exact.name;
+      -- A function result has no collation, so the join needs COLLATE to compare without case.
+      JOIN exact_familiars AS exact ON grouped.chosen = exact.name COLLATE NOCASE;
     SELECT 'init', * FROM chosen_familiars;
     DELETE FROM familiar_names WHERE name = 'A' COLLATE BINARY;
     SELECT 'after-delete', * FROM chosen_familiars;

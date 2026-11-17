@@ -1,6 +1,10 @@
 use std::sync::Arc;
-use turso_core::Value;
-use turso_pg::{Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags};
+use turso_core::{SessionRole, Value};
+use turso_pg::{
+    Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags, StepResult,
+    TransactionState,
+};
+use turso_sqlite::SqliteDialect;
 
 fn pg_connection() -> (Arc<dyn turso_core::IO>, Connection) {
     let (io, db) =
@@ -261,11 +265,41 @@ fn errors_report_postgres_sqlstates() {
 }
 
 #[test]
-fn nested_begin_reports_active_sql_transaction() {
+fn array_types_with_more_than_seven_dimensions_are_not_supported() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE DOMAIN posint AS INT").unwrap();
+    conn.execute("CREATE TABLE seven (a INT[][][][][][][])")
+        .unwrap();
+    conn.execute("ALTER TABLE seven ADD COLUMN b posint[][][][][][][]")
+        .unwrap();
+    conn.execute("SELECT '{}'::int[][][][][][][]").unwrap();
+    for sql in [
+        "CREATE TABLE v3 (c4 INT[][][][][][][][])",
+        "CREATE TABLE v3 (c4 posint[][][][][][][][])",
+        "CREATE TABLE v3 (c4 _int4[][][][][][][])",
+        "ALTER TABLE seven ADD COLUMN c int[][][][][][][][]",
+        "SELECT '{}'::int[][][][][][][][]",
+        "SELECT CAST('{}' AS posint[][][][][][][][])",
+        "SELECT * FROM json_to_recordset('[]') AS x(a int[][][][][][][][])",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "0A000", "{sql}: {e:?}");
+        assert_eq!(
+            e.to_string(),
+            "an array type with 8 dimensions (at most 7) is not supported",
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn nested_begin_keeps_the_open_transaction() {
+    // PostgreSQL warns "there is already a transaction in progress" for BEGIN
+    // inside a transaction block and keeps the transaction.
     let (_io, conn) = pg_connection();
     conn.execute("BEGIN").unwrap();
-    let e = exec_err(&conn, "BEGIN");
-    assert_eq!(e.sqlstate, "25001");
+    conn.execute("BEGIN").unwrap();
+    assert!(!conn.inner().get_auto_commit());
     conn.execute("ROLLBACK").unwrap();
 }
 
@@ -323,6 +357,47 @@ fn non_numeric_string_divisor_raises_22p02() {
             "expected InvalidTextRepresentation for {sql}, got: {e:?}"
         );
         assert_eq!(e.sqlstate, "22P02", "{sql}: {e:?}");
+    }
+}
+
+#[test]
+fn lookup_and_input_errors_report_postgres_sqlstates() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (j jsonb)").unwrap();
+    for (sql, code) in [
+        ("SELECT current_setting('nosuch.x')", "42704"),
+        ("SELECT set_config('nodot', 'x', false)", "42704"),
+        ("SELECT set_config('a..b', 'x', false)", "42602"),
+        ("SELECT current_setting('a..b')", "42704"),
+        ("INSERT INTO t VALUES ('not json')", "22P02"),
+        ("SELECT * FROM nosuchschema.t", "42P01"),
+        ("INSERT INTO nosuchschema.t VALUES ('{}')", "42P01"),
+        ("UPDATE nosuchschema.t SET j = '{}'", "42P01"),
+        ("DELETE FROM nosuchschema.t", "42P01"),
+        ("SELECT nextval('nosuchschema.q')", "42P01"),
+        ("SELECT nextval('public.q')", "42P01"),
+        ("SELECT currval('nosuchschema.q')", "42P01"),
+        ("SELECT setval('nosuchschema.q', 1)", "42P01"),
+        ("DROP VIEW nosuchschema.v", "3F000"),
+        ("CREATE VIEW nosuchschema.v AS SELECT 1", "3F000"),
+        ("CREATE SEQUENCE nosuchschema.q", "3F000"),
+        ("CREATE TABLE nosuchschema.t (a INT)", "3F000"),
+        ("DROP TABLE nosuchschema.t", "3F000"),
+        ("ALTER TABLE nosuchschema.t ADD COLUMN b INT", "3F000"),
+        ("ALTER TABLE nosuchschema.t RENAME TO u", "3F000"),
+        ("CREATE INDEX i ON nosuchschema.t (a)", "3F000"),
+        ("DROP INDEX nosuchschema.i", "3F000"),
+        ("DROP SEQUENCE nosuchschema.q", "3F000"),
+        ("DROP SCHEMA nosuchschema", "3F000"),
+        ("SELECT 1 x 'malformed JSON'", "42601"),
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, code, "{sql}: {e:?}");
+    }
+    conn.execute("SET search_path = nosuchschema").unwrap();
+    for sql in ["CREATE TABLE z (a INT)", "CREATE SEQUENCE zq"] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "3F000", "{sql}: {e:?}");
     }
 }
 
@@ -520,6 +595,95 @@ fn foreign_key_update_reports_structured_fields() {
 }
 
 #[test]
+fn constraint_details_show_custom_type_values_as_the_user_wrote_them() {
+    let (_io, conn) = pg_connection();
+    for sql in [
+        "CREATE TABLE t_pk (id uuid PRIMARY KEY)",
+        "INSERT INTO t_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "CREATE TABLE t_j (j jsonb UNIQUE)",
+        "INSERT INTO t_j VALUES ('{\"a\":1}')",
+        "CREATE TABLE t_u (k INT PRIMARY KEY, id uuid UNIQUE)",
+        "INSERT INTO t_u VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        // A column named `value` must not stand in for the value DECODE reads.
+        "CREATE TABLE t_ck (value INT, id uuid, n INT CHECK (n > 0))",
+        "CREATE TABLE t_nn (id uuid, n INT NOT NULL, b uuid NOT NULL)",
+        "CREATE TABLE t_arr (a INT[] UNIQUE, ids uuid[], n INT CHECK (n > 0))",
+        "INSERT INTO t_arr VALUES ('{1,2}', NULL, 1)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for (sql, detail) in [
+        (
+            "INSERT INTO t_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+            "Key (id)=(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
+        ),
+        (
+            "INSERT INTO t_j VALUES ('{\"a\":1}')",
+            "Key (j)=({\"a\":1}) already exists.",
+        ),
+        (
+            "UPDATE t_u SET id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' WHERE k = 2",
+            "Key (id)=(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
+        ),
+        (
+            "INSERT INTO t_u VALUES (1, 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') \
+             ON CONFLICT (k) DO UPDATE SET id = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+            "Key (id)=(b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
+        ),
+        (
+            "INSERT INTO t_ck VALUES (5, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 0)",
+            "Failing row contains (5, a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, 0).",
+        ),
+        // `n` is checked before the row is encoded, `b` after.
+        (
+            "INSERT INTO t_nn VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', NULL, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+            "Failing row contains (a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, null, b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11).",
+        ),
+        (
+            "INSERT INTO t_nn VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 1, NULL)",
+            "Failing row contains (a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, 1, null).",
+        ),
+        (
+            "INSERT INTO t_arr VALUES ('{1,2}', NULL, 1)",
+            "Key (a)=({1,2}) already exists.",
+        ),
+        (
+            "INSERT INTO t_arr VALUES ('{3}', '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}', 0)",
+            "Failing row contains ({3}, {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}, 0).",
+        ),
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(constraint_violation(&e).detail.as_deref(), Some(detail), "{sql}");
+    }
+}
+
+#[test]
+fn foreign_key_details_show_custom_type_values_as_the_user_wrote_them() {
+    let (_io, conn) = pg_connection_with_fk();
+    for sql in [
+        "CREATE TABLE parent (id uuid PRIMARY KEY)",
+        "CREATE TABLE child (id INT PRIMARY KEY, pid uuid REFERENCES parent(id))",
+        "INSERT INTO parent VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "INSERT INTO child VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let detail =
+        "Key (pid)=(b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) is not present in table \"parent\".";
+    for sql in [
+        "INSERT INTO child VALUES (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "UPDATE child SET pid = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(
+            constraint_violation(&e).detail.as_deref(),
+            Some(detail),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn zero_divisors_raise_postgres_errors() {
     let (_pg_io, pg) = pg_connection();
     for sql in [
@@ -555,10 +719,15 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
         for (dialect, conn) in [("sqlite", &sqlite), ("postgres", pg.inner())] {
             conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
                 .unwrap();
-            conn.execute(
-                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-            )
-            .unwrap();
+            // The frontend binds the foreign key's table to its schema; a
+            // table created through core alone references the root namespace.
+            let create_child =
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))";
+            if dialect == "postgres" {
+                pg.execute(create_child).unwrap();
+            } else {
+                conn.execute(create_child).unwrap();
+            }
             conn.execute("INSERT INTO parent VALUES (1)").unwrap();
             conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
             conn.execute("BEGIN").unwrap();
@@ -591,6 +760,1245 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
     }
 }
 
+#[test]
+fn runtime_error_in_explicit_transaction_aborts_it() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let e = exec_err(&conn, "SELECT 1");
+    assert_eq!(
+        e.sqlstate, "25P02",
+        "statements after a runtime error in an explicit tx must return 25P02"
+    );
+    assert_eq!(
+        e.message,
+        "current transaction is aborted, commands ignored until end of transaction block"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn commit_of_aborted_transaction_rolls_back() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "aborted-block.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    let waker = std::task::Waker::from(Arc::new(WakeCounter::default()));
+    for sql in ["COMMIT", "ROLLBACK"] {
+        let mut end = conn.prepare(sql).unwrap();
+        conn.execute("BEGIN; INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(exec_err(&conn, "SELECT 1/0").sqlstate, "22012");
+        loop {
+            let before = io.steps.load(Relaxed);
+            let result = end.step_with_waker(&waker).unwrap();
+            assert_eq!(
+                io.steps.load(Relaxed),
+                before,
+                "aborted block cleanup pumped I/O"
+            );
+            match result {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                    assert_eq!(end.command_tag_override(), None);
+                    io.step().unwrap();
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            end.command_tag_override(),
+            (sql == "COMMIT").then_some("ROLLBACK")
+        );
+        assert_eq!(conn.transaction_state(), TransactionState::Idle);
+        assert_eq!(
+            conn.prepare("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()[0][0],
+            Value::from_i64(0)
+        );
+        end.reset().unwrap();
+        conn.execute("BEGIN; INSERT INTO t VALUES (2)").unwrap();
+        drive_prerequisites(&io, &mut end).unwrap();
+        assert_eq!(end.command_tag_override(), None);
+        let count = if sql == "COMMIT" { 1 } else { 0 };
+        assert_eq!(
+            conn.prepare("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()[0][0],
+            Value::from_i64(count)
+        );
+        conn.execute("DELETE FROM t").unwrap();
+    }
+}
+
+#[test]
+fn syntax_error_aborts_transaction() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (id INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn.execute("SELCT 1").is_err());
+    let e = exec_err(&conn, "INSERT INTO t VALUES (1)");
+    assert_eq!(e.sqlstate, "25P02", "a syntax error must abort the block");
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(0));
+}
+
+#[test]
+fn unknown_table_error_at_prepare_aborts_transaction() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn.prepare("SELECT * FROM nonexistent").is_err());
+    let e = exec_err(&conn, "SELECT 1");
+    assert_eq!(e.sqlstate, "25P02", "a prepare error must abort the block");
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn statement_prepared_before_the_error_is_rejected_after_it() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let mut stmt = conn.prepare("SELECT 1").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let e = stmt.run_collect_rows().unwrap_err();
+    assert_eq!(
+        e.sqlstate, "25P02",
+        "executing a statement prepared before the error must be rejected too"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    stmt.reset().unwrap();
+    stmt.run_collect_rows().unwrap();
+}
+
+#[test]
+fn failing_insert_aborts_the_block_and_rollback_recovers() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(
+        exec_err(&conn, "INSERT INTO t VALUES (1/0)").sqlstate,
+        "22012"
+    );
+    assert_eq!(
+        exec_err(&conn, "SELECT 1").sqlstate,
+        "25P02",
+        "a failed write must abort the block like any other error"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(0));
+}
+
+#[test]
+fn rollback_to_savepoint_recovers_aborted_transaction() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("SAVEPOINT a").unwrap();
+    let _err = exec_err(&conn, "INSERT INTO t VALUES (1)");
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    conn.execute("ROLLBACK TO SAVEPOINT a").unwrap();
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Active,
+        "ROLLBACK TO SAVEPOINT must return the block to normal"
+    );
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(2));
+}
+
+#[test]
+fn interrupted_statement_aborts_the_block() {
+    // A query timeout interrupts the statement; the core reports that as
+    // StepResult::Interrupt rather than an error, but PostgreSQL treats
+    // cancellation as an ordinary error that aborts the block.
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+    stmt.set_query_timeout_override(Some(Some(std::time::Duration::from_nanos(1))));
+    assert!(matches!(stmt.step(), Ok(StepResult::Interrupt)));
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "query cancellation is an ordinary error in PostgreSQL and aborts the block"
+    );
+    assert_eq!(exec_err(&conn, "SELECT 1").sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn error_in_autocommit_does_not_abort_the_session() {
+    let (_io, conn) = pg_connection();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn second_error_keeps_the_transaction_aborted() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    assert_eq!(exec_err(&conn, "SELECT 1").sqlstate, "25P02");
+    assert_eq!(exec_err(&conn, "SELECT 2").sqlstate, "25P02");
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("SELECT 1").unwrap();
+}
+
+#[test]
+fn commit_of_aborted_transaction_reports_the_rollback_tag() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert_eq!(commit.command_tag_override(), None);
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(
+        commit.command_tag_override(),
+        Some("ROLLBACK"),
+        "COMMIT that ended an aborted block must report ROLLBACK"
+    );
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+
+    conn.execute("BEGIN").unwrap();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(
+        commit.command_tag_override(),
+        None,
+        "a normal COMMIT keeps its own tag"
+    );
+}
+
+#[test]
+fn aborted_commit_never_reports_success_with_transaction_still_open() {
+    // An unfinished statement makes the core reject ROLLBACK with
+    // "SQL statements in progress". COMMIT on the aborted block must then
+    // fail and leave the block aborted — reporting success while the
+    // transaction is still open would let a later COMMIT persist it.
+    let (io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+    let mut writer = conn.prepare("INSERT INTO t VALUES(2) RETURNING x").unwrap();
+    loop {
+        match writer.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => io.step().unwrap(),
+            other => panic!("expected a returned row, got {other:?}"),
+        }
+    }
+
+    assert!(conn.execute("SELECT 1/0").is_err());
+
+    let result = conn.execute("COMMIT");
+    assert!(
+        result.is_err() || conn.inner().get_auto_commit(),
+        "COMMIT reported success, but the aborted transaction is still open"
+    );
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "the block must stay aborted while it cannot be rolled back"
+    );
+
+    // Finishing the statement unblocks the rollback; COMMIT then ends the
+    // block and nothing from it survives.
+    drop(writer);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0], Value::from_i64(0));
+}
+
+#[test]
+fn copy_to_stdout_is_rejected_while_aborted() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (x INT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    // A COPY prepared before the error is rejected at execution.
+    let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
+        .unwrap()
+        .unwrap();
+    let mut prepared_before = conn.prepare_copy_to_stdout(&spec).unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let e = prepared_before.run_collect_rows().unwrap_err();
+    assert_eq!(e.sqlstate, "25P02", "COPY must respect the aborted block");
+    // Preparing a COPY while aborted is rejected outright.
+    let e = conn.prepare_copy_to_stdout(&spec).err().unwrap();
+    assert_eq!(e.sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn copy_text_encoding_returns_one_record_per_row() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "copy-encoding.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (b BOOLEAN, n BIGINT, f FLOAT8, s TEXT, a INT[], z TIMESTAMPTZ, ts TIMESTAMP, data BYTEA)").unwrap();
+    conn.execute(r#"INSERT INTO t VALUES
+        (true, -17, 1.25, E'\\N\t\n\r\b\f\013é', ARRAY[2,7], '2026-10-31 12:34:56', '2026-10-31 12:34:56', NULL),
+        (false, 0, 1e100, '', ARRAY[]::INT[], NULL, NULL, NULL),
+        (NULL, NULL, -1e-100, NULL, NULL, NULL, NULL, NULL)"#).unwrap();
+    let mut update = conn
+        .prepare("UPDATE t SET data = $1 WHERE n = -17")
+        .unwrap();
+    update
+        .bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            Value::from_blob(vec![0, 255]),
+        )
+        .unwrap();
+    update.run_ignore_rows().unwrap();
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().get_pager().clear_page_cache(false);
+    let mut stmt = conn.prepare("COPY t TO STDOUT").unwrap();
+    let encoder = turso_pg::CopyTextEncoder::new(&stmt);
+    let expected = [
+        "t\t-17\t1.25\t\\\\N\\t\\n\\r\\b\\f\\vé\t{2,7}\t2026-10-31 12:34:56+00\t2026-10-31 12:34:56\t\\\\x00ff\n",
+        "f\t0\t1e100\t\t{}\t\\N\t\\N\t\\N\n",
+        "\\N\t\\N\t-1e-100\t\\N\t\\N\t\\N\t\\N\t\\N\n",
+    ];
+    let mut rows = 0;
+    let mut yields = 0;
+    let mut output = Vec::new();
+    loop {
+        let before = io.steps.load(Relaxed);
+        let result = stmt.step().unwrap();
+        assert_eq!(io.steps.load(Relaxed), before, "COPY pumped I/O");
+        match result {
+            StepResult::Row => {
+                output.clear();
+                encoder.encode_row(stmt.row().unwrap(), &mut output);
+                assert_eq!(output, expected[rows].as_bytes());
+                assert_eq!(io.steps.load(Relaxed), before, "encoding pumped I/O");
+                rows += 1;
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                yields += 1;
+                io.step().unwrap();
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected COPY result: {other:?}"),
+        }
+    }
+    assert_eq!(rows, expected.len());
+    assert!(yields > 0);
+}
+
+#[test]
+fn embedded_copy_returns_values_in_column_order() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE SCHEMA exports").unwrap();
+    conn.execute("CREATE TABLE exports.items (id INT, name TEXT, enabled BOOLEAN)")
+        .unwrap();
+    conn.execute("SET search_path TO exports").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO items VALUES (7, E'a\tb', true), (19, NULL, false)")
+        .unwrap();
+
+    for sql in [
+        "COPY items (name, enabled, id) TO STDOUT",
+        "COPY exports.items (name, enabled, id) TO STDOUT WITH (FORMAT text)",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_text("a\tb"),
+                    Value::from_i64(1),
+                    Value::from_i64(7)
+                ],
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(19)],
+            ],
+            "{sql}"
+        );
+        assert_eq!(conn.transaction_state(), TransactionState::Active);
+    }
+
+    assert!(conn
+        .prepare("COPY items TO STDOUT WITH (FORMAT csv)")
+        .is_err());
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    let error = conn.prepare("COPY items TO STDOUT").err().unwrap();
+    assert_eq!(error.sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare("COPY items TO STDOUT").unwrap();
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
+}
+
+#[test]
+fn and_chain_is_rejected_in_every_transaction_state() {
+    // PostgreSQL's COMMIT/ROLLBACK AND CHAIN ends the transaction and starts
+    // a new one with the same characteristics — on an aborted block too
+    // (xact.c, the chain handling in the abort paths). The frontend does not
+    // support chaining, so both forms must be rejected in every state rather
+    // than silently dropping the chain; in particular, a rejected chained
+    // COMMIT must leave an aborted block aborted.
+    //
+    // Implementing AND CHAIN makes this test fail. When that happens, the
+    // aborted-block redirect (TxRole::Commit/Rollback in statement.rs
+    // tx_gate) must also start the chained transaction, and this test must
+    // assert that behavior instead.
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let e = exec_err(&conn, "COMMIT AND CHAIN");
+    assert_eq!(e.sqlstate, "0A000", "{e:?}");
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "the rejected statement is an error inside the block, aborting it"
+    );
+    let e = exec_err(&conn, "ROLLBACK AND CHAIN");
+    assert_eq!(e.sqlstate, "0A000", "{e:?}");
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "a rejected chained ROLLBACK must not end the aborted block"
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+}
+
+#[test]
+fn preparing_commit_while_aborted_has_no_side_effects() {
+    let (_io, conn) = pg_connection();
+    conn.execute("BEGIN").unwrap();
+    let _err = exec_err(&conn, "SELECT 1/0");
+    let stmt = conn.prepare("COMMIT").unwrap();
+    drop(stmt);
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Aborted,
+        "preparing COMMIT without executing it must not end the block"
+    );
+    assert_eq!(exec_err(&conn, "SELECT 1").sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn failed_commit_returns_the_session_to_idle() {
+    // A schema change committed by another connection makes this
+    // connection's COMMIT fail with a schema conflict.
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "failed-commit.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let ddl_conn = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 0)").unwrap();
+    ddl_conn.execute("ALTER TABLE t ADD COLUMN w INT").unwrap();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let e = drive_prerequisites(&io, &mut commit).unwrap_err();
+    assert_eq!(e.sqlstate, "40001");
+    assert_eq!(
+        conn.transaction_state(),
+        TransactionState::Idle,
+        "a failed COMMIT rolls back and goes idle, it does not abort the session"
+    );
+    conn.execute("SELECT 1").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap()[0][0],
+        Value::from_i64(0),
+        "the failed transaction's insert must be rolled back"
+    );
+}
+
+#[test]
+fn transaction_rolled_back_by_the_core_still_reports_aborted() {
+    // A write-write conflict makes the core roll the whole transaction back
+    // on its own. The session must still be in the aborted state afterwards:
+    // without it, later statements would silently run and commit in
+    // autocommit while the client believes it is mid-transaction.
+    let (_io, db) =
+        turso_pg::open_database(":memory:", None, OpenFlags::default(), DatabaseOpts::new())
+            .unwrap();
+    let conn1 = Connection::connect(&db).unwrap();
+    let conn2 = Connection::connect(&db).unwrap();
+    conn1
+        .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn2.execute("BEGIN").unwrap();
+    conn1.execute("UPDATE t SET v = 1 WHERE id = 1").unwrap();
+    let _conflict = exec_err(&conn2, "UPDATE t SET v = 2 WHERE id = 1");
+    assert!(
+        conn2.inner().get_auto_commit(),
+        "the conflict must have rolled the core transaction back already"
+    );
+    assert_eq!(conn2.transaction_state(), TransactionState::Aborted);
+    assert_eq!(
+        exec_err(&conn2, "INSERT INTO t VALUES (3, 3)").sqlstate,
+        "25P02"
+    );
+    conn2.execute("ROLLBACK").unwrap();
+    assert_eq!(conn2.transaction_state(), TransactionState::Idle);
+    conn1.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn serial_prerequisites_yield_to_the_caller() {
+    use turso_core::{IOResult, IO};
+
+    for method in 0..4 {
+        let io = Arc::new(CountedYieldIO::default());
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            "serial-yield.db",
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        let mut stmt = conn
+            .prepare("CREATE TABLE t (a SERIAL, b SERIAL, payload INT)")
+            .unwrap();
+        conn.inner()
+            .set_yield_injector(Some(Arc::new(NthYield::new(4))));
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut yields = 0;
+        let mut explicit_yields = 0;
+        loop {
+            assert_eq!(stmt.result_kind(), turso_pg::StatementResultKind::Command);
+            let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
+            let result = match method {
+                0 => stmt.step(),
+                1 => stmt.step_with_waker(&waker),
+                2 | 3 => {
+                    let result = if method == 2 {
+                        stmt.run_ignore_rows_nonblock()
+                    } else {
+                        stmt.run_with_row_callback_nonblock(|_| panic!("DDL returned a row"))
+                    };
+                    result.map(|result| match result {
+                        IOResult::Done(()) => StepResult::Done,
+                        IOResult::IO(completion) => {
+                            assert!(completion.is_explicit_yield() || !completion.finished());
+                            if completion.is_explicit_yield() {
+                                StepResult::Yield
+                            } else {
+                                StepResult::IO
+                            }
+                        }
+                    })
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                io.steps.load(std::sync::atomic::Ordering::Relaxed),
+                before,
+                "method {method} pumped I/O inside the nonblocking call"
+            );
+            let result = result.unwrap();
+            match result {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    yields += 1;
+                    if method < 2 {
+                        let completion = stmt.io_completions().unwrap();
+                        assert!(completion.is_explicit_yield() || !completion.finished());
+                    }
+                    if matches!(result, StepResult::Yield) {
+                        explicit_yields += 1;
+                    }
+                    let before_wake = wakes.0.load(std::sync::atomic::Ordering::Relaxed);
+                    io.step().unwrap();
+                    if method == 1 && matches!(result, StepResult::IO) {
+                        assert!(wakes.0.load(std::sync::atomic::Ordering::Relaxed) > before_wake);
+                    }
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert!(yields > 0);
+        assert!(explicit_yields > 0);
+        conn.inner().set_yield_injector(None);
+        assert_eq!(conn.transaction_state(), TransactionState::Idle);
+        conn.execute("INSERT INTO t (payload) VALUES (42)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT a, b FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(1), Value::from_i64(1)]]
+        );
+        assert_eq!(
+            conn.prepare("SELECT sequencename FROM pg_sequences ORDER BY sequencename")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![
+                vec![Value::build_text("t_a_seq")],
+                vec![Value::build_text("t_b_seq")]
+            ]
+        );
+    }
+}
+
+#[test]
+fn serial_prerequisites_clean_up_when_abandoned() {
+    use turso_core::IO;
+
+    for action in 0..3 {
+        for pause_at in 1..200 {
+            let io = Arc::new(CountedYieldIO::default());
+            let db = turso_pg::open_database_with_io(
+                io.clone(),
+                "abandoned.db",
+                OpenFlags::default(),
+                DatabaseOpts::new(),
+            )
+            .unwrap();
+            let conn = Connection::connect(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE kept (v INT); BEGIN; INSERT INTO kept VALUES (42); SAVEPOINT user_sp",
+            )
+            .unwrap();
+            let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
+            let injector = Arc::new(NthYield::new(pause_at));
+            conn.inner().set_yield_injector(Some(injector.clone()));
+            let mut paused = false;
+            loop {
+                let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
+                let result = stmt.step().unwrap();
+                assert_eq!(io.steps.load(std::sync::atomic::Ordering::Relaxed), before);
+                match result {
+                    StepResult::Done => break,
+                    StepResult::Yield
+                        if injector.0.load(std::sync::atomic::Ordering::Relaxed) == 0 =>
+                    {
+                        paused = true;
+                        break;
+                    }
+                    StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                        io.step().unwrap()
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            }
+            conn.inner().set_yield_injector(None);
+            if !paused {
+                assert!(pause_at > 1);
+                break;
+            }
+            match action {
+                0 => drop(stmt),
+                1 => {
+                    stmt.reset().unwrap();
+                    drop(stmt);
+                }
+                2 => {
+                    stmt.interrupt();
+                    let error = drive_prerequisites(&io, &mut stmt)
+                        .expect_err(&format!("pause {pause_at}"));
+                    assert_eq!(error.sqlstate, "57014", "pause {pause_at}: {error}");
+                    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                    conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                conn.transaction_state(),
+                TransactionState::Active,
+                "action {action}, pause {pause_at}"
+            );
+            assert!(
+                conn.prepare("SELECT sequencename FROM pg_sequences")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap()
+                    .is_empty(),
+                "action {action}, pause {pause_at}"
+            );
+            assert!(conn
+                .prepare("SELECT tablename FROM pg_tables WHERE tablename = 't'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .is_empty());
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                conn.prepare("SELECT v FROM kept")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::from_i64(42)]]
+            );
+            assert!(pause_at < 199, "did not exhaust yield points");
+        }
+    }
+
+    for read_completion in [false, true] {
+        for reset in [false, true] {
+            let io = Arc::new(CountedYieldIO::default());
+            let db = turso_pg::open_database_with_io(
+                io.clone(),
+                "pending.db",
+                OpenFlags::default(),
+                DatabaseOpts::new(),
+            )
+            .unwrap();
+            let conn = Connection::connect(&db).unwrap();
+            let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
+            assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+            if read_completion {
+                assert!(!stmt.io_completions().unwrap().finished());
+                assert!(!stmt.io_completions().unwrap().finished());
+            }
+            if reset {
+                stmt.reset().unwrap();
+            }
+            drop(stmt);
+            assert_eq!(conn.transaction_state(), TransactionState::Idle);
+            let tables = conn
+                .prepare("SELECT tablename FROM pg_tables WHERE tablename = 't'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            let sequences = conn
+                .prepare("SELECT sequencename FROM pg_sequences")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(sequences.len(), 2 * tables.len());
+            conn.execute("CREATE TABLE usable (v INT)").unwrap();
+        }
+    }
+}
+
+#[test]
+fn serial_prerequisites_rollback_conflicts_and_reset() {
+    for explicit_tx in [false, true] {
+        let io = Arc::new(CountedYieldIO::default());
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            "conflict.db",
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        if explicit_tx {
+            conn.execute("BEGIN; SAVEPOINT user_sp").unwrap();
+        }
+        let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
+        conn.execute("CREATE TABLE t (v INT)").unwrap();
+        conn.inner()
+            .set_yield_injector(Some(Arc::new(NthYield::new(4))));
+        let error = drive_prerequisites(&io, &mut stmt).unwrap_err();
+        conn.inner().set_yield_injector(None);
+        assert_eq!(error.sqlstate, "42P07");
+        if explicit_tx {
+            assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+            conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+        } else {
+            assert_eq!(conn.transaction_state(), TransactionState::Idle);
+            conn.execute("DROP TABLE t").unwrap();
+        }
+        assert!(conn
+            .prepare("SELECT sequencename FROM pg_sequences")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+        stmt.reset().unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        let mut noop = conn
+            .prepare("CREATE TABLE IF NOT EXISTS t (extra SERIAL)")
+            .unwrap();
+        drive_prerequisites(&io, &mut noop).unwrap();
+        noop.reset().unwrap();
+        drive_prerequisites(&io, &mut noop).unwrap();
+        assert_eq!(
+            conn.prepare("SELECT sequencename FROM pg_sequences ORDER BY sequencename")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![
+                vec![Value::build_text("t_a_seq")],
+                vec![Value::build_text("t_b_seq")]
+            ]
+        );
+        if explicit_tx {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+}
+
+#[test]
+fn session_statements_yield_to_the_caller() {
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "session-yield.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let mut create = conn
+        .prepare("CREATE SCHEMA app CREATE TABLE t (id SERIAL, payload INT UNIQUE)")
+        .unwrap();
+    assert!(conn.inner().qualifier("app").is_none());
+    drive_prerequisites(&io, &mut create).unwrap();
+    let data = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(data.path(), "13\n27\n").unwrap();
+    let mut copy = conn
+        .prepare(format!(
+            "COPY app.t (payload) FROM '{}'",
+            data.path().display()
+        ))
+        .unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
+    drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
+    assert_eq!(copy.n_change(), 2);
+    assert_eq!(
+        conn.prepare("SELECT id, payload FROM app.t ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(13)],
+            vec![Value::from_i64(2), Value::from_i64(27)],
+        ]
+    );
+    copy.reset().unwrap();
+    std::fs::write(data.path(), "41\n27\n").unwrap();
+    assert_eq!(
+        drive_prerequisites(&io, &mut copy).unwrap_err().sqlstate,
+        "23505"
+    );
+    assert_eq!(
+        conn.prepare("SELECT count(*) FROM app.t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+    copy.reset().unwrap();
+    std::fs::write(data.path(), "").unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
+    drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
+    assert_eq!(copy.n_change(), 0);
+    let mut invalid_copy = conn
+        .prepare(format!(
+            "COPY app.t (missing) FROM '{}'",
+            data.path().display()
+        ))
+        .unwrap();
+    assert!(drive_prerequisites(&io, &mut invalid_copy).is_err());
+    let mut drop_schema = conn.prepare("DROP SCHEMA app CASCADE").unwrap();
+    drive_prerequisites(&io, &mut drop_schema).unwrap();
+    assert!(conn.inner().qualifier("app").is_none());
+    create.reset().unwrap();
+    drive_prerequisites(&io, &mut create).unwrap();
+    let mut failure = conn
+        .prepare("CREATE SCHEMA failed CREATE TABLE t (v INT) CREATE TABLE t (v INT)")
+        .unwrap();
+    assert!(drive_prerequisites(&io, &mut failure).is_err());
+    assert!(conn.inner().qualifier("failed").is_none());
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+
+    for sql in ["RESET ALL", "DISCARD ALL"] {
+        conn.execute("SET search_path TO app").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["app".to_string()]));
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+        conn.execute("SET search_path TO app").unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["app".to_string()]));
+        stmt.reset().unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+    }
+}
+
+#[test]
+fn session_statements_clean_up_when_abandoned() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let data = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(data.path(), "13\n27\n").unwrap();
+    for operation in 0..3 {
+        for action in 0..6 {
+            let mut exhausted = false;
+            for pause_at in 0..200 {
+                let io = Arc::new(CountedYieldIO::default());
+                let db = turso_pg::open_database_with_io(
+                    io.clone(),
+                    "session-abandoned.db",
+                    OpenFlags::default(),
+                    DatabaseOpts::new(),
+                )
+                .unwrap();
+                let conn = Connection::connect(&db).unwrap();
+                conn.inner().set_foreign_keys_enabled(true);
+                conn.execute("SET search_path TO public; CREATE TABLE kept (v INT)")
+                    .unwrap();
+                let create = "CREATE SCHEMA work CREATE TABLE t (id SERIAL PRIMARY KEY, payload INT) CREATE TABLE u (id INT REFERENCES work.t(id))";
+                if operation != 0 {
+                    conn.execute(create).unwrap();
+                }
+                if operation == 1 {
+                    conn.execute("BEGIN; INSERT INTO kept VALUES (42); SAVEPOINT user_sp")
+                        .unwrap();
+                }
+                let sql = match operation {
+                    0 => create.to_string(),
+                    1 => "DROP SCHEMA work CASCADE".to_string(),
+                    2 => format!("COPY work.t (payload) FROM '{}'", data.path().display()),
+                    _ => unreachable!(),
+                };
+                let mut stmt = conn.prepare(sql).unwrap();
+                let injector = Arc::new(NthYield::new(pause_at));
+                conn.inner().set_yield_injector(Some(injector.clone()));
+                let wakes = Arc::new(WakeCounter::default());
+                let waker = std::task::Waker::from(wakes.clone());
+                let mut paused = false;
+                loop {
+                    let before = io.steps.load(Relaxed);
+                    let result = stmt.step_with_waker(&waker).unwrap();
+                    assert_eq!(io.steps.load(Relaxed), before);
+                    assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+                    assert!(conn.inner().foreign_keys_enabled());
+                    match result {
+                        StepResult::Done => break,
+                        StepResult::Yield if injector.0.load(Relaxed) == 0 => {
+                            paused = true;
+                            break;
+                        }
+                        StepResult::IO if pause_at == 0 => {
+                            assert!(!stmt.io_completions().unwrap().finished());
+                            assert!(!stmt.io_completions().unwrap().finished());
+                            paused = true;
+                            break;
+                        }
+                        StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                            let before_wake = wakes.0.load(Relaxed);
+                            io.step().unwrap();
+                            if matches!(result, StepResult::IO) {
+                                assert!(wakes.0.load(Relaxed) > before_wake);
+                            }
+                        }
+                        other => panic!("unexpected result: {other:?}"),
+                    }
+                }
+                conn.inner().set_yield_injector(None);
+                if !paused {
+                    if pause_at == 0 {
+                        continue;
+                    }
+                    assert!(pause_at > 1, "operation {operation}, action {action}");
+                    exhausted = true;
+                    break;
+                }
+                match action {
+                    0 => drop(stmt),
+                    1 => {
+                        stmt.reset().unwrap();
+                        drop(stmt);
+                    }
+                    2 => {
+                        stmt.interrupt();
+                        if let Err(error) = drive_prerequisites(&io, &mut stmt) {
+                            assert_eq!(error.sqlstate, "57014");
+                            if operation == 1 {
+                                assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                                conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+                            }
+                        }
+                    }
+                    3 | 4 => {
+                        loop {
+                            let before = io.steps.load(Relaxed);
+                            let result = stmt.cleanup_nonblock().unwrap();
+                            assert_eq!(io.steps.load(Relaxed), before, "cleanup pumped I/O");
+                            assert_eq!(
+                                conn.inner().search_path(),
+                                Some(vec!["public".to_string()])
+                            );
+                            assert!(conn.inner().foreign_keys_enabled());
+                            match result {
+                                turso_core::IOResult::Done(()) => break,
+                                turso_core::IOResult::IO(completion) => {
+                                    completion.set_waker(Some(&waker));
+                                    let pending = !completion.finished();
+                                    let before_wake = wakes.0.load(Relaxed);
+                                    io.step().unwrap();
+                                    if pending {
+                                        assert!(wakes.0.load(Relaxed) > before_wake);
+                                    }
+                                }
+                            }
+                        }
+                        let before = io.steps.load(Relaxed);
+                        if action == 3 {
+                            stmt.reset().unwrap();
+                        }
+                        drop(stmt);
+                        assert_eq!(
+                            io.steps.load(Relaxed),
+                            before,
+                            "reset/drop repeated cleanup I/O"
+                        );
+                    }
+                    5 => {
+                        let before = io.steps.load(Relaxed);
+                        let _ = stmt.cleanup_nonblock().unwrap();
+                        assert_eq!(io.steps.load(Relaxed), before);
+                        drop(stmt);
+                    }
+                    _ => unreachable!(),
+                }
+                if operation == 1 {
+                    assert_eq!(conn.transaction_state(), TransactionState::Active);
+                    conn.execute("COMMIT").unwrap();
+                    assert_eq!(
+                        conn.prepare("SELECT v FROM kept")
+                            .unwrap()
+                            .run_collect_rows()
+                            .unwrap(),
+                        vec![vec![Value::from_i64(42)]]
+                    );
+                }
+                assert_eq!(conn.transaction_state(), TransactionState::Idle);
+                let tables = conn
+                    .prepare("SELECT tablename FROM pg_tables WHERE schemaname = 'work'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                let sequences = conn
+                    .prepare("SELECT sequencename FROM pg_sequences WHERE schemaname = 'work'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert!(
+                    tables.is_empty() || tables.len() == 2,
+                    "operation {operation}, action {action}, pause {pause_at}: {tables:?}"
+                );
+                assert_eq!(sequences.len() * 2, tables.len());
+                assert_eq!(conn.inner().qualifier("work").is_some(), !tables.is_empty());
+                if operation == 2 {
+                    let rows = conn
+                        .prepare("SELECT payload FROM work.t ORDER BY payload")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap();
+                    assert!(
+                        rows.is_empty()
+                            || rows == vec![vec![Value::from_i64(13)], vec![Value::from_i64(27)]]
+                    );
+                }
+                conn.execute("INSERT INTO kept VALUES (99)").unwrap();
+            }
+            assert!(exhausted, "did not exhaust yield points");
+        }
+    }
+}
+
+#[test]
+fn catalog_checks_do_not_execute_during_prepare() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "catalog-prepare.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let other = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (v INT); CREATE VIEW v AS SELECT v FROM t")
+        .unwrap();
+    other.execute("CREATE SEQUENCE t_v_idx; ALTER TABLE t ADD COLUMN w INT DEFAULT 9; INSERT INTO t (v) VALUES (7)")
+        .unwrap();
+    let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
+        .unwrap()
+        .unwrap();
+    conn.inner()
+        .set_yield_injector(Some(Arc::new(NthYield::new(1))));
+    let before = io.steps.load(Relaxed);
+    let mut copy = conn.prepare_copy_to_stdout(&spec).unwrap();
+    assert_eq!(
+        io.steps.load(Relaxed),
+        before,
+        "COPY preparation pumped I/O"
+    );
+    conn.inner().set_yield_injector(None);
+    assert_eq!(
+        copy.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(7), Value::from_i64(9)]]
+    );
+    drop(copy);
+    for sql in ["CREATE INDEX ON t (v)", "DROP VIEW v", "DROP VIEW t"] {
+        conn.inner()
+            .set_yield_injector(Some(Arc::new(NthYield::new(1))));
+        let before = io.steps.load(Relaxed);
+        let result = conn.prepare(sql);
+        assert_eq!(io.steps.load(Relaxed), before, "{sql} pumped I/O");
+        conn.inner().set_yield_injector(None);
+        if sql == "DROP VIEW t" {
+            assert_eq!(result.err().unwrap().sqlstate, "42809");
+        } else {
+            drive_prerequisites(&io, &mut result.unwrap()).unwrap();
+        }
+    }
+    assert_eq!(
+        conn.prepare("SELECT indexname FROM pg_indexes WHERE tablename = 't'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("t_v_idx1")]]
+    );
+}
+
+fn drive_prerequisites(
+    io: &CountedYieldIO,
+    stmt: &mut turso_pg::Statement,
+) -> turso_pg::Result<()> {
+    use turso_core::{IOResult, IO};
+    loop {
+        let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
+        let result = stmt.run_ignore_rows_nonblock();
+        assert_eq!(
+            io.steps.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "nonblocking execution pumped I/O"
+        );
+        match result? {
+            IOResult::Done(()) => return Ok(()),
+            IOResult::IO(_) => io.step().unwrap(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NthYield(std::sync::atomic::AtomicUsize);
+
+impl NthYield {
+    fn new(n: usize) -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(n))
+    }
+}
+
+impl turso_core::mvcc::yield_points::YieldInjector for NthYield {
+    fn should_yield(
+        &self,
+        _instance: u64,
+        _key: u64,
+        _point: turso_core::mvcc::yield_points::YieldPoint,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.0.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)) == Ok(1)
+    }
+}
+
+#[derive(Default)]
+struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct CountedYieldIO {
+    inner: turso_core::io::MemoryYieldIO,
+    steps: std::sync::atomic::AtomicUsize,
+}
+
+impl turso_core::Clock for CountedYieldIO {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl turso_core::IO for CountedYieldIO {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.step()
+    }
+}
+
 fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>) {
     let io = Arc::new(turso_core::MemoryIO::new());
     let db = turso_core::Database::open_file_with_flags(
@@ -599,10 +2007,160 @@ fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>)
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(turso_core::SqliteDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.set_foreign_keys_enabled(true);
     (io, conn)
+}
+
+#[test]
+fn result_kind_uses_original_sql_and_survives_reset() {
+    use turso_pg::StatementResultKind::{Command, Rows};
+
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE results (v INTEGER)").unwrap();
+    for (sql, kind) in [
+        (
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+            Command,
+        ),
+        ("SET application_name = 'metadata'", Command),
+        ("RESET ALL", Command),
+        ("COMMENT ON TABLE results IS 'metadata'", Command),
+        ("INSERT INTO results VALUES (1)", Command),
+        ("UPDATE results SET v = 2", Command),
+        ("DELETE FROM results", Command),
+        ("SELECT 'LOCK TABLE results'", Rows),
+        ("SELECT v FROM results WHERE false", Rows),
+        ("SHOW application_name", Rows),
+        ("EXPLAIN SELECT v FROM results", Rows),
+        ("INSERT INTO results VALUES (3) RETURNING v", Rows),
+        ("UPDATE results SET v = 4 RETURNING v", Rows),
+        ("DELETE FROM results RETURNING v", Rows),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.result_kind(), kind, "{sql}");
+        for _ in 0..2 {
+            stmt.run_ignore_rows().unwrap();
+            assert_eq!(stmt.result_kind(), kind, "{sql}");
+            stmt.reset().unwrap();
+            assert_eq!(stmt.result_kind(), kind, "{sql}");
+        }
+    }
+    conn.execute("BEGIN").unwrap();
+    let mut lock = conn
+        .prepare("LOCK TABLE results IN ACCESS SHARE MODE")
+        .unwrap();
+    assert_eq!(lock.result_kind(), Command);
+    assert!(lock.num_columns() > 0);
+    for _ in 0..2 {
+        lock.run_ignore_rows().unwrap();
+        lock.reset().unwrap();
+        assert_eq!(lock.result_kind(), Command);
+    }
+    conn.execute("COMMIT").unwrap();
+    let mut stmt = conn.prepare("SELECT $1 WHERE false").unwrap();
+    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(7))
+        .unwrap();
+    assert_eq!(stmt.result_kind(), Rows);
+    assert_eq!(stmt.num_columns(), 1);
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
+
+    for (stmt, expected) in conn
+        .query_runner(b"SET application_name = 'runner'; SELECT 1")
+        .zip([Command, Rows])
+    {
+        let mut stmt = stmt.unwrap().unwrap();
+        assert_eq!(stmt.result_kind(), expected);
+        stmt.run_ignore_rows().unwrap();
+    }
+}
+
+#[test]
+fn result_kind_preserves_copy_rows_on_both_prepare_paths() {
+    use turso_pg::StatementResultKind::CopyOut;
+
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE copy_results (v INTEGER)")
+        .unwrap();
+    let sql = "COPY copy_results (v) TO STDOUT";
+    let spec = turso_pg_parser::copy::parse_copy_to_stdout(sql)
+        .unwrap()
+        .unwrap();
+    let mut statements = [
+        conn.prepare(sql).unwrap(),
+        conn.prepare_copy_to_stdout(&spec).unwrap(),
+    ];
+    for stmt in &mut statements {
+        assert_eq!(stmt.result_kind(), CopyOut);
+        assert_eq!(stmt.num_columns(), 1);
+        assert_eq!(stmt.get_column_name(0), "v");
+        assert!(stmt.run_collect_rows().unwrap().is_empty());
+        stmt.reset().unwrap();
+    }
+    conn.execute("INSERT INTO copy_results VALUES (42)")
+        .unwrap();
+    for stmt in &mut statements {
+        assert_eq!(stmt.result_kind(), CopyOut);
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(42)]]
+        );
+    }
+    assert!(conn
+        .prepare("COPY copy_results TO STDOUT WITH (FORMAT binary)")
+        .is_err());
+    assert!(conn.prepare("COPY (SELECT 1) TO STDOUT").is_err());
+}
+
+#[test]
+fn command_result_kind_preserves_effects_errors_and_completion() {
+    use turso_pg::StatementResultKind::Command;
+
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE command_results (v INTEGER)")
+        .unwrap();
+    let mut set = conn
+        .prepare("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .unwrap();
+    assert_eq!(set.result_kind(), Command);
+    assert!(!conn.inner().is_tx_read_only());
+    conn.execute("BEGIN").unwrap();
+    assert!(!conn.inner().is_tx_read_only());
+    set.run_ignore_rows().unwrap();
+    assert!(conn.inner().is_tx_read_only());
+    assert_eq!(
+        exec_err(&conn, "INSERT INTO command_results VALUES (1)").sqlstate,
+        "25006"
+    );
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert_eq!(commit.result_kind(), Command);
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(commit.command_tag_override(), Some("ROLLBACK"));
+    commit.reset().unwrap();
+    assert_eq!(commit.result_kind(), Command);
+    assert_eq!(commit.command_tag_override(), None);
+    conn.execute("BEGIN").unwrap();
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(commit.command_tag_override(), None);
+
+    set.reset().unwrap();
+    conn.execute("BEGIN").unwrap();
+    set.run_ignore_rows().unwrap();
+    conn.execute("SELECT 1").unwrap();
+    let mut write = conn.prepare("SET TRANSACTION READ WRITE").unwrap();
+    assert_eq!(write.result_kind(), Command);
+    assert_eq!(write.run_ignore_rows().unwrap_err().sqlstate, "25001");
+    conn.execute("ROLLBACK").unwrap();
+
+    let mut schema = conn.prepare("CREATE SCHEMA metadata_schema").unwrap();
+    assert_eq!(schema.result_kind(), Command);
+    schema.run_ignore_rows().unwrap();
+    schema.reset().unwrap();
+    assert_eq!(schema.result_kind(), Command);
+    assert!(schema.run_ignore_rows().is_err());
 }

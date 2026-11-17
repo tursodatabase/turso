@@ -47,6 +47,17 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
         &self,
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>>;
+
+    /// Called when ALTER TABLE renames a column of a table that has an index of this method
+    /// Updates WITH clause parameters that name the column
+    fn rename_column_in_with_clause(
+        &self,
+        _with_clause: &mut [(ast::Name, Box<ast::Expr>)],
+        _from: &str,
+        _to: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +90,16 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
         parameters: &HashMap<i32, ast::Expr>,
     ) -> Option<Box<ast::Expr>> {
         crate::util::try_substitute_parameters(pattern, parameters)
+    }
+
+    /// Called when ALTER TABLE renames column `from` of the indexed table to `to`
+    /// Returns the attachment to use from now on, or None to keep this one
+    fn rename_column(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
+        Ok(None)
     }
 }
 
@@ -157,7 +178,7 @@ pub enum IndexMethodSnapshotIdentity {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum IndexMethodYieldPoint {
+pub enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -753,8 +774,7 @@ pub(crate) fn open_table_cursor(
 pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
     let mut parsed = Vec::new();
     for pattern in patterns {
-        let mut parser = turso_parser::parser::Parser::new(pattern.as_bytes());
-        let Some(ast) = parser.next() else {
+        let Some(ast) = crate::dialect::engine::parse_statement(pattern).transpose() else {
             return Err(LimboError::ParseError(format!(
                 "unable to parse pattern statement: {pattern}",
             )));

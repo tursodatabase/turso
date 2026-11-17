@@ -1,0 +1,13 @@
+---
+source: indexes.sqltest
+expression: SELECT * FROM r WHERE x >= 2 AND x <= 8 ORDER BY x DESC;
+info:
+  statement_type: SELECT
+  tables:
+  - r
+  setup_blocks:
+  - rowid_bounds
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH r USING INTEGER PRIMARY KEY (rowid>=? AND rowid<=?)

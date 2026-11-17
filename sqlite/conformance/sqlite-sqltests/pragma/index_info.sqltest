@@ -112,3 +112,29 @@ expect {
     pk|0|0|z
     0|0|z
 }
+
+@cross-check-integrity
+test pragma-index-info-expression-column {
+    CREATE TABLE t(a, b, c, d);
+    CREATE INDEX i_expr ON t(substr(b,1,1), a);
+    SELECT seqno, cid, quote(name) FROM pragma_index_info('i_expr');
+    ALTER TABLE t DROP COLUMN d;
+    ALTER TABLE t RENAME COLUMN a TO z;
+    PRAGMA index_info('i_expr');
+}
+expect {
+    0|-2|NULL
+    1|0|'a'
+    0|-2|
+    1|0|z
+}
+
+@cross-check-integrity
+test pragma-index-info-virtual-generated-column {
+    CREATE TABLE t(a, b, g AS (a*2));
+    CREATE INDEX i ON t(g);
+    PRAGMA index_info('i');
+}
+expect {
+    0|2|g
+}

@@ -79,3 +79,33 @@ test create-temp-trigger-missing-table-reports-plain-name {
 expect error {
     no such table: nosuch
 }
+
+# A table that a statement reads or writes in a database that is not
+# attached is a missing table, not an unknown database.
+test select-table-in-unknown-database {
+    SELECT * FROM nosuchdb.t;
+}
+expect error {
+    no such table: nosuchdb.t
+}
+
+test insert-table-in-unknown-database {
+    INSERT INTO nosuchdb.t VALUES (1);
+}
+expect error {
+    no such table: nosuchdb.t
+}
+
+test update-table-in-unknown-database {
+    UPDATE nosuchdb.t SET x = 1;
+}
+expect error {
+    no such table: nosuchdb.t
+}
+
+test delete-table-in-unknown-database {
+    DELETE FROM nosuchdb.t;
+}
+expect error {
+    no such table: nosuchdb.t
+}

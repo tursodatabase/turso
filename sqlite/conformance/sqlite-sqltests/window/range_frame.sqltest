@@ -487,3 +487,17 @@ test range-offset-rejects-zero-order-by {
 }
 expect error {
 }
+
+# CAST(x AS) with no type name converts x as CAST(x AS NUMERIC) does, so a RANGE
+# offset works.
+@setup base
+test range-offset-over-cast-without-type-name {
+    SELECT id, count(*) OVER (ORDER BY CAST(v AS) RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+    3|2
+    4|2
+    5|2
+}

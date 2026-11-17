@@ -3,6 +3,7 @@ use super::output::{EmittedNodeOutput, NodeOutputContract};
 use super::stream::{emit_ephemeral_delta_row, open_ephemeral_delta, EphemeralDelta};
 use crate::incremental::dag;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
@@ -35,17 +36,19 @@ pub(super) fn emit_filter(
     )?;
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 
@@ -69,13 +72,7 @@ pub(super) fn emit_filter(
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
-    seed_ephemeral_stream_cache(
-        program,
-        input,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
     let bound_predicate = remap_bound_expr(predicate, &binding_remap)?;
     translate_condition_expr(
         program,
@@ -387,17 +384,19 @@ fn emit_project_rows(
     );
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 
@@ -408,13 +407,7 @@ fn emit_project_rows(
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
-    seed_ephemeral_stream_cache(
-        program,
-        input,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
 
     turso_assert!(
         output.identity == input.identity

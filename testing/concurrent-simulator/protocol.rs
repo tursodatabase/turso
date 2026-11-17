@@ -105,8 +105,8 @@ impl WorkerResponse {
 /// (so it round-trips through `error_kind_to_limbo_error` unchanged).
 /// For unit variants, return the Display form. Using `Display` for
 /// inner-string variants would prepend the Display prefix
-/// (e.g. `"Parse error: {0}"`); the receiver would then
-/// reconstruct `LimboError::ParseError("Parse error: ...")`. A
+/// (e.g. `"Corrupt database: {0}"`); the receiver would then
+/// reconstruct `LimboError::Corrupt("Corrupt database: ...")`. A
 /// `SequenceExhausted` sends its sequence name; the direction rides in
 /// the error kind.
 pub fn limbo_error_to_message(err: &LimboError) -> String {
@@ -144,6 +144,9 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::CheckpointFailed(_) => "CheckpointFailed",
         LimboError::ParseError(_) => "ParseError",
         LimboError::TxError(_) => "TxError",
+        LimboError::TransactionAlreadyActive => "TransactionAlreadyActive",
+        LimboError::NoActiveTransaction { op: "commit" } => "NoActiveTransactionCommit",
+        LimboError::NoActiveTransaction { .. } => "NoActiveTransactionRollback",
         LimboError::DatabaseFull => "DatabaseFull",
         LimboError::SequenceExhausted {
             ascending: true, ..
@@ -176,6 +179,9 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "CheckpointFailed" => LimboError::CheckpointFailed(message.to_string()),
         "ParseError" => LimboError::ParseError(message.to_string()),
         "TxError" => LimboError::TxError(message.to_string()),
+        "TransactionAlreadyActive" => LimboError::TransactionAlreadyActive,
+        "NoActiveTransactionCommit" => LimboError::NoActiveTransaction { op: "commit" },
+        "NoActiveTransactionRollback" => LimboError::NoActiveTransaction { op: "rollback" },
         "DatabaseFull" => LimboError::DatabaseFull,
         "SequenceExhaustedMax" => LimboError::SequenceExhausted {
             name: message.to_string(),

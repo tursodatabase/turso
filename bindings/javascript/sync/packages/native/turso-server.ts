@@ -94,9 +94,6 @@ export class TursoServer {
                 const port = await getFreePort();
                 const child = spawn(localSyncServer, [
                     '--sync-server', `0.0.0.0:${port}`,
-                    // enable experimental features on the server so synced clients
-                    // can push schemas that use them (e.g. generated columns)
-                    '--experimental-generated-columns',
                 ], {
                     stdio: 'ignore',
                 });

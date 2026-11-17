@@ -60,6 +60,7 @@ pub struct Column {
 pub enum BackendEvent {
     RowDescription(Vec<Column>),
     DataRow(Vec<Option<String>>),
+    CopyData(Vec<u8>),
     CommandComplete(String),
     EmptyQueryResponse,
     ErrorResponse(ErrorFields),
@@ -240,6 +241,7 @@ impl PgConn {
         Ok(match tag {
             b'T' => BackendEvent::RowDescription(parse_row_description(&body)?),
             b'D' => BackendEvent::DataRow(parse_data_row(&body)?),
+            b'd' => BackendEvent::CopyData(body),
             b'C' => {
                 let mut r = Reader::new(&body);
                 BackendEvent::CommandComplete(r.cstring()?)

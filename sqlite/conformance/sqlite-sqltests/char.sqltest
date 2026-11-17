@@ -128,3 +128,11 @@ expect {
     004100004200
 }
 
+# Codepoints that only fit in 64 bits are out of range too; they must not be
+# truncated to 32 bits first (4294967296 would become U+0000).
+test char-codepoint-above-u32-is-replacement {
+    SELECT HEX(CHAR(4294967296)), HEX(CHAR(4294967297)), HEX(CHAR(4294967361));
+}
+expect {
+    EFBFBD|EFBFBD|EFBFBD
+}

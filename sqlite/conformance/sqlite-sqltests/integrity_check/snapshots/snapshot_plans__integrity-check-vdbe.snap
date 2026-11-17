@@ -110,7 +110,7 @@ addr  opcode         p1   p2   p3  p4                                   p5  comm
   93  Next            0   20    0                                        0
   94  Close           1    0    0                                        0
   95  Count           2   22    0                                        0
-  96  Eq             22    7  102                                        0  if r[22]==r[7] goto 102
+  96  Eq             22    7  102  Binary                                0  if r[22]==r[7] goto 102
   97  String8         0    4    0  wrong # of entries in index idx_t_c   0  r[4]='wrong # of entries in index idx_t_c'
   98  Integer         1    3    0                                        0  r[3]=1
   99  ResultRow       4    1    0                                        0  output=r[4]
@@ -118,7 +118,7 @@ addr  opcode         p1   p2   p3  p4                                   p5  comm
  101  Halt            0    0    0                                        0
  102  Close           2    0    0                                        0
  103  Count           3   23    0                                        0
- 104  Eq             23    8  110                                        0  if r[23]==r[8] goto 110
+ 104  Eq             23    8  110  Binary                                0  if r[23]==r[8] goto 110
  105  String8         0    4    0  wrong # of entries in index idx_t_b   0  r[4]='wrong # of entries in index idx_t_b'
  106  Integer         1    3    0                                        0  r[3]=1
  107  ResultRow       4    1    0                                        0  output=r[4]

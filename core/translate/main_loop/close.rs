@@ -3,7 +3,7 @@ use crate::translate::main_loop::hash::{
     emit_hash_join_unmatched_build_rows, GraceHashLoop, HashProbeCloseEmitter,
 };
 use crate::translate::main_loop::open::{
-    emit_right_join_key, emit_table_read_start, TableReadCursors,
+    emit_right_join_key, emit_row_filter, emit_table_read_start, TableReadCursors,
 };
 use crate::translate::subquery::emit_non_from_clause_subquery;
 
@@ -401,13 +401,13 @@ fn emit_unmatched_right_rows(
             program.emit_insn(Insn::OpenRead {
                 cursor_id: table_cursor_id,
                 root_page: btree.root_page,
-                db: table.database_id,
+                db: table.namespace.database_id,
             });
             for (index, index_cursor_id) in &unmatched_index_cursors {
                 program.emit_insn(Insn::OpenRead {
                     cursor_id: *index_cursor_id,
                     root_page: index.root_page,
-                    db: table.database_id,
+                    db: table.namespace.database_id,
                 });
             }
         }
@@ -480,6 +480,14 @@ fn emit_unmatched_right_rows(
             },
         )
     })?;
+
+    // A row that row-level security hides is not an unmatched row either, and
+    // the conditions below must not see it.
+    if let Some(row_filter) = &table.row_filter {
+        program.with_cursor_overrides(&cursor_overrides, |program| {
+            emit_row_filter(program, t_ctx, tables, table, row_filter, next_row)
+        })?;
+    }
 
     // Other copied subqueries belong to the copied WHERE clause. This code is
     // inside the right-table loop, so it runs again for each candidate row.
@@ -792,16 +800,23 @@ fn assign_new_subquery_output(
                 QueryDestination::ExistsSubqueryResult { result_reg },
             )
         }
-        SubqueryType::RowValue { num_regs, .. } => {
+        SubqueryType::RowValue {
+            num_regs,
+            row_count_reg,
+            ..
+        } => {
             let result_reg_start = program.alloc_registers(*num_regs);
+            let row_count_reg = row_count_reg.map(|_| program.alloc_register());
             (
                 SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: *num_regs,
+                    row_count_reg,
                 },
                 QueryDestination::RowValueSubqueryResult {
                     result_reg_start,
                     num_regs: *num_regs,
+                    row_count_reg,
                 },
             )
         }
@@ -1139,10 +1154,12 @@ pub(super) fn emit_autoindex(
     // the probe treats a NULL key as "definitely absent", which would skip rows
     // whose key IS NULL, so such a seek never probes — and then building the
     // filter would be wasted work on every row.
-    let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {
-        col.collation
-            .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
-    }) && seek_def.start.op.eq_only()
+    let use_bloom_filter = index
+        .columns
+        .iter()
+        .take(num_seek_keys)
+        .all(|col| col.collation == CollationSeq::BINARY)
+        && seek_def.start.op.eq_only()
         && (0..num_seek_keys).all(|i| !seek_def.is_null_matching_key_component(i));
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {

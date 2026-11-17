@@ -135,9 +135,9 @@ class Database extends DatabasePromise {
         const io = memory ? memoryIO() : NodeIO;
         const run = runner(runOpts, io, engine);
 
-        super(engine.db() as unknown as any, () => run.wait());
+        super(db, () => run.wait());
 
-        this.#db = engine.db() as unknown as any;
+        this.#db = db;
         this.#runner = run;
         this.#engine = engine;
         this.#guards = new SyncEngineGuards();

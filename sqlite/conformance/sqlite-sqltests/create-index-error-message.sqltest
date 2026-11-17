@@ -27,3 +27,171 @@ test create-index-on-view {
 expect error {
     views may not be indexed
 }
+
+# SQLite rejects a qualified column name anywhere in an indexed term, but
+# allows one in the WHERE clause of a partial index. A qualified name that
+# does not name a column of the indexed table is reported as a missing column
+# instead.
+
+test create-index-qualified-column-in-expression {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a + 1);
+}
+expect error {
+    the "." operator prohibited in index expressions
+}
+
+test create-index-qualified-column {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a);
+}
+expect error {
+    the "." operator prohibited in index expressions
+}
+
+test create-index-schema-qualified-column {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (main.t.a);
+}
+expect error {
+    the "." operator prohibited in index expressions
+}
+
+test create-index-qualified-column-with-collate {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (abs(t.a) COLLATE nocase);
+}
+expect error {
+    the "." operator prohibited in index expressions
+}
+
+test create-partial-index-qualified-column-in-where {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (a) WHERE t.b > 0;
+    INSERT INTO t VALUES (1, 1), (2, 0);
+    SELECT a FROM t INDEXED BY idx WHERE b > 0;
+}
+expect {
+    1
+}
+
+test create-index-qualified-column-case-insensitive {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t ("T"."A");
+}
+expect error {
+    the "." operator prohibited in index expressions
+}
+
+test create-index-other-table-qualifier {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (x.a);
+}
+expect error {
+    no such column: x.a
+}
+
+test create-index-qualified-unknown-column {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.zz);
+}
+expect error {
+    no such column: t.zz
+}
+
+test create-index-qualified-rowid {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.rowid);
+}
+expect error {
+    no such column: t.rowid
+}
+
+test create-index-other-schema-qualifier {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (temp.t.a);
+}
+expect error {
+    no such column: temp.t.a
+}
+
+test create-index-schema-qualified-other-table {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (main.x.a);
+}
+expect error {
+    no such column: main.x.a
+}
+
+test create-index-unresolved-qualified-column-after-resolved-one {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a + x.b);
+}
+expect error {
+    no such column: x.b
+}
+
+@skip-if mvcc "attach is not supported for mvcc"
+test create-index-attached-schema-qualified-column {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.u (a);
+    CREATE INDEX aux.idx ON u (aux.u.a);
+}
+expect error {
+    the "." operator prohibited in index expressions
+}
+
+@skip-if mvcc "attach is not supported for mvcc"
+test create-index-attached-table-qualified-with-main {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.u (a);
+    CREATE INDEX aux.idx ON u (main.u.a);
+}
+expect error {
+    no such column: main.u.a
+}
+
+# Any other error in a term with a qualified name is reported instead of the
+# "." error. Turso still reports these with its own "invalid expression in
+# CREATE INDEX" message, so the patterns accept either message.
+
+test create-index-qualified-column-and-unknown-column {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a + zz);
+}
+expect error {
+    zz
+}
+
+test create-index-qualified-column-and-parameter {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a + ?1);
+}
+expect error {
+    parameters prohibited|invalid expression
+}
+
+test create-index-qualified-column-and-non-deterministic-function {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a + random());
+}
+expect error {
+    non-deterministic functions prohibited|invalid expression
+}
+
+test create-index-qualified-column-and-subquery {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t ((SELECT 1) + t.a);
+}
+expect error {
+    subqueries prohibited|invalid expression
+}
+
+# SQLite stops at the first term with an error.
+test create-index-qualified-column-before-unknown-column {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t (t.a, zz);
+}
+expect error {
+    the "." operator prohibited in index expressions
+}

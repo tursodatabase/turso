@@ -1,0 +1,37 @@
+@database :memory:
+
+test json_pretty_empty_containers {
+    SELECT json_pretty('[]'), json_pretty('{}');
+}
+expect {
+    []|{}
+}
+
+test json_pretty_nested_empty_containers_default_indent {
+    SELECT json_pretty('{"a":{},"b":[]}');
+}
+expect raw {
+\{
+    "a": {},
+    "b": []
+\}
+}
+
+test json_pretty_nested_empty_containers_custom_indent {
+    SELECT json_pretty('{"a":{},"b":[]}', '  ');
+}
+expect raw {
+\{
+  "a": {},
+  "b": []
+\}
+}
+
+test json_pretty_empty_in_predicate {
+    CREATE TABLE t(doc TEXT);
+    INSERT INTO t VALUES ('{}'), ('{"x":1}');
+    SELECT count(*) FROM t WHERE doc = json_pretty('{}');
+}
+expect {
+    1
+}

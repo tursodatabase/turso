@@ -194,8 +194,13 @@ impl TextValue {
 
     fn new_boxed(s: String, sub: TextSubtype) -> Box<Self> {
         let len = s.len();
-        let buffer = s.into_boxed_str();
-        let strbox = Box::into_raw(buffer);
+        // Store the text with a trailing NUL (len + 1 bytes) so the pointer handed to
+        // C via sqlite3_value_text is a valid NUL-terminated string, as the SQLite API
+        // contract requires (#7982). `len` still counts only the text, so as_str() /
+        // to_text() are unchanged.
+        let mut buffer = s.into_bytes();
+        buffer.push(0);
+        let strbox = Box::into_raw(buffer.into_boxed_slice());
         Box::new(Self {
             _type: sub,
             text: strbox as *const u8,
@@ -206,7 +211,9 @@ impl TextValue {
     #[cfg(feature = "core_only")]
     fn free(self) {
         if !self.text.is_null() {
-            let ptr = std::ptr::slice_from_raw_parts_mut(self.text as *mut u8, self.len as usize);
+            // The buffer was allocated with a trailing NUL (len + 1); free all of it.
+            let ptr =
+                std::ptr::slice_from_raw_parts_mut(self.text as *mut u8, self.len as usize + 1);
             let _ = unsafe { Box::from_raw(ptr) };
         }
     }
@@ -236,10 +243,12 @@ impl ErrValue {
     }
 
     fn new_with_message(code: ResultCode, message: String) -> Self {
-        let buffer = message.into_boxed_str();
-        let ptr = buffer.as_ptr();
-        let len = buffer.len();
-        std::mem::forget(buffer);
+        let len = message.len();
+        // Trailing NUL (len + 1), matching new_boxed, so free() frees the right size
+        // and the stored message is a valid NUL-terminated C string.
+        let mut buffer = message.into_bytes();
+        buffer.push(0);
+        let ptr = Box::into_raw(buffer.into_boxed_slice()) as *const u8;
         let text_value = TextValue::new(ptr, len);
         Self {
             code,
@@ -527,6 +536,33 @@ impl Value {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sqlite3_value_text` must hand back a NUL-terminated C string. The pointer it
+    /// returns is `Value::to_text()?.as_ptr()`, so the buffer backing the text has to
+    /// carry a trailing NUL at `len`. See
+    /// https://github.com/tursodatabase/turso/issues/7982.
+    #[test]
+    fn text_value_pointer_is_nul_terminated() {
+        for input in ["hello", "", "a longer string with spaces", "NUL\0inside"] {
+            let v = Value::from_text(input.to_string());
+            let text = v.to_text().expect("text value");
+            // The stored length still counts only the text, so to_text() is unchanged.
+            assert_eq!(text, input);
+            // The byte one past the text — where C's strlen stops — must be NUL.
+            unsafe {
+                assert_eq!(
+                    *text.as_ptr().add(text.len()),
+                    0,
+                    "value text {input:?} is not NUL-terminated"
+                );
+            }
         }
     }
 }

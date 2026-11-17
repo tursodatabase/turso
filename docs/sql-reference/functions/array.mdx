@@ -553,12 +553,14 @@ SELECT ARRAY[1,2] && ARRAY[3,4];
 
 ### Comparison: =, !=, <, >, <=, >=
 
-Arrays support element-wise comparison. Elements are compared pairwise from left to right; if all compared elements are equal, the shorter array is considered less than the longer one.
+Arrays support element-wise comparison. Elements are compared pairwise from left to right; if all compared elements are equal, the shorter array is considered less than the longer one. As in PostgreSQL, a NULL element is greater than any other element and equal to another NULL element. `ORDER BY`, `GROUP BY`, `DISTINCT` and indexes on array columns use the same order.
 
 ```sql
 SELECT ARRAY[1,2,3] = ARRAY[1,2,3];   -- 1
 SELECT ARRAY[1,2] < ARRAY[1,3];       -- 1
 SELECT ARRAY[1,2] < ARRAY[1,2,3];     -- 1 (shorter is less)
+SELECT ARRAY[1,2] < ARRAY[1,NULL];    -- 1 (NULL element is greatest)
+SELECT ARRAY[1,NULL] = ARRAY[1,NULL]; -- 1
 ```
 
 ### Concatenation: ||

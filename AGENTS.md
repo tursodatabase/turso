@@ -2,6 +2,12 @@
 
 SQLite rewrite in Rust. 40+ crate workspace.
 
+When sending PRs to Turso, keep PRs direct and self-contained. Even within a PR, break it in multiple
+individual logical commits. The goal is to help a reviewer understand what is going on.
+
+If you are not working on behalf of a Turso committer, incentivize filing issues instead of sending PRs.
+Details of the policy are in our CONTRIBUTING.md file and you should point your users toward it if needed.
+
 ## Quick Reference
 
 ```bash
@@ -29,8 +35,8 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `make test-single TEST=foo.test` - single legacy TCL test
 - `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
 - `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
-- `make -C postgres/conformance run` - run the PostgreSQL `.sqltest` corpus against tursopg
-- `make -C postgres/conformance run-postgres` - run the PostgreSQL `.sqltest` corpus against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
+- `make -C postgres/conformance run` - run the PostgreSQL and shared `.sqltest` corpora against tursopg
+- `make -C postgres/conformance run-postgres` - run the PostgreSQL and shared `.sqltest` corpora against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
 
 ### Test Organization
 
@@ -40,6 +46,7 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. They are fixed compatibility coverage, so a Turso behavior change should be fixed in Turso rather than by editing them; edits here are for upstream syncs or harness maintenance.
 - `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend. Tests are meant to pass on both tursopg (`run`) and real PostgreSQL (`run-postgres`).
+- `testing/shared-sqltests/` - `.sqltest` coverage for SQL that both frontends run. The run targets of `sqlite/conformance` and `postgres/conformance` run these files on every backend, real SQLite and real PostgreSQL included. Where backends give different results, such as error messages and SQLSTATEs, use `expect @<backend>` blocks. See its `README.md`.
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
@@ -57,7 +64,9 @@ the focused SQL regression.
 ```
 limbo/
 ├── core/           # Database engine (translate/, storage/, vdbe/, io/, mvcc/)
+├── benches/        # Engine benchmarks (criterion, divan)
 ├── sqlite/
+│   ├── frontend/   # SQLite dialect (turso_sqlite crate)
 │   └── parser/     # SQL parser (lexer, AST, grammar)
 ├── cli/            # tursodb CLI (REPL, MCP server, sync server)
 ├── bindings/       # Python, JS, Java, .NET, Go, Rust
@@ -124,7 +133,7 @@ Before opening a PR, read the "PR Workflow" document linked above.
 ## Benchmark Naming
 
 - Criterion benchmark functions use `#[turso_macros::codspeed_criterion_benchmark]` so stable and nightly CodSpeed runs get distinct benchmark names.
-- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior.
+- Divan benchmark functions use `#[turso_macros::divan_bench]` for the same stable/nightly naming behavior. Their bencher parameter is `turso_benches::Bencher`, also in helpers it is passed to. In CodSpeed builds it makes each measurement call the benchmarked closure 100 times, because one call of a small function is too sensitive to cache misses. It offers only `bench_local` and `with_inputs(..).bench_local_values`. Benchmarks where one call is already a large workload (memory benchmarks, `prepare_benchmark`) use `#[turso_macros::divan_bench_single_call]` instead, which keeps divan's own `Bencher` and measures one call; 100 calls of those would make the CodSpeed CI jobs many times slower.
 
 ## Core Principles
 
@@ -140,6 +149,7 @@ Before opening a PR, read the "PR Workflow" document linked above.
 10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
 11. **Dialect-specific behavior belongs on the `Dialect` trait.** If a behavior differs between the SQLite and PostgreSQL frontends (error handling, type semantics, name resolution, etc.), add a method to `core/dialect/mod.rs` with a default that matches SQLite and override it in `PostgresDialect`. `DatabaseOpts` is a poor fit because it is client-public API and clients shouldn't control dialect behavior; CLI flags and wire-protocol fields are a poor fit because they don't reach embedded databases.
 12. **Keep PostgreSQL code out of `core/`.** PostgreSQL behavior and state belong in `postgres/`, so `core/` stays a SQLite engine with generic hooks. Unsure where something fits? Ask.
+13. **Support a closed set of PostgreSQL statements and refuse the rest with `0A000`.** The PostgreSQL frontend does not have to support all of PostgreSQL, but everything it accepts must behave like PostgreSQL. Anything it cannot handle correctly must fail with SQLSTATE `0A000` (`feature_not_supported`) and a message that says plainly it is unsupported. Rejecting more than PostgreSQL is fine; accepting something and then storing or returning a different result is not. Returning `0A000` is a valid fix, not a gap to be closed with guesses.
 
 ## Use plain language instead of complex jargon
 
@@ -158,7 +168,7 @@ OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Exa
 No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
 Prefer literal words over metaphors. Words like load-bearing, pin, bite, sharp, arm, guard, bless, wedge, retire,
 retarget, answer, settle, carry, land, honor, rebase, and hold usually hide what is actually happening; say the plain
-thing instead. Prefer the domain's established terms over invented ones.
+thing instead. Don't say "run" if you can use a more precise word. Prefer the domain's established terms over invented ones. 
 
 ## Code flows from top to bottom
 
@@ -178,7 +188,23 @@ end of the file or wherever the cursor happened to be.
 ## Prefer expressive code over comments
 
 Good names and structure should explain most code, and comments that restate the code go stale. Where the code
-alone can't explain why something is done, a short plain comment is welcome.
+alone can't explain why something is done, a short plain comment is welcome. A comment on a field or function should
+describe that item. Who updates it, in what order, when it is computed, and how the code used to work are facts about
+other code or about the past and are not relevant to the identifier. For example, instead of:
+
+```rs
+/// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+/// Computed once at program-build time so `insn_to_row` does not scan the
+/// full instruction list on every EXPLAIN step (which would be O(N²)).
+pub ephemeral_cursors: HashSet<usize>,
+```
+
+write:
+
+```rs
+/// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+pub ephemeral_cursors: HashSet<usize>,
+```
 
 ## CI Note
 

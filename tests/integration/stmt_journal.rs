@@ -530,9 +530,7 @@ fn update_rowid_alias_to_text_on_later_row_keeps_no_changes(
 
 #[test]
 fn update_making_not_null_generated_column_null_on_later_row_keeps_no_changes() {
-    let tmp_db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
-        .build();
+    let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b AS (a + 0) NOT NULL)")
         .unwrap();

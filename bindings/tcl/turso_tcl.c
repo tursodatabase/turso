@@ -1540,21 +1540,6 @@ static StmtHandle *find_stmt_handle(Tcl_Interp *interp, Tcl_Obj *name_obj)
     return NULL;
 }
 
-/* Turso prefixes some error messages (e.g. "Parse error: no such table")
- * where SQLite reports just the message; the C-API tests match on the
- * SQLite form, so strip the prefix like tester.tcl's normalize_errmsg. */
-static const char *strip_err_prefix(const char *msg)
-{
-    static const char *prefixes[] = { "Parse error: ", "Runtime error: ", NULL };
-    int i;
-    if (!msg) return "";
-    for (i = 0; prefixes[i]; i++) {
-        size_t n = strlen(prefixes[i]);
-        if (strncmp(msg, prefixes[i], n) == 0) return msg + n;
-    }
-    return msg;
-}
-
 /*
  * sqlite3_prepare DB SQL BYTES ?TAILVAR?
  * sqlite3_prepare_v2 DB SQL BYTES ?TAILVAR?
@@ -1610,7 +1595,7 @@ static int TursoPrepareCmd(ClientData cd, Tcl_Interp *interp,
 
     if (rc != SQLITE_OK) {
         Tcl_SetObjResult(interp, Tcl_ObjPrintf("(%d) %s", rc,
-            strip_err_prefix(sqlite3_errmsg(tdb->db))));
+            sqlite3_errmsg(tdb->db)));
         return TCL_ERROR;
     }
     if (!stmt) {
@@ -2241,7 +2226,7 @@ static int TursoErrmsgCmd(ClientData cd, Tcl_Interp *interp,
     TursoDb *tdb;
     if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
     Tcl_SetResult(interp,
-        (char *)strip_err_prefix(sqlite3_errmsg(tdb->db)), TCL_VOLATILE);
+        (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
     return TCL_OK;
 }
 
@@ -2778,7 +2763,7 @@ static int TursoTableColumnMetadataCmd(ClientData cd, Tcl_Interp *interp,
         col_name, &decltype, &collseq, &notnull, &primarykey, &autoincrement);
     if (rc != SQLITE_OK) {
         Tcl_SetResult(interp,
-            (char *)strip_err_prefix(sqlite3_errmsg(tdb->db)), TCL_VOLATILE);
+            (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
         return TCL_ERROR;
     }
 

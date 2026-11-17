@@ -22,5 +22,5 @@ test expr_depth_or_chain_over_limit {
     SELECT 1{{repeat:expr_depth_limit: OR 1}};
 }
 expect error {
-    Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+    Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
 }

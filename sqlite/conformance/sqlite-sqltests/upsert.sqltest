@@ -1050,6 +1050,25 @@ expect {
     1
 }
 
+# A non-unique index cannot cause a conflict, so it does not make DO UPDATE
+# reachable.
+@cross-check-integrity
+test upsert-do-update-not-compiled-when-table-has-only-non-unique-index {
+    CREATE TABLE t (a INT, b INT);
+    CREATE INDEX i ON t (a);
+    INSERT INTO t VALUES (1, 10) ON CONFLICT DO UPDATE SET nosuch = 1;
+    CREATE TABLE u(a);
+    CREATE INDEX j ON u (a);
+    CREATE TRIGGER w BEFORE UPDATE ON u BEGIN INSERT INTO gone VALUES (1); END;
+    INSERT INTO u VALUES (1) ON CONFLICT DO UPDATE SET a = 2;
+    SELECT * FROM t;
+    SELECT * FROM u;
+}
+expect {
+    1|10
+    1
+}
+
 test upsert-do-update-compiled-when-insert-sets-rowid {
     CREATE TABLE t(a, b INTEGER PRIMARY KEY);
     INSERT INTO t(a, b) VALUES (1, 1) ON CONFLICT DO UPDATE SET nosuch = 1;
@@ -1061,6 +1080,15 @@ expect error {
 test upsert-do-update-compiled-when-table-has-unique-index {
     CREATE TABLE t(a UNIQUE);
     INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET nosuch = 1;
+}
+expect error {
+    no such column: nosuch
+}
+
+test upsert-do-update-compiled-when-table-has-unique-index-created-separately {
+    CREATE TABLE t (a INT, b INT);
+    CREATE UNIQUE INDEX i ON t (a);
+    INSERT INTO t VALUES (1, 10) ON CONFLICT DO UPDATE SET nosuch = 1;
 }
 expect error {
     no such column: nosuch

@@ -80,6 +80,88 @@ expect {
     2
 }
 
+# With a window function, an aggregate anywhere in the ORDER BY of a
+# non-aggregate query is a misuse, also without a FROM clause and also
+# inside the window definition.
+test order-by-window-with-aggregate-without-from {
+    SELECT 1 ORDER BY row_number() OVER (ORDER BY sum(1));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-window-with-aggregate-from-table {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a FROM t ORDER BY row_number() OVER (ORDER BY sum(a));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-window-partition-by-aggregate {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT a FROM t ORDER BY row_number() OVER (PARTITION BY sum(a));
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-window-argument-aggregate {
+    SELECT 1 ORDER BY lag(sum(1)) OVER ();
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-aggregate-next-to-window {
+    SELECT 1 ORDER BY row_number() OVER (), sum(1);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-aggregate-with-result-window {
+    SELECT row_number() OVER () ORDER BY sum(1);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+# Without a window function and without FROM, the ORDER BY aggregate is allowed.
+test order-by-aggregate-without-from-ok {
+    SELECT 1 ORDER BY sum(1);
+}
+expect {
+    1
+}
+
+test order-by-window-with-aggregate-in-aggregate-query-ok {
+    SELECT sum(1) ORDER BY row_number() OVER (ORDER BY sum(1));
+}
+expect {
+    1
+}
+
+# An aggregate inside a window function of the result makes the query an
+# aggregate query, so the ORDER BY may use aggregates.
+test order-by-aggregate-with-result-window-over-aggregate-ok {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    SELECT row_number() OVER (ORDER BY sum(a)) FROM t ORDER BY sum(a);
+}
+expect {
+    1
+}
+
+test order-by-windows-over-aggregates-ok {
+    SELECT row_number() OVER (ORDER BY sum(1)) ORDER BY row_number() OVER (ORDER BY count(*));
+}
+expect {
+    1
+}
+
 test scalar-aggregate-order-error-names-function {
     SELECT abs(-1 ORDER BY 1);
 }

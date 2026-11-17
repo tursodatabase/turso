@@ -33,7 +33,7 @@ addr  opcode        p1  p2  p3  p4            p5  comment
   12    Column       0   2  20                 0  r[20]=ordered_input_idx.b ->> 'x'
   13    Integer      1  21   0                 0  r[21]=1
   14    Integer      1  19   0                 0  r[19]=1
-  15    Eq          20  21  17                 0  if r[20]==r[21] goto 17
+  15    Eq          20  21  17  Binary         0  if r[20]==r[21] goto 17
   16    ZeroOrNull  20  19  21                 0  ((r[20]=NULL)|(r[21]=NULL)) ? r[19]=NULL : r[19]=0
   17    IfNot       19  20   1                 0  if !r[19] goto 20
   18    Column       0   3  11                 0  r[11]=ordered_input_idx.c

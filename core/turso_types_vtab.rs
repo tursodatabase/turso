@@ -29,6 +29,10 @@ impl InternalVirtualTable for TursoTypesTable {
         "CREATE TABLE sqlite_turso_types(name TEXT, sql TEXT)".to_string()
     }
 
+    fn superuser_only(&self) -> bool {
+        false
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         let cursor = TursoTypesCursor::new(conn);
         Ok(Arc::new(RwLock::new(cursor)))

@@ -14,7 +14,7 @@ use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
-use crate::{bail_constraint_error, LimboError, ValueRef};
+use crate::{LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
     jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
@@ -128,9 +128,9 @@ pub fn convert_dbtype_to_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Res
 fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
-    let str = std::str::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
-    Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
+    // Like CAST(blob AS TEXT), bytes that are not UTF-8 become U+FFFD.
+    let str = String::from_utf8_lossy(truncated);
+    Jsonb::from_str_with_mode(&str, mode).map_err(malformed_json_error)
 }
 
 /// Parses like [parse_as_json_text] but also reports whether the text
@@ -139,9 +139,8 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
 fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
     let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
-    let str = std::str::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
-    Jsonb::from_str_tracking(str).map_err(Into::into)
+    let str = String::from_utf8_lossy(truncated);
+    Jsonb::from_str_tracking(&str).map_err(Into::into)
 }
 
 fn malformed_json_error(error: JsonError) -> LimboError {
@@ -151,13 +150,11 @@ fn malformed_json_error(error: JsonError) -> LimboError {
     }
 }
 
-/// Whether a blob is a complete, fully valid JSONB document. Unlike
-/// [`looks_like_jsonb_blob`] this examines the whole payload, because
-/// later readers trust its interior offsets and decode its text
-/// payloads as `&str`: any blob's first byte parses as a plausible
-/// header, so the header alone cannot identify JSONB.
+/// Whether a JSON function reads a blob as JSONB: SQLite's rule in
+/// [`looks_like_jsonb_blob`], plus a check of the whole document,
+/// because later readers trust its interior offsets.
 fn is_jsonb_blob(slice: &[u8]) -> bool {
-    validate_jsonb(slice)
+    looks_like_jsonb_blob(slice) && validate_jsonb(slice)
 }
 
 /// SQLite's shallow "superficially looks like JSONB" test
@@ -226,42 +223,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             res.map_err(malformed_json_error)
         }
         ValueRef::Blob(blob) => {
-            let bytes = blob;
-            // Valid JSON can start with these whitespace characters
-            let index = bytes
-                .iter()
-                .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-                .unwrap_or(bytes.len());
-            let slice = &bytes[index..];
-            let json = match slice {
-                // branch with no overlapping initial byte
-                [b'"', ..] | [b'-', ..] | [b'0'..=b'2', ..] => parse_as_json_text(slice, strict)?,
-                _ => match JsonbHeader::from_slice(0, slice) {
-                    Ok((header, header_offset)) => {
-                        let payload_size = header.payload_size();
-                        let total_expected = match header_offset.checked_add(payload_size) {
-                            Some(t) => t,
-                            None => {
-                                return Err(LimboError::ParseError("malformed JSON".to_string()))
-                            }
-                        };
-
-                        if total_expected != slice.len() {
-                            parse_as_json_text(slice, strict)?
-                        } else {
-                            // Validate the whole document, not just the outer
-                            // header: later readers trust interior offsets and
-                            // the UTF-8 well-formedness of text payloads.
-                            let jsonb = Jsonb::from_raw_data(slice)?;
-                            if jsonb.is_valid() {
-                                jsonb
-                            } else {
-                                parse_as_json_text(slice, strict)?
-                            }
-                        }
-                    }
-                    Err(_) => parse_as_json_text(slice, strict)?,
-                },
+            // Like SQLite, a blob that is not JSONB is read as JSON text.
+            let json = if is_jsonb_blob(blob) {
+                Jsonb::from_raw_data(blob)?
+            } else {
+                parse_as_json_text(blob, strict)?
             };
             json.element_type()?;
             Ok(json)
@@ -299,7 +265,9 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
 pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
     if let ValueRef::Blob(blob) = value {
         if !is_jsonb_blob(blob) {
-            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+            return Err(LimboError::SqlError(
+                "JSON cannot hold BLOB values".to_string(),
+            ));
         }
     }
     Ok(())
@@ -394,6 +362,9 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -417,7 +388,7 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, OutputVariant::String)
+    json_document_to_db_type(json, el_type, OutputVariant::String)
 }
 
 pub fn jsonb_set<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -435,6 +406,9 @@ where
     let first_arg = args.next().ok_or_else(|| {
         crate::LimboError::InternalError("args should not be empty after length check".to_string())
     })?;
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
@@ -456,7 +430,7 @@ where
 
     let el_type = json.element_type()?;
 
-    json_string_to_db_type(json, el_type, OutputVariant::Binary)
+    json_document_to_db_type(json, el_type, OutputVariant::Binary)
 }
 
 /// Implements the -> operator. Always returns a proper JSON value.
@@ -660,6 +634,17 @@ pub fn json_string_to_db_type(
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
     }
+    // SQL values of TEXT5 strings are decoded from the payload, not from the
+    // JSON rendering, because escapes that cannot be rendered as JSON text
+    // still extract, as in SQLite.
+    if element_type == ElementType::TEXT5
+        && matches!(
+            flag,
+            OutputVariant::ElementType | OutputVariant::ElementTypePlain
+        )
+    {
+        return Ok(Value::Text(Text::new(json.scalar_string_value()?)));
+    }
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::String) {
         return Ok(Value::Text(Text::json(json_string)));
@@ -677,13 +662,9 @@ pub fn json_string_to_db_type(
                 flag,
                 OutputVariant::ElementType | OutputVariant::ElementTypePlain
             ) {
-                if element_type == ElementType::TEXT5 {
-                    Ok(Value::Text(Text::new(json.scalar_string_value()?)))
-                } else {
-                    json_string.remove(json_string.len() - 1);
-                    json_string.remove(0);
-                    Ok(Value::Text(Text::new(unescape_string(&json_string))))
-                }
+                json_string.remove(json_string.len() - 1);
+                json_string.remove(0);
+                Ok(Value::Text(Text::new(unescape_string(&json_string))))
             } else {
                 Ok(Value::Text(Text::new(json_string)))
             }
@@ -693,11 +674,11 @@ pub fn json_string_to_db_type(
             // f64, which is exactly what ->> and json_extract return.
             match json_string.parse::<f64>() {
                 Ok(float_val) => Ok(Value::from_f64(float_val)),
-                Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
+                Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
             }
         }
         ElementType::INT | ElementType::INT5 => {
-            if let Some(int) = json5_hex_literal_to_i64(json.scalar_payload_text()?)? {
+            if let Some(int) = json5_hex_literal_to_i64(&json.scalar_payload_text()?)? {
                 return Ok(Value::from_i64(int));
             }
             let result = i64::from_str(&json_string);
@@ -707,7 +688,7 @@ pub fn json_string_to_db_type(
                 let res = f64::from_str(&json_string);
                 match res {
                     Ok(num) => Ok(Value::from_f64(num)),
-                    Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
+                    Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
                 }
             }
         }
@@ -730,7 +711,7 @@ fn json5_hex_literal_to_i64(payload: &str) -> crate::Result<Option<i64>> {
     };
     let digits = digits.trim_start_matches('0');
     if digits.len() > 16 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(LimboError::Constraint("malformed JSON".to_string()));
+        return Err(LimboError::SqlError("malformed JSON".to_string()));
     }
     let magnitude = if digits.is_empty() {
         0
@@ -795,7 +776,9 @@ fn json_path_from_db_value<'a>(
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::ArrayLocator(Some(i as i32)),
+                        // SQLite reads integer N as the path `$[N]`, or `$[#N]`
+                        // when N is negative, which keeps only the low 32 bits.
+                        PathElement::array_locator(i.unsigned_abs() as u32, i < 0),
                     ],
                 }));
             }
@@ -807,7 +790,12 @@ fn json_path_from_db_value<'a>(
                     ],
                 }));
             }
-            _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
+            _ => {
+                return Err(LimboError::SqlError(format!(
+                    "JSON path error near: {:?}",
+                    path.to_string()
+                )))
+            }
         },
     };
     Ok(Some(json_path_from_text(text, strict)?))
@@ -848,6 +836,21 @@ fn json_edit_path<'a>(
         ensure_blob_arg_is_jsonb(value.as_value_ref())?;
     }
     json_path_from_db_value(path, true)
+}
+
+pub fn json_document_to_db_type(
+    json: Jsonb,
+    element_type: ElementType,
+    output: OutputVariant,
+) -> crate::Result<Value> {
+    if element_type == ElementType::NULL {
+        return if matches!(output, OutputVariant::Binary) {
+            Ok(Value::Blob(json.data()))
+        } else {
+            Ok(Value::Text(Text::json("null".to_string())))
+        };
+    }
+    json_string_to_db_type(json, element_type, output)
 }
 
 pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
@@ -916,7 +919,9 @@ where
 {
     let mut values = values.into_iter();
     if values.len() % 2 != 0 {
-        bail_constraint_error!("json_object() requires an even number of arguments")
+        return Err(LimboError::SqlError(
+            "json_object() requires an even number of arguments".to_string(),
+        ));
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50)?;
 
@@ -929,7 +934,9 @@ where
         })?;
         let first = first.as_value_ref();
         if first.value_type() != ValueType::Text {
-            bail_constraint_error!("json_object() labels must be TEXT")
+            return Err(LimboError::SqlError(
+                "json_object() labels must be TEXT".to_string(),
+            ));
         }
         let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
@@ -957,7 +964,9 @@ where
 {
     let mut values = values.into_iter();
     if values.len() % 2 != 0 {
-        bail_constraint_error!("json_object() requires an even number of arguments")
+        return Err(LimboError::SqlError(
+            "json_object() requires an even number of arguments".to_string(),
+        ));
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50)?;
 
@@ -970,7 +979,9 @@ where
         })?;
         let first = first.as_value_ref();
         if first.value_type() != ValueType::Text {
-            bail_constraint_error!("json_object() labels must be TEXT")
+            return Err(LimboError::SqlError(
+                "json_object() labels must be TEXT".to_string(),
+            ));
         }
         let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
@@ -1120,7 +1131,9 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
                 let json = Jsonb::from_raw_data(blob)?;
                 Ok(Value::Text(Text::json(json.to_string()?)))
             } else {
-                crate::bail_constraint_error!("JSON cannot hold BLOB values")
+                Err(LimboError::SqlError(
+                    "JSON cannot hold BLOB values".to_string(),
+                ))
             }
         }
         ValueRef::Null => Ok(Value::Text(Text::json("null".to_string()))),
@@ -2134,12 +2147,13 @@ mod tests {
         assert!(!is_jsonb_blob(overlapping_scalar));
     }
 
-    /// Object with a payload larger than a scalar blob, so header inspection
-    /// alone accepts it, but the TEXT5 key holds bytes that are not UTF-8.
-    /// Reading such a key used to reach `str::from_utf8_unchecked`.
+    /// Object whose TEXT5 key holds a byte that is not UTF-8. Like SQLite,
+    /// the blob is JSONB; reading the key decodes the byte as U+FFFD.
     #[test]
-    fn test_is_jsonb_blob_rejects_invalid_utf8_key() {
+    fn test_is_jsonb_blob_accepts_invalid_utf8_key() {
         let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
-        assert!(!is_jsonb_blob(invalid_utf8_key));
+        assert!(is_jsonb_blob(invalid_utf8_key));
+        let jsonb = Jsonb::from_raw_data(invalid_utf8_key).unwrap();
+        assert_eq!(jsonb.to_string().unwrap(), "{\"aaaaaa\u{FFFD}\":null}");
     }
 }

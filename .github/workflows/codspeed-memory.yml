@@ -148,7 +148,7 @@ jobs:
           rm codspeed-memory-benchmarks.tar.zst
 
       - name: Run memory benchmarks
-        uses: CodSpeedHQ/action@v4.17.0
+        uses: CodSpeedHQ/action@v5.6.3
         with:
           mode: memory
           # The CodSpeed runner runs this with `bash -c`; the single quotes

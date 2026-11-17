@@ -374,7 +374,6 @@ async fn main() -> Result<()> {
     let sql = read_sql(&args.sql)?;
 
     let db = turso::Builder::new_local(":memory:")
-        .experimental_generated_columns(true)
         .experimental_custom_types(true)
         .experimental_materialized_views(true)
         .build()

@@ -41,6 +41,8 @@ pub struct RunOptions {
     pub backend_type: Backend,
     /// Whether this is the sqlite CLI backend
     pub backend_is_sqlite: bool,
+    /// Whether the errors of the backend have a SQLSTATE (used by tests)
+    pub backend_reports_sqlstate: bool,
     /// Snapshot update mode (used by snapshots)
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Path to binary used for cross-checking integrity (None = disabled)
@@ -64,6 +66,12 @@ pub trait Runnable: Clone + Send + 'static {
     /// Check if this test should be skipped due to additional conditions (e.g., capabilities)
     /// Returns Some(reason) if should skip, None if can proceed
     fn check_skip_conditions(&self, options: &RunOptions) -> Option<String>;
+
+    /// Check that the backend can evaluate this item.
+    /// Returns Some(reason) if it cannot. The item then fails with an error instead of a skip.
+    fn check_backend_support(&self, _options: &RunOptions) -> Option<String> {
+        None
+    }
 
     /// Whether this test expects an error outcome (skip cross-check for these).
     fn expects_error(&self) -> bool {
@@ -119,8 +127,20 @@ impl Runnable for TestCase {
         None
     }
 
+    fn check_backend_support(&self, options: &RunOptions) -> Option<String> {
+        let expectation = self.expectations.for_backend(options.backend_type);
+        if expectation.sqlstate().is_some() && !options.backend_reports_sqlstate {
+            return Some(format!(
+                "@sqlstate needs a backend whose errors have a SQLSTATE (tursopg or postgres), \
+                 and the errors of the {} backend have none",
+                options.backend_type
+            ));
+        }
+        None
+    }
+
     fn expects_error(&self) -> bool {
-        matches!(self.expectations.default, Expectation::Error(_))
+        matches!(self.expectations.default, Expectation::Error { .. })
     }
 
     fn cross_check_integrity(&self) -> bool {
@@ -498,6 +518,16 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                 file: options.file_path,
                 database: options.db_config,
                 outcome: TestOutcome::Skipped { reason },
+                duration: start.elapsed(),
+            };
+        }
+
+        if let Some(message) = test.check_backend_support(&options) {
+            return TestResult {
+                name: test.name().to_string(),
+                file: options.file_path,
+                database: options.db_config,
+                outcome: TestOutcome::Error { message },
                 duration: start.elapsed(),
             };
         }
@@ -907,6 +937,8 @@ pub struct RunnerConfig {
     /// Path to binary for cross-checking integrity (None = disabled).
     /// Used by tests annotated with `@cross-check-integrity`.
     pub cross_check_binary: Option<PathBuf>,
+    /// Stop the run at the first failed test or error
+    pub fail_fast: bool,
 }
 
 impl Default for RunnerConfig {
@@ -918,6 +950,7 @@ impl Default for RunnerConfig {
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
             cross_check_binary: None,
+            fail_fast: false,
         }
     }
 }
@@ -950,6 +983,11 @@ impl RunnerConfig {
 
     pub fn with_cross_check_binary(mut self, binary: PathBuf) -> Self {
         self.cross_check_binary = Some(binary);
+        self
+    }
+
+    pub fn with_fail_fast(mut self, fail_fast: bool) -> Self {
+        self.fail_fast = fail_fast;
         self
     }
 }
@@ -1027,6 +1065,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
                     backend_is_sqlite: self.backend.is_sqlite(),
+                    backend_reports_sqlstate: self.backend.reports_sqlstate(),
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
                     cross_check_binary: self.config.cross_check_binary.clone(),
@@ -1100,6 +1139,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
                     backend_is_sqlite: self.backend.is_sqlite(),
+                    backend_reports_sqlstate: self.backend.reports_sqlstate(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
                     cross_check_binary: self.config.cross_check_binary.clone(),
                     verify_materialized_views: false,
@@ -1158,6 +1198,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         backend_capabilities: backend_capabilities.clone(),
                         backend_type,
                         backend_is_sqlite: self.backend.is_sqlite(),
+                        backend_reports_sqlstate: self.backend.reports_sqlstate(),
                         snapshot_update_mode: self.config.snapshot_update_mode,
                         cross_check_binary: self.config.cross_check_binary.clone(),
                         verify_materialized_views: false,
@@ -1254,6 +1295,9 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 on_result(result);
             }
         }
+        if self.config.fail_fast && !loaded.errors.is_empty() {
+            return Ok(loaded.errors);
+        }
 
         // Spawn ALL test tasks from ALL files at once into a single FuturesUnordered
         let mut all_futures: FuturesUnordered<tokio::task::JoinHandle<TestResult>> =
@@ -1309,12 +1353,22 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
             // Call the callback with each result as it completes
             on_result(&test_result);
 
+            let stop = self.config.fail_fast
+                && (test_result.outcome.is_failed() || test_result.outcome.is_error());
+
             // Use test_result.file for grouping
             let file_path = test_result.file.clone();
             results_by_file
                 .entry(file_path)
                 .or_default()
                 .push(test_result);
+
+            if stop {
+                for handle in all_futures.iter() {
+                    handle.abort();
+                }
+                break;
+            }
         }
 
         // Convert to FileResults
@@ -1445,6 +1499,7 @@ pub fn summarize(start: Instant, results: &[FileResult]) -> RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::rust::RustBackend;
 
     #[test]
     fn test_matches_filter_exact() {
@@ -1492,6 +1547,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_fast_runs_no_tests_when_a_file_does_not_parse() {
+        let broken = r#"
+@database :memory:
+
+test broken {
+"#;
+        let passes = r#"
+@database :memory:
+
+test passes {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("broken.sqltest"), broken).unwrap();
+        std::fs::write(dir.path().join("passes.sqltest"), passes).unwrap();
+        let config = RunnerConfig::default().with_fail_fast(true);
+        let runner = TestRunner::new(RustBackend::new()).with_config(config);
+
+        let results = runner
+            .run_paths(&[dir.path().to_path_buf()], |_| {})
+            .await
+            .unwrap();
+
+        let summary = summarize(Instant::now(), &results);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.total, 1);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_stops_after_the_first_failed_test() {
+        let source = r#"
+@database :memory:
+
+test fails {
+    SELECT 1;
+}
+expect {
+    2
+}
+
+test passes-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test passes-2 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+        let loaded = LoadedTests {
+            files: vec![(
+                PathBuf::from("fail-fast.sqltest"),
+                crate::parse(source).unwrap(),
+            )],
+            errors: vec![],
+        };
+        let config = RunnerConfig::default()
+            .with_max_jobs(1)
+            .with_fail_fast(true);
+        let runner = TestRunner::new(RustBackend::new()).with_config(config);
+
+        let results = runner.run_loaded_tests(loaded, |_| {}).await.unwrap();
+
+        let summary = summarize(Instant::now(), &results);
+        assert_eq!(summary.failed, 1);
+        assert!(summary.total < 3, "ran {} of 3 tests", summary.total);
+    }
+
+    #[tokio::test]
     async fn skip_if_postgres_skips_only_on_the_postgres_backend() {
         let file = crate::parser::parse(
             r#"
@@ -1519,6 +1652,7 @@ expect {
                 backend_capabilities: HashSet::new(),
                 backend_type,
                 backend_is_sqlite: false,
+                backend_reports_sqlstate: false,
                 snapshot_update_mode: SnapshotUpdateMode::No,
                 cross_check_binary: None,
                 verify_materialized_views: false,
@@ -1576,6 +1710,7 @@ expect {
                 backend_capabilities: HashSet::new(),
                 backend_type,
                 backend_is_sqlite: false,
+                backend_reports_sqlstate: false,
                 snapshot_update_mode: SnapshotUpdateMode::No,
                 cross_check_binary: None,
                 verify_materialized_views: false,
@@ -1597,6 +1732,120 @@ expect {
                     result.outcome
                 ),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlstate_is_rejected_on_backends_whose_errors_have_none() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+test missing-table {
+    SELECT * FROM missing;
+}
+@sqlstate 42P01
+expect error {
+}
+"#,
+        )
+        .unwrap();
+
+        for reports_sqlstate in [false, true] {
+            let backend = Arc::new(MissingTableBackend { reports_sqlstate });
+            let options = RunOptions {
+                file_path: PathBuf::from("sqlstate.sqltest"),
+                db_config: file.databases[0].clone(),
+                setups: file.setups.clone(),
+                mvcc: false,
+                global_skip: file.global_skip.clone(),
+                global_requires: file.global_requires.clone(),
+                backend_capabilities: HashSet::new(),
+                backend_type: backend.backend_type(),
+                backend_is_sqlite: false,
+                backend_reports_sqlstate: backend.reports_sqlstate(),
+                snapshot_update_mode: SnapshotUpdateMode::No,
+                cross_check_binary: None,
+                verify_materialized_views: false,
+            };
+            let result = run_single(backend, file.tests[0].clone(), options).await;
+            if reports_sqlstate {
+                assert!(
+                    matches!(result.outcome, TestOutcome::Passed),
+                    "{:?}",
+                    result.outcome
+                );
+            } else {
+                assert!(
+                    matches!(
+                        &result.outcome,
+                        TestOutcome::Error { message } if message.starts_with("@sqlstate needs a backend")
+                    ),
+                    "{:?}",
+                    result.outcome
+                );
+            }
+        }
+    }
+
+    /// A backend whose every query fails because a table is missing.
+    struct MissingTableBackend {
+        reports_sqlstate: bool,
+    }
+
+    #[async_trait]
+    impl SqlBackend for MissingTableBackend {
+        fn name(&self) -> &str {
+            "missing-table"
+        }
+
+        fn backend_type(&self) -> Backend {
+            if self.reports_sqlstate {
+                Backend::Tursopg
+            } else {
+                Backend::Rust
+            }
+        }
+
+        fn capabilities(&self) -> HashSet<Capability> {
+            HashSet::new()
+        }
+
+        fn reports_sqlstate(&self) -> bool {
+            self.reports_sqlstate
+        }
+
+        async fn create_database(
+            &self,
+            _config: &DatabaseConfig,
+        ) -> Result<Box<dyn crate::backends::DatabaseInstance>, BackendError> {
+            Ok(Box::new(MissingTableDatabase {
+                reports_sqlstate: self.reports_sqlstate,
+            }))
+        }
+    }
+
+    struct MissingTableDatabase {
+        reports_sqlstate: bool,
+    }
+
+    #[async_trait]
+    impl crate::backends::DatabaseInstance for MissingTableDatabase {
+        async fn execute(&mut self, _sql: &str) -> Result<QueryResult, BackendError> {
+            if self.reports_sqlstate {
+                Ok(QueryResult::error_with_sqlstate(
+                    "relation \"missing\" does not exist",
+                    Some("42P01".to_string()),
+                ))
+            } else {
+                Ok(QueryResult::error("no such table: missing"))
+            }
+        }
+
+        async fn close(
+            self: Box<Self>,
+        ) -> Result<crate::backends::DatabaseFileHandle, BackendError> {
+            Ok(crate::backends::DatabaseFileHandle::none())
         }
     }
 

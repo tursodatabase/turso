@@ -1539,6 +1539,20 @@ expect {
     2460699.048964896
 }
 
+test strftime-julianday-sixteen-significant-digits {
+    SELECT strftime('%J', 10.609676180555555), strftime('%J', 123456.123456789);
+}
+expect {
+    10.60967618055555|123456.123456794
+}
+
+test strftime-real-format-argument {
+    SELECT strftime(2460324.8751736111, 0), CAST(2460324.8751736111 AS TEXT), strftime(1.0, 0);
+}
+expect {
+    2460324.87517361|2460324.87517361|1.0
+}
+
 test strftime-hour-without-leading-zero-1 {
     SELECT strftime('%k', '2025-01-23T13:10:30.567');
 }
@@ -2204,6 +2218,71 @@ test time_date-overflow-issue-5251 {
     SELECT time_date(2147483647, 2147483647, 2147483647);
 }
 expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_date-day-overflow-issue-11398 {
+    SELECT make_date(1, 4, 1453556443);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_timestamp-day-overflow-issue-11398 {
+    SELECT make_timestamp(2024, 1, 1453556443, 0, 0, 0);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_date-year-wider-than-i32 {
+    SELECT make_date(4294969297, 1, 1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test make_date-month-wider-than-i32 {
+    SELECT make_date(2024, 4294967297, 1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_date-offset-overflow {
+    SELECT time_date(2000, 1, 1, 0, 0, -9223372036854775808, 0, 1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_date-offset-overflow-negative {
+    SELECT time_date(2024, 1, 1, 0, 0, 9223372036854775807, 0, -1);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_add-overflow {
+    SELECT time_add(time_date(-262143, 1, 1), -9223372036854775807);
+}
+expect {
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_add_date-day-overflow {
+    SELECT time_add_date(make_date(2024, 1, 1), 0, 0, 1453556443);
+}
+expect error {
+    time creation error
+}
+
+@skip-if sqlite "time_date is a custom Limbo function not supported in standard SQLite"
+test time_add_date-year-overflow {
+    SELECT time_add_date(make_date(2024, 1, 1), 2147483647);
+}
+expect error {
+    time creation error
 }
 
 # Invalid date and time

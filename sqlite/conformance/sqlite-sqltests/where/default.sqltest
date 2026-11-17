@@ -840,3 +840,48 @@ expect {
     10000
 }
 
+# A WHERE term that calls random() must run once per row, not once per query.
+# With 10000 rows, a per-row coin flip keeps some rows and drops others.
+test where-random-runs-per-row {
+    select count(*) between 1 and 9999 from users where random() < 0;
+}
+expect {
+    1
+}
+
+# In a join, SQLite runs the term once per row of the outermost loop.
+test where-random-runs-per-row-in-join {
+    select count(*) between 1 and 9999 from users u join users v on v.id = u.id where random() < 0;
+}
+expect {
+    1
+}
+
+# Rows that a RIGHT JOIN adds for unmatched right rows must also check the term.
+# The term below is never true, so no row may be returned.
+test where-random-checks-right-join-unmatched-rows {
+    select count(*) from users u full join products p on u.id = p.id right join products q
+    where random() < -9223372036854775807 - 1;
+}
+expect {
+    0
+}
+
+# Deciding where a term runs must not hide an error in one of its function calls.
+test where-function-with-wrong-argument-count-is-an-error {
+    select id from users where count(id, age) != 11;
+}
+expect error {
+    wrong number of arguments to function count()
+}
+
+# The date and time functions give one value for the whole statement, so the term
+# runs once before the loops, as in SQLite.
+test where-date-function-with-right-join {
+    select count(*) from users u full join products p on u.id = p.id right join products q
+    where time('not a time');
+}
+expect {
+    0
+}
+

@@ -66,6 +66,9 @@ pub struct GeneratedColumnOpts {
     pub generated_column_prob: f64,
     #[garde(range(min = 1, max = 10))]
     pub max_expr_depth: usize,
+    /// Probability (0.0–1.0) that a generated column is STORED rather than VIRTUAL.
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub stored_prob: f64,
 }
 
 impl Default for GeneratedColumnOpts {
@@ -74,6 +77,7 @@ impl Default for GeneratedColumnOpts {
             enable: true,
             generated_column_prob: 0.2,
             max_expr_depth: 3,
+            stored_prob: 0.5,
         }
     }
 }

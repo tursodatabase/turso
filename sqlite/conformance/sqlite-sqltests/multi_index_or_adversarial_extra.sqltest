@@ -575,3 +575,33 @@ expect {
     4|40|50|0
     5|10|30|1
 }
+
+setup text_columns_or_schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    CREATE INDEX ta ON t(a);
+    CREATE INDEX tb ON t(b);
+    INSERT INTO t VALUES (1, '5', '9');
+    INSERT INTO t VALUES (2, '100', '7');
+    INSERT INTO t VALUES (3, 'abc', '5');
+    INSERT INTO t VALUES (4, '30', '400');
+}
+
+# Same shape as #9574 with OR: a numeric comparison on TEXT columns must not seek the TEXT indexes
+@setup text_columns_or_schema
+test or-text-columns-integer-cast-range {
+    SELECT id FROM t WHERE a < CAST(10 AS INTEGER) OR b < CAST(8 AS INTEGER) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup text_columns_or_schema
+test or-text-columns-text-keys {
+    SELECT id FROM t WHERE a = '5' OR b = '400' ORDER BY id;
+}
+expect {
+    1
+    4
+}

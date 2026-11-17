@@ -27,7 +27,7 @@ RUN --mount=type=bind,source=.,target=/app \
 FROM chef AS builder
 
 COPY --from=planner /tmp/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release -p turso-java --recipe-path recipe.json
 
 # Copy full source
 COPY . .

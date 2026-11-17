@@ -1,0 +1,36 @@
+---
+source: distinct.sqltest
+expression: SELECT count(DISTINCT id), sum(c) FROM t;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t
+`--USE HASH TABLE FOR count(DISTINCT)
+
+BYTECODE
+addr  opcode                  p1  p2  p3  p4              p5  comment
+   0  Init                     0  17   0                   0  Start at 17
+   1  Null                     0   3   4                   0  r[3..4]=NULL
+   2  HashClear       1073741824   0   0                   0
+   3  OpenRead                 0   2   0  k(5,B,B,B,B,B)   0  table=t, root=2, iDb=0
+   4  Rewind                   0  11   0                   0  Rewind table t
+   5    RowId                  0   5   0                   0  r[5]=t.rowid
+   6    HashDistinct  1073741824   5   1  jmp=8            0
+   7    AggStep                0   5   3  count            0  accum=r[3] step(r[5])
+   8    Column                 0   4   6                   0  r[6]=t.c
+   9    AggStep                0   6   4  sum              0  accum=r[4] step(r[6])
+  10  Next                     0   5   0                   1
+  11  AggFinal                 0   3   0  count            0  accum=r[3]
+  12  AggFinal                 0   4   0  sum              0  accum=r[4]
+  13  Copy                     3   1   0                   0  r[1]=r[3]
+  14  Copy                     4   2   0                   0  r[2]=r[4]
+  15  ResultRow                1   2   0                   0  output=r[1..2]
+  16  Halt                     0   0   0                   0
+  17  Transaction              0   1   2                   0  iDb=0 tx_mode=Read
+  18  Goto                     0   1   0                   0

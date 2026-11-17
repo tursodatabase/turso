@@ -20,5 +20,5 @@ info:
 ---
 QUERY PLAN
 |--SCAN selected_nodes AS s
-|  `--SEARCH node USING INTEGER PRIMARY KEY (rowid=?)
+|  `--SEARCH node USING INTEGER PRIMARY KEY (rowid<=?)
 `--MULTI-INDEX OR e (idx_edge_source, idx_edge_target)
