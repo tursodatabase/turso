@@ -700,3 +700,21 @@ test timestamp-compare-with-other-text-with-and-without-index {
 expect {
     1|1|1|1
 }
+
+@requires strict "uses STRICT tables"
+test date-type-modifier-is-refused {
+    -- PostgreSQL refuses it too: a date takes no type modifier.
+    CREATE TABLE tm(d date(3)) STRICT;
+}
+expect error {
+    a type modifier on type "date" is not supported
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-type-modifier-is-refused {
+    -- PostgreSQL rounds a timestamp(3) to milliseconds; Turso does not.
+    CREATE TABLE tm(ts timestamp(3)) STRICT;
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
