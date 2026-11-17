@@ -450,6 +450,8 @@ fn record_delete_optimizer_safety(
         .joined_tables()
         .first()
         .expect("DELETE should have one target table");
+    // FK actions fire after the row is deleted, and a rowid equality search never steps to
+    // a next row, so the actions cannot change which rows this DELETE visits.
     if connection.foreign_keys_enabled()
         && !matches!(table.op, Operation::Search(Search::RowidEq { .. }))
     {
