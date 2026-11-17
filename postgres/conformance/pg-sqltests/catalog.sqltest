@@ -1836,6 +1836,30 @@ expect {
     c
 }
 
+test pg-attribute-alter-table-errors {
+    ALTER TABLE pg_attribute ADD COLUMN zz_added INTEGER;
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-rename-errors {
+    ALTER TABLE pg_catalog.pg_attribute RENAME TO zz_renamed;
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-drop-table-errors {
+    DROP TABLE pg_attribute;
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-create-index-errors {
+    CREATE INDEX zz_attr_idx ON pg_attribute (attname);
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
 test pg-attribute-is-read-by-a-role-without-privileges {
     CREATE TABLE zz_attr_read (zz_attr_read_a INTEGER, zz_attr_read_b TEXT);
     CREATE ROLE zz_attr_reader;
