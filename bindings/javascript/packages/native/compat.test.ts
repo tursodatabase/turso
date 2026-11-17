@@ -231,3 +231,62 @@ test('encryption', () => {
         unlinkSync(path);
     }
 })
+
+test('a transaction function called inside another runs as a savepoint, as in better-sqlite3', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        if (x === 2) throw new Error('inner failed');
+    });
+    const outer = db.transaction(() => {
+        inner(1);
+        expect(() => inner(2)).toThrow('inner failed');
+        insert.run(3);
+    });
+    outer();
+    expect(db.prepare('SELECT x FROM t ORDER BY x').all()).toEqual([{ x: 1 }, { x: 3 }]);
+})
+
+test('transaction functions nest three deep, each level rolling back only itself', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        throw new Error('inner failed');
+    });
+    const middle = db.transaction(() => {
+        insert.run(2);
+        expect(() => inner(3)).toThrow('inner failed');
+        insert.run(4);
+    });
+    const outer = db.transaction(() => {
+        insert.run(1);
+        middle();
+        insert.run(5);
+    });
+    outer();
+    expect(db.inTransaction).toBe(false);
+    expect(db.prepare('SELECT x FROM t ORDER BY x').all()).toEqual([{ x: 1 }, { x: 2 }, { x: 4 }, { x: 5 }]);
+})
+
+test('an error that leaves every nested transaction function rolls back the whole transaction', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        throw new Error('inner failed');
+    });
+    const outer = db.transaction(() => {
+        insert.run(1);
+        inner(2);
+    });
+    expect(() => outer()).toThrow('inner failed');
+    expect(db.inTransaction).toBe(false);
+    expect(db.prepare('SELECT x FROM t').all()).toEqual([]);
+    db.transaction(() => insert.run(3))();
+    expect(db.prepare('SELECT x FROM t').all()).toEqual([{ x: 3 }]);
+})

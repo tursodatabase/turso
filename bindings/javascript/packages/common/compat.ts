@@ -158,13 +158,22 @@ class Database {
     const db = this;
     const wrapTxn = (mode) => {
       return (...bindParameters) => {
-        db.exec("BEGIN " + mode);
+        // Called inside a transaction, run as a savepoint, as better-sqlite3 does.
+        const nested = db.inTransaction;
+        db.exec(nested ? "SAVEPOINT turso_compat_txn" : "BEGIN " + mode);
         try {
           const result = fn(...bindParameters);
-          db.exec("COMMIT");
+          db.exec(nested ? "RELEASE turso_compat_txn" : "COMMIT");
           return result;
         } catch (err) {
-          db.exec("ROLLBACK");
+          if (db.inTransaction) {
+            if (nested) {
+              db.exec("ROLLBACK TO turso_compat_txn");
+              db.exec("RELEASE turso_compat_txn");
+            } else {
+              db.exec("ROLLBACK");
+            }
+          }
           throw err;
         }
       };
