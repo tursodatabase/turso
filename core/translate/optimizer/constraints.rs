@@ -2169,8 +2169,6 @@ pub struct AnalyzedTerm {
 pub struct IndexableTermSummary {
     /// The constrained table column, if any.
     pub table_col_pos: Option<usize>,
-    /// The other tables referenced by the constraining expression.
-    pub lhs_mask: TableMask,
     /// The chosen index for this term, or `None` for rowid access.
     pub best_index: Option<Arc<Index>>,
 }
@@ -2246,6 +2244,9 @@ fn analyze_binary_term_index_info<'a>(
     })
 }
 
+/// Summarize a binary term that constrains `table_id` with a value that does
+/// not depend on another table of the query, such as `t.a = 5`. Return `None`
+/// for other terms, such as the join term `t.a = u.b`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn summarize_binary_term_for_index(
     expr: &ast::Expr,
@@ -2267,6 +2268,11 @@ pub(crate) fn summarize_binary_term_for_index(
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
+    if !lhs_mask.is_empty() {
+        return None;
+    }
     let comparison_collation = comparison_collation(
         lhs,
         rhs,
@@ -2296,21 +2302,8 @@ pub(crate) fn summarize_binary_term_for_index(
         return None;
     }
 
-    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
-        .unwrap_or_else(|_| TableMask::default());
-
-    let table_pos = table_references
-        .joined_tables()
-        .iter()
-        .position(|t| t.internal_id == table_id)
-        .expect("target table must exist in table_references");
-    if lhs_mask.get(table_pos) {
-        return None;
-    }
-
     Some(IndexableTermSummary {
         table_col_pos,
-        lhs_mask,
         best_index,
     })
 }

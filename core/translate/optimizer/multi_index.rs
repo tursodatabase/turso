@@ -874,10 +874,6 @@ fn analyze_and_terms_for_multi_index(
             continue;
         };
 
-        if !summary.lhs_mask.is_empty() {
-            continue;
-        }
-
         candidate_branches.push(AndBranchSummary {
             where_term_idx,
             table_col_pos: summary.table_col_pos,
