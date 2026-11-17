@@ -635,9 +635,11 @@ pub(crate) fn check_custom_types(
         check_custom_operator(expr, &context.type_env())?;
         Ok(WalkControl::Continue)
     })?;
-    // Function calls after operators: `abs(d * 2)` fails because `*` does
-    // not exist for a date.
+    // Casts and function calls after operators, so the operator's error is
+    // the one reported: `CAST(date_col * 2 AS interval)` fails because `*`
+    // does not exist for a date.
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_custom_cast(expr, &context.type_env())?;
         check_function_reads(expr, &context.type_env())?;
         Ok(WalkControl::Continue)
     })?;
