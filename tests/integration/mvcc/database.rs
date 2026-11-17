@@ -5083,6 +5083,174 @@ fn test_exact_rowid_seek_over_shadowed_btree_rows() {
     }
 }
 
+#[test]
+fn test_exact_index_seek_over_shadowed_btree_rows() {
+    for changed_rows in [750, 20_000, 40_000] {
+        for unique in [false, true] {
+            let total_rows = changed_rows + 250;
+            let db = MvccTestDbNoConn::new_with_random_db();
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+                .expect("test table must be created");
+            let unique_sql = if unique { "UNIQUE" } else { "" };
+            conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+                .expect("test index must be created");
+            conn.execute(format!(
+                "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x < {total_rows}) \
+                 INSERT INTO t SELECT x,x FROM seq",
+            ))
+            .expect("test rows must be inserted");
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("test rows must be checkpointed");
+            conn.execute("BEGIN IMMEDIATE")
+                .expect("test transaction must begin");
+            conn.execute(format!("DELETE FROM t WHERE id <= {changed_rows}"))
+                .expect("test rows must be deleted");
+
+            let steps = Arc::new(SeekBtreeSteps::default());
+            conn.set_yield_injector(Some(steps.clone()));
+            for id in 1..=changed_rows {
+                steps.0.store(0, Ordering::Relaxed);
+                conn.execute(format!("INSERT INTO t VALUES ({id},{id})"))
+                    .expect("deleted row must be reinserted");
+                let taken = steps.0.load(Ordering::Relaxed);
+                assert!(
+                    taken <= 8,
+                    "reinserting id {id} of {changed_rows} with unique={unique} took {taken} B-tree steps"
+                );
+            }
+            conn.set_yield_injector(None);
+            conn.execute("COMMIT")
+                .expect("test transaction must commit");
+            assert_eq!(
+                get_rows(&conn, "SELECT id,v FROM t INDEXED BY t_v ORDER BY v"),
+                (1..=total_rows)
+                    .map(|id| vec![Value::from_i64(id), Value::from_i64(id)])
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                get_rows(&conn, "PRAGMA integrity_check"),
+                vec![vec![Value::build_text("ok")]]
+            );
+        }
+    }
+}
+
+/// What this test checks: Inserting rows back inside the transaction that deleted them, as a sync
+/// pull does when it replays an UPDATE, looks up each index key in a few B-tree steps however
+/// many deleted entries follow it, including keys stored in interior index pages, and leaves the
+/// index with exactly the original entries.
+/// Why this matters: Each insert looks up its exact index key. If that lookup steps through the
+/// deleted entries after the key, putting back N rows that sit next to each other in an index
+/// takes O(N^2) steps.
+#[test]
+fn test_index_insert_over_shadowed_btree_entries() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    // Wide keys give the index interior pages, which hold keys too.
+    conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+    for i in 1..=200 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, '{}')",
+            wide_index_key(i)
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DELETE FROM t WHERE id <= 150").unwrap();
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    for i in 1..=150 {
+        steps.0.store(0, Ordering::Relaxed);
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, '{}')",
+            wide_index_key(i)
+        ))
+        .unwrap();
+        let taken = steps.0.load(Ordering::Relaxed);
+        assert!(
+            taken <= 6,
+            "inserting id {i} back took {taken} B-tree steps"
+        );
+    }
+    conn.set_yield_injector(None);
+    conn.execute("COMMIT").unwrap();
+
+    let keys: Vec<String> = get_rows(&conn, "SELECT k FROM t ORDER BY k")
+        .into_iter()
+        .map(|row| row[0].to_string())
+        .collect();
+    let expected: Vec<String> = (1..=200).map(wide_index_key).collect();
+    assert_eq!(keys, expected);
+}
+
+/// What this test checks: An exact lookup by UNIQUE key over checkpointed index entries that
+/// newer versions shadow returns each row's newest version, or nothing for a changed, deleted or
+/// missing key, in a few B-tree steps however many shadowed entries follow its target.
+/// Why this matters: A lookup that steps through the shadowed entries after its target makes point
+/// lookups by key over an updated table quadratic.
+#[test]
+fn test_exact_unique_index_seek_over_shadowed_btree_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX t_k ON t(k)").unwrap();
+    for i in 1..=200 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, '{}')",
+            wide_index_key(i)
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Newer versions shadow the index entries of the first 150 rows and of every deleted row.
+    // The new keys start with 'n', so they sort after every old key.
+    conn.execute("UPDATE t SET k = 'new' || k WHERE id <= 150")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id % 3 = 0").unwrap();
+
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    for i in 1..=201 {
+        let old_key = wide_index_key(i);
+        let new_key = format!("new{old_key}");
+        let exists = i % 3 != 0;
+        for (key, expected) in [
+            (old_key, (151..=200).contains(&i) && exists),
+            (new_key, i <= 150 && exists),
+        ] {
+            steps.0.store(0, Ordering::Relaxed);
+            // LIMIT 1 stops the scan after a match, so only the lookup itself is counted.
+            let rows = get_rows(
+                &conn,
+                &format!("SELECT id FROM t WHERE k = '{key}' LIMIT 1"),
+            );
+            assert_eq!(
+                rows.first().map(|row| row[0].as_int().unwrap()),
+                expected.then_some(i),
+                "key {}...",
+                &key[..8]
+            );
+            let taken = steps.0.load(Ordering::Relaxed);
+            assert!(
+                taken <= 3,
+                "the lookup of key {}... took {taken} B-tree steps",
+                &key[..8]
+            );
+        }
+    }
+}
+
+/// A 305-byte index key that sorts like `i`. About a dozen fit in a page.
+fn wide_index_key(i: i64) -> String {
+    format!("{i:05}{}", "x".repeat(300))
+}
+
 /// Core MVCC read/write semantics for AUTOINCREMENT with rowid update.
 /// After INSERT (rowid 1), UPDATE rowid 1→2, and a second INSERT,
 /// the second insert must get rowid 3 (never reuse 1 or 2).
