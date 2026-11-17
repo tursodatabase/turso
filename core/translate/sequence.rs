@@ -11,7 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{CatalogChange, NewOwner, OwnerColumn};
+use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -1066,13 +1066,13 @@ pub fn translate_create_sequence(
     // The sequence is a relation of the dialect's; its backing table is an
     // engine object and is not.
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_name.clone(),
+                name: &normalized_name,
                 kind: crate::schema::RelationKind::Sequence,
                 table: None,
             }],
@@ -1269,13 +1269,13 @@ pub(crate) fn emit_drop_sequence(
         return Ok(false);
     }
     if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Drop {
+            &[RelationChange::Dropped {
                 namespace: namespace.id,
-                name: seq_name.to_string(),
+                name: seq_name,
             }],
         )?;
     }
@@ -1545,15 +1545,15 @@ pub fn translate_alter_sequence_owned_by(
     }
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
+    resolver.catalog.dialect.translate_access_statement(
         program,
         resolver.schema(),
         connection,
-        &[CatalogChange::ChangeOwner {
+        &AccessStatement::ChangeOwner {
             namespace: namespace.id,
-            name: normalized_name,
-            owner: NewOwner::Column(owner_column),
-        }],
+            name: &normalized_name,
+            owner: &NewOwner::Column(owner_column),
+        },
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
