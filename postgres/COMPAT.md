@@ -91,6 +91,9 @@ as the text `pg_get_expr` prints), `pg_policies`, plus `pg_input_error_info`. Pr
 always empty: `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
 `pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_attribute` is a table in the database file, which the statements that
+create a table, drop it or change its columns write; the others are computed
+when they are read.
 `pg_description` contains the default `standard public schema` comment for
 `public`, so pg_dump does not emit a command to clear that comment on restore.
 User-defined comments are not persisted. The public schema reports
