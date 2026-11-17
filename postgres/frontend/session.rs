@@ -168,14 +168,13 @@ impl PgConnection {
         &self.inner.conn
     }
 
-    /// Record an error the caller raised on this session's behalf before
-    /// reaching prepare — the wire server failing to parse a query string,
-    /// for example. In PostgreSQL any error inside a transaction block
-    /// aborts the block.
+    /// Apply PostgreSQL's rule for an error: inside a transaction block, the
+    /// block becomes aborted. The session applies it to the errors it
+    /// raises, and applying it again for the same error changes nothing, so
+    /// the wire server applies it to every error it reports, also to errors
+    /// the session never saw, such as a malformed Bind message.
     pub fn abort_transaction_block_on_error(&self) {
-        if !self.inner.conn.get_auto_commit() {
-            self.inner.tx.abort();
-        }
+        self.inner.abort_open_block();
     }
 
     pub fn transaction_state(&self) -> TransactionState {
@@ -204,7 +203,7 @@ impl PgConnection {
         }
         let result = crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec);
         if result.is_err() && !self.inner.conn.get_auto_commit() {
-            self.inner.tx.abort();
+            self.inner.abort_open_block();
             self.inner.tx.mark_query_started();
         }
         result
@@ -370,7 +369,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
     // transaction's first query — unless the block was already aborted, in
     // which case PostgreSQL rejects it before doing anything.
     if result.is_err() && !pg_conn.conn.get_auto_commit() {
-        pg_conn.tx.abort();
+        pg_conn.abort_open_block();
         if !was_aborted
             && turso_pg_parser::parse(sql).is_ok_and(|parsed| execution_takes_snapshot(&parsed))
         {
@@ -378,6 +377,16 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         }
     }
     result
+}
+
+impl PgConnectionInner {
+    /// Apply PostgreSQL's rule for an error to the current state: inside a
+    /// transaction block, the block becomes aborted.
+    fn abort_open_block(&self) {
+        let in_block = !self.conn.get_auto_commit();
+        self.tx
+            .abort_block_after_error(&self.conn, TxRole::Other, in_block);
+    }
 }
 
 fn prepare_statement_inner(

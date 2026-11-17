@@ -55,6 +55,36 @@ impl PgTxState {
         self.aborted.load(Ordering::Relaxed)
     }
 
+    /// Apply PostgreSQL's rule for an error in a transaction block: the
+    /// block becomes aborted. `role` is the failed statement's role, and
+    /// `was_in_block` says whether the session was inside a transaction
+    /// block before it ran; an error raised before any statement ran counts
+    /// as [`TxRole::Other`] with the current state.
+    pub(crate) fn abort_block_after_error(
+        &self,
+        conn: &Connection,
+        role: TxRole,
+        was_in_block: bool,
+    ) {
+        let abort = match role {
+            // PostgreSQL never enters the aborted state from a failed COMMIT
+            // or ROLLBACK: the transaction is rolled back and the session
+            // returns to idle. When the rollback itself fails, the
+            // transaction is still open, and aborted is the only honest
+            // state to report.
+            TxRole::Commit | TxRole::Rollback => !conn.get_auto_commit(),
+            // A nested BEGIN is only a warning in PostgreSQL, and post_run
+            // turns it into success. Any other BEGIN error, like a rejected
+            // access-mode change, aborts the block like any other error. The
+            // core may have rolled the transaction back on the error, so the
+            // state before the statement decides.
+            TxRole::Begin | TxRole::Other | TxRole::RollbackToSavepoint => was_in_block,
+        };
+        if abort {
+            self.abort();
+        }
+    }
+
     pub(crate) fn query_started(&self) -> bool {
         self.query_started.load(Ordering::Relaxed)
     }
@@ -271,27 +301,7 @@ impl Statement {
         let Some(t) = &self.tx_tracking else {
             return;
         };
-        match t.role {
-            // PostgreSQL never enters the aborted state from a failed COMMIT
-            // or ROLLBACK: the transaction is rolled back and the session
-            // returns to idle. When the rollback itself fails, the
-            // transaction is still open, and aborted is the only honest
-            // state to report.
-            TxRole::Commit | TxRole::Rollback => {
-                if !t.conn.get_auto_commit() {
-                    t.tx.abort();
-                }
-            }
-            // A nested BEGIN is a warning in PostgreSQL and post_run already
-            // replaced it with success before this runs; a BEGIN error that
-            // survives post_run, like a rejected access-mode change, aborts
-            // the block like any other error.
-            TxRole::Begin | TxRole::Other | TxRole::RollbackToSavepoint => {
-                if was_in_tx {
-                    t.tx.abort();
-                }
-            }
-        }
+        t.tx.abort_block_after_error(&t.conn, t.role, was_in_tx);
     }
 
     fn note_execution_done(&self) {
