@@ -8495,8 +8495,12 @@ impl Column {
     /// The declared type with its parameters, as `PRAGMA table_info` shows it,
     /// e.g. `VARCHAR(40)`. Empty for a column declared without a type.
     pub fn declared_type(&self) -> String {
-        let mut declared_type = self.ty_str.clone();
         let written_type = self.written_ty_str.as_deref().unwrap_or(&self.ty_str);
+        // SQLite keeps the type names that STRICT tables accept in upper case.
+        if self.ty_params.is_empty() && is_builtin_strict_type(written_type) {
+            return self.ty_str.to_ascii_uppercase();
+        }
+        let mut declared_type = self.ty_str.clone();
         if !self.ty_params.is_empty()
             && !matches!(
                 written_type.as_bytes().first(),

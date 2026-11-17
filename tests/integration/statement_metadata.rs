@@ -761,7 +761,7 @@ mod tests {
         let conn = db.connect_limbo();
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40), note)")
             .unwrap();
-        conn.execute("CREATE TABLE posts (title TEXT)").unwrap();
+        conn.execute("CREATE TABLE posts (title text)").unwrap();
         conn.execute("CREATE VIEW v AS SELECT name AS n, id * 2 AS dbl FROM users")
             .unwrap();
         conn.execute("ATTACH ':memory:' AS aux").unwrap();

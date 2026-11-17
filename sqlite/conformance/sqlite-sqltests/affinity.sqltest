@@ -843,6 +843,22 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-type-name-case {
+    CREATE TABLE t (a integer, b "int", c [blob], d 'text' int, e Real(3), f varchar(4), g Numeric, h any);
+    SELECT type FROM pragma_table_info('t');
+}
+expect {
+    INTEGER
+    INT
+    BLOB
+    text
+    Real(3)
+    varchar(4)
+    Numeric
+    ANY
+}
+
+@cross-check-integrity
 test affinity-type-name-empty-after-quotes-removed {
     CREATE TABLE t (a "" INT, b "", c);
     INSERT INTO t VALUES ('12', '12', '12');
