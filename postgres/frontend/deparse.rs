@@ -1,6 +1,6 @@
-//! PostgreSQL's text of a row-level security condition or a CHECK
-//! condition, as `pg_get_expr` prints it for `pg_policy.polqual`,
-//! `pg_policies.qual` and `pg_constraint.conbin`.
+//! PostgreSQL's text of a row-level security condition, a CHECK condition
+//! or a column default, as `pg_get_expr` prints it for `pg_policy.polqual`,
+//! `pg_policies.qual`, `pg_constraint.conbin` and `pg_attrdef.adbin`.
 //!
 //! The catalog stores what the engine compiled the condition into, so this
 //! turns the engine's forms back into PostgreSQL's: `GLOB 'a*'` is printed
@@ -24,6 +24,28 @@ use crate::functions::quote_literal;
 pub(crate) fn condition_text(condition: &ast::Expr, table: &BTreeTable) -> Option<String> {
     let printed = Printer { table }.expr(condition)?;
     Some(printed.typed_text(None))
+}
+
+/// PostgreSQL's text of `default`, the default or generation expression of
+/// a column of `table` declared with the type `declared_type`, or None when
+/// it has a form this module does not print. PostgreSQL does not print the
+/// cast of the whole expression to the column's type, so `7` stays `7` in a
+/// `bigint` column, but a quoted literal takes the column's type.
+pub(crate) fn default_text(
+    default: &ast::Expr,
+    table: &BTreeTable,
+    declared_type: &str,
+) -> Option<String> {
+    let printed = Printer { table }.expr(default)?;
+    if printed.ty != PgType::UnknownLiteral {
+        return Some(printed.text);
+    }
+    let type_name = match PgType::of_column(declared_type) {
+        PgType::Text => "text",
+        PgType::Varchar => "character varying",
+        _ => return None,
+    };
+    Some(format!("{}::{type_name}", printed.text))
 }
 
 /// The types that decide how PostgreSQL prints an expression.
@@ -564,7 +586,10 @@ fn coalesce(args: &[Printed]) -> Option<Printed> {
 
 fn literal_text(literal: &ast::Literal) -> Option<Printed> {
     match literal {
-        ast::Literal::Numeric(value) => number_text(value),
+        ast::Literal::Numeric(value) => match value.strip_prefix('-') {
+            Some(positive) => negative_number_text(positive),
+            None => number_text(value),
+        },
         ast::Literal::String(quoted) => Some(Printed::constant(
             quote_literal(&unquote(quoted)?),
             PgType::UnknownLiteral,
@@ -682,6 +707,69 @@ mod tests {
             ),
         ] {
             assert_eq!(text(stored).as_deref(), Some(expected), "{stored}");
+        }
+    }
+
+    /// The triples are what the engine stores for a default, the type of
+    /// its column, and what PostgreSQL 18's pg_get_expr prints for it.
+    #[test]
+    fn defaults_print_as_postgres_prints_them() {
+        for (stored, declared_type, expected) in [
+            ("'x'", "TEXT", "'x'::text"),
+            ("'a''b'", "VARCHAR(10)", "'a''b'::character varying"),
+            ("7", "BIGINT", "7"),
+            ("7", "NUMERIC(10, 2)", "7"),
+            ("-1", "INT", "'-1'::integer"),
+            ("1.5", "NUMERIC(10, 2)", "1.5"),
+            ("3000000000", "BIGINT", "'3000000000'::bigint"),
+            ("CAST (1 AS boolean)", "BOOLEAN", "true"),
+            ("1 + 2", "INT", "(1 + 2)"),
+            ("current_user ()", "TEXT", "CURRENT_USER"),
+            ("\"id\" - (1 - \"n\")", "BIGINT", "(id - (1 - n))"),
+            ("\"v\"", "TEXT", "v"),
+        ] {
+            let default = parse_condition(stored).unwrap();
+            assert_eq!(
+                default_text(&default, &table(), declared_type).as_deref(),
+                Some(expected),
+                "{stored}"
+            );
+        }
+    }
+
+    /// The engine stores the default `-1` as one literal, not as the
+    /// negation of `1`.
+    #[test]
+    fn negative_number_literals_print_quoted_with_their_type() {
+        for (stored, expected) in [
+            ("-1", "'-1'::integer"),
+            ("-3000000000", "'-3000000000'::bigint"),
+            ("-1.5", "'-1.5'::numeric"),
+        ] {
+            let default = ast::Expr::Literal(ast::Literal::Numeric(stored.to_string()));
+            assert_eq!(
+                default_text(&default, &table(), "INT").as_deref(),
+                Some(expected),
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_postgres_prints_differently_give_none() {
+        for (stored, declared_type) in [
+            ("'5'", "INT"),
+            ("'2020-01-01'", "DATE"),
+            ("'x'", "CHAR(3)"),
+            ("lower ('X')", "TEXT"),
+            ("'a' || 'b'", "TEXT"),
+        ] {
+            let default = parse_condition(stored).unwrap();
+            assert_eq!(
+                default_text(&default, &table(), declared_type),
+                None,
+                "{stored}"
+            );
         }
     }
 

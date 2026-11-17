@@ -2675,15 +2675,18 @@ impl SnapshotRows for PgAttrdefTable {
                 if col.identity.is_some() {
                     continue;
                 }
-                let adbin = match (&col.default, col.generated_type()) {
-                    (Some(default_expr), _) => render_expr(default_expr),
+                let default = match (&col.default, col.generated_type()) {
+                    (Some(default_expr), _) => default_expr.as_ref().clone(),
                     (None, GeneratedType::Stored { expr, .. }) => {
-                        let named = generated_expr_with_names(expr, btree.columns())
-                            .expect("stored generated column expression resolves its columns");
-                        render_expr(&named)
+                        generated_expr_with_names(expr, btree.columns())
+                            .expect("stored generated column expression resolves its columns")
                     }
                     (None, _) => continue,
                 };
+                // A default with a form the printer does not know is shown
+                // as the engine's SQL.
+                let adbin = crate::deparse::default_text(&default, btree, &col.ty_str)
+                    .unwrap_or_else(|| render_expr(&default));
                 rows.push(vec![
                     Value::from_i64(attrdef_oid),        // oid
                     Value::from_i64(table_oid),          // adrelid

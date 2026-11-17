@@ -737,6 +737,56 @@ expect {
     7
 }
 
+test pg-get-expr-text-default {
+    CREATE TABLE demo (a text DEFAULT 'x', b varchar(10) DEFAULT 'it''s', c text DEFAULT '');
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    'x'::text
+    'it''s'::character varying
+    ''::text
+}
+
+test pg-get-expr-number-default {
+    CREATE TABLE demo (
+        a int DEFAULT 7, b bigint DEFAULT 7, c int DEFAULT -1, d numeric(10, 2) DEFAULT 1.5,
+        e bigint DEFAULT 3000000000, f numeric(10, 2) DEFAULT -1.5, g int DEFAULT 1 + 2
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    7
+    7
+    '-1'::integer
+    1.5
+    '3000000000'::bigint
+    '-1.5'::numeric
+    (1 + 2)
+}
+
+test pg-get-expr-boolean-default {
+    CREATE TABLE demo (a boolean DEFAULT true, b boolean DEFAULT false, c boolean DEFAULT (1 > 0));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    true
+    false
+    (1 > 0)
+}
+
+# tursopg does not print the cast of a function's argument and shows the
+# default as the engine stores it.
+test pg-get-expr-default-with-function-of-literal {
+    CREATE TABLE demo (a text DEFAULT lower('X'));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
+}
+expect {
+    lower('X'::text)
+}
+expect @tursopg {
+    lower ('X')
+}
+
 test pg-get-expr-null-oid-is-null {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(adbin, NULL, true) FROM pg_attrdef;
