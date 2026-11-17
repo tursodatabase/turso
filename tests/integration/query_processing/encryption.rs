@@ -6,30 +6,34 @@ use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::{
-    CipherMode, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags,
-    PlatformIO, Row, SessionRole, IO,
+    CompletionError, ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts,
+    LimboError, OpenFlags, OpenOptions, PlatformIO, Row, SessionRole, IO,
 };
 use turso_sqlite::SqliteDialect;
 
 const ENABLE_ENCRYPTION: bool = true;
 
+fn encrypted_fixture(source: &TempDatabase, size: u32) -> TempDatabase {
+    TempDatabaseBuilder::new()
+        .with_opts(source.db_opts)
+        .with_mvcc(source.enable_mvcc)
+        .with_encryption(CIPHER_A, KEY_A)
+        .with_page_size(size)
+        .build()
+}
+
 fn run_non_4k_page_size_encryption_test(
     tmp_db: &TempDatabase,
     enable_mvcc: bool,
 ) -> anyhow::Result<()> {
+    // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
+    let encrypted = encrypted_fixture(tmp_db, 8192);
+    let tmp_db = &encrypted;
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
     {
         let conn = tmp_db.connect_limbo();
-        // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
-        run_query(tmp_db, &conn, "PRAGMA page_size = 8192;")?;
-        run_query(
-            tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         if enable_mvcc {
             run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         }
@@ -78,17 +82,13 @@ fn run_corruption_associated_data_bytes_test(
     tmp_db: &TempDatabase,
     enable_mvcc: bool,
 ) -> anyhow::Result<()> {
+    let encrypted = encrypted_fixture(tmp_db, 4096);
+    let tmp_db = &encrypted;
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
     {
         let conn = tmp_db.connect_limbo();
-        run_query(
-            tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         if enable_mvcc {
             run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
         }
@@ -157,18 +157,13 @@ fn run_corruption_associated_data_bytes_test(
 // TODO: mvcc does not error here
 #[turso_macros::test]
 fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
     let opts = tmp_db.db_opts;
 
     {
         let conn = tmp_db.connect_limbo();
-        run_query(
-            &tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -359,6 +354,7 @@ fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Re
 // TODO: mvcc for some reason does not error on corruption here
 #[turso_macros::test]
 fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 4096);
     let _ = env_logger::try_init();
     let db_path = tmp_db.path.clone();
 
@@ -366,12 +362,6 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     {
         let conn = tmp_db.connect_limbo();
-        run_query(
-            &tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
         run_query(
             &tmp_db,
             &conn,
@@ -516,13 +506,12 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
         let tmp_db = TempDatabase::builder()
             .with_opts(opts)
             .with_flags(flags)
+            .with_encryption(cipher_name, hexkey)
             .build();
         let db_path = tmp_db.path.clone();
 
         {
             let conn = tmp_db.connect_limbo();
-            run_query(&tmp_db, &conn, &format!("PRAGMA hexkey = '{hexkey}';"))?;
-            run_query(&tmp_db, &conn, &format!("PRAGMA cipher = '{cipher_name}';"))?;
             run_query(
                 &tmp_db,
                 &conn,
@@ -580,9 +569,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         let correct_encryption_key =
             turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
 
-        let conn = main_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn = main_db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(correct_encryption_key)),
+        )?;
 
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
@@ -606,9 +596,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(correct_encryption_key)),
+        )?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
@@ -686,9 +677,10 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             Arc::new(SqliteDialect),
         )?;
 
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
-        conn.set_encryption_key(correct_encryption_key)?;
+        let conn = db.connect(
+            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                .with_encryption_key(Some(correct_encryption_key)),
+        )?;
 
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
