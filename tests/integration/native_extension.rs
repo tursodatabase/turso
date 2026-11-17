@@ -1378,6 +1378,37 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
 }
 
 #[test]
+fn table_function_argument_reads_a_table_listed_after_the_function() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE TABLE bounds(lower)").unwrap();
+    conn.execute("INSERT INTO bounds VALUES (8), (16)").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT bounds.lower, r.value FROM native_rows(bounds.lower) AS r, bounds \
+             ORDER BY bounds.lower, r.value",
+        )
+        .unwrap();
+    assert_eq!(
+        collect(&mut stmt, &queue),
+        vec![
+            vec![Value::from_i64(8), Value::from_i64(9)],
+            vec![Value::from_i64(8), Value::from_i64(17)],
+            vec![Value::from_i64(16), Value::from_i64(17)],
+        ]
+    );
+}
+
+#[test]
 fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl() {
     for mvcc in [false, true] {
         let queue = Arc::new(Mutex::new(Vec::new()));
