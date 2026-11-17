@@ -7,14 +7,16 @@ use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
-    schema::Schema,
+    schema::{Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
         expr::{
-            expr_type::{query_column_type, type_of, type_ordering, ExprType},
-            row_value_component_expr, row_value_len,
+            expr_type::{
+                query_column_type, same_type_def, type_of, type_ordering, BuiltinType, ExprType,
+            },
+            is_untyped_operand, row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
@@ -543,7 +545,7 @@ pub fn in_subquery_collation(
     let lhs_context = ExprContext::new(lhs_tables, resolver);
     let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
     let types = [
-        type_of(lhs, &lhs_context.type_env()),
+        operand_type(lhs, &lhs_context)?,
         query_column_type(query, column, resolver),
     ];
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
@@ -694,7 +696,7 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     let mut schema = None;
     for (expr, context) in exprs {
         let context: ExprContext<'c, 's> = *context.borrow();
-        types.push(type_of(expr, &context.type_env()));
+        types.push(operand_type(expr, &context)?);
         schema.get_or_insert(context.schema());
     }
     match schema {
@@ -703,14 +705,25 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     }
 }
 
+/// The type `expr` brings to a comparison. A string literal or a parameter
+/// has none of its own: it is read as a value of the type it is compared with.
+fn operand_type(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<ExprType> {
+    Ok(match is_untyped_operand(expr)? {
+        true => ExprType::Untyped,
+        false => type_of(expr, &context.type_env()),
+    })
+}
+
 /// The one order among values of `types`, as [common_type_ordering] decides
 /// it. `has_collate` says whether a COLLATE applies to the values. Every
-/// COLLATE that applies to a value is checked here, through [operand_order].
+/// COLLATE that applies to a value is checked here, through [operand_order],
+/// and so is every pair of types, through [check_types_compare].
 fn common_ordering(
     types: &[ExprType],
     schema: &Schema,
     has_collate: bool,
 ) -> Result<Option<TypeOrdering>> {
+    check_types_compare(types, schema)?;
     let mut found: Option<(TypeOrdering, &ExprType)> = None;
     let mut array_of_unknown_elements = None;
     for ty in types {
@@ -737,6 +750,91 @@ fn common_ordering(
         }
         (found, _) => Ok(found.map(|(ordering, _)| ordering)),
     }
+}
+
+/// Fails when two values of `types` don't compare with each other. Every
+/// comparison asks this one rule, as SQLite asks `sqlite3CompareAffinity`
+/// (expr.c). Each value is checked as the type it compares as (see
+/// [compared_type]). Only a built-in custom type limits what it compares with,
+/// so each one is paired with every other value.
+pub(crate) fn check_types_compare(types: &[ExprType], schema: &Schema) -> Result<()> {
+    let compared = types
+        .iter()
+        .map(|ty| compared_type(ty, schema))
+        .collect::<Result<SmallVec<[ExprType; 2]>>>()?;
+    for (i, ty) in compared.iter().enumerate() {
+        let ExprType::Custom { type_def, .. } = ty else {
+            continue;
+        };
+        for j in (0..types.len()).filter(|&j| j != i) {
+            if !compares_with(type_def, &compared[j]) {
+                let (left, right) = (i.min(j), i.max(j));
+                return Err(cannot_compare(&types[left], &types[right]));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The type values of `ty` compare as. A built-in type, such as date or
+/// jsonb, compares as itself without its domains. A user type (CREATE TYPE)
+/// compares as the kind of value its DECODE returns, so `c < 9` compares the
+/// decoded value of c with 9.
+fn compared_type(ty: &ExprType, schema: &Schema) -> Result<ExprType> {
+    let ExprType::Custom { type_def, .. } = ty else {
+        return Ok(ty.clone());
+    };
+    Ok(match schema.without_domains(type_def)? {
+        // A STRUCT or UNION has no DECODE, so it compares as itself too.
+        Some(base) if base.is_builtin || base.is_struct() || base.is_union() => ExprType::Custom {
+            type_def: base,
+            params: Vec::new(),
+        },
+        // A user type, or a domain over a plain SQLite type.
+        Some(_) | None => ExprType::Builtin(type_def.value_type()),
+    })
+}
+
+/// Whether a value of the built-in type `custom` compares with a value of
+/// `other`, a type as [compared_type] gives it. A string literal, a parameter
+/// and NULL compare with anything. A built-in type compares with itself, and
+/// with another type only when both are numbers, or when it has no ENCODE and
+/// the other type is its input type, as varchar compares with text.
+fn compares_with(custom: &TypeDef, other: &ExprType) -> bool {
+    let plain = match other {
+        ExprType::Untyped | ExprType::Null => return true,
+        // Checked again once the type is known, as in `d = (SELECT ...)`.
+        ExprType::NotKnownYet => return true,
+        // A row value compared with one value is an error of its own.
+        ExprType::RowValue => return true,
+        // Any kind of value, such as a column without a declared type.
+        ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown => return false,
+        ExprType::Array { .. } => return false,
+        ExprType::Custom { type_def, .. } => {
+            return same_type_def(custom, type_def) || (is_number(custom) && is_number(type_def))
+        }
+        ExprType::Builtin(plain) => *plain,
+    };
+    let both_numbers = is_number(custom)
+        && matches!(
+            plain,
+            BuiltinType::Integer | BuiltinType::Real | BuiltinType::Decimal | BuiltinType::Numeric
+        );
+    let takes_plain_as_input = custom.encode().is_none()
+        && custom
+            .value_input_type()
+            .eq_ignore_ascii_case(plain.sqlite_name());
+    both_numbers || takes_plain_as_input
+}
+
+/// Whether values of `type_def` are numbers: it computes with exact numbers, as
+/// numeric does, or its values are integers or reals, as smallint's are.
+fn is_number(type_def: &TypeDef) -> bool {
+    type_def.computes_with_exact_numbers()
+        || matches!(
+            type_def.value_type(),
+            BuiltinType::Integer | BuiltinType::Real
+        )
 }
 
 /// How the values of a table or index column of type `ty` compare: the order

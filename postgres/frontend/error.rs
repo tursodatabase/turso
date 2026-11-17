@@ -372,6 +372,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_SCHEMA_NAME
     } else if msg.contains("query_only mode") {
         SQLSTATE_READ_ONLY_SQL_TRANSACTION
+    } else if msg.starts_with("cannot compare type ") {
+        SQLSTATE_FEATURE_NOT_SUPPORTED
     } else {
         SQLSTATE_SYNTAX_ERROR
     }
@@ -597,6 +599,10 @@ mod tests {
             ("column \"c\" does not exist", SQLSTATE_UNDEFINED_COLUMN),
             ("function f does not exist", SQLSTATE_UNDEFINED_FUNCTION),
             ("there is no parameter $1", SQLSTATE_UNDEFINED_PARAMETER),
+            (
+                "cannot compare type date with type integer",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
             (
                 "window functions are not allowed in policy expressions",
                 SQLSTATE_WINDOWING_ERROR,

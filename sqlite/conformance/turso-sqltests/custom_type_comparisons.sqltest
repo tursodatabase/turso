@@ -299,19 +299,15 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-numeric-in-subquery-either-side {
+test cmp-numeric-with-any-column-is-an-error {
+    -- A column of type ANY holds any kind of value, which numeric doesn't
+    -- compare with.
     CREATE TABLE s(id INTEGER PRIMARY KEY, x ANY) STRICT;
     CREATE TABLE b(m numeric(10,3)) STRICT;
-    INSERT INTO s VALUES (1, '1.5'), (2, 1.5), (3, 2);
-    INSERT INTO b VALUES (1.5);
-    SELECT 'eq', group_concat(s.id) FROM s, b WHERE s.x = b.m;
-    SELECT 'in', group_concat(id) FROM s WHERE x IN (SELECT m FROM b);
-    SELECT 'not-in', group_concat(id) FROM s WHERE x NOT IN (SELECT m FROM b);
+    SELECT id FROM s WHERE x IN (SELECT m FROM b);
 }
-expect {
-    eq|1,2
-    in|1,2
-    not-in|3
+expect error {
+    cannot compare type any with type numeric
 }
 
 @requires strict "uses STRICT tables"
@@ -332,27 +328,23 @@ test cmp-uuid-with-null-and-constants {
     CREATE TABLE t(id INTEGER PRIMARY KEY, u uuid) STRICT;
     INSERT INTO t VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, NULL);
     SELECT 'eq-null', count(*) FROM t WHERE u = NULL;
-    SELECT 'eq-null-text', count(*) FROM t WHERE u = CAST(NULL AS TEXT);
     SELECT 'is', count(*) FROM t WHERE u IS 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
     SELECT 'is-null', count(*) FROM t WHERE u IS NULL;
     SELECT 'in', count(*) FROM t WHERE u IN (NULL, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
     SELECT 'case', id, CASE u WHEN NULL THEN 'null' WHEN 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' THEN 'yes' ELSE 'no' END FROM t ORDER BY id;
     CREATE INDEX t_u ON t(u);
     SELECT 'eq-null', count(*) FROM t WHERE u = NULL;
-    SELECT 'eq-null-text', count(*) FROM t WHERE u = CAST(NULL AS TEXT);
     SELECT 'is', count(*) FROM t WHERE u IS 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
     SELECT 'is-null', count(*) FROM t WHERE u IS NULL;
 }
 expect {
     eq-null|0
-    eq-null-text|0
     is|1
     is-null|1
     in|1
     case|1|yes
     case|2|no
     eq-null|0
-    eq-null-text|0
     is|1
     is-null|1
 }
@@ -1739,7 +1731,7 @@ test cmp-min-with-text-and-two-custom-types-is-an-error {
     SELECT min(tm, d, '10:00') FROM t;
 }
 expect error {
-    cannot tell which type to read a string literal or parameter as
+    cannot compare type time with type date
 }
 
 @requires strict "uses STRICT tables"
@@ -1795,4 +1787,143 @@ test cmp-coalesce-with-text-and-two-custom-types-is-an-error {
 }
 expect error {
     cannot tell which type to read a string literal or parameter as
+}
+
+# One rule decides which types compare. A custom type compares with its own
+# type, a string literal, a parameter or NULL. It compares with another type
+# only when both are numbers, or when the custom type has no ENCODE and the
+# other type is its input type (varchar and text). PostgreSQL also refuses the
+# pairs in tests named "...-is-an-error". It runs the pairs in tests named
+# "...-is-not-supported", which Turso would compare as stored values.
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-integer-is-an-error-with-an-index {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05');
+    CREATE INDEX a_d ON a(d);
+    SELECT id FROM a WHERE d = 5;
+}
+expect error {
+    cannot compare type date with type integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-timestamp-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05', '2024-01-05 00:00');
+    SELECT id FROM a WHERE d = ts;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-timestamp-in-a-join-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05');
+    INSERT INTO b VALUES (1, '2024-01-05 00:00');
+    SELECT a.id, b.id FROM a JOIN b ON a.d = b.ts;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-in-timestamp-subquery-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05');
+    INSERT INTO b VALUES (1, '2024-01-05 00:00');
+    SELECT id FROM a WHERE d IN (SELECT ts FROM b);
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-timestamp-scalar-subquery-is-not-supported {
+    -- The subquery's type is known only after the subquery is planned, so the
+    -- comparison is checked again then.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05');
+    INSERT INTO b VALUES (1, '2024-01-05 00:00');
+    SELECT id FROM a WHERE d = (SELECT ts FROM b);
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+# A trigger's NEW.k and OLD.k, and an UPSERT's excluded.rowid and
+# excluded.<rowid alias>, have no type when the column has no custom type. They
+# compare as type any, which a custom type doesn't compare with.
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-with-trigger-new-of-integer-column-is-not-supported {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO p VALUES (1, 5);
+    CREATE TABLE src(id INTEGER, k INTEGER) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN UPDATE p SET n = 0 WHERE n = NEW.k; END;
+    INSERT INTO src VALUES (1, 5);
+}
+expect error {
+    cannot compare type numeric with type any
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-in-timestamp-list-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05', '2024-01-05 00:00');
+    SELECT id FROM a WHERE d IN (ts);
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-between-timestamps-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, ts timestamp) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05', '2024-01-05 00:00');
+    SELECT id FROM a WHERE d BETWEEN ts AND ts;
+}
+expect error {
+    cannot compare type date with type timestamp
+}
+
+@requires strict "uses STRICT tables"
+test cmp-nullif-of-date-and-integer-is-an-error {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05');
+    SELECT nullif(d, 5) FROM a;
+}
+expect error {
+    cannot compare type date with type integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-union-of-time-and-integer-is-an-error {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tm time) STRICT;
+    SELECT tm FROM a UNION SELECT 5;
+}
+expect error {
+    cannot compare type time with type integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-pairs-that-still-compare {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date, v varchar(10), t text, i bigint, n numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05', 'x', 'x', 5, 5), (2, '2024-01-06', 'y', 'z', 6, 6.5);
+    SELECT 'literal', id FROM a WHERE d = '2024-01-05';
+    SELECT 'null', count(*) FROM a WHERE d = NULL;
+    SELECT 'same-type', count(*) FROM a x JOIN a y ON x.d = y.d;
+    SELECT 'numbers', id FROM a WHERE n = i;
+    SELECT 'varchar-text', id FROM a WHERE v = t;
+}
+expect {
+    literal|1
+    null|0
+    same-type|2
+    numbers|1
+    varchar-text|1
 }

@@ -383,17 +383,16 @@ expect {
     3
 }
 
-# timestamptz is stored as the UTC instant with no offset, so it equals the
-# same timestamp and SQLite's date functions can read it.
+# timestamp and timestamptz are two types. Comparing them needs a time zone
+# conversion, which Turso doesn't support.
 @requires strict "uses STRICT tables"
-test datetime-timestamp-equals-timestamptz {
+test datetime-timestamp-equals-timestamptz-is-refused {
     CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
     INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
-    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
     SELECT id FROM t WHERE ts = tz;
 }
-expect {
-    1
+expect error {
+    cannot compare type timestamp with type timestamptz
 }
 
 @requires strict "uses STRICT tables"

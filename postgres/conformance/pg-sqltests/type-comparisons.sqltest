@@ -1,0 +1,18 @@
+# Which types compare with each other. tursopg refuses with 0A000 every pair
+# of types it can't compare as PostgreSQL does, whether or not PostgreSQL runs
+# the comparison.
+
+@database :memory:
+
+test compare-date-with-timestamp {
+    CREATE TABLE a (id int, d date, ts timestamp);
+    INSERT INTO a VALUES (1, '2024-01-05', '2024-01-05 00:00');
+    SELECT id FROM a WHERE d = ts;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type date with type timestamp
+}
