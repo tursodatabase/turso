@@ -2829,7 +2829,10 @@ impl PostgreSQLTranslator {
             func_name,
             "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
         );
-        if !returns_record && !column_definitions.is_empty() {
+        if !returns_record
+            && rewritten_function(func_name).is_none()
+            && !column_definitions.is_empty()
+        {
             return Err(ParseError::not_supported(format!(
                 "a column definition list on {func_name}()"
             )));
@@ -2922,7 +2925,11 @@ impl PostgreSQLTranslator {
                 qualified_name,
                 args,
                 alias,
-                func_call.funcname.len() > 1,
+                CallShape {
+                    arg_count: func_call.args.len(),
+                    schema_qualified: func_call.funcname.len() > 1,
+                    has_column_definition_list: !column_definitions.is_empty(),
+                },
             );
         }
         if returns_record {
@@ -5607,13 +5614,21 @@ impl PostgreSQLTranslator {
     }
 }
 
+/// What a call of a function in FROM looks like, before its arguments are translated.
+#[derive(Clone, Copy)]
+struct CallShape {
+    arg_count: usize,
+    schema_qualified: bool,
+    has_column_definition_list: bool,
+}
+
 /// A table function that PostgreSQL has in FROM and that is a call of a table function of
 /// the engine here. The call is a SELECT over the engine's table function.
 struct RewrittenFunction {
     name: &'static str,
     in_main_schema: bool,
-    /// Refuses a call, given its number of arguments and whether its name has a schema.
-    check_arg_count: fn(usize, bool) -> Result<(), ParseError>,
+    /// Refuses a call that PostgreSQL refuses for this function.
+    check_call: fn(CallShape) -> Result<(), ParseError>,
     /// The column of the engine's table function that holds each column of the result,
     /// and the name PostgreSQL gives that column, for a call with this many arguments.
     columns: fn(usize) -> Vec<(ast::Expr, String)>,
@@ -5644,8 +5659,9 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 2] = [
     RewrittenFunction {
         name: "unnest",
         in_main_schema: true,
-        check_arg_count: |count, schema_qualified| {
-            if count == 0 || (schema_qualified && count > 1) {
+        check_call: |call| {
+            let count = call.arg_count;
+            if count == 0 || (call.schema_qualified && count > 1) {
                 return Err(ParseError::Sqlstate {
                     sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
                     message: if count == 0 {
@@ -5659,6 +5675,11 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 2] = [
                 return Err(ParseError::not_supported(format!(
                     "unnest() with more than {MAX_UNNEST_ARRAYS} arrays"
                 )));
+            }
+            if count > 1 && call.has_column_definition_list {
+                return Err(ParseError::ParseError(
+                    "UNNEST() with multiple arguments cannot have a column definition list".into(),
+                ));
             }
             Ok(())
         },
@@ -5677,12 +5698,13 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 2] = [
     RewrittenFunction {
         name: "generate_series",
         in_main_schema: true,
-        check_arg_count: |count, _| {
-            if !(2..=3).contains(&count) {
+        check_call: |call| {
+            if !(2..=3).contains(&call.arg_count) {
                 return Err(ParseError::Sqlstate {
                     sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
                     message: format!(
-                        "function generate_series with {count} arguments does not exist"
+                        "function generate_series with {} arguments does not exist",
+                        call.arg_count
                     ),
                 });
             }
@@ -5717,9 +5739,14 @@ fn translate_rewritten_function(
     qualified_name: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
     alias: Option<ast::As>,
-    schema_qualified: bool,
+    call: CallShape,
 ) -> Result<ast::SelectTable, ParseError> {
-    (function.check_arg_count)(args.len(), schema_qualified)?;
+    (function.check_call)(call)?;
+    if call.has_column_definition_list {
+        return Err(ParseError::ParseError(
+            "a column definition list is only allowed for functions returning \"record\"".into(),
+        ));
+    }
     let (mut sources, mut default_names): (Vec<_>, Vec<_>) =
         (function.columns)(args.len()).into_iter().unzip();
     if let ([name], Some(table_alias)) = (default_names.as_mut_slice(), &range_func.alias) {
@@ -12828,6 +12855,18 @@ mod tests {
         );
     }
 
+    fn assert_rejected(sql: &str, needle: &str) {
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains(needle),
+            "{sql}: expected an error mentioning {needle:?}, got: {err}"
+        );
+    }
+
     fn assert_translates(sql: &str) {
         let parsed = crate::parse(sql).unwrap();
         if let Err(err) = PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
@@ -13700,9 +13739,17 @@ mod tests {
             "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
             "column definition list on f()",
         );
-        assert_not_supported(
+        assert_rejected(
             "SELECT * FROM unnest(ARRAY[1]) AS u(a int)",
-            "column definition list on unnest()",
+            "only allowed for functions returning",
+        );
+        assert_rejected(
+            "SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS u(a int, b int)",
+            "UNNEST() with multiple arguments",
+        );
+        assert_rejected(
+            "SELECT * FROM generate_series(1, 3) AS g(a int)",
+            "only allowed for functions returning",
         );
         assert_translates("SELECT * FROM ROWS FROM (json_to_record('{}') AS (a int)) AS r(x)");
         assert_not_supported(

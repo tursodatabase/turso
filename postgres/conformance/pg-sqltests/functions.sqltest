@@ -1449,6 +1449,58 @@ expect error {
     table "t" has 2 columns available but 3 columns specified
 }
 
+test unnest-column-definition-list-errors {
+    SELECT * FROM unnest(ARRAY[1,2]) AS t(x int);
+}
+@sqlstate 42601
+expect error {
+    a column definition list is only allowed for functions returning "record"
+}
+
+test unnest-several-arrays-column-definition-list-errors {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS t(x int, y int);
+}
+@sqlstate 42601
+expect error {
+    UNNEST\(\) with multiple arguments cannot have a column definition list
+}
+
+test generate-series-column-definition-list-errors {
+    SELECT * FROM generate_series(1, 3) AS t(x int);
+}
+@sqlstate 42601
+expect error {
+    a column definition list is only allowed for functions returning "record"
+}
+
+test generate-series-with-one-argument-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM generate_series(1) AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-with-four-arguments-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM generate_series(1, 2, 3, 4) AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test unnest-without-an-array-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM unnest() AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test schema-qualified-unnest-with-several-arrays-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1], ARRAY[2]) AS t(x int, y int);
+}
+@sqlstate 42883
+expect error {
+}
+
 test unnest-without-an-array-errors {
     SELECT * FROM unnest();
 }
