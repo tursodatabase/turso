@@ -400,6 +400,16 @@ expect @tursopg error {
     a function parameter of type pg_class is not supported
 }
 
+test catalog-row-array-parameter {
+    CREATE FUNCTION f(_pg_class) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a function parameter of type _pg_class is not supported
+}
+
 test enum-parameter {
     CREATE TYPE mood AS ENUM ('sad', 'happy');
     CREATE FUNCTION is_happy(mood) RETURNS bool AS $$ SELECT $1 = 'happy' $$ LANGUAGE sql;

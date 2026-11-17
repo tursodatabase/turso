@@ -31,6 +31,9 @@ pub(crate) enum TypeKind {
     BuiltInArray(BuiltInType),
     /// A type that PostgreSQL defines outside the lists of built-in types.
     System,
+    /// The array type of a type that PostgreSQL defines outside the lists
+    /// of built-in types, such as `_pg_class`.
+    SystemArray,
     /// A type of the catalog, as `type_lookup` finds it by the name as it
     /// is written.
     Catalog(PgType),
@@ -62,6 +65,11 @@ pub(crate) fn type_kind(
         Some(TypeKind::BuiltInArray(kind))
     } else if is_system_type(schema, name) {
         Some(TypeKind::System)
+    } else if name
+        .strip_prefix('_')
+        .is_some_and(|element| is_system_type(schema, element))
+    {
+        Some(TypeKind::SystemArray)
     } else if let Some(pg_type) = type_lookup(schema, name) {
         Some(TypeKind::Catalog(pg_type))
     } else {

@@ -552,7 +552,9 @@ fn classify_type(
     // record[], but not of polymorphic types. It has no array type of an
     // array type such as `_int4`.
     Ok(match type_kind(type_lookup, schema, name) {
-        Some(TypeKind::BuiltInArray(_) | TypeKind::CatalogArray(_)) if !brackets.is_empty() => {
+        Some(TypeKind::BuiltInArray(_) | TypeKind::SystemArray | TypeKind::CatalogArray(_))
+            if !brackets.is_empty() =>
+        {
             missing()
         }
         Some(TypeKind::BuiltIn(BuiltInType::Base)) if brackets.is_empty() => TypeClass::Base,
@@ -575,9 +577,12 @@ fn classify_type(
         Some(TypeKind::BuiltInArray(BuiltInType::Polymorphic)) => {
             unreachable!("type_kind gives no array type of a polymorphic type")
         }
-        Some(TypeKind::System | TypeKind::Catalog(_) | TypeKind::CatalogArray(_)) => {
-            TypeClass::Catalog(type_name_text(type_name)?)
-        }
+        Some(
+            TypeKind::System
+            | TypeKind::SystemArray
+            | TypeKind::Catalog(_)
+            | TypeKind::CatalogArray(_),
+        ) => TypeClass::Catalog(type_name_text(type_name)?),
     })
 }
 

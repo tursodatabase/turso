@@ -532,6 +532,13 @@ expect {
     null
 }
 
+test select-cast-of-null-to-array-of-catalog-row-type {
+    SELECT CASE WHEN NULL::_pg_class IS NULL THEN 'null' END;
+}
+expect {
+    null
+}
+
 # An index has no row type.
 test select-cast-to-index-name {
     CREATE TABLE emp (name text);

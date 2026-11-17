@@ -5676,6 +5676,7 @@ impl PostgreSQLTranslator {
                 TypeKind::BuiltIn(_)
                 | TypeKind::BuiltInArray(_)
                 | TypeKind::System
+                | TypeKind::SystemArray
                 | TypeKind::Catalog(PgType::Custom)
                 | TypeKind::CatalogArray(PgType::Custom),
             ) => Ok(()),
