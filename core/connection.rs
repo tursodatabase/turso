@@ -35,7 +35,7 @@ use crate::{
     ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Program, QueryMode, Result, Schema, Statement, SyncMode, TransactionMode, Trigger, Value,
-    VirtualTable, WalAutoActions,
+    VirtualTable, WalAutoActions, WallClockInstant,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -477,6 +477,9 @@ pub struct Connection {
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
+    /// When the explicit transaction started. Valid only while autocommit is
+    /// off; see `start_explicit_transaction`.
+    pub(super) explicit_transaction_start: RwLock<Option<WallClockInstant>>,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
@@ -2542,7 +2545,7 @@ impl Connection {
         self.set_tx_state(TransactionState::Write {
             schema_did_change: false,
         });
-        self.auto_commit.store(false, Ordering::SeqCst);
+        self.start_explicit_transaction(pager.io.current_time_wall_clock());
 
         Ok(())
     }
@@ -3111,6 +3114,24 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    /// Turns autocommit off because the user starts a transaction at `now`,
+    /// which PostgreSQL's `now()` then returns until the transaction ends.
+    pub(crate) fn start_explicit_transaction(&self, now: WallClockInstant) {
+        *self.explicit_transaction_start.write() = Some(now);
+        self.auto_commit.store(false, Ordering::SeqCst);
+    }
+
+    /// When the open explicit transaction started.
+    pub(crate) fn explicit_transaction_start(&self) -> WallClockInstant {
+        turso_assert!(
+            !self.get_auto_commit(),
+            "only an explicit transaction has a start time"
+        );
+        self.explicit_transaction_start
+            .read()
+            .expect("every explicit transaction starts in start_explicit_transaction")
     }
 
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.

@@ -23,9 +23,10 @@ use crate::{
     schema::{BTreeTable, RelationKind, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
-    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
+    WallClockInstant, IO,
 };
-use std::{any::Any, sync::Arc};
+use std::{any::Any, cell::Cell, sync::Arc};
 use turso_parser::ast::{
     self, Cmd, CreateTableBody, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec, Stmt,
 };
@@ -134,14 +135,53 @@ pub struct OwnerColumn {
     pub column: String,
 }
 
-/// What a built-in scalar function may read besides its arguments.
+/// What a scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
-    pub connection: &'a Connection,
+    pub connection: &'a Arc<Connection>,
     pub io: &'a dyn IO,
     /// The statement's clock: every function of one step sees the same time.
     pub clock: &'a dyn Clock,
+    /// Set by the first call of `statement_times` in the statement.
+    pub statement_times: &'a Cell<Option<StatementTimes>>,
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
+}
+
+impl ScalarFuncContext<'_> {
+    /// The same times for every call until the statement ends, triggers
+    /// included.
+    pub fn statement_times(&self) -> StatementTimes {
+        if let Some(times) = self.statement_times.get() {
+            return times;
+        }
+        let times = StatementTimes::new(self.io.current_time_wall_clock(), self.connection);
+        self.statement_times.set(Some(times));
+        times
+    }
+}
+
+/// When a statement and its transaction started, as PostgreSQL's
+/// `statement_timestamp()` and `now()` report them.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementTimes {
+    pub statement: WallClockInstant,
+    pub transaction: WallClockInstant,
+}
+
+impl StatementTimes {
+    /// Times for a statement that starts at `now`. In autocommit mode the
+    /// statement is its own transaction.
+    pub(crate) fn new(now: WallClockInstant, connection: &Connection) -> Self {
+        let transaction = if connection.get_auto_commit() {
+            now
+        } else {
+            connection.explicit_transaction_start()
+        };
+        Self {
+            statement: now,
+            transaction,
+        }
+    }
 }
 
 /// Start of the comment in stored table SQL that lists the positions and kinds
