@@ -15,9 +15,10 @@ use turso_pg::{
 };
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
+use turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED;
 use turso_pg_parser::ParseResult;
 
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::{self, StartupHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{
     send_execution_response, send_query_response, send_ready_for_query, ExtendedQueryHandler,
@@ -30,7 +31,8 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireServerHandlers, Type,
+    METADATA_DATABASE, METADATA_USER,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
@@ -40,7 +42,7 @@ use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -162,7 +164,55 @@ impl PgWireServerHandlers for TursoPgFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(NoopHandler)
+        self.handler.clone()
+    }
+}
+
+#[async_trait]
+impl StartupHandler for TursoPgHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let PgWireFrontendMessage::Startup(startup) = &message else {
+            unreachable!("without password authentication, pgwire passes only Startup");
+        };
+        for (name, value) in &startup.parameters {
+            self.set_startup_parameter(name, value)?;
+        }
+        auth::protocol_negotiation(client, startup).await?;
+        auth::save_startup_parameters_to_metadata(client, startup);
+        let mut parameters = auth::DefaultServerParameterProvider::default();
+        parameters.time_zone = self.conn.time_zone().into();
+        auth::finish_authentication(client, &parameters).await?;
+        Ok(())
+    }
+}
+
+impl TursoPgHandler {
+    /// A parameter that the session cannot set ends the connection, so the
+    /// session never runs with a setting other than the one the client sent.
+    fn set_startup_parameter(&self, name: &str, value: &str) -> PgWireResult<()> {
+        // These name the role and the database, not settings. pgwire saves
+        // them as connection metadata.
+        if name == METADATA_USER || name == METADATA_DATABASE {
+            return Ok(());
+        }
+        self.conn
+            .set_startup_parameter(name, value)
+            .map_err(|error| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    SQLSTATE_FEATURE_NOT_SUPPORTED.to_owned(),
+                    error.message.clone(),
+                )))
+            })
     }
 }
 

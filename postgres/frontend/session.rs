@@ -168,6 +168,16 @@ impl PgConnection {
         &self.inner.conn
     }
 
+    /// Sets a parameter that the client sent in its startup message.
+    pub fn set_startup_parameter(&self, name: &str, value: &str) -> crate::Result<()> {
+        crate::settings::set_startup_parameter(&self.inner.conn, name, value).map_err(Into::into)
+    }
+
+    /// The session's time zone, as SHOW TimeZone returns it.
+    pub fn time_zone(&self) -> &'static str {
+        crate::settings::time_zone(&self.inner.conn)
+    }
+
     /// Record an error the caller raised on this session's behalf before
     /// reaching prepare — the wire server failing to parse a query string,
     /// for example. In PostgreSQL any error inside a transaction block

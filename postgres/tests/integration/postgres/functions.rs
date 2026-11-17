@@ -252,6 +252,15 @@ fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabas
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_time_zone_cannot_be_set_at_startup_after_it_is_read(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert_eq!(query_text(&conn, "SHOW TimeZone"), ["Etc/UTC"]);
+    let error = conn.set_startup_parameter("TimeZone", "UTC").unwrap_err();
+    assert_eq!(error.to_string(), "the session's time zone is already set");
+    assert_eq!(query_text(&conn, "SHOW TimeZone"), ["Etc/UTC"]);
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_custom_parameters_belong_to_one_connection(db: TempDatabase) {
     let conn = db.connect_postgres();
     let other = db.connect_postgres();

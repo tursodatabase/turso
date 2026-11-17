@@ -1,5 +1,8 @@
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 use turso_core::{ConnectOpts, SessionRole};
@@ -70,6 +73,95 @@ fn schema_dropped_by_one_client_is_gone_for_another() {
     query_error(&mut client2, "SELECT count(*) FROM s.t");
 }
 
+#[test]
+fn startup_parameters_of_the_jdbc_driver_are_accepted() {
+    let server = TestServer::start();
+    // The parameters that the PostgreSQL JDBC driver sends when the JVM's
+    // time zone is UTC.
+    let mut client = server.connect_with(&[
+        ("client_encoding", "UTF8"),
+        ("DateStyle", "ISO"),
+        ("TimeZone", "UTC"),
+        ("extra_float_digits", "3"),
+        ("application_name", "PostgreSQL JDBC Driver"),
+    ]);
+    assert_eq!(
+        query(&mut client, "SELECT TIMESTAMPTZ '2024-01-05 10:00:00+02'"),
+        vec!["2024-01-05 08:00:00+00"]
+    );
+}
+
+#[test]
+fn startup_parameter_that_cannot_be_set_ends_the_connection() {
+    let server = TestServer::start();
+    for (name, value) in [
+        ("TimeZone", "Europe/Helsinki"),
+        ("DateStyle", "German"),
+        ("IntervalStyle", "sql_standard"),
+        ("search_path", "app"),
+        ("role", "postgres"),
+        ("app.user_id", "42"),
+        ("no_such_parameter", "1"),
+        ("options", "-c TimeZone=UTC"),
+        ("_pq_.option", "1"),
+    ] {
+        let reply = startup_reply(server.port, name, value);
+        assert!(
+            reply.starts_with('E') && reply.contains("SFATAL\0") && reply.contains("C0A000\0"),
+            "{name}={value}: {reply}"
+        );
+    }
+}
+
+#[test]
+fn startup_time_zone_is_the_session_time_zone() {
+    let server = TestServer::start();
+    let mut client = server.connect_with(&[("TimeZone", "utc")]);
+    assert_eq!(query(&mut client, "SHOW TimeZone"), vec!["UTC"]);
+    query(&mut client, "RESET TimeZone");
+    assert_eq!(query(&mut client, "SHOW TimeZone"), vec!["UTC"]);
+    assert_eq!(
+        query_error(&mut client, "SET TimeZone = 'Etc/UTC'"),
+        "time zone \"Etc/UTC\" is not supported; the session's time zone is \"UTC\" and cannot be changed"
+    );
+    let mut client = server.connect();
+    assert_eq!(query(&mut client, "SHOW TimeZone"), vec!["Etc/UTC"]);
+    // The time zone in the ParameterStatus message sent at startup.
+    let reply = startup_reply(server.port, "TimeZone", "utc");
+    assert!(reply.contains("TimeZone\0UTC\0"), "{reply}");
+    let reply = startup_reply(server.port, "application_name", "test");
+    assert!(reply.contains("TimeZone\0Etc/UTC\0"), "{reply}");
+}
+
+/// Sends a startup message with `name=value` and returns what the server
+/// sends until it closes the connection or waits for a query.
+fn startup_reply(port: u16, name: &str, value: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut body = b"\0\x03\0\0user\0postgres\0".to_vec();
+    for text in [name, value] {
+        body.extend_from_slice(text.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    stream
+        .write_all(&(body.len() as u32 + 4).to_be_bytes())
+        .unwrap();
+    stream.write_all(&body).unwrap();
+    let mut reply = Vec::new();
+    let mut buffer = [0; 1024];
+    // ReadyForQuery with an idle transaction status.
+    while !reply.ends_with(b"Z\0\0\0\x05I") {
+        match stream.read(&mut buffer).unwrap() {
+            0 => break,
+            read => reply.extend_from_slice(&buffer[..read]),
+        }
+    }
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
 struct TestServer {
     port: u16,
     _dir: TempDir,
@@ -103,6 +195,10 @@ impl TestServer {
     }
 
     fn connect(&self) -> PgConn {
+        self.connect_with(&[])
+    }
+
+    fn connect_with(&self, startup: &[(&str, &str)]) -> PgConn {
         let params = ConnParams {
             host: "127.0.0.1".to_string(),
             port: self.port,
@@ -110,7 +206,7 @@ impl TestServer {
             password: None,
             database: "main".to_string(),
         };
-        PgConn::connect(&params, &[]).unwrap()
+        PgConn::connect(&params, startup).unwrap()
     }
 }
 

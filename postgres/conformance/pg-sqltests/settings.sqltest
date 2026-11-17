@@ -253,6 +253,45 @@ expect {
     ISO, MDY
 }
 
+test builtin-timezone-utc {
+    SET TimeZone = 'Etc/UTC';
+    SHOW TimeZone;
+    SELECT set_config('timezone', 'etc/utc', false);
+    RESET TimeZone;
+    SHOW TimeZone;
+    SELECT TIMESTAMPTZ '2024-01-05 10:00:00+02';
+}
+expect {
+    Etc/UTC
+    Etc/UTC
+    Etc/UTC
+    2024-01-05 08:00:00+00
+}
+
+test builtin-timezone-other-name-for-utc {
+    SET TimeZone = 'utc';
+    SHOW TimeZone;
+}
+expect {
+    UTC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    time zone "utc" is not supported; the session's time zone is "Etc/UTC" and cannot be changed
+}
+
+test builtin-timezone-other-than-utc-is-not-supported {
+    SET TimeZone = 'Europe/Helsinki';
+    SHOW TimeZone;
+}
+expect {
+    Europe/Helsinki
+}
+@sqlstate 0A000
+expect @tursopg error {
+    time zone "Europe/Helsinki" is not supported
+}
+
 test builtin-application-name-transaction-scope {
     SELECT CASE WHEN set_config('app.default_name', current_setting('application_name'), false) IS NOT NULL THEN 'yes' ELSE 'no' END;
     SET application_name = 'session';

@@ -70,6 +70,14 @@ Session changes inside a transaction roll back with the transaction; local
 changes last until its end. An implicit-transaction `set_config(..., true)`
 returns the validated value without changing the next statement's settings.
 
+A client can send parameters when it connects. A parameter from the table
+below is accepted when `SET` accepts its value. `TimeZone` accepts `UTC` or
+`Etc/UTC`, and that name is the session's time zone. `application_name` is
+accepted but not stored, so `SHOW application_name` returns the default. Any
+other parameter, such as `search_path`, `role`, a custom parameter, `options`
+or a protocol option (`_pq_.*`), and any value that `SET` refuses, ends the
+connection with a `FATAL` error, SQLSTATE `0A000`.
+
 `application_name` stores text per connection (default: empty). `search_path`
 and dotted custom parameter names retain their existing transaction behavior.
 `current_setting(name, true)` returns NULL for unknown parameters.
@@ -80,6 +88,7 @@ is returned consistently, including after reset:
 | Parameter | Effective value | Accepted alternatives |
 | --- | --- | --- |
 | `DateStyle` | `ISO, MDY` | `ISO`, `MDY`, either order of `ISO, MDY`; case insensitive |
+| `TimeZone` | `Etc/UTC`, or `UTC` when the client connected with `UTC` | The effective value; case insensitive. Other values, including the other name for UTC, raise SQLSTATE `0A000` |
 | `IntervalStyle` | `postgres` | Case insensitive |
 | `client_encoding` | `UTF8` | `UTF-8`, `UNICODE`; case insensitive |
 | `standard_conforming_strings` | `on` | PostgreSQL true spellings |

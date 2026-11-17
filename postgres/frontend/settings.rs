@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use turso_core::security::roles::RoleId;
 use turso_core::{Connection, ConnectionHooks, SavepointMemo};
@@ -13,6 +13,9 @@ pub(crate) enum SettingScope {
 #[derive(Default)]
 pub(crate) struct PgSessionState {
     settings: Mutex<ConnectionSettings>,
+    /// The time zone the client sent when it connected. No statement can
+    /// change it.
+    startup_time_zone: OnceLock<&'static str>,
 }
 
 impl PgSessionState {
@@ -315,12 +318,50 @@ pub(crate) enum ConfigParameter {
     SearchPath,
     Role,
     ApplicationName,
+    TimeZone,
     Fixed(&'static FixedParameter),
 }
 
 pub(crate) enum Parameter<'a> {
     BuiltIn(ConfigParameter),
     Custom(&'a str),
+}
+
+/// Sets a parameter that the client sent when it connected. PostgreSQL makes
+/// that value the one RESET returns to, but RESET here returns to the
+/// built-in default. So only parameters that no statement can change are
+/// set, and the others are refused, except `application_name`.
+pub(crate) fn set_startup_parameter(
+    conn: &Connection,
+    name: &str,
+    value: &str,
+) -> turso_core::Result<()> {
+    match find_parameter(name) {
+        Some(Parameter::BuiltIn(parameter @ ConfigParameter::Fixed(_))) => {
+            parameter.set(conn, Some(value), SettingScope::Session)?;
+            Ok(())
+        }
+        Some(Parameter::BuiltIn(ConfigParameter::TimeZone)) => {
+            let zone = parse_time_zone(value)?;
+            let state = crate::session::session_state(conn)?;
+            state.startup_time_zone.set(zone).map_err(|_| {
+                crate::error::sqlstate_error(
+                    turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                    "the session's time zone is already set",
+                )
+            })
+        }
+        // Clients such as psql and the JDBC driver send it on every
+        // connection. It is not stored: SHOW application_name returns the
+        // default.
+        Some(Parameter::BuiltIn(ConfigParameter::ApplicationName)) => Ok(()),
+        Some(Parameter::BuiltIn(ConfigParameter::SearchPath | ConfigParameter::Role))
+        | Some(Parameter::Custom(_))
+        | None => Err(crate::error::sqlstate_error(
+            turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("startup parameter \"{name}\" is not supported"),
+        )),
+    }
 }
 
 pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
@@ -330,6 +371,8 @@ pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
         ConfigParameter::Role
     } else if name.eq_ignore_ascii_case("application_name") {
         ConfigParameter::ApplicationName
+    } else if name.eq_ignore_ascii_case("TimeZone") {
+        ConfigParameter::TimeZone
     } else if let Some(parameter) = FIXED_PARAMETERS
         .iter()
         .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
@@ -357,6 +400,19 @@ impl ConfigParameter {
                 });
                 Ok(value.unwrap_or_default().to_owned())
             }
+            // RESET returns to the startup time zone, which no SET can change.
+            Self::TimeZone => {
+                let zone = time_zone(conn);
+                match value {
+                    Some(value) if parse_time_zone(value)? != zone => {
+                        Err(crate::error::sqlstate_error(
+                            turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            format!("time zone \"{value}\" is not supported; the session's time zone is \"{zone}\" and cannot be changed"),
+                        ))
+                    }
+                    Some(_) | None => Ok(zone.to_owned()),
+                }
+            }
             Self::Fixed(parameter) => {
                 if let Some(value) = value {
                     parameter.validate(value)?;
@@ -378,6 +434,7 @@ impl ConfigParameter {
                 .context::<PgSessionState>()
                 .and_then(|state| state.setting(self.name()))
                 .unwrap_or_default(),
+            Self::TimeZone => time_zone(conn).to_owned(),
             Self::Fixed(parameter) => parameter.value.to_owned(),
         }
     }
@@ -387,6 +444,7 @@ impl ConfigParameter {
             Self::SearchPath => "search_path",
             Self::Role => "role",
             Self::ApplicationName => "application_name",
+            Self::TimeZone => "TimeZone",
             Self::Fixed(parameter) => parameter.name,
         }
     }
@@ -400,6 +458,28 @@ impl ConfigParameter {
             })
         )
     }
+}
+
+/// The time zone the client connected with, or `Etc/UTC` if it sent none.
+/// Once read, it cannot be set.
+pub(crate) fn time_zone(conn: &Connection) -> &'static str {
+    conn.context::<PgSessionState>().map_or("Etc/UTC", |state| {
+        *state.startup_time_zone.get_or_init(|| "Etc/UTC")
+    })
+}
+
+/// tursopg supports only UTC. Of PostgreSQL's names for it, this returns the
+/// one `value` names, in PostgreSQL's case; SHOW TimeZone returns that name.
+fn parse_time_zone(value: &str) -> turso_core::Result<&'static str> {
+    ["UTC", "Etc/UTC"]
+        .into_iter()
+        .find(|zone| value.eq_ignore_ascii_case(zone))
+        .ok_or_else(|| {
+            crate::error::sqlstate_error(
+                turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!("time zone \"{value}\" is not supported; only UTC is supported"),
+            )
+        })
 }
 
 pub(crate) struct FixedParameter {
