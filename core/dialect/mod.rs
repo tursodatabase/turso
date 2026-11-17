@@ -269,6 +269,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether the arguments of a table function can only name columns of the
+    /// tables listed before it in FROM.
+    ///
+    /// SQLite looks in every table of the query, so `json_each(value)` reads
+    /// `json_each.value` and `json_each(t.x), t` is accepted. PostgreSQL only
+    /// lets a function in FROM read the tables to its left.
+    fn table_function_arguments_read_only_earlier_tables(&self) -> bool {
+        false
+    }
+
     /// Whether a sequence named without a schema in an expression stored in
     /// the schema is bound to the schema it is found in when the expression
     /// is created.

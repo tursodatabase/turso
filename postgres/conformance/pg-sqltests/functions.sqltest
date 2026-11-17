@@ -2081,3 +2081,38 @@ test array-to-json-result-is-json {
 expect {
     [[1,2]]|2
 }
+
+test table-function-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE json_each_later (j json);
+    SELECT * FROM json_each(json_each_later.j), json_each_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test table-function-argument-cannot-name-a-column-of-a-table-listed-after-it {
+    CREATE TABLE json_each_later_column (j json);
+    SELECT * FROM json_each(j), json_each_later_column;
+}
+@sqlstate 42703
+expect error {
+    j
+}
+
+test table-function-argument-named-like-a-column-of-the-function {
+    CREATE TABLE json_each_value (value json);
+    INSERT INTO json_each_value VALUES ('{"a": 1, "b": 2}');
+    SELECT count(*) FROM json_each_value, json_each(value) AS e;
+}
+expect {
+    2
+}
+
+test table-function-argument-names-the-column-of-the-function-before-it {
+    CREATE TABLE json_each_nested (j json);
+    INSERT INTO json_each_nested VALUES ('{"a": {"x": 1, "y": 2}, "b": {"z": 3}}');
+    SELECT count(*) FROM json_each_nested, json_each(j) AS outer_each, json_each(value) AS inner_each;
+}
+expect {
+    3
+}
