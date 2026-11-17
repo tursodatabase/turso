@@ -611,12 +611,14 @@ pub fn bind_and_rewrite_expr<'a>(
     check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 
-/// Fails when `expr` uses an operator that no function of its operands' types
-/// runs, such as `d * 2` for a date d, applies a COLLATE to a type that takes
-/// none, or compares two types with different orders. This runs on every
-/// expression a statement binds, so it also catches what the planner never
-/// compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are
-/// bound only once the binding walk is done, so these are further walks.
+/// Fails when `expr` casts to a type with arguments that don't fit it, such as
+/// `CAST(x AS timestamp(3))`, uses an operator that no function of its
+/// operands' types runs, such as `d * 2` for a date d, applies a COLLATE to a
+/// type that takes none, or compares two types with different orders. This
+/// runs on every expression a statement binds, so it also catches what the
+/// planner never compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The
+/// operands are bound only once the binding walk is done, so these are further
+/// walks.
 pub(crate) fn check_custom_types(
     expr: &ast::Expr,
     tables: Option<&TableReferences>,
@@ -629,7 +631,10 @@ pub(crate) fn check_custom_types(
         return Ok(());
     }
     let context = ExprContext::new(tables, resolver);
-    // Operators first: `(d * 2) COLLATE nocase` fails because `*` does not
+    // Type arguments first: `CAST(x AS numeric(10)) + 1` fails because numeric
+    // takes two arguments, not because `+` has no function for the CAST.
+    expr_type::check_cast_type_args(expr, resolver.schema())?;
+    // Then operators: `(d * 2) COLLATE nocase` fails because `*` does not
     // exist for a date, not because its result has no type.
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         check_custom_operator(expr, &context.type_env())?;

@@ -990,23 +990,22 @@ impl TypeDef {
 
     /// The arguments `type_name`, a use of this type, gives the type's
     /// parameters: `10, 2` in `numeric(10, 2)`, and none for a type without
-    /// parameters. None when the type has parameters and `type_name` gives no
-    /// arguments, as `numeric` does. Any other number of arguments is an
-    /// error. PostgreSQL gives a modifier on some types without parameters a
-    /// meaning Turso does not implement, such as the precision in
-    /// `timestamp(3)`.
+    /// parameters. None for a use that is SQLite's type (see
+    /// [Self::is_sqlite_type]). Any other number of arguments is an error.
+    /// PostgreSQL gives a modifier on some types without parameters a meaning
+    /// Turso does not implement, such as the precision in `timestamp(3)`.
     #[allow(clippy::vec_box)]
     pub fn type_args(
         &self,
         type_name: &ast::Type,
     ) -> Result<Option<std::vec::Vec<Box<ast::Expr>>>> {
+        if self.is_sqlite_type(type_name) {
+            return Ok(None);
+        }
         let args = written_type_args(type_name);
         let param_count = self.user_params().count();
         if args.len() == param_count {
             return Ok(Some(args));
-        }
-        if args.is_empty() {
-            return Ok(None);
         }
         if param_count == 0 {
             return Err(LimboError::NotSupported(format!(
@@ -1020,6 +1019,13 @@ impl TypeDef {
             param_count,
             args.len()
         )))
+    }
+
+    /// Whether `type_name`, a use of this type, names SQLite's type of the
+    /// same name rather than this one: the type has parameters and the use
+    /// gives no arguments, as `CAST(x AS NUMERIC)` does.
+    pub fn is_sqlite_type(&self, type_name: &ast::Type) -> bool {
+        type_name.size.is_none() && self.user_params().next().is_some()
     }
 
     /// Returns the original SQL used to create this type or domain.

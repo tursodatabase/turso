@@ -9,6 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
+use super::{walk_expr, WalkControl};
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -744,10 +745,19 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
     ExprType::array(scalar, column.array_dimensions())
 }
 
+/// The type a CAST to `type_name` gives. A CAST whose arguments don't fit its
+/// type still has that type: binding and code generation refuse it (see
+/// [check_cast_type_args]).
 fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
-    let scalar = match custom_cast_target(type_name, schema) {
-        Ok(Some(custom)) => custom,
-        Ok(None) => match Affinity::of_written_type(&crate::util::dequote(&type_name.name)) {
+    let custom = schema
+        .get_type_def_unchecked(&crate::util::dequote(&type_name.name))
+        .filter(|type_def| !type_def.is_sqlite_type(type_name));
+    let scalar = match custom {
+        Some(type_def) => ExprType::Custom {
+            type_def: Arc::clone(type_def),
+            params: crate::schema::written_type_args(type_name),
+        },
+        None => match Affinity::of_written_type(&crate::util::dequote(&type_name.name)) {
             // A CAST to BLOB always gives a blob.
             Affinity::Blob => ExprType::Builtin(BuiltinType::Blob),
             affinity @ (Affinity::Integer
@@ -756,30 +766,30 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
             | Affinity::Text
             | Affinity::None) => ExprType::Builtin(builtin_type_of_affinity(affinity)),
         },
-        // The arguments don't fit the type, so compiling the CAST fails.
-        Err(_) => return ExprType::Unknown,
     };
     ExprType::array(scalar, type_name.array_dimensions)
 }
 
-/// The custom type a CAST to `type_name` gives, or None when the CAST is
-/// SQLite's CAST: no custom type has the name, or the CAST gives no arguments
-/// to a type that takes some, as CAST(x AS NUMERIC) does. Fails when the
-/// arguments don't fit the type (see [TypeDef::type_args]).
-pub(super) fn custom_cast_target(
-    type_name: &ast::Type,
-    schema: &Schema,
-) -> Result<Option<ExprType>> {
-    let Some(type_def) = schema.get_type_def_unchecked(&crate::util::dequote(&type_name.name))
-    else {
-        return Ok(None);
-    };
-    Ok(type_def
-        .type_args(type_name)?
-        .map(|params| ExprType::Custom {
-            type_def: Arc::clone(type_def),
-            params,
-        }))
+/// Fails when `expr` casts to a type with arguments that don't fit it, such as
+/// `CAST(x AS varchar(1, 2))`.
+pub(crate) fn check_cast_type_args(expr: &ast::Expr, schema: &Schema) -> Result<()> {
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } = expr
+        {
+            // A name no custom type has is SQLite's CAST, which takes any
+            // arguments.
+            if let Some(type_def) =
+                schema.get_type_def_unchecked(&crate::util::dequote(&type_name.name))
+            {
+                type_def.type_args(type_name)?;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// The type a function returns. Unlike a CAST target, a custom type needs no

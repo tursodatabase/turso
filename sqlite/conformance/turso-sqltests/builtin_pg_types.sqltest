@@ -780,8 +780,70 @@ expect error {
     type "numeric" requires 2 parameter\(s\), got 1
 }
 
+test varchar-cast-with-too-many-arguments-in-index-is-refused {
+    CREATE TABLE t(x integer);
+    CREATE INDEX i ON t (CAST(x AS varchar(1, 2)));
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
 test varchar-array-cast-with-too-many-arguments-is-refused {
     SELECT CAST('{abcdef}' AS varchar(2,3)[]);
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
+# The CAST is refused even where it is never evaluated.
+test timestamp-type-modifier-is-refused-in-cast-that-never-runs {
+    SELECT 1 WHERE 0 AND CAST('x' AS timestamp(3)) IS NULL;
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
+
+# Expressions stored in the schema are compiled without being bound. The `=`
+# asks for the type of the CAST there.
+test varchar-cast-with-too-many-arguments-in-default-is-refused {
+    CREATE TABLE t(x DEFAULT ('a' = CAST('b' AS varchar(1, 2))));
+    INSERT INTO t DEFAULT VALUES;
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
+test varchar-cast-with-too-many-arguments-in-generated-column-is-refused {
+    CREATE TABLE t(x, y AS ('a' = CAST(x AS varchar(1, 2))));
+    INSERT INTO t(x) VALUES ('a');
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
+@requires strict "uses STRICT tables"
+test varchar-cast-with-too-many-arguments-in-encode-is-refused {
+    CREATE TYPE mt BASE text ENCODE CASE WHEN 'a' = CAST(value AS varchar(1, 2)) THEN value ELSE value END DECODE value;
+    CREATE TABLE t(x mt) STRICT;
+    INSERT INTO t VALUES ('a');
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
+@requires strict "uses STRICT tables"
+test varchar-cast-with-too-many-arguments-in-decode-is-refused {
+    CREATE TYPE mt BASE text ENCODE value DECODE CASE WHEN 'a' = CAST(value AS varchar(1, 2)) THEN value ELSE value END;
+    CREATE TABLE t(x mt) STRICT;
+    SELECT * FROM t;
+}
+expect error {
+    type "varchar" requires 1 parameter\(s\), got 2
+}
+
+test varchar-cast-with-too-many-arguments-in-domain-check-is-refused {
+    CREATE DOMAIN d AS text CHECK ('a' = CAST(value AS varchar(1, 2)));
+    SELECT CAST('a' AS d);
 }
 expect error {
     type "varchar" requires 1 parameter\(s\), got 2
