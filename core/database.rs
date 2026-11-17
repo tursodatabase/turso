@@ -3697,6 +3697,12 @@ impl Database {
             pager.stage_page_size(page_size);
         }
         if let Some(reserved_bytes) = reserved_bytes {
+            if cipher != CipherMode::None && reserved_bytes as usize != cipher.metadata_size() {
+                return Err(LimboError::InvalidArgument(
+                    "encryption cipher does not match the database reserved bytes".into(),
+                )
+                .into());
+            }
             pager.set_reserved_space_bytes(reserved_bytes);
         }
         if disable_checksums {

@@ -2632,6 +2632,15 @@ impl Connection {
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        if self
+            .get_pager_from_database_index(&database_id)?
+            .encryption_cipher()
+            != CipherMode::None
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page size is fixed when opening the database".into(),
+            ));
+        }
         self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
@@ -4444,6 +4453,14 @@ impl Connection {
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
+        if pager.encryption_cipher() != CipherMode::None {
+            if reserved_bytes as usize == pager.encryption_cipher().metadata_size() {
+                return Ok(());
+            }
+            return Err(LimboError::InvalidArgument(
+                "encrypted database reserved bytes are fixed when opening the database".into(),
+            ));
+        }
         if let Some(codec) = pager.page_codec_external() {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {

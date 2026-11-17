@@ -1350,13 +1350,11 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
 fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
+    let tmp_db = encrypted_fixture(&tmp_db, 8192);
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
     [
-        "PRAGMA page_size = 8192;",
-        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        "PRAGMA cipher = 'aegis256';",
         "PRAGMA journal_mode = 'mvcc';",
         "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
         "INSERT INTO test (value) VALUES ('Hello, World!')",
@@ -1368,19 +1366,18 @@ fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
 
 // Regression coverage for https://github.com/tursodatabase/turso/issues/7375.
 
-fn assert_encrypted_page_size_after_key_and_cipher(
+fn assert_encrypted_page_size_selected_at_open(
     page_size: i64,
     cipher: &str,
     hexkey: &str,
 ) -> anyhow::Result<()> {
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
+        .with_encryption(cipher, hexkey)
+        .with_page_size(page_size as u32)
         .build();
 
     let conn = tmp_db.connect_limbo();
-    conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
-    conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-    conn.execute(format!("PRAGMA page_size = {page_size}"))?;
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
     conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
 
@@ -1410,22 +1407,23 @@ fn assert_encrypted_page_size_after_key_and_cipher(
 }
 
 #[turso_macros::test]
-fn test_encrypted_page_size_after_key_and_cipher(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_encrypted_page_size_selected_at_open(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     for page_size in [512, 4096, 65536] {
-        assert_encrypted_page_size_after_key_and_cipher(page_size, CIPHER_A, KEY_A)?;
+        assert_encrypted_page_size_selected_at_open(page_size, CIPHER_A, KEY_A)?;
     }
     // Exercise a cipher that uses a 16-byte key and different metadata size.
     let aes128_key = &KEY_A[..32];
-    assert_encrypted_page_size_after_key_and_cipher(512, "aes128gcm", aes128_key)?;
+    assert_encrypted_page_size_selected_at_open(512, "aes128gcm", aes128_key)?;
     Ok(())
 }
 
 #[turso_macros::test]
-fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_uri_encryption_rejects_page_size_changes(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db = TempDatabaseBuilder::new()
         .with_opts(DatabaseOpts::new().with_encryption(true))
+        .with_encryption(CIPHER_A, KEY_A)
         .build();
 
     let uri = format!(
@@ -1439,14 +1437,14 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
             DatabaseOpts::new().with_encryption(true),
             Arc::new(SqliteDialect),
         )?;
-        conn.execute("PRAGMA page_size = 512")?;
+        assert!(conn.execute("PRAGMA page_size = 512").is_err());
         conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)")?;
         conn.execute("INSERT INTO t VALUES(1, randomblob(300))")?;
 
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
         assert_eq!(rows[0].0, 1);
         let ps: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
-        assert_eq!(ps[0].0, 512);
+        assert_eq!(ps[0].0, 4096);
 
         for c in conn.cacheflush()? {
             io.wait_for_completion(c)?;
@@ -1461,7 +1459,7 @@ fn test_uri_encryption_then_page_size(_tmp_db: TempDatabase) -> anyhow::Result<(
     let rows: Vec<(i64,)> = reopened.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows[0].0, 1);
     let ps: Vec<(i64,)> = reopened.exec_rows("PRAGMA page_size");
-    assert_eq!(ps[0].0, 512);
+    assert_eq!(ps[0].0, 4096);
 
     Ok(())
 }

@@ -90,22 +90,22 @@ impl HeaderRef {
 }
 
 #[derive(Debug, Clone)]
-pub struct HeaderRefMut(PageRef);
+pub(crate) struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
-    pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
+    pub(crate) fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
     }
 
-    pub fn borrow_mut(&self) -> &mut DatabaseHeader {
+    pub(crate) fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
         bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_ptr()[0..DatabaseHeader::SIZE])
     }
 
     /// Get a reference to the underlying page
-    pub fn page(&self) -> &PageRef {
+    pub(crate) fn page(&self) -> &PageRef {
         &self.0
     }
 }
@@ -3175,6 +3175,14 @@ impl Pager {
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
+        if self.encryption_cipher() != CipherMode::None {
+            if self.get_page_size_unchecked() == size {
+                return Ok(());
+            }
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page size is fixed when opening the database".into(),
+            ));
+        }
         let _lock = self.shared.init_lock.lock();
         if self.db_initialized() {
             return Ok(());
@@ -3295,7 +3303,12 @@ impl Pager {
     }
 
     /// Set the page size. Used internally when page size is determined.
-    pub fn set_page_size(&self, size: PageSize) {
+    pub(crate) fn set_page_size(&self, size: PageSize) {
+        let current = self.shared.page_size.load(Ordering::SeqCst);
+        turso_assert!(
+            self.encryption_cipher() == CipherMode::None || current == 0 || current == size.get(),
+            "encrypted database page size must remain unchanged"
+        );
         self.shared.page_size.store(size.get(), Ordering::SeqCst);
         self.staged_page_size.store(0, Ordering::SeqCst);
     }
@@ -3315,7 +3328,11 @@ impl Pager {
     }
 
     /// Set the reserved space. Must fit in u8.
-    pub fn set_reserved_space(&self, space: u8) {
+    pub(crate) fn set_reserved_space(&self, space: u8) {
+        assert!(
+            self.encryption_cipher() == CipherMode::None
+                || space as usize == self.encryption_cipher().metadata_size()
+        );
         self.reserved_space.store(space as u16, Ordering::SeqCst);
     }
 
@@ -6298,9 +6315,21 @@ impl Pager {
     }
 
     pub fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> IOResultOr<T> {
-        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
-        let header = header_ref.borrow_mut();
-        let result = f(header);
+        let header_ref = return_if_io!(HeaderRef::from_pager(self));
+        let mut header = *header_ref.borrow();
+        let result = f(&mut header);
+        let cipher = self.encryption_cipher();
+        if cipher != CipherMode::None
+            && (header.page_size != self.get_page_size_unchecked()
+                || header.reserved_space as usize != cipher.metadata_size())
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page layout is fixed when opening the database".into(),
+            )
+            .into());
+        }
+        self.add_dirty(&header_ref.0)?;
+        header_ref.0.get_contents().write_database_header(&header);
         // Update cached schema cookie after modification
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(result))
@@ -6515,7 +6544,7 @@ impl Pager {
         wal.set_io_context(self.io_ctx.read().clone())
     }
 
-    pub fn set_reserved_space_bytes(&self, value: u8) {
+    pub(crate) fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
     }
 
