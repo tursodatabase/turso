@@ -437,6 +437,14 @@ impl<'a> CatalogContext<'a> {
         None
     }
 
+    /// Whether `namespace` has a table, view or materialized view named
+    /// `table_name`.
+    pub(crate) fn table_exists_in(&self, namespace: NamespaceRef, table_name: &str) -> bool {
+        self.with_schema(namespace.database_id, |schema| {
+            Self::namespace_has_table_like_object(schema, namespace.id, table_name)
+        })
+    }
+
     fn namespace_has_table_like_object(
         schema: &Schema,
         namespace: NamespaceId,

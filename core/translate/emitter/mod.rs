@@ -764,6 +764,13 @@ impl<'a> Resolver<'a> {
         self.catalog.find_existing_table(qualified_name)
     }
 
+    /// Whether `namespace` has a table, view or materialized view named
+    /// `table_name`. [`Self::find_existing_table`] also gives a namespace
+    /// for a name that no namespace has.
+    pub(crate) fn table_exists_in(&self, namespace: NamespaceRef, table_name: &str) -> bool {
+        self.catalog.table_exists_in(namespace, table_name)
+    }
+
     pub(crate) fn resolve_existing_index(
         &self,
         qualified_name: &ast::QualifiedName,

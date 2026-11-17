@@ -1329,6 +1329,20 @@ pub(crate) fn bind_sequence_names_in_stored_expressions(
             }
             Ok(bound)
         }
+        ast::Stmt::AlterPolicy(policy) => match &mut policy.body {
+            ast::AlterPolicyBody::Change {
+                using_expr,
+                check_expr,
+                ..
+            } => {
+                let mut bound = false;
+                for expr in [using_expr, check_expr].into_iter().flatten() {
+                    bound |= bind_sequence_names(expr, resolver)?;
+                }
+                Ok(bound)
+            }
+            ast::AlterPolicyBody::RenameTo(_) => Ok(false),
+        },
         ast::Stmt::Analyze { .. }
         | ast::Stmt::Attach { .. }
         | ast::Stmt::Begin { .. }
