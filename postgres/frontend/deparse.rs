@@ -287,8 +287,29 @@ impl Printer<'_> {
                 self.function_call(name.as_str(), args)
             }
             ast::Expr::Subquery(select) => self.scalar_subquery(select),
+            ast::Expr::Collate(operand, collation) => self.collate(operand, collation),
             _ => None,
         }
+    }
+
+    /// The translator compiles PostgreSQL's binary collations to `BINARY`,
+    /// which PostgreSQL calls `"C"`. PostgreSQL makes the operand `text`
+    /// before applying the collation: a quoted literal is printed as
+    /// `'a'::text`, and a `varchar` column as `(code)::text`.
+    fn collate(&self, operand: &ast::Expr, collation: &ast::Name) -> Option<Printed> {
+        if !collation.as_str().eq_ignore_ascii_case("binary") {
+            return None;
+        }
+        let operand = self.expr(operand)?;
+        let text = match operand.ty {
+            PgType::UnknownLiteral | PgType::Varchar => operand.typed_text(Some(PgType::Text)),
+            PgType::Text => operand.text,
+            _ => return None,
+        };
+        Some(Printed::new(
+            format!("({text} COLLATE \"C\")"),
+            PgType::Text,
+        ))
     }
 
     fn column(&self, name: &ast::Name) -> Option<Printed> {

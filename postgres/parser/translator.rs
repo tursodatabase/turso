@@ -3474,13 +3474,18 @@ impl PostgreSQLTranslator {
                         "a non-binary COLLATE in an expression",
                     ));
                 }
-                if let Some(arg) = &collate.arg {
-                    self.translate_expr(arg)
-                } else {
-                    Err(ParseError::ParseError(
-                        "COLLATE clause missing inner expression".to_string(),
-                    ))
+                let arg = collate.arg.as_ref().ok_or_else(|| {
+                    ParseError::ParseError("COLLATE clause missing inner expression".to_string())
+                })?;
+                let arg = self.translate_expr(arg)?;
+                if is_default_collation(&collate.collname) {
+                    return Ok(arg);
                 }
+                // The catalogs print COLLATE BINARY as COLLATE "C".
+                Ok(ast::Expr::Collate(
+                    Box::new(arg),
+                    ast::Name::from_string("BINARY"),
+                ))
             }
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
@@ -9711,6 +9716,15 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
             "c" | "posix" | "default" | "ucs_basic"
         )
     })
+}
+
+/// Whether `collname` names the default collation, which leaves an
+/// expression's collation as it is.
+fn is_default_collation(collname: &[pg_query::protobuf::Node]) -> bool {
+    let Ok(names) = extract_key_columns(collname) else {
+        return false;
+    };
+    unqualified_name(&names, is_pg_catalog).is_some_and(|name| name.eq_ignore_ascii_case("default"))
 }
 
 #[cfg(test)]

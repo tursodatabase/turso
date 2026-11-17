@@ -122,6 +122,17 @@ expect {
     p2|((m > '5'::numeric) AND (m > 7.50) AND (m > 0.0) AND (m > '-1.5'::numeric))
 }
 
+test pg-policy-keeps-collate-in-conditions {
+    CREATE TABLE pp_docs_13 (owner TEXT);
+    CREATE POLICY p1 ON pp_docs_13 USING (owner < 'a' COLLATE "C");
+    SELECT polname, pg_get_expr(polqual, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_13');
+}
+expect {
+    p1|(owner < ('a'::text COLLATE "C"))
+}
+
 # A condition that tursopg cannot print as pg_get_expr does is shown as
 # CREATE POLICY wrote it, which PostgreSQL reads back, rather than as the
 # engine's SQL.
