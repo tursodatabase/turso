@@ -778,6 +778,18 @@ expect {
     0
 }
 
+test pg-get-expr-negative-zero-decimal-default {
+    CREATE TABLE demo (
+        a numeric(10, 2) DEFAULT -0.0, b numeric(10, 2) DEFAULT -0.00, c numeric(10, 2) DEFAULT -0.10
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    0.0
+    0.00
+    '-0.10'::numeric
+}
+
 test pg-get-expr-boolean-default {
     CREATE TABLE demo (a boolean DEFAULT true, b boolean DEFAULT false, c boolean DEFAULT (1 > 0));
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
@@ -880,6 +892,21 @@ expect {
     (big > '-2147483649'::bigint)
     (big > '-9223372036854775808'::bigint)
     (id > 0)
+}
+
+test pg-get-expr-check-constraint-with-negative-zero-decimal {
+    CREATE TABLE checked (
+        price numeric(10, 2),
+        CONSTRAINT a_zero CHECK (price > -0.0),
+        CONSTRAINT b_two_places CHECK (price > -0.00),
+        CONSTRAINT c_not_zero CHECK (price > -0.10)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > 0.0)
+    (price > 0.00)
+    (price > '-0.10'::numeric)
 }
 
 test pg-get-expr-check-constraint-on-several-columns {
