@@ -951,7 +951,10 @@ fn push_ascii_digits(out: &mut String, digits: &[u8]) {
 }
 
 /// Write the decimal digits of `n` at the end of `buf`, and return them.
-fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
+// Without inline(always), the date and time functions in another module
+// call this function, and the call costs more than the loop.
+#[inline(always)]
+pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
     let mut start = buf.len();
     loop {
         start -= 1;
