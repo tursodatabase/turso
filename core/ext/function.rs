@@ -1,7 +1,8 @@
 use crate::alloc::TryClone;
 use crate::function::{ExtFunc, ExternalFunc};
 use crate::native_ext::{
-    AggregateFunction, ExtensionState, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
+    AggregateFunction, ChooseResultType, ExtensionState, FunctionArity, ScalarCall, ScalarFunction,
+    ScalarReturn,
 };
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
@@ -31,6 +32,7 @@ impl ExternalFunc {
                 deterministic,
                 return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 receives_argument_types: false,
+                choose_result_type: None,
                 function: Arc::new(function),
             },
         })
@@ -49,6 +51,27 @@ impl ExternalFunc {
             panic!("only a native scalar function can receive its argument types");
         };
         *receives_argument_types = true;
+        self
+    }
+
+    /// Makes a call's result type depend on its argument types, as
+    /// `date_trunc`'s does. `choose` runs when a call is translated and may
+    /// refuse the call.
+    pub fn choosing_result_type(mut self, choose: ChooseResultType) -> Self {
+        let ExtFunc::NativeScalar {
+            return_type,
+            choose_result_type,
+            ..
+        } = &mut self.func
+        else {
+            panic!("only a native scalar function can choose its result type");
+        };
+        assert!(
+            return_type.is_none(),
+            "function {} declares a return type and also chooses one",
+            self.name
+        );
+        *choose_result_type = Some(choose);
         self
     }
 

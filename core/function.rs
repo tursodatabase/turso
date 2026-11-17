@@ -127,6 +127,9 @@ pub enum ExtFunc {
         /// Whether a call also gets the type name of each argument, such as
         /// `boolean[]`, as one more text argument per argument, after them.
         receives_argument_types: bool,
+        /// Set for a function whose result type depends on the types of its
+        /// arguments; `return_type` is then `None`.
+        choose_result_type: Option<ChooseResultType>,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -193,6 +196,15 @@ impl ExtFunc {
                 ..
             }
         )
+    }
+
+    pub fn result_type_chooser(&self) -> Option<ChooseResultType> {
+        match self {
+            Self::NativeScalar {
+                choose_result_type, ..
+            } => *choose_result_type,
+            Self::Scalar { .. } | Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
+        }
     }
 
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
@@ -1898,6 +1910,22 @@ pub enum ReturnType {
     Array,
 }
 
+/// What a query knows about the type of a function's argument when the call
+/// is translated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgumentType {
+    /// A string literal. PostgreSQL takes its type from where it is used.
+    StringLiteral,
+    /// NULL, a parameter, or a value whose type nothing declares.
+    Unknown,
+    /// A value of a declared type, named without domains: `date`, `integer`.
+    Typed(String),
+}
+
+/// Chooses the type of a call's result from the types of its arguments, or
+/// refuses the call with the error to report.
+pub type ChooseResultType = fn(&[ArgumentType]) -> crate::Result<ReturnType>;
+
 /// How the type of a function's result follows from the types of its
 /// arguments. Query typing (`type_of`) and the STRICT CHECK checker
 /// (`resolve_func_return_type`) both read it, so each function states its rule
@@ -1908,6 +1936,9 @@ pub enum ReturnType {
 pub enum ResultType {
     /// Every non-NULL result has this type, whatever the arguments.
     Declared(ReturnType),
+    /// The function picks the type from the types of the arguments, and may
+    /// refuse them: `date_trunc` of a `timestamp` is a `timestamp`.
+    ChosenFromArgumentTypes(ChooseResultType),
     /// The first argument, unchanged: `nullif(x, y)` and `likely(x)` return x.
     FirstArgument,
     /// One of the arguments, unchanged: `coalesce`, `ifnull`, `min`, `max`.
@@ -1953,7 +1984,10 @@ impl Func {
             #[cfg(feature = "json")]
             Self::Json(func) => declared(func.return_type()),
             Self::Vector(func) => declared(func.return_type()),
-            Self::External(func) => declared(func.func.return_type()),
+            Self::External(func) => match func.func.result_type_chooser() {
+                Some(choose) => ResultType::ChosenFromArgumentTypes(choose),
+                None => declared(func.func.return_type()),
+            },
             Self::Agg(AggFunc::Min | AggFunc::Max) => ResultType::OneOfTheArguments,
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             Self::Fts(_) => ResultType::Unknown,

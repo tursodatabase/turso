@@ -1,7 +1,7 @@
 mod function;
 mod vtab;
 
-pub use crate::function::ReturnType;
+pub use crate::function::{ArgumentType, ChooseResultType, ReturnType};
 
 pub use function::{
     Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,

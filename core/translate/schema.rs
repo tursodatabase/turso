@@ -485,6 +485,12 @@ fn resolve_func_return_type(
             Some(CheckExprType::CustomType(_)) | None => CheckExprType::Any,
         }),
         ResultType::ElementOfTheFirstArgument => Ok(CheckExprType::Any),
+        // This checker types a timestamp column as the text it stores and a
+        // string literal as text, so it can't give the function the argument
+        // types a query would.
+        ResultType::ChosenFromArgumentTypes(_) => Err(LimboError::NotSupported(format!(
+            "{name}() is not supported in a CHECK constraint"
+        ))),
         ResultType::Unknown if matches!(func, Func::External(_)) => {
             bail_parse_error!(
                 "cannot determine return type of function {}() in CHECK constraint; \

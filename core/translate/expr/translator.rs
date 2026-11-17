@@ -1114,6 +1114,14 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
+            if let crate::function::ResultType::ChosenFromArgumentTypes(choose) =
+                func_ctx.func.result_type()
+            {
+                let env = TypeEnv::new(referenced_tables, resolver);
+                let types: Vec<_> = args.iter().map(|arg| argument_type(arg, &env)).collect();
+                // Refuses the arguments the function doesn't take.
+                choose(&types)?;
+            }
             let argument_types: Vec<String> = match &func_ctx.func {
                 Func::External(external) if external.func.receives_argument_types() => {
                     let env = TypeEnv::new(referenced_tables, resolver);

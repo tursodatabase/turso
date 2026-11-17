@@ -6,7 +6,7 @@
 //! Nothing is written into the expression tree.
 
 use super::*;
-use crate::function::Deterministic;
+use crate::function::{Deterministic, ResultType};
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
     same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
@@ -301,6 +301,16 @@ fn call_for(
             signature.op, ty.type_def.name
         )));
     };
+    // An operator call doesn't pass argument types for the function to choose from.
+    let chooses = matches!(
+        function.result_type(),
+        ResultType::ChosenFromArgumentTypes(_)
+    );
+    assert!(
+        !chooses,
+        "function {func} for operator {} chooses its result type",
+        signature.op
+    );
     let encode = signature
         .args
         .iter()
