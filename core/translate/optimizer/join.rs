@@ -1398,6 +1398,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         };
     }
     let mut best_plan = naive_plan;
+    let table_connections = table_connections(num_tables, &where_terms)?;
 
     // Reuse a single mutable join order to avoid allocating join orders per permutation.
     let mut join_order = Vec::with_capacity(num_tables);
@@ -1534,13 +1535,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     continue;
                 }
 
-                if has_connected_legal_candidate(
-                    &lhs_mask,
-                    num_tables,
-                    &where_terms,
-                    required_lhs_by_table.as_deref(),
-                    left_join_illegal_map.as_ref(),
-                ) && !tables_are_connected(&lhs_mask, rhs_idx, &where_terms)
+                if !tables_are_connected(&lhs_mask, rhs_idx, &table_connections)
+                    && has_connected_legal_candidate(
+                        &lhs_mask,
+                        num_tables,
+                        &table_connections,
+                        required_lhs_by_table.as_deref(),
+                        left_join_illegal_map.as_ref(),
+                    )
                 {
                     continue;
                 }
@@ -1713,7 +1715,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 fn has_connected_legal_candidate(
     prefix: &TableMask,
     num_tables: usize,
-    where_terms: &[WhereTermInfo],
+    table_connections: &[TableMask],
     required_lhs_by_table: Option<&[TableMask]>,
     left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
 ) -> bool {
@@ -1725,7 +1727,7 @@ fn has_connected_legal_candidate(
                 required_lhs_by_table,
                 left_join_illegal_map,
             )
-            && tables_are_connected(prefix, candidate, where_terms)
+            && tables_are_connected(prefix, candidate, table_connections)
     })
 }
 
@@ -1744,14 +1746,14 @@ fn can_add_table_to_prefix(
     has_required_tables && keeps_outer_join_order
 }
 
+/// Whether a WHERE term reads both `candidate` and a table of `prefix`.
+/// `table_connections` comes from [table_connections].
 fn tables_are_connected(
     prefix: &TableMask,
     candidate: usize,
-    where_terms: &[WhereTermInfo],
+    table_connections: &[TableMask],
 ) -> bool {
-    where_terms
-        .iter()
-        .any(|term| term.table_mask.get(candidate) && term.table_mask.intersects(prefix))
+    table_connections[candidate].intersects(prefix)
 }
 
 /// Above this threshold, use greedy O(n²) ordering instead of exhaustive O(2^n) DP.
@@ -1796,6 +1798,7 @@ fn compute_greedy_join_order<'a, 'w>(
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
+    let table_connections = table_connections(num_tables, where_terms)?;
 
     // Pick the starting table using local filters and directed indexed-seek benefits.
     let first_idx = find_best_starting_table(
@@ -1859,12 +1862,13 @@ fn compute_greedy_join_order<'a, 'w>(
         };
         let must_stay_connected = remaining.iter().any(|candidate| {
             candidate_is_legal(candidate)
-                && tables_are_connected(&current_mask, candidate, where_terms)
+                && tables_are_connected(&current_mask, candidate, &table_connections)
         });
 
         for idx in &remaining {
             if !candidate_is_legal(idx)
-                || (must_stay_connected && !tables_are_connected(&current_mask, idx, where_terms))
+                || (must_stay_connected
+                    && !tables_are_connected(&current_mask, idx, &table_connections))
             {
                 continue;
             }
@@ -1927,6 +1931,19 @@ fn compute_greedy_join_order<'a, 'w>(
         best_plan: current_plan.expect("loop invariant: current_plan always Some"),
         best_ordered_plan: None, // Greedy doesn't track ordered variants
     }))
+}
+
+/// For each table, the union of the table masks of the WHERE terms that read it.
+fn table_connections(num_tables: usize, where_terms: &[WhereTermInfo]) -> Result<Vec<TableMask>> {
+    let mut connections = vec![TableMask::default(); num_tables];
+    for term in where_terms {
+        for table in term.table_mask.iter() {
+            if let Some(connected) = connections.get_mut(table) {
+                connected.union_with(&term.table_mask)?;
+            }
+        }
+    }
+    Ok(connections)
 }
 
 /// For each table, the tables that must come before it in any join order.
