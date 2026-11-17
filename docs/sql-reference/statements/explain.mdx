@@ -8,6 +8,12 @@ sidebarTitle: EXPLAIN
 
 The EXPLAIN statement displays information about how Turso executes a SQL statement. There are two forms: `EXPLAIN` shows the virtual machine bytecode, and `EXPLAIN QUERY PLAN` shows the high-level query execution strategy.
 
+## PostgreSQL frontend
+
+In the PostgreSQL frontend, `EXPLAIN statement` returns the high-level query
+plan. Prepared EXPLAIN statements retain this output format when schema changes
+cause them to be prepared again; the plan reflects the updated schema.
+
 ## Syntax
 
 ```sql
@@ -69,6 +75,8 @@ EXPLAIN QUERY PLAN SELECT * FROM users WHERE name = 'Alice';
 | parent | The id of the parent step (0 for top-level) |
 | notused | Reserved for future use (always 0) |
 | detail | Human-readable description of the execution step |
+
+Rowid range searches show their lower bound first, for example `(rowid>? AND rowid<?)` for `WHERE rowid > 2 AND rowid < 8`; inclusive bounds use `>=` and `<=`.
 
 ### Common Detail Messages
 

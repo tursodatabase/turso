@@ -505,3 +505,21 @@ expect {
     6
     6
 }
+
+# A sqlite_sequence row with a NULL name belongs to no table, so the MVCC
+# sqlite_sequence sync must not delete it.
+test mvcc-autoincrement-keeps-null-name-sequence-row {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t1 (i INTEGER PRIMARY KEY AUTOINCREMENT);
+    CREATE TABLE t2 (i INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t1 VALUES (NULL);
+    INSERT INTO t2 VALUES (NULL);
+    UPDATE sqlite_sequence SET name = NULL WHERE name = 't1';
+    INSERT INTO t2 VALUES (NULL);
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    mvcc
+    |1
+    t2|2
+}

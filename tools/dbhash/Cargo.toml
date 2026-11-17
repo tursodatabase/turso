@@ -10,6 +10,7 @@ name = "turso-dbhash"
 path = "src/main.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 turso_core = { workspace = true, features = ["fs"] }
 sha1 = "0.10"
 clap = { workspace = true, features = ["derive"] }

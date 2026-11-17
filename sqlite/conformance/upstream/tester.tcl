@@ -120,18 +120,9 @@ proc execsql2 {sql {db db}} {
   return $result
 }
 
-# Normalize Turso error messages to match SQLite's format.
-# Turso prefixes some messages (e.g. "Parse error: no such table: t1")
-# where SQLite would just say "no such table: t1".
-proc normalize_errmsg {msg} {
-  regsub {^Parse error: } $msg {} msg
-  return $msg
-}
-
 # Normalize a test result. If the result is a two-element list whose first
 # element is "1" (i.e. an error result from catchsql or catch+execsql),
-# strip known Turso prefixes from the error message so it matches SQLite.
-# Plain results are returned unchanged.
+# rebuild it as a canonical TCL list. Plain results are returned unchanged.
 proc normalize_result {result} {
   # A result that is not a valid TCL list (e.g. an error message with an
   # unmatched brace or a quoted word followed by ':') cannot be an
@@ -141,8 +132,7 @@ proc normalize_result {result} {
     return $result
   }
   if {$n == 2 && [lindex $result 0] eq "1"} {
-    set msg [normalize_errmsg [lindex $result 1]]
-    return [list 1 $msg]
+    return [list 1 [lindex $result 1]]
   }
   return $result
 }
@@ -152,7 +142,7 @@ proc catchsql {sql {db db}} {
   # Do not route through execsql: its uplevel would land in this frame, one
   # level short of the caller whose variables the SQL may reference.
   if {[catch {uplevel [list $db eval $sql]} result]} {
-    return [list 1 [normalize_errmsg $result]]
+    return [list 1 $result]
   } else {
     return [list 0 $result]
   }
@@ -188,7 +178,6 @@ proc do_test {name cmd expected} {
     return
   }
 
-  # Normalize Turso error prefixes so results match SQLite's format.
   set result [normalize_result $result]
 
   # Compare result with expected. The pattern forms are upstream's:

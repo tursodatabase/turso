@@ -80,6 +80,86 @@ test domain-not-null-fail {
 expect error {
 }
 
+# NULL skips the ENCODE of the domain's base type, so the error is the
+# domain's NOT NULL, not the error of an ENCODE that rejects NULL.
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-over-type-rejecting-null-insert {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    CREATE TABLE t1(a nn_pick) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+}
+expect error {
+    NOT NULL constraint failed: t1.a
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-over-type-rejecting-null-update {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    CREATE TABLE t1(a nn_pick) STRICT;
+    INSERT INTO t1 VALUES ('a');
+    UPDATE t1 SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.a
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-not-null-over-type-rejecting-null-cast {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    SELECT CAST(NULL AS nn_pick);
+}
+expect error {
+    domain nn_pick does not allow null values
+}
+
+# Each element of a column of type pos[] is a value of domain pos, and the
+# array itself is not, so a NULL array is stored.
+@requires custom_types "uses CREATE DOMAIN"
+test domain-array-column-checks-each-element {
+    CREATE DOMAIN pos AS integer CHECK (value > 0) NOT NULL;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a pos[]) STRICT;
+    INSERT INTO t1 VALUES (1, '{1,2}'), (2, NULL);
+    SELECT id, a FROM t1 ORDER BY id;
+}
+expect {
+    1|{1,2}
+    2|
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-array-column-rejects-element-failing-check {
+    CREATE DOMAIN pos AS integer CHECK (value > 0) NOT NULL;
+    CREATE TABLE t1(a pos[]) STRICT;
+    INSERT INTO t1 VALUES ('{1,-2}');
+}
+expect error {
+    value for domain pos violates check constraint "pos_0"
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-array-column-rejects-null-element {
+    CREATE DOMAIN pos AS integer CHECK (value > 0) NOT NULL;
+    CREATE TABLE t1(a pos[]) STRICT;
+    INSERT INTO t1 VALUES ('{1}');
+    UPDATE t1 SET a = '{1,NULL}';
+}
+expect error {
+    domain pos does not allow null values
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-array-column-over-type-rejecting-null-rejects-null-element {
+    CREATE TYPE pick BASE text ENCODE (CASE WHEN value IN ('a') THEN value ELSE RAISE(ABORT, 'bad pick: ' || value) END) DECODE (value);
+    CREATE DOMAIN nn_pick AS pick NOT NULL;
+    CREATE TABLE t1(a nn_pick[]) STRICT;
+    INSERT INTO t1 VALUES ('{a,NULL}');
+}
+expect error {
+    domain nn_pick does not allow null values
+}
 
 @requires custom_types "uses CREATE DOMAIN"
 test domain-default {
@@ -982,7 +1062,7 @@ test domain-over-custom-type-cast-pass {
     SELECT CAST(5 AS positive_cents);
 }
 expect {
-    500
+    5
 }
 
 @requires custom_types "uses CREATE DOMAIN"
@@ -1037,9 +1117,9 @@ test domain-over-custom-type-expression-index {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE DOMAIN pc AS cents;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
-    CREATE INDEX i ON t(x + 0);
+    CREATE INDEX i ON t(abs(x));
     INSERT INTO t VALUES (1, 5);
-    SELECT count(*) FROM t WHERE x + 0 = 5;
+    SELECT count(*) FROM t WHERE abs(x) = 5;
     PRAGMA integrity_check;
 }
 expect {
@@ -1049,19 +1129,19 @@ expect {
 
 @requires custom_types "uses CREATE DOMAIN"
 test domain-over-custom-type-index-lookup {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE cents BASE integer ENCODE value * 100;
     CREATE DOMAIN pc AS cents;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
     CREATE INDEX i ON t(x);
     INSERT INTO t VALUES (1, 5), (2, 6);
-    SELECT id FROM t WHERE x = 5;
-    UPDATE t SET x = 9 WHERE x = 6;
+    SELECT id FROM t WHERE x = 500;
+    UPDATE t SET x = 9 WHERE x = 600;
     SELECT id, x FROM t ORDER BY id;
 }
 expect {
     1
-    1|5
-    2|9
+    1|500
+    2|900
 }
 
 @requires custom_types "uses CREATE DOMAIN"

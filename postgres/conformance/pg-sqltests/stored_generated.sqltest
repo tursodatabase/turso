@@ -1,0 +1,759 @@
+@database :memory:
+
+test stored-generated-column-computed-on-insert {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (5);
+    SELECT a, b FROM t;
+}
+expect {
+    5|10
+}
+
+test stored-generated-column-rejects-explicit-value {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a, b) VALUES (5, 99);
+}
+@sqlstate 428C9
+expect error {}
+
+test stored-generated-column-updated-on-row-update {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (3);
+    UPDATE t SET a = 7;
+    SELECT a, b FROM t;
+}
+expect {
+    7|14
+}
+
+test stored-generated-column-constant-expression {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (5) STORED, c text GENERATED ALWAYS AS ('x') STORED);
+    INSERT INTO t (a) VALUES (1), (2);
+    UPDATE t SET a = a + 10;
+    SELECT a, b, c FROM t ORDER BY a;
+}
+expect {
+    11|5|x
+    12|5|x
+}
+
+test stored-generated-column-string-concat {
+    CREATE TABLE t (first text, last text, full_name text GENERATED ALWAYS AS (first || ' ' || last) STORED);
+    INSERT INTO t (first, last) VALUES ('John', 'Doe');
+    SELECT full_name FROM t;
+}
+expect {
+    John Doe
+}
+
+test stored-generated-column-insert-default-with-column-list {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a, b) VALUES (5, DEFAULT);
+    SELECT a, b FROM t;
+}
+expect {
+    5|10
+}
+
+test stored-generated-column-insert-default-values {
+    CREATE TABLE t (a int DEFAULT 4, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t DEFAULT VALUES;
+    SELECT a, b FROM t;
+}
+expect {
+    4|8
+}
+
+test stored-generated-column-insert-returning {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1) RETURNING a, b;
+}
+expect {
+    1|2
+}
+
+test stored-generated-column-update-rejects-explicit-value {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1);
+    UPDATE t SET b = 1;
+}
+@sqlstate 428C9
+expect error {}
+
+test stored-generated-column-update-returning {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1);
+    UPDATE t SET a = a + 1 RETURNING a, b;
+}
+expect {
+    2|4
+}
+
+test stored-generated-column-upsert-rejects-explicit-value {
+    CREATE TABLE t (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1);
+    INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 5;
+}
+@sqlstate 428C9
+expect error {}
+
+test stored-generated-column-upsert-updates-index {
+    CREATE TABLE t (a int PRIMARY KEY, c int, b int GENERATED ALWAYS AS (c * 2) STORED);
+    CREATE INDEX t_b ON t (b);
+    INSERT INTO t (a, c) VALUES (1, 1);
+    INSERT INTO t (a, c) VALUES (1, 5) ON CONFLICT (a) DO UPDATE SET c = excluded.c;
+    SELECT a FROM t WHERE b = 10;
+}
+expect {
+    1
+}
+
+test stored-generated-column-index-after-update {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    CREATE INDEX t_b ON t (b);
+    INSERT INTO t (a) VALUES (1), (2);
+    UPDATE t SET a = 5 WHERE a = 1;
+    SELECT a FROM t WHERE b = 10;
+}
+expect {
+    5
+}
+
+test stored-generated-column-not-null-violation {
+    CREATE TABLE t (a int, b int NOT NULL GENERATED ALWAYS AS (a) STORED);
+    INSERT INTO t (a) VALUES (NULL);
+}
+@sqlstate 23502
+expect error {}
+
+test stored-generated-column-check-violation {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED CHECK (b > 0));
+    INSERT INTO t (a) VALUES (-1);
+}
+@sqlstate 23514
+expect error {}
+
+test stored-generated-column-unique-violation {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a % 2) STORED UNIQUE);
+    INSERT INTO t (a) VALUES (1);
+    INSERT INTO t (a) VALUES (3);
+}
+@sqlstate 23505
+expect error {}
+
+test stored-generated-column-division-by-zero {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a / 0) STORED);
+    INSERT INTO t (a) VALUES (1);
+}
+@sqlstate 22012
+expect error {}
+
+test stored-generated-column-qualified-with-own-table {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (t.a) STORED);
+    INSERT INTO t (a) VALUES (3);
+    SELECT a, b FROM t;
+}
+expect {
+    3|3
+}
+
+test stored-generated-column-cast-to-integer-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2.6) STORED);
+    INSERT INTO t (a) VALUES (5);
+    SELECT b FROM t;
+}
+expect {
+    13
+}
+
+test stored-generated-column-references-generated-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c int GENERATED ALWAYS AS (b + 1) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-references-itself {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (b) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-default-and-generation-expression {
+    CREATE TABLE t (a int, b int DEFAULT 5 GENERATED ALWAYS AS (a * 2) STORED);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-by-default {
+    CREATE TABLE t (a int, b int GENERATED BY DEFAULT AS (a) STORED);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-random-not-immutable {
+    CREATE TABLE t (a int, b float8 GENERATED ALWAYS AS (random()) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-now-not-immutable {
+    CREATE TABLE t (a int, b timestamptz GENERATED ALWAYS AS (now()) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-date-cast-not-immutable {
+    CREATE TABLE t (a text, b date GENERATED ALWAYS AS (a::date) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-subquery {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS ((SELECT 1)) STORED);
+}
+@sqlstate 0A000
+expect error {}
+
+test stored-generated-column-set-returning-function {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (generate_series(1, 2)) STORED);
+}
+@sqlstate 0A000
+expect error {}
+
+test stored-generated-column-aggregate {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (sum(a)) STORED);
+}
+@sqlstate 42803
+expect error {}
+
+test stored-generated-column-window-function {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (row_number() OVER ()) STORED);
+}
+@sqlstate 42P20
+expect error {}
+
+test stored-generated-column-parameter {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS ($1) STORED);
+}
+@sqlstate 42P02
+expect error {}
+
+test stored-generated-column-unknown-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (nosuch) STORED);
+}
+@sqlstate 42703
+expect error {}
+
+test stored-generated-column-other-table {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (w.a) STORED);
+}
+@sqlstate 42P01
+expect error {}
+
+test stored-generated-column-system-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (ctid) STORED);
+}
+@sqlstate 42P10
+expect error {}
+
+test stored-generated-column-select-star {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (3);
+    SELECT * FROM t;
+}
+expect {
+    3|6
+}
+
+test stored-generated-column-where-without-index {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1), (3), (5);
+    SELECT a FROM t WHERE b > 4 ORDER BY a;
+}
+expect {
+    3
+    5
+}
+
+test stored-generated-column-group-by {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a % 3) STORED);
+    INSERT INTO t (a) VALUES (1), (2), (4), (5);
+    SELECT b, count(*) FROM t GROUP BY b ORDER BY b;
+}
+expect {
+    1|2
+    2|2
+}
+
+test stored-generated-column-having {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a % 3) STORED);
+    INSERT INTO t (a) VALUES (1), (2), (4), (5);
+    SELECT b FROM t GROUP BY b HAVING count(*) > 1 ORDER BY b;
+}
+expect {
+    1
+    2
+}
+
+test stored-generated-column-join {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED);
+    CREATE TABLE r (id int, label text);
+    INSERT INTO t (a) VALUES (1), (2);
+    INSERT INTO r VALUES (1, 'x'), (2, 'y');
+    SELECT t.a, r.label FROM t JOIN r ON t.b = r.id ORDER BY t.a;
+}
+expect {
+    1|x
+    2|y
+}
+
+test stored-generated-column-insert-returning-star {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (4) RETURNING *;
+}
+expect {
+    4|8
+}
+
+test stored-generated-column-update-returning-star {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1);
+    UPDATE t SET a = 6 RETURNING *;
+}
+expect {
+    6|12
+}
+
+test stored-generated-column-null-input {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (NULL);
+    SELECT a, b FROM t;
+}
+expect {
+    |
+}
+
+test stored-generated-column-on-conflict-do-nothing {
+    CREATE TABLE t (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1);
+    INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING;
+    SELECT a, b FROM t;
+}
+expect {
+    1|2
+}
+
+test stored-generated-column-foreign-key-plain-reference-allowed {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id));
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test stored-generated-column-foreign-key-on-delete-cascade-allowed {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id) ON DELETE CASCADE);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test stored-generated-column-catalog-one-entry-per-generated-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c int);
+    SELECT count(*) FROM pg_attrdef d
+    JOIN pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 't';
+}
+expect {
+    1
+}
+
+test stored-generated-column-foreign-key-on-update-set-null {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id) ON UPDATE SET NULL);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-foreign-key-on-delete-set-default {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id) ON DELETE SET DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-foreign-key-on-update-set-default {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id) ON UPDATE SET DEFAULT);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-foreign-key-on-update-cascade {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id) ON UPDATE CASCADE);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-foreign-key-on-delete-set-null {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED REFERENCES p (id) ON DELETE SET NULL);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-drop-referenced-column {
+    CREATE TABLE t (a int, x int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE t DROP COLUMN a;
+}
+@sqlstate 2BP01
+expect error {}
+
+test stored-generated-column-drop-generated-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a) VALUES (1);
+    ALTER TABLE t DROP COLUMN b;
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test stored-generated-column-rename-referenced-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE t RENAME COLUMN a TO z;
+    INSERT INTO t (z) VALUES (4);
+    SELECT z, b FROM t;
+}
+expect {
+    4|8
+}
+
+test stored-generated-column-catalog-attgenerated {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    SELECT a.attname, a.attgenerated, a.atthasdef
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 't' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    a||f
+    b|s|t
+}
+
+@skip-if postgres "tursopg rejects positional INSERT on tables with generated columns as unsupported (0A000); PostgreSQL rejects with a column-count mismatch error instead"
+test stored-generated-column-positional-insert-rejected {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c int);
+    INSERT INTO t VALUES (1, 3);
+}
+@sqlstate 0A000
+expect error {}
+
+test insert-positional-default-into-regular-columns {
+    CREATE TABLE t (a int DEFAULT 7, b int);
+    INSERT INTO t VALUES (DEFAULT, 5);
+    INSERT INTO t DEFAULT VALUES;
+    SELECT a, b FROM t ORDER BY b;
+}
+expect {
+    7|5
+    7|
+}
+
+test smallint-out-of-range {
+    CREATE TABLE t (a smallint);
+    INSERT INTO t VALUES (100000);
+}
+@sqlstate 22003
+expect error {}
+
+test varchar-too-long {
+    CREATE TABLE t (a varchar(3));
+    INSERT INTO t VALUES ('abcdef');
+}
+@sqlstate 22001
+expect error {}
+
+test stored-generated-column-concat-not-immutable {
+    CREATE TABLE t (a text, b text, y text GENERATED ALWAYS AS (concat(a, b)) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-concat-ws-not-immutable {
+    CREATE TABLE t (a text, b text, y text GENERATED ALWAYS AS (concat_ws('-', a, b)) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-format-not-immutable {
+    CREATE TABLE t (a text, y text GENERATED ALWAYS AS (format('%s!', a)) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-length-one-arg-is-immutable {
+    CREATE TABLE t (s text, n int GENERATED ALWAYS AS (length(s)) STORED);
+    INSERT INTO t (s) VALUES ('hello');
+    SELECT s, n FROM t;
+}
+expect {
+    hello|5
+}
+
+test stored-generated-column-length-two-args-not-immutable {
+    CREATE TABLE t (b bytea, n int GENERATED ALWAYS AS (length(b, 'SQL_ASCII')) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-quoted-uppercase-name-is-case-sensitive {
+    CREATE TABLE t (a int, "Y" int GENERATED ALWAYS AS (a + 1) STORED, z int GENERATED ALWAYS AS (y + 1) STORED);
+}
+@sqlstate 42703
+expect error {}
+
+test stored-generated-column-two-generation-clauses-rejected {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a + 1) STORED GENERATED ALWAYS AS (a) STORED);
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-schema-qualified-column-reference {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (public.t.a + 1) STORED);
+    INSERT INTO t (a) VALUES (1);
+    SELECT a, b FROM t;
+}
+expect {
+    1|2
+}
+
+test stored-generated-column-unqualified-alter-table-accepts-schema-qualified-expression {
+    CREATE SCHEMA s;
+    CREATE TABLE s.t (a int);
+    SET search_path = s, public;
+    ALTER TABLE t ADD COLUMN b int GENERATED ALWAYS AS (s.t.a * 2) STORED;
+    INSERT INTO t (a) VALUES (5);
+    SELECT a, b FROM t;
+}
+expect {
+    5|10
+}
+
+test stored-generated-column-text-cast-to-date-not-immutable {
+    CREATE TABLE t (s text, y date GENERATED ALWAYS AS (s::date) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-date-cast-to-text-not-immutable {
+    CREATE TABLE t (d date, y text GENERATED ALWAYS AS (d::text) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-timestamp-cast-to-timestamptz-not-immutable {
+    CREATE TABLE t (ts timestamp, y timestamptz GENERATED ALWAYS AS (ts::timestamptz) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-timestamptz-cast-to-date-not-immutable {
+    CREATE TABLE t (tz timestamptz, y date GENERATED ALWAYS AS (tz::date) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-date-part-of-timestamptz-not-immutable {
+    CREATE TABLE t (tz timestamptz, y double precision GENERATED ALWAYS AS (date_part('year', tz)) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-one-argument-age-not-immutable {
+    CREATE TABLE t (ts timestamp, y interval GENERATED ALWAYS AS (age(ts)) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-reference-qualified-by-other-schema-rejected {
+    CREATE SCHEMA other;
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (other.t.a + 1) STORED);
+}
+@sqlstate 42P01
+expect error {}
+
+test stored-generated-column-insert-select-star-before-generated-column {
+    CREATE TABLE src (x int, y int);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE t (a int, b int, g int GENERATED ALWAYS AS (a + b) STORED);
+    INSERT INTO t (a, b) SELECT * FROM src;
+    SELECT a, b, g FROM t;
+}
+expect {
+    1|2|3
+}
+
+test stored-generated-column-upsert-do-update-not-null-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED NOT NULL, c text UNIQUE);
+    INSERT INTO t (a, c) VALUES (1, 'x');
+    INSERT INTO t (a, c) VALUES (1, 'x') ON CONFLICT (c) DO UPDATE SET a = NULL;
+}
+@sqlstate 23502
+expect error {}
+
+test stored-generated-column-add-column-references-generated-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE t ADD COLUMN c int GENERATED ALWAYS AS (b + 1) STORED;
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-add-column-with-default-rejected {
+    CREATE TABLE t2 (a int);
+    INSERT INTO t2 VALUES (1);
+    ALTER TABLE t2 ADD COLUMN c int DEFAULT 3 GENERATED ALWAYS AS (a * 2) STORED;
+}
+@sqlstate 42601
+expect error {}
+
+test stored-generated-column-timestamptz-plus-interval-not-immutable {
+    CREATE TABLE t (ts timestamptz, g timestamptz GENERATED ALWAYS AS (ts + interval '1 day') STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-nested-arithmetic {
+    CREATE TABLE t (price int, qty int, discount int, total int GENERATED ALWAYS AS (price * qty - discount) STORED);
+    INSERT INTO t (price, qty, discount) VALUES (5, 3, 2);
+    SELECT total FROM t;
+}
+expect {
+    13
+}
+
+test stored-generated-column-nested-timestamptz-plus-interval-not-immutable {
+    CREATE TABLE t (tz timestamptz, g timestamptz GENERATED ALWAYS AS ((tz + interval '1 day') + interval '1 day') STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-nested-timestamp-result-cast-to-text-not-immutable {
+    CREATE TABLE t (ts timestamp, g text GENERATED ALWAYS AS ((ts + interval '1 day')::text) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-timestamptz-difference-cast-to-text-not-immutable {
+    CREATE TABLE t (a timestamptz, b timestamptz, g text GENERATED ALWAYS AS ((a - b)::text) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-text-concat-timestamptz-not-immutable {
+    CREATE TABLE t (ts timestamptz, g text GENERATED ALWAYS AS ('x' || ts) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-text-concat-int-is-immutable {
+    CREATE TABLE t (a int, g text GENERATED ALWAYS AS ('x' || a) STORED);
+    INSERT INTO t (a) VALUES (5);
+    SELECT g FROM t;
+}
+expect {
+    x5
+}
+
+test stored-generated-column-text-concat-timestamp-not-immutable {
+    CREATE TABLE t (ts timestamp, g text GENERATED ALWAYS AS ('x' || ts) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-date-concat-text-not-immutable {
+    CREATE TABLE t (d date, g text GENERATED ALWAYS AS (d || 'x') STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-text-column-concat-timestamptz-not-immutable {
+    CREATE TABLE t (s text, ts timestamptz, g text GENERATED ALWAYS AS (s || ts) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-timestamptz-minus-interval-not-immutable {
+    CREATE TABLE t (ts timestamptz, g timestamptz GENERATED ALWAYS AS (ts - interval '1 day') STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-interval-plus-timestamptz-not-immutable {
+    CREATE TABLE t (ts timestamptz, g timestamptz GENERATED ALWAYS AS (interval '1 day' + ts) STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-timestamptz-plus-string-literal-not-immutable {
+    CREATE TABLE t (ts timestamptz, g timestamptz GENERATED ALWAYS AS (ts + '1 day') STORED);
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-add-column-references-qualified-generated-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE t ADD COLUMN c int GENERATED ALWAYS AS (t.b + 1) STORED;
+}
+@sqlstate 42P17
+expect error {}
+
+test stored-generated-column-quoted-column-named-ctid {
+    CREATE TABLE t ("CTID" int, b int GENERATED ALWAYS AS ("CTID" + 1) STORED);
+    INSERT INTO t ("CTID") VALUES (5);
+    SELECT "CTID", b FROM t;
+}
+expect {
+    5|6
+}
+
+@skip-if postgres "tursopg pg_get_expr returns pg-dialect syntax; real postgres returns a different internal representation"
+test stored-generated-column-pg-get-expr-returns-pg-syntax {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (greatest(a, 2)) STORED);
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
+}
+expect {
+    greatest (a, 2)
+}
+
+@skip-if postgres "real postgres prints adbin differently"
+test stored-generated-column-pg-get-expr-keeps-grouping {
+    CREATE TABLE t (a int, b int, g int GENERATED ALWAYS AS (a - (1 - b)) STORED);
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
+}
+expect {
+    a - (1 - b)
+}
+
+@skip-if postgres "real postgres prints adbin differently"
+test stored-generated-column-pg-get-expr-quotes-names {
+    CREATE TABLE t ("select" int, "Mixed Case" int, g int GENERATED ALWAYS AS ("select" + "Mixed Case") STORED);
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
+}
+expect {
+    "select" + "Mixed Case"
+}
+
+@skip-if postgres "real postgres prints adbin differently"
+test stored-generated-column-pg-get-expr-after-rename {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE t RENAME COLUMN a TO z;
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
+}
+expect {
+    z * 2
+}

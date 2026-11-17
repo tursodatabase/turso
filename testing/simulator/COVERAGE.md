@@ -85,7 +85,7 @@ simulator covers and tests.
 | PRAGMA analysis_limit            | No         |                                                  |
 | PRAGMA application_id            | No         |                                                  |
 | PRAGMA auto_vacuum               | Yes        |                                                  |
-| PRAGMA automatic_index           | No         |                                                  |
+| PRAGMA automatic_index           | Yes        |                                                  |
 | PRAGMA busy_timeout              | No         |                                                  |
 | PRAGMA busy_timeout              | No         |                                                  |
 | PRAGMA cache_size                | No         |                                                  |

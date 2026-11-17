@@ -499,6 +499,17 @@ expect error {
     ORDER BY may not be used with non-aggregate group_concat()
 }
 
+# The checks on a view body run in source order, so the window ORDER BY error
+# comes before a cross-database table that only a later subquery names.
+test view-rejects-ordered-window-before-a-cross-database-subquery {
+    CREATE TEMP TABLE x(a);
+    CREATE TABLE t(a);
+    CREATE VIEW invalid_view AS SELECT group_concat(a ORDER BY a) OVER (), (SELECT a FROM temp.x) FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
 test view-rejects-ordered-window-scalar-subquery {
     CREATE TABLE t(val INT);
     CREATE VIEW invalid_view AS SELECT (SELECT group_concat(val ORDER BY val) OVER () FROM t);

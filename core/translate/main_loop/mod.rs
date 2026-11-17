@@ -26,7 +26,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, Table},
     translate::{
-        collate::{comparison_collation, expr_collation, CollationSeq},
+        collate::{comparison_collation, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
         planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
         result_row::emit_select_result,
@@ -58,11 +58,11 @@ use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;
 use close::{emit_autoindex, AutoIndexResult};
-use in_seek::{emit_in_seek_end, emit_in_seek_start, open_in_seek_source_cursor};
+use in_seek::{emit_in_seek_end, emit_in_seek_key, emit_in_seek_start, open_in_seek_source_cursor};
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;
-use seek::SeekEmitter;
+use seek::{encode_seek_keys_for_custom_types, SeekEmitter};
 
 #[derive(Debug)]
 pub struct LeftJoinMetadata {

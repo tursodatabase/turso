@@ -1,6 +1,7 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
+use crate::translate::expr_context::ExprContext;
 
 pub fn init_distinct(
     program: &mut ProgramBuilder,
@@ -10,7 +11,9 @@ pub fn init_distinct(
     let collations = plan
         .result_columns
         .iter()
-        .map(|col| expr_collation(&col.expr, Some(&plan.table_references), resolver))
+        .map(|col| {
+            ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
+        })
         .collect::<Result<Vec<_>>>()?;
     DistinctCtx::new(program, collations)
 }
@@ -84,7 +87,8 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![expr_collation(&agg.args[0], Some(tables), &t_ctx.resolver)?];
+            let collations =
+                vec![ExprContext::new(Some(tables), &t_ctx.resolver).expr_collation(&agg.args[0])?];
             let ctx = DistinctCtx::new(program, collations)?;
             let hash_table_id = ctx.hash_table_id;
             agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };
@@ -509,10 +513,11 @@ impl InitLoop {
                             // Open cursors for each index branch
                             for branch in &multi_idx_op.branches {
                                 if let Some(index) = &branch.index {
-                                    let branch_cursor_id = program.alloc_cursor_index(
-                                        Some(CursorKey::index(table.internal_id, index.clone())),
-                                        index,
-                                    )?;
+                                    let branch_cursor_id = program
+                                        .alloc_cursor_index_if_not_exists(
+                                            CursorKey::index(table.internal_id, index.clone()),
+                                            index,
+                                        )?;
                                     program.emit_insn(Insn::OpenRead {
                                         cursor_id: branch_cursor_id,
                                         root_page: index.root_page,
@@ -597,10 +602,10 @@ fn right_join_metadata(
                     .name
                     .clone()
                     .unwrap_or_default();
-                IndexColumn::new(&name, key_position, CollationSeq::Binary)
+                IndexColumn::new(&name, key_position, CollationSeq::BINARY)
             })
             .try_collect::<crate::alloc::Vec<_>>()?,
-        None => crate::alloc::vec![IndexColumn::new("rowid", 0, CollationSeq::Binary)],
+        None => crate::alloc::vec![IndexColumn::new("rowid", 0, CollationSeq::BINARY)],
     };
     let key_len = key_columns.len();
     let matched_rows_index = Arc::new(Index {
@@ -641,11 +646,11 @@ fn emit_percentile_fraction_check(
     // (correlated) columns are constant for the inner aggregate and allowed;
     // a subquery may hide an input-column reference, so reject conservatively.
     // This must run before we emit the expression — at this point the cursors
-    // for this query's tables aren't open yet, so a local Column read would
+    // for this query's tables aren't open yet, so a local Column or RowId read would
     // panic in translate_expr.
     walk_expr(&agg.args[1], &mut |e: &Expr| -> Result<WalkControl> {
         let invalid = match e {
-            Expr::Column { table, .. } => {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 matches!(tables.find_table_by_internal_id(*table), Some((false, _)))
             }
             Expr::Subquery(_) | Expr::Exists(_) | Expr::SubqueryResult { .. } => true,

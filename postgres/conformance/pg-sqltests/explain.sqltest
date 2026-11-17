@@ -101,7 +101,40 @@ test explain-order-by-primary-key-uses-index {
     EXPLAIN SELECT code FROM k3 ORDER BY code LIMIT 3;
 }
 expect {
-    1|0|0|SCAN k USING COVERING INDEX sqlite_autoindex_k_1
-    1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex_k2_1
+    1|0|0|SCAN k USING COVERING INDEX sqlite_autoindex___turso_ns1_k_1
+    1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex___turso_ns1_k2_1
     1|0|0|SCAN k3 USING COVERING INDEX k3_code
+}
+
+# The parts of a row-level security policy are conditions the optimizer can
+# use, so a role reads its rows through the index on the column the policy
+# compares with the role.
+test explain-select-seeks-index-of-policy-column {
+    CREATE ROLE explain_policy_role;
+    CREATE TABLE explain_policy_docs (id int primary key, owner text, archived boolean);
+    CREATE INDEX explain_policy_docs_owner ON explain_policy_docs (owner);
+    ALTER TABLE explain_policy_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON explain_policy_docs USING (owner = current_user AND NOT archived);
+    GRANT SELECT ON explain_policy_docs TO explain_policy_role;
+    SET ROLE explain_policy_role;
+    EXPLAIN SELECT id FROM explain_policy_docs;
+}
+expect {
+    1|0|0|SEARCH explain_policy_docs USING INDEX explain_policy_docs_owner (owner=?)
+}
+
+# A subquery of a policy that reads no column is computed once, so the role
+# is still sought through the index.
+test explain-select-seeks-index-with-subquery-of-policy {
+    CREATE ROLE explain_policy_subquery_role;
+    CREATE TABLE explain_policy_subquery_docs (id int primary key, owner text);
+    CREATE INDEX explain_policy_subquery_docs_owner ON explain_policy_subquery_docs (owner);
+    ALTER TABLE explain_policy_subquery_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own ON explain_policy_subquery_docs USING (owner = (SELECT current_user));
+    GRANT SELECT ON explain_policy_subquery_docs TO explain_policy_subquery_role;
+    SET ROLE explain_policy_subquery_role;
+    EXPLAIN SELECT id FROM explain_policy_subquery_docs;
+}
+expect {
+    1|0|0|SEARCH explain_policy_subquery_docs USING COVERING INDEX explain_policy_subquery_docs_owner (owner=?)
 }

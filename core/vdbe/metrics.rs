@@ -76,6 +76,10 @@ pub struct StatementMetrics {
     pub vm_steps: u64,
     pub insn_executed: u64,
     pub reprepares: u64,
+    /// Number of `Init` instructions executed, as SQLite counts
+    /// SQLITE_STMTSTATUS_RUN: one per run plus one per trigger or foreign
+    /// key action program started.
+    pub runs: u64,
 
     // Table scan metrics
     pub fullscan_steps: u64,
@@ -118,6 +122,7 @@ impl StatementMetrics {
         self.vm_steps = self.vm_steps.wrapping_add(other.vm_steps);
         self.insn_executed = self.insn_executed.wrapping_add(other.insn_executed);
         self.reprepares = self.reprepares.wrapping_add(other.reprepares);
+        self.runs = self.runs.wrapping_add(other.runs);
         self.fullscan_steps = self.fullscan_steps.wrapping_add(other.fullscan_steps);
         self.index_steps = self.index_steps.wrapping_add(other.index_steps);
         self.sort_operations = self.sort_operations.wrapping_add(other.sort_operations);
@@ -150,6 +155,7 @@ impl fmt::Display for StatementMetrics {
         writeln!(f, "    VM steps:         {}", self.vm_steps)?;
         writeln!(f, "    Instructions:     {}", self.insn_executed)?;
         writeln!(f, "    Reprepares:       {}", self.reprepares)?;
+        writeln!(f, "    Runs:             {}", self.runs)?;
         writeln!(f, "  Table Access:")?;
         writeln!(f, "    Full scan steps:  {}", self.fullscan_steps)?;
         writeln!(f, "    Index steps:      {}", self.index_steps)?;

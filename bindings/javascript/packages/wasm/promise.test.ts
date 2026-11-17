@@ -274,6 +274,54 @@ test('blobs', async () => {
     await db.close();
 })
 
+test('typed array and DataView parameters are bound as their bytes', async () => {
+    const db = await connect(":memory:");
+    const iframe = document.createElement('iframe');
+    document.body.appendChild(iframe);
+    const otherRealm = iframe.contentWindow as any;
+    const shadowedBuffer = new Uint8Array([1, 2]);
+    Object.defineProperty(shadowedBuffer, 'buffer', { value: new Uint8Array([7, 7, 7]).buffer });
+    const shadowedOffset = new Uint8Array([1, 2]);
+    Object.defineProperty(shadowedOffset, 'byteOffset', { value: 1 });
+    const detachedDataView = new DataView(new Uint8Array([1, 2]).buffer);
+    structuredClone(detachedDataView.buffer, { transfer: [detachedDataView.buffer] });
+    const shrunkBuffer = new (ArrayBuffer as any)(4, { maxByteLength: 4 });
+    const shrunkDataView = new DataView(shrunkBuffer, 1, 2);
+    shrunkBuffer.resize(2);
+    const cases: [any, string][] = [
+        [new Float32Array([1.5, 2.25]), '0000C03F00001040'],
+        [new Uint16Array([1000, 2000]), 'E803D007'],
+        [new DataView(new Uint8Array([9, 1, 2, 3]).buffer, 1, 2), '0102'],
+        [new Uint8Array(new Uint8Array([9, 1, 2, 3]).buffer, 1, 2), '0102'],
+        [new otherRealm.Float32Array([1.5]), '0000C03F'],
+        [new otherRealm.DataView(new otherRealm.Uint8Array([1, 2]).buffer), '0102'],
+        [Object.setPrototypeOf(new Uint8Array([1, 2]), null), '0102'],
+        [shadowedBuffer, '0102'],
+        [shadowedOffset, '0102'],
+        [detachedDataView, ''],
+        [shrunkDataView, ''],
+    ];
+    const stmt = await db.prepare("SELECT hex(?) AS h");
+    for (const [value, hex] of cases) {
+        expect(await stmt.get(value)).toEqual({ h: hex });
+        expect(await stmt.get([value])).toEqual({ h: hex });
+    }
+    iframe.remove();
+    await db.close();
+})
+
+test('a typed array is bound with its current bytes after its ArrayBuffer grows', async () => {
+    const db = await connect(":memory:");
+    const buffer = new (ArrayBuffer as any)(1, { maxByteLength: 1 << 20 });
+    const view = new Uint8Array(buffer);
+    const stmt = await db.prepare("SELECT length(?1) AS n, hex(substr(?1, -2)) AS tail");
+    expect(await stmt.get(view)).toEqual({ n: 1, tail: '00' });
+    buffer.resize(1 << 20);
+    view[(1 << 20) - 1] = 7;
+    expect(await stmt.get(view)).toEqual({ n: 1 << 20, tail: '0007' });
+    await db.close();
+})
+
 test("datetime('now')", async () => {
     const db = await connect(":memory:");
     const rows = await (await db.prepare("SELECT datetime('now') as now")).all();

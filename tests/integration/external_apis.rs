@@ -12,7 +12,9 @@ use std::{
         Arc,
     },
 };
-use turso_core::{ConnectOpts, Connection, ConnectionHooks, LimboError, SavepointMemo, StepResult};
+use turso_core::{
+    ConnectOpts, Connection, ConnectionHooks, LimboError, SavepointMemo, SessionRole, StepResult,
+};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
     ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
@@ -26,11 +28,16 @@ static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = tmp_db.limbo_database();
     let context = Arc::new(std::sync::Mutex::new(7i64));
-    let first = db.connect_with_context(context.clone())?;
+    let first =
+        db.connect_with_context(ConnectOpts::new(SessionRole::Superuser), context.clone())?;
     let first_clone = first.clone();
-    let second = db.connect_with_context(Arc::new(std::sync::Mutex::new(19i64)))?;
-    let shared = db.connect_with_context(context.clone())?;
-    let plain = db.connect(ConnectOpts::new())?;
+    let second = db.connect_with_context(
+        ConnectOpts::new(SessionRole::Superuser),
+        Arc::new(std::sync::Mutex::new(19i64)),
+    )?;
+    let shared =
+        db.connect_with_context(ConnectOpts::new(SessionRole::Superuser), context.clone())?;
+    let plain = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     assert!(std::ptr::eq(
         context.as_ref(),
@@ -65,7 +72,9 @@ fn connection_hooks_see_statement_ends_rollbacks_and_savepoints(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let hooks = Arc::new(RecordingHooks::default());
-    let conn = tmp_db.limbo_database().connect_with_hooks(hooks.clone())?;
+    let conn = tmp_db
+        .limbo_database()
+        .connect_with_hooks(ConnectOpts::new(SessionRole::Superuser), hooks.clone())?;
     assert!(std::ptr::eq(
         hooks.as_ref(),
         conn.context::<RecordingHooks>().unwrap()
@@ -135,6 +144,27 @@ impl RecordingHooks {
 }
 
 #[turso_macros::test(mvcc)]
+fn connection_made_with_settings_and_a_context_has_that_context(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = tmp_db.limbo_database();
+    let context = Arc::new(std::sync::Mutex::new(7i64));
+    let opts = ConnectOpts::new(SessionRole::Superuser).with_encryption_key(None);
+
+    let conn = db.connect_with_context(opts.clone(), context.clone())?;
+
+    assert!(std::ptr::eq(
+        context.as_ref(),
+        conn.context::<std::sync::Mutex<i64>>().unwrap()
+    ));
+    assert!(db
+        .connect(opts)?
+        .context::<std::sync::Mutex<i64>>()
+        .is_none());
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
 fn connection_context_lives_until_the_last_connection_owner_drops(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -143,7 +173,7 @@ fn connection_context_lives_until_the_last_connection_owner_drops(
     let weak = Arc::downgrade(&context);
     let conn = tmp_db
         .limbo_database()
-        .connect_with_context(context.clone())?;
+        .connect_with_context(ConnectOpts::new(SessionRole::Superuser), context.clone())?;
     let cloned_conn = conn.clone();
     let mut statement = conn.prepare("SELECT 7")?;
 
@@ -997,6 +1027,54 @@ unsafe extern "C" fn dotnet_case_sensitive_collation(
         Ordering::Equal => 0,
         Ordering::Greater => 1,
     }
+}
+
+#[turso_macros::test]
+#[serial]
+fn pragma_collation_list_lists_registered_collations_first(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation("zz_last".to_string(), 0, dotnet_nocase_collation, None);
+    conn.register_external_collation("aa_first".to_string(), 0, dotnet_nocase_collation, None);
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(
+        rows,
+        vec![
+            (0, "aa_first".to_string()),
+            (1, "zz_last".to_string()),
+            (2, "RTRIM".to_string()),
+            (3, "NOCASE".to_string()),
+            (4, "BINARY".to_string()),
+        ]
+    );
+
+    conn.unregister_external_collation("aa_first");
+    conn.unregister_external_collation("zz_last");
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(rows.len(), 3);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn pragma_collation_list_lists_a_replaced_builtin_once(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation("NOCASE".to_string(), 0, dotnet_nocase_collation, None);
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(
+        rows,
+        vec![
+            (0, "nocase".to_string()),
+            (1, "RTRIM".to_string()),
+            (2, "BINARY".to_string()),
+        ]
+    );
+
+    conn.unregister_external_collation("NOCASE");
+    Ok(())
 }
 
 #[turso_macros::test]

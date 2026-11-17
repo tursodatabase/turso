@@ -974,3 +974,54 @@ expect {
     mvcc
     2|x
 }
+# OR IGNORE only ignores constraint failures. A SQL error raised by a function
+# in a trigger (here a multi-character LIKE escape, a LIKE/GLOB pattern over
+# the length limit, or bad arguments to a JSON function) still fails the
+# statement.
+test insert-or-ignore-does-not-ignore-like-escape-error-in-trigger {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT 'a' LIKE 'a' ESCAPE 'xx';
+    END;
+    INSERT OR IGNORE INTO t VALUES (1);
+}
+expect error {
+    ESCAPE expression must be a single character
+}
+
+test insert-or-ignore-does-not-ignore-glob-pattern-error-in-trigger {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT 'a' GLOB printf('%.*c', 50001, 'a');
+    END;
+    INSERT OR IGNORE INTO t VALUES (1);
+}
+expect error {
+    LIKE or GLOB pattern too complex
+}
+
+test insert-or-ignore-does-not-ignore-json-object-label-error-in-trigger {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT json_object(new.a, 2);
+    END;
+    INSERT OR IGNORE INTO t VALUES (1);
+}
+expect error {
+    json_object\(\) labels must be TEXT
+}
+
+test insert-or-ignore-does-not-ignore-json-set-argument-count-error-in-trigger {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT json_set('{}', '$.a');
+    END;
+    INSERT OR IGNORE INTO t VALUES (1);
+}
+expect error {
+    json_set\(\) needs an odd number of arguments
+}

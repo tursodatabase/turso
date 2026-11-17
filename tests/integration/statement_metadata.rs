@@ -400,7 +400,7 @@ mod tests {
             ("abs(x)", Some("INTEGER")),
             ("abs(x) * 2", Some("INTEGER")),
             ("abs(ratio)", Some("REAL")),
-            ("abs(label)", Some("NUMERIC")),
+            ("abs(label)", Some("REAL")),
             ("CASE WHEN x = 1 THEN x ELSE 0 END - 1", Some("INTEGER")),
             ("CASE WHEN x = 1 THEN x END", Some("INTEGER")),
             ("CASE x WHEN 1 THEN NULL ELSE ratio END", Some("REAL")),
@@ -452,18 +452,15 @@ mod tests {
         assert_eq!(array_agg.array_dimensions, 1);
     }
 
-    /// An expression of a custom type that isn't a column reports the primitive
-    /// the type is stored as, not one guessed from the type's name. A type's own
-    /// operator function reports nothing, because the function decides the result.
+    /// An expression of a custom type that isn't a column reports itself like a
+    /// column of that type: the type's name, with the primitive it is stored as
+    /// in `base_type` (not one guessed from the type's name).
     #[test]
     fn type_info_for_custom_type_expressions() {
         let db = fresh_db_with_custom_types("type_info_custom_expressions.db");
         let conn = db.connect_limbo();
-        conn.execute(
-            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 \
-             OPERATOR '+' max",
-        )
-        .unwrap();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
         conn.execute("CREATE TYPE rev BASE text ENCODE value DECODE value")
             .unwrap();
         conn.execute(
@@ -473,14 +470,33 @@ mod tests {
 
         let stmt = conn
             .prepare(
-                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code), amount + 1 \
-                 FROM accounts",
+                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code), \
+                 coalesce(amount, CAST(0 AS cents)), CAST(id AS cents[]) FROM accounts",
             )
             .unwrap();
-        assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
-        assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
-        assert_eq!(expect_info(&stmt, 2).declared_name, "TEXT");
-        assert!(stmt.get_column_type_info(3).unwrap().is_none());
+        let column_of_cents = conn.prepare("SELECT amount FROM accounts").unwrap();
+        let expected_cents = expect_info(&column_of_cents, 0);
+
+        let cast_to_cents = expect_info(&stmt, 0);
+        assert_eq!(cast_to_cents, expected_cents);
+        assert_eq!(cast_to_cents.declared_name, "cents");
+        assert_eq!(cast_to_cents.base_type.as_deref(), Some("INTEGER"));
+        assert_eq!(cast_to_cents.kind, ColumnTypeKind::Custom);
+
+        let cast_to_rev = expect_info(&stmt, 1);
+        assert_eq!(cast_to_rev.declared_name, "rev");
+        assert_eq!(cast_to_rev.base_type.as_deref(), Some("TEXT"));
+        assert_eq!(cast_to_rev.kind, ColumnTypeKind::Custom);
+
+        let coalesced = expect_info(&stmt, 2);
+        assert_eq!(coalesced.declared_name, "rev");
+        assert_eq!(coalesced.base_type.as_deref(), Some("TEXT"));
+
+        assert_eq!(expect_info(&stmt, 3), expected_cents);
+
+        let cents_array = expect_info(&stmt, 4);
+        assert_eq!(cents_array.declared_name, "cents");
+        assert_eq!(cents_array.array_dimensions, 1);
     }
 
     /// A custom type with no function for an operator goes to SQLite's operator as
@@ -509,6 +525,22 @@ mod tests {
                 "column {idx}"
             );
         }
+    }
+
+    /// Date arithmetic declares its result: `date + n` is a date, which is stored
+    /// as text (it reports as a date), and `date - date` is a number of days.
+    #[test]
+    fn type_info_for_date_arithmetic() {
+        let db = fresh_db_with_custom_types("type_info_date_arithmetic.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT")
+            .unwrap();
+
+        let stmt = conn.prepare("SELECT d + 1, d - d FROM t").unwrap();
+        let date_plus_days = expect_info(&stmt, 0);
+        assert_eq!(date_plus_days.declared_name, "date");
+        assert_eq!(date_plus_days.base_type.as_deref(), Some("TEXT"));
+        assert_eq!(expect_info(&stmt, 1).declared_name, "INTEGER");
     }
 
     /// Expressions whose primitive can't be determined statically — function

@@ -88,6 +88,7 @@ impl SqlBackend for RustBackend {
             Capability::Trigger,
             Capability::MaterializedViews,
             Capability::CustomTypes,
+            Capability::IndexMethod,
         ])
     }
 
@@ -254,7 +255,7 @@ impl RustDatabaseInstance {
                     remaining = &remaining[offset..];
                 }
                 Some(Err(e)) => {
-                    return Err(turso::Error::Error(format!("Parse error: {e}")));
+                    return Err(turso::Error::Error(e.to_string()));
                 }
                 None => {
                     // No more statements

@@ -13,7 +13,6 @@ use turso_parser::ast;
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode,
         expr_type::{type_of, TypeEnv},
         translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
     },
@@ -433,12 +432,33 @@ pub fn emit_columns_to_destination(
         QueryDestination::RowValueSubqueryResult {
             result_reg_start,
             num_regs,
+            row_count_reg,
         } => {
             turso_assert_eq!(
                 num_columns,
                 *num_regs,
                 "Row value subqueries should have the same number of result columns as the number of registers"
             );
+            if let Some(row_count_reg) = *row_count_reg {
+                let first_row = program.allocate_label();
+                let counted = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: row_count_reg,
+                    target_pc: first_row,
+                    jump_if_null: false,
+                });
+                program.emit_insn(Insn::Null {
+                    dest: row_count_reg,
+                    dest_end: None,
+                });
+                program.emit_insn(Insn::Goto { target_pc: counted });
+                program.preassign_label_to_next_insn(first_row);
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: row_count_reg,
+                });
+                program.preassign_label_to_next_insn(counted);
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: start_reg,
                 dst_reg: *result_reg_start,
@@ -513,31 +533,13 @@ pub(crate) fn emit_array_decode_for_results(
     start_reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    if program.flags.reads_stored_values() {
+        return Ok(());
+    }
     let env = TypeEnv::new(Some(table_references), resolver);
     for (i, rc) in result_columns.iter().enumerate() {
         if type_of(&rc.expr, &env).is_array() {
-            // An array column's elements may have a custom type to decode.
-            let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
-                table_references
-                    .find_table_by_internal_id(*table)
-                    .and_then(|(_, t)| t.get_column_at(*column))
-            } else {
-                None
-            };
-            let reg = start_reg + i;
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip,
-            });
-
-            if let Some(col) = array_col {
-                emit_array_decode(program, reg, col, resolver)?;
-            } else if !program.flags.keep_array_results_as_blobs() {
-                program.emit_insn(Insn::ArrayDecode { reg });
-            }
-
-            program.preassign_label_to_next_insn(skip);
+            program.emit_insn(Insn::ArrayDecode { reg: start_reg + i });
         }
     }
     Ok(())

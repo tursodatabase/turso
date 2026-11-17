@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true
 tempfile = { workspace = true }
 log = "0.4.22"
+parking_lot = { workspace = true }
 assert_cmd = "^2"
 rand_chacha = { workspace = true }
 rand = { workspace = true }

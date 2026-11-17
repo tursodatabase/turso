@@ -65,7 +65,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
-            allow_automatic_index: true,
+            allow_automatic_index: resolver.automatic_index,
             resolver,
         }
     }
@@ -833,7 +833,11 @@ fn join_lhs_and_rhs<'a>(
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
-                && !build_is_left_of_right_or_full_join;
+                && !build_is_left_of_right_or_full_join
+                // A hash join computes its keys from rows before the loop
+                // checks their row-level security filter.
+                && build_table.row_filter.is_none()
+                && rhs_table_reference.row_filter.is_none();
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),
@@ -2297,7 +2301,7 @@ fn build_where_term_info(
             let equal_tables = if term.consumed {
                 None
             } else {
-                tables_in_hashable_equal_test(&term.expr, table_references, resolver)?
+                tables_in_hashable_equal_test(&term.expr, table_references, subqueries, resolver)?
             };
             Ok(WhereTermInfo {
                 table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
@@ -3039,7 +3043,7 @@ mod tests {
                 table_id: joined_tables[0].internal_id,
                 target: ColumnTarget::Column(0),
                 order: SortOrder::Asc,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
                 nulls_order: None,
             }],
             purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
@@ -3185,7 +3189,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "id",
                 0,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: true,
             ephemeral: false,
@@ -3283,7 +3287,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "id",
                 0,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: true,
             ephemeral: false,
@@ -3427,7 +3431,7 @@ mod tests {
                     columns: crate::alloc::vec![IndexColumn::new(
                         "id",
                         0,
-                        crate::translate::collate::CollationSeq::Binary
+                        crate::translate::collate::CollationSeq::BINARY
                     )],
                     unique: true,
                     ephemeral: false,
@@ -3450,7 +3454,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "customer_id",
                 1,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: false,
             ephemeral: false,
@@ -3467,7 +3471,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "order_id",
                 1,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: false,
             ephemeral: false,
@@ -3980,8 +3984,8 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::BINARY),
             ],
             unique: false,
             root_page: 2,
@@ -4008,6 +4012,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4084,9 +4089,9 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("c3", 2, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("c3", 2, crate::translate::collate::CollationSeq::BINARY),
             ],
             unique: false,
             root_page: 2,
@@ -4110,6 +4115,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4229,6 +4235,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
@@ -4397,7 +4404,7 @@ mod tests {
                     IndexColumn::new(
                         (*name).to_string(),
                         *pos_in_table,
-                        crate::translate::collate::CollationSeq::Binary,
+                        crate::translate::collate::CollationSeq::BINARY,
                     )
                 })
                 .try_collect()
@@ -4433,6 +4440,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         }
     }
@@ -4552,7 +4560,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "a",
                 0,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: false, // Non-unique index
             ephemeral: false,

@@ -9,6 +9,7 @@ use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
@@ -529,17 +530,19 @@ pub(super) fn emit_inner_join(
     let eph_record_reg = program.alloc_register();
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
@@ -779,17 +782,19 @@ pub(super) fn emit_semi_or_anti_join(
         })?;
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));

@@ -7,6 +7,18 @@
 //! names for a root, like `public` for main. A name without a namespace is
 //! looked up through the connection's search path, an ordered list of
 //! namespace names.
+//!
+//! A database can also store more namespaces, like PostgreSQL schemas. A
+//! namespace has an id, and the schema of its database keeps its
+//! objects apart from the objects of the other namespaces by that id. On
+//! disk, an object of a namespace is stored under a name that starts
+//! with `__turso_ns<id>_`, and the namespace exists while its row in
+//! `__turso_internal_namespaces` exists, so creating and dropping one is
+//! DDL of its database: it is part of the transaction, other
+//! connections see it when the schema changes, and the schema has the
+//! namespaces whenever it is loaded. Only the schema loader and the code
+//! that writes schema rows use the mangled names; every lookup uses the
+//! namespace id and the name of the object.
 
 use crate::sync::RwLock;
 use crate::{turso_assert, MAIN_DB_ID, TEMP_DB_ID};
@@ -51,15 +63,62 @@ impl NamespaceRef {
     }
 }
 
+/// What the mangled names of the objects of a namespace start with,
+/// before the namespace's id and an underscore.
+pub const MANGLED_NAME_PREFIX: &str = "__turso_ns";
+
+/// The name that object `name` of namespace `namespace` is stored under in
+/// the schema rows of its database.
+pub fn mangle_name(namespace: NamespaceId, name: &str) -> String {
+    if namespace.is_root() {
+        return name.to_string();
+    }
+    format!("{MANGLED_NAME_PREFIX}{}_{name}", namespace.as_u32())
+}
+
+/// The namespace and name of the object whose mangled name is `mangled`:
+/// the root namespace and the whole name when the name has no namespace
+/// id in front.
+///
+/// `supports_namespaces` says whether the database supports namespaces at all.
+/// When it does not, a name that looks like a mangled name is an ordinary
+/// name of the root namespace: SQLite allows such names, and a database
+/// made by SQLite may hold them.
+pub fn demangle_name(supports_namespaces: bool, mangled: &str) -> (NamespaceId, &str) {
+    if !supports_namespaces {
+        return (NamespaceId::ROOT, mangled);
+    }
+    let Some(rest) = mangled.strip_prefix(MANGLED_NAME_PREFIX) else {
+        return (NamespaceId::ROOT, mangled);
+    };
+    let Some((id, name)) = rest.split_once('_') else {
+        return (NamespaceId::ROOT, mangled);
+    };
+    match id.parse::<u32>() {
+        Ok(id) if id != 0 => (NamespaceId::new(id), name),
+        _ => (NamespaceId::ROOT, mangled),
+    }
+}
+
+/// Whether the engine stores an object under `name` for its own use or, in
+/// a database that supports namespaces, for a namespace, so that a
+/// user may not name an object so.
+pub fn is_reserved_object_name(supports_namespaces: bool, name: &str) -> bool {
+    crate::schema::RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || (supports_namespaces && name.starts_with(MANGLED_NAME_PREFIX))
+}
+
 /// A name that qualifies object names in SQL and the namespace it refers
 /// to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Namespace {
+pub struct Qualifier {
     pub name: String,
     pub target: NamespaceRef,
 }
 
-impl Namespace {
+impl Qualifier {
     /// The name of the root namespace of database `database_id`: the
     /// objects of the whole database.
     pub fn database(name: &str, database_id: usize) -> Self {
@@ -69,29 +128,72 @@ impl Namespace {
         }
     }
 
+    /// The name of the namespace stored in the main database under `id`.
+    pub fn in_main(name: &str, id: NamespaceId) -> Self {
+        Self {
+            name: name.to_string(),
+            target: NamespaceRef {
+                database_id: MAIN_DB_ID,
+                id,
+            },
+        }
+    }
+
     pub fn database_id(&self) -> usize {
         self.target.database_id
     }
 
-    /// Whether the namespace is one of the namespaces of its database rather
-    /// than the whole database.
-    pub fn is_stored(&self) -> bool {
-        !self.target.id.is_root()
+    /// Whether the name refers to a whole database rather than to a
+    /// namespace inside one.
+    pub fn is_database(&self) -> bool {
+        self.target.id.is_root()
+    }
+
+    /// The name that object `name` of the namespace this qualifier names is
+    /// stored under.
+    pub fn mangle_name(&self, name: &str) -> String {
+        mangle_name(self.target.id, name)
     }
 }
 
-/// The names of a connection's namespaces.
+/// The qualifiers a connection accepts: each name that may qualify an object
+/// name in SQL, with the database or namespace it names.
 #[derive(Default)]
-pub struct Namespaces {
-    name_to_namespace: RwLock<HashMap<String, Namespace>>,
+pub struct Qualifiers {
+    name_to_namespace: RwLock<HashMap<String, Qualifier>>,
 }
 
-impl Namespaces {
+impl Clone for Qualifiers {
+    fn clone(&self) -> Self {
+        Qualifiers {
+            name_to_namespace: RwLock::new(self.name_to_namespace.read().clone()),
+        }
+    }
+}
+
+impl Qualifiers {
+    /// These names together with the namespaces of the main database, with
+    /// their ids; a database added here under the same name hides one.
+    pub fn with_namespaces<'a>(
+        &self,
+        namespaces: impl IntoIterator<Item = (NamespaceId, &'a str)>,
+    ) -> Qualifiers {
+        let mut name_to_namespace = self.name_to_namespace.read().clone();
+        for (id, name) in namespaces {
+            name_to_namespace
+                .entry(name.to_string())
+                .or_insert_with(|| Qualifier::in_main(name, id));
+        }
+        Qualifiers {
+            name_to_namespace: RwLock::new(name_to_namespace),
+        }
+    }
+
     /// The namespace called `name`. `name` is normalized.
-    pub fn get(&self, name: &str) -> Option<Namespace> {
+    pub fn get(&self, name: &str) -> Option<Qualifier> {
         match name {
-            "main" => Some(Namespace::database("main", MAIN_DB_ID)),
-            "temp" => Some(Namespace::database("temp", TEMP_DB_ID)),
+            "main" => Some(Qualifier::database("main", MAIN_DB_ID)),
+            "temp" => Some(Qualifier::database("temp", TEMP_DB_ID)),
             _ => self.name_to_namespace.read().get(name).cloned(),
         }
     }
@@ -103,15 +205,15 @@ impl Namespaces {
 
     /// The namespace that is the whole of database `database_id`: main,
     /// temp or an attached database.
-    pub fn of_database(&self, database_id: usize) -> Option<Namespace> {
+    pub fn of_database(&self, database_id: usize) -> Option<Qualifier> {
         match database_id {
-            MAIN_DB_ID => Some(Namespace::database("main", MAIN_DB_ID)),
-            TEMP_DB_ID => Some(Namespace::database("temp", TEMP_DB_ID)),
+            MAIN_DB_ID => Some(Qualifier::database("main", MAIN_DB_ID)),
+            TEMP_DB_ID => Some(Qualifier::database("temp", TEMP_DB_ID)),
             _ => self
                 .name_to_namespace
                 .read()
                 .values()
-                .find(|namespace| namespace.database_id() == database_id && !namespace.is_stored())
+                .find(|namespace| namespace.database_id() == database_id && namespace.is_database())
                 .cloned(),
         }
     }
@@ -137,13 +239,13 @@ impl Namespaces {
 
     /// The namespaces of the attached databases: the databases other than
     /// main and temp, ordered by database.
-    pub fn attached_databases(&self) -> Vec<Namespace> {
+    pub fn attached_databases(&self) -> Vec<Qualifier> {
         let mut namespaces: Vec<_> = self
             .name_to_namespace
             .read()
             .values()
             .filter(|namespace| {
-                !namespace.is_stored()
+                namespace.is_database()
                     && namespace.database_id() != MAIN_DB_ID
                     && namespace.database_id() != TEMP_DB_ID
             })
@@ -154,7 +256,7 @@ impl Namespaces {
     }
 
     /// Adds `namespace` under its name.
-    pub fn add(&self, namespace: Namespace) {
+    pub fn add(&self, namespace: Qualifier) {
         let name = namespace.name.clone();
         let previous = self
             .name_to_namespace
@@ -186,13 +288,13 @@ impl Namespaces {
     /// `public` for `main`, is skipped. The names are normalized: the
     /// caller has already lowercased the unquoted ones and kept the quoted
     /// ones as written.
-    pub fn search_order(&self, search_path: Option<&[String]>) -> Vec<Namespace> {
+    pub fn search_order(&self, search_path: Option<&[String]>) -> Vec<Qualifier> {
         let Some(search_path) = search_path else {
-            let mut order = vec![Namespace::database("main", MAIN_DB_ID)];
+            let mut order = vec![Qualifier::database("main", MAIN_DB_ID)];
             order.extend(self.attached_databases());
             return order;
         };
-        let mut order: Vec<Namespace> = Vec::new();
+        let mut order: Vec<Qualifier> = Vec::new();
         for name in search_path {
             let Some(namespace) = self.get(name) else {
                 continue;
@@ -210,7 +312,10 @@ impl Namespaces {
 
 #[cfg(test)]
 mod tests {
-    use super::{Namespace, NamespaceId, NamespaceRef, Namespaces};
+    use super::{
+        demangle_name, is_reserved_object_name, mangle_name, NamespaceId, NamespaceRef, Qualifier,
+        Qualifiers,
+    };
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
 
     #[test]
@@ -223,10 +328,10 @@ mod tests {
         assert_ne!(NamespaceRef::root_of(3), NamespaceRef::root_of(MAIN_DB_ID));
     }
 
-    fn namespaces_with_app_and_other() -> Namespaces {
-        let namespaces = Namespaces::default();
-        namespaces.add(Namespace::database("app", 2));
-        namespaces.add(Namespace::database("other", 3));
+    fn namespaces_with_app_and_other() -> Qualifiers {
+        let namespaces = Qualifiers::default();
+        namespaces.add(Qualifier::database("app", 2));
+        namespaces.add(Qualifier::database("other", 3));
         namespaces
     }
 
@@ -234,7 +339,7 @@ mod tests {
         names.iter().map(|name| name.to_string()).collect()
     }
 
-    fn names_of(namespaces: &[Namespace]) -> Vec<&str> {
+    fn names_of(namespaces: &[Qualifier]) -> Vec<&str> {
         namespaces
             .iter()
             .map(|namespace| namespace.name.as_str())
@@ -278,7 +383,7 @@ mod tests {
     #[test]
     fn a_second_name_for_main_is_not_an_other_database() {
         let namespaces = namespaces_with_app_and_other();
-        namespaces.add(Namespace::database("public", MAIN_DB_ID));
+        namespaces.add(Qualifier::database("public", MAIN_DB_ID));
         assert_eq!(namespaces.database_id("public"), Some(MAIN_DB_ID));
         assert_eq!(namespaces.of_database(MAIN_DB_ID).unwrap().name, "main");
         assert_eq!(
@@ -295,8 +400,8 @@ mod tests {
     #[test]
     fn a_namespace_of_main_that_is_not_its_root_is_its_own_entry_of_the_search_order() {
         let namespaces = namespaces_with_app_and_other();
-        namespaces.add(Namespace::database("public", MAIN_DB_ID));
-        let app_in_main = Namespace {
+        namespaces.add(Qualifier::database("public", MAIN_DB_ID));
+        let app_in_main = Qualifier {
             name: "app_in_main".to_string(),
             target: NamespaceRef {
                 database_id: MAIN_DB_ID,
@@ -307,8 +412,8 @@ mod tests {
         let found = namespaces.get("app_in_main").unwrap();
         assert_eq!(found, app_in_main);
         assert_eq!(found.database_id(), MAIN_DB_ID);
-        assert!(found.is_stored());
-        assert!(!namespaces.get("app").unwrap().is_stored());
+        assert!(!found.is_database());
+        assert!(namespaces.get("app").unwrap().is_database());
         assert_eq!(
             namespaces.name_of(app_in_main.target).as_deref(),
             Some("app_in_main")
@@ -328,6 +433,95 @@ mod tests {
         assert_eq!(names_of(&order), vec!["app_in_main", "public"]);
         assert_eq!(order[0].target.id, NamespaceId::new(17));
         assert_eq!(order[1].target, NamespaceRef::root_of(MAIN_DB_ID));
+    }
+
+    #[test]
+    fn a_namespace_is_its_own_entry_of_the_search_order() {
+        let namespaces = namespaces_with_app_and_other();
+        namespaces.add(Qualifier::database("public", MAIN_DB_ID));
+        let all = namespaces.with_namespaces([(NamespaceId::new(17), "app_in_main")]);
+        let app = all.get("app_in_main").unwrap();
+        assert_eq!(app.database_id(), MAIN_DB_ID);
+        assert!(!app.is_database());
+        assert_eq!(app.mangle_name("t"), "__turso_ns17_t");
+        assert_eq!(all.get("app").unwrap().mangle_name("t"), "t");
+        assert_eq!(all.name_of(app.target).as_deref(), Some("app_in_main"));
+        assert_eq!(
+            all.name_of(NamespaceRef::root_of(MAIN_DB_ID)).as_deref(),
+            Some("main")
+        );
+        assert_eq!(names_of(&all.attached_databases()), vec!["app", "other"]);
+        let search_path = names(&["app_in_main", "public", "main", "app_in_main"]);
+        let order = all.search_order(Some(&search_path));
+        assert_eq!(names_of(&order), vec!["app_in_main", "public"]);
+        assert_eq!(order[0].target.id, NamespaceId::new(17));
+        assert_eq!(order[1].target, NamespaceRef::root_of(MAIN_DB_ID));
+    }
+
+    #[test]
+    fn namespaces_are_hidden_by_databases_of_the_same_name() {
+        let namespaces = namespaces_with_app_and_other();
+        let all = namespaces
+            .with_namespaces([(NamespaceId::new(1), "app"), (NamespaceId::new(2), "shop")]);
+        assert_eq!(all.get("app").unwrap().database_id(), 2);
+        assert_eq!(
+            all.get("shop").unwrap(),
+            Qualifier::in_main("shop", NamespaceId::new(2))
+        );
+    }
+
+    #[test]
+    fn a_mangled_name_says_which_namespace_the_object_is_in() {
+        assert_eq!(mangle_name(NamespaceId::ROOT, "t"), "t");
+        assert_eq!(mangle_name(NamespaceId::new(17), "t"), "__turso_ns17_t");
+        assert_eq!(
+            mangle_name(NamespaceId::new(1), "sub.t"),
+            "__turso_ns1_sub.t"
+        );
+        assert_eq!(demangle_name(true, "t"), (NamespaceId::ROOT, "t"));
+        assert_eq!(
+            demangle_name(false, "__turso_ns17_t"),
+            (NamespaceId::ROOT, "__turso_ns17_t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns17_t"),
+            (NamespaceId::new(17), "t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns1_sub.t"),
+            (NamespaceId::new(1), "sub.t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns17"),
+            (NamespaceId::ROOT, "__turso_ns17")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_nsx_t"),
+            (NamespaceId::ROOT, "__turso_nsx_t")
+        );
+        assert_eq!(
+            demangle_name(true, "__turso_ns0_t"),
+            (NamespaceId::ROOT, "__turso_ns0_t")
+        );
+    }
+
+    #[test]
+    fn mangled_names_are_reserved() {
+        assert!(is_reserved_object_name(true, "__turso_ns17_t"));
+        assert!(is_reserved_object_name(true, "__turso_nst"));
+        assert!(is_reserved_object_name(
+            true,
+            "__turso_internal_namespace_17_app"
+        ));
+        assert!(is_reserved_object_name(true, "sqlite_t"));
+        assert!(!is_reserved_object_name(true, "__turso_t"));
+        assert!(!is_reserved_object_name(true, "t"));
+        assert!(!is_reserved_object_name(false, "__turso_ns17_t"));
+        assert!(is_reserved_object_name(
+            false,
+            "__turso_internal_namespace_17_app"
+        ));
+        assert!(is_reserved_object_name(false, "sqlite_t"));
     }
 
     #[test]

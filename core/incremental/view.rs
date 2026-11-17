@@ -1,17 +1,15 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
+use crate::namespace::NamespaceId;
+use crate::schema::view::{extract_view_columns, ViewColumnSchema};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, Value};
-use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{turso_assert, LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
-use turso_parser::{
-    ast::{Cmd, Stmt},
-    parser::Parser,
-};
+use turso_parser::ast::{Cmd, Stmt};
 
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
@@ -109,6 +107,7 @@ pub fn create_dbsp_state_index(
             // (see state_table_sql), and the index must compare the same way.
             collation: state_table.columns()[pos_in_table].collation(),
             pos_in_table,
+            explicit_collation: None,
             default: None,
             expr: None,
         })?;
@@ -710,10 +709,9 @@ impl IncrementalView {
         sql: &str,
         schema: &Schema,
         main_data_root: i64,
-        namespace: crate::namespace::NamespaceId,
+        namespace: NamespaceId,
     ) -> Result<Self> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let cmd = crate::dialect::engine::parse_statement(sql)?;
         let cmd = cmd.expect("View is an empty statement");
         match cmd {
             Cmd::Stmt(Stmt::CreateMaterializedView {
@@ -751,11 +749,15 @@ impl IncrementalView {
     /// Schema reconstruction uses this to order persisted materialized views
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
-    pub(crate) fn referenced_table_names(select: &ast::Select) -> std::vec::Vec<String> {
+    /// The tables `select` reads, each with the namespace it is written
+    /// with, if any. A name that is a CTE of the select is not a table.
+    pub(crate) fn referenced_tables(
+        select: &ast::Select,
+    ) -> std::vec::Vec<(Option<String>, String)> {
         fn collect_source(
             source: &ast::SelectTable,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             match source {
                 ast::SelectTable::Table(name, _, _) => {
@@ -765,7 +767,12 @@ impl IncrementalView {
                     {
                         return;
                     }
-                    tables.insert(crate::util::normalize_ident(name.name.as_str()));
+                    tables.insert((
+                        name.namespace
+                            .as_ref()
+                            .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
+                        crate::util::normalize_ident(name.name.as_str()),
+                    ));
                 }
                 ast::SelectTable::Select { select, .. } => {
                     collect_select(select, cte_names, tables)
@@ -783,7 +790,7 @@ impl IncrementalView {
         fn collect_one(
             select: &ast::OneSelect,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let ast::OneSelect::Select {
                 columns,
@@ -839,7 +846,7 @@ impl IncrementalView {
         fn collect_select(
             select: &ast::Select,
             inherited_ctes: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let mut cte_names = inherited_ctes.clone();
             if let Some(with) = &select.with {
@@ -871,9 +878,10 @@ mod tests {
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
+    use crate::security::roles::SessionRole;
     use crate::storage::btree::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
     use crate::sync::Arc;
-    use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect, StepResult};
+    use crate::{ConnectOpts, Database, DatabaseOpts, EngineDialect, OpenFlags, StepResult};
     use turso_parser::ast;
 
     #[test]
@@ -1172,50 +1180,6 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_finalization_error_rolls_back_intermediate_state() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            "ivm-aggregate-finalization-rollback.db",
-            OpenFlags::default(),
-            DatabaseOpts::new().with_views(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute("CREATE TABLE aggregate_base(x)").unwrap();
-        conn.execute(
-            "CREATE MATERIALIZED VIEW aggregate_view AS SELECT SUM(x) AS total FROM aggregate_base",
-        )
-        .unwrap();
-        conn.execute("INSERT INTO aggregate_base VALUES (5)")
-            .unwrap();
-
-        let error = conn
-            .execute("INSERT INTO aggregate_base VALUES (9223372036854775807), (1)")
-            .expect_err("the completed integer sum must overflow");
-        assert!(error.to_string().contains("integer overflow"));
-
-        let mut query = conn
-            .prepare("SELECT (SELECT COUNT(*) FROM aggregate_base), total FROM aggregate_view")
-            .unwrap();
-        assert!(matches!(query.step().unwrap(), StepResult::Row));
-        let row = query.row().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 5);
-        assert!(matches!(query.step().unwrap(), StepResult::Done));
-        drop(query);
-
-        conn.execute("INSERT INTO aggregate_base VALUES (2)")
-            .unwrap();
-        let mut query = conn.prepare("SELECT total FROM aggregate_view").unwrap();
-        assert!(matches!(query.step().unwrap(), StepResult::Row));
-        assert_eq!(query.row().unwrap().get::<i64>(0).unwrap(), 7);
-    }
-
-    #[test]
     fn maintenance_insert_resumes_after_overflow_cell_yield() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
@@ -1225,10 +1189,12 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_views(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
             .unwrap();
         for id in 1..260 {

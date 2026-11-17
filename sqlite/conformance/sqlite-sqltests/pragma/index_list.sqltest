@@ -173,3 +173,16 @@ expect {
     list|0|sqlite_autoindex_w_1|1|pk|0
     0|sqlite_autoindex_w2_1|1|pk|0
 }
+
+@cross-check-integrity
+test pragma-index-list-unique-on-integer-primary-key-is-not-pk {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, UNIQUE(id));
+    CREATE TABLE w(a, b, PRIMARY KEY(a, b), UNIQUE(b, a));
+    PRAGMA index_list(r);
+    PRAGMA index_list(w);
+}
+expect {
+    0|sqlite_autoindex_r_1|1|u|0
+    0|sqlite_autoindex_w_2|1|u|0
+    1|sqlite_autoindex_w_1|1|pk|0
+}

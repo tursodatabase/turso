@@ -1348,6 +1348,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         }
     }
@@ -1588,7 +1589,7 @@ mod tests {
                 columns: crate::alloc::vec![IndexColumn::new(
                     "a",
                     1,
-                    crate::translate::collate::CollationSeq::Binary
+                    crate::translate::collate::CollationSeq::BINARY
                 )],
                 unique: false,
                 ephemeral: false,

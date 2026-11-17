@@ -65,16 +65,6 @@ impl Subprogram {
     }
 }
 
-/// Known custom type comparator functions for sorting and MIN/MAX aggregates.
-/// These replace heap-allocated String names with a compact enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortComparatorType {
-    NumericLt,
-    StringReverse,
-    TestUintLt,
-    ArrayLt,
-}
-
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -83,7 +73,6 @@ impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
     const AFFINITY_MASK: usize = 0x47;
-    const ARRAY_CMP: usize = 0x100;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
@@ -116,15 +105,6 @@ impl CmpInsFlags {
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
         Affinity::from_char_code(aff_code)
-    }
-
-    pub fn array_cmp(mut self) -> Self {
-        self.0 |= Self::ARRAY_CMP;
-        self
-    }
-
-    pub fn has_array_cmp(&self) -> bool {
-        self.has(Self::ARRAY_CMP)
     }
 }
 
@@ -319,6 +299,7 @@ pub struct AlterColumnData {
     pub definition: turso_parser::ast::ColumnDefinition,
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
+    pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -355,9 +336,6 @@ pub struct SorterOpenData {
         CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
-    /// Per-column custom type comparators for ORDER BY sorting.
-    /// When present, the comparator is used instead of standard value comparison.
-    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -367,8 +345,6 @@ pub struct AggStepData {
     pub col: usize,
     pub delimiter: usize,
     pub func: AccumulatorFunc,
-    /// Optional custom type comparator for MIN/MAX aggregates.
-    pub comparator: Option<SortComparatorType>,
     /// The collation MIN, MAX, mode and percentile compare the argument with.
     /// BINARY for the aggregates that do not compare values.
     pub collation: CollationSeq,
@@ -435,10 +411,40 @@ pub struct IvmSumFinalizeData {
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
     pub reg: usize,
-    pub element_affinity: Affinity,
+    /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
-    pub table_name: Arc<str>,
-    pub col_name: Arc<str>,
+    pub element_kind: crate::types::StrictType,
+    /// The number of dimensions of the array: 2 for INTEGER[][].
+    pub dimensions: u32,
+    pub target: ArrayEncodeTarget,
+}
+
+/// Where the array an ArrayEncode builds goes, which its error for a value
+/// that is not an array names.
+#[derive(Debug, Clone)]
+pub enum ArrayEncodeTarget {
+    /// Column `col_name` of table `table_name`.
+    Column {
+        table_name: Arc<str>,
+        col_name: Arc<str>,
+    },
+    /// The result of a CAST to an array type.
+    Cast,
+    /// The key of an index lookup on an array column.
+    IndexKey,
+}
+
+impl std::fmt::Display for ArrayEncodeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column {
+                table_name,
+                col_name,
+            } => write!(f, "column {table_name}.{col_name}"),
+            Self::Cast => write!(f, "a cast"),
+            Self::IndexKey => write!(f, "an index key"),
+        }
+    }
 }
 
 /// Data for HashDistinct instruction (boxed to keep Insn small).
@@ -489,12 +495,17 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+    pub fn unique_index(table: &BTreeTable, index: &Index, regs: Vec<usize>) -> Self {
+        let kind = if table.is_primary_key_index(index) {
+            crate::ConstraintKind::PrimaryKey
+        } else {
+            crate::ConstraintKind::Unique
+        };
         Self {
-            kind: crate::ConstraintKind::Unique,
+            kind,
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
-            table_name: table.to_string(),
+            table_name: table.name.clone(),
             column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
             violation_regs: regs,
             row_col_names: vec![],
@@ -995,6 +1006,15 @@ pub enum Insn {
         table_reference: Arc<BTreeTable>, // P4
     },
 
+    /// Converts the value in `reg` as a STRICT column storing `storage_class`
+    /// does, and fails with "cannot store <kind> value <description>" when it
+    /// can't: '5' becomes 5 for INTEGER, 'abc' is an error. NULL is left as it is.
+    ConvertToType {
+        reg: usize,
+        storage_class: crate::types::StorageClass,
+        description: String,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -1034,14 +1054,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Create an array from contiguous registers (dynamic count).
-    /// Like MakeArray but count is read from count_reg at runtime.
-    MakeArrayDynamic {
-        start_reg: usize,
-        count_reg: usize,
-        dest: usize,
-    },
-
     /// Extract a field from a struct blob by field index.
     /// If src_reg is NULL, dest = NULL.
     StructField {
@@ -1075,16 +1087,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Copy a register value to a dynamically-computed destination.
-    /// ```text
-    /// dest = registers[base + registers[offset_reg]]
-    /// registers[base + registers[offset_reg]] = registers[src]
-    /// ```
-    RegCopyOffset {
-        src: usize,
-        base: usize,
-        offset_reg: usize,
-    },
     /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
     /// of the cursor's current table row into `dest` (as a blob), following overflow
     /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
@@ -1182,6 +1184,12 @@ pub enum Insn {
         on_error: Option<ResolveType>, // p2
     },
 
+    /// Fail the statement because a row it writes fails a condition of a
+    /// row-level security policy.
+    RowSecurityViolation {
+        denial: Box<crate::security::permission::PermissionDenied>,
+    },
+
     /// Start a transaction.
     Transaction {
         db: usize,                // p1
@@ -1198,6 +1206,9 @@ pub enum Insn {
         auto_commit: bool,
         rollback: bool,
         concurrent: bool,
+        /// True when this AutoCommit starts a READ ONLY transaction (auto_commit=false).
+        /// Ignored for commit/rollback (auto_commit=true).
+        read_only: bool,
     },
 
     /// Execute a named savepoint operation.
@@ -1414,7 +1425,6 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AccumulatorFunc,
-        comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
@@ -1801,6 +1811,24 @@ pub enum Insn {
         /// The name of the sequence being dropped
         seq_name: String,
     },
+    /// Name a namespace in the in-memory schema, after CREATE SCHEMA
+    /// inserted its row into the namespaces table.
+    AddNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being created
+        namespace: NamespaceId,
+        /// The name of the namespace
+        name: String,
+    },
+    /// Forget a namespace in the in-memory schema, after DROP SCHEMA
+    /// deleted its row.
+    DropNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being dropped
+        namespace: NamespaceId,
+    },
     /// Begin the autonomous inner transaction that wraps a sequence
     /// read-modify-write. The translator emits this immediately before
     /// the cursor-based RMW bytecode and pairs it with a matching
@@ -1877,6 +1905,7 @@ pub enum Insn {
     /// register operation.
     SetSequenceCurrval {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
     },
@@ -1897,6 +1926,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
@@ -1909,6 +1939,15 @@ pub enum Insn {
         db: usize,
         /// The full CREATE TYPE SQL string
         sql: String,
+    },
+    /// Tell the dialect that its catalog of database `db` changed, after the
+    /// statement wrote the dialect's own schema state for it, so the
+    /// in-memory copy follows. `value_regs` name the registers the dialect
+    /// reads back, such as the id its state gave a created relation.
+    CatalogChange {
+        db: usize,
+        change: Box<crate::dialect::CatalogChange>,
+        value_regs: Vec<usize>,
     },
 
     /// Close a cursor.
@@ -2454,17 +2493,16 @@ impl InsnVariants {
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::ConvertToType => execute::op_convert_to_type,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
-            InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
             InsnVariants::StructField => execute::op_struct_field,
             InsnVariants::UnionPack => execute::op_union_pack,
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
-            InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::BlobRead => execute::op_blob_read,
             InsnVariants::BlobWrite => execute::op_blob_write,
             InsnVariants::BlobLen => execute::op_blob_len,
@@ -2477,6 +2515,7 @@ impl InsnVariants {
             InsnVariants::Prev => execute::op_prev,
             InsnVariants::Halt => execute::op_halt,
             InsnVariants::HaltIfNull => execute::op_halt_if_null,
+            InsnVariants::RowSecurityViolation => execute::op_row_security_violation,
             InsnVariants::Transaction => execute::op_transaction,
             InsnVariants::AutoCommit => execute::op_auto_commit,
             InsnVariants::Savepoint => execute::op_savepoint,
@@ -2555,6 +2594,8 @@ impl InsnVariants {
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddSequence => execute::op_add_sequence,
             InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::AddNamespace => execute::op_add_namespace,
+            InsnVariants::DropNamespace => execute::op_drop_namespace,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
             InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
@@ -2562,6 +2603,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::CatalogChange => execute::op_catalog_change,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2631,6 +2673,30 @@ impl InsnVariants {
 }
 
 impl Insn {
+    /// The collations this instruction compares values with.
+    #[cfg(test)]
+    pub(crate) fn collations(&self) -> Vec<CollationSeq> {
+        match self {
+            Insn::Eq { collation, .. }
+            | Insn::Ne { collation, .. }
+            | Insn::Lt { collation, .. }
+            | Insn::Le { collation, .. }
+            | Insn::Gt { collation, .. }
+            | Insn::Ge { collation, .. } => vec![*collation],
+            Insn::Compare { key_info, .. } => key_info.iter().map(|key| key.collation).collect(),
+            Insn::SorterOpen { data } => data
+                .order_collations_nulls
+                .iter()
+                .map(|(_, collation, _)| *collation)
+                .collect(),
+            Insn::AggStep { data } => vec![data.collation],
+            Insn::HashBuild { data } => data.collations.clone(),
+            Insn::HashDistinct { data } => data.collations.clone(),
+            Insn::Function { func, .. } => vec![func.collation],
+            _ => Vec::new(),
+        }
+    }
+
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
@@ -2648,6 +2714,9 @@ impl Insn {
     /// Returns true if this opcode cannot directly modify persistent database
     /// contents. This is used to compute PreparedProgram::readonly, mirroring
     /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
+    /// Row writes such as Insert and Delete are not listed: writing a table
+    /// needs a write Transaction, and the same opcodes also fill ephemeral
+    /// tables, as in a recursive CTE.
     pub fn is_readonly(&self) -> bool {
         match self {
             Self::Checkpoint { .. }
@@ -2659,10 +2728,6 @@ impl Insn {
                 tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
                 ..
             }
-            | Self::Insert { .. }
-            | Self::Delete { .. }
-            | Self::IdxDelete { .. }
-            | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
@@ -2676,6 +2741,8 @@ impl Insn {
             | Self::DropType { .. }
             | Self::AddSequence { .. }
             | Self::DropSequence { .. }
+            | Self::AddNamespace { .. }
+            | Self::DropNamespace { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
             | Self::SequenceTrackAllocation { .. }
@@ -2683,6 +2750,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
+            | Self::CatalogChange { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

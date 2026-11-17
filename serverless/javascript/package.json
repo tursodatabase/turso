@@ -44,7 +44,8 @@
     "test": "ava integration-tests/*.test.mjs"
   },
   "overrides": {
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "glob@>=10 <14": "^14.0.3"
   },
   "keywords": [],
   "author": "",

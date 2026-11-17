@@ -209,6 +209,30 @@ connection!.ConnectionString = "Data Source=:memory:";
 connection.Open();
 ```
 
+## Page codecs
+
+A page codec transforms every page of a local database on its way to and from storage, for example to encrypt it with
+a key the application manages. Implement `Turso.Raw.Public.ITursoPageCodec` and set it on the connection before
+opening it; a connection string cannot carry it:
+
+```C#
+using var connection = new TursoConnection("Data Source=app.db") { PageCodec = codec };
+connection.Open();
+```
+
+The raw API is `TursoBindings.OpenDatabaseWithPageCodec`, `OpenDatabaseReadOnlyWithPageCodec` (read-only) and
+`OpenSharedDatabase(path, codec)`.
+
+- The codec gets whole pages, the reserved tail included. Per-page metadata such as a nonce and tag goes in the last
+  `ReservedSpace` bytes; opening an existing database fails unless its header holds the same value.
+- `CodecId` must be non-zero and must change whenever encoded bytes could differ, such as with another key. A
+  process keeps one database per path and refuses a connection whose codec ID differs from the one the database was
+  opened with, instead of reading through the wrong codec.
+- Callbacks run concurrently on any thread that steps a statement, so the codec must be thread-safe and must not call
+  back into Turso. An exception thrown by the codec fails the page operation with a generic message.
+- The codec does not cover temporary files: run `PRAGMA temp_store = memory` on each connection. It cannot be combined
+  with `Encryption Cipher`, `ATTACH`, MVCC, remote URLs or embedded replicas.
+
 ## Migrating from Microsoft.Data.Sqlite
 
 For common embedded SQLite usage, the `Turso.Data.Sqlite.Provider` package exposes a SQLite-compatible `Turso.Data.Sqlite` facade over the Turso engine:
@@ -268,6 +292,11 @@ Supported common connection string keywords include:
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
 | `Sync Interval` | Embedded replica automatic pull interval in seconds. `0` disables automatic sync. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
+| `BinaryGUID` | Defaults to `False`: a `Guid` parameter binds as 36-character uppercase TEXT, as in Microsoft.Data.Sqlite. Set `True` to bind an untyped `Guid` as a 16-byte BLOB (`Guid.ToByteArray()`). A parameter typed as `DbType.Guid` or `SqliteType.Text`, which is what EF Core sends, binds as TEXT either way. `GetGuid` reads both forms. |
+
+`TursoConnection` accepts the same `BinaryGUID=True` opt-in, and a `TursoParameter` typed as `DbType.Guid` stays TEXT
+there too. `TursoParameter` has no untyped state, so its default `DbType.String` counts as untyped. A `TursoParameter`
+whose `DbType` is `DbType.Binary` binds a `Guid` as a BLOB without the option.
 
 ## SQLite-compatible facade coverage
 

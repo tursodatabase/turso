@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="400" viewBox="0 0 760 400" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <title>Object name resolution</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+  <style>
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; rx: 8; }
+    .ns { fill: #ddf4ff; stroke: #54aeff; stroke-width: 1.5; rx: 8; }
+    .title { font-weight: 600; fill: #24292f; font-size: 15px; }
+    .mono { font-family: Menlo, Consolas, monospace; font-size: 13px; fill: #24292f; }
+    .label { fill: #57606a; font-size: 13px; }
+    .arrow { stroke: #57606a; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+  </style>
+
+  <rect width="760" height="400" fill="#ffffff"/>
+
+  <!-- Statement -->
+  <rect class="box" x="40" y="30" width="230" height="60"/>
+  <text class="title" x="56" y="54">Statement</text>
+  <text class="mono" x="56" y="76">SELECT * FROM users</text>
+
+  <!-- search_path -->
+  <rect class="box" x="490" y="30" width="230" height="60"/>
+  <text class="title" x="506" y="54">search_path</text>
+  <text class="mono" x="506" y="76">app, public</text>
+
+  <!-- Resolver -->
+  <rect class="box" x="235" y="140" width="290" height="78"/>
+  <text class="title" x="251" y="164">Resolver</text>
+  <text class="label" x="251" y="184">first namespace of the path that has users</text>
+  <text class="mono" x="251" y="206">users → (2, "users")</text>
+
+  <path class="arrow" d="M 155 90 L 155 179 L 233 179"/>
+  <path class="arrow" d="M 605 90 L 605 179 L 527 179"/>
+
+  <!-- Schema in memory -->
+  <rect class="box" x="40" y="270" width="680" height="110"/>
+  <text class="title" x="56" y="294">Schema in memory, keyed by (namespace id, name)</text>
+  <rect class="ns" x="56" y="308" width="320" height="56"/>
+  <text class="title" x="70" y="330">namespace 1: public</text>
+  <text class="mono" x="70" y="352">users</text>
+  <rect class="ns" x="392" y="308" width="312" height="56"/>
+  <text class="title" x="406" y="330">namespace 2: app</text>
+  <text class="mono" x="406" y="352">users</text>
+
+  <path class="arrow" d="M 380 218 L 380 268"/>
+</svg>

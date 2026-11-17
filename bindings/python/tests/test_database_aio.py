@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import time
 
 import pytest
 import turso.aio
@@ -264,3 +265,50 @@ async def test_batch_error_identifies_the_failing_statement():
                 ]
             )
         assert excinfo.value.batch_index == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_kwargs", [{}, {"timeout": 5.0}])
+async def test_writer_waits_for_lock_held_by_another_connection(timeout_kwargs, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = await turso.aio.connect(db_file, isolation_level=None)
+    writer = await turso.aio.connect(db_file, isolation_level=None, **timeout_kwargs)
+    await holder.execute("CREATE TABLE t (x)")
+
+    await holder.execute("BEGIN IMMEDIATE")
+    await holder.execute("INSERT INTO t VALUES (1)")
+    insert = asyncio.create_task(writer.execute("INSERT INTO t VALUES (2)"))
+    await asyncio.sleep(0.3)
+    await holder.execute("COMMIT")
+    await insert
+
+    cursor = await writer.execute("SELECT x FROM t ORDER BY x")
+    assert await cursor.fetchall() == [(1,), (2,)]
+    await writer.close()
+    await holder.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_timeout_fails_at_once_on_locked_database(tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = await turso.aio.connect(db_file, isolation_level=None)
+    writer = await turso.aio.connect(db_file, isolation_level=None, timeout=0)
+    await holder.execute("CREATE TABLE t (x)")
+
+    await holder.execute("BEGIN IMMEDIATE")
+    start = time.monotonic()
+    with pytest.raises(turso.OperationalError, match="database is locked"):
+        await writer.execute("INSERT INTO t VALUES (1)")
+    assert time.monotonic() - start < 3
+    await holder.execute("ROLLBACK")
+    await writer.close()
+    await holder.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout, busy_timeout", [(10.0, 10000), (float("nan"), 0), (float("inf"), 2147483647)])
+async def test_timeout_sets_busy_timeout_in_milliseconds(timeout, busy_timeout):
+    conn = await turso.aio.connect(":memory:", timeout)
+    cursor = await conn.execute("PRAGMA busy_timeout")
+    assert await cursor.fetchall() == [(busy_timeout,)]
+    await conn.close()

@@ -516,6 +516,52 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
+    /// Sets a wall-clock limit for each statement run on this connection.
+    ///
+    /// The VM checks the deadline before every instruction, so a statement that
+    /// runs past it fails with [`Error::Interrupt`] even when it never yields
+    /// (for example a long aggregate over an in-memory or cached table).
+    /// `Duration::ZERO` disables the limit, which is the default.
+    pub fn set_query_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.set_query_timeout(duration);
+        Ok(())
+    }
+
+    /// Registers a callback invoked approximately every `ops` virtual machine
+    /// instructions while a statement runs on this connection, like
+    /// [`sqlite3_progress_handler`](https://www.sqlite.org/c3ref/progress_handler.html).
+    ///
+    /// A callback that returns `true` interrupts the running statement, which
+    /// fails with [`Error::Interrupt`]. The callback runs on the thread
+    /// executing the statement, so it stops one that never yields, and it can
+    /// carry a cancellation signal such as a token checked on every call.
+    /// Passing `None` or `ops == 0` removes the handler. One handler is set
+    /// per connection; setting another replaces it.
+    pub fn set_progress_handler<F>(&self, ops: u64, handler: Option<F>) -> Result<()>
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        let conn = self.get_inner_connection()?;
+        conn.set_progress_handler(
+            ops,
+            handler.map(|f| Box::new(f) as Box<dyn Fn() -> bool + Send + Sync>),
+        );
+        Ok(())
+    }
+
+    /// Interrupts the statement currently running on this connection, like
+    /// [`sqlite3_interrupt`](https://www.sqlite.org/c3ref/interrupt.html).
+    ///
+    /// The running statement fails with [`Error::Interrupt`]. This is safe to
+    /// call from another thread through a clone of the connection, and it is a
+    /// no-op when no statement is running.
+    pub fn interrupt(&self) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.interrupt();
+        Ok(())
+    }
 }
 
 impl Debug for Connection {

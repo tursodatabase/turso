@@ -364,3 +364,52 @@ test select-list-subquery-reads-materialized-build-input-unmatched-rows-uses-a-h
 expect pattern {
     (?s)MATERIALIZE hash build input.*HASH JOIN u
 }
+
+# A hash join key must not have a subquery that reads a table whose loop
+# comes after the hash join.
+setup key-subquery-reads-later-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (1);
+}
+
+@setup key-subquery-reads-later-table
+test build-key-in-subquery-reads-later-table {
+    SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE (t1.a IN (SELECT t3.a)) = t2.a;
+}
+expect {
+}
+
+@setup key-subquery-reads-later-table
+test build-key-not-in-subquery-reads-later-table {
+    SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE (t1.a NOT IN (SELECT t3.a)) = t2.a;
+}
+expect {
+}
+
+@setup key-subquery-reads-later-table
+test probe-key-in-subquery-reads-later-table {
+    INSERT INTO t2 VALUES (1);
+    SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE (t2.a IN (SELECT t3.a)) = t1.a;
+}
+expect {
+}
+
+@setup key-subquery-reads-later-table
+test build-key-in-subquery-reads-later-left-join-table {
+    INSERT INTO t2 VALUES (0);
+    SELECT * FROM t1 JOIN t2 LEFT JOIN t3 WHERE (t1.a IN (SELECT t3.a)) = t2.a;
+}
+expect {
+}
+
+@setup key-subquery-reads-later-table
+test build-key-scalar-subquery-reads-later-table {
+    INSERT INTO t2 VALUES (1);
+    INSERT INTO t3 VALUES (1);
+    SELECT * FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE (t1.a = (SELECT t3.a)) = t2.a;
+}
+expect {
+    1|1|1
+}

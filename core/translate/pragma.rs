@@ -13,7 +13,7 @@ use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
 use crate::function::Func;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -164,7 +164,10 @@ fn emit_table_list_rows_for_schema(
                           wr: bool,
                           strict: bool| {
         program.emit_string8(database_name.to_string(), base_reg);
-        program.emit_string8(display_table_list_name(database_id, name), base_reg + 1);
+        program.emit_string8(
+            display_table_list_name(database_id, &mangle_name(namespace, name)),
+            base_reg + 1,
+        );
         program.emit_string8(obj_type.to_string(), base_reg + 2);
         program.emit_int(ncol as i64, base_reg + 3);
         program.emit_int(wr as i64, base_reg + 4);
@@ -359,10 +362,8 @@ fn update_pragma(
     match pragma {
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
-            let app_id_value = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as i32,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
-                _ => bail_parse_error!("expected integer, got {:?}", data),
+            let Some(app_id_value) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -375,22 +376,29 @@ fn update_pragma(
         }
         PragmaName::BusyTimeout => {
             let data = parse_signed_number(&value)?;
-            let busy_timeout_ms = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as i32,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
-                _ => bail_parse_error!("expected integer, got {:?}", data),
+            let Some(busy_timeout_ms) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
-            Ok(TransactionMode::None)
+            // Like SQLite, the setter also returns the new busy timeout.
+            query_pragma(
+                PragmaName::BusyTimeout,
+                resolver,
+                None,
+                pager,
+                connection,
+                namespace,
+                schema_was_explicit,
+                program,
+            )
         }
         PragmaName::CacheSize => {
-            let cache_size = match parse_signed_number(&value)? {
-                Value::Numeric(Numeric::Integer(size)) => size,
-                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
-                _ => bail_parse_error!("Invalid value for cache size pragma"),
+            let data = parse_signed_number(&value)?;
+            let Some(cache_size) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("Invalid value for cache size pragma");
             };
-            update_cache_size(cache_size, pager, connection)?;
+            update_cache_size(i64::from(cache_size), pager, connection)?;
             Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
@@ -460,15 +468,10 @@ fn update_pragma(
         }
         PragmaName::WalAutocheckpoint => {
             let data = parse_signed_number(&value)?;
-            let frames = match data {
-                Value::Numeric(Numeric::Integer(i)) => i,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i64,
-                _ => bail_parse_error!("expected integer, got {:?}", data),
+            let Some(frames) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
-            let frames = i32::try_from(frames)
-                .ok()
-                .and_then(|frames| u32::try_from(frames).ok())
-                .unwrap_or(0);
+            let frames = u32::try_from(frames).unwrap_or(0);
             connection.set_wal_autocheckpoint(frames);
             query_pragma(
                 PragmaName::WalAutocheckpoint,
@@ -522,10 +525,8 @@ fn update_pragma(
         }
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
-            let version_value = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as i32,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
-                _ => unreachable!(),
+            let Some(version_value) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -555,24 +556,11 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            let page_size = match parse_signed_number(&value)? {
-                Value::Numeric(Numeric::Integer(size)) => size,
-                // SQLite's sqlite3Atoi reads only the leading digits of the literal,
-                // so 1024.5 is 1024 but 8.192e3 is 8. Negative sizes are invalid anyway.
-                Value::Numeric(Numeric::Float(size)) if f64::from(size) >= 0.0 => {
-                    let literal = match &value {
-                        Expr::Unary(_, inner) => inner.as_ref(),
-                        literal => literal,
-                    };
-                    let Expr::Literal(Literal::Numeric(digits)) = literal else {
-                        unreachable!("parse_signed_number only reads numeric literals");
-                    };
-                    crate::numeric::str_to_i64(digits).unwrap_or(0)
-                }
-                Value::Numeric(Numeric::Float(_)) => 0,
-                _ => bail_parse_error!("Invalid value for page size pragma"),
+            let data = parse_signed_number(&value)?;
+            let Some(page_size) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("Invalid value for page size pragma");
             };
-            // Like SQLite's sqlite3Atoi, a value outside the 32-bit range reads as 0.
+            // A negative size is invalid, so it reads as 0 like an out-of-range one.
             update_page_size(
                 connection,
                 database_id,
@@ -658,6 +646,11 @@ fn update_pragma(
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
+            if !connection.dialect().supports_capture_data_changes() {
+                crate::bail_parse_error!(
+                    "capture_data_changes is not supported with this frontend"
+                );
+            }
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             // InitCdcVersion handles everything at execution time:
@@ -792,8 +785,10 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
-            let enabled = parse_pragma_enabled(&value);
-            connection.set_foreign_keys_enabled(enabled);
+            if connection.get_auto_commit() {
+                let enabled = parse_pragma_enabled(&value);
+                connection.set_foreign_keys_enabled(enabled);
+            }
             Ok(TransactionMode::None)
         }
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
@@ -809,6 +804,11 @@ fn update_pragma(
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::AutomaticIndex => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_automatic_index(enabled);
             Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
@@ -870,6 +870,16 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
 
+        PragmaName::CollationList => query_pragma(
+            PragmaName::CollationList,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            namespace,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -1053,6 +1063,29 @@ fn query_pragma(
             }
 
             program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CollationList => {
+            // 2 columns: seq, name. Like SQLite, collations registered on the
+            // connection come first, then the built-in RTRIM, NOCASE and BINARY.
+            // A registered collation with a built-in's name replaces it, so the
+            // built-in is not listed a second time.
+            let base_reg = register;
+            program.alloc_register();
+            let registered = connection.get_syms_collation_names();
+            let builtins = ["RTRIM", "NOCASE", "BINARY"]
+                .into_iter()
+                .filter(|b| !registered.iter().any(|r| r.eq_ignore_ascii_case(b)))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let names = registered.into_iter().chain(builtins);
+            for (seq, name) in names.enumerate() {
+                program.emit_int(seq as i64, base_reg);
+                program.emit_string8(name, base_reg + 1);
+                program.emit_result_row(base_reg, 2);
+            }
+            program.add_pragma_result_column("seq".to_string());
+            program.add_pragma_result_column("name".to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::FunctionList => {
@@ -1258,15 +1291,6 @@ fn query_pragma(
                 resolver.with_schema(table_namespace.database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(table_namespace.id, &table_name) {
                         let btree = table.btree();
-                        let pk_cols: Vec<String> = btree
-                            .as_ref()
-                            .map(|bt| {
-                                bt.primary_key_columns
-                                    .iter()
-                                    .map(|(name, _)| name.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
                         let without_rowid_pk_index = match &btree {
                             Some(bt) => without_rowid_primary_key_index(bt)?,
                             None => None,
@@ -1277,19 +1301,13 @@ fn query_pragma(
                             .map(|index| index.as_ref())
                             .chain(without_rowid_pk_index.as_ref());
                         for (seq, index) in indices.enumerate() {
-                            let origin = if index.name.starts_with("sqlite_autoindex_") {
-                                let idx_cols: Vec<&str> =
-                                    index.columns.iter().map(|c| c.name.as_str()).collect();
-                                if idx_cols.len() == pk_cols.len()
-                                    && idx_cols
-                                        .iter()
-                                        .zip(pk_cols.iter())
-                                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                                {
-                                    "pk"
-                                } else {
-                                    "u"
-                                }
+                            let origin = if btree
+                                .as_ref()
+                                .is_some_and(|bt| bt.is_primary_key_index(index))
+                            {
+                                "pk"
+                            } else if index.name.starts_with("sqlite_autoindex_") {
+                                "u"
                             } else {
                                 "c"
                             };
@@ -1399,15 +1417,17 @@ fn query_pragma(
                     .namespace_name(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
                 resolver.with_schema(current_database_id, |schema| {
-                    emit_table_list_rows_for_schema(
-                        program,
-                        schema,
-                        NamespaceId::ROOT,
-                        current_database_id,
-                        &database_name,
-                        base_reg,
-                        name.as_deref(),
-                    )
+                    for namespace in schema.namespace_ids() {
+                        emit_table_list_rows_for_schema(
+                            program,
+                            schema,
+                            namespace,
+                            current_database_id,
+                            &database_name,
+                            base_reg,
+                            name.as_deref(),
+                        )
+                    }
                 });
             }
 
@@ -1821,6 +1841,13 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::AutomaticIndex => {
+            let enabled = connection.automatic_index();
+            program.emit_bool(enabled, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
             let enabled = connection.get_sync_type() == crate::io::FileSyncType::FullFsync;
@@ -1840,17 +1867,13 @@ fn query_pragma(
         }
         PragmaName::ListTypes => {
             let base_reg = register;
-            program.alloc_registers(5); // 6 total (1 already allocated)
+            program.alloc_registers(6); // 7 total (1 already allocated)
 
-            // Built-in types: NULL parent, encode, decode, default, operators
+            // Built-in types: NULL parent, encode, coerce, decode, default, operators
             for builtin in &["INTEGER", "REAL", "TEXT", "BLOB", "ANY"] {
                 program.emit_string8(builtin.to_string(), base_reg);
-                program.emit_null(base_reg + 1, None);
-                program.emit_null(base_reg + 2, None);
-                program.emit_null(base_reg + 3, None);
-                program.emit_null(base_reg + 4, None);
-                program.emit_null(base_reg + 5, None);
-                program.emit_result_row(base_reg, 6);
+                program.emit_null(base_reg + 1, Some(base_reg + 6));
+                program.emit_result_row(base_reg, 7);
             }
 
             // Custom types from the type registry are only shown when strict mode is enabled
@@ -1881,23 +1904,20 @@ fn query_pragma(
                     };
                     program.emit_string8(display_name, base_reg);
                     program.emit_string8(type_def.base().to_string(), base_reg + 1);
-                    if let Some(expr) = type_def.encode() {
-                        program.emit_string8(expr.to_string(), base_reg + 2);
-                    } else {
-                        program.emit_null(base_reg + 2, None);
-                    }
-                    if let Some(expr) = type_def.decode() {
-                        program.emit_string8(expr.to_string(), base_reg + 3);
-                    } else {
-                        program.emit_null(base_reg + 3, None);
-                    }
-                    if let Some(expr) = type_def.default_expr() {
-                        program.emit_string8(expr.to_string(), base_reg + 4);
-                    } else {
-                        program.emit_null(base_reg + 4, None);
+                    let clauses = [
+                        type_def.encode(),
+                        type_def.coerce(),
+                        type_def.decode(),
+                        type_def.default_expr(),
+                    ];
+                    for (i, clause) in clauses.into_iter().enumerate() {
+                        match clause {
+                            Some(expr) => program.emit_string8(expr.to_string(), base_reg + 2 + i),
+                            None => program.emit_null(base_reg + 2 + i, None),
+                        }
                     }
                     if type_def.operators().is_empty() {
-                        program.emit_null(base_reg + 5, None);
+                        program.emit_null(base_reg + 6, None);
                     } else {
                         let ops: Vec<String> = type_def
                             .operators()
@@ -1907,9 +1927,9 @@ fn query_pragma(
                                 None => format!("'{}'", op.op),
                             })
                             .collect();
-                        program.emit_string8(ops.join(", "), base_reg + 5);
+                        program.emit_string8(ops.join(", "), base_reg + 6);
                     }
-                    program.emit_result_row(base_reg, 6);
+                    program.emit_result_row(base_reg, 7);
                 }
             }
 
@@ -2026,6 +2046,8 @@ fn emit_columns_for_table_info(
             1
         } else if column.is_virtual_generated() {
             2
+        } else if column.is_stored_generated() {
+            3
         } else {
             // normal column
             0
@@ -2044,7 +2066,34 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        program.emit_string8(column.ty_str.clone(), base_reg + 2);
+        let mut declared_type = column.ty_str.clone();
+        let written_type = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
+        if !column.ty_params.is_empty()
+            && !matches!(
+                written_type.as_bytes().first(),
+                Some(b'"' | b'\'' | b'`' | b'[')
+            )
+        {
+            declared_type.push('(');
+            for (i, param) in column.ty_params.iter().enumerate() {
+                if i > 0 {
+                    declared_type.push(',');
+                }
+                match param.as_ref() {
+                    Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                        declared_type.push('-');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                        declared_type.push('+');
+                        declared_type.push_str(&inner.to_string());
+                    }
+                    _ => declared_type.push_str(&param.to_string()),
+                }
+            }
+            declared_type.push(')');
+        }
+        program.emit_string8(declared_type, base_reg + 2);
 
         // notnull
         program.emit_bool(
@@ -2083,6 +2132,34 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
+}
+
+/// Reads the value of an integer PRAGMA the way SQLite's `sqlite3Atoi` does:
+/// only the leading digits of a float literal count, so `8.192e3` is 8, and a
+/// value outside the 32-bit range reads as 0. Returns `None` for a value that
+/// is not a number.
+fn pragma_int_value(expr: &ast::Expr, data: &Value) -> Option<i32> {
+    let value = match data {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(_)) => {
+            let (negative, literal) = match expr {
+                Expr::Unary(ast::UnaryOperator::Negative, inner) => (true, inner.as_ref()),
+                Expr::Unary(_, inner) => (false, inner.as_ref()),
+                literal => (false, literal),
+            };
+            let Expr::Literal(Literal::Numeric(digits)) = literal else {
+                return None;
+            };
+            let leading = crate::numeric::str_to_i64(digits).unwrap_or(0);
+            if negative {
+                leading.checked_neg().unwrap_or(0)
+            } else {
+                leading
+            }
+        }
+        _ => return None,
+    };
+    Some(i32::try_from(value).unwrap_or(0))
 }
 
 fn update_cache_size(

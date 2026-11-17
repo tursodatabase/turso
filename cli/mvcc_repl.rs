@@ -38,8 +38,9 @@ use anyhow::Context as _;
 use rustyline::DefaultEditor;
 use std::{collections::HashMap, sync::Arc};
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags, SqliteDialect, Value,
+    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags, SessionRole, Value,
 };
+use turso_sqlite::SqliteDialect;
 
 pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -67,7 +68,7 @@ pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
 
                 if let Some((conn_name, sql)) = parse_conn_input(line) {
                     let conn = connections.entry(conn_name.clone()).or_insert_with(|| {
-                        db.connect(ConnectOpts::new())
+                        db.connect(ConnectOpts::new(SessionRole::Superuser))
                             .expect("failed to create connection")
                     });
 
@@ -106,7 +107,7 @@ fn open_mvcc_db(path: &str, passive_checkpoint: bool) -> anyhow::Result<Arc<Data
     )
     .context("failed to open database")?;
 
-    let boot = db.connect(ConnectOpts::new())?;
+    let boot = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     boot.execute("PRAGMA journal_mode = 'mvcc'")?;
     boot.close()?;
 

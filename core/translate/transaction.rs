@@ -3,11 +3,12 @@ use crate::translate::emitter::{emit_cdc_explicit_commit_insns, Resolver, Transa
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::Result;
-use turso_parser::ast::{Name, TransactionType};
+use turso_parser::ast::{AccessMode, Name, TransactionType};
 
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
+    access_mode: Option<AccessMode>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
@@ -18,6 +19,7 @@ pub fn translate_tx_begin(
     });
     let schema = resolver.schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
+    let read_only = matches!(access_mode, Some(AccessMode::ReadOnly));
     match tx_type {
         TransactionType::Deferred => {
             // SQLite emits only AutoCommit for deferred — no
@@ -26,6 +28,7 @@ pub fn translate_tx_begin(
                 auto_commit: false,
                 rollback: false,
                 concurrent: false,
+                read_only,
             });
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
@@ -56,6 +59,7 @@ pub fn translate_tx_begin(
                 auto_commit: false,
                 rollback: false,
                 concurrent: false,
+                read_only,
             });
         }
         TransactionType::Concurrent => {
@@ -66,6 +70,7 @@ pub fn translate_tx_begin(
                 auto_commit: false,
                 rollback: false,
                 concurrent: true,
+                read_only,
             });
         }
     }
@@ -100,6 +105,7 @@ pub fn translate_tx_commit(
         auto_commit: true,
         rollback: false,
         concurrent: false,
+        read_only: false,
     });
     Ok(())
 }

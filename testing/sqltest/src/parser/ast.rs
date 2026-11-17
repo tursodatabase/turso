@@ -70,6 +70,8 @@ pub enum Capability {
     MaterializedViews,
     /// Support for custom types (CREATE TYPE / DROP TYPE)
     CustomTypes,
+    /// Support for CREATE INDEX ... USING <index method> (experimental)
+    IndexMethod,
 }
 
 impl Capability {
@@ -79,6 +81,7 @@ impl Capability {
         Capability::Strict,
         Capability::MaterializedViews,
         Capability::CustomTypes,
+        Capability::IndexMethod,
     ];
 
     /// Get all capabilities as a HashSet (convenience for backends that support everything)
@@ -94,6 +97,7 @@ impl Display for Capability {
             Capability::Strict => write!(f, "strict"),
             Capability::MaterializedViews => write!(f, "materialized_views"),
             Capability::CustomTypes => write!(f, "custom_types"),
+            Capability::IndexMethod => write!(f, "index_method"),
         }
     }
 }

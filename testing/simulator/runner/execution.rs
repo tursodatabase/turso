@@ -29,6 +29,8 @@ fn is_recoverable_tx_error(err: &LimboError) -> bool {
         err,
         LimboError::WriteWriteConflict
             | LimboError::TxError(_)
+            | LimboError::TransactionAlreadyActive
+            | LimboError::NoActiveTransaction { .. }
             | LimboError::Busy
             | LimboError::BusySnapshot
     ) || matches!(
@@ -574,12 +576,14 @@ mod tests {
     use clap::Parser as _;
     use sql_generation::model::query::pragma::{CheckpointMode, Pragma};
     use std::num::NonZeroUsize;
-    use turso_core::{ConnectOpts, Database, IO, MemoryIO, SqliteDialect};
+    use turso_core::{ConnectOpts, Database, IO, MemoryIO, SessionRole};
+    use turso_sqlite::SqliteDialect;
 
     fn memory_connection() -> Arc<Connection> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap()
     }
 
     fn query_interaction(query: Query) -> Interaction {

@@ -364,6 +364,7 @@ DELETE FROM articles WHERE id = 5;
 - **No automatic segment merging**: Use `OPTIMIZE INDEX` periodically after bulk writes.
 - **No read-your-writes in a transaction**: FTS changes within a transaction are not visible to queries until the transaction is committed. ROLLBACK correctly discards both table and FTS changes.
 - **No MATCH operator syntax**: Use `fts_match()` function calls instead of `WHERE table MATCH 'query'`.
+- **Some column names cannot be indexed**: An FTS index cannot include a column whose name is empty, starts with `-`, or is `rowid`, `doc_identity_hi` or `doc_identity_lo`.
 
 ## See Also
 

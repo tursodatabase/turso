@@ -11,7 +11,7 @@ use crate::sync::Arc;
 use crate::util::normalize_ident;
 use crate::{DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 
-use super::collate::CollationSeq;
+use super::collate::TextCollation;
 use super::plan::BitSet;
 
 pub(crate) struct CatalogContext<'a> {
@@ -19,7 +19,7 @@ pub(crate) struct CatalogContext<'a> {
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
-    namespaces: &'a crate::Namespaces,
+    qualifiers: &'a crate::Qualifiers,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub enable_custom_types: bool,
@@ -74,7 +74,7 @@ impl<'a> CatalogContext<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
+        qualifiers: &'a crate::Qualifiers,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dialect: Arc<dyn crate::dialect::Dialect>,
@@ -86,14 +86,14 @@ impl<'a> CatalogContext<'a> {
             database_schemas,
             temp_database,
             attached_databases,
-            namespaces,
+            qualifiers,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             enable_custom_types,
             dialect,
             database_scope: RefCell::new(None),
             has_temp_schema,
-            search_order: namespaces
+            search_order: qualifiers
                 .search_order(search_path)
                 .into_iter()
                 .map(|namespace| namespace.target)
@@ -107,7 +107,7 @@ impl<'a> CatalogContext<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
-            namespaces: self.namespaces,
+            qualifiers: self.qualifiers,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             enable_custom_types: self.enable_custom_types,
@@ -162,6 +162,14 @@ impl<'a> CatalogContext<'a> {
         self.with_database_scope(namespace, "view", view_name, f)
     }
 
+    /// The view whose query is being planned, innermost first, or None
+    /// outside any view.
+    pub(crate) fn enclosing_view(&self) -> Option<(NamespaceRef, String)> {
+        let scope = self.database_scope.borrow();
+        let scope = scope.as_ref()?;
+        (scope.kind == "view").then(|| (scope.namespace, scope.object_name.clone()))
+    }
+
     pub fn resolve_function(
         &self,
         func_name: &str,
@@ -178,11 +186,11 @@ impl<'a> CatalogContext<'a> {
         }
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
         if let Some(collation) = self.symbol_table.resolve_collation(name) {
             return Ok(collation);
         }
-        CollationSeq::new(name)
+        TextCollation::new(name)
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
@@ -363,6 +371,18 @@ impl<'a> CatalogContext<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
+                // The virtual tables of main are found from the namespaces of
+                // main only: an attached database's view or trigger sees its
+                // own database, as SQLite's fixer binds it there.
+                if ctx.namespace.database_id == crate::MAIN_DB_ID
+                    && !self.with_schema(ctx.namespace.database_id, |schema| {
+                        Self::namespace_has_table_like_object(schema, ctx.namespace.id, table_name)
+                    })
+                {
+                    if let Some(root) = self.root_virtual_table(table_name) {
+                        return Some(root);
+                    }
+                }
                 return Some(ctx.namespace);
             }
         }
@@ -371,7 +391,33 @@ impl<'a> CatalogContext<'a> {
             return Some(namespace);
         }
 
-        self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object)
+        let found =
+            self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object);
+        match found {
+            Some(namespace)
+                if self.with_schema(namespace.database_id, |schema| {
+                    Self::namespace_has_table_like_object(schema, namespace.id, table_name)
+                }) =>
+            {
+                Some(namespace)
+            }
+            other => self.root_virtual_table(table_name).or(other),
+        }
+    }
+
+    /// The root namespace of the main database when it has a virtual table
+    /// called `table_name`. The engine's virtual tables, such as table-valued
+    /// functions and a frontend's catalog tables, exist only there and are
+    /// found from every namespace, the way PostgreSQL's `pg_catalog` is on
+    /// every search path.
+    fn root_virtual_table(&self, table_name: &str) -> Option<NamespaceRef> {
+        self.with_schema(crate::MAIN_DB_ID, |schema| {
+            matches!(
+                schema.get_table(NamespaceId::ROOT, table_name).as_deref(),
+                Some(crate::schema::Table::Virtual(_))
+            )
+        })
+        .then(|| NamespaceRef::root_of(crate::MAIN_DB_ID))
     }
 
     fn namespace_of_schema_table(table_name: &str) -> Option<NamespaceRef> {
@@ -448,17 +494,28 @@ impl<'a> CatalogContext<'a> {
         schema.get_trigger(namespace, trigger_name).is_some()
     }
 
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.find_existing_sequence(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
-    }
-
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.find_unqualified_existing(seq_name, |schema, namespace, seq_name| {
             schema.get_sequence(namespace, seq_name).is_some()
+        })
+    }
+
+    /// The namespace and bare name of the sequence whose mangled name is
+    /// `mangled`. A column default read from the stored text of a table of
+    /// a namespace names its serial sequence so, since that text names the
+    /// table by its mangled name too.
+    pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {
+        self.with_schema(crate::MAIN_DB_ID, |schema| {
+            let (id, name) = schema.demangle_name(mangled);
+            (!id.is_root() && schema.has_sequence(id, name)).then(|| {
+                (
+                    NamespaceRef {
+                        database_id: crate::MAIN_DB_ID,
+                        id,
+                    },
+                    name.to_string(),
+                )
+            })
         })
     }
 
@@ -534,19 +591,19 @@ impl<'a> CatalogContext<'a> {
 
     /// The database that namespace `name` refers to. `name` is normalized.
     pub(crate) fn namespace_database_id(&self, name: &str) -> Option<usize> {
-        self.namespaces.database_id(name)
+        self.qualifiers.database_id(name)
     }
 
     /// The namespace called `name`, whatever the statement is being
     /// compiled for. `name` is normalized.
     pub(crate) fn namespace_named(&self, name: &str) -> Option<NamespaceRef> {
-        self.namespaces.get(name).map(|namespace| namespace.target)
+        self.qualifiers.get(name).map(|namespace| namespace.target)
     }
 
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
-        self.namespaces
+        self.qualifiers
             .of_database(index)
             .map(|namespace| namespace.name)
     }
@@ -554,6 +611,6 @@ impl<'a> CatalogContext<'a> {
     /// The name of `namespace`: the database's name for a root namespace,
     /// else the name the namespace was added under.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
-        self.namespaces.name_of(namespace)
+        self.qualifiers.name_of(namespace)
     }
 }

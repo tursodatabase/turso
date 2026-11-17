@@ -158,6 +158,14 @@ export function encodeValue(value: any): Value {
   if (value instanceof Uint8Array) {
     return { type: 'blob', base64: toBase64(value) };
   }
+
+  if (value instanceof Date) {
+    const millis = value.getTime();
+    if (Number.isNaN(millis)) {
+      throw new Error("Invalid Date cannot be passed as an argument");
+    }
+    return { type: 'integer', value: millis.toString() };
+  }
   
   return { type: 'text', value: String(value) };
 }

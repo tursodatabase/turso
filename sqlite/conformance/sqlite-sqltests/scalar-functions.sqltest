@@ -449,6 +449,36 @@ expect error {
     wrong number of arguments to function replace()
 }
 
+test ifnull-wrong-arg-count-1 {
+    select ifnull(1)
+}
+expect error {
+    wrong number of arguments to function ifnull()
+}
+
+test random-wrong-arg-count-1 {
+    select random(1)
+}
+expect error {
+    wrong number of arguments to function random()
+}
+
+test unicode-wrong-arg-count-2 {
+    select unicode('a', 'b')
+}
+expect error {
+    wrong number of arguments to function unicode()
+}
+
+# SQLite reports OVER on a scalar function before a wrong argument count.
+test scalar-function-wrong-arg-count-over-rejected {
+    WITH t(a) AS (VALUES (1))
+    SELECT abs(a, a) OVER () FROM t;
+}
+expect error {
+    may not be used as a window function
+}
+
 test replace-null-byte-pattern {
     select replace('hello', char(0), 'world');
 }
@@ -2353,6 +2383,13 @@ test iif-2-args-false-is-null {
     select iif(1 > 2, 'yes');
 }
 expect {
+}
+
+test iif-1-arg-rejected {
+    select iif(1);
+}
+expect error {
+    iif
 }
 
 test iif-multi-args-finds-first-true {

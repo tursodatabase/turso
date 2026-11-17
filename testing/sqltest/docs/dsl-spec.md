@@ -128,7 +128,7 @@ test expr-depth {
     SELECT 1{{repeat:expr_depth_limit-1: OR 1}};
 }
 expect error {
-    Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+    Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
 }
 ```
 

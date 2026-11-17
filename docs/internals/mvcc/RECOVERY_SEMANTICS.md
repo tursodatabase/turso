@@ -1,7 +1,7 @@
 # MVCC Recovery and Checkpoint Semantics
 
 This document describes the MVCC recovery and checkpoint behavior as implemented in
-`core/mvcc/database/mod.rs` and `core/mvcc/database/checkpoint_state_machine.rs`.
+`core/mvcc/database/mod.rs` and `core/mvcc/database/checkpoint.rs`.
 
 The checkpoint model is stop-the-world (blocking checkpoint lock).
 
