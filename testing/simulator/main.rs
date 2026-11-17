@@ -135,6 +135,7 @@ fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Resul
     }
 
     let paths = env.paths.clone();
+    let page_size = env.opts.page_size;
 
     if cli_opts.differential {
         env.type_ = SimulationType::Differential;
@@ -144,8 +145,9 @@ fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Resul
 
     let result = run_simulator(bugbase.as_mut(), cli_opts, env, plans);
 
-    // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
+    // Print the seed, the page size, the locations of the database and the plan file at the end again for easily accessing them.
     println!("seed: {seed}");
+    println!("page size: {page_size}");
     println!("path: {}", paths.base.display());
 
     if !cli_opts.keep_files && result.is_ok() {
