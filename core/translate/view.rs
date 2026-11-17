@@ -8,7 +8,8 @@ use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
-    schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{self, SQLITE_TABLEID},
+    sqlite_schema_rows::{emit_schema_entry, SchemaEntryType},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,

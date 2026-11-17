@@ -40,6 +40,7 @@ pub(crate) mod row_security;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod sequence;
+pub(crate) mod sqlite_schema_rows;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
