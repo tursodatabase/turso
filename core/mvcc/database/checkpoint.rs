@@ -13,7 +13,7 @@ use crate::mvcc::database::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::namespace::{mangle_name, NamespaceId};
-use crate::schema::{Index, Schema};
+use crate::schema::Schema;
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::comparator::{BasicComparator, Comparator};
 use crate::skiplist::{SkipMap, SkiplistAllocator};
@@ -25,8 +25,8 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
+use crate::types::{IOResultOr, IndexInfo};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
@@ -328,9 +328,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Index row changes to write: (row_id, row_version, is_delete). The table id of
     /// `row_id` is the index id.
     index_write_set: Vec<(RowID, RowVersion, bool)>,
-    /// Map from index_id to Index struct (for creating cursors)
-    /// This is populated when we process sqlite_schema rows for indexes
-    index_id_to_index: HashMap<MVTableId, Arc<Index>>,
+    /// Comparison metadata for indexes visible to the checkpoint.
+    index_infos: HashMap<MVTableId, Arc<IndexInfo>>,
     /// Result of the checkpoint
     checkpoint_result: Option<CheckpointResult>,
     /// Update connection's transaction state on checkpoint. If checkpoint was called as automatic
@@ -376,7 +375,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     snapshot_ts: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
-    /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
+    /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_infos` in PASSIVE mode.
     local_schema: Option<Arc<Schema>>,
     owns_checkpoint_in_progress: bool,
     /// Roots allocated this checkpoint; published with `visible_from = durable_txid_max_new`.
@@ -852,14 +851,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn refresh_schema_metadata(&mut self) {
         let schema = self.connection.clone_shared_schema(self.database_id);
-        self.index_id_to_index = schema
+        self.index_infos = schema
             .all_indexes()
             .filter(|index| index.is_btree_backed())
             .map(|index| {
                 turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                 (
                     self.mvstore.get_table_id_from_root_page(index.root_page),
-                    index.clone(),
+                    Arc::new(IndexInfo::new_from_index(index).expect(ALLOC_ERR_MSG)),
                 )
             })
             .collect();
@@ -908,7 +907,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // mode, MVCC checkpoint writes from the mv store back to the pager —
         // so the schema must match the pager being checkpointed.
         let schema = connection.clone_shared_schema(database_id);
-        let index_id_to_index = if mvstore.uses_passive_checkpoint() {
+        let index_infos = if mvstore.uses_passive_checkpoint() {
             HashMap::default()
         } else {
             schema
@@ -918,7 +917,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                     (
                         mvstore.get_table_id_from_root_page(index.root_page),
-                        index.clone(),
+                        Arc::new(IndexInfo::new_from_index(index).expect(ALLOC_ERR_MSG)),
                     )
                 })
                 .collect()
@@ -966,7 +965,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             destroyed_tables: HashSet::default(),
             destroyed_indexes: HashSet::default(),
             index_write_set: crate::alloc::vec![],
-            index_id_to_index,
+            index_infos,
             checkpoint_result: None,
             update_transaction_state,
             sync_mode,
@@ -1323,9 +1322,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 // Fixes DROP INDEX during checkpoint when the schema cache no longer
                                 // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
                                 let num_columns = self
-                                    .index_id_to_index
+                                    .index_infos
                                     .get(&index_id)
-                                    .map(|index| index.columns.len())
+                                    .map(|index| index.num_cols)
                                     .unwrap_or(0);
 
                                 special_write = Some(SpecialWrite::BTreeDestroyIndex {
@@ -2491,10 +2490,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // the same id collect_index_rows uses (mvstore.index_rows is keyed by the
                         // owning id). Resolving at the *current* owner (u64::MAX) instead would,
                         // under concurrent page reuse, key a present index under a different (reused)
-                        // id, so WriteIndexRow would fail to find its Index struct and drop real
+                        // id, so WriteIndexRow would fail to find its comparison metadata and drop real
                         // entries ("row N missing from index"). filter_map: an index whose root has
                         // no binding covering the snapshot is not part of this snapshot.
-                        self.index_id_to_index = local
+                        self.index_infos = local
                             .all_indexes()
                             .filter(|index| index.is_btree_backed())
                             .filter_map(|index| {
@@ -2507,9 +2506,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                         index.root_page,
                                         self.snapshot_ts,
                                     )
-                                    .map(|id| (id, index.clone()))
+                                    .map(|id| Ok((id, Arc::new(IndexInfo::new_from_index(index)?))))
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         self.build_local_schema_sm = None;
                         if self.build_local_schema_began_read_tx {
                             self.pager.end_read_tx();
@@ -2711,10 +2710,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Undo-logged: reverted if the checkpoint fails before commit.
                             self.ckpt_rootmap_alloc(index_id, created_root_page as u64);
                             self.staged_roots.push(index_id);
-                            // Index struct should already be stored in index_id_to_index from collect_committed_versions
                             turso_assert!(
-                                self.index_id_to_index.contains_key(&index_id),
-                                "checkpoint index struct missing before BTreeCreateIndex",
+                                self.index_infos.contains_key(&index_id),
+                                "checkpoint index metadata missing before BTreeCreateIndex",
                                 { "index_id": i64::from(index_id) }
                             );
                         }
@@ -2736,13 +2734,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
-                            } else if let Some(index) = self.index_id_to_index.get(&index_id) {
-                                let cursor = BTreeCursor::new_index(
+                            } else if let Some(index) = self.index_infos.get(&index_id) {
+                                let cursor = BTreeCursor::new_with_index_info(
                                     self.pager.clone(),
                                     known_root_page as i64,
-                                    index.as_ref(),
                                     num_columns,
-                                )?;
+                                    Some(index.clone()),
+                                );
                                 let cursor = Arc::new(RwLock::new(cursor));
                                 self.cursors.insert(root_page, cursor.clone());
                                 cursor
@@ -2997,14 +2995,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     return Ok(TransitionResult::Continue);
                 }
 
-                // The index is absent from the snapshot schema (index_id_to_index is built from
+                // The index is absent from the snapshot schema (index_infos is built from
                 // local_schema at snapshot_ts). That means the index does not exist at the
                 // checkpoint snapshot — it was dropped — so its whole btree is (or will be)
                 // destroyed wholesale. DROP does not tombstone each in-memory index-entry
                 // version, so collect_index_rows still picks them up as live inserts/tombstones;
                 // materializing them into the (possibly reused) root page would corrupt. Skip
                 // every entry for a snapshot-absent index, mirroring the destroyed_indexes skip.
-                let Some(index) = self.index_id_to_index.get(index_id) else {
+                let Some(index) = self.index_infos.get(index_id) else {
                     self.state = CheckpointState::WriteIndexRow {
                         index_write_set_index: index_write_set_index + 1,
                         requires_seek: true,
@@ -3029,12 +3027,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
                     cursor.clone()
                 } else {
-                    let cursor = BTreeCursor::new_index(
+                    let cursor = BTreeCursor::new_with_index_info(
                         self.pager.clone(),
                         root_page as i64,
-                        index.as_ref(),
-                        index.columns.len(),
-                    )?;
+                        index.num_cols,
+                        Some(index.clone()),
+                    );
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor
