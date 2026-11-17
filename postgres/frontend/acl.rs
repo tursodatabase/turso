@@ -101,6 +101,7 @@ impl Privileges {
                     ast::Privilege::Trigger => Self::TRIGGER,
                     ast::Privilege::Maintain => Self::MAINTAIN,
                     ast::Privilege::Usage => Self::USAGE,
+                    ast::Privilege::Create => Self::CREATE,
                     ast::Privilege::All => all,
                 }
         });

@@ -23,7 +23,7 @@ use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
 use crate::translate::row_security::translate_change;
 use crate::translate::schema::emit_schema_cookie;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{bail_parse_error, CatalogChange, LimboError, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, CatalogChange, GrantTarget, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
@@ -570,22 +570,29 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT` and `REVOKE`. Of privileges on relations, the dialect changes
-/// the privileges it stores with each relation, through its relation hooks,
-/// as it stores ownership. Of roles, the dialect stores the membership,
-/// through the same hook as its other catalog changes.
+/// `GRANT` and `REVOKE`. Of privileges on relations or namespaces, the
+/// dialect changes the privileges it stores with each of them. Of roles, the
+/// dialect stores the membership. Both go through the same hook as its other
+/// catalog changes.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let (privileges, on_sequences, relations) = match &grant.objects {
+    let (privileges, targets) = match &grant.objects {
         ast::GrantObjects::Relations {
             privileges,
             on_sequences,
             relations,
-        } => (privileges, on_sequences, relations),
+        } => (
+            privileges,
+            relation_grant_targets(relations, *on_sequences, resolver)?,
+        ),
+        ast::GrantObjects::Namespaces {
+            privileges,
+            namespaces,
+        } => (privileges, namespace_grant_targets(namespaces, resolver)?),
         ast::GrantObjects::Roles(roles) => {
             let change = CatalogChange::GrantRole {
                 revoke: grant.revoke,
@@ -595,7 +602,35 @@ pub fn translate_grant(
             return translate_change(change, resolver, program, connection);
         }
     };
-    let mut changes = Vec::with_capacity(relations.len());
+    let changes: Vec<_> = targets
+        .into_iter()
+        .map(|target| CatalogChange::Grant {
+            revoke: grant.revoke,
+            target,
+            privileges: privileges.clone(),
+            grantees: grant.grantees.clone(),
+        })
+        .collect();
+    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_catalog_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// The relations of the main database that `relations` name, each of which
+/// must exist and, with `on_sequences`, be a sequence.
+fn relation_grant_targets(
+    relations: &[ast::QualifiedName],
+    on_sequences: bool,
+    resolver: &Resolver,
+) -> Result<Vec<GrantTarget>> {
+    let mut targets = Vec::with_capacity(relations.len());
     for qualified_name in relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
         // A schema that does not exist is reported as such, not as a
@@ -614,7 +649,7 @@ pub fn translate_grant(
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
         }
-        if *on_sequences && kind != ast::RelationKind::Sequence {
+        if on_sequences && kind != ast::RelationKind::Sequence {
             bail_parse_error!("\"{normalized_name}\" is not a sequence");
         }
         // Only the main database has dialect schema state to store the
@@ -622,24 +657,30 @@ pub fn translate_grant(
         if namespace.database_id != MAIN_DB_ID {
             continue;
         }
-        changes.push(crate::CatalogChange::Grant {
-            revoke: grant.revoke,
+        targets.push(GrantTarget::Relation {
             namespace: namespace.id,
             name: normalized_name,
-            privileges: privileges.clone(),
-            grantees: grant.grantees.clone(),
         });
     }
-    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
-    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
-        program,
-        resolver.schema(),
-        connection,
-        &changes,
-    )?;
-    emit_schema_cookie(resolver, program);
-    Ok(())
+    Ok(targets)
+}
+
+/// The namespaces of the main database that `namespaces` name, each of which
+/// must exist.
+fn namespace_grant_targets(
+    namespaces: &[ast::Name],
+    resolver: &Resolver,
+) -> Result<Vec<GrantTarget>> {
+    namespaces
+        .iter()
+        .map(|name| {
+            let normalized_name = crate::util::normalize_ident(name.as_str());
+            resolver
+                .with_schema(MAIN_DB_ID, |s| s.namespace_named(&normalized_name))
+                .map(GrantTarget::Namespace)
+                .ok_or_else(|| LimboError::ParseError(format!("no such schema: {normalized_name}")))
+        })
+        .collect()
 }
 
 /// `CREATE ROLE`: the dialect stores the role, through the same hook as its

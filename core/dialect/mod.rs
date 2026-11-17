@@ -72,12 +72,11 @@ pub enum CatalogChange {
         old_name: String,
         new_name: String,
     },
-    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
-    /// relation FROM grantees` when `revoke` is set.
+    /// `GRANT privileges ON target TO grantees`, or `REVOKE privileges ON
+    /// target FROM grantees` when `revoke` is set.
     Grant {
         revoke: bool,
-        namespace: NamespaceId,
-        name: String,
+        target: GrantTarget,
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
@@ -114,6 +113,17 @@ pub enum CatalogChange {
         roles: Vec<String>,
         grantees: Vec<Grantee>,
     },
+}
+
+/// What a [`CatalogChange::Grant`] gives privileges on, in the main database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantTarget {
+    /// A table, view, materialized view or sequence.
+    Relation {
+        namespace: NamespaceId,
+        name: String,
+    },
+    Namespace(NamespaceId),
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].

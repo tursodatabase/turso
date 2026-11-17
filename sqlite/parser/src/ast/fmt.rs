@@ -1805,6 +1805,15 @@ impl ToTokens for Grant {
                 }
                 s.comma(relations, context)?;
             }
+            GrantObjects::Namespaces {
+                privileges,
+                namespaces,
+            } => {
+                s.comma(privileges, context)?;
+                s.append(TK_ON, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                s.comma(namespaces, context)?;
+            }
             GrantObjects::Roles(roles) => {
                 for (i, role) in roles.iter().enumerate() {
                     if i > 0 {
@@ -1840,6 +1849,7 @@ impl ToTokens for Privilege {
             Self::Trigger => s.append(TK_TRIGGER, None),
             Self::Maintain => s.append(TK_ID, Some("MAINTAIN")),
             Self::Usage => s.append(TK_ID, Some("USAGE")),
+            Self::Create => s.append(TK_CREATE, None),
             Self::All => s.append(TK_ALL, None),
         }
     }
