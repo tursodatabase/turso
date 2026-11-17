@@ -1448,7 +1448,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
-        created_table_ids: Mutex::new(Vec::new()),
+        btree_changes: Mutex::new(Vec::new()),
         portable_logical_changes: false,
     }
 }
@@ -2640,7 +2640,7 @@ fn transaction_display() {
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
-        created_table_ids: Mutex::new(Vec::new()),
+        btree_changes: Mutex::new(Vec::new()),
         portable_logical_changes: false,
     };
 
@@ -5378,4 +5378,93 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+#[test]
+fn savepoint_rollback_removes_created_btree_row_slots() {
+    let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("SAVEPOINT before_create").unwrap();
+    db.conn
+        .execute("CREATE TABLE rollback_tree (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO rollback_tree VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    let root = db
+        .conn
+        .schema
+        .read()
+        .get_btree_table(NamespaceId::ROOT, "rollback_tree")
+        .unwrap()
+        .root_page;
+    let id = db.mvcc_store.get_table_id_from_root_page(root);
+    assert!(db
+        .mvcc_store
+        .rows
+        .iter()
+        .any(|entry| entry.key().table_id == id));
+    db.conn.execute("ROLLBACK TO before_create").unwrap();
+    assert!(!db
+        .mvcc_store
+        .rows
+        .iter()
+        .any(|entry| entry.key().table_id == id));
+    db.conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn savepoint_rollback_restores_btree_operations() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE kept (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("SAVEPOINT before_drop").unwrap();
+    db.conn.execute("DROP TABLE kept").unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let tx = db.mvcc_store.txs.get(&tx_id).unwrap();
+    assert!(matches!(
+        tx.value().btree_changes.lock().as_slice(),
+        [BtreeChange::Drop(_)]
+    ));
+    db.conn.execute("SAVEPOINT nested").unwrap();
+    db.conn
+        .execute("CREATE TABLE discarded (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.conn.execute("RELEASE nested").unwrap();
+    assert_eq!(tx.value().btree_changes.lock().len(), 2);
+    db.conn.execute("ROLLBACK TO before_drop").unwrap();
+    assert!(tx.value().btree_changes.lock().is_empty());
+    db.conn.execute("INSERT INTO kept VALUES (1)").unwrap();
+    db.conn.execute("COMMIT").unwrap();
+}
+
+#[quickcheck]
+fn nested_savepoint_rollback_restores_btree_operations(releases: Vec<bool>) -> bool {
+    let db = MvccTestDb::new();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("CREATE TABLE kept (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let tx_id = db.conn.get_mv_tx_id().unwrap();
+    let tx = db.mvcc_store.txs.get(&tx_id).unwrap();
+    let before = tx.value().btree_changes.lock().clone();
+    db.conn.execute("SAVEPOINT outer_savepoint").unwrap();
+    for (i, release) in releases.into_iter().take(16).enumerate() {
+        db.conn.execute(&format!("SAVEPOINT nested_{i}")).unwrap();
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE discarded_{i} (id INTEGER PRIMARY KEY)"
+            ))
+            .unwrap();
+        if release {
+            db.conn.execute(&format!("RELEASE nested_{i}")).unwrap();
+        }
+    }
+    db.conn.execute("DROP TABLE kept").unwrap();
+    db.conn.execute("ROLLBACK TO outer_savepoint").unwrap();
+    let restored = *tx.value().btree_changes.lock() == before;
+    db.conn.execute("COMMIT").unwrap();
+    restored
 }

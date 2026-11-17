@@ -862,6 +862,7 @@ pub struct Savepoint {
     /// open, the write set does not get shorter than this, so on rollback the
     /// entries from this index on are the chains that the savepoint added.
     write_set_len_at_begin: usize,
+    btree_changes_len_at_begin: usize,
 }
 
 impl Savepoint {
@@ -870,11 +871,13 @@ impl Savepoint {
         header: DatabaseHeader,
         header_dirty: bool,
         write_set_len_at_begin: usize,
+        btree_changes_len_at_begin: usize,
     ) -> Self {
         Self {
             header,
             header_dirty,
             write_set_len_at_begin,
+            btree_changes_len_at_begin,
             ..Default::default()
         }
     }
@@ -887,6 +890,7 @@ impl Savepoint {
         header: DatabaseHeader,
         header_dirty: bool,
         write_set_len_at_begin: usize,
+        btree_changes_len_at_begin: usize,
     ) -> Self {
         Self {
             kind: SavepointKind::Named {
@@ -897,6 +901,7 @@ impl Savepoint {
             header,
             header_dirty,
             write_set_len_at_begin,
+            btree_changes_len_at_begin,
             ..Default::default()
         }
     }
@@ -966,7 +971,12 @@ impl<A: RowVersionAllocator> WriteSet<A> {
     }
 }
 
-/// Transaction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BtreeChange {
+    Create(MVTableId),
+    Drop(MVTableId),
+}
+
 #[derive(Debug)]
 pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// The state of the transaction.
@@ -1014,9 +1024,8 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
-    /// Table and index ids this transaction allocated with `CreateBtree`. No other
-    /// transaction can see these objects, so rollback drops their row maps whole.
-    created_table_ids: Mutex<Vec<MVTableId>>,
+    /// B-tree operations performed by this transaction.
+    btree_changes: Mutex<Vec<BtreeChange>>,
     /// The portable logical-change setting of the connection when this transaction
     /// began.
     portable_logical_changes: bool,
@@ -1048,7 +1057,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
-            created_table_ids: Mutex::new(Vec::new()),
+            btree_changes: Mutex::new(Vec::new()),
         }
     }
 
@@ -1075,6 +1084,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header,
             header_dirty,
             write_set_len,
+            self.btree_changes.lock().len(),
         ));
     }
 
@@ -1104,6 +1114,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header,
             header_dirty,
             write_set_len,
+            self.btree_changes.lock().len(),
         ));
     }
 
@@ -1210,6 +1221,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         // The rollback of the drained savepoints shortens the write set to this
         // length after this function returns.
         let write_set_len_at_begin = savepoints[target_idx].write_set_len_at_begin;
+        let btree_changes_len_at_begin = savepoints[target_idx].btree_changes_len_at_begin;
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
@@ -1219,6 +1231,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header,
             header_dirty,
             write_set_len_at_begin,
+            btree_changes_len_at_begin,
         ));
         Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
@@ -2360,13 +2373,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         };
         let end_ts = ctx.end_ts;
 
-        // A sqlite_schema row that is inserted and deleted inside one
-        // transaction does not always mean the underlying table or index was
-        // inserted and deleted. ALTER TABLE can rewrite sqlite_schema several
-        // times for an existing root page. We only treat a root page as
-        // transaction-local when it has no schema row before the transaction and
-        // no schema row after it.
-
         let is_our_begin = |row_version: &RowVersion| {
             matches!(
                 row_version.begin(),
@@ -2380,72 +2386,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             )
         };
 
-        let mut btree_ids_created_and_dropped_in_tx: HashSet<MVTableId> = HashSet::default();
-        let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
-        {
-            let write_set = tx.write_set.lock();
-            let frame_writes_schema = write_set
-                .entries
-                .iter()
-                .any(|(id, _)| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
-
-            // Decoding sqlite_schema records is only needed for DDL frames.
-            // Normal DML frames do not touch sqlite_schema, so avoid parsing
-            // schema records while committing the common path.
-            if frame_writes_schema {
-                let mut schema_roots_created_and_deleted_in_tx: HashSet<i64> = HashSet::default();
-                let mut schema_roots_deleted_by_tx: HashSet<i64> = HashSet::default();
-                let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
-                let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
-
-                for (id, row_versions) in &write_set.entries {
-                    // Only sqlite_schema entries can yield a btree identity. The
-                    // common path (CREATE INDEX on a populated table, bulk DML)
-                    // has tens of thousands of write_set entries that are NOT
-                    // sqlite_schema; locking each and parsing every version was
-                    // the dominant cost of MVCC commit on this branch.
-                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                        continue;
-                    }
-                    for row_version in row_versions.read().iter() {
-                        let Some(identity) = sqlite_schema_btree_identity(id.table_id, row_version)
-                        else {
-                            continue;
-                        };
-                        let our_begin = is_our_begin(row_version);
-                        let our_end = is_our_end(row_version);
-                        if !our_begin {
-                            schema_roots_present_before_tx.insert(identity.root_page);
-                        }
-                        if our_end {
-                            schema_roots_deleted_by_tx.insert(identity.root_page);
-                        }
-                        if !our_end {
-                            schema_roots_present_after_tx.insert(identity.root_page);
-                        }
-                        if our_begin && our_end && !row_version.btree_resident {
-                            schema_roots_created_and_deleted_in_tx.insert(identity.root_page);
-                        }
-                    }
-                }
-
-                for root_page in schema_roots_deleted_by_tx {
-                    if !schema_roots_present_after_tx.contains(&root_page) {
-                        btree_ids_removed_from_schema_by_tx
-                            .insert(mvcc_store.get_table_id_from_root_page(root_page));
-                    }
-                }
-
-                for root_page in schema_roots_created_and_deleted_in_tx {
-                    if !schema_roots_present_before_tx.contains(&root_page)
-                        && !schema_roots_present_after_tx.contains(&root_page)
-                    {
-                        btree_ids_created_and_dropped_in_tx
-                            .insert(mvcc_store.get_table_id_from_root_page(root_page));
-                    }
-                }
-            }
-        }
+        let btree_changes = tx.btree_changes.lock();
+        let created: HashSet<_> = btree_changes
+            .iter()
+            .filter_map(|change| match change {
+                BtreeChange::Create(id) => Some(*id),
+                BtreeChange::Drop(_) => None,
+            })
+            .collect();
+        let dropped: HashSet<_> = btree_changes
+            .iter()
+            .filter_map(|change| match change {
+                BtreeChange::Drop(id) => Some(*id),
+                BtreeChange::Create(_) => None,
+            })
+            .collect();
+        drop(btree_changes);
 
         // Remap a table_id to its canonical form for the log. After checkpoint,
         // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
@@ -2549,19 +2505,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     // row_version belongs to another tx
                     return None;
                 }
-                if btree_ids_created_and_dropped_in_tx.contains(&id.table_id) {
-                    // This table or index has no sqlite_schema row before the
-                    // transaction and no sqlite_schema row after it. It was created
-                    // and dropped inside this commit, so its table/index entries do
-                    // not change durable state.
+                if created.contains(&id.table_id) && dropped.contains(&id.table_id) {
                     return None;
                 }
-                if btree_ids_removed_from_schema_by_tx.contains(&id.table_id)
-                    && our_begin
-                    && !our_end
-                {
+                if dropped.contains(&id.table_id) && our_begin && !our_end {
                     // This transaction created or rewrote an entry for a table or
-                    // index that is gone from sqlite_schema by COMMIT. Example:
+                    // index that is dropped before COMMIT. Example:
                     // UPDATE writes a new entry into idx_old, then DROP INDEX
                     // idx_old runs before COMMIT. Keep deletes for entries that
                     // existed before the transaction, but do not log new entries
@@ -5421,12 +5370,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Records that `tx_id` allocated `table_id` with `CreateBtree`, so rollback can drop
     /// everything stored under it.
     pub fn record_created_table_id(&self, tx_id: TxID, table_id: i64) {
-        if let Some(tx) = self.txs.get(&tx_id) {
-            tx.value()
-                .created_table_ids
-                .lock()
-                .push(MVTableId::new(table_id));
-        }
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("B-tree creation requires a transaction");
+        tx.value()
+            .btree_changes
+            .lock()
+            .push(BtreeChange::Create(MVTableId::new(table_id)));
+    }
+
+    pub(crate) fn record_dropped_btree(&self, tx_id: TxID, root_page: i64) {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("B-tree deletion requires a transaction");
+        let tx = tx.value();
+        let id = self.get_table_id_from_root_page_at(root_page, tx.begin_ts);
+        tx.btree_changes.lock().push(BtreeChange::Drop(id));
     }
 
     pub fn get_next_rowid(&self) -> i64 {
@@ -7237,9 +7198,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // transaction created never existed for anyone else, and its id is never reused,
         // so nothing would ever reclaim those slots. E.g. a CREATE INDEX that is retried
         // and rolled back over and over would leave one full set of keys per attempt.
-        let created_table_ids = std::mem::take(&mut *tx.created_table_ids.lock());
-        for table_id in created_table_ids {
-            self.drop_created_btree(table_id);
+        let changes = std::mem::take(&mut *tx.btree_changes.lock());
+        for change in changes {
+            if let BtreeChange::Create(id) = change {
+                self.drop_created_btree(id);
+            }
         }
 
         if let Some(connection) = connection {
@@ -7556,6 +7519,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             deleted_table_versions,
             deleted_index_versions,
             write_set_len_at_begin,
+            btree_changes_len_at_begin,
             ..
         } = savepoint;
 
@@ -7665,6 +7629,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or_else(|| panic!("Transaction {tx_id} not found while restoring savepoint"));
         let tx = tx.value();
         Self::remove_rolled_back_chains_from_write_set(tx, write_set_len_at_begin);
+        for change in tx.btree_changes.lock().drain(btree_changes_len_at_begin..) {
+            if let BtreeChange::Create(id) = change {
+                self.drop_created_btree(id);
+            }
+        }
         *tx.header.write() = header;
         tx.header_dirty.store(header_dirty, Ordering::Release);
     }

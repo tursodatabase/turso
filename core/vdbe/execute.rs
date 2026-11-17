@@ -13572,8 +13572,12 @@ pub fn op_destroy(
     );
     check_db_write_allowed(program, state, None)?;
     let mv_store = program.connection.mv_store_for_db(*db);
-    if mv_store.is_some() {
-        // MVCC only does pager operations in checkpoint
+    if let Some(mv_store) = mv_store {
+        let tx_id = program
+            .connection
+            .get_mv_tx_id_for_db(*db)
+            .expect("Destroy requires an MVCC transaction");
+        mv_store.record_dropped_btree(tx_id, *root);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
