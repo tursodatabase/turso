@@ -411,6 +411,87 @@ expect error {
     table "s" has 2 columns available but 3 columns specified
 }
 
+test ordinality-with-a-column-definition-list-after-the-alias-errors {
+    SELECT * FROM json_to_recordset('[{"a":1}]') WITH ORDINALITY AS t(a int);
+}
+@sqlstate 42601
+expect error {
+    WITH ORDINALITY cannot be used with a column definition list
+}
+
+test ordinality-of-a-record-function-without-a-column-definition-list-errors {
+    SELECT * FROM json_to_recordset('[{"a":1}]') WITH ORDINALITY;
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test ordinality-of-json-to-recordset {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"},{"a":2,"b":"y"}]') AS (a int, b text)) WITH ORDINALITY;
+}
+expect {
+    1|x|1
+    2|y|2
+}
+
+test ordinality-of-json-to-recordset-column-names {
+    SELECT t.ordinality, t.p, t.b
+    FROM ROWS FROM (jsonb_to_recordset('[{"a":1,"b":"x"},{"a":2,"b":"y"}]') AS (a int, b text)) WITH ORDINALITY AS t(p)
+    WHERE b = 'y';
+    SELECT r, q, p
+    FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"}]') AS (a int, b text)) WITH ORDINALITY AS t(p, q, r);
+}
+expect {
+    2|2|y
+    1|x|1
+}
+
+test column-alias-list-longer-than-defined-columns-and-ordinality-errors {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1}]') AS (a int, b text)) WITH ORDINALITY AS t(p, q, r, s);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 3 columns available but 4 columns specified
+}
+
+test ordinality-of-json-to-recordset-is-the-position-in-the-array {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":7},{},{"a":9}]') AS (a int)) WITH ORDINALITY ORDER BY ordinality DESC;
+}
+expect {
+    9|3
+    |2
+    7|1
+}
+
+test ordinality-of-json-to-recordset-on-an-empty-array {
+    SELECT count(*) FROM ROWS FROM (json_to_recordset('[]') AS (a int)) WITH ORDINALITY;
+}
+expect {
+    0
+}
+
+test ordinality-of-json-to-record-is-one {
+    SELECT * FROM ROWS FROM (json_to_record('{"a":1}') AS (a int)) WITH ORDINALITY;
+    SELECT * FROM ROWS FROM (jsonb_to_record('{"a":2}') AS (a int)) WITH ORDINALITY;
+}
+expect {
+    1|1
+    2|1
+}
+
+test ordinality-of-json-to-recordset-restarts-for-each-table-row {
+    CREATE TABLE docs(id INT, body TEXT);
+    INSERT INTO docs VALUES (1, '[{"a":10},{"a":11}]'), (2, '[{"a":20}]');
+    SELECT id, a, ordinality
+    FROM docs, ROWS FROM (json_to_recordset(body::json) AS (a int)) WITH ORDINALITY
+    ORDER BY id, ordinality;
+}
+expect {
+    1|10|1
+    1|11|2
+    2|20|1
+}
+
 test with-ordinality-after-the-alias-is-a-syntax-error {
     SELECT * FROM generate_series(1, 2) AS g WITH ORDINALITY;
 }

@@ -2970,7 +2970,11 @@ impl PostgreSQLTranslator {
                 lateral: true,
             });
         }
-        reject_ordinality(range_func, func_name)?;
+        if range_func.ordinality {
+            return Err(ParseError::not_supported(format!(
+                "WITH ORDINALITY on {func_name}()"
+            )));
+        }
         reject_column_aliases(&range_func.alias, "a function")?;
 
         fn function_uses_main_schema(name: &str) -> bool {
@@ -2988,7 +2992,12 @@ impl PostgreSQLTranslator {
         args: &[Box<ast::Expr>],
         alias: Option<ast::As>,
     ) -> Result<ast::SelectTable, ParseError> {
-        reject_ordinality(range_func, func_name)?;
+        if range_func.ordinality && !range_func.coldeflist.is_empty() {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_SYNTAX_ERROR,
+                message: "WITH ORDINALITY cannot be used with a column definition list".into(),
+            });
+        }
         let [arg] = args else {
             return Err(ParseError::ParseError(format!(
                 "{func_name} requires exactly one argument"
@@ -3110,9 +3119,9 @@ impl PostgreSQLTranslator {
         } else {
             (arg_json, vec![])
         };
-        let columns = column_definitions
+        let mut columns = column_definitions
             .iter()
-            .zip(names)
+            .zip(&names)
             .map(|(col_def, name)| {
                 let type_name = col_def.type_name.as_ref().ok_or_else(|| {
                     ParseError::ParseError(format!("column {} missing type", col_def.colname))
@@ -3164,10 +3173,30 @@ impl PostgreSQLTranslator {
                 };
                 Ok(ast::ResultColumn::Expr(
                     Box::new(cast),
-                    Some(ast::As::Elided(exact_name(name))),
+                    Some(ast::As::Elided(exact_name(name.clone()))),
                 ))
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
+        if range_func.ordinality {
+            let one = ast::Expr::Literal(ast::Literal::Numeric("1".into()));
+            let ordinality = if is_recordset {
+                ast::Expr::Binary(
+                    Box::new(ast::Expr::Qualified(
+                        exact_name("element"),
+                        exact_name("key"),
+                    )),
+                    ast::Operator::Add,
+                    Box::new(one),
+                )
+            } else {
+                one
+            };
+            let name = names.last().expect("WITH ORDINALITY adds a column name");
+            columns.push(ast::ResultColumn::Expr(
+                Box::new(bigint(ordinality)),
+                Some(ast::As::Elided(exact_name(name.clone()))),
+            ));
+        }
         Ok(ast::SelectTable::Select {
             select: ast::Select {
                 with: None,
@@ -5699,18 +5728,6 @@ fn bigint(expr: ast::Expr) -> ast::Expr {
             array_dimensions: 0,
         }),
     }
-}
-
-fn reject_ordinality(
-    range_func: &pg_query::protobuf::RangeFunction,
-    func_name: &str,
-) -> Result<(), ParseError> {
-    if range_func.ordinality {
-        return Err(ParseError::not_supported(format!(
-            "WITH ORDINALITY on {func_name}()"
-        )));
-    }
-    Ok(())
 }
 
 /// The names of the columns of a function in FROM. `function_columns` are the
@@ -13578,6 +13595,9 @@ mod tests {
         );
         assert_translates("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS g(n, o)");
         assert_translates("SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(x, o)");
+        assert_translates(
+            "SELECT * FROM ROWS FROM (json_to_recordset('[]') AS (a int)) WITH ORDINALITY",
+        );
         assert_not_supported(
             "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
             "column definition list on f()",
