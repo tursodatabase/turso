@@ -45,6 +45,7 @@ mod binding;
 pub(crate) use binding::validate_function_tail;
 mod columns;
 mod condition;
+mod custom_type_functions;
 mod custom_type_operators;
 mod custom_types;
 mod emission;
@@ -67,6 +68,8 @@ use binding::*;
 use columns::*;
 #[allow(unused_imports)]
 use condition::*;
+#[allow(unused_imports)]
+use custom_type_functions::*;
 #[allow(unused_imports)]
 use custom_type_operators::*;
 #[allow(unused_imports)]

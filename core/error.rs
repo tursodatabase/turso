@@ -122,6 +122,10 @@ pub enum LimboError {
     DatetimeFieldOverflow(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
+    /// Something PostgreSQL has that Turso does not implement, such as
+    /// `sum(interval)`.
+    #[error("{0} is not supported")]
+    NotSupported(String),
     #[error("Modifier parsing error: {0}")]
     InvalidModifier(String),
     #[error("{0}")]

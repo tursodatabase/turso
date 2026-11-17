@@ -28,30 +28,32 @@ fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
     // Whether the stored form sorts in the same order as the values.
     const SORTS: bool = true;
     const NO_SORT: bool = false;
-    let types: &[(bool, RangeOffsets, bool, &str)] = &[
+    // Whether SQLite's functions, such as sum and abs, may read the values.
+    const READS: bool = true;
+    let types: &[(bool, RangeOffsets, bool, bool, &str)] = &[
         #[cfg(feature = "uuid")]
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
         #[cfg(feature = "json")]
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
         #[cfg(feature = "json")]
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
-        (COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
+        (COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
         // The ENCODEs read PostgreSQL's input forms and store one text form
         // with a 4-digit year, which sorts in time order (see
         // functions/datetime_input.rs).
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE date(value text) BASE text ENCODE temporal_encode(value, 'date') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE time(value text) BASE text ENCODE temporal_encode(value, 'time') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamp(value text) BASE text ENCODE temporal_encode(value, 'timestamp') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, "CREATE TYPE timestamptz(value text) BASE text ENCODE temporal_encode(value, 'timestamptz') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, "CREATE TYPE bigint(value integer) BASE integer"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
-        (NO_COLLATE, RangeOffsets::None, NO_SORT, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::Numeric, NO_SORT, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, READS, "CREATE TYPE date(value text) BASE text ENCODE temporal_encode(value, 'date') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, READS, "CREATE TYPE time(value text) BASE text ENCODE temporal_encode(value, 'time') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, READS, "CREATE TYPE timestamp(value text) BASE text ENCODE temporal_encode(value, 'timestamp') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, READS, "CREATE TYPE timestamptz(value text) BASE text ENCODE temporal_encode(value, 'timestamptz') DECODE value OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, READS, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Integer, NO_SORT, READS, "CREATE TYPE bigint(value integer) BASE integer"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, RangeOffsets::None, NO_SORT, READS, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::Numeric, NO_SORT, READS, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
     let aliases: &[(&str, &str)] = &[
@@ -59,7 +61,14 @@ fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
         ("int2", "smallint"),
         ("int8", "bigint"),
     ];
-    for &(accepts_collate, range_offsets, stored_form_sorts_in_value_order, sql) in types {
+    for &(
+        accepts_collate,
+        range_offsets,
+        stored_form_sorts_in_value_order,
+        sqlite_functions_read_values,
+        sql,
+    ) in types
+    {
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
         }))) = crate::dialect::engine::parse_statement(sql)
@@ -76,6 +85,7 @@ fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
                 accepts_collate,
                 range_offsets,
                 stored_form_sorts_in_value_order,
+                sqlite_functions_read_values,
             },
             sql.to_string(),
         )?;

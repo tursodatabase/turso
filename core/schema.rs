@@ -541,6 +541,19 @@ impl ResolvedType {
             .find_map(|td| td.accepts_collate)
             .unwrap_or_else(|| self.primitive == "text")
     }
+
+    /// Whether SQLite's functions may read values of the type. A domain
+    /// answers as its base type does.
+    pub fn sqlite_functions_read_values(&self) -> bool {
+        match self.base_type() {
+            Some(base) => base
+                .sqlite_functions_read_values
+                .expect("TypeDef::from_create_type sets it on every type that is not a domain"),
+            // A domain over a plain SQLite type, such as the integers of
+            // `CREATE DOMAIN pos AS integer`.
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +569,11 @@ pub struct TypeDef {
     /// Whether values of the type take a COLLATE, as PostgreSQL's text types
     /// do. None for a domain, which takes the answer of its base type.
     pub accepts_collate: Option<bool>,
+    /// Whether SQLite's functions, such as sum and abs, may read values of
+    /// the type. False for interval: such a function would read its 16
+    /// stored bytes as a number or text and give a wrong answer. None
+    /// for a domain, which takes the answer of its base type.
+    pub sqlite_functions_read_values: Option<bool>,
     /// Whether the stored form of the type sorts in the same order as its
     /// values, so an index on a column of the type can serve a range or ORDER
     /// BY even though the type has no ordering of its own. True only for the
@@ -841,6 +859,13 @@ impl TypeDef {
                         // A user type takes a COLLATE when its values are text.
                         TypeOrigin::User => base.eq_ignore_ascii_case("text"),
                     }),
+                    sqlite_functions_read_values: Some(match origin {
+                        TypeOrigin::Builtin {
+                            sqlite_functions_read_values,
+                            ..
+                        } => sqlite_functions_read_values,
+                        TypeOrigin::User => true,
+                    }),
                     stored_form_sorts_in_value_order: match origin {
                         TypeOrigin::Builtin {
                             stored_form_sorts_in_value_order,
@@ -884,6 +909,7 @@ impl TypeDef {
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
+                    sqlite_functions_read_values: Some(true),
                     stored_form_sorts_in_value_order: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -919,6 +945,7 @@ impl TypeDef {
                     is_domain: false,
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
+                    sqlite_functions_read_values: Some(true),
                     stored_form_sorts_in_value_order: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
@@ -950,6 +977,7 @@ impl TypeDef {
             is_domain: true,
             range_offsets: None,
             accepts_collate: None,
+            sqlite_functions_read_values: None,
             stored_form_sorts_in_value_order: false,
             sql,
             domain_checks: constraints.to_vec(),
@@ -1532,13 +1560,15 @@ impl RangeOffsets {
 #[derive(Debug, Clone, Copy)]
 pub enum TypeOrigin {
     /// `accepts_collate` says whether values of the type take a COLLATE,
-    /// `range_offsets` what kind of number they are in a RANGE frame, and
+    /// `range_offsets` what kind of number they are in a RANGE frame,
     /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
+    /// the same order as the values, and `sqlite_functions_read_values`
+    /// whether SQLite's functions may read them.
     Builtin {
         accepts_collate: bool,
         range_offsets: RangeOffsets,
         stored_form_sorts_in_value_order: bool,
+        sqlite_functions_read_values: bool,
     },
     User,
 }
@@ -2208,6 +2238,17 @@ impl Schema {
     /// column whose type is a custom type of a STRICT table.
     pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
         column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
+    }
+
+    /// Whether SQLite's functions may read the column's values. See
+    /// [ResolvedType::sqlite_functions_read_values].
+    pub fn sqlite_functions_read_column(&self, column: &Column, is_strict: bool) -> Result<bool> {
+        Ok(match self.resolve_type(&column.ty_str, is_strict)? {
+            Some(resolved) => resolved.sqlite_functions_read_values(),
+            // A plain SQLite type, or any type of a table that is not STRICT,
+            // whose columns have no custom types.
+            None => true,
+        })
     }
 
     /// Whether reading the column runs a DECODE, so a read gives a value other
@@ -5847,19 +5888,33 @@ impl BTreeTable {
         Ok(())
     }
 
-    /// Fails when a STORED generated column has a custom type or reads a column that has one.
+    /// Fails when a generated column has, or reads a column that has, a type
+    /// it cannot use: a STORED one any custom type, any generated column a
+    /// type whose values SQLite's functions would misread, such as interval.
     // FIXME: allow custom types in STORED generated columns once custom types stabilize.
-    pub(crate) fn check_stored_columns_have_no_custom_types(&self, schema: &Schema) -> Result<()> {
+    pub(crate) fn check_generated_column_types(&self, schema: &Schema) -> Result<()> {
         let graph = self.column_graph()?;
         for (idx, column) in self.columns.iter().enumerate() {
-            if !column.is_stored_generated() {
+            if !column.is_generated() {
                 continue;
             }
-            let uses_custom_type = std::iter::once(idx)
-                .chain(graph.dependencies[idx].iter())
-                .any(|i| schema.column_has_custom_type(&self.columns[i], self.is_strict));
-            if uses_custom_type {
+            let used_columns = || {
+                std::iter::once(idx)
+                    .chain(graph.dependencies[idx].iter())
+                    .map(|i| &self.columns[i])
+            };
+            if column.is_stored_generated()
+                && used_columns().any(|used| schema.column_has_custom_type(used, self.is_strict))
+            {
                 bail_parse_error!("stored generated columns cannot use custom types");
+            }
+            for used in used_columns() {
+                if !schema.sqlite_functions_read_column(used, self.is_strict)? {
+                    return Err(LimboError::NotSupported(format!(
+                        "a generated column on a column of type {}",
+                        used.ty_str
+                    )));
+                }
             }
         }
         Ok(())

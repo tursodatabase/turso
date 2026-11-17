@@ -14,8 +14,8 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        self, check_column_type, validate_check_expr, validate_default_expr,
-        validate_generated_function_calls, SQLITE_TABLEID,
+        self, check_column_expressions, check_column_type, validate_check_expr,
+        validate_default_expr, validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
@@ -1365,6 +1365,7 @@ pub fn translate_alter_table(
             }
 
             check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            check_column_expressions(&col_def, resolver)?;
             let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema())?;
@@ -1460,8 +1461,10 @@ pub fn translate_alter_table(
                 ));
             };
 
+            if is_generated {
+                btree.check_generated_column_types(resolver.schema())?;
+            }
             if is_stored {
-                btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
                 emit_halt_if_table_has_rows(
                     program,
                     &original_btree,
@@ -1996,9 +1999,24 @@ pub fn translate_alter_table(
                             btree.is_strict,
                             resolver.schema(),
                         )?;
+                        check_column_expressions(&definition, resolver)?;
                         let replacement_column =
                             btree.column_for_alter(column_index, &definition)?;
                         let old_column = &btree.columns()[column_index];
+                        // The table's CHECKs, indexes and generated columns
+                        // that read the column are not checked again for its
+                        // new type.
+                        for column in [old_column, &replacement_column] {
+                            if !resolver
+                                .schema()
+                                .sqlite_functions_read_column(column, btree.is_strict)?
+                            {
+                                return Err(LimboError::NotSupported(format!(
+                                    "ALTER COLUMN on a column of type {}",
+                                    column.ty_str
+                                )));
+                            }
+                        }
                         // Switching between a rowid alias and a key with an automatic
                         // index would need that index created or dropped.
                         if old_column.primary_key()
@@ -2126,6 +2144,7 @@ pub fn translate_alter_table(
                 let ty = column_type(column, table.is_strict, resolver.schema());
                 key_collation(column.text_collation(), &ty, resolver.schema())?;
                 table.prepare_generated_columns()?;
+                table.check_generated_column_types(resolver.schema())?;
                 let column_names: Vec<&str> = table
                     .columns()
                     .iter()

@@ -26,7 +26,7 @@ use crate::translate::emitter::{
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, iif_values, value_type, ExprType,
 };
-use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr::{check_custom_types, takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -802,7 +802,7 @@ fn validate(
             table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
-        table.check_stored_columns_have_no_custom_types(resolver.schema())?;
+        table.check_generated_column_types(resolver.schema())?;
     }
     Ok(())
 }
@@ -1273,6 +1273,9 @@ pub fn translate_create_table(
     } = &body
     {
         for col in columns {
+            check_column_expressions(col, resolver)?;
+        }
+        for col in columns {
             for constraint in &col.constraints {
                 if let ast::ColumnConstraint::PrimaryKey { auto_increment, .. } =
                     constraint.constraint
@@ -1608,6 +1611,34 @@ pub fn translate_create_table(
         )?;
     }
 
+    Ok(())
+}
+
+/// Runs the checks that binding runs on a query's expressions, such as the
+/// refusal of `abs(iv)` on an interval, on the DEFAULT and generated
+/// expressions of a column, which are not bound. Their column references
+/// have no type here: [crate::schema::BTreeTable::check_generated_column_types]
+/// refuses a generated column on a column whose type needs these checks.
+pub(crate) fn check_column_expressions(
+    column: &ast::ColumnDefinition,
+    resolver: &Resolver,
+) -> Result<()> {
+    for constraint in &column.constraints {
+        match &constraint.constraint {
+            ast::ColumnConstraint::Default(expr)
+            | ast::ColumnConstraint::Generated { expr, .. } => {
+                check_custom_types(expr, None, resolver)?;
+            }
+            // A CHECK is bound when a statement writes the table.
+            ast::ColumnConstraint::Check { .. }
+            | ast::ColumnConstraint::PrimaryKey { .. }
+            | ast::ColumnConstraint::NotNull { .. }
+            | ast::ColumnConstraint::Unique(_)
+            | ast::ColumnConstraint::Collate { .. }
+            | ast::ColumnConstraint::ForeignKey { .. }
+            | ast::ColumnConstraint::Identity(_) => {}
+        }
+    }
     Ok(())
 }
 
@@ -3820,6 +3851,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         not_null: _,
         is_domain: _,
         accepts_collate: _,
+        sqlite_functions_read_values: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
         sql: _,

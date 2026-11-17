@@ -635,6 +635,12 @@ pub(crate) fn check_custom_types(
         check_custom_operator(expr, &context.type_env())?;
         Ok(WalkControl::Continue)
     })?;
+    // Function calls after operators: `abs(d * 2)` fails because `*` does
+    // not exist for a date.
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_function_reads(expr, &context.type_env())?;
+        Ok(WalkControl::Continue)
+    })?;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         check_expr_collation(expr, &context)?;
         Ok(WalkControl::Continue)

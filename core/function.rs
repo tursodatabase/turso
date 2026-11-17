@@ -1938,6 +1938,25 @@ pub enum ResultType {
 }
 
 impl Func {
+    /// Whether the function reads its arguments' values as numbers or text,
+    /// as sum, abs and length do. Such a function is refused on a type whose
+    /// stored values it would misread, such as interval (see
+    /// [crate::schema::ResolvedType::sqlite_functions_read_values]). The
+    /// functions listed only hand their arguments back, count them or compare
+    /// them in the order of their type. A function that is not listed is
+    /// refused on an interval. Scalar min, max, nullif, coalesce and ifnull
+    /// are not listed, as they can return another argument as it is:
+    /// `max(iv, 0)` returns the number, and `coalesce(iv, '24 hours')` returns
+    /// `24 hours` where PostgreSQL prints `24:00:00`.
+    pub fn reads_argument_values(&self) -> bool {
+        !matches!(
+            self,
+            Self::Scalar(ScalarFunc::Likely | ScalarFunc::Unlikely)
+                | Self::Agg(AggFunc::Count | AggFunc::Min | AggFunc::Max)
+                | Self::Window(WindowFunc::FirstValue | WindowFunc::LastValue)
+        )
+    }
+
     /// How the type of the function's result follows from its arguments.
     /// Aggregate and window functions other than min and max don't declare a
     /// type yet, and neither do functions of C extensions, whose interface has
