@@ -30,6 +30,12 @@ test error-syntax {
 @sqlstate 42601
 expect error {}
 
+test error-zero-parameter {
+    SELECT $0;
+}
+@sqlstate 42P02
+expect error {}
+
 # tursopg does not have LISTEN.
 test error-unsupported-statement {
     LISTEN channel;

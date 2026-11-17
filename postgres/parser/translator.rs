@@ -3544,10 +3544,15 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::ParamRef(param_ref)) => {
                 // $1, $2, etc. — translate to Variable("$N")
-                Ok(ast::Expr::Variable(ast::Variable::indexed(
-                    std::num::NonZeroU32::new(param_ref.number as u32)
-                        .unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-                )))
+                let index =
+                    std::num::NonZeroU32::new(param_ref.number as u32).ok_or_else(|| {
+                        ParseError::ParseError(format!(
+                            "there is no parameter ${}",
+                            param_ref.number
+                        ))
+                    })?;
+
+                Ok(ast::Expr::Variable(ast::Variable::indexed(index)))
             }
             Some(pg_query::protobuf::node::Node::BooleanTest(bt)) => {
                 use pg_query::protobuf::BoolTestType;
