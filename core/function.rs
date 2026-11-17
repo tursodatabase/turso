@@ -159,6 +159,7 @@ impl Drop for ExternalContext {
 }
 
 impl ExtFunc {
+    #[allow(clippy::result_unit_err)]
     pub fn agg_args(&self) -> Result<i32, ()> {
         if let ExtFunc::Aggregate { argc, .. } | ExtFunc::NativeAggregate { argc, .. } = self {
             return Ok(*argc);
@@ -1047,6 +1048,7 @@ pub enum ScalarFunc {
     BooleanToInt,
     IntToBoolean,
     ValidateIpAddr,
+    TemporalEncode,
     // Numeric type functions
     NumericEncode,
     NumericFit,
@@ -1176,6 +1178,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::TemporalEncode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
@@ -1306,6 +1309,7 @@ impl ScalarFunc {
             | Self::Repeat
             | Self::Lpad
             | Self::Rpad
+            | Self::TemporalEncode
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1440,6 +1444,7 @@ impl Display for ScalarFunc {
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
+            Self::TemporalEncode => "temporal_encode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
@@ -1591,7 +1596,8 @@ impl ScalarFunc {
             | Self::NumericEncode
             | Self::NumericDecode
             | Self::NumericNeg => &[1],
-            Self::NumericAdd
+            Self::TemporalEncode
+            | Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv

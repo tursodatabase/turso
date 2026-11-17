@@ -306,7 +306,7 @@ pub(crate) fn check_blob_open(
         policy_for(
             dialect.as_ref(),
             schema,
-            role,
+            &|other| dialect.role_has_privileges_of(schema, role, other),
             dialect.role_bypass_rls(schema, role),
             NamespaceId::ROOT,
             table_name,
@@ -342,12 +342,14 @@ fn policy(
     } else {
         roles::table_reader(resolver, resolver.row_security_role)
     };
-    let bypass_rls = dialect.role_bypass_rls(resolver.schema(), role);
+    let main_schema = resolver.schema();
+    let bypass_rls = dialect.role_bypass_rls(main_schema, role);
+    let has_privileges_of = |other| dialect.role_has_privileges_of(main_schema, role, other);
     resolver.with_schema(namespace.database_id, |schema| {
         policy_for(
             dialect,
             schema,
-            role,
+            &has_privileges_of,
             bypass_rls,
             namespace.id,
             table_name,
@@ -357,16 +359,18 @@ fn policy(
 }
 
 /// Whether row-level security limits the rows of table `table_name` of
-/// `namespace` in `schema` that `role` may access for `command`, and the
-/// policies that then decide. As in PostgreSQL's `check_enable_rls`,
-/// row-level security does not limit a role that bypasses it, such as a
-/// superuser, or the table's owner. Whether `role` bypasses row-level
-/// security comes from the main database, which the role was set from, and
-/// `schema` may be another one.
+/// `namespace` in `schema` that a role may access for `command`, and the
+/// policies that then decide. `has_privileges_of` says whether the role has
+/// the privileges of another role. As in PostgreSQL, row-level security does
+/// not limit a role that bypasses it, such as a superuser, or a role with
+/// the privileges of the table's owner, and a policy applies to the roles
+/// with the privileges of its roles. What the role bypasses and whose
+/// privileges it has come from the main database, which the role was set
+/// from, and `schema` may be another one.
 fn policy_for(
     dialect: &dyn Dialect,
     schema: &Schema,
-    role: RoleId,
+    has_privileges_of: &dyn Fn(RoleId) -> bool,
     bypass_rls: bool,
     namespace: NamespaceId,
     table_name: &str,
@@ -375,7 +379,9 @@ fn policy_for(
     let table_name = normalize_ident(table_name);
     if bypass_rls
         || !dialect.table_rls_enabled(schema, namespace, &table_name)
-        || dialect.relation_owner(schema, namespace, &table_name) == Some(role)
+        || dialect
+            .relation_owner(schema, namespace, &table_name)
+            .is_some_and(has_privileges_of)
     {
         return Policy::Allow;
     }
@@ -387,7 +393,7 @@ fn policy_for(
         dialect
             .row_security_policies(schema, namespace, &table_name)
             .iter()
-            .filter(|policy| policy.applies_to(command, role))
+            .filter(|policy| policy.applies_to(command, has_privileges_of))
             .cloned()
             .collect(),
     )
@@ -920,7 +926,6 @@ fn single_value_of_mut(select: &mut ast::Select) -> Option<&mut ast::Expr> {
 
 #[cfg(test)]
 mod tests {
-    use crate::security::roles::SessionRole;
     use std::sync::Arc;
 
     use rustc_hash::FxHashMap;
@@ -936,7 +941,7 @@ mod tests {
     use crate::security::policy::RowPolicy;
     use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::{Database, DatabaseCatalog, MemoryIO, Qualifiers, RwLock, SymbolTable};
+    use crate::{DatabaseCatalog, Qualifiers, RwLock, SymbolTable};
 
     /// The engine dialect, except that every table of a schema with dialect
     /// schema state has row-level security, and table `documents` has a
@@ -1176,83 +1181,5 @@ mod tests {
             role,
         );
         f(&mut resolver)
-    }
-
-    /// A materialized view stores the rows of its query when it is refreshed,
-    /// so policies on it could not limit them.
-    #[test]
-    fn row_security_statements_reject_a_materialized_view() {
-        let db = Database::open_file_with_flags(
-            Arc::new(MemoryIO::new()),
-            "row-security-materialized-view.db",
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_views(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT x FROM t")
-            .unwrap();
-        let mv = || ast::QualifiedName::single(ast::Name::exact("mv".to_string()));
-        let statements = [
-            ast::Stmt::AlterTable(ast::AlterTable {
-                name: mv(),
-                body: ast::AlterTableBody::EnableRowSecurity,
-            }),
-            ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
-                policy_name: ast::Name::exact("p".to_string()),
-                tbl_name: mv(),
-                permissive: true,
-                command: ast::PolicyCommand::All,
-                roles: vec![ast::Grantee::Public],
-                using_expr: None,
-                check_expr: None,
-            })),
-        ];
-
-        for statement in statements {
-            let sql = statement.to_string();
-            let error = conn
-                .prepare_translated_cmd(ast::Cmd::Stmt(statement), &sql)
-                .unwrap_err();
-
-            assert!(
-                error.to_string().contains("\"mv\" is not a table"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn enabling_row_security_fails_under_a_dialect_without_it() {
-        let db = Database::open_file(
-            Arc::new(MemoryIO::new()),
-            ":memory:",
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-        let enable = ast::Cmd::Stmt(ast::Stmt::AlterTable(ast::AlterTable {
-            name: ast::QualifiedName::single(ast::Name::exact("t".to_string())),
-            body: ast::AlterTableBody::EnableRowSecurity,
-        }));
-
-        let error = conn
-            .prepare_translated_cmd(enable, "ALTER TABLE t ENABLE ROW LEVEL SECURITY")
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("row-level security is not supported"),
-            "{error}"
-        );
     }
 }

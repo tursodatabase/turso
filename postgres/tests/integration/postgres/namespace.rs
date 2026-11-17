@@ -494,6 +494,32 @@ fn serial_tables_of_two_schemas_keep_their_sequences(db: TempDatabase) {
     }
 }
 
+#[turso_macros::test(mvcc)]
+fn vacuum_keeps_the_sequences_of_bigserial_columns_of_a_namespace(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE t (id bigserial, v text)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.t (id smallserial, v text)")
+        .unwrap();
+    conn.execute("INSERT INTO t (v) VALUES ('a'), ('b')")
+        .unwrap();
+    conn.execute("INSERT INTO app.t (v) VALUES ('c')").unwrap();
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().execute("VACUUM").unwrap();
+
+    assert_eq!(
+        pg_query_i64(&conn, "INSERT INTO t (v) VALUES ('d') RETURNING id"),
+        3
+    );
+    assert_eq!(
+        pg_query_i64(&conn, "INSERT INTO app.t (v) VALUES ('e') RETURNING id"),
+        2
+    );
+}
+
 /// VACUUM INTO copies the indexes of the tables of every schema, public
 /// included, whose stored text names the table by its mangled name.
 #[turso_macros::test]

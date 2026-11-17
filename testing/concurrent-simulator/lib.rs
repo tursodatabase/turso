@@ -1255,10 +1255,12 @@ impl Whopper {
             )));
             if let Err(e) = op.init_op(&mut ctx) {
                 let err = e.to_string().to_lowercase();
-                // Allow "no such table/index" and "already exists" errors
+                // Allow "no such table/index" and "already exists" errors, and
+                // the refusal to drop a sequence that a table still uses
                 if err.contains("no such")
                     || err.contains("already exists")
                     || err.contains("not exist")
+                    || err.contains("other objects depend on it")
                 {
                     debug!("init operation skipped: {}", err);
                     return Ok(());

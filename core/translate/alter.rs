@@ -21,6 +21,10 @@ use super::{
 };
 use crate::{
     function::{AlterTableFunc, Func},
+    schema::alter_table::{
+        rename_identifiers, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
+        rewrite_view_sql_for_column_rename,
+    },
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
         ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -41,8 +45,7 @@ use crate::{
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
-        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+        parse_numeric_literal,
     },
     vdbe::{
         affinity::Affinity,
@@ -1227,7 +1230,34 @@ pub fn translate_alter_table(
                 None
             };
 
+            let owned_sequences = if database_id == crate::MAIN_DB_ID {
+                resolver.catalog.dialect.owned_sequences(
+                    resolver.schema(),
+                    namespace.id,
+                    &table_name_norm,
+                    Some(&column_name_norm),
+                )
+            } else {
+                Vec::new()
+            };
+            if let Some(usage) = schema::find_object_using_sequence(
+                resolver,
+                connection,
+                namespace,
+                &owned_sequences,
+                schema::DroppedWithSequences::Column {
+                    table: &table_name_norm,
+                    column: &column_name_norm,
+                },
+            )? {
+                crate::bail_parse_error!(
+                    "cannot drop column {} of table {} because other objects depend on it: {usage}",
+                    column_name_norm,
+                    table_name_norm
+                );
+            }
             let mut rewrite_rows_result = Ok(());
+            let mut owned_sequences_result = Ok(());
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1248,6 +1278,12 @@ pub fn translate_alter_table(
                             database_id,
                         );
                     }
+                    owned_sequences_result = owned_sequences.iter().try_for_each(|sequence| {
+                        crate::translate::sequence::emit_drop_sequence(
+                            program, resolver, connection, namespace, sequence,
+                        )
+                        .map(|_| ())
+                    });
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1264,7 +1300,8 @@ pub fn translate_alter_table(
                     })
                 },
             )?;
-            rewrite_rows_result?
+            rewrite_rows_result?;
+            owned_sequences_result?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def
@@ -2503,6 +2540,22 @@ pub fn translate_alter_table(
                 )?;
             }
 
+            if col_name != old_column_name
+                && schema::dialect_relation_hooks_apply(connection, database_id)?
+            {
+                resolver.catalog.dialect.translate_catalog_changes(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    &[CatalogChange::RenameColumn {
+                        namespace: namespace.id,
+                        table: normalize_ident(table_name),
+                        old_name: old_column_name.to_string(),
+                        new_name: col_name.to_string(),
+                    }],
+                )?;
+            }
+
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::SchemaVersion,
@@ -2537,8 +2590,7 @@ pub fn translate_alter_table(
 /// relation of another kind.
 ///
 /// [`crate::translate::roles::check_statement_privileges`] lets a superuser
-/// run it, and the owner when it names a role it may set, which without
-/// role membership is itself.
+/// run it, and the owner when it names a role it may set.
 fn translate_alter_owner(
     qualified_name: &ast::QualifiedName,
     kind: RelationKind,
@@ -3606,7 +3658,7 @@ impl<'a> ColumnRenameMode<'a> {
 struct TargetQualifiers {
     names: Vec<String>,
     unqualified_column_is_from_other_table: bool,
-    ctes: rustc_hash::FxHashMap<String, crate::util::ViewColumnSchema>,
+    ctes: rustc_hash::FxHashMap<String, crate::schema::view::ViewColumnSchema>,
 }
 
 impl TargetQualifiers {
@@ -3651,7 +3703,7 @@ impl TargetQualifiers {
                 _ => {
                     other_table_has_column |= resolver
                         .with_schema(database_id, |schema| {
-                            crate::util::select_table_column_names(
+                            crate::schema::view::select_table_column_names(
                                 NamespaceId::ROOT,
                                 select_table,
                                 schema,
@@ -4119,7 +4171,7 @@ fn apply_select_for_column_rename(
 ) -> Result<()> {
     let outer_target_qualifiers = &TargetQualifiers {
         ctes: resolver.with_schema(database_id, |schema| {
-            crate::util::extract_cte_columns(
+            crate::schema::view::extract_cte_columns(
                 NamespaceId::ROOT,
                 &select.with,
                 schema,
@@ -4187,7 +4239,7 @@ fn apply_select_for_column_rename(
     // the alias label, which is independent of the renamed table column.
     let body = &select.body;
     for sorted_col in &mut select.order_by {
-        if crate::util::is_order_by_alias_ref(body, &sorted_col.expr, old_col_norm) {
+        if crate::schema::alter_table::is_order_by_alias_ref(body, &sorted_col.expr, old_col_norm) {
             continue;
         }
         apply_expr_for_column_rename(
@@ -5887,7 +5939,7 @@ fn collect_select_table_visible_columns_from_output(
 }
 
 fn collect_one_select_output_columns(one_select: &ast::OneSelect) -> Vec<String> {
-    crate::util::output_column_aliases(one_select)
+    crate::schema::alter_table::output_column_aliases(one_select)
 }
 
 /// Check a single expression node for invalid column references after a DROP COLUMN.

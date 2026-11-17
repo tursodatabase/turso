@@ -14,6 +14,14 @@ use crate::mvcc::database::{
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
+use crate::schema::alter_table::{
+    rename_identifiers, rewrite_check_expr_table_refs,
+    rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
+    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    RewrittenView,
+};
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
@@ -37,14 +45,7 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::types::{StorageClass, StrictType};
-use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
-    rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
-    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
-    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trim_ascii_whitespace, RewrittenView,
-};
+use crate::util::{escape_sql_string_literal, normalize_ident, trim_ascii_whitespace};
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
@@ -4249,7 +4250,7 @@ pub enum OpTransactionState {
 
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum TransactionYieldPoint {
+pub enum TransactionYieldPoint {
     BeforeStart,
     BeforeMvccBegin,
 }
@@ -19546,6 +19547,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::security::roles::SessionRole;
     use crate::translate::collate::CollationSeq;
+    use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
     use crate::vdbe::BranchOffset;
     use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
@@ -19593,7 +19595,7 @@ mod tests {
     }
 
     fn assert_set_subtype_error(subtype: Value, expected_message: &str) {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let mut state = ProgramState::new(2, 0);
         let original = Value::build_text("unchanged");
         state.set_register(0, Register::Value(subtype));
@@ -19602,7 +19604,7 @@ mod tests {
             subtype_reg: 0,
             dest_reg: 1,
         };
-        let err = match op_set_subtype(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_set_subtype(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("invalid subtype must fail"),
             Err(err) => err,
         };
@@ -19614,7 +19616,7 @@ mod tests {
         assert_eq!(state.get_register(1).get_value(), &original);
     }
 
-    fn prepare_test_statement() -> Statement {
+    fn empty_program() -> (Program, Arc<Pager>) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
             io,
@@ -19628,7 +19630,11 @@ mod tests {
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.prepare("SELECT 1;").unwrap()
+        let pager = conn.get_pager();
+        let builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
+        let program = builder.build(conn, false, "").unwrap();
+        (program, pager)
     }
 
     fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
@@ -19670,71 +19676,6 @@ mod tests {
         let partition_idx = ht.partition_for_keys(&probe_key).unwrap();
 
         (ht, probe_key, partition_idx)
-    }
-
-    /// test to check that vacuum into connection state is reset if it is
-    /// interrupted mid way
-    #[test]
-    fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-
-        let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
-        let did_interrupt = Arc::new(AtomicBool::new(false));
-        let conn_for_progress = conn.clone();
-        let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
-        let did_interrupt_for_handler = did_interrupt.clone();
-        conn.set_progress_handler(
-            1,
-            Some(Box::new(move || {
-                if !conn_for_progress.get_auto_commit() {
-                    let calls =
-                        source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
-                    calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
-                } else {
-                    false
-                }
-            })),
-        );
-
-        let dest_dir = tempfile::TempDir::new().unwrap();
-        let dest_path = dest_dir.path().join("busy_vacuum.db");
-        let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
-        let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
-        let step = stmt.step().unwrap();
-        conn.set_progress_handler(0, None);
-
-        assert!(
-            matches!(step, StepResult::Busy),
-            "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
-        );
-        assert!(
-            source_txn_progress_calls.load(Ordering::SeqCst) > 10,
-            "test should interrupt after VACUUM INTO opens the source transaction"
-        );
-        assert!(
-            did_interrupt.load(Ordering::SeqCst),
-            "progress handler should have interrupted VACUUM INTO exactly once"
-        );
-        assert!(
-            conn.get_auto_commit(),
-            "Busy cleanup should roll back the source transaction before returning"
-        );
     }
 
     /// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
@@ -19835,109 +19776,8 @@ mod tests {
     }
 
     #[test]
-    fn test_in_place_vacuum_succeeds_and_releases_source_locks() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            "in-place-vacuum-design-b.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        for i in 0..128 {
-            conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
-                .unwrap();
-        }
-        conn.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
-
-        conn.execute("VACUUM").unwrap();
-
-        let mut stmt = conn
-            .prepare("SELECT count(*), coalesce(sum(id), 0) FROM t")
-            .unwrap();
-        let mut count = 0_i64;
-        let mut sum = 0_i64;
-        stmt.run_with_row_callback(|row| {
-            count = row.get(0)?;
-            sum = row.get(1)?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(count, 64);
-        assert_eq!(sum, (1..128).step_by(2).sum::<i64>());
-        assert!(conn.get_auto_commit());
-
-        let pager = conn.pager.load();
-        assert!(!pager.holds_read_lock());
-        assert!(!pager.holds_write_lock());
-    }
-
-    #[test]
-    fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            "in-place-vacuum-busy-before-copyback.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
-            .unwrap();
-        for i in 0..32 {
-            conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
-                .unwrap();
-        }
-
-        let did_interrupt = Arc::new(AtomicBool::new(false));
-        let conn_for_progress = conn.clone();
-        let did_interrupt_for_handler = did_interrupt.clone();
-        conn.set_progress_handler(
-            1,
-            Some(Box::new(move || {
-                !conn_for_progress.get_auto_commit()
-                    && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
-            })),
-        );
-
-        let mut stmt = conn.prepare("VACUUM").unwrap();
-        let step = stmt.step().unwrap();
-        conn.set_progress_handler(0, None);
-
-        assert!(
-            matches!(step, StepResult::Busy),
-            "progress interruption inside in-place VACUUM should surface as Busy, got {step:?}"
-        );
-        assert!(
-            did_interrupt.load(Ordering::SeqCst),
-            "test should interrupt after in-place VACUUM opens the source snapshot"
-        );
-        assert!(
-            conn.get_auto_commit(),
-            "Busy cleanup should restore auto-commit before returning"
-        );
-        let pager = conn.pager.load();
-        assert!(!pager.holds_read_lock());
-        assert!(!pager.holds_write_lock());
-    }
-
-    #[test]
     fn test_hash_probe_rejects_unloaded_spilled_partition_without_probe_rowid() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let (ht, probe_key, _) = make_spilled_hash_table();
 
         let mut state = ProgramState::new(2, 0);
@@ -19956,7 +19796,7 @@ mod tests {
             probe_rowid_reg: None,
         };
 
-        let err = match op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_hash_probe(&program, &mut state, &insn, &pager) {
             Ok(_) => {
                 panic!("HashProbe should reject grace-only probing without a loaded partition")
             }
@@ -19976,7 +19816,7 @@ mod tests {
 
     #[test]
     fn test_hash_probe_allows_grace_style_probe_after_partition_preload() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let (mut ht, probe_key, partition_idx) = make_spilled_hash_table();
 
         loop {
@@ -20011,7 +19851,7 @@ mod tests {
             probe_rowid_reg: None,
         };
 
-        let step = op_hash_probe(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+        let step = op_hash_probe(&program, &mut state, &insn, &pager)
             .expect("preloaded grace probe should succeed");
         assert!(matches!(step, InsnFunctionStepResult::Step));
         assert_eq!(state.pc, 1, "matching probe should fall through");
@@ -20024,7 +19864,7 @@ mod tests {
 
     #[test]
     fn test_decr_jump_zero_non_integer_register_returns_error() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
 
         let mut state = ProgramState::new(1, 0);
         state.set_register(0, Register::Value(Value::Text("not-an-int".into())));
@@ -20034,7 +19874,7 @@ mod tests {
             target_pc: crate::vdbe::BranchOffset::Offset(1),
         };
 
-        let err = match op_decr_jump_zero(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_decr_jump_zero(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("non-integer register must fail"),
             Err(err) => err,
         };
@@ -20044,7 +19884,7 @@ mod tests {
 
     #[test]
     fn test_make_record_overlapping_dest_returns_error() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
 
         let mut state = ProgramState::new(3, 0);
         for i in 0..3 {
@@ -20058,7 +19898,7 @@ mod tests {
             affinity_str: None,
         };
 
-        let err = match op_make_record(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_make_record(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("overlapping destination register must fail"),
             Err(err) => err,
         };
@@ -20070,7 +19910,7 @@ mod tests {
 
     #[test]
     fn test_sorter_data_unpaired_content_register_returns_error() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
 
         // Pseudo cursor 1 exposes register 2, but SorterData targets register 3.
         let mut state = ProgramState::new(4, 2);
@@ -20081,7 +19921,7 @@ mod tests {
             pseudo_cursor: 1,
         };
 
-        let err = match op_sorter_data(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+        let err = match op_sorter_data(&program, &mut state, &insn, &pager) {
             Ok(_) => panic!("unpaired content register must fail"),
             Err(err) => err,
         };
@@ -20100,7 +19940,7 @@ mod tests {
 
     #[test]
     fn if_null_row_does_nothing_for_unopened_cursor() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let mut state = ProgramState::new(1, 1);
         state.set_register(0, Register::Value(Value::from_i64(7)));
         let insn = Insn::IfNullRow {
@@ -20109,7 +19949,7 @@ mod tests {
             dest: 0,
         };
 
-        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+        let step = op_if_null_row(&program, &mut state, &insn, &pager)
             .expect("IfNullRow must accept an unopened cursor");
 
         assert!(matches!(step, InsnFunctionStepResult::Step));
@@ -20119,7 +19959,7 @@ mod tests {
 
     #[test]
     fn if_null_row_clears_destination_and_jumps() {
-        let stmt = prepare_test_statement();
+        let (program, pager) = empty_program();
         let mut state = ProgramState::new(1, 1);
         state.cursors[0] = Some(Cursor::NullRow);
         state.set_register(0, Register::Value(Value::from_i64(7)));
@@ -20129,7 +19969,7 @@ mod tests {
             dest: 0,
         };
 
-        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+        let step = op_if_null_row(&program, &mut state, &insn, &pager)
             .expect("IfNullRow must accept a null-row cursor");
 
         assert!(matches!(step, InsnFunctionStepResult::Step));
@@ -20542,32 +20382,6 @@ mod tests {
         assert!(
             result.is_err(),
             "Should error on count exceeding payload length"
-        );
-    }
-
-    #[test]
-    fn test_negate_blob_subscript_invalid_utf8_no_panic() {
-        // Reproduces fuzzer bug at seed 27035.
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")
-        }));
-        assert!(
-            result.is_ok(),
-            "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
     }
 }

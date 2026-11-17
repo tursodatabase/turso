@@ -1,5 +1,6 @@
 mod acl;
 mod auth_functions;
+mod auth_members;
 mod catalog;
 mod classes;
 mod copy;
@@ -14,6 +15,7 @@ mod schema_state;
 mod session;
 mod settings;
 mod statement;
+mod unique_index;
 mod unnest;
 
 pub use catalog::PostgresDialect;

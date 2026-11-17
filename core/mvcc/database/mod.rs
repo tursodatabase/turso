@@ -60,12 +60,10 @@ use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
 
-pub mod checkpoint_state_machine;
+pub mod checkpoint;
 #[cfg(not(nightly))]
 mod version_chain;
-pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
-};
+pub use checkpoint::{sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -84,8 +82,6 @@ use super::portable_logical::{
     portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
-#[cfg(test)]
-pub mod hermitage_tests;
 #[cfg(test)]
 pub mod tests;
 
@@ -1323,7 +1319,7 @@ impl<A: RowVersionAllocator> std::fmt::Display for Transaction<A> {
 
 /// Transaction state.
 #[derive(Debug, Clone, PartialEq, Copy)]
-enum TransactionState {
+pub enum TransactionState {
     Active,
     /// Preparing state includes the end_ts so other transactions can compare
     /// timestamps during validation to resolve races (first-committer-wins).
@@ -1538,7 +1534,7 @@ pub struct RewriteLiveVersionsCtx {
 /// How many rowids `BuildLogRecord` / `RewriteLiveVersions` process before
 /// yielding to the executor. Picked to amortize state-machine overhead
 /// while keeping a CREATE INDEX on a 2M-row table responsive.
-const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
+pub const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub enum WriteRowState {
@@ -1555,7 +1551,7 @@ pub enum WriteRowState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CommitYieldPoint {
+pub enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     /// Fires once on the first entry into `step_build_log_record` (cursor=0,
@@ -1585,7 +1581,7 @@ pub(crate) enum CommitYieldPoint {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum ExclusiveTxYieldPoint {
+pub enum ExclusiveTxYieldPoint {
     AfterTimestampCheckBeforeCas,
 }
 
@@ -4343,11 +4339,31 @@ impl RootEntry {
     }
 }
 
-/// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
-/// Test-only harness data, not part of the public MVCC API.
-#[cfg(test)]
+/// What a transaction looked like when [`MvStore::tx_snapshot`] read it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TxSnapshot {
+    pub state: TransactionState,
+    pub begin_ts: u64,
+    /// Number of transactions this one waits for before it can commit.
+    pub commit_dep_count: u64,
+    /// Whether a transaction this one waited for aborted, so that this one has to abort too.
+    pub abort_now: bool,
+    /// Whether the commit record of this transaction is in the logical log.
+    pub log_appended: bool,
+}
+
+/// Commit timestamps that say how far the commits and the checkpoints of a store have come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GcDebugSnapshot {
+pub struct Watermarks {
+    /// Commit timestamp of the newest committed transaction.
+    pub last_committed_tx_ts: u64,
+    /// Highest commit timestamp that a checkpoint has made durable.
+    pub durable_txid_max: u64,
+}
+
+/// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcDebugSnapshot {
     pub rows_slots: usize,
     pub rows_empty_slots: usize,
     pub rows_versions: usize,
@@ -4361,6 +4377,13 @@ pub(crate) struct GcDebugSnapshot {
     pub logical_log_offset: u64,
     pub logical_log_size: u64,
     pub active_txs: usize,
+    /// Number of removed transactions whose final state the store still remembers.
+    pub finalized_tx_states: usize,
+    /// Whether the incremental GC of table rows stopped part way, so that the next pass
+    /// continues from there instead of from the first row.
+    pub table_sweep_unfinished: bool,
+    /// Like `table_sweep_unfinished`, for index rows.
+    pub index_sweep_unfinished: bool,
     pub min_reader_mark: WalPos,
     pub backfill_floor: WalPos,
 }
@@ -6677,17 +6700,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This function starts a new transaction in the database and returns a `TxID` value
     /// that you can use to perform operations within the transaction. All changes made within the
     /// transaction are isolated from other transactions until you commit the transaction.
-    #[cfg(any(test, feature = "bench"))]
     pub fn begin_tx(&self, pager: Arc<Pager>) -> Result<TxID> {
         self.begin_tx_with_schema_generation(pager, None)
     }
 
     /// `begin_tx` with the connection's validated `schema_generation` gate (see
-    /// `Connection::mvcc_begin_schema_generation`). Used by the statement begin path so a passive
-    /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
-    /// of a transaction beginning against stale roots.
-    #[cfg(any(test, feature = "bench"))]
-    pub fn begin_tx_with_schema_generation(
+    /// `Connection::mvcc_begin_schema_generation`). With the gate, a passive checkpoint that
+    /// republishes physical roots into the begin window forces a reprepare instead of a
+    /// transaction beginning against stale roots.
+    pub(crate) fn begin_tx_with_schema_generation(
         &self,
         pager: Arc<Pager>,
         expected_schema_generation: Option<u64>,
@@ -7460,6 +7481,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Some(self.txs.get(&tx_id)?.value().write_set.lock().len())
     }
 
+    /// What the transaction looks like now, or None when the store no longer tracks it.
+    pub fn tx_snapshot(&self, tx_id: TxID) -> Option<TxSnapshot> {
+        let tx = self.txs.get(&tx_id)?;
+        let tx = tx.value();
+        Some(TxSnapshot {
+            state: tx.state.load(),
+            begin_ts: tx.begin_ts,
+            commit_dep_count: tx.commit_dep_counter.load(Ordering::Acquire),
+            abort_now: tx.abort_now.load(Ordering::Acquire),
+            log_appended: tx.log_appended.load(Ordering::Acquire),
+        })
+    }
+
+    /// How far commits and checkpoints of this store have come.
+    pub fn watermarks(&self) -> Watermarks {
+        Watermarks {
+            last_committed_tx_ts: self.last_committed_tx_ts.load(Ordering::SeqCst),
+            durable_txid_max: self.durable_txid_max.load(Ordering::SeqCst),
+        }
+    }
+
     /// Rolls back a savepoint within a transaction.
     /// Returns true if a savepoint was rolled back, false if no savepoint was active.
     pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<bool> {
@@ -8025,8 +8067,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Debug SkipMap / GC counters. Walks every chain; not for hot paths.
-    #[cfg(test)]
-    pub(crate) fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
+    pub fn debug_gc_snapshot(&self) -> GcDebugSnapshot {
         let mut rows_empty_slots = 0;
         let mut rows_versions = 0;
         for entry in self.rows.iter() {
@@ -8065,6 +8106,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             logical_log_offset: self.logical_log_offset(),
             logical_log_size: self.get_logical_log_file().size().unwrap_or(0),
             active_txs: self.txs.len(),
+            finalized_tx_states: self.finalized_tx_states.len(),
+            table_sweep_unfinished: self.gc_table_cursor.lock().is_some(),
+            index_sweep_unfinished: self.gc_index_cursor.lock().is_some(),
             min_reader_mark: self.compute_min_reader_mark(),
             backfill_floor: *self.backfill_floor.read(),
         }
@@ -10204,9 +10248,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 };
                                 let has_btree = match row_type {
                                     "index" => root_page != 0,
-                                    "table" => {
-                                        !sql.is_some_and(crate::util::sql_is_create_virtual_table)
-                                    }
+                                    "table" => !sql
+                                        .is_some_and(crate::dialect::sql_is_create_virtual_table),
                                     _ => false,
                                 };
                                 if has_btree {
@@ -10649,6 +10692,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
+    }
+
+    /// Whether the logical log has reached the checkpoint threshold, so that the next commit
+    /// starts a checkpoint.
+    pub fn should_checkpoint(&self) -> bool {
+        self.storage.should_checkpoint()
     }
 
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {

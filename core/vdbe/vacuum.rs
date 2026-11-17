@@ -1,11 +1,10 @@
 use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
-use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
-use crate::schema::{BTreeTable, Schema, TypeDef};
+use crate::schema::{BTreeTable, Schema, SequencesByNamespace, TypeDef};
 use crate::security::roles::SessionRole;
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
@@ -1781,7 +1780,7 @@ fn install_mvcc_state_after_vacuum_commit(
 /// state machine.
 fn capture_target_metadata(
     temp_db: &VacuumTempDb,
-    source_sequences: FxHashMap<String, Arc<crate::schema::Sequence>>,
+    source_sequences: SequencesByNamespace,
 ) -> Result<VacuumCommittedImageMeta> {
     let temp_conn = &temp_db.conn;
     let temp_pager = temp_conn.get_pager();
@@ -1850,11 +1849,7 @@ fn reload_physical_schema_for_mvcc_vacuum(
     // blocking `Schema::populate_sequences` and `populate_sequences_via_sql`
     // helpers, which violate the vdbe async contract from inside the
     // VACUUM state machine.
-    let preserved_sequences = connection
-        .schema
-        .read()
-        .sequences_by_name(NamespaceId::ROOT)
-        .clone();
+    let preserved_sequences = connection.schema.read().sequences_by_namespace();
     let reparse_result = connection.read_current_schema_cookie().and_then(|cookie| {
         connection.reparse_schema_with_cookie_keeping_sequences(cookie, preserved_sequences)
     });
@@ -2069,11 +2064,7 @@ fn vacuum_in_place_step(
                 let temp_db_ref = temp_db
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
-                let source_sequences = connection
-                    .schema
-                    .read()
-                    .sequences_by_name(NamespaceId::ROOT)
-                    .clone();
+                let source_sequences = connection.schema.read().sequences_by_namespace();
                 *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
@@ -3058,7 +3049,7 @@ mod tests {
         }
         temp.conn.execute("COMMIT")?;
 
-        let committed = capture_target_metadata(&temp, FxHashMap::default())?;
+        let committed = capture_target_metadata(&temp, SequencesByNamespace::new())?;
 
         assert_eq!(committed.header.schema_cookie.get(), 42);
         assert_eq!(committed.header.read_version, mvcc_version);
@@ -3220,92 +3211,6 @@ mod tests {
             Ok(())
         })?;
         assert_eq!(copied_rows, Some(8));
-
-        Ok(())
-    }
-
-    #[test]
-    fn in_place_vacuum_with_sync_off_syncs_source_db_once_and_wal_twice() -> Result<()> {
-        let io = Arc::new(SyncCountingIo::new("vacuum-source.db"));
-        let io_dyn: Arc<dyn IO> = io.clone();
-        let db = Database::open_file_with_flags(
-            io_dyn,
-            "vacuum-source.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_sync_mode(crate::SyncMode::Off);
-
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        conn.execute("INSERT INTO t VALUES (1, 'x')")?;
-        conn.execute("INSERT INTO t VALUES (2, 'y')")?;
-
-        let before = io.counts();
-        assert_eq!(
-            before.db, 1,
-            "creating the database does exactly one source db fsync (page 1 must be \
-             durable before the first WAL commit, even with synchronous=OFF); \
-             ordinary writes must not add more"
-        );
-
-        conn.execute("VACUUM")?;
-
-        let after = io.counts();
-        assert_eq!(
-            after.db - before.db,
-            1,
-            "in-place VACUUM must do exactly one source DB fsync before truncating WAL"
-        );
-        assert_eq!(
-            after.wal - before.wal,
-            2,
-            "in-place VACUUM with synchronous=OFF must do one WAL fsync before backfill \
-             (the checkpoint crash-atomicity barrier; VACUUM forces the checkpoint to \
-             synchronous=FULL) and one after truncation"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> Result<()> {
-        let io = Arc::new(SyncCountingIo::new("vacuum-source-full.db"));
-        let io_dyn: Arc<dyn IO> = io.clone();
-        let db = Database::open_file_with_flags(
-            io_dyn,
-            "vacuum-source-full.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(EngineDialect),
-        )?;
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        conn.set_sync_mode(crate::SyncMode::Off);
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-        conn.execute("INSERT INTO t VALUES (1, 'x')")?;
-        conn.execute("INSERT INTO t VALUES (2, 'y')")?;
-
-        conn.set_sync_mode(crate::SyncMode::Full);
-        let before = io.counts();
-
-        conn.execute("VACUUM")?;
-
-        let after = io.counts();
-        assert_eq!(
-            after.db - before.db,
-            1,
-            "in-place VACUUM must still do exactly one source DB fsync under synchronous=FULL"
-        );
-        assert_eq!(
-            after.wal - before.wal,
-            3,
-            "in-place VACUUM with synchronous=FULL must do one WAL fsync before publish, \
-             one before backfill (the checkpoint crash-atomicity barrier), and one after \
-             truncation"
-        );
 
         Ok(())
     }

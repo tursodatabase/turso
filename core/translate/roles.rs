@@ -86,7 +86,9 @@ pub fn check_statement_privileges(
             )
         }
         // The dialect decides who may grant or revoke on each relation, from
-        // the privileges it stores.
+        // the privileges it stores, and who may grant or revoke role
+        // membership, after it looks up the roles so that a role that does
+        // not exist is reported as such.
         ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
         // on the index's schema, which only a superuser has until GRANT
@@ -118,14 +120,29 @@ pub fn check_statement_privileges(
             };
             match &alter.body {
                 // The owner may give its relation to a role it may set
-                // itself, as in PostgreSQL; without role membership that is
-                // itself, which changes nothing. Anyone else must be the
-                // owner.
+                // itself, such as a role it is a member of, as in
+                // PostgreSQL. Anyone else must be the owner.
                 ast::AlterTableBody::OwnerTo { role, .. } if owner => {
-                    if may_set_role(resolver, connection, role) {
-                        return Ok(());
+                    match settable_role(resolver, connection, role) {
+                        // As in PostgreSQL, a new owner also needs CREATE on
+                        // the relation's schema, which only a superuser has
+                        // until GRANT on schemas exists. Giving the relation
+                        // to the role that owns it changes nothing.
+                        Some(new_owner)
+                            if resolver
+                                .catalog
+                                .dialect
+                                .role_is_superuser(resolver.schema(), new_owner)
+                                || table_owner(resolver, &alter.name) == Some(new_owner) =>
+                        {
+                            return Ok(())
+                        }
+                        Some(_) => create_in_schema_denial(&alter.name),
+                        None => PermissionDenied::privilege(
+                            Action::SetRole,
+                            Object::Role(role_spec_name(role)),
+                        ),
                     }
-                    PermissionDenied::privilege(Action::SetRole, Object::Role(role_spec_name(role)))
                 }
                 ast::AlterTableBody::OwnerTo { .. } => owner_denial(),
                 // Renaming also needs CREATE on the schema, as in
@@ -235,7 +252,8 @@ pub fn check_statement_privileges(
 }
 
 /// Whether the current role may run an owner-gated statement on the table or
-/// view `name` names: the dialect says the role owns it. A relation that does not
+/// view `name` names: the role has the privileges of the owner, as the
+/// owner itself does. A relation that does not
 /// resolve is let through, so the statement fails in translation with its
 /// usual missing-relation error, as PostgreSQL orders the checks.
 fn may_act_as_owner_of_table(
@@ -258,8 +276,45 @@ fn may_act_as_owner(
     let Some(namespace) = namespace else {
         return true;
     };
+    relation_owner(resolver, namespace, name).is_some_and(|owner| {
+        resolver.catalog.dialect.role_has_privileges_of(
+            resolver.schema(),
+            connection.current_role(),
+            owner,
+        )
+    })
+}
+
+/// The role `role` names, if the current role may `SET ROLE` to it, which
+/// is what giving a relation to `role` takes.
+fn settable_role(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    role: &ast::RoleSpec,
+) -> Option<RoleId> {
+    let dialect = &resolver.catalog.dialect;
+    let schema = resolver.schema();
+    let target = match role {
+        ast::RoleSpec::CurrentRole => Some(connection.current_role()),
+        ast::RoleSpec::SessionUser => Some(connection.session_role()),
+        ast::RoleSpec::Name(name) => dialect.role_by_name(schema, name),
+    }?;
+    dialect
+        .can_set_role(schema, connection.current_role(), target)
+        .then_some(target)
+}
+
+/// The role that owns the table or view `name` of the main database names.
+fn table_owner(resolver: &Resolver, name: &ast::QualifiedName) -> Option<RoleId> {
+    let namespace = resolver.find_existing_table(name).ok().flatten()?;
+    relation_owner(resolver, namespace, name.name.as_str())
+}
+
+/// The role that owns relation `name` of `namespace`, as the dialect stores
+/// it. Only relations of the main database have an owner.
+fn relation_owner(resolver: &Resolver, namespace: NamespaceRef, name: &str) -> Option<RoleId> {
     if namespace.database_id != MAIN_DB_ID {
-        return false;
+        return None;
     }
     let normalized = crate::util::normalize_ident(name);
     resolver.with_schema(MAIN_DB_ID, |schema| {
@@ -267,21 +322,7 @@ fn may_act_as_owner(
             .catalog
             .dialect
             .relation_owner(schema, namespace.id, &normalized)
-            == Some(connection.current_role())
     })
-}
-
-/// Whether the session may `SET ROLE` to `role`, which is what giving a
-/// relation to `role` takes.
-fn may_set_role(resolver: &Resolver, connection: &Arc<Connection>, role: &ast::RoleSpec) -> bool {
-    let dialect = &resolver.catalog.dialect;
-    let schema = resolver.schema();
-    let target = match role {
-        ast::RoleSpec::CurrentRole => Some(connection.current_role()),
-        ast::RoleSpec::SessionUser => Some(connection.session_role()),
-        ast::RoleSpec::Name(name) => dialect.role_by_name(schema, name),
-    };
-    target.is_some_and(|target| dialect.can_set_role(schema, connection.current_role(), target))
 }
 
 /// The name a denial calls `role` by.
@@ -529,16 +570,33 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT` and `REVOKE`: the dialect changes the privileges it stores with
-/// each relation, through its relation hooks, as it stores ownership.
+/// `GRANT` and `REVOKE`. Of privileges on relations, the dialect changes
+/// the privileges it stores with each relation, through its relation hooks,
+/// as it stores ownership. Of roles, the dialect stores the membership,
+/// through the same hook as its other catalog changes.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let mut changes = Vec::with_capacity(grant.relations.len());
-    for qualified_name in &grant.relations {
+    let (privileges, on_sequences, relations) = match &grant.objects {
+        ast::GrantObjects::Relations {
+            privileges,
+            on_sequences,
+            relations,
+        } => (privileges, on_sequences, relations),
+        ast::GrantObjects::Roles(roles) => {
+            let change = CatalogChange::GrantRole {
+                revoke: grant.revoke,
+                roles: roles.clone(),
+                grantees: grant.grantees.clone(),
+            };
+            return translate_change(change, resolver, program, connection);
+        }
+    };
+    let mut changes = Vec::with_capacity(relations.len());
+    for qualified_name in relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
         // A schema that does not exist is reported as such, not as a
         // missing relation.
@@ -556,7 +614,7 @@ pub fn translate_grant(
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
         }
-        if grant.on_sequences && kind != ast::RelationKind::Sequence {
+        if *on_sequences && kind != ast::RelationKind::Sequence {
             bail_parse_error!("\"{normalized_name}\" is not a sequence");
         }
         // Only the main database has dialect schema state to store the
@@ -568,7 +626,7 @@ pub fn translate_grant(
             revoke: grant.revoke,
             namespace: namespace.id,
             name: normalized_name,
-            privileges: grant.privileges.clone(),
+            privileges: privileges.clone(),
             grantees: grant.grantees.clone(),
         });
     }
@@ -598,43 +656,4 @@ pub fn translate_create_role(
         options,
     };
     translate_change(change, resolver, program, connection)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::security::roles::SessionRole;
-    use std::sync::Arc;
-
-    use turso_parser::ast;
-
-    use crate::{Connection, Database, EngineDialect, MemoryIO};
-
-    #[test]
-    fn create_role_fails_under_a_dialect_without_roles() {
-        let db = Database::open_file(
-            Arc::new(MemoryIO::new()),
-            ":memory:",
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        let error = create_role(&conn, "alice").unwrap_err();
-
-        assert!(
-            error.to_string().contains("CREATE ROLE is not supported"),
-            "{error}"
-        );
-    }
-
-    fn create_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {
-        let create_role = ast::Cmd::Stmt(ast::Stmt::CreateRole {
-            role_name: name.to_string(),
-            options: ast::RoleOptions::default(),
-        });
-        conn.prepare_translated_cmd(create_role, &format!("CREATE ROLE {name}"))?
-            .run_ignore_rows()
-    }
 }

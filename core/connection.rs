@@ -4,6 +4,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::schema::SequencesByNamespace;
 use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
@@ -14,6 +15,7 @@ use crate::sync::{
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::IOResult;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -72,7 +74,7 @@ fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
 }
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TransactionState {
+pub enum TransactionState {
     Write {
         schema_did_change: bool,
     },
@@ -212,7 +214,7 @@ pub struct ReparseSchemaInner {
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
-    preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+    preserved_sequences: Option<SequencesByNamespace>,
     /// The `sqlite_schema` scan, which also collects the indexes and
     /// materialized views that are built once the types are loaded.
     parse: Box<crate::util::ParseSchemaRowsState>,
@@ -392,13 +394,80 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// How much storage the main database uses, read by
+/// [`Connection::storage_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// The page size in bytes, as `PRAGMA page_size` returns it.
+    pub page_size: u32,
+    /// The pages in the database, as `PRAGMA page_count` returns it. Under
+    /// MVCC this counts the pages as of the last checkpoint of the logical
+    /// log: rows committed since then are only in the log.
+    pub page_count: u32,
+    /// The unused pages, as `PRAGMA freelist_count` returns it. Under MVCC,
+    /// as of the last checkpoint, like `page_count`.
+    pub freelist_count: u32,
+    /// The bytes written to the MVCC logical log since its last checkpoint,
+    /// which holds every change committed since then, deleted and replaced
+    /// rows included. 0 without MVCC.
+    pub logical_log_bytes: u64,
+}
+
+/// A read of [`StorageStats`], started by [`Connection::storage_stats`].
+pub struct StorageStatsRead {
+    connection: Arc<Connection>,
+    statement: Option<Statement>,
+    stats: Option<StorageStats>,
+}
+
+impl StorageStatsRead {
+    /// Reads the counts with a query of the engine's own, which the role the
+    /// connection's user set does not limit. It runs like a top-level
+    /// statement, in its own read transaction when no transaction is open.
+    /// Returns [`IOResult::IO`] when the query waits for storage: wait for
+    /// the completions and call `read` again. Do not run other statements
+    /// on the connection until it returns [`IOResult::Done`] or an error,
+    /// or until this value is dropped.
+    pub fn read(&mut self) -> Result<IOResult<StorageStats>> {
+        let statement = match &mut self.statement {
+            Some(statement) => statement,
+            None => self
+                .statement
+                .insert(self.connection.prepare_engine_metadata_read(
+                "SELECT * FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count()",
+            )?),
+        };
+        let stats = &mut self.stats;
+        crate::return_if_io!(statement.run_with_row_callback_nonblock(|row| {
+            let count = |idx| {
+                u32::try_from(row.get::<i64>(idx)?)
+                    .map_err(|_| LimboError::InternalError("negative storage count".to_string()))
+            };
+            *stats = Some(StorageStats {
+                page_size: count(0)?,
+                page_count: count(1)?,
+                freelist_count: count(2)?,
+                logical_log_bytes: 0,
+            });
+            Ok(())
+        }));
+        let mut stats = self.stats.ok_or_else(|| {
+            LimboError::InternalError("storage stats query returned no row".to_string())
+        })?;
+        if let Some(mv_store) = self.connection.mv_store().as_ref() {
+            stats.logical_log_bytes = mv_store.logical_log_offset();
+        }
+        Ok(IOResult::Done(stats))
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
-    pub(crate) db: Arc<Database>,
+    pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -416,7 +485,7 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
-    pub(crate) syms: parking_lot::RwLock<SymbolTable>,
+    pub syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// Page size from the last `PRAGMA page_size` on any database of this connection, or 0.
@@ -533,7 +602,7 @@ pub struct Connection {
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
-    pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -553,6 +622,9 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// The namespace whose objects this connection is dropping one statement
+    /// at a time.
+    pub(super) namespace_being_dropped: RwLock<Option<NamespaceId>>,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Whether non-TEMP triggers fire for statements prepared on this
     /// connection. TEMP triggers always fire, matching SQLite's
@@ -954,7 +1026,7 @@ impl Connection {
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.
     #[inline]
-    pub(crate) fn bump_prepare_context_generation(&self) {
+    pub fn bump_prepare_context_generation(&self) {
         self.prepare_context_generation
             .fetch_add(1, Ordering::Release);
     }
@@ -1458,7 +1530,7 @@ impl Connection {
     pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
         self: &Arc<Connection>,
         cookie: u32,
-        sequences: rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>,
+        sequences: SequencesByNamespace,
     ) -> Result<()> {
         let io = self.pager.load().io.clone();
         let mut state = ReparseSchemaState::default();
@@ -1502,7 +1574,7 @@ impl Connection {
     fn init_reparse_building(
         self: &Arc<Connection>,
         cookie: u32,
-        preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+        preserved_sequences: Option<SequencesByNamespace>,
     ) -> Result<ReparseSchemaInner> {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
@@ -1613,7 +1685,7 @@ impl Connection {
                     // descriptor SELECTs can resolve the backing tables.
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.set_sequences(NamespaceId::ROOT, sequences);
+                            inner.fresh.set_sequences_by_namespace(sequences);
                             *pending = Some(crate::alloc::vec![]);
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
@@ -2077,6 +2149,18 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Names the namespace whose objects the statements prepared from now on
+    /// drop one at a time, or None. An object of that namespace that depends
+    /// on a dropped object does not stop the drop, because it is dropped too.
+    pub fn set_namespace_being_dropped(&self, namespace: Option<NamespaceId>) {
+        *self.namespace_being_dropped.write() = namespace;
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn namespace_being_dropped(&self) -> Option<NamespaceId> {
+        *self.namespace_being_dropped.read()
     }
 
     /// Turns non-TEMP triggers on or off for statements prepared from now on.
@@ -2917,6 +3001,18 @@ impl Connection {
     }
     pub fn get_page_size(&self) -> PageSize {
         self.pager.load().get_page_size_unchecked()
+    }
+
+    /// Starts reading the page size, page count and freelist count of the
+    /// main database, and the size of its MVCC logical log. An embedder uses
+    /// it to measure the database on a user's connection, whatever role the
+    /// user set.
+    pub fn storage_stats(self: &Arc<Connection>) -> StorageStatsRead {
+        StorageStatsRead {
+            connection: self.clone(),
+            statement: None,
+            stats: None,
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -4823,7 +4919,7 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
-    pub(crate) fn get_tx_state(&self) -> TransactionState {
+    pub fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
 
@@ -4855,7 +4951,7 @@ impl Connection {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
 
-    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
         *self.mv_tx.read()
     }
 
@@ -5256,6 +5352,16 @@ impl Connection {
         }
     }
 
+    /// Turns off the automatic checkpoint of the MVCC logical log, like
+    /// `PRAGMA mvcc_checkpoint_threshold = -1` but without running SQL, so
+    /// the role the connection's user set does not limit it. The threshold
+    /// belongs to the database, so this applies to all of its connections.
+    /// Explicit checkpoints still run. Fails when the database does not use
+    /// MVCC.
+    pub fn disable_mvcc_auto_checkpoint(&self) -> Result<()> {
+        self.set_mvcc_checkpoint_threshold(-1)
+    }
+
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => {
@@ -5443,15 +5549,6 @@ mod tests {
         open_connection_with_opts(path, DatabaseOpts::new())
     }
 
-    #[test]
-    fn test_the_sqlite_dialect_does_not_store_namespaces() {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(&temp_dir.path().join("main.db"));
-        assert!(conn.prepare("CREATE SCHEMA app").is_err());
-        assert!(conn.create_namespace("app").is_err());
-        assert_eq!(conn.qualifier("app"), None);
-    }
-
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
         let mut state = AttachDatabaseState::default();
         loop {
@@ -5477,189 +5574,12 @@ mod tests {
         }
     }
 
-    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
-    }
-
-    fn text_value(value: &Value) -> &str {
-        match value {
-            Value::Text(text) => text.as_str(),
-            other => panic!("expected text value, got {other:?}"),
-        }
-    }
-
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let index = conn.qualifiers.database_id(alias).unwrap();
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
-    }
-
-    #[test]
-    fn test_named_memory_databases_on_same_io_are_distinct() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let draft_db =
-            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(EngineDialect)).unwrap();
-        let synced_db =
-            Database::open_file(io, ":memory:sync-synced", Arc::new(EngineDialect)).unwrap();
-        assert!(!Arc::ptr_eq(&draft_db, &synced_db));
-
-        let draft = draft_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let synced = synced_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        for conn in [&draft, &synced] {
-            assert_eq!(conn.get_database_canonical_path(), "");
-            assert_eq!(
-                conn.list_all_databases(),
-                vec![(MAIN_DB_ID, "main".to_string(), String::new())]
-            );
-        }
-
-        draft
-            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(11)")
-            .unwrap();
-        synced
-            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(22)")
-            .unwrap();
-
-        assert_eq!(query_single_i64(&draft, "SELECT x FROM t"), 11);
-        assert_eq!(query_single_i64(&synced, "SELECT x FROM t"), 22);
-    }
-
-    #[test]
-    fn test_named_memory_database_reopened_on_same_io_sees_same_rows() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-
-        let first_db =
-            Database::open_file(io.clone(), ":memory:reopen", Arc::new(EngineDialect)).unwrap();
-        let first = first_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        first
-            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
-            .unwrap();
-
-        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(EngineDialect)).unwrap();
-        let second = second_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
-    }
-
-    #[test]
-    fn test_attach_named_memory_database_reports_empty_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
-
-        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(5)")
-            .unwrap();
-
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
-        let database_list = conn.pragma_query("database_list").unwrap();
-        let aux = database_list
-            .iter()
-            .find(|row| text_value(&row[1]) == "aux")
-            .expect("attached aux database must be listed");
-        assert_eq!(text_value(&aux[2]), "");
-    }
-
-    #[test]
-    fn test_search_path_decides_where_names_are_looked_up_and_created() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
-        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(5)")
-            .unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
-
-        conn.set_search_path(Some(vec!["main".to_string()]));
-        assert!(conn.prepare("SELECT x FROM t").is_err());
-        conn.execute("DROP TABLE IF EXISTS t").unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
-
-        conn.set_search_path(Some(vec!["missing".to_string(), "aux".to_string()]));
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
-        conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM aux.u"), 0);
-
-        conn.set_search_path(Some(vec!["missing".to_string()]));
-        let Err(LimboError::ParseError(message)) = conn.execute("CREATE TABLE v(z INTEGER)") else {
-            panic!("CREATE without a namespace needs a database in the search path");
-        };
-        assert_eq!(message, "no schema has been selected to create in");
-        conn.execute("DROP TABLE IF EXISTS t").unwrap();
-
-        conn.set_search_path(None);
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
-        conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
-    }
-
-    #[test]
-    fn test_a_database_that_does_not_store_namespaces_keeps_names_that_look_stored() {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("main.db");
-        let conn = open_connection(&path);
-        conn.execute(
-            "CREATE TABLE __turso_ns1_t(x INTEGER); INSERT INTO __turso_ns1_t VALUES(7); \
-             CREATE TABLE p(v INTEGER); CREATE INDEX __turso_ns2_i ON p(v); INSERT INTO p VALUES(1); \
-             CREATE VIEW __turso_ns3_v AS SELECT x FROM __turso_ns1_t",
-        )
-        .unwrap();
-        assert!(conn.create_namespace("app").is_err());
-        drop(conn);
-
-        let conn = open_connection(&path);
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns1_t"), 7);
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns3_v"), 7);
-        assert!(conn.execute("DROP INDEX i").is_err());
-        conn.execute("DROP INDEX __turso_ns2_i").unwrap();
-        conn.execute("ALTER TABLE p RENAME TO __turso_ns4_p")
-            .unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT v FROM __turso_ns4_p"), 1);
-        let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
-        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "ok");
-    }
-
-    #[test]
-    fn test_named_memory_parent_can_attach_real_file_database() {
-        let temp_dir = TempDir::new().unwrap();
-        let aux_path = temp_dir.path().join("aux.db");
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:named-main",
-            OpenFlags::default(),
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute(format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap()))
-            .unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(7)")
-            .unwrap();
-        conn.execute("DETACH aux").unwrap();
-
-        let reopened = open_connection(&aux_path);
-        assert_eq!(query_single_i64(&reopened, "SELECT x FROM t"), 7);
     }
 
     #[test]
@@ -5737,67 +5657,6 @@ mod tests {
     }
 
     #[test]
-    fn test_temp_tables_are_connection_local_and_shadow_main() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn1 = open_connection(&db_path);
-
-        conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
-        conn1.execute("INSERT INTO main.t VALUES(1)").unwrap();
-        let conn2 = open_connection(&db_path);
-        conn1.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        conn1.execute("INSERT INTO temp.t VALUES(2)").unwrap();
-
-        assert_eq!(query_single_i64(&conn1, "SELECT x FROM t"), 2);
-        assert_eq!(query_single_i64(&conn1, "SELECT x FROM main.t"), 1);
-        assert_eq!(query_single_i64(&conn2, "SELECT x FROM t"), 1);
-
-        let err = conn2
-            .prepare("SELECT x FROM temp.t")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no such table"),
-            "expected no such table error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_reprepare_after_temp_store_reset_does_not_panic() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
-
-        conn.execute("PRAGMA temp_store = MEMORY").unwrap();
-
-        let err = stmt.step().unwrap_err().to_string();
-        assert!(
-            err.contains("no such table"),
-            "expected no such table after temp reset, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_prepared_insert_checks_constraints_after_ignore_check_constraints_off() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE t1(a CHECK (a > 0))").unwrap();
-        conn.execute("PRAGMA ignore_check_constraints = ON")
-            .unwrap();
-        let mut stmt = conn.prepare("INSERT INTO t1 VALUES (-1)").unwrap();
-        conn.execute("PRAGMA ignore_check_constraints = OFF")
-            .unwrap();
-
-        let err = stmt.run_ignore_rows().unwrap_err().to_string();
-        assert!(err.contains("CHECK constraint failed"), "got: {err}");
-    }
-
-    #[test]
     fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("main.db");
@@ -5811,115 +5670,6 @@ mod tests {
 
         let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
         assert_eq!(reprepares, 1);
-    }
-
-    #[test]
-    fn test_temp_trigger_abort_rolls_back_temp_writes_without_panicking() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
-             INSERT INTO u VALUES (NEW.x); \
-             SELECT RAISE(ABORT, 'boom'); \
-             END;",
-        )
-        .unwrap();
-
-        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
-        assert!(
-            err.to_string().contains("boom"),
-            "expected trigger abort error, got: {err}"
-        );
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
-    }
-
-    #[test]
-    fn test_temp_trigger_abort_rolls_back_main_and_temp_writes() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE m(x INTEGER)").unwrap();
-        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
-             INSERT INTO m VALUES (NEW.x); \
-             INSERT INTO u VALUES (NEW.x); \
-             SELECT RAISE(ABORT, 'boom'); \
-             END;",
-        )
-        .unwrap();
-
-        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
-        assert!(
-            err.to_string().contains("boom"),
-            "expected trigger abort error, got: {err}"
-        );
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.m"), 0);
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
-    }
-
-    #[test]
-    fn test_distinct_triggers_with_same_name_in_different_schemas_can_fire_nested() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE src(x INTEGER)").unwrap();
-        conn.execute("CREATE TABLE dst(y INTEGER)").unwrap();
-        conn.execute("CREATE TABLE audit(z INTEGER)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER shared_name AFTER INSERT ON dst BEGIN \
-             INSERT INTO audit VALUES (NEW.y); \
-             END;",
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TEMP TRIGGER shared_name AFTER INSERT ON main.src BEGIN \
-             INSERT INTO dst VALUES (NEW.x); \
-             END;",
-        )
-        .unwrap();
-
-        conn.execute("INSERT INTO src VALUES(7)").unwrap();
-
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.dst"), 1);
-        assert_eq!(query_single_i64(&conn, "SELECT SUM(z) FROM main.audit"), 7);
-    }
-
-    /// A committed `setval(X, false)` stores an unconsumed sequence value.
-    /// After sequence initialization reloads persisted state, the in-memory
-    /// sequence must still represent that value as unconsumed, so the next
-    /// `nextval()` returns `X` rather than advancing past it.
-    /// Disk-only sequence design: setval(value, is_called=false) must be
-    /// observable as the next nextval() result. Previously this exercised
-    /// the in-memory-atomic reseeding path; that path no longer exists,
-    /// but the user-visible contract still holds because every nextval
-    /// reads the backing-table watermark and applies is_called semantics
-    /// in op_sequence_compute_next.
-    #[test]
-    fn test_setval_uncalled_emits_stored_value_as_next() -> Result<()> {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("seq_init.db");
-        let conn = open_connection_with_opts(&path, DatabaseOpts::new());
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 3")?;
-        conn.execute("SELECT setval('s', 13, 0)")?;
-
-        let next_val = query_single_i64(&conn, "SELECT nextval('s')");
-        assert_eq!(
-            next_val, 13,
-            "setval(13, false) committed: next nextval must return 13"
-        );
-        Ok(())
     }
 
     /// The reparse of the schema installs a fresh schema before the

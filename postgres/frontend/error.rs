@@ -228,7 +228,7 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-fn sqlstate(error: &LimboError) -> &'static str {
+pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
@@ -252,6 +252,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
+        LimboError::DatetimeFieldOverflow(_) => SQLSTATE_DATETIME_FIELD_OVERFLOW,
         LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
         LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {
@@ -299,6 +300,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
+        || (msg.starts_with("cannot drop ") && msg.contains(" because other objects depend on it"))
         || (msg.starts_with("cannot change column \"") && msg.contains("\" because policy \""))
         || (msg.starts_with("error in table ")
             && msg.contains(" after drop column: no such column"))
@@ -306,8 +308,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if msg.starts_with("cannot INSERT into generated column ")
         || msg.starts_with("cannot UPDATE generated column ")
+        || is_identity_write_error(msg)
     {
         SQLSTATE_GENERATED_ALWAYS
+    } else if is_invalid_sequence_parameter(msg) {
+        SQLSTATE_INVALID_PARAMETER_VALUE
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
@@ -347,7 +352,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         && (msg.contains("\" is not a") || msg.ends_with("\" is an index"))
     {
         SQLSTATE_WRONG_OBJECT_TYPE
-    } else if msg.starts_with("cannot change owner of sequence \"") {
+    } else if msg.starts_with("cannot change owner of sequence \"")
+        || msg.starts_with("cannot change ownership of identity sequence")
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
         SQLSTATE_UNDEFINED_COLUMN
@@ -392,6 +399,17 @@ fn is_duplicate_object_error(msg: &str) -> bool {
         && !msg.contains(" has no column named ")
 }
 
+fn is_identity_write_error(msg: &str) -> bool {
+    msg.starts_with("cannot insert a non-DEFAULT value into column \"")
+        || (msg.starts_with("column \"") && msg.ends_with("\" can only be updated to DEFAULT"))
+}
+
+fn is_invalid_sequence_parameter(msg: &str) -> bool {
+    msg == "INCREMENT must not be zero"
+        || (msg.starts_with("MINVALUE (") && msg.contains(") must be less than MAXVALUE ("))
+        || (msg.starts_with("START value (") && msg.contains(") cannot be "))
+}
+
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("no such database") {
         SQLSTATE_INVALID_SCHEMA_NAME
@@ -416,9 +434,7 @@ fn sql_error_sqlstate(msg: &str) -> &'static str {
 /// The SQLSTATE of a RAISE. The translator and the types of the engine check
 /// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
 fn raise_sqlstate(msg: &str) -> &'static str {
-    if msg == "invalid date value" || msg == "invalid timestamp value" {
-        SQLSTATE_INVALID_DATETIME_FORMAT
-    } else if msg.starts_with("invalid input value for enum ") {
+    if msg.starts_with("invalid input value for enum ") {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
     } else if msg == "integer out of range for smallint" {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE

@@ -27,7 +27,7 @@ use crate::{
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{
-    self, Cmd, CreateTableBody, Grantee, Privilege, QualifiedName, RoleSpec, Stmt,
+    self, Cmd, CreateTableBody, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec, Stmt,
 };
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -65,6 +65,13 @@ pub enum CatalogChange {
         name: String,
         owner: NewOwner,
     },
+    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
+    RenameColumn {
+        namespace: NamespaceId,
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
     /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
     /// relation FROM grantees` when `revoke` is set.
     Grant {
@@ -100,17 +107,31 @@ pub enum CatalogChange {
         name: String,
         options: ast::RoleOptions,
     },
+    /// `GRANT roles TO grantees`, which makes each grantee a member of each
+    /// role, or `REVOKE roles FROM grantees` when `revoke` is set.
+    GrantRole {
+        revoke: bool,
+        roles: Vec<String>,
+        grantees: Vec<Grantee>,
+    },
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
 #[derive(Debug, Clone)]
 pub enum NewOwner {
-    /// A table of the same namespace, as `ALTER SEQUENCE ... OWNED BY
-    /// table.column` names one for a sequence, or no table. What a table
-    /// owns changes owner with it, and not on its own.
-    Table(Option<String>),
+    /// A column of a table of the same namespace, as `ALTER SEQUENCE ...
+    /// OWNED BY table.column` names one for a sequence, or no column. What a
+    /// table owns changes owner with it, and not on its own.
+    Column(Option<OwnerColumn>),
     /// A role, as `ALTER ... OWNER TO` names one.
     Role(RoleSpec),
+}
+
+/// The column that owns a sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerColumn {
+    pub table: String,
+    pub column: String,
 }
 
 /// What a built-in scalar function may read besides its arguments.
@@ -122,6 +143,12 @@ pub struct ScalarFuncContext<'a> {
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
 }
+
+/// Start of the comment in stored table SQL that lists the positions and kinds
+/// of its identity columns, as in `/* turso_identity 0:always 2:default */ `.
+// FIXME: temporary. Remove the marker once the real PostgreSQL catalog is
+// adopted (pedrocarlo is working on it) and stores the identity kind itself.
+pub const IDENTITY_TABLE_SQL_MARKER: &str = "/* turso_identity";
 
 /// SQL dialect layered on top of the engine.
 ///
@@ -306,13 +333,9 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether a sequence named without a schema in a column default or a
-    /// view body is bound to the schema it is found in when the table or
-    /// view is created.
-    ///
-    /// PostgreSQL stores the bound name, so the default or view keeps its
-    /// sequence after the search path changes. SQLite looks the name up
-    /// each time the default or view runs.
+    /// Whether a sequence named without a schema in an expression stored in
+    /// the schema is bound to the schema it is found in when the expression
+    /// is created.
     fn binds_names_at_create(&self) -> bool {
         false
     }
@@ -366,7 +389,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
     /// has no roles, ownership, privileges or row-level security and refuses
-    /// `CREATE ROLE`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
+    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
     /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
     /// `CREATE POLICY` and `DROP POLICY`.
     fn translate_catalog_changes(
@@ -388,7 +411,7 @@ pub trait Dialect: Send + Sync + 'static {
                     ));
                 }
                 CatalogChange::ChangeOwner {
-                    owner: NewOwner::Table(_),
+                    owner: NewOwner::Column(_),
                     ..
                 } => {
                     return Err(LimboError::ParseError(
@@ -412,6 +435,12 @@ pub trait Dialect: Send + Sync + 'static {
                     return Err(LimboError::ParseError(
                         "CREATE ROLE is not supported".to_string(),
                     ));
+                }
+                CatalogChange::GrantRole { revoke, .. } => {
+                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
+                    return Err(LimboError::ParseError(format!(
+                        "{statement} of role membership is not supported"
+                    )));
                 }
                 _ => {}
             }
@@ -469,6 +498,14 @@ pub trait Dialect: Send + Sync + 'static {
         role != RoleId::PUBLIC && (member == role || self.role_is_superuser(schema, member))
     }
 
+    /// Whether `member` has the privileges of `role`: it is `role`, a
+    /// superuser, or, in a dialect with role membership, a role that
+    /// inherits the privileges of `role`. An owner check asks this of the
+    /// owner, so a role with the owner's privileges acts as the owner.
+    fn role_has_privileges_of(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        member == role || self.role_is_superuser(schema, member)
+    }
+
     /// The role that owns relation `name` of `namespace`, when the dialect
     /// stores ownership. None means ownership is unknown, and only a
     /// superuser may drop or alter the relation.
@@ -480,6 +517,22 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Option<RoleId> {
         let _ = (schema, namespace, name);
         None
+    }
+
+    /// The sequences of `namespace` that `column` of table `table` owns, or
+    /// that any column of the table owns when `column` is None.
+    ///
+    /// Which column owns a sequence has to be stored in a table of its own,
+    /// so only a dialect that keeps one has owned sequences. SQLite has none.
+    fn owned_sequences(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: Option<&str>,
+    ) -> Vec<String> {
+        let _ = (schema, namespace, table, column);
+        Vec::new()
     }
 
     /// Whether `role` has `privilege` on relation `name` of `namespace`,
@@ -603,998 +656,118 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    /// Whether INSERT generates a rowid for an `INTEGER PRIMARY KEY` that is
+    /// NULL or not given.
+    ///
+    /// SQLite does. PostgreSQL gives a key that is not given the column
+    /// DEFAULT, and rejects a NULL key.
+    fn generates_integer_primary_keys(&self) -> bool {
+        true
+    }
+}
+
+/// Returns true if `sql` parses as a `CREATE VIRTUAL TABLE` statement.
+///
+/// Like SQLite (whose `sqlite3InitCallback` feeds schema SQL to the real
+/// parser, so a row is a virtual table purely as a byproduct of the
+/// `create_vtab` grammar rule), classification is done by parsing rather than
+/// by substring or token matching, which would misclassify regular tables
+/// whose SQL merely contains the text (e.g. in a DEFAULT literal).
+pub fn sql_is_create_virtual_table(sql: &str) -> bool {
+    matches!(
+        engine::parse_statement(sql),
+        Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
+    )
+}
+
+/// The comment that marks the columns at the given positions as identity
+/// columns of the given kinds in stored table SQL, or nothing when there are none.
+pub fn identity_table_sql_marker(
+    columns: impl IntoIterator<Item = (usize, IdentityKind)>,
+) -> String {
+    let columns: Vec<String> = columns
+        .into_iter()
+        .map(|(position, kind)| {
+            let kind = match kind {
+                IdentityKind::Always => "always",
+                IdentityKind::ByDefault => "default",
+            };
+            format!("{position}:{kind}")
+        })
+        .collect();
+    if columns.is_empty() {
+        return String::new();
+    }
+    format!("{IDENTITY_TABLE_SQL_MARKER} {} */ ", columns.join(" "))
+}
+
+/// Splits the identity comment off the start of `sql`, returning the column
+/// positions and kinds it lists and the rest of the text.
+pub fn split_identity_table_sql_marker(
+    sql: &str,
+) -> crate::Result<(Vec<(usize, IdentityKind)>, &str)> {
+    let Some(marked) = sql.strip_prefix(IDENTITY_TABLE_SQL_MARKER) else {
+        return Ok((Vec::new(), sql));
+    };
+    let corrupt =
+        || crate::LimboError::Corrupt(format!("malformed identity marker in table SQL: {sql}"));
+    let (list, rest) = marked.split_once(" */ ").ok_or_else(corrupt)?;
+    let columns = list
+        .split_whitespace()
+        .map(|entry| {
+            let (position, kind) = entry.split_once(':').ok_or_else(corrupt)?;
+            let kind = match kind {
+                "always" => IdentityKind::Always,
+                "default" => IdentityKind::ByDefault,
+                _ => return Err(corrupt()),
+            };
+            Ok((position.parse::<usize>().map_err(|_| corrupt())?, kind))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(corrupt());
+    }
+    Ok((columns, rest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::PlatformIO;
-    use crate::native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule};
-    use crate::security::roles::SessionRole;
-    use crate::storage::database::DatabaseFile;
-    use crate::sync::atomic::{AtomicUsize, Ordering};
-    use crate::types::IOResultOr;
-    use crate::{
-        ConnectOpts, Database, DatabaseOpts, IOResult, MemoryIO, Numeric, OpenFlags,
-        StatementStatusCounter, IO,
-    };
-    use std::sync::Arc;
-    use turso_ext::{
-        ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode, VTabKind,
-    };
-
-    /// A dialect that counts schema-row parses and strips a `/* test */ `
-    /// marker before delegating to SQLite parsing, mirroring how a frontend
-    /// dialect recognizes its own stored text and falls back to SQLite for
-    /// unmarked rows.
-    #[derive(Default)]
-    struct TestDialect {
-        parse_calls: AtomicUsize,
-        statement_parse_calls: AtomicUsize,
-    }
-
-    impl Dialect for TestDialect {
-        fn name(&self) -> &'static str {
-            "test"
-        }
-
-        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-            self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(sql) = sql.strip_prefix("test: ") {
-                let (cmd, offset) = engine::parse(sql)?;
-                Ok((cmd, "test: ".len() + offset))
-            } else {
-                engine::parse(sql)
-            }
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-            self.parse_calls.fetch_add(1, Ordering::SeqCst);
-            let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-            BTreeTable::from_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-            let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-            engine::parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-            let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-            engine::table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            input: &str,
-            _tbl_name: &QualifiedName,
-            _body: &CreateTableBody,
-        ) -> Result<String> {
-            Ok(format!("/* test */ {input}"))
-        }
-
-        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-            if name.eq_ignore_ascii_case("nvl") {
-                return engine::resolve_builtin_function("coalesce", arg_count);
-            }
-            if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
-                return Ok(Some(Func::Dialect("test_add_one".to_string())));
-            }
-            engine::resolve_builtin_function(name, arg_count)
-        }
-
-        fn exec_scalar_function(
-            &self,
-            _conn: &Connection,
-            name: &str,
-            args: &[Value],
-        ) -> Result<Value> {
-            assert_eq!(name, "test_add_one");
-            let Value::Numeric(Numeric::Integer(v)) = args[0] else {
-                return Err(LimboError::InvalidArgument(
-                    "test_add_one expects an integer".to_string(),
-                ));
-            };
-            Ok(Value::Numeric(Numeric::Integer(v + 1)))
-        }
-
-        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-            engine::register_builtin_catalog(schema, enable_custom_types)
-        }
-
-        fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-            options.native_module(
-                "test_catalog",
-                VTabKind::TableValuedFunction,
-                TestCatalogTable,
-            )
-        }
-    }
-
-    /// Stores table definitions in syntax that SQLite cannot parse and always
-    /// adds its marker, so replay tests detect repeated storage formatting.
-    struct StrictTestDialect;
-
-    impl StrictTestDialect {
-        const PREFIX: &'static str = "strict: ";
-    }
-
-    impl Dialect for StrictTestDialect {
-        fn name(&self) -> &'static str {
-            "strict-test"
-        }
-
-        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-            engine::parse(sql)
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-            let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-            BTreeTable::from_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-            let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-            engine::parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-            let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-            engine::table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            input: &str,
-            _tbl_name: &QualifiedName,
-            _body: &CreateTableBody,
-        ) -> Result<String> {
-            Ok(format!("{}{input}", Self::PREFIX))
-        }
-
-        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-            engine::register_builtin_catalog(schema, enable_custom_types)
-        }
-
-        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-            engine::resolve_builtin_function(name, arg_count)
-        }
-    }
-
-    /// A one-row catalog table installed by [`TestDialect`],
-    /// standing in for a frontend catalog surface like `pg_class`.
-    #[derive(Debug)]
-    struct TestCatalogTable;
-
-    impl VirtualTableModule for TestCatalogTable {
-        type Table = Self;
-
-        fn schema(&self, _args: &[Value]) -> Result<String> {
-            Ok("CREATE TABLE test_catalog (value INTEGER)".to_string())
-        }
-
-        fn create(&self, _args: &[Value]) -> Result<Self::Table> {
-            Ok(Self)
-        }
-    }
-
-    impl VirtualTable for TestCatalogTable {
-        type Cursor = TestCatalogCursor;
-
-        fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
-            Ok(TestCatalogCursor { row: 0 })
-        }
-
-        fn best_index(
-            &self,
-            constraints: &[ConstraintInfo],
-            _order_by: &[OrderByInfo],
-        ) -> Result<IndexInfo, ResultCode> {
-            Ok(IndexInfo {
-                idx_num: 0,
-                idx_str: None,
-                order_by_consumed: false,
-                estimated_cost: 1.0,
-                estimated_rows: 1,
-                constraint_usages: constraints
-                    .iter()
-                    .map(|_| ConstraintUsage {
-                        argv_index: None,
-                        omit: false,
-                    })
-                    .collect(),
-            })
-        }
-    }
-
-    struct TestCatalogCursor {
-        row: usize,
-    }
-
-    impl VirtualTableCursor for TestCatalogCursor {
-        fn filter(
-            &mut self,
-            _args: &[Value],
-            _idx_str: Option<&str>,
-            _idx_num: i32,
-        ) -> IOResultOr<bool> {
-            self.row = 0;
-            Ok(IOResult::Done(true))
-        }
-
-        fn next(&mut self) -> IOResultOr<bool> {
-            self.row += 1;
-            Ok(IOResult::Done(self.row < 1))
-        }
-
-        fn rowid(&self) -> i64 {
-            self.row as i64
-        }
-
-        fn column(&mut self, column: usize) -> IOResultOr<Value> {
-            Ok(IOResult::Done(match column {
-                0 => Value::from_i64(42),
-                _ => Value::Null,
-            }))
-        }
-    }
-
-    fn open_db(io: &Arc<dyn IO>, path: &str, dialect: Arc<dyn Dialect>) -> Result<Arc<Database>> {
-        let file = io.open_file(path, OpenFlags::Create, true)?;
-        let db_file = Arc::new(DatabaseFile::new(file));
-        Database::open(io.clone(), path, OpenOptions::new(dialect).storage(db_file))
-    }
 
     #[test]
-    fn schema_load_routes_through_dialect() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        {
-            let db = open_db(&io, "dialect-load.db", Arc::new(EngineDialect)).unwrap();
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-            conn.close().unwrap();
-        }
+    fn identity_marker_keeps_each_columns_position_and_kind() {
+        let marker =
+            identity_table_sql_marker([(0, IdentityKind::Always), (2, IdentityKind::ByDefault)]);
+        assert_eq!(marker, "/* turso_identity 0:always 2:default */ ");
 
-        // Reopening the database parses the stored schema row for `t`
-        // through the dialect.
-        let dialect = Arc::new(TestDialect::default());
-        let db = open_db(&io, "dialect-load.db", dialect.clone()).unwrap();
-        assert!(dialect.parse_calls.load(Ordering::SeqCst) >= 1);
-
-        // DDL reparses the schema via the ParseSchema opcode, again through
-        // the dialect.
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let before = dialect.parse_calls.load(Ordering::SeqCst);
-        conn.execute("CREATE TABLE u (y INTEGER)").unwrap();
-        assert!(dialect.parse_calls.load(Ordering::SeqCst) > before);
-
-        // Both tables are usable under the dialect.
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-        conn.execute("INSERT INTO u VALUES (2)").unwrap();
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn dialect_parser_is_used_for_reprepare() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let dialect = Arc::new(TestDialect::default());
-        let db = open_db(&io, "dialect-reprepare.db", dialect.clone()).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        let mut stmt = conn.prepare("test: SELECT 42").unwrap();
-        conn.set_full_column_names(true);
-        let rows = stmt.run_collect_rows().unwrap();
-
-        assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
-        assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 1);
-        assert_eq!(dialect.statement_parse_calls.load(Ordering::SeqCst), 2);
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn consume_stmt_reports_parse_error() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        assert!(conn.consume_stmt("SELECT * FROM").is_err());
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn dialect_catalog_available_on_every_schema_and_rebuild() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-catalog.db", Arc::new(TestDialect::default())).unwrap();
-
-        let query_catalog = |conn: &Arc<Connection>| -> Vec<Vec<Value>> {
-            conn.prepare("SELECT value FROM test_catalog")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap()
-        };
-
-        let conn1 = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let conn2 = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
+        let sql = format!("{marker}CREATE TABLE t (a, b, c)");
+        let (columns, rest) = split_identity_table_sql_marker(&sql).unwrap();
         assert_eq!(
-            query_catalog(&conn1),
-            vec![vec![Value::Numeric(Numeric::Integer(42))]]
+            columns,
+            [(0, IdentityKind::Always), (2, IdentityKind::ByDefault)]
         );
-        assert_eq!(
-            query_catalog(&conn2),
-            vec![vec![Value::Numeric(Numeric::Integer(42))]]
-        );
-
-        // DDL on another connection forces conn1 to rebuild its schema from
-        // sqlite_schema; the catalog table must survive because schema
-        // construction re-registers it.
-        conn2.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        assert_eq!(
-            query_catalog(&conn1),
-            vec![vec![Value::Numeric(Numeric::Integer(42))]]
-        );
-
-        conn1.close().unwrap();
-        conn2.close().unwrap();
+        assert_eq!(rest, "CREATE TABLE t (a, b, c)");
     }
 
     #[test]
-    fn dialect_catalog_cannot_be_dropped() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(
-            &io,
-            "dialect-catalog-drop.db",
-            Arc::new(TestDialect::default()),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        let error = conn.execute("DROP TABLE test_catalog").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("table test_catalog may not be dropped"),
-            "unexpected error: {error}"
-        );
-
-        let new_conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        for catalog_conn in [&conn, &new_conn] {
-            let rows = catalog_conn
-                .prepare("SELECT value FROM test_catalog")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap();
-            assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
-        }
-        conn.close().unwrap();
-        new_conn.close().unwrap();
+    fn identity_marker_is_absent_without_identity_columns() {
+        assert_eq!(identity_table_sql_marker([]), "");
+        let (columns, rest) = split_identity_table_sql_marker("CREATE TABLE t (a)").unwrap();
+        assert!(columns.is_empty());
+        assert_eq!(rest, "CREATE TABLE t (a)");
     }
 
     #[test]
-    fn dialect_catalog_survives_mvcc_recovery() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let path = "dialect-catalog-mvcc-recovery.db";
-
-        {
-            let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
-            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-            conn.close().unwrap();
+    fn malformed_identity_marker_is_corruption() {
+        for sql in [
+            "/* turso_identity */ CREATE TABLE t (a)",
+            "/* turso_identity 0 */ CREATE TABLE t (a)",
+            "/* turso_identity 0:sometimes */ CREATE TABLE t (a)",
+            "/* turso_identity x:always */ CREATE TABLE t (a)",
+            "/* turso_identity 0:always CREATE TABLE t (a)",
+        ] {
+            assert!(split_identity_table_sql_marker(sql).is_err(), "{sql}");
         }
-
-        let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let rows = conn
-            .prepare("SELECT value FROM test_catalog")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn dialect_catalog_available_in_initialized_temp_schema() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(
-            &io,
-            "dialect-catalog-temp.db",
-            Arc::new(TestDialect::default()),
-        )
-        .unwrap();
-
-        for temp_store in ["MEMORY", "FILE"] {
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-            conn.execute(format!("PRAGMA temp_store = {temp_store}"))
-                .unwrap();
-            conn.execute("CREATE TEMP TABLE t (x INTEGER)").unwrap();
-            let rows = conn
-                .prepare("SELECT value FROM temp.test_catalog")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap();
-            assert_eq!(rows, vec![vec![Value::from_i64(42)]]);
-            conn.close().unwrap();
-        }
-    }
-
-    #[test]
-    fn create_table_stores_dialect_formatted_sql() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        {
-            let dialect = Arc::new(TestDialect::default());
-            let db = open_db(&io, "dialect-store.db", dialect).unwrap();
-            let conn = db
-                .connect(ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-
-            // A frontend prepares its translated AST while supplying the
-            // original statement text.
-            let input = "CREATE TABLE t (x INTEGER)";
-            let stmt = match crate::dialect::engine::parse_statement(input)
-                .unwrap()
-                .unwrap()
-            {
-                Cmd::Stmt(stmt) => stmt,
-                other => panic!("unexpected command: {other:?}"),
-            };
-            conn.prepare_translated_stmt(stmt, input)
-                .unwrap()
-                .run_ignore_rows()
-                .unwrap();
-
-            // The stored schema row carries the dialect marker and the
-            // original text.
-            let rows = conn
-                .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            let stored = rows[0][0].to_string();
-            assert_eq!(stored.trim_matches('\''), format!("/* test */ {input}"));
-            conn.close().unwrap();
-        }
-
-        // Round-trip: reopening parses the marked row back through the
-        // dialect and the table stays usable.
-        let dialect = Arc::new(TestDialect::default());
-        let db = open_db(&io, "dialect-store.db", dialect.clone()).unwrap();
-        assert!(dialect.parse_calls.load(Ordering::SeqCst) >= 1);
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-        let rows = conn
-            .prepare("SELECT x FROM t")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        conn.close().unwrap();
-    }
-
-    /// A dialect that resolves no functions at all, proving the dialect —
-    /// not the engine — owns the function name surface of user SQL.
-    struct NoFunctionsDialect;
-
-    impl Dialect for NoFunctionsDialect {
-        fn name(&self) -> &'static str {
-            "nofuncs"
-        }
-
-        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-            engine::parse(sql)
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-            BTreeTable::from_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-            engine::parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-            engine::table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            _input: &str,
-            tbl_name: &QualifiedName,
-            body: &CreateTableBody,
-        ) -> Result<String> {
-            Ok(format!(
-                "CREATE TABLE {} {}",
-                tbl_name.name.as_ident(),
-                body
-            ))
-        }
-
-        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-            engine::register_builtin_catalog(schema, enable_custom_types)
-        }
-
-        fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
-            Ok(None)
-        }
-    }
-
-    /// A dialect that resolves the built-in names but runs `upper` its own
-    /// way, as a frontend does for a built-in whose behavior differs in its
-    /// dialect.
-    struct ShoutingUpperDialect;
-
-    impl Dialect for ShoutingUpperDialect {
-        fn name(&self) -> &'static str {
-            "shouting"
-        }
-
-        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-            engine::parse(sql)
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-            BTreeTable::from_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-            engine::parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-            engine::table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            _input: &str,
-            tbl_name: &QualifiedName,
-            body: &CreateTableBody,
-        ) -> Result<String> {
-            engine::format_table_sql(tbl_name, body)
-        }
-
-        fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-            engine::register_builtin_catalog(schema, enable_custom_types)
-        }
-
-        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-            engine::resolve_builtin_function(name, arg_count)
-        }
-
-        fn call_scalar(
-            &self,
-            context: &ScalarFuncContext<'_>,
-            func: &ScalarFunc,
-            args: &[Register],
-        ) -> Result<Value> {
-            let value = engine::call_builtin_scalar(context, func, args)?;
-            if !matches!(func, ScalarFunc::Upper) {
-                return Ok(value);
-            }
-            Ok(Value::build_text(format!("{value}!")))
-        }
-    }
-
-    #[test]
-    fn dialect_owns_builtin_scalar_function_behavior() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-shouting.db", Arc::new(ShoutingUpperDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE t (s TEXT)").unwrap();
-        conn.execute("INSERT INTO t VALUES ('hi')").unwrap();
-        let rows = conn
-            .prepare("SELECT upper(s), lower('ABC'), abs(-7) FROM t")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(
-            rows,
-            vec![vec![
-                Value::build_text("HI!"),
-                Value::build_text("abc"),
-                Value::from_i64(7),
-            ]]
-        );
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn dialect_scalar_function_resolves_and_executes() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-funcs.db", Arc::new(TestDialect::default())).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        // Dialect-provided scalar executes through exec_scalar_function.
-        let rows = conn
-            .prepare("SELECT test_add_one(41)")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows, vec![vec![Value::Numeric(Numeric::Integer(42))]]);
-
-        // Built-ins still resolve because the dialect composes with the
-        // shared table.
-        let rows = conn
-            .prepare("SELECT abs(-7)")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows, vec![vec![Value::Numeric(Numeric::Integer(7))]]);
-
-        // Unknown names still error.
-        let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
-        assert!(err.to_string().contains("no such function"));
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn dialect_function_alias_preserves_outer_join() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(
-            &io,
-            "dialect-outer-join.db",
-            Arc::new(TestDialect::default()),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE lhs (id INTEGER)").unwrap();
-        conn.execute("CREATE TABLE rhs (id INTEGER, value INTEGER)")
-            .unwrap();
-        conn.execute("INSERT INTO lhs VALUES (1), (2)").unwrap();
-        conn.execute("INSERT INTO rhs VALUES (1, 0)").unwrap();
-
-        let rows = conn
-            .prepare(
-                "SELECT lhs.id FROM lhs LEFT JOIN rhs ON rhs.id = lhs.id \
-                 WHERE nvl(rhs.value, 1) = 1 ORDER BY lhs.id",
-            )
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn dialect_owns_the_function_surface() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-nofuncs.db", Arc::new(NoFunctionsDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        // Function-free SQL works, including DDL (whose internal helper
-        // statements resolve with SQLite semantics regardless of dialect).
-        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        conn.execute("INSERT INTO t VALUES (-7)").unwrap();
-
-        // A SQLite built-in is not part of this dialect's surface.
-        let err = conn.prepare("SELECT abs(x) FROM t").unwrap_err();
-        assert!(
-            err.to_string().contains("no such function"),
-            "unexpected error: {err}"
-        );
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn cdc_generated_functions_bypass_the_dialect() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-cdc.db", Arc::new(NoFunctionsDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        conn.execute("PRAGMA capture_data_changes_conn('full')")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (7)").unwrap();
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO t VALUES (8)").unwrap();
-        conn.execute("COMMIT").unwrap();
-
-        let rows = conn
-            .prepare(
-                "SELECT change_type, table_name, id, change_txn_id \
-                 FROM turso_cdc ORDER BY change_id",
-            )
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0][0], Value::from_i64(1));
-        assert_eq!(rows[0][1], Value::build_text("t"));
-        assert_eq!(rows[0][2], Value::from_i64(1));
-        assert_eq!(rows[1][0], Value::from_i64(2));
-        assert_eq!(rows[1][1], Value::Null);
-        assert_eq!(rows[1][2], Value::Null);
-        assert_eq!(rows[0][3], rows[1][3]);
-        assert_eq!(rows[2][0], Value::from_i64(1));
-        assert_eq!(rows[2][1], Value::build_text("t"));
-        assert_eq!(rows[2][2], Value::from_i64(2));
-        assert_eq!(rows[3][0], Value::from_i64(2));
-        assert_eq!(rows[3][1], Value::Null);
-        assert_eq!(rows[3][2], Value::Null);
-        assert_eq!(rows[2][3], rows[3][3]);
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn alter_table_rewrites_dialect_formatted_sql() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-alter-table.db", Arc::new(StrictTestDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        conn.execute("ALTER TABLE t RENAME TO u").unwrap();
-
-        let rows = conn
-            .prepare("SELECT sql FROM sqlite_schema WHERE name = 'u'")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0][0].to_string().trim_matches('\''),
-            "strict: CREATE TABLE u (x INTEGER)"
-        );
-        conn.execute("INSERT INTO u VALUES (1)").unwrap();
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn alter_table_rename_column_decodes_dialect_formatted_sql() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "dialect-alter-column.db", Arc::new(StrictTestDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-        conn.execute("ALTER TABLE t RENAME COLUMN x TO y").unwrap();
-
-        let rows = conn
-            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0][0].to_string().trim_matches('\''),
-            "strict: CREATE TABLE t (y INTEGER)"
-        );
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-        assert_eq!(
-            conn.prepare("SELECT y FROM t")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(1)]]
-        );
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn registry_rejects_dialect_mismatch() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let _db = open_db(&io, "dialect-mismatch.db", Arc::new(EngineDialect)).unwrap();
-
-        let err =
-            open_db(&io, "dialect-mismatch.db", Arc::new(TestDialect::default())).unwrap_err();
-        assert!(
-            err.to_string().contains("already open with dialect"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn registry_rejects_default_open_of_dialect_database() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let _db = open_db(
-            &io,
-            "dialect-mismatch-reverse.db",
-            Arc::new(TestDialect::default()),
-        )
-        .unwrap();
-
-        let err = open_db(&io, "dialect-mismatch-reverse.db", Arc::new(EngineDialect)).unwrap_err();
-        assert!(
-            err.to_string().contains("already open with dialect"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[cfg(feature = "fs")]
-    #[test]
-    fn shared_memory_registry_rejects_dialect_mismatch() {
-        let name = "dialect-shared-memory-mismatch";
-        let _db = Database::open_shared_memory(name, Arc::new(EngineDialect)).unwrap();
-
-        let err = Database::open_shared_memory(name, Arc::new(TestDialect::default())).unwrap_err();
-        assert!(
-            err.to_string().contains("already open with dialect"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    #[test]
-    fn vacuum_into_replays_schema_with_source_dialect() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.db");
-        let output_path = dir.path().join("output.db");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            source_path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(StrictTestDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO t VALUES (42)").unwrap();
-
-        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
-            .unwrap();
-
-        let output_db = Database::open_file(
-            io,
-            output_path.to_str().unwrap(),
-            Arc::new(StrictTestDialect),
-        )
-        .unwrap();
-        let output_conn = output_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let schema_rows = output_conn
-            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(schema_rows.len(), 1);
-        assert_eq!(
-            schema_rows[0][0].to_string().trim_matches('\''),
-            "strict: CREATE TABLE t(x INTEGER)"
-        );
-        assert_eq!(
-            output_conn
-                .prepare("SELECT x FROM t")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(42)]]
-        );
-    }
-
-    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    #[test]
-    fn vacuum_attached_database_strips_source_schema_from_replay() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.db");
-        let attached_path = dir.path().join("attached.db");
-        let output_path = dir.path().join("output.db");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            source_path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(StrictTestDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute(format!(
-            "ATTACH DATABASE '{}' AS aux",
-            attached_path.display()
-        ))
-        .unwrap();
-        conn.execute("CREATE TABLE aux.t (x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES (42)").unwrap();
-
-        conn.execute(format!("VACUUM aux INTO '{}'", output_path.display()))
-            .unwrap();
-
-        let output_db = Database::open_file(
-            io,
-            output_path.to_str().unwrap(),
-            Arc::new(StrictTestDialect),
-        )
-        .unwrap();
-        let output_conn = output_db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        assert_eq!(
-            output_conn
-                .prepare("SELECT x FROM t")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(42)]]
-        );
-    }
-
-    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    #[test]
-    fn in_place_vacuum_replays_schema_with_source_dialect() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("source.db");
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            Arc::new(StrictTestDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO t VALUES (42)").unwrap();
-
-        conn.execute("VACUUM").unwrap();
-
-        let schema_rows = conn
-            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        assert_eq!(schema_rows.len(), 1);
-        assert_eq!(
-            schema_rows[0][0].to_string().trim_matches('\''),
-            "strict: CREATE TABLE t(x INTEGER)"
-        );
-        assert_eq!(
-            conn.prepare("SELECT x FROM t")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(42)]]
-        );
     }
 }

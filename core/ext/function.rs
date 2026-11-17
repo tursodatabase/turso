@@ -69,7 +69,7 @@ impl ExternalFunc {
 }
 
 impl ExtFunc {
-    pub(crate) fn call_scalar(
+    pub fn call_scalar(
         &self,
         state: &mut ExtensionState,
         connection: &Arc<Connection>,

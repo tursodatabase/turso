@@ -1456,7 +1456,10 @@ mod tests {
             ("SELECT booleq(true, true)", Type::BOOL),
             ("SELECT now()", Type::TIMESTAMPTZ),
             ("SELECT auth.uid()", Type::UUID),
-            ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
+            (
+                "SELECT CAST('2024-01-05 10:00:00+00' AS timestamptz)",
+                Type::TIMESTAMPTZ,
+            ),
             ("SELECT random()", Type::FLOAT8),
             ("SELECT random() * 10", Type::FLOAT8),
             ("SELECT array_to_json(ARRAY[1])", Type::JSON),

@@ -12,8 +12,10 @@
 //! the policies in the same way, or the statement fails with
 //! [`crate::security::permission::PermissionDenied::policy`].
 //!
-//! Row-level security does not limit superusers or the owner of the table,
-//! and it does not apply to TRUNCATE.
+//! A policy for a role applies to every role that has its privileges, such
+//! as a member that inherits them. Row-level security does not limit
+//! superusers or the owner of the table, or a role with the owner's
+//! privileges, and it does not apply to TRUNCATE.
 
 use turso_parser::ast;
 
@@ -68,10 +70,11 @@ pub struct RowPolicy {
 }
 
 impl RowPolicy {
-    /// Whether the policy decides which rows `role` may access for `command`:
-    /// the policy is for `command` or for `ALL`, and for `role` or for
-    /// [`RoleId::PUBLIC`].
-    pub fn applies_to(&self, command: Command, role: RoleId) -> bool {
+    /// Whether the policy decides which rows a role may access for `command`:
+    /// the policy is for `command` or for `ALL`, and for [`RoleId::PUBLIC`]
+    /// or a role whose privileges the role has, which `has_privileges_of`
+    /// says, as in PostgreSQL.
+    pub fn applies_to(&self, command: Command, has_privileges_of: impl Fn(RoleId) -> bool) -> bool {
         let command_matches = match self.command {
             ast::PolicyCommand::All => true,
             ast::PolicyCommand::Select => command == Command::Select,
@@ -80,9 +83,8 @@ impl RowPolicy {
             ast::PolicyCommand::Delete => command == Command::Delete,
         };
         command_matches
-            && self
-                .roles
-                .iter()
-                .any(|policy_role| *policy_role == RoleId::PUBLIC || *policy_role == role)
+            && self.roles.iter().any(|policy_role| {
+                *policy_role == RoleId::PUBLIC || has_privileges_of(*policy_role)
+            })
     }
 }

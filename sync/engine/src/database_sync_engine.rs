@@ -83,6 +83,10 @@ pub struct DatabaseSyncEngineOpts {
     /// `Query` bootstrap strategy** — the server picks the page set, so the
     /// client can't chunk it locally.
     pub pull_bytes_threshold: Option<usize>,
+    /// Maximum number of bootstrap chunk requests in flight at once when
+    /// `pull_bytes_threshold` splits the bootstrap. All chunks after the first
+    /// are pinned to the first chunk's server revision. `None` means 1.
+    pub pull_parallel_requests: Option<usize>,
     /// Sync-protocol override for incremental pulls.
     ///
     /// `None` (default) auto-detects the remote protocol from the first
@@ -1020,6 +1024,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     opts.protocol_version_hint,
                     partial_sync_opts,
                     opts.pull_bytes_threshold,
+                    opts.pull_parallel_requests,
                 )
                 .await?;
                 let remote_pull_protocol = forced_protocol.unwrap_or(detected_protocol);
@@ -3759,6 +3764,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
+            pull_parallel_requests: None,
             logical_mvcc_pull: Some(true),
         }
     }

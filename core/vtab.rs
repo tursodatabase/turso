@@ -20,7 +20,7 @@ pub(crate) enum VirtualTableType {
 #[derive(Clone, Debug)]
 pub struct VirtualTable {
     pub(crate) name: String,
-    pub(crate) columns: Vec<Column>,
+    pub columns: Vec<Column>,
     pub(crate) kind: VTabKind,
     pub(crate) vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
@@ -29,7 +29,7 @@ pub struct VirtualTable {
     pub(crate) is_droppable: bool,
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
-    pub(crate) innocuous: bool,
+    pub innocuous: bool,
 }
 
 impl VirtualTable {
@@ -159,7 +159,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
+    pub fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
         match &self.vtab_type {
             VirtualTableType::Pragma(table) => {
                 Ok(VirtualTableCursor::new_pragma(table.open(conn)?))
@@ -185,7 +185,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn destroy(&self) -> crate::Result<()> {
+    pub fn destroy(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
             VirtualTableType::External(table) => table.destroy(),
@@ -322,7 +322,7 @@ impl VirtualTableCursor {
         })
     }
 
-    pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
+    pub fn column(&mut self, column: usize) -> IOResultOr<Value> {
         if self.null_flag {
             return Ok(IOResult::Done(Value::Null));
         }
@@ -334,7 +334,7 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn filter(
+    pub fn filter(
         &mut self,
         idx_num: i32,
         idx_str: Option<String>,

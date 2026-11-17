@@ -568,6 +568,7 @@ impl ToTokens for Stmt {
                 columns,
                 body,
                 returning,
+                ..
             } => {
                 if let Some(with) = with {
                     with.to_tokens(s, context)?;
@@ -1791,12 +1792,28 @@ impl ToTokens for Grant {
         context: &C,
     ) -> Result<(), S::Error> {
         s.append(TK_ID, Some(if self.revoke { "REVOKE" } else { "GRANT" }))?;
-        s.comma(&self.privileges, context)?;
-        s.append(TK_ON, None)?;
-        if self.on_sequences {
-            s.append(TK_ID, Some("SEQUENCE"))?;
+        match &self.objects {
+            GrantObjects::Relations {
+                privileges,
+                on_sequences,
+                relations,
+            } => {
+                s.comma(privileges, context)?;
+                s.append(TK_ON, None)?;
+                if *on_sequences {
+                    s.append(TK_ID, Some("SEQUENCE"))?;
+                }
+                s.comma(relations, context)?;
+            }
+            GrantObjects::Roles(roles) => {
+                for (i, role) in roles.iter().enumerate() {
+                    if i > 0 {
+                        s.append(TK_COMMA, None)?;
+                    }
+                    s.append(TK_ID, Some(role))?;
+                }
+            }
         }
-        s.comma(&self.relations, context)?;
         if self.revoke {
             s.append(TK_FROM, None)?;
         } else {
@@ -2102,6 +2119,7 @@ impl ToTokens for ColumnConstraint {
                 }
                 Ok(())
             }
+            Self::Identity(_) => Ok(()),
         }
     }
 }

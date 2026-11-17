@@ -178,7 +178,7 @@ pub enum IndexMethodSnapshotIdentity {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum IndexMethodYieldPoint {
+pub enum IndexMethodYieldPoint {
     BeforePrepareStatement = 0,
     AfterPrepareStatement = 1,
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]

@@ -1,3 +1,14 @@
+mod checkpoint;
+mod concurrent_inserts;
+mod database;
+mod group_commit;
+mod hermitage;
+mod logical_log;
+mod persistence;
+mod store;
+mod test_db;
+mod transactions;
+
 use crate::common::{ExecRows, TempDatabase};
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;

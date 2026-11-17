@@ -494,7 +494,7 @@ fn capture_data_changes_is_refused_under_the_postgres_dialect() {
 }
 
 #[test]
-fn dropping_a_table_releases_the_sequences_it_owned() {
+fn dropping_a_table_drops_the_sequences_it_owned() {
     let db = TempDatabase::builder().build();
     let pg = db.connect_postgres();
     pg.execute("CREATE ROLE alice").unwrap();
@@ -504,10 +504,12 @@ fn dropping_a_table_releases_the_sequences_it_owned() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("cannot change owner of sequence"), "{error}");
-    // Turso keeps the sequence of a dropped table, unlike PostgreSQL, so it
-    // becomes a sequence of its own.
     pg.execute("DROP TABLE d").unwrap();
-    pg.execute("ALTER SEQUENCE d_x_seq OWNER TO alice").unwrap();
+    let error = pg
+        .execute("ALTER SEQUENCE d_x_seq OWNER TO alice")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
 }
 
 /// The stored access control list of `relname`, as `pg_class.relacl` shows
@@ -546,6 +548,59 @@ fn stored_relacl(conn: &Arc<Connection>, relname: &str) -> Option<String> {
         Value::Text(text) => Some(text.as_str().to_string()),
         other => panic!("relacl is text or NULL, got {other:?}"),
     }
+}
+
+/// The stored name of the column that owns sequence `relname`, read from
+/// the catalog table.
+fn stored_relownedbycolumn(conn: &Arc<Connection>, relname: &str) -> Option<String> {
+    let rows = conn
+        .prepare(format!(
+            "SELECT relownedbycolumn FROM __turso_internal_classes WHERE relname = '{relname}'"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{relname} has one class row: {rows:?}");
+    match &rows[0][0] {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str().to_string()),
+        other => panic!("relownedbycolumn is text or NULL, got {other:?}"),
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn the_catalog_stores_the_column_that_owns_a_sequence(db: TempDatabase) {
+    let pg = db.connect_postgres();
+    let conn = db.connect_limbo();
+    pg.execute("CREATE TABLE t (id serial, other int)").unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("id")
+    );
+
+    pg.execute("ALTER TABLE t RENAME COLUMN id TO ident")
+        .unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("ident")
+    );
+
+    pg.execute("ALTER SEQUENCE t_id_seq OWNED BY t.other")
+        .unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("other")
+    );
+
+    pg.execute("ALTER TABLE t RENAME COLUMN ident TO id")
+        .unwrap();
+    assert_eq!(
+        stored_relownedbycolumn(&conn, "t_id_seq").as_deref(),
+        Some("other")
+    );
+
+    pg.execute("ALTER SEQUENCE t_id_seq OWNED BY NONE").unwrap();
+    assert_eq!(stored_relownedbycolumn(&conn, "t_id_seq"), None);
 }
 
 #[turso_macros::test(mvcc)]
@@ -736,273 +791,6 @@ fn a_rolled_back_revoke_leaves_the_list_as_it_was(db: TempDatabase) {
     );
     pg.execute("SET ROLE reader").unwrap();
     pg.execute("SELECT x FROM t").unwrap();
-}
-
-/// Writes a database at `path` with the catalog as the first tursopg with
-/// one made it: six columns, no `relacl`, and a class row for the table
-/// `app.t`, written by hand.
-fn write_catalog_without_relacl(path: &str) {
-    write_old_catalog(path, "");
-}
-
-/// Writes a database at `path` with the catalog as tursopg made it before
-/// row-level security: `relacl` but no `relrowsecurity`.
-fn write_catalog_without_relrowsecurity(path: &str) {
-    write_old_catalog(path, "relacl");
-}
-
-/// Writes a database at `path` with the catalog as tursopg made it before
-/// policies: `relacl` and `relrowsecurity` but no `relpolicies`.
-fn write_catalog_without_relpolicies(path: &str) {
-    write_old_catalog(path, "relrowsecurity");
-}
-
-/// Writes a database at `path` with a catalog that has the columns of the
-/// first catalog and the later ones up to `last_column`: none for "",
-/// `relacl`, or `relacl` and `relrowsecurity`. It has a class row for the
-/// table `app.t`, written by hand.
-fn write_old_catalog(path: &str, last_column: &str) {
-    let db = open_without_catalog(path);
-    let conn = db
-        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
-        .unwrap();
-    conn.create_namespace("app").unwrap();
-    let app = conn.qualifier("app").unwrap().target.id.as_u32();
-    let (relacl_column, relacl_value) = match last_column {
-        "" => ("", ""),
-        "relacl" => (", relacl TEXT", ", NULL"),
-        "relrowsecurity" => (
-            ", relacl TEXT, relrowsecurity INTEGER NOT NULL DEFAULT 0",
-            ", NULL, 0",
-        ),
-        _ => unreachable!("unknown catalog column {last_column}"),
-    };
-    for sql in [
-        format!(
-            "CREATE TABLE __turso_internal_classes (oid INTEGER PRIMARY KEY, \
-             relname TEXT NOT NULL, relnamespace INTEGER NOT NULL, relkind TEXT NOT NULL, \
-             relowner INTEGER NOT NULL, relownedby INTEGER NOT NULL{relacl_column})"
-        ),
-        "CREATE UNIQUE INDEX __turso_internal_classes_name \
-         ON __turso_internal_classes (relnamespace, relname)"
-            .to_string(),
-        "CREATE TABLE sqlite_sequence(name,seq)".to_string(),
-        "INSERT INTO sqlite_sequence (name, seq) VALUES ('__turso_internal_classes', 16384)"
-            .to_string(),
-        "CREATE TABLE app.t (x int)".to_string(),
-        format!(
-            "INSERT INTO __turso_internal_classes \
-             VALUES (16384, 't', {app}, 'r', 0, 0{relacl_value})"
-        ),
-    ] {
-        conn.prepare_engine_schema_statement(&sql)
-            .unwrap()
-            .run_ignore_rows()
-            .unwrap();
-    }
-}
-
-#[test]
-fn a_catalog_made_before_relacl_gets_the_column_when_opened() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pre-relacl.db");
-    let path = path.to_str().unwrap();
-    write_catalog_without_relacl(path);
-
-    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let db = turso_pg::open_database_with_io(
-        io,
-        path,
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new(),
-    )
-    .unwrap();
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-    let conn = db
-        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
-        .unwrap();
-    assert_eq!(stored_relacl(&conn, "t"), None);
-    assert_eq!(relacl(&pg, "t"), None);
-
-    pg.execute("CREATE ROLE reader").unwrap();
-    pg.execute("GRANT SELECT ON app.t TO reader").unwrap();
-    assert_eq!(
-        stored_relacl(&conn, "t").as_deref(),
-        Some("{10=arwdDxtm/10,16385=r/10}")
-    );
-    assert_eq!(
-        relacl(&pg, "t").as_deref(),
-        Some("{postgres=arwdDxtm/postgres,reader=r/postgres}")
-    );
-}
-
-#[test]
-fn a_catalog_made_before_relacl_opens_read_only_without_the_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pre-relacl-read-only.db");
-    let path = path.to_str().unwrap();
-    write_catalog_without_relacl(path);
-
-    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let db = turso_pg::open_database_with_io(
-        io,
-        path,
-        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
-        turso_core::DatabaseOpts::new(),
-    )
-    .unwrap();
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-    assert_eq!(relacl(&pg, "t"), None);
-    let rows = pg
-        .query("SELECT count(*) FROM app.t")
-        .unwrap()
-        .unwrap()
-        .run_collect_rows()
-        .unwrap();
-    assert_eq!(rows[0][0].as_int(), Some(0));
-
-    // Statements that rewrite a class row compile without the column and
-    // fail as any write to a read-only database does.
-    pg.execute("CREATE ROLE reader").unwrap_err();
-    for sql in [
-        "DROP TABLE app.t",
-        "ALTER TABLE app.t RENAME TO u",
-        "ALTER TABLE app.t OWNER TO postgres",
-        "GRANT SELECT ON app.t TO postgres",
-        "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY",
-    ] {
-        let error = pg.execute(sql).unwrap_err().to_string();
-        assert!(error.contains("readonly"), "{sql}: {error}");
-    }
-}
-
-/// Whether `relname` has row-level security, as `pg_class.relrowsecurity`
-/// shows it.
-fn relrowsecurity(conn: &turso_pg::Connection, relname: &str) -> bool {
-    let rows = conn
-        .query(format!(
-            "SELECT relrowsecurity FROM pg_class WHERE relname = '{relname}'"
-        ))
-        .unwrap()
-        .unwrap()
-        .run_collect_rows()
-        .unwrap();
-    rows[0][0].as_int() == Some(1)
-}
-
-fn open_pg_database(path: &str, flags: turso_core::OpenFlags) -> Arc<turso_core::Database> {
-    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-    turso_pg::open_database_with_io(io, path, flags, turso_core::DatabaseOpts::new()).unwrap()
-}
-
-#[test]
-fn a_catalog_made_before_relrowsecurity_gets_the_column_when_opened() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pre-relrowsecurity.db");
-    let path = path.to_str().unwrap();
-    write_catalog_without_relrowsecurity(path);
-
-    let db = open_pg_database(path, turso_core::OpenFlags::default());
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-    assert!(!relrowsecurity(&pg, "t"));
-
-    pg.execute("ALTER TABLE app.t ENABLE ROW LEVEL SECURITY")
-        .unwrap();
-    assert!(relrowsecurity(&pg, "t"));
-    pg.close().unwrap();
-    drop(pg);
-    drop(db);
-
-    let db = open_pg_database(path, turso_core::OpenFlags::default());
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-    assert!(relrowsecurity(&pg, "t"));
-}
-
-#[test]
-fn a_catalog_made_before_relrowsecurity_opens_read_only_without_the_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pre-relrowsecurity-read-only.db");
-    let path = path.to_str().unwrap();
-    write_catalog_without_relrowsecurity(path);
-
-    let db = open_pg_database(
-        path,
-        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
-    );
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-
-    assert!(!relrowsecurity(&pg, "t"));
-    let error = pg
-        .execute("ALTER TABLE app.t ENABLE ROW LEVEL SECURITY")
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("readonly"), "{error}");
-}
-
-/// The ids of `app.t` that role alice reads.
-fn ids_alice_reads(pg: &turso_pg::Connection) -> Vec<String> {
-    pg.execute("SET ROLE alice").unwrap();
-    let mut stmt = pg.query("SELECT x FROM app.t ORDER BY x").unwrap().unwrap();
-    let ids = stmt
-        .run_collect_rows()
-        .unwrap()
-        .into_iter()
-        .map(|row| row[0].to_string())
-        .collect();
-    pg.execute("RESET ROLE").unwrap();
-    ids
-}
-
-#[test]
-fn a_catalog_made_before_relpolicies_gets_the_column_when_opened() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pre-relpolicies.db");
-    let path = path.to_str().unwrap();
-    write_catalog_without_relpolicies(path);
-
-    let db = open_pg_database(path, turso_core::OpenFlags::default());
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-    for sql in [
-        "CREATE ROLE alice",
-        "INSERT INTO app.t VALUES (1), (2)",
-        "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY",
-        "GRANT SELECT ON app.t TO alice",
-    ] {
-        pg.execute(sql).unwrap();
-    }
-    assert!(ids_alice_reads(&pg).is_empty());
-
-    pg.execute("CREATE POLICY one ON app.t USING (x = 1)")
-        .unwrap();
-    assert_eq!(ids_alice_reads(&pg), vec!["1"]);
-    pg.close().unwrap();
-    drop(pg);
-    drop(db);
-
-    let db = open_pg_database(path, turso_core::OpenFlags::default());
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-    assert_eq!(ids_alice_reads(&pg), vec!["1"]);
-}
-
-#[test]
-fn a_catalog_made_before_relpolicies_opens_read_only_without_the_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("pre-relpolicies-read-only.db");
-    let path = path.to_str().unwrap();
-    write_catalog_without_relpolicies(path);
-
-    let db = open_pg_database(
-        path,
-        turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
-    );
-    let pg = turso_pg::Connection::connect(&db).unwrap();
-
-    assert!(!relrowsecurity(&pg, "t"));
-    let error = pg
-        .execute("CREATE POLICY one ON app.t USING (x = 1)")
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("readonly"), "{error}");
 }
 
 /// A table without a class row is one the engine made for itself. Nobody

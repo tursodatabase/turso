@@ -15,8 +15,9 @@ use crate::sqlstate::{
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_RESERVED_NAME, SQLSTATE_SYNTAX_ERROR,
-    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_PARAMETER,
-    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION, SQLSTATE_WINDOWING_ERROR,
+    SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_PARAMETER, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_UNIQUE_VIOLATION,
+    SQLSTATE_WINDOWING_ERROR,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -53,6 +54,7 @@ pub struct SerialSequence {
     /// text implies. A table whose sequence is named otherwise has to be
     /// stored as text that names the sequence.
     pub has_default_name: bool,
+    pub options: SequenceOptions,
 }
 
 /// Whether a schema, by name, has a relation of a name.
@@ -138,6 +140,7 @@ impl PostgreSQLTranslator {
             | "pg_namespace"
             | "pg_attribute"
             | "pg_roles"
+            | "pg_auth_members"
             | "pg_am"
             | "pg_database"
             | "pg_proc"
@@ -247,13 +250,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
-            NodeRef::GrantRoleStmt(grant) => {
-                return Err(ParseError::not_supported(if grant.is_grant {
-                    "GRANT of role membership"
-                } else {
-                    "REVOKE of role membership"
-                }))
-            }
+            NodeRef::GrantRoleStmt(grant) => translate_grant_role(grant)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -565,11 +562,11 @@ impl PostgreSQLTranslator {
                     exact_name(&namespace),
                     exact_name(&sequence.name),
                 ),
-                start: None,
-                increment: None,
-                min_value: None,
-                max_value: None,
-                cycle: false,
+                start: sequence.options.start,
+                increment: sequence.options.increment,
+                min_value: sequence.options.min_value,
+                max_value: sequence.options.max_value,
+                cycle: sequence.options.cycle,
             })
             .collect();
         // PostgreSQL links a serial column's sequence to the column once the
@@ -682,6 +679,10 @@ impl PostgreSQLTranslator {
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
         let mut stored_generated_constraint: Option<ast::NamedColumnConstraint> = None;
+        let mut identity = None;
+        let mut has_identity = false;
+        let mut explicit_default = false;
+        let mut explicit_null = false;
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
@@ -709,6 +710,7 @@ impl PostgreSQLTranslator {
                     let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
                         ParseError::ParseError("DEFAULT missing expression".into())
                     })?;
+                    explicit_default = true;
                     default_expr = Some(self.translate_expr(raw_expr)?);
                 }
                 ConstrType::ConstrCheck => {
@@ -738,9 +740,49 @@ impl PostgreSQLTranslator {
                     stored_generated_constraint =
                         Some(self.translate_generated_constraint(constraint, tbl_name)?);
                 }
-                ConstrType::ConstrNull
-                | ConstrType::ConstrAttrNotDeferrable
-                | ConstrType::ConstrAttrImmediate => {}
+                ConstrType::ConstrIdentity => {
+                    if has_identity {
+                        return Err(ParseError::ParseError(format!(
+                            "multiple identity specifications for column \"{name}\" of table \"{}\"",
+                            tbl_name.name.as_str()
+                        )));
+                    }
+                    if is_serial {
+                        return Err(ParseError::ParseError(format!(
+                            "both default and identity specified for column \"{name}\" of table \"{}\"",
+                            tbl_name.name.as_str()
+                        )));
+                    }
+                    if !matches!(
+                        pg_type.as_str(),
+                        "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint"
+                    ) {
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                            message: "identity column type must be smallint, integer, or bigint"
+                                .into(),
+                        });
+                    }
+                    has_identity = true;
+                    let (sequence_name, option_nodes) =
+                        identity_sequence_name(&constraint.options, tbl_name)?;
+                    let options = SequenceOptions::new(&option_nodes, Some(&pg_type))?;
+                    default_expr = Some(self.serial_default(
+                        tbl_name,
+                        &name,
+                        sequence_name,
+                        options,
+                        serial_sequences,
+                    ));
+                    is_not_null = true;
+                    identity = Some(if constraint.generated_when == "a" {
+                        ast::IdentityKind::Always
+                    } else {
+                        ast::IdentityKind::ByDefault
+                    });
+                }
+                ConstrType::ConstrNull => explicit_null = true,
+                ConstrType::ConstrAttrNotDeferrable | ConstrType::ConstrAttrImmediate => {}
                 other => {
                     return Err(ParseError::not_supported(format!(
                         "column constraint {}",
@@ -748,6 +790,19 @@ impl PostgreSQLTranslator {
                     )))
                 }
             }
+        }
+
+        if has_identity && explicit_default {
+            return Err(ParseError::ParseError(format!(
+                "both default and identity specified for column \"{name}\" of table \"{}\"",
+                tbl_name.name.as_str()
+            )));
+        }
+        if has_identity && explicit_null {
+            return Err(ParseError::ParseError(format!(
+                "conflicting NULL/NOT NULL declarations for column \"{name}\" of table \"{}\"",
+                tbl_name.name.as_str()
+            )));
         }
 
         // Build the type with size parameters (e.g. varchar(4), numeric(10,2))
@@ -776,35 +831,13 @@ impl PostgreSQLTranslator {
 
         // For serial columns, add DEFAULT nextval('namespace.tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let (seq_name, has_default_name) = self.serial_sequence_name(tbl_name, &name);
-            // The stored text of a table of a schema names the table by its
-            // mangled name, and the sequence's mangled name is that name with
-            // the same suffix, so the default names the sequence that way.
-            let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
-                seq_name.clone()
-            } else {
-                format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
-            };
-            serial_sequences.push(SerialSequence {
-                column: name.clone(),
-                schema: serial_sequence_namespace(tbl_name),
-                name: seq_name,
-                has_default_name,
-            });
-            default_expr = Some(ast::Expr::FunctionCall {
-                name: exact_name("nextval"),
-                distinctness: None,
-                args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{}'",
-                    sequence.replace('\'', "''")
-                ))))],
-                order_by: vec![],
-                within_group: vec![],
-                filter_over: ast::FunctionTail {
-                    filter_clause: None,
-                    over_clause: None,
-                },
-            });
+            default_expr = Some(self.serial_default(
+                tbl_name,
+                &name,
+                None,
+                SequenceOptions::default(),
+                serial_sequences,
+            ));
         }
 
         // PRIMARY KEY (only on column level if there's no table-level PK)
@@ -866,6 +899,13 @@ impl PostgreSQLTranslator {
             constraints.push(gen);
         }
 
+        if let Some(kind) = identity {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Identity(kind),
+            });
+        }
+
         Ok(ast::ColumnDefinition {
             col_name: exact_name(name),
             col_type,
@@ -879,11 +919,7 @@ impl PostgreSQLTranslator {
     /// of `<table>_<column>_seq1`, `<table>_<column>_seq2`, ... that none
     /// has, as PostgreSQL names it.
     fn serial_sequence_name(&self, tbl_name: &ast::QualifiedName, column: &str) -> (String, bool) {
-        let name = format!(
-            "{}_{}_seq",
-            tbl_name.name.as_str().to_lowercase(),
-            column.to_lowercase()
-        );
+        let name = default_serial_sequence_name(tbl_name, column);
         let Some(is_taken) = &self.relation_name_is_taken else {
             return (name, true);
         };
@@ -896,6 +932,54 @@ impl PostgreSQLTranslator {
             .find(|name| !is_taken(&schema, name))
             .expect("the numbers never run out");
         (free_name, false)
+    }
+
+    /// Record the sequence of a serial or identity column and return the
+    /// `nextval` default that draws from it.
+    fn serial_default(
+        &self,
+        tbl_name: &ast::QualifiedName,
+        column: &str,
+        explicit_name: Option<String>,
+        options: SequenceOptions,
+        serial_sequences: &mut Vec<SerialSequence>,
+    ) -> ast::Expr {
+        let (seq_name, has_default_name) = match explicit_name {
+            Some(name) => {
+                let is_default = name == default_serial_sequence_name(tbl_name, column);
+                (name, is_default)
+            }
+            None => self.serial_sequence_name(tbl_name, column),
+        };
+        // The stored text of a table of a schema names the table by its
+        // mangled name, and the sequence's mangled name is that name with
+        // the same suffix, so the default names the sequence that way.
+        let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
+            seq_name.clone()
+        } else {
+            format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
+        };
+        serial_sequences.push(SerialSequence {
+            column: column.to_string(),
+            schema: serial_sequence_namespace(tbl_name),
+            name: seq_name,
+            has_default_name,
+            options,
+        });
+        ast::Expr::FunctionCall {
+            name: exact_name("nextval"),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                sequence.replace('\'', "''")
+            ))))],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }
     }
 
     /// Translate `GENERATED ALWAYS AS (expr) STORED` of a column of table `tbl_name`.
@@ -1064,7 +1148,7 @@ impl PostgreSQLTranslator {
             tbl_name: self.qualified_name_from_range_var(table)?,
             permissive: policy.permissive,
             command,
-            roles: policy_roles(&policy.roles)?,
+            roles: role_list(&policy.roles, "CREATE POLICY")?,
             using_expr,
             check_expr,
         })))
@@ -1908,15 +1992,16 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<_, _>>()?;
         reject_duplicate_columns(columns.iter().map(|c| c.as_str()), "INSERT")?;
-        if matches!(
-            pg_query::protobuf::OverridingKind::try_from(insert.r#override),
-            Ok(pg_query::protobuf::OverridingKind::OverridingUserValue
-                | pg_query::protobuf::OverridingKind::OverridingSystemValue)
-        ) {
-            return Err(ParseError::not_supported(
-                "INSERT ... OVERRIDING SYSTEM/USER VALUE",
-            ));
-        }
+        let overriding_system_value =
+            match pg_query::protobuf::OverridingKind::try_from(insert.r#override) {
+                Ok(pg_query::protobuf::OverridingKind::OverridingUserValue) => {
+                    return Err(ParseError::not_supported(
+                        "INSERT ... OVERRIDING USER VALUE",
+                    ));
+                }
+                Ok(pg_query::protobuf::OverridingKind::OverridingSystemValue) => true,
+                _ => false,
+            };
         let has_explicit_columns = !columns.is_empty();
 
         // Translate ON CONFLICT clause (upsert)
@@ -1929,6 +2014,7 @@ impl PostgreSQLTranslator {
                 ));
             }
             return Ok(ast::Stmt::Insert {
+                overriding_system_value,
                 with: self.translate_with_clause(&insert.with_clause)?,
                 or_conflict: None,
                 tbl_name,
@@ -2004,6 +2090,7 @@ impl PostgreSQLTranslator {
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
+            overriding_system_value,
             with,
             or_conflict: None,
             tbl_name,
@@ -5397,117 +5484,15 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        let mut start = None;
-        let mut increment = None;
-        let mut min_value = None;
-        let mut max_value = None;
-        let mut cycle = false;
-
-        let mut as_type = None;
-        for opt_node in &seq.options {
-            if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
-                match elem.defname.as_str() {
-                    "as" => {
-                        let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
-                            elem.arg.as_ref().and_then(|n| n.node.as_ref())
-                        else {
-                            return Err(ParseError::ParseError(
-                                "CREATE SEQUENCE AS: missing type".into(),
-                            ));
-                        };
-                        as_type = Some(extract_type_name_from_typename(tn)?);
-                    }
-                    "start" => {
-                        start = sequence_option_int(elem)?;
-                    }
-                    "increment" => {
-                        increment = sequence_option_int(elem)?;
-                    }
-                    "minvalue" => {
-                        min_value = sequence_option_int(elem)?;
-                    }
-                    "maxvalue" => {
-                        max_value = sequence_option_int(elem)?;
-                    }
-                    "cycle" => {
-                        // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
-                        cycle = extract_def_elem_bool(elem);
-                    }
-                    "cache" => match sequence_option_int(elem)? {
-                        Some(1) => {}
-                        Some(cache) if cache < 1 => {
-                            return Err(ParseError::Sqlstate {
-                                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
-                                message: format!("CACHE ({cache}) must be greater than zero"),
-                            });
-                        }
-                        Some(cache) => {
-                            return Err(ParseError::not_supported(format!(
-                                "CACHE {cache} (Turso sequences do not cache values, \
-                                 so CACHE must be 1)"
-                            )));
-                        }
-                        None => {
-                            return Err(ParseError::not_supported(
-                                "this CACHE value in CREATE SEQUENCE",
-                            ));
-                        }
-                    },
-                    "owned_by"
-                        if matches!(
-                            elem.arg.as_ref().and_then(|n| n.node.as_ref()),
-                            Some(pg_query::protobuf::node::Node::List(l))
-                                if extract_key_columns(&l.items).is_ok_and(|n| n == ["none"])
-                        ) => {}
-                    other => {
-                        return Err(ParseError::not_supported(format!(
-                            "CREATE SEQUENCE option {}",
-                            other.to_uppercase().replace('_', " ")
-                        )))
-                    }
-                }
-            } else {
-                return Err(ParseError::ParseError(
-                    "CREATE SEQUENCE: unexpected option node".into(),
-                ));
-            }
-        }
-
-        // AS smallint/integer narrows the default bound in the sequence's
-        // direction; bigint is the default range.
-        if let Some(as_type) = as_type {
-            let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
-                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
-                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
-                "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
-                other => {
-                    return Err(ParseError::ParseError(format!(
-                        "CREATE SEQUENCE AS {other} is not supported"
-                    )))
-                }
-            };
-            for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
-                if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
-                    return Err(ParseError::ParseError(format!(
-                        "{option} ({value}) is out of range for sequence data type {type_name}"
-                    )));
-                }
-            }
-            if increment.unwrap_or(1) > 0 {
-                max_value.get_or_insert(type_max);
-            } else {
-                min_value.get_or_insert(type_min);
-            }
-        }
-
+        let options = SequenceOptions::new(&seq.options, None)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
+            start: options.start,
+            increment: options.increment,
+            min_value: options.min_value,
+            max_value: options.max_value,
+            cycle: options.cycle,
         })
     }
 
@@ -5866,6 +5851,278 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SequenceOptions {
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: bool,
+}
+
+impl SequenceOptions {
+    /// The options of a sequence of the type `data_type`, or of the type an `AS`
+    /// option names.
+    pub fn new(
+        options: &[pg_query::protobuf::Node],
+        data_type: Option<&str>,
+    ) -> Result<Self, ParseError> {
+        let mut cycle = false;
+
+        let mut as_type = data_type.map(str::to_string);
+        let mut seen = std::collections::HashSet::new();
+        let mut as_type_name = None;
+        // The options with a number, read after the loop in the order
+        // PostgreSQL reads them, so that the first error is the one it reports.
+        let (mut start_elem, mut increment_elem, mut min_elem, mut max_elem, mut cache_elem) =
+            (None, None, None, None, None);
+        for opt_node in options {
+            if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
+                let is_repeated = !seen.insert(elem.defname.as_str())
+                    || (elem.defname == "as" && data_type.is_some());
+                if is_repeated {
+                    return Err(conflicting_options());
+                }
+                match elem.defname.as_str() {
+                    "as" => {
+                        let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
+                            elem.arg.as_ref().and_then(|n| n.node.as_ref())
+                        else {
+                            return Err(ParseError::ParseError(
+                                "CREATE SEQUENCE AS: missing type".into(),
+                            ));
+                        };
+                        as_type_name = Some(tn);
+                    }
+                    "start" => start_elem = Some(&**elem),
+                    "increment" => increment_elem = Some(&**elem),
+                    "minvalue" => min_elem = Some(&**elem),
+                    "maxvalue" => max_elem = Some(&**elem),
+                    "cycle" => {
+                        // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
+                        cycle = extract_def_elem_bool(elem);
+                    }
+                    "cache" => cache_elem = Some(&**elem),
+                    "owned_by"
+                        if matches!(
+                            elem.arg.as_ref().and_then(|n| n.node.as_ref()),
+                            Some(pg_query::protobuf::node::Node::List(l))
+                                if extract_key_columns(&l.items).is_ok_and(|n| n == ["none"])
+                        ) => {}
+                    other => {
+                        return Err(ParseError::not_supported(format!(
+                            "CREATE SEQUENCE option {}",
+                            other.to_uppercase().replace('_', " ")
+                        )))
+                    }
+                }
+            } else {
+                return Err(ParseError::ParseError(
+                    "CREATE SEQUENCE: unexpected option node".into(),
+                ));
+            }
+        }
+
+        if let Some(type_name) = as_type_name {
+            as_type = Some(sequence_data_type(type_name)?.to_string());
+        }
+        let (type_min, type_max, type_name) = match as_type.as_deref().map(str::to_lowercase) {
+            None => (i64::MIN, i64::MAX, "bigint"),
+            Some(as_type) => match as_type.as_str() {
+                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
+                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
+                "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
+                other => {
+                    return Err(ParseError::ParseError(format!(
+                        "CREATE SEQUENCE AS {other} is not supported"
+                    )))
+                }
+            },
+        };
+        let invalid = |message: String| ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+            message,
+        };
+        let read = |elem: Option<&pg_query::protobuf::DefElem>| -> Result<Option<i64>, ParseError> {
+            elem.map_or(Ok(None), sequence_option_int)
+        };
+        let read_bound = |option: &str, elem| -> Result<Option<i64>, ParseError> {
+            let value = read(elem)?;
+            match value.filter(|v| !(type_min..=type_max).contains(v)) {
+                Some(value) => Err(invalid(format!(
+                    "{option} ({value}) is out of range for sequence data type {type_name}"
+                ))),
+                None => Ok(value),
+            }
+        };
+
+        // The values are read and checked in the order PostgreSQL's
+        // init_params reads them, so that the first error is the one it
+        // reports. Core checks the bounds again when it makes the sequence.
+        let increment = read(increment_elem)?;
+        if increment == Some(0) {
+            return Err(invalid("INCREMENT must not be zero".to_string()));
+        }
+        let ascending = increment.unwrap_or(1) > 0;
+        let mut max_value = read_bound("MAXVALUE", max_elem)?;
+        let mut min_value = read_bound("MINVALUE", min_elem)?;
+        let min = min_value.unwrap_or(if ascending { 1 } else { type_min });
+        let max = max_value.unwrap_or(if ascending { type_max } else { -1 });
+        if min >= max {
+            return Err(invalid(format!(
+                "MINVALUE ({min}) must be less than MAXVALUE ({max})"
+            )));
+        }
+        let start = read(start_elem)?;
+        let first = start.unwrap_or(if ascending { min } else { max });
+        if first < min {
+            return Err(invalid(format!(
+                "START value ({first}) cannot be less than MINVALUE ({min})"
+            )));
+        }
+        if first > max {
+            return Err(invalid(format!(
+                "START value ({first}) cannot be greater than MAXVALUE ({max})"
+            )));
+        }
+        match read(cache_elem)? {
+            None | Some(1) => {}
+            Some(cache) if cache < 1 => {
+                return Err(invalid(format!(
+                    "CACHE ({cache}) must be greater than zero"
+                )));
+            }
+            Some(cache) => {
+                return Err(ParseError::not_supported(format!(
+                    "CACHE {cache} (Turso sequences do not cache values, so CACHE must be 1)"
+                )));
+            }
+        }
+
+        // AS smallint/integer narrows the default bound in the sequence's
+        // direction; bigint is the default range.
+        if as_type.is_some() {
+            if ascending {
+                max_value.get_or_insert(type_max);
+            } else {
+                min_value.get_or_insert(type_min);
+            }
+        }
+
+        Ok(Self {
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        })
+    }
+}
+
+/// The integer type that `AS type` of a sequence names.
+fn sequence_data_type(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<&'static str, ParseError> {
+    let names = extract_key_columns(&type_name.names)?;
+    let name = object_name(&type_name.names, is_default_schema, "type")?;
+    if names.len() == 2 && !is_pg_catalog(&names[0]) {
+        return Err(type_does_not_exist(&names.join(".")));
+    }
+    if name.chars().any(char::is_uppercase) {
+        return Err(type_does_not_exist(&name));
+    }
+    let integer_type = match name.as_str() {
+        "int2" | "smallint" => "smallint",
+        "int4" | "integer" | "int" => "integer",
+        "int8" | "bigint" => "bigint",
+        _ => {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+                message: "sequence type must be smallint, integer, or bigint".to_string(),
+            })
+        }
+    };
+    if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
+        return Err(ParseError::ParseError(format!(
+            "CREATE SEQUENCE AS {name} with a modifier is not supported"
+        )));
+    }
+    Ok(integer_type)
+}
+
+fn type_does_not_exist(name: &str) -> ParseError {
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_OBJECT,
+        message: format!("type \"{name}\" does not exist"),
+    }
+}
+
+fn conflicting_options() -> ParseError {
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_SYNTAX_ERROR,
+        message: "conflicting or redundant options".to_string(),
+    }
+}
+
+/// The sequence name an identity column's `SEQUENCE NAME` option gives, if
+/// any, and the identity options without it. The name has to be in the
+/// table's schema.
+fn identity_sequence_name(
+    options: &[pg_query::protobuf::Node],
+    tbl_name: &ast::QualifiedName,
+) -> Result<(Option<String>, Vec<pg_query::protobuf::Node>), ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let mut sequence_name = None;
+    let mut rest = Vec::new();
+    for option in options {
+        let Some(Node::DefElem(elem)) = &option.node else {
+            rest.push(option.clone());
+            continue;
+        };
+        if elem.defname != "sequence_name" {
+            rest.push(option.clone());
+            continue;
+        }
+        let Some(Node::List(list)) = elem.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
+            return Err(ParseError::ParseError(
+                "SEQUENCE NAME: missing name".to_string(),
+            ));
+        };
+        let parts: Vec<&str> = list
+            .items
+            .iter()
+            .filter_map(|item| match &item.node {
+                Some(Node::String(part)) => Some(part.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let name = match parts.as_slice() {
+            [name] => *name,
+            [schema, name] if *schema == serial_sequence_namespace(tbl_name) => *name,
+            _ => {
+                return Err(ParseError::not_supported(
+                    "SEQUENCE NAME in a schema other than the table's",
+                ))
+            }
+        };
+        if sequence_name.replace(name.to_string()).is_some() {
+            return Err(conflicting_options());
+        }
+    }
+    Ok((sequence_name, rest))
+}
+
+/// `<table>_<column>_seq`, the name PostgreSQL gives the sequence of a serial
+/// or identity column when nothing else has it.
+fn default_serial_sequence_name(tbl_name: &ast::QualifiedName, column: &str) -> String {
+    format!(
+        "{}_{}_seq",
+        tbl_name.name.as_str().to_lowercase(),
+        column.to_lowercase()
+    )
+}
+
 /// The namespace of the sequences of the serial columns of table `tbl_name`:
 /// the namespace of the table, or public when the table has none.
 fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
@@ -5901,6 +6158,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_namespace"
             | "pg_attribute"
             | "pg_roles"
+            | "pg_auth_members"
             | "pg_proc"
             | "pg_database"
             | "pg_am"
@@ -6476,6 +6734,68 @@ fn translate_create_role(
     })
 }
 
+/// `GRANT role TO role` or `REVOKE role FROM role`. A membership is stored
+/// without options, so the options of the statement, `GRANTED BY` and
+/// `CASCADE` are refused rather than ignored.
+fn translate_grant_role(stmt: &pg_query::protobuf::GrantRoleStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::DropBehavior;
+
+    let statement = if stmt.is_grant { "GRANT" } else { "REVOKE" };
+    // GRANT gives options as `WITH ADMIN OPTION`, `WITH INHERIT TRUE` or
+    // `WITH SET FALSE`. REVOKE takes one away as `ADMIN OPTION FOR`.
+    if let Some(option) = stmt.opt.first() {
+        let Some(Node::DefElem(elem)) = &option.node else {
+            return Err(ParseError::ParseError(format!(
+                "{statement}: unexpected role membership option"
+            )));
+        };
+        let option = elem.defname.to_uppercase();
+        return Err(ParseError::not_supported(
+            match (stmt.is_grant, option.as_str()) {
+                (true, "ADMIN") => "GRANT ... WITH ADMIN OPTION".to_string(),
+                (true, _) => format!("GRANT ... WITH {option}"),
+                (false, _) => format!("REVOKE {option} OPTION FOR"),
+            },
+        ));
+    }
+    if stmt.grantor.is_some() {
+        return Err(ParseError::not_supported(format!(
+            "{statement} ... GRANTED BY"
+        )));
+    }
+    if stmt.behavior == DropBehavior::DropCascade as i32 {
+        return Err(ParseError::not_supported(
+            "REVOKE of role membership with CASCADE",
+        ));
+    }
+    let roles = stmt
+        .granted_roles
+        .iter()
+        .map(|role| {
+            let Some(Node::AccessPriv(role)) = &role.node else {
+                return Err(ParseError::ParseError(format!(
+                    "{statement}: unexpected role node"
+                )));
+            };
+            // The grammar takes roles in the same list as privileges, which
+            // may name columns.
+            if role.priv_name.is_empty() || !role.cols.is_empty() {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_INVALID_GRANT_OPERATION,
+                    message: "column names cannot be included in GRANT/REVOKE ROLE".to_string(),
+                });
+            }
+            Ok(role.priv_name.clone())
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ast::Stmt::Grant(ast::Grant {
+        revoke: !stmt.is_grant,
+        objects: ast::GrantObjects::Roles(roles),
+        grantees: role_list(&stmt.grantee_roles, statement)?,
+    }))
+}
+
 /// The keyword that a CREATE ROLE option is written with, such as `NOLOGIN`
 /// for the option PostgreSQL's parser names `canlogin` with value false.
 fn role_option_keyword(elem: &pg_query::protobuf::DefElem) -> String {
@@ -6573,8 +6893,12 @@ fn translate_drop_policy(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stm
     })
 }
 
-/// The roles of a policy's TO clause.
-fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>, ParseError> {
+/// The roles of a role list, such as a policy's TO clause, which
+/// `statement` names in its errors.
+fn role_list(
+    roles: &[pg_query::protobuf::Node],
+    statement: &str,
+) -> Result<Vec<ast::Grantee>, ParseError> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::RoleSpecType;
 
@@ -6582,9 +6906,9 @@ fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>,
         .iter()
         .map(|role| {
             let Some(Node::RoleSpec(spec)) = &role.node else {
-                return Err(ParseError::ParseError(
-                    "CREATE POLICY: unexpected role node".into(),
-                ));
+                return Err(ParseError::ParseError(format!(
+                    "{statement}: unexpected role node"
+                )));
             };
             match RoleSpecType::try_from(spec.roletype) {
                 Ok(RoleSpecType::RolespecPublic) => Ok(ast::Grantee::Public),
@@ -6597,9 +6921,9 @@ fn policy_roles(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Grantee>,
                 Ok(RoleSpecType::RolespecCstring) => Ok(ast::Grantee::Role(ast::RoleSpec::Name(
                     spec.rolename.clone(),
                 ))),
-                _ => Err(ParseError::ParseError(
-                    "CREATE POLICY: unknown role kind".into(),
-                )),
+                _ => Err(ParseError::ParseError(format!(
+                    "{statement}: unknown role kind"
+                ))),
             }
         })
         .collect()
@@ -9083,7 +9407,9 @@ fn reject_constraint_attributes(
     if !constraint.including.is_empty() {
         return Err(ParseError::not_supported("INCLUDE on a constraint"));
     }
-    if !constraint.options.is_empty() || !constraint.indexspace.is_empty() {
+    if (!constraint.options.is_empty() && contype != ConstrType::ConstrIdentity)
+        || !constraint.indexspace.is_empty()
+    {
         return Err(ParseError::not_supported(
             "WITH (storage parameters) / USING INDEX TABLESPACE on a constraint",
         ));
@@ -9486,7 +9812,7 @@ mod tests {
             .translate(&crate::parse("CREATE SEQUENCE s AS numeric").unwrap())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("AS numeric"), "{err}");
+        assert_eq!(err, "sequence type must be smallint, integer, or bigint");
     }
 
     #[test]
@@ -12474,14 +12800,8 @@ mod tests {
 
     #[test]
     fn fail_closed_create_table_column_constraint_kinds() {
-        assert_not_supported(
-            "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY)",
-            "AS IDENTITY",
-        );
-        assert_not_supported(
-            "CREATE TABLE t (id int GENERATED BY DEFAULT AS IDENTITY)",
-            "AS IDENTITY",
-        );
+        assert_translates("CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY)");
+        assert_translates("CREATE TABLE t (id int GENERATED BY DEFAULT AS IDENTITY)");
         assert_translates("CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)");
         assert_translates("CREATE TABLE t (a int NULL)");
     }
@@ -12497,6 +12817,33 @@ mod tests {
         assert!(
             output.contains("AS (a * 2) STORED"),
             "STORED generated column must keep its expression: {output}"
+        );
+    }
+
+    #[test]
+    fn test_identity_columns_emit_sequence_and_default() {
+        let sql = "CREATE TABLE orders (id int GENERATED ALWAYS AS IDENTITY, name text)";
+        let parsed = crate::parse(sql).unwrap();
+        let result = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect("translation must succeed");
+        let output = format!(
+            "{} {}",
+            result
+                .prereqs
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            result.cmd
+        );
+        assert!(
+            output.contains("nextval"),
+            "IDENTITY column must emit a nextval() DEFAULT: {output}"
+        );
+        assert!(
+            output.contains("orders_id_seq"),
+            "IDENTITY column must create a sequence named orders_id_seq: {output}"
         );
     }
 
@@ -12905,13 +13252,10 @@ mod tests {
 
     #[test]
     fn fail_closed_overriding() {
-        assert_not_supported(
-            "INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)",
-            "OVERRIDING",
-        );
+        assert_translates("INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)");
         assert_not_supported(
             "INSERT INTO t OVERRIDING USER VALUE VALUES (1)",
-            "OVERRIDING",
+            "OVERRIDING USER VALUE",
         );
     }
 
@@ -13426,7 +13770,6 @@ mod tests {
     fn fail_closed_create_sequence_options() {
         assert_not_supported("CREATE TEMP SEQUENCE s", "TEMPORARY SEQUENCE");
         assert_not_supported("CREATE SEQUENCE s OWNED BY t.id", "OWNED BY");
-        assert_not_supported("CREATE SEQUENCE s AS numeric", "AS numeric");
         assert_not_supported("CREATE SEQUENCE s CACHE 10", "CACHE 10");
         assert_not_supported("CREATE SEQUENCE s CACHE 9999999999", "CACHE 9999999999");
         // A number that does not read as a bigint is refused as PostgreSQL refuses it.
@@ -13784,23 +14127,122 @@ mod tests {
     }
 
     #[test]
-    fn grant_and_revoke_of_role_membership_are_not_supported() {
-        for (sql, message) in [
-            ("GRANT admins TO alice", "GRANT of role membership"),
-            ("REVOKE admins FROM alice", "REVOKE of role membership"),
+    fn grant_and_revoke_of_roles_name_the_roles_and_the_grantees() {
+        let role = |name: &str| ast::Grantee::Role(ast::RoleSpec::Name(name.to_string()));
+        for (sql, revoke, roles, grantees) in [
+            (
+                "GRANT admins TO alice",
+                false,
+                vec!["admins"],
+                vec![role("alice")],
+            ),
+            (
+                "GRANT admins, \"Readers\" TO alice, CURRENT_USER, SESSION_USER, PUBLIC",
+                false,
+                vec!["admins", "Readers"],
+                vec![
+                    role("alice"),
+                    ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+                    ast::Grantee::Role(ast::RoleSpec::SessionUser),
+                    ast::Grantee::Public,
+                ],
+            ),
+            (
+                "REVOKE admins FROM alice",
+                true,
+                vec!["admins"],
+                vec![role("alice")],
+            ),
+            (
+                "REVOKE admins FROM alice RESTRICT",
+                true,
+                vec!["admins"],
+                vec![role("alice")],
+            ),
         ] {
             let parsed = crate::parse(sql).unwrap();
             assert_eq!(try_extract_grant(&parsed).unwrap(), None, "{sql}");
-            match PostgreSQLTranslator::new().translate(&parsed) {
+            let translated = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+            assert_eq!(
+                translated,
+                ast::Stmt::Grant(ast::Grant {
+                    revoke,
+                    objects: ast::GrantObjects::Roles(
+                        roles.into_iter().map(str::to_string).collect()
+                    ),
+                    grantees,
+                }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_and_revoke_of_roles_refuse_options() {
+        for (sql, message) in [
+            (
+                "GRANT admins TO alice WITH ADMIN OPTION",
+                "GRANT ... WITH ADMIN OPTION is not supported",
+            ),
+            (
+                "GRANT admins TO alice WITH ADMIN TRUE",
+                "GRANT ... WITH ADMIN OPTION is not supported",
+            ),
+            (
+                "GRANT admins TO alice WITH INHERIT FALSE",
+                "GRANT ... WITH INHERIT is not supported",
+            ),
+            (
+                "GRANT admins TO alice WITH SET TRUE",
+                "GRANT ... WITH SET is not supported",
+            ),
+            (
+                "GRANT admins TO alice GRANTED BY postgres",
+                "GRANT ... GRANTED BY is not supported",
+            ),
+            (
+                "REVOKE ADMIN OPTION FOR admins FROM alice",
+                "REVOKE ADMIN OPTION FOR is not supported",
+            ),
+            (
+                "REVOKE INHERIT OPTION FOR admins FROM alice",
+                "REVOKE INHERIT OPTION FOR is not supported",
+            ),
+            (
+                "REVOKE admins FROM alice GRANTED BY postgres",
+                "REVOKE ... GRANTED BY is not supported",
+            ),
+            (
+                "REVOKE admins FROM alice CASCADE",
+                "REVOKE of role membership with CASCADE is not supported",
+            ),
+        ] {
+            match PostgreSQLTranslator::new().translate(&crate::parse(sql).unwrap()) {
                 Err(ParseError::Sqlstate {
                     sqlstate,
                     message: got,
                 }) => {
                     assert_eq!(sqlstate, SQLSTATE_FEATURE_NOT_SUPPORTED, "{sql}");
-                    assert_eq!(got, format!("{message} is not supported"), "{sql}");
+                    assert_eq!(got, message, "{sql}");
                 }
                 other => panic!("{sql}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn grant_of_a_role_with_columns_fails() {
+        match PostgreSQLTranslator::new()
+            .translate(&crate::parse("GRANT admins (x) TO alice").unwrap())
+        {
+            Err(ParseError::Sqlstate { sqlstate, message }) => {
+                assert_eq!(sqlstate, SQLSTATE_INVALID_GRANT_OPERATION);
+                assert_eq!(
+                    message,
+                    "column names cannot be included in GRANT/REVOKE ROLE"
+                );
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

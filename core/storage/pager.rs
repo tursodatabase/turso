@@ -1630,7 +1630,7 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
@@ -1755,7 +1755,7 @@ struct PendingRead {
 /// Test-only deterministic spill-yield injector for `Pager::read_page`. When
 /// armed, the next matching call (after `skip` ignored matches) returns
 /// `IO(yield)` once, then disarms itself.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 struct SpillYieldHook {
     /// `-1` = disarmed; otherwise the `page_idx` to fire on.
     target: std::sync::atomic::AtomicI64,
@@ -1763,7 +1763,7 @@ struct SpillYieldHook {
     skip: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl SpillYieldHook {
     const fn new() -> Self {
         Self {
@@ -1943,7 +1943,7 @@ impl Pager {
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             pages_dirtied_count: AtomicU64::new(0),
@@ -3296,6 +3296,16 @@ impl Pager {
         self.wal.as_ref().map(|wal| wal.backfill_frame())
     }
 
+    /// The write-ahead log of this pager, or `None` if there is no WAL.
+    pub fn wal(&self) -> Option<&Arc<dyn Wal>> {
+        self.wal.as_ref()
+    }
+
+    /// Number of the last frame in the WAL, or `None` if there is no WAL.
+    pub fn wal_max_frame(&self) -> Option<u64> {
+        self.wal.as_ref().map(|wal| wal.get_max_frame_in_wal())
+    }
+
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
@@ -3672,7 +3682,7 @@ impl Pager {
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
         }
@@ -3814,9 +3824,16 @@ impl Pager {
 
     /// Test-only: arm `read_page` to return `IO(yield)` once for `page_id`
     /// after `skip` matching calls have passed through.
-    #[cfg(test)]
-    pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
         self.spill_yield.arm(page_id, skip);
+    }
+
+    /// Whether the page is in the page cache. Unlike `cache_get`, this never removes the page.
+    pub fn cache_contains(&self, page_idx: usize) -> bool {
+        self.page_cache
+            .read()
+            .contains_key(&PageCacheKey::new(page_idx))
     }
 
     // Get a page from the cache, if it exists.
@@ -5470,7 +5487,7 @@ impl Pager {
     /// Test-only: evict clean, unpinned pages WITHOUT invalidating cursors, so we
     /// can exercise what happens to a cursor that still holds a `PageRef` to an
     /// evicted (buffer-taken) page — the exact hazard normal LRU eviction creates.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn test_evict_all_unpinned_clean(&self) {
         self.page_cache.write().test_evict_all_unpinned_clean();
     }
@@ -6811,139 +6828,6 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id(), 1);
-    }
-
-    #[test]
-    fn rollback_keeps_pages_the_transaction_did_not_change() {
-        let (db, conn) = open_memory_database("rollback-keeps-unchanged-pages.db");
-        conn.execute("CREATE TABLE changed(x)").unwrap();
-        conn.execute("CREATE TABLE unchanged(x)").unwrap();
-        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
-        conn.execute("INSERT INTO unchanged VALUES (1)").unwrap();
-        let changed_root = root_page(&conn, "changed");
-        let unchanged_root = root_page(&conn, "unchanged");
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
-        let pager = conn.pager.load();
-        let cached_unchanged_root = pager.cache_get(unchanged_root).unwrap().unwrap();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO changed VALUES (2)").unwrap();
-        conn.execute("ROLLBACK").unwrap();
-
-        assert!(!pager
-            .page_cache
-            .write()
-            .contains_key(&PageCacheKey::new(changed_root)));
-        let unchanged_root_after_rollback = pager.cache_get(unchanged_root).unwrap().unwrap();
-        assert!(Arc::ptr_eq(
-            &cached_unchanged_root,
-            &unchanged_root_after_rollback
-        ));
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM changed"), 1);
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
-        drop(db);
-    }
-
-    #[test]
-    fn rollback_drops_pages_spilled_to_the_wal() {
-        let (db, conn) = open_memory_database("rollback-drops-spilled-pages.db");
-        conn.execute("PRAGMA cache_size = 200").unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 500)")
-            .unwrap();
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
-        let pager = conn.pager.load();
-        let wal = pager.wal.as_ref().unwrap();
-        let committed_max_frame = wal.get_max_frame();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("UPDATE t SET x = randomblob(1000)").unwrap();
-        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 1000)")
-            .unwrap();
-        assert!(
-            wal.get_max_frame() > committed_max_frame,
-            "the transaction must spill pages to the WAL"
-        );
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 1500);
-        conn.execute("ROLLBACK").unwrap();
-
-        assert_eq!(wal.get_max_frame(), committed_max_frame);
-        let mut cache = pager.page_cache.write();
-        for key in cache.keys() {
-            let page = cache.peek(&key, false).unwrap();
-            assert!(!page.is_dirty());
-            assert!(!page.has_wal_tag() || page.wal_tag_pair().0 <= committed_max_frame);
-        }
-        drop(cache);
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
-        let mut integrity_check = conn.prepare("PRAGMA integrity_check").unwrap();
-        assert_eq!(
-            integrity_check.run_collect_rows().unwrap(),
-            vec![vec![crate::Value::build_text("ok")]]
-        );
-        drop(db);
-    }
-
-    #[test]
-    fn rollback_drops_pinned_pages_that_are_not_loaded() {
-        let (db, conn) = open_memory_database("rollback-drops-pinned-unloaded-pages.db");
-        conn.execute("CREATE TABLE changed(x)").unwrap();
-        conn.execute("CREATE TABLE unloaded(x)").unwrap();
-        conn.execute("INSERT INTO unloaded VALUES (1)").unwrap();
-        let unloaded_root = root_page(&conn, "unloaded");
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
-        let pager = conn.pager.load();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
-        let page = pager.cache_get(unloaded_root).unwrap().unwrap();
-        page.pin();
-        page.clear_loaded();
-        conn.execute("ROLLBACK").unwrap();
-
-        assert!(!pager
-            .page_cache
-            .write()
-            .contains_key(&PageCacheKey::new(unloaded_root)));
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
-        drop(db);
-    }
-
-    #[test]
-    #[should_panic(expected = "rollback must discard pages while holding the WAL write lock")]
-    fn rollback_without_the_write_lock_panics() {
-        let (_db, conn) = open_memory_database("rollback-without-write-lock.db");
-        conn.execute("CREATE TABLE t(x)").unwrap();
-
-        conn.pager.load().rollback(false, &conn, true);
-    }
-
-    fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = crate::Database::open_file(io, path, Arc::new(crate::EngineDialect)).unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        (db, conn)
-    }
-
-    fn root_page(conn: &Arc<crate::Connection>, table: &str) -> usize {
-        query_i64(
-            conn,
-            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{table}'"),
-        ) as usize
-    }
-
-    fn query_i64(conn: &Arc<crate::Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        match rows.as_slice() {
-            [row] => match row.as_slice() {
-                [crate::Value::Numeric(crate::Numeric::Integer(value))] => *value,
-                other => panic!("expected one integer, got {other:?}"),
-            },
-            other => panic!("expected one row, got {other:?}"),
-        }
     }
 }
 

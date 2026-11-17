@@ -494,3 +494,33 @@ test drop-schema-cascade-lets-the-names-be-reused {
 expect {
     2
 }
+
+test drop-schema-cascade-drops-a-table-whose-sequence-another-table-of-the-schema-uses {
+    CREATE SCHEMA dc_seq_user;
+    CREATE TABLE dc_seq_user.a (id serial);
+    CREATE TABLE dc_seq_user.b (n bigint DEFAULT nextval('dc_seq_user.a_id_seq'));
+    CREATE VIEW dc_seq_user.v AS SELECT nextval('dc_seq_user.a_id_seq') AS n;
+    DROP SCHEMA dc_seq_user CASCADE;
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'dc_seq_user';
+    SELECT count(*) FROM pg_class WHERE relname IN ('a', 'b', 'v', 'a_id_seq');
+}
+expect {
+    0
+    0
+}
+
+# PostgreSQL drops the default of public.dc_outside_user.n with the schema.
+test drop-schema-cascade-when-a-table-of-another-schema-uses-its-sequence {
+    CREATE SCHEMA dc_outside;
+    CREATE TABLE dc_outside.a (id serial);
+    CREATE TABLE dc_outside_user (n bigint DEFAULT nextval('dc_outside.a_id_seq'), label text);
+    DROP SCHEMA dc_outside CASCADE;
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'dc_outside';
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP SCHEMA "dc_outside" CASCADE is not supported when an object of another schema depends on an object of the schema
+}

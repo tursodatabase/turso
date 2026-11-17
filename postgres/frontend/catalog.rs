@@ -6,7 +6,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{
+        identity_table_sql_marker, split_identity_table_sql_marker, POSTGRES_TABLE_SQL_PREFIX,
+    },
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{
@@ -86,7 +88,12 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
+            let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
+                canonical_table_sql_ast(sql)?
+            else {
+                unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
+            };
+            let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
             if !table.has_rowid {
                 return Err(LimboError::ParseError(format!(
                     "PostgreSQL does not support WITHOUT ROWID table '{}'",
@@ -116,7 +123,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::parse_table_sql_ast(sql);
+            return canonical_table_sql_ast(sql);
         };
 
         let parse_result =
@@ -184,7 +191,14 @@ impl Dialect for PostgresDialect {
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        turso_core::dialect::engine::format_table_sql(tbl_name, body)
+        let sql = turso_core::dialect::engine::format_table_sql(tbl_name, body)?;
+        let identity_marker = identity_table_sql_marker(
+            table_columns(body)
+                .iter()
+                .enumerate()
+                .filter_map(|(position, column)| Some((position, column.identity_kind()?))),
+        );
+        Ok(format!("{identity_marker}{sql}"))
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -254,8 +268,16 @@ impl Dialect for PostgresDialect {
         connection: &Arc<Connection>,
         changes: &[turso_core::CatalogChange],
     ) -> turso_core::Result<()> {
-        if let [turso_core::CatalogChange::CreateRole { name, options }] = changes {
-            return crate::roles::translate_create_role(program, schema, name, options);
+        match changes {
+            [turso_core::CatalogChange::CreateRole { name, options }] => {
+                return crate::roles::translate_create_role(program, schema, name, options);
+            }
+            [change @ turso_core::CatalogChange::GrantRole { .. }] => {
+                return crate::auth_members::translate_grant_role(
+                    program, schema, connection, change,
+                );
+            }
+            _ => {}
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
     }
@@ -269,8 +291,9 @@ impl Dialect for PostgresDialect {
         crate::schema_state::apply_catalog_change(schema, change, values)
     }
 
+    /// The built-in superuser is found by its name, `postgres`, too.
     fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
-        schema_roles(schema).get_by_name(name).map(|role| role.id)
+        engine_role_by_name(schema_roles(schema), name)
     }
 
     fn role_is_superuser(&self, schema: &Schema, role: RoleId) -> bool {
@@ -285,6 +308,10 @@ impl Dialect for PostgresDialect {
         schema_roles(schema).can_set_role(member, role)
     }
 
+    fn role_has_privileges_of(&self, schema: &Schema, member: RoleId, role: RoleId) -> bool {
+        schema_roles(schema).has_privileges_of(member, role)
+    }
+
     fn relation_owner(
         &self,
         schema: &Schema,
@@ -292,6 +319,16 @@ impl Dialect for PostgresDialect {
         name: &str,
     ) -> Option<RoleId> {
         crate::classes::relation_owner(schema, namespace, name)
+    }
+
+    fn owned_sequences(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        table: &str,
+        column: Option<&str>,
+    ) -> Vec<String> {
+        crate::classes::owned_sequences(schema, namespace, table, column)
     }
 
     fn role_has_privilege(
@@ -338,6 +375,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn generates_integer_primary_keys(&self) -> bool {
+        false
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
@@ -361,6 +402,40 @@ pub fn encode_pg_schema_sql(sql: &str) -> String {
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
     sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
+}
+
+/// The `CREATE TABLE` of stored table SQL that is SQLite text, with its
+/// identity columns marked as the SQL says.
+fn canonical_table_sql_ast(sql: &str) -> Result<ast::Stmt> {
+    let (identity_columns, sql) = split_identity_table_sql_marker(sql)?;
+    let mut stmt = turso_core::dialect::engine::parse_table_sql_ast(sql)?;
+    let ast::Stmt::CreateTable { body, .. } = &mut stmt else {
+        unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+    };
+    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return Err(LimboError::Corrupt(format!(
+            "stored table SQL has no column definitions: {sql}"
+        )));
+    };
+    for (position, kind) in identity_columns {
+        let column = columns.get_mut(position).ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "identity column {position} is not in table SQL: {sql}"
+            ))
+        })?;
+        column.constraints.push(ast::NamedColumnConstraint {
+            name: None,
+            constraint: ast::ColumnConstraint::Identity(kind),
+        });
+    }
+    Ok(stmt)
+}
+
+fn table_columns(body: &ast::CreateTableBody) -> &[ast::ColumnDefinition] {
+    match body {
+        ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns,
+        ast::CreateTableBody::AsSelect(_) => &[],
+    }
 }
 
 /// Returns the user tables of every namespace as (namespace, name, table)
@@ -912,8 +987,15 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = i64::from(col.default.is_some() || col.is_stored_generated());
+                let has_def = i64::from(
+                    (col.default.is_some() && col.identity.is_none()) || col.is_stored_generated(),
+                );
                 let generated = if col.is_stored_generated() { "s" } else { "" };
+                let identity = match col.identity {
+                    Some(ast::IdentityKind::Always) => "a",
+                    Some(ast::IdentityKind::ByDefault) => "d",
+                    None => "",
+                };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -932,7 +1014,7 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(notnull),      // attnotnull
                     Value::from_i64(has_def),      // atthasdef
                     Value::from_i64(0),            // atthasmissing
-                    Value::Text("".into()),        // attidentity
+                    Value::Text(identity.into()),  // attidentity
                     Value::Text(generated.into()), // attgenerated
                     Value::from_i64(0),            // attisdropped
                     Value::from_i64(1),            // attislocal
@@ -979,12 +1061,37 @@ pub(crate) fn role_name_by_oid(roles: &RoleCatalog, oid: i64) -> Option<String> 
 /// The PostgreSQL oid of the role named `name`, the inverse of
 /// [`role_name_by_oid`].
 pub(crate) fn role_oid_by_name(roles: &RoleCatalog, name: &str) -> Option<i64> {
+    pg_role_by_name(roles, name).map(|role| match role {
+        PgRole::Engine(id) => role_oid(id),
+        PgRole::DatabaseOwner => PG_DATABASE_OWNER_OID,
+    })
+}
+
+/// A role that `pg_roles` lists: one of the engine's roles, or
+/// `pg_database_owner`, which is not a role of the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgRole {
+    Engine(RoleId),
+    DatabaseOwner,
+}
+
+/// The engine's role named `name`, the built-in superuser `postgres`
+/// included. `pg_database_owner` is not a role of the engine.
+pub(crate) fn engine_role_by_name(roles: &RoleCatalog, name: &str) -> Option<RoleId> {
+    match pg_role_by_name(roles, name)? {
+        PgRole::Engine(id) => Some(id),
+        PgRole::DatabaseOwner => None,
+    }
+}
+
+/// The role named `name` among those `pg_roles` lists.
+pub(crate) fn pg_role_by_name(roles: &RoleCatalog, name: &str) -> Option<PgRole> {
     if name == PG_DATABASE_OWNER_NAME {
-        return Some(PG_DATABASE_OWNER_OID);
+        return Some(PgRole::DatabaseOwner);
     }
     postgres_roles(roles)
         .find(|role| role.name == name)
-        .map(|role| role_oid(role.id))
+        .map(|role| PgRole::Engine(role.id))
 }
 
 /// The roles that PostgreSQL has: its bootstrap superuser, which is the
@@ -1069,6 +1176,46 @@ fn role_row(role: &Role) -> Vec<Value> {
         Value::from_i64(role.bypassrls as i64), // rolbypassrls
         Value::Null,                            // rolconfig
     ]
+}
+
+/// Virtual table implementation for pg_catalog.pg_auth_members: the
+/// memberships that `GRANT role TO role` made.
+#[derive(Debug)]
+struct PgAuthMembersTable;
+
+impl SnapshotRows for PgAuthMembersTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_auth_members (
+            oid INTEGER,
+            roleid INTEGER,
+            member INTEGER,
+            grantor INTEGER,
+            admin_option BOOLEAN,
+            inherit_option BOOLEAN,
+            set_option BOOLEAN
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 2;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        connection_roles(conn)
+            .memberships()
+            .iter()
+            .map(|membership| {
+                vec![
+                    // Membership oids start where PostgreSQL's own objects
+                    // end, as role oids do.
+                    Value::from_i64(USER_ROLE_OID_START + membership.id),
+                    Value::from_i64(role_oid(membership.role)),
+                    Value::from_i64(role_oid(membership.member)),
+                    Value::from_i64(role_oid(membership.grantor)),
+                    Value::from_i64(membership.admin_option as i64),
+                    Value::from_i64(membership.inherit_option as i64),
+                    Value::from_i64(membership.set_option as i64),
+                ]
+            })
+            .collect()
+    }
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -2352,6 +2499,9 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
+                if col.identity.is_some() {
+                    continue;
+                }
                 let adbin = match (&col.default, col.generated_type()) {
                     (Some(default_expr), _) => render_expr(default_expr),
                     (None, GeneratedType::Stored { expr, .. }) => {
@@ -2535,6 +2685,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_roles",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgRolesTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_auth_members",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgAuthMembersTable>(PhantomData),
     );
     options = options.native_module(
         "pg_am",
@@ -3172,6 +3327,37 @@ impl SnapshotRows for PgDependTable {
                 DependencyKind::Auto,
             ));
         }
+
+        // A sequence owned by a column depends on it: internally for identity columns, automatically otherwise.
+        let schema = conn.current_schema();
+        for (namespace, table_name, table, table_oid) in user_tables_with_oids(&schema) {
+            for (index, column) in table.columns().iter().enumerate() {
+                let Some(column_name) = column.name.as_deref() else {
+                    continue;
+                };
+                for sequence_name in crate::classes::owned_sequences(
+                    &schema,
+                    namespace,
+                    table_name,
+                    Some(column_name),
+                ) {
+                    let Some(sequence_oid) =
+                        stored_relation_oid(&schema, namespace, &sequence_name)
+                    else {
+                        continue;
+                    };
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgClassTable>(sequence_oid),
+                        ObjectAddress::column(table_oid, index as i64 + 1),
+                        if column.identity.is_some() {
+                            DependencyKind::Internal
+                        } else {
+                            DependencyKind::Auto
+                        },
+                    ));
+                }
+            }
+        }
         rows
     }
 }
@@ -3711,6 +3897,8 @@ impl PgGetTableDefCursor {
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
+        let sqlite_ddl =
+            split_identity_table_sql_marker(sqlite_ddl).map_or(sqlite_ddl, |(_, sql)| sql);
         let mut postgres_ddl = sqlite_ddl.to_string();
 
         // Basic SQLite to PostgreSQL type conversions
@@ -4353,6 +4541,7 @@ mod tests {
             "pg_namespace",
             "pg_attribute",
             "pg_roles",
+            "pg_auth_members",
             "pg_am",
             "pg_proc",
             "pg_database",

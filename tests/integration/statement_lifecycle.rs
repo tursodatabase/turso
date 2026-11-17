@@ -1,15 +1,15 @@
-use crate::EngineDialect;
 use std::collections::{HashMap, HashSet};
+use turso_sqlite::SqliteDialect;
 
-use crate::io::{MemoryIO, PlatformIO, IO};
-use crate::mvcc::cursor::CursorYieldPoint;
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
-use crate::security::roles::SessionRole;
-use crate::sync::{Arc, Mutex};
+use turso_core::io::{MemoryIO, PlatformIO, IO};
+use turso_core::mvcc::cursor::CursorYieldPoint;
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
+use turso_core::security::roles::SessionRole;
+use turso_core::sync::{Arc, Mutex};
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
-use crate::StepResult;
-use crate::{
+use turso_core::StepResult;
+use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value,
 };
 
@@ -27,11 +27,11 @@ struct FailingPrepareCursor {
     dirty: bool,
 }
 
-impl crate::index_method::IndexMethod for FailingPrepareIndexMethod {
+impl turso_core::index_method::IndexMethod for FailingPrepareIndexMethod {
     fn attach(
         &self,
-        configuration: &crate::index_method::IndexMethodConfiguration,
-    ) -> Result<Arc<dyn crate::index_method::IndexMethodAttachment>> {
+        configuration: &turso_core::index_method::IndexMethodConfiguration,
+    ) -> Result<Arc<dyn turso_core::index_method::IndexMethodAttachment>> {
         Ok(Arc::new(FailingPrepareAttachment {
             table_name: configuration.table_name.clone(),
             index_name: configuration.index_name.clone(),
@@ -39,94 +39,103 @@ impl crate::index_method::IndexMethod for FailingPrepareIndexMethod {
     }
 }
 
-impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
-    fn definition<'a>(&'a self) -> crate::index_method::IndexMethodDefinition<'a> {
-        crate::index_method::IndexMethodDefinition {
+impl turso_core::index_method::IndexMethodAttachment for FailingPrepareAttachment {
+    fn definition<'a>(&'a self) -> turso_core::index_method::IndexMethodDefinition<'a> {
+        turso_core::index_method::IndexMethodDefinition {
             method_name: "failing_prepare",
             table_name: &self.table_name,
             index_name: &self.index_name,
             patterns: &[],
             backing_btree: false,
             results_materialized: true,
-            mvcc_support: crate::index_method::IndexMethodMvccSupport::ExternalTransactional,
+            mvcc_support: turso_core::index_method::IndexMethodMvccSupport::ExternalTransactional,
         }
     }
 
-    fn init(&self) -> Result<Box<dyn crate::index_method::IndexMethodCursor>> {
+    fn init(&self) -> Result<Box<dyn turso_core::index_method::IndexMethodCursor>> {
         Ok(Box::new(FailingPrepareCursor::default()))
     }
 
-    fn backing_schema(&self) -> crate::index_method::BackingSchema {
-        crate::index_method::BackingSchema::default()
+    fn backing_schema(&self) -> turso_core::index_method::BackingSchema {
+        turso_core::index_method::BackingSchema::default()
     }
 }
 
-impl crate::index_method::IndexMethodCursor for FailingPrepareCursor {
+impl turso_core::index_method::IndexMethodCursor for FailingPrepareCursor {
     fn create(
         &mut self,
-        _context: &crate::index_method::IndexMethodContext,
-    ) -> crate::types::IOResultOr<()> {
-        Ok(crate::IOResult::Done(()))
+        _context: &turso_core::index_method::IndexMethodContext,
+    ) -> turso_core::types::IOResultOr<()> {
+        Ok(turso_core::IOResult::Done(()))
     }
 
     fn destroy(
         &mut self,
-        _context: &crate::index_method::IndexMethodContext,
-    ) -> crate::types::IOResultOr<()> {
-        Ok(crate::IOResult::Done(()))
+        _context: &turso_core::index_method::IndexMethodContext,
+    ) -> turso_core::types::IOResultOr<()> {
+        Ok(turso_core::IOResult::Done(()))
     }
 
     fn open_read(
         &mut self,
-        _context: &crate::index_method::IndexMethodContext,
-    ) -> crate::types::IOResultOr<()> {
-        Ok(crate::IOResult::Done(()))
+        _context: &turso_core::index_method::IndexMethodContext,
+    ) -> turso_core::types::IOResultOr<()> {
+        Ok(turso_core::IOResult::Done(()))
     }
 
     fn open_write(
         &mut self,
-        _context: &crate::index_method::IndexMethodContext,
-    ) -> crate::types::IOResultOr<()> {
-        Ok(crate::IOResult::Done(()))
+        _context: &turso_core::index_method::IndexMethodContext,
+    ) -> turso_core::types::IOResultOr<()> {
+        Ok(turso_core::IOResult::Done(()))
     }
 
-    fn insert(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<()> {
+    fn insert(
+        &mut self,
+        _values: &[turso_core::vdbe::Register],
+    ) -> turso_core::types::IOResultOr<()> {
         self.dirty = true;
-        Ok(crate::IOResult::Done(()))
+        Ok(turso_core::IOResult::Done(()))
     }
 
-    fn delete(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<()> {
+    fn delete(
+        &mut self,
+        _values: &[turso_core::vdbe::Register],
+    ) -> turso_core::types::IOResultOr<()> {
         self.dirty = true;
-        Ok(crate::IOResult::Done(()))
+        Ok(turso_core::IOResult::Done(()))
     }
 
-    fn query_start(&mut self, _values: &[crate::vdbe::Register]) -> crate::types::IOResultOr<bool> {
-        Ok(crate::IOResult::Done(false))
+    fn query_start(
+        &mut self,
+        _values: &[turso_core::vdbe::Register],
+    ) -> turso_core::types::IOResultOr<bool> {
+        Ok(turso_core::IOResult::Done(false))
     }
 
-    fn query_next(&mut self) -> crate::types::IOResultOr<bool> {
-        Ok(crate::IOResult::Done(false))
+    fn query_next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        Ok(turso_core::IOResult::Done(false))
     }
 
-    fn query_column(&mut self, _idx: usize) -> crate::types::IOResultOr<Value> {
+    fn query_column(&mut self, _idx: usize) -> turso_core::types::IOResultOr<Value> {
         Err(LimboError::InternalError("failing_prepare has no query rows".to_string()).into())
     }
 
-    fn query_rowid(&mut self) -> crate::types::IOResultOr<Option<i64>> {
-        Ok(crate::IOResult::Done(None))
+    fn query_rowid(&mut self) -> turso_core::types::IOResultOr<Option<i64>> {
+        Ok(turso_core::IOResult::Done(None))
     }
 
     fn stage_statement_commit(
         &mut self,
-        _context: &crate::index_method::IndexMethodContext,
-    ) -> crate::types::IOResultOr<()> {
+        _context: &turso_core::index_method::IndexMethodContext,
+    ) -> turso_core::types::IOResultOr<()> {
         if self.dirty {
             return Err(LimboError::InternalError(
                 "forced index-method preparation failure".to_string(),
             )
             .into());
         }
-        Ok(crate::IOResult::Done(()))
+        Ok(turso_core::IOResult::Done(()))
     }
 }
 
@@ -150,11 +159,11 @@ impl YieldInjector for FixedYieldInjector {
 }
 
 fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
-    let mut state = crate::attach::AttachDatabaseState::default();
+    let mut state = turso_core::attach::AttachDatabaseState::default();
     loop {
         match conn.attach_database(path, alias, &mut state).unwrap() {
-            crate::IOResult::Done(()) => return,
-            crate::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+            turso_core::IOResult::Done(()) => return,
+            turso_core::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
         }
     }
 }
@@ -180,7 +189,7 @@ fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
         OpenFlags::default(),
         DatabaseOpts::new().with_index_method(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     db.builtin_syms.write().index_methods.insert(
@@ -218,7 +227,7 @@ fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
 /// pumping I/O synchronously instead of yielding it to the caller.
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 struct NoPumpInsideStepIo {
-    inner: Arc<dyn crate::IO>,
+    inner: Arc<dyn turso_core::IO>,
     inside_step: std::sync::atomic::AtomicBool,
     pumps_inside_step: std::sync::atomic::AtomicUsize,
 }
@@ -234,7 +243,7 @@ impl std::fmt::Debug for NoPumpInsideStepIo {
 
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 impl NoPumpInsideStepIo {
-    fn new(inner: Arc<dyn crate::IO>) -> Self {
+    fn new(inner: Arc<dyn turso_core::IO>) -> Self {
         Self {
             inner,
             inside_step: std::sync::atomic::AtomicBool::new(false),
@@ -280,46 +289,46 @@ impl NoPumpInsideStepIo {
 }
 
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
-impl crate::Clock for NoPumpInsideStepIo {
-    fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+impl turso_core::Clock for NoPumpInsideStepIo {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
         self.inner.current_time_monotonic()
     }
 
-    fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
         self.inner.current_time_wall_clock()
     }
 }
 
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
-impl crate::IO for NoPumpInsideStepIo {
+impl turso_core::IO for NoPumpInsideStepIo {
     fn open_file(
         &self,
         path: &str,
         flags: OpenFlags,
         direct: bool,
-    ) -> crate::Result<Arc<dyn crate::File>> {
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
         self.inner.open_file(path, flags, direct)
     }
 
-    fn remove_file(&self, path: &str) -> crate::Result<()> {
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         self.inner.remove_file(path)
     }
 
-    fn step(&self) -> crate::Result<()> {
+    fn step(&self) -> turso_core::Result<()> {
         self.note_pump();
         self.inner.step()
     }
 
-    fn wait_for_completion(&self, c: crate::Completion) -> crate::Result<()> {
+    fn wait_for_completion(&self, c: turso_core::Completion) -> turso_core::Result<()> {
         self.note_pump();
         self.inner.wait_for_completion(c)
     }
 
-    fn cancel(&self, c: &[crate::Completion]) -> crate::Result<()> {
+    fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.inner.cancel(c)
     }
 
-    fn drain_completions(&self, completions: &[crate::Completion]) -> crate::Result<()> {
+    fn drain_completions(&self, completions: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.inner.drain_completions(completions)
     }
 
@@ -343,7 +352,7 @@ fn fts_backing_store_ddl_yields_its_io_instead_of_pumping_it() {
         OpenFlags::default(),
         DatabaseOpts::new().with_index_method(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -436,7 +445,7 @@ fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
         OpenFlags::default(),
         DatabaseOpts::new().with_index_method(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -522,7 +531,7 @@ fn fts_auto_merge_resumes_and_rolls_back_at_each_merge_phase() {
 
 #[cfg(all(feature = "fts", feature = "io_memory_yield", feature = "test_helper"))]
 fn fts_merge_resumes_and_rolls_back_at_each_phase(auto_merge: bool) {
-    use crate::index_method::{fts::FtsBackingRowDumper, IndexMethodYieldPoint};
+    use turso_core::index_method::{fts::FtsBackingRowDumper, IndexMethodYieldPoint};
 
     let points = if auto_merge {
         [
@@ -539,14 +548,14 @@ fn fts_merge_resumes_and_rolls_back_at_each_phase(auto_merge: bool) {
     };
     for mvcc in [false, true] {
         for abandon_after in [None, Some(1), Some(2), Some(3)] {
-            let io = Arc::new(crate::MemoryYieldIO::new());
+            let io = Arc::new(turso_core::MemoryYieldIO::new());
             let db = Database::open_file_with_flags(
                 io.clone(),
                 &format!("fts-merge-phases-{auto_merge}-{mvcc}-{abandon_after:?}.db"),
                 OpenFlags::default(),
                 DatabaseOpts::new().with_index_method(true),
                 None,
-                Arc::new(EngineDialect),
+                Arc::new(SqliteDialect),
             )
             .unwrap();
             let conn = db
@@ -611,11 +620,11 @@ fn fts_merge_resumes_and_rolls_back_at_each_phase(auto_merge: bool) {
                 "mvcc={mvcc}, abandon_after={abandon_after:?}"
             );
             let mut dumper =
-                FtsBackingRowDumper::new(&conn, crate::MAIN_DB_ID, "docs_fts").unwrap();
+                FtsBackingRowDumper::new(&conn, turso_core::MAIN_DB_ID, "docs_fts").unwrap();
             loop {
                 match dumper.step().unwrap() {
-                    crate::IOResult::Done(()) => break,
-                    crate::IOResult::IO(completion) => completion.wait(io.as_ref()).unwrap(),
+                    turso_core::IOResult::Done(()) => break,
+                    turso_core::IOResult::IO(completion) => completion.wait(io.as_ref()).unwrap(),
                 }
             }
             assert_eq!(
@@ -652,7 +661,7 @@ fn fts_merge_resumes_and_rolls_back_at_each_phase(auto_merge: bool) {
 fn fts_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
     for mvcc in [false, true] {
         let io = Arc::new(NoPumpInsideStepIo::new(Arc::new(
-            crate::MemoryYieldIO::new(),
+            turso_core::MemoryYieldIO::new(),
         )));
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -660,7 +669,7 @@ fn fts_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
             OpenFlags::default(),
             DatabaseOpts::new().with_index_method(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -726,7 +735,7 @@ fn fts_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
 fn toy_index_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
     for mvcc in [false, true] {
         let io = Arc::new(NoPumpInsideStepIo::new(Arc::new(
-            crate::MemoryYieldIO::new(),
+            turso_core::MemoryYieldIO::new(),
         )));
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -734,7 +743,7 @@ fn toy_index_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
             OpenFlags::default(),
             DatabaseOpts::new().with_index_method(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -797,7 +806,7 @@ fn toy_index_backing_store_ddl_yields_real_io_on_a_deferred_backend() {
 #[cfg(feature = "fts")]
 #[test]
 fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
-    use crate::index_method::IndexMethodYieldPoint;
+    use turso_core::index_method::IndexMethodYieldPoint;
 
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(
@@ -806,7 +815,7 @@ fn abandoning_after_index_method_prepare_rolls_back_without_drop_io() {
         OpenFlags::default(),
         DatabaseOpts::new().with_index_method(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -861,7 +870,7 @@ fn open_mvcc_database_with_opts(path: &str, opts: DatabaseOpts) -> Arc<Database>
         OpenFlags::default(),
         opts,
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -885,7 +894,7 @@ struct SameConnectionWal {
 impl SameConnectionWal {
     fn new(path: &str) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -905,7 +914,7 @@ impl SameConnectionWal {
 impl SameConnectionMvcc {
     fn new(path: &str) -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -976,16 +985,16 @@ fn ids_from_query(conn: &Arc<Connection>, sql: &str) -> Vec<i64> {
         .collect()
 }
 
-fn prepare_insert_returning(conn: &Arc<Connection>, id: i64, value: &str) -> crate::Statement {
+fn prepare_insert_returning(conn: &Arc<Connection>, id: i64, value: &str) -> turso_core::Statement {
     conn.prepare(format!(
         "INSERT INTO rows VALUES ({id}, '{value}') RETURNING id"
     ))
     .unwrap()
 }
 
-fn step_returning_id(stmt: &mut crate::Statement) -> i64 {
+fn step_returning_id(stmt: &mut turso_core::Statement) -> i64 {
     match stmt.step().unwrap() {
-        crate::StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+        turso_core::StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
         other => panic!("expected RETURNING row, got {other:?}"),
     }
 }
@@ -994,7 +1003,7 @@ fn step_returning_id(stmt: &mut crate::Statement) -> i64 {
 /// BUSY-class error that aborts the statement instead of the retryable
 /// `StepResult::Busy`, mirroring SQLite's "SQL statements in progress"
 /// rejections (error-class SQLITE_BUSY that never invokes the busy handler).
-fn expect_step_busy(stmt: &mut crate::Statement, context: &str) {
+fn expect_step_busy(stmt: &mut turso_core::Statement, context: &str) {
     match stmt.step() {
         Err(LimboError::StatementsInProgress(_)) => {}
         Ok(result) => panic!("expected StatementsInProgress for {context}, got {result:?}"),
@@ -1022,44 +1031,47 @@ fn expect_unfinished_write_commit_error(result: Result<()>) {
 /// driving any genuine I/O encountered before the injection point. Injected
 /// yields surface as `StepResult::Yield` (explicit yields are not stored as
 /// pending I/O), so the statement stays parked at the same PC afterwards.
-fn expect_injected_yield(stmt: &mut crate::Statement, context: &str) {
+fn expect_injected_yield(stmt: &mut turso_core::Statement, context: &str) {
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Yield => return,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Yield => return,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
             other => panic!("expected injected yield during {context}, got {other:?}"),
         }
     }
 }
 
-fn finish_without_rows(stmt: &mut crate::Statement) {
+fn finish_without_rows(stmt: &mut turso_core::Statement) {
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Done => return,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
-            crate::StepResult::Row => panic!("expected statement to finish without more rows"),
+            turso_core::StepResult::Done => return,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Row => panic!("expected statement to finish without more rows"),
             other => panic!("expected statement to finish, got {other:?}"),
         }
     }
 }
 
-fn drain_returning_ids(stmt: &mut crate::Statement) -> Vec<i64> {
+fn drain_returning_ids(stmt: &mut turso_core::Statement) -> Vec<i64> {
     let mut ids = Vec::new();
     loop {
         match stmt.step().unwrap() {
-            crate::StepResult::Done => return ids,
-            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
-            crate::StepResult::Row => ids.push(stmt.row().unwrap().get::<i64>(0).unwrap()),
+            turso_core::StepResult::Done => return ids,
+            turso_core::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            turso_core::StepResult::Row => ids.push(stmt.row().unwrap().get::<i64>(0).unwrap()),
             other => panic!("expected RETURNING rows or Done, got {other:?}"),
         }
     }
 }
 
-fn prepare_yielding_insert_select(env: &SameConnectionMvcc) -> crate::Statement {
+fn prepare_yielding_insert_select(env: &SameConnectionMvcc) -> turso_core::Statement {
     prepare_yielding_insert_select_sql(env, "INSERT INTO rows SELECT id, v FROM src")
 }
 
-fn prepare_yielding_insert_select_sql(env: &SameConnectionMvcc, sql: &str) -> crate::Statement {
+fn prepare_yielding_insert_select_sql(
+    env: &SameConnectionMvcc,
+    sql: &str,
+) -> turso_core::Statement {
     prepare_yielding_statement(&env.conn, sql, CursorYieldPoint::NextStart, "INSERT SELECT")
 }
 
@@ -1070,7 +1082,7 @@ fn prepare_yielding_statement(
     sql: impl AsRef<str>,
     yield_point: CursorYieldPoint,
     context: &str,
-) -> crate::Statement {
+) -> turso_core::Statement {
     conn.set_yield_injector(Some(FixedYieldInjector::new([yield_point.point()])));
     let mut stmt = conn.prepare(sql).unwrap();
     expect_injected_yield(&mut stmt, context);
@@ -1078,7 +1090,7 @@ fn prepare_yielding_statement(
     stmt
 }
 
-fn prepare_yielding_update_all_rows(conn: &Arc<Connection>, value: &str) -> crate::Statement {
+fn prepare_yielding_update_all_rows(conn: &Arc<Connection>, value: &str) -> turso_core::Statement {
     prepare_yielding_statement(
         conn,
         format!("UPDATE rows SET v = '{value}'"),
@@ -1090,7 +1102,7 @@ fn prepare_yielding_update_all_rows(conn: &Arc<Connection>, value: &str) -> crat
 fn prepare_wal_update_yielding_on_table_read(
     env: &SameConnectionWal,
     value: &str,
-) -> crate::Statement {
+) -> turso_core::Statement {
     let root_page = scalar_i64(
         &env.conn,
         "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'rows'",
@@ -1108,7 +1120,7 @@ fn prepare_wal_update_yielding_on_table_read(
 fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:returning-owner-interrupted-drop-table";
-    let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -1146,7 +1158,7 @@ fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
         .prepare("INSERT INTO other VALUES (1) RETURNING id")
         .unwrap();
     match returning_owner.step().unwrap() {
-        crate::StepResult::Row => {
+        turso_core::StepResult::Row => {
             let row = returning_owner.row().unwrap();
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
         }
@@ -1165,7 +1177,7 @@ fn test_returning_owner_drop_does_not_commit_interrupted_drop_table() {
     drop(conn);
     drop(db);
 
-    let db = Database::open_file(io, path, Arc::new(EngineDialect)).expect(
+    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
         "reopen should not fail; dropping a RETURNING owner must not commit another statement's interrupted DROP",
     );
     let conn = db
@@ -1392,7 +1404,7 @@ fn test_suspended_read_does_not_finish_sibling_read_transaction() {
     assert_eq!(env.conn.get_mv_tx(), None);
     assert_eq!(
         env.conn.get_tx_state(),
-        crate::connection::TransactionState::None
+        turso_core::connection::TransactionState::None
     );
 }
 
@@ -1506,7 +1518,7 @@ fn test_wal_dropping_one_attached_reader_keeps_sibling_reader_locked() {
         OpenFlags::default(),
         DatabaseOpts::new().with_attach(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -1549,7 +1561,7 @@ fn review_attached_writer_success_is_not_lost_when_sibling_dropped() {
         OpenFlags::default(),
         DatabaseOpts::new().with_attach(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -1581,7 +1593,7 @@ fn review_transactionless_last_sibling_closes_attached_txn() {
         OpenFlags::default(),
         DatabaseOpts::new().with_attach(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -2238,7 +2250,7 @@ fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connecti
         OpenFlags::default(),
         DatabaseOpts::new().with_index_method(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -2338,7 +2350,7 @@ fn dropping_connection_mid_transaction_releases_its_fts_writes() {
 #[cfg(feature = "fts")]
 #[test]
 fn interrupt_during_fail_staging_keeps_fail_outcome() {
-    use crate::index_method::IndexMethodYieldPoint;
+    use turso_core::index_method::IndexMethodYieldPoint;
 
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(
@@ -2347,7 +2359,7 @@ fn interrupt_during_fail_staging_keeps_fail_outcome() {
         OpenFlags::default(),
         DatabaseOpts::new().with_index_method(true),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
@@ -2427,7 +2439,7 @@ fn register_keepalive_aggregate(conn: &Arc<Connection>) {
     conn.syms.write().functions.insert(
         "keepalive_agg".to_string(),
         Arc::new(
-            crate::function::ExternalFunc::new_aggregate(
+            turso_core::function::ExternalFunc::new_aggregate(
                 "keepalive_agg".to_string(),
                 1,
                 0,
@@ -2451,7 +2463,7 @@ fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db
