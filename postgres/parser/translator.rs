@@ -5683,10 +5683,7 @@ impl PostgreSQLTranslator {
             Some(TypeKind::Catalog(PgType::Row) | TypeKind::CatalogArray(PgType::Row)) => Err(
                 ParseError::not_supported(used_as.row_type_feature(&type_name_text(type_name)?)),
             ),
-            None => Err(ParseError::Sqlstate {
-                sqlstate: SQLSTATE_UNDEFINED_OBJECT,
-                message: format!("type \"{}\" does not exist", type_name_text(type_name)?),
-            }),
+            None => Err(type_does_not_exist(&type_name_text(type_name)?)),
         }
     }
 }
