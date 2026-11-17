@@ -971,6 +971,13 @@ impl<A: RowVersionAllocator> WriteSet<A> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BtreeObject {
+    pub descriptor: crate::storage::btree_descriptor::BtreeDescriptor,
+    pub begin: u64,
+    pub end: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BtreeChange {
     Create(MVTableId, crate::storage::btree_descriptor::BtreeDescriptor),
@@ -4355,6 +4362,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
     pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    btree_objects: RwLock<HashMap<MVTableId, BtreeObject>>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4604,6 +4612,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(Self {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
+            btree_objects: RwLock::new(HashMap::default()),
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
@@ -4840,6 +4849,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `end <= lwm`). Live bindings have `end == u64::MAX` and are never reclaimed — important
     /// because `compute_lwm()` is `u64::MAX` when no transactions are active. Returns count.
     pub fn gc_rootpage_entries(&self, lwm: u64) -> usize {
+        let durable = self.durable_txid_max.load(Ordering::Acquire);
+        self.btree_objects
+            .write()
+            .retain(|_, object| !object.end.is_some_and(|end| end <= lwm && end <= durable));
         let stale: Vec<MVTableId> = self
             .table_id_to_rootpage
             .iter()
@@ -4960,6 +4973,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let table_id = MVTableId::from(-root_page);
             self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
         }
+        self.btree_objects.write().clear();
+        self.restore_btree_snapshot(schema.btree_descriptors().expect(ALLOC_ERR_MSG), 0);
         self.global_header.write().replace(header);
     }
 
@@ -5355,6 +5370,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let root_page_as_table_id = MVTableId::from(-(root_page));
             self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
         }
+        self.restore_btree_snapshot(schema.btree_descriptors()?, 0);
         Ok(())
     }
 
@@ -5393,6 +5409,49 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         let id = self.get_table_id_from_root_page_at(root_page, tx.begin_ts);
         tx.btree_changes.lock().push(BtreeChange::Drop(id));
+    }
+
+    fn restore_btree_snapshot(
+        &self,
+        descriptors: impl IntoIterator<Item = (i64, crate::storage::btree_descriptor::BtreeDescriptor)>,
+        timestamp: u64,
+    ) {
+        let present: HashMap<_, _> = descriptors
+            .into_iter()
+            .filter(|(root, _)| *root != 0)
+            .map(|(root, descriptor)| (self.get_table_id_from_root_page(root), descriptor))
+            .collect();
+        let mut objects = self.btree_objects.write();
+        for (id, object) in objects.iter_mut() {
+            if object.end.is_none() && !present.contains_key(id) {
+                object.end = Some(timestamp);
+            }
+        }
+        for (id, descriptor) in present {
+            objects.entry(id).or_insert(BtreeObject {
+                descriptor,
+                begin: timestamp,
+                end: None,
+            });
+        }
+    }
+
+    fn checkpoint_index_infos(&self, timestamp: u64) -> HashMap<MVTableId, Arc<IndexInfo>> {
+        self.btree_objects
+            .read()
+            .iter()
+            .filter_map(|(id, object)| {
+                if object.begin > timestamp || object.end.is_some_and(|end| end <= timestamp) {
+                    return None;
+                }
+                match &object.descriptor {
+                    crate::storage::btree_descriptor::BtreeDescriptor::Table => None,
+                    crate::storage::btree_descriptor::BtreeDescriptor::Index(info) => {
+                        Some((*id, info.clone()))
+                    }
+                }
+            })
+            .collect()
     }
 
     pub fn get_next_rowid(&self) -> i64 {
@@ -7333,6 +7392,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Raises `last_committed_tx_ts` to `end_ts` and publishes the transaction's
     /// header as the global header, unless a newer commit already did.
     fn publish_committed_tx(&self, tx: &Transaction<A>, end_ts: u64) {
+        {
+            let mut objects = self.btree_objects.write();
+            for change in tx.btree_changes.lock().iter() {
+                match change {
+                    BtreeChange::Create(id, descriptor) => {
+                        objects.entry(*id).or_insert_with(|| BtreeObject {
+                            descriptor: descriptor.clone(),
+                            begin: end_ts,
+                            end: None,
+                        });
+                    }
+                    BtreeChange::Drop(id) => {
+                        objects
+                            .get_mut(id)
+                            .expect("dropped B-tree has a descriptor")
+                            .end = Some(end_ts);
+                    }
+                }
+            }
+        }
         let tx_header = *tx.header.read();
         // Hold the header lock across the watermark update and header
         // publish so the guard decision and replacement are serialized.
@@ -9492,9 +9571,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid)
-    /// and the CREATE TYPE statements `type_sqls`. Used by the checkpoint's
-    /// snapshot-consistent `BuildLocalSchemaView` (btree + MVCC-delta merge at
-    /// snapshot_ts).
+    /// and the CREATE TYPE statements `type_sqls` during legacy log recovery.
     pub(crate) fn build_schema_from_rows(
         &self,
         connection: &Arc<Connection>,
@@ -10518,6 +10595,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if let Some(type_sqls_after) = type_sqls_after {
                     type_sqls = type_sqls_after;
                 }
+                self.restore_btree_snapshot(schema_after.btree_descriptors()?, frame_commit_ts);
                 install_schema(schema_after.clone());
                 current_schema = schema_after;
                 // The frame may have decoded DROP INDEX entries using the

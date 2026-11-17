@@ -5499,3 +5499,37 @@ fn created_btrees_record_resolved_index_ordering() {
     drop(schema);
     db.conn.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+fn checkpoint_ordering_survives_index_drop_at_a_later_snapshot() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE ordered (a TEXT, b INTEGER)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX ordered_idx ON ordered(a COLLATE NOCASE DESC, b)")
+        .unwrap();
+    let schema = db.conn.schema.read();
+    let index = schema
+        .all_indexes()
+        .find(|index| index.name == "ordered_idx")
+        .unwrap();
+    let id = db.mvcc_store.get_table_id_from_root_page(index.root_page);
+    let expected = IndexInfo::new_from_index(index).unwrap();
+    drop(schema);
+    let before = db.mvcc_store.watermarks().last_committed_tx_ts;
+    db.conn.execute("DROP INDEX ordered_idx").unwrap();
+    let after = db.mvcc_store.watermarks().last_committed_tx_ts;
+    assert_eq!(
+        db.mvcc_store
+            .checkpoint_index_infos(before)
+            .get(&id)
+            .unwrap()
+            .as_ref(),
+        &expected
+    );
+    assert!(!db
+        .mvcc_store
+        .checkpoint_index_infos(after)
+        .contains_key(&id));
+}
