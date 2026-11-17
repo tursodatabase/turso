@@ -1228,6 +1228,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Invalidate candidates and visibility scans before repositioning.
     fn reset_dual_peek(&mut self) {
+        self.peeks_valid_for = None;
         self.dual_peek = DualCursorPeek::default();
         self.mvcc_peek_epoch = self.mvcc_rows_epoch();
         self.eq_seek_row = None;
@@ -2154,7 +2155,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
-            self.peeks_valid_for = None;
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
