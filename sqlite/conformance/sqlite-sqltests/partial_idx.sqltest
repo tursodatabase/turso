@@ -1621,6 +1621,205 @@ snapshot-eqp partial-index-indexed-by-count-star-without-predicate-counts-table-
     SELECT COUNT(*) FROM indexed_items INDEXED BY indexed_items_marker_null_idx;
 }
 
+setup partial_index_not_null_schema {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b IS NOT NULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL), (3, -7), (4, 0);
+}
+
+# Each WHERE term can be true only when b is not NULL, so it proves the index
+# predicate. INDEXED BY makes the query fail if the index is not usable.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-where-term {
+    SELECT 'b = 5', a FROM t1 INDEXED BY t1_a WHERE b = 5;
+    SELECT '0 > b', a FROM t1 INDEXED BY t1_a WHERE 0 > b;
+    SELECT 'b NOT IN (5)', a FROM t1 INDEXED BY t1_a WHERE b NOT IN (5);
+    SELECT 'b IN (SELECT 5)', a FROM t1 INDEXED BY t1_a WHERE b IN (SELECT 5);
+    SELECT 'b BETWEEN 1 AND 9', a FROM t1 INDEXED BY t1_a WHERE b BETWEEN 1 AND 9;
+    SELECT 'b + random() % 1 BETWEEN 1 AND 9', a FROM t1 INDEXED BY t1_a WHERE b + random() % 1 BETWEEN 1 AND 9;
+    SELECT 'b', a FROM t1 INDEXED BY t1_a WHERE b;
+    SELECT 'NOT b', a FROM t1 INDEXED BY t1_a WHERE NOT b;
+    SELECT '-b', a FROM t1 INDEXED BY t1_a WHERE -b;
+    SELECT '(b + 1) = 6', a FROM t1 INDEXED BY t1_a WHERE (b + 1) = 6;
+    SELECT 'b * 2', a FROM t1 INDEXED BY t1_a WHERE b * 2;
+    SELECT 'b COLLATE NOCASE = 5', a FROM t1 INDEXED BY t1_a WHERE b COLLATE NOCASE = 5;
+    SELECT 'b IS TRUE', a FROM t1 INDEXED BY t1_a WHERE b IS TRUE;
+    SELECT 'b IS FALSE', a FROM t1 INDEXED BY t1_a WHERE b IS FALSE;
+}
+expect {
+    b = 5|1
+    0 > b|3
+    b NOT IN (5)|3
+    b NOT IN (5)|4
+    b IN (SELECT 5)|1
+    b BETWEEN 1 AND 9|1
+    b + random() % 1 BETWEEN 1 AND 9|1
+    b|1
+    b|3
+    NOT b|4
+    -b|1
+    -b|3
+    (b + 1) = 6|1
+    b * 2|1
+    b * 2|3
+    b COLLATE NOCASE = 5|1
+    b IS TRUE|1
+    b IS TRUE|3
+    b IS FALSE|4
+}
+
+test partial-index-not-null-predicate-on-expression-implied-by-where-term {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE a + b IS NOT NULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_a WHERE a + b = 6;
+}
+expect {
+    1
+}
+
+test partial-index-notnull-keyword-predicate-implied-by-where-term {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b NOTNULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b = 5;
+}
+expect {
+    1
+}
+
+# SQLite parses `b NOTNULL` and `b NOT NULL` like `b IS NOT NULL`, and
+# `b ISNULL` like `b IS NULL`.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-other-spellings {
+    SELECT 'b NOTNULL', a FROM t1 INDEXED BY t1_a WHERE b NOTNULL;
+    SELECT 'b NOT NULL', a FROM t1 INDEXED BY t1_a WHERE b NOT NULL;
+}
+expect {
+    b NOTNULL|1
+    b NOTNULL|3
+    b NOTNULL|4
+    b NOT NULL|1
+    b NOT NULL|3
+    b NOT NULL|4
+}
+
+test partial-index-notnull-keyword-predicate-implied-by-is-not-null {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE b NOTNULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b IS NOT NULL;
+}
+expect {
+    1
+}
+
+test partial-index-is-null-predicate-implied-by-other-spelling {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_is_null ON t1(a) WHERE b IS NULL;
+    CREATE INDEX t1_isnull ON t1(a) WHERE b ISNULL;
+    INSERT INTO t1 VALUES (1, 5), (2, NULL);
+    SELECT a FROM t1 INDEXED BY t1_is_null WHERE b ISNULL;
+    SELECT a FROM t1 INDEXED BY t1_isnull WHERE b IS NULL;
+}
+expect {
+    2
+    2
+}
+
+# `b = 5` rules out NULL, so it proves `b IS NOT NULL` but not `b IS NULL`.
+test partial-index-is-null-predicate-not-implied-by-comparison {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_is_null ON t1(a) WHERE b IS NULL;
+    SELECT a FROM t1 INDEXED BY t1_is_null WHERE b = 5;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-isnull {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b ISNULL;
+}
+expect error {
+    no query solution
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@setup partial_index_not_null_schema
+test plan-partial-index-not-null-predicate-implied-by-where-term {
+    EXPLAIN QUERY PLAN SELECT a FROM t1 WHERE b = 5 AND a = 1;
+}
+expect {
+    1|0|0|SEARCH t1 USING INDEX t1_a (a=?)
+}
+
+# These WHERE terms are true for the row where b is NULL, which the index does
+# not have.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-is-not-true {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b IS NOT TRUE;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-compared-is-true {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE (b IS TRUE) = 0;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-not-in-subquery {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b NOT IN (SELECT 1 WHERE 0);
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-by-compared-in-subquery {
+    SELECT a FROM t1 INDEXED BY t1_a WHERE (b IN (SELECT 1 WHERE 0)) = 0;
+}
+expect error {
+    no query solution
+}
+
+test partial-index-null-is-not-null-predicate-never-implied {
+    CREATE TABLE t1(a, b);
+    CREATE INDEX t1_a ON t1(a) WHERE NULL IS NOT NULL;
+    SELECT a FROM t1 INDEXED BY t1_a WHERE b = NULL;
+}
+expect error {
+    no query solution
+}
+
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-implied-by-left-join-on-term {
+    CREATE TABLE t2(c);
+    INSERT INTO t2 VALUES (1), (2);
+    SELECT t2.c, t1.a
+      FROM t2 LEFT JOIN t1 INDEXED BY t1_a ON t1.a = t2.c AND t1.b = 5
+     ORDER BY t2.c;
+}
+expect {
+    1|1
+    2|
+}
+
+# The read for unmatched right rows has no ON terms.
+@setup partial_index_not_null_schema
+test partial-index-not-null-predicate-not-implied-for-unmatched-right-join-rows {
+    CREATE TABLE t2(c);
+    SELECT * FROM t2 RIGHT JOIN t1 INDEXED BY t1_a ON t1.b = 5;
+}
+expect error {
+    no query solution
+}
+
 setup partial_index_multi_index_or_schema {
     CREATE TABLE indexed_items(a INT, b INT, c INT);
     CREATE INDEX indexed_items_a_partial_idx ON indexed_items(a) WHERE b = 1;

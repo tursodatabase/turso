@@ -1752,6 +1752,95 @@ fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> boo
         ast::Expr::Binary(left, ast::Operator::Or, right) => {
             query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
         }
+        predicate => null_test(predicate).is_some_and(|(operand, is_null)| {
+            // SQLite parses `x ISNULL` like `x IS NULL`, and `x NOTNULL` like
+            // `x IS NOT NULL`, so each spelling proves the other.
+            let same_test = null_test(query).is_some_and(|(query_operand, query_is_null)| {
+                query_is_null == is_null && exprs_are_equivalent(query_operand, operand)
+            });
+            same_test || (!is_null && expr_implies_not_null(query, operand, false))
+        }),
+    }
+}
+
+/// Returns `(x, true)` for `x IS NULL` and `x ISNULL`, and `(x, false)` for
+/// `x IS NOT NULL`, `x NOTNULL` and `x NOT NULL`.
+fn null_test(expr: &ast::Expr) -> Option<(&ast::Expr, bool)> {
+    let is_null_literal = |expr: &ast::Expr| matches!(expr, ast::Expr::Literal(ast::Literal::Null));
+    match unwrap_parens(expr).unwrap_or(expr) {
+        ast::Expr::IsNull(operand) => Some((operand.as_ref(), true)),
+        ast::Expr::NotNull(operand) => Some((operand.as_ref(), false)),
+        ast::Expr::Binary(operand, ast::Operator::Is, rhs) if is_null_literal(rhs) => {
+            Some((operand.as_ref(), true))
+        }
+        ast::Expr::Binary(operand, ast::Operator::IsNot, rhs) if is_null_literal(rhs) => {
+            Some((operand.as_ref(), false))
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if `expr` can be TRUE only when `operand` is not NULL. With
+/// `when_not_null`, the claim is stronger: `expr` can be non-NULL only when
+/// `operand` is not NULL. An expression such as `NOT x` is TRUE when `x` is
+/// FALSE, so it asks for the stronger claim about `x`.
+///
+/// Port of SQLite's `exprImpliesNotNull` (expr.c). Returns false when unsure.
+fn expr_implies_not_null(expr: &ast::Expr, operand: &ast::Expr, when_not_null: bool) -> bool {
+    use ast::{Operator::*, UnaryOperator};
+    if exprs_are_equivalent(expr, operand) {
+        return !matches!(operand, ast::Expr::Literal(ast::Literal::Null));
+    }
+    let implies =
+        |expr: &ast::Expr, when_not_null: bool| expr_implies_not_null(expr, operand, when_not_null);
+    match expr {
+        // `x IN (...)` and `x NOT IN (...)` are NULL for a NULL x, unless the
+        // list is empty.
+        ast::Expr::InList { lhs, rhs, .. } => !rhs.is_empty() && implies(lhs, true),
+
+        // A subquery can return no rows. `x IN (...)` is then FALSE for a
+        // NULL x, and `x NOT IN (...)` is TRUE.
+        ast::Expr::SubqueryResult {
+            lhs: Some(lhs),
+            not_in: false,
+            query_type: ast::SubqueryType::In { .. },
+            ..
+        } => !when_not_null && implies(lhs, true),
+
+        // `x BETWEEN y AND z` can be FALSE when one of its inputs is NULL.
+        ast::Expr::Between {
+            lhs,
+            not: false,
+            start,
+            end,
+        } => !when_not_null && (implies(start, true) || implies(end, true) || implies(lhs, true)),
+
+        // These are NULL when an input is NULL.
+        ast::Expr::Binary(
+            lhs,
+            Equals | NotEquals | Less | LessEquals | Greater | GreaterEquals | Add | Subtract
+            | BitwiseOr | LeftShift | RightShift | Concat,
+            rhs,
+        ) => implies(rhs, true) || implies(lhs, true),
+
+        // These are also NULL when an input is NULL, and they are TRUE only
+        // when both inputs are TRUE.
+        ast::Expr::Binary(lhs, Multiply | Modulus | BitwiseAnd | Divide, rhs) => {
+            implies(rhs, when_not_null) || implies(lhs, when_not_null)
+        }
+
+        // `x IS TRUE` and `x IS FALSE` are FALSE for a NULL x.
+        ast::Expr::Binary(lhs, Is, rhs) if truth_test_rhs(rhs).is_some() => {
+            !when_not_null && implies(lhs, true)
+        }
+
+        ast::Expr::Unary(UnaryOperator::Not | UnaryOperator::BitwiseNot, inner) => {
+            implies(inner, true)
+        }
+        ast::Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, inner)
+        | ast::Expr::Collate(inner, _) => implies(inner, when_not_null),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => implies(&exprs[0], when_not_null),
+
         _ => false,
     }
 }
@@ -1817,8 +1906,7 @@ pub(super) fn partial_index_predicate_terms(
             .find(|(_, term)| query_term_implies_predicate(&term.expr, index_conjunct))?;
     }
     Some(matched_terms)
-    // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
-    // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+    // TODO: recognize more implications (e.g. `x > 10` implies `x > 5`).
 }
 
 pub(crate) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
@@ -2567,4 +2655,28 @@ fn find_best_index_for_constraint(
     }
 
     (None, vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_in_empty_list_does_not_imply_not_null() {
+        let column = ast::Expr::Column {
+            database: None,
+            table: TableInternalId::from(1),
+            column: 0,
+            is_rowid_alias: false,
+        };
+        let not_in = |rhs| ast::Expr::InList {
+            lhs: Box::new(column.clone()),
+            not: true,
+            rhs,
+        };
+        let value = Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into())));
+
+        assert!(expr_implies_not_null(&not_in(vec![value]), &column, false));
+        assert!(!expr_implies_not_null(&not_in(vec![]), &column, false));
+    }
 }
