@@ -1,4 +1,4 @@
-use super::gencol::{compute_generated_columns, compute_virtual_columns};
+use super::gencol::{compute_generated_columns, compute_virtual_columns, sets_custom_type_column};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -1015,9 +1015,11 @@ fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) 
 /// where they must run later than the first `emit_update_column_values` call:
 /// after BEFORE triggers have fired, or after the STRICT type check.
 ///
-/// The checks run in two passes, as in INSERT: first the columns the SET clauses
+/// The checks run in passes, as in INSERT: first the columns the SET clauses
 /// change, because OR REPLACE puts a column's DEFAULT in place of a NULL there,
 /// then the generated columns, once they are computed again from those values.
+/// When a SET column has a custom type, the virtual columns are checked after
+/// ENCODE instead, once they are computed from the encoded row.
 /// `include_column` picks the columns of the pass.
 fn emit_deferred_notnull_checks<'a>(
     program: &mut ProgramBuilder,
@@ -1707,6 +1709,12 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // When a SET column has a custom type, the virtual columns are computed again
+    // after ENCODE, below, and their NOT NULL checks wait for these values.
+    let computes_virtual_columns_after_encode = target_table.table.btree().is_some_and(|btree| {
+        btree.is_strict && sets_custom_type_column(&btree, &user_value_columns, &t_ctx.resolver)
+    });
+
     // The generated columns were computed again above, from the values the
     // deferred checks may have replaced with a DEFAULT.
     emit_deferred_notnull_checks(
@@ -1716,7 +1724,10 @@ fn emit_update_insns<'a>(
         &column_ctx,
         skip_row_label,
         t_ctx,
-        Column::is_generated,
+        |column| {
+            column.is_generated()
+                && !(computes_virtual_columns_after_encode && column.is_virtual_generated())
+        },
     )?;
     emit_cdc_updates_of_generated_columns(program, &target_table, &column_ctx);
 
@@ -1824,6 +1835,26 @@ fn emit_update_insns<'a>(
                 &layout,
             )?;
 
+            // The virtual columns were computed from the SET values before ENCODE. When a
+            // SET column has a custom type, a read of the row can give other values, so
+            // compute them again from the encoded row, as a read of the row gives them.
+            if computes_virtual_columns_after_encode {
+                let dml_ctx = DmlColumnContext::layout(
+                    btree_table.columns(),
+                    start,
+                    effective_rowid_reg,
+                    layout.clone(),
+                    DmlRowForm::Stored,
+                );
+                compute_virtual_columns(
+                    program,
+                    &btree_table.columns_topo_sort()?,
+                    &dml_ctx,
+                    &t_ctx.resolver,
+                    &btree_table,
+                )?;
+            }
+
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
@@ -1835,6 +1866,18 @@ fn emit_update_insns<'a>(
                     t_ctx.resolver.schema(),
                 ),
             });
+
+            if computes_virtual_columns_after_encode {
+                emit_deferred_notnull_checks(
+                    program,
+                    table_references,
+                    &target_table,
+                    &column_ctx,
+                    skip_row_label,
+                    t_ctx,
+                    Column::is_virtual_generated,
+                )?;
+            }
         }
 
         // Rows that row-level security does not let the role write fail
