@@ -595,7 +595,7 @@ fn translate_statement(
             schema::translate_create_schema(&name, resolver, program)?;
         }
         ast::Stmt::DropSchema { name } => {
-            schema::translate_drop_schema(&name, resolver, program)?;
+            schema::translate_drop_schema(&name, resolver, program, connection)?;
         }
         ast::Stmt::CreatePolicy(policy) => {
             row_security::translate_create_policy(&policy, resolver, program, connection)?;

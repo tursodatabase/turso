@@ -1651,12 +1651,14 @@ pub fn translate_create_schema(
 }
 
 /// Translates `DROP SCHEMA name`: removes the namespace's row from the
-/// namespaces table and forgets its name. The objects stored under its id
-/// stay until they are dropped, so the caller drops them first.
+/// namespaces table and forgets its name, and the dialect removes what it
+/// stores for the namespace. The objects stored under its id stay until they
+/// are dropped, so the caller drops them first.
 pub fn translate_drop_schema(
     name: &ast::Name,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     if !resolver.catalog.dialect.supports_namespaces() {
         bail_parse_error!("DROP SCHEMA is not supported");
@@ -1701,6 +1703,12 @@ pub fn translate_drop_schema(
     });
     program.preassign_label_to_next_insn(delete_done_label);
 
+    resolver.catalog.dialect.translate_catalog_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &[CatalogChange::DropNamespace { namespace: id }],
+    )?;
     program.emit_insn(Insn::DropNamespace {
         db: MAIN_DB_ID,
         namespace: id,

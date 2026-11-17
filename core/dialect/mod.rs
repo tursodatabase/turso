@@ -80,6 +80,9 @@ pub enum CatalogChange {
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
+    /// `DROP SCHEMA`: the namespace is gone, with what the dialect stores
+    /// for it. Its id may name another namespace later.
+    DropNamespace { namespace: NamespaceId },
     /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
     /// `enabled` is false.
     SetRowSecurity {

@@ -274,6 +274,8 @@ impl Dialect for PostgresDialect {
                     program, schema, connection, change,
                 );
             }
+            // The frontend stores nothing for a schema itself.
+            [turso_core::CatalogChange::DropNamespace { .. }] => return Ok(()),
             _ => {}
         }
         crate::classes::translate_catalog_changes(program, schema, connection, changes)
