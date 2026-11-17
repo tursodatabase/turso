@@ -10,7 +10,7 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+        schema::{emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType},
     },
     util::normalize_ident,
     vdbe::{
@@ -224,17 +224,7 @@ pub fn translate_analyze(
         )?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
-        let table = resolver
-            .with_schema(database_id, |s| {
-                s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            })
-            .unwrap();
-        let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: sqlite_schema_cursor_id,
-            root_page: 1i64.into(),
-            db: database_id,
-        });
+        let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
         // Add the table entry to sqlite_schema
         emit_schema_entry(

@@ -45,7 +45,9 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema::{
+    self, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType, SQLITE_TABLEID,
+};
 
 fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -1533,15 +1535,7 @@ pub fn translate_drop_index(
         .schema()
         .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
-
-    // Open sqlite_schema for writing
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();

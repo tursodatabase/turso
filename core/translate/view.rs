@@ -8,14 +8,14 @@ use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
-    schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{self, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast;
 
 fn validate_materialized(
@@ -220,17 +220,7 @@ pub fn translate_create_materialized_view(
 
     program.preassign_label_to_next_insn(clear_done_label);
 
-    // Open cursor to sqlite_schema table
-    let table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     // Add the materialized view entry to sqlite_schema
     emit_schema_entry(
@@ -452,17 +442,7 @@ pub fn translate_create_view(
         select_stmt,
     );
 
-    // Open cursor to sqlite_schema table
-    let table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     // Add the view entry to sqlite_schema
     emit_schema_entry(
@@ -678,17 +658,7 @@ pub fn translate_drop_view(
         )?;
     }
 
-    // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     // Allocate registers for searching
     let view_name_reg = program.alloc_register();
