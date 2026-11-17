@@ -1,0 +1,516 @@
+@database :memory:
+
+# WITH ORDINALITY on a function in the FROM clause.
+# PostgreSQL 18 gave every expected result.
+
+test ordinality-is-the-last-column-and-starts-at-one {
+    SELECT * FROM generate_series(10, 12) WITH ORDINALITY;
+}
+expect {
+    10|1
+    11|2
+    12|3
+}
+
+test ordinality-column-is-named-ordinality {
+    SELECT ordinality, generate_series FROM generate_series(10, 11) WITH ORDINALITY;
+}
+expect {
+    1|10
+    2|11
+}
+
+test table-alias-names-the-function-column-and-not-ordinality {
+    SELECT t.t, t.ordinality FROM generate_series(10, 11) WITH ORDINALITY AS t;
+}
+expect {
+    10|1
+    11|2
+}
+
+test short-column-alias-list-keeps-the-name-ordinality {
+    SELECT v, ordinality FROM generate_series(10, 11) WITH ORDINALITY AS t(v);
+}
+expect {
+    10|1
+    11|2
+}
+
+test column-alias-list-can-rename-ordinality {
+    SELECT o, v FROM generate_series(10, 11) WITH ORDINALITY AS t(v, o);
+}
+expect {
+    1|10
+    2|11
+}
+
+test column-alias-list-longer-than-function-and-ordinality-errors {
+    SELECT * FROM generate_series(10, 12) WITH ORDINALITY AS t(v, o, extra);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 2 columns available but 3 columns specified
+}
+
+test ordinality-of-two-functions-is-ambiguous-without-a-table-name {
+    SELECT ordinality FROM generate_series(1, 2) WITH ORDINALITY a, generate_series(1, 2) WITH ORDINALITY b;
+}
+expect error {
+}
+
+test ordinality-of-two-functions-with-table-names {
+    SELECT a.ordinality, b.ordinality
+    FROM generate_series(1, 2) WITH ORDINALITY a
+    JOIN generate_series(1, 2) WITH ORDINALITY b ON a.ordinality = b.ordinality;
+}
+expect {
+    1|1
+    2|2
+}
+
+# PostgreSQL returns two columns named ordinality.
+@skip-if postgres "tursopg cannot return two columns of a function with the same name"
+test function-column-named-ordinality-is-not-supported {
+    SELECT * FROM generate_series(1, 2) WITH ORDINALITY AS ordinality;
+}
+@sqlstate 0A000
+expect error {
+    two columns with the same name in a function in FROM is not supported
+}
+
+test ordinality-counts-rows-before-where {
+    SELECT * FROM generate_series(10, 15) WITH ORDINALITY AS t(v, o) WHERE v > 12;
+}
+expect {
+    13|4
+    14|5
+    15|6
+}
+
+test where-on-ordinality {
+    SELECT * FROM generate_series(10, 15) WITH ORDINALITY AS t(v, o) WHERE o % 2 = 0;
+}
+expect {
+    11|2
+    13|4
+    15|6
+}
+
+test ordinality-does-not-follow-order-by {
+    SELECT * FROM generate_series(10, 15) WITH ORDINALITY AS t(v, o) ORDER BY v DESC LIMIT 2;
+}
+expect {
+    15|6
+    14|5
+}
+
+test ordinality-of-a-series-with-a-step {
+    SELECT * FROM generate_series(10, 20, 5) WITH ORDINALITY;
+}
+expect {
+    10|1
+    15|2
+    20|3
+}
+
+test ordinality-of-a-descending-series {
+    SELECT * FROM generate_series(5, 1, -2) WITH ORDINALITY;
+}
+expect {
+    5|1
+    3|2
+    1|3
+}
+
+test ordinality-of-a-series-wider-than-a-bigint {
+    SELECT * FROM generate_series(-9223372036854775808, 9223372036854775807, 4611686018427387904) WITH ORDINALITY;
+}
+expect {
+    -9223372036854775808|1
+    -4611686018427387904|2
+    0|3
+    4611686018427387904|4
+}
+
+test ordinality-of-an-empty-series {
+    SELECT count(*) FROM generate_series(1, 0) WITH ORDINALITY;
+}
+expect {
+    0
+}
+
+test ordinality-of-many-rows {
+    SELECT count(*), max(ordinality) FROM generate_series(1, 100000) WITH ORDINALITY;
+}
+expect {
+    100000|100000
+}
+
+@skip-if postgres "pg_generate_series_ordinality is a function of tursopg"
+test position-in-a-series-with-step-zero-errors {
+    SELECT pg_generate_series_ordinality(5, 1, 0);
+}
+@sqlstate 22023
+expect error {
+    step size cannot equal zero
+}
+
+@skip-if postgres "pg_generate_series_ordinality is a function of tursopg"
+test position-in-a-series-beyond-bigint-errors {
+    SELECT pg_generate_series_ordinality(9223372036854775807, -9223372036854775807 - 1, 1);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test ordinality-restarts-for-each-outer-row {
+    SELECT * FROM generate_series(1, 2) AS a(i), generate_series(1, a.i) WITH ORDINALITY AS b(j, o);
+}
+expect {
+    1|1|1
+    2|1|1
+    2|2|2
+}
+
+test ordinality-is-null-for-unmatched-left-join-rows {
+    SELECT g.i, s.o
+    FROM generate_series(1, 3) AS g(i)
+    LEFT JOIN LATERAL generate_series(1, g.i - 1) WITH ORDINALITY AS s(v, o) ON true
+    ORDER BY 1, 2;
+}
+expect {
+    1|
+    2|1
+    3|1
+    3|2
+}
+
+test ordinality-in-a-correlated-scalar-subquery {
+    SELECT i, (SELECT max(o) FROM generate_series(1, i) WITH ORDINALITY AS s(v, o))
+    FROM generate_series(0, 2) AS g(i)
+    ORDER BY i;
+}
+expect {
+    0|
+    1|1
+    2|2
+}
+
+test ordinality-in-an-in-subquery {
+    SELECT * FROM generate_series(1, 4) WITH ORDINALITY AS t(v, o)
+    WHERE o IN (SELECT ordinality FROM generate_series(9, 10) WITH ORDINALITY);
+}
+expect {
+    1|1
+    2|2
+}
+
+test ordinality-with-a-schema-qualified-function {
+    SELECT * FROM pg_catalog.generate_series(1, 2) WITH ORDINALITY;
+}
+expect {
+    1|1
+    2|2
+}
+
+test ordinality-on-rows-from-with-one-function {
+    SELECT * FROM ROWS FROM (generate_series(1, 2)) WITH ORDINALITY;
+}
+expect {
+    1|1
+    2|2
+}
+
+test ordinality-in-a-cte {
+    WITH c AS (SELECT * FROM generate_series(1, 2) WITH ORDINALITY) SELECT * FROM c;
+}
+expect {
+    1|1
+    2|2
+}
+
+test ordinality-in-a-view {
+    CREATE VIEW v AS SELECT * FROM generate_series(1, 3) WITH ORDINALITY;
+    SELECT * FROM v WHERE ordinality > 1;
+}
+expect {
+    2|2
+    3|3
+}
+
+test ordinality-in-insert-select-and-update-from {
+    CREATE TABLE dst(v INT, o BIGINT);
+    INSERT INTO dst SELECT * FROM generate_series(5, 7) WITH ORDINALITY;
+    UPDATE dst d SET v = g.x FROM generate_series(100, 300, 100) WITH ORDINALITY AS g(x, o) WHERE g.o = d.o;
+    SELECT * FROM dst ORDER BY o;
+}
+expect {
+    100|1
+    200|2
+    300|3
+}
+
+setup arrays {
+    CREATE TABLE t(id INT, arr TEXT[]);
+    INSERT INTO t VALUES (1, '{a,b}'), (2, '{}'), (3, NULL), (4, '{c}');
+}
+
+test unnest-with-ordinality {
+    SELECT * FROM unnest(ARRAY['a', 'b']) WITH ORDINALITY;
+}
+expect {
+    a|1
+    b|2
+}
+
+test unnest-with-ordinality-column-names {
+    SELECT unnest, ordinality FROM unnest(ARRAY['a']) WITH ORDINALITY;
+    SELECT u.u, u.ordinality FROM unnest(ARRAY['b']) WITH ORDINALITY AS u;
+    SELECT x, ordinality FROM unnest(ARRAY['c']) WITH ORDINALITY AS u(x);
+    SELECT n, x FROM unnest(ARRAY['d']) WITH ORDINALITY AS u(x, n);
+}
+expect {
+    a|1
+    b|1
+    c|1
+    1|d
+}
+
+test unnest-column-alias-list-longer-than-element-and-ordinality-errors {
+    SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+    table "u" has 2 columns available but 3 columns specified
+}
+
+test unnest-column-alias-list-longer-than-element-errors {
+    SELECT * FROM unnest(ARRAY[1, 2]) AS u(a, b);
+}
+@sqlstate 42P10
+expect error {
+    table "u" has 1 columns available but 2 columns specified
+}
+
+test unnest-without-ordinality-has-no-ordinality-column {
+    SELECT * FROM unnest(ARRAY[1]) AS u WHERE ordinality = 1;
+}
+@sqlstate 42703
+expect error {
+}
+
+test unnest-ordinality-counts-null-elements {
+    SELECT COALESCE(x, '<null>'), n FROM unnest(ARRAY[NULL, 'b', NULL]) WITH ORDINALITY AS u(x, n) WHERE n > 1;
+}
+expect {
+    b|2
+    <null>|3
+}
+
+test unnest-ordinality-is-the-position-and-not-the-sort-order {
+    SELECT * FROM unnest(ARRAY[3, 1, 2]) WITH ORDINALITY AS u(x, o) ORDER BY x;
+}
+expect {
+    1|2
+    2|3
+    3|1
+}
+
+test unnest-ordinality-of-a-null-array {
+    SELECT count(*) FROM unnest(NULL::int[]) WITH ORDINALITY;
+}
+expect {
+    0
+}
+
+test unnest-ordinality-of-a-two-dimensional-array {
+    SELECT * FROM unnest(ARRAY[[1, 2], [3, 4]]) WITH ORDINALITY;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+}
+
+@setup arrays
+test unnest-ordinality-restarts-for-each-table-row {
+    SELECT id, x, ordinality FROM t, unnest(arr) WITH ORDINALITY AS u(x) ORDER BY id, ordinality;
+}
+expect {
+    1|a|1
+    1|b|2
+    4|c|1
+}
+
+@setup arrays
+test unnest-ordinality-is-null-for-unmatched-left-join-rows {
+    SELECT id, x, n FROM t LEFT JOIN LATERAL unnest(arr) WITH ORDINALITY AS u(x, n) ON true ORDER BY id, n;
+}
+expect {
+    1|a|1
+    1|b|2
+    2||
+    3||
+    4|c|1
+}
+
+@setup arrays
+test where-on-unnest-ordinality-in-a-lateral-join {
+    SELECT id, x, n FROM t CROSS JOIN LATERAL unnest(arr) WITH ORDINALITY AS u(x, n) WHERE n = 2;
+}
+expect {
+    1|b|2
+}
+
+@setup arrays
+test unnest-ordinality-in-a-correlated-scalar-subquery {
+    SELECT id, (SELECT max(o) FROM unnest(arr) WITH ORDINALITY AS u(x, o)) FROM t ORDER BY id;
+}
+expect {
+    1|2
+    2|
+    3|
+    4|1
+}
+
+test unnest-argument-is-a-table-column-named-ordinality {
+    CREATE TABLE k(ordinality INT[]);
+    INSERT INTO k VALUES ('{5,6}');
+    SELECT e, o FROM k, unnest(ordinality) WITH ORDINALITY AS u(e, o);
+}
+expect {
+    5|1
+    6|2
+}
+
+test ordinality-of-a-function-that-returns-one-value-is-one {
+    SELECT * FROM current_schema() WITH ORDINALITY;
+    SELECT cs.cs, cs.ordinality FROM current_schema() WITH ORDINALITY AS cs;
+    SELECT b FROM version() WITH ORDINALITY AS v(a, b) WHERE length(a) > 0;
+}
+expect {
+    public|1
+    public|1
+    1
+}
+
+test column-alias-list-on-a-function-that-returns-one-value {
+    SELECT s.x FROM current_schema() AS s(x);
+}
+expect {
+    public
+}
+
+test column-alias-list-longer-than-one-value-and-ordinality-errors {
+    SELECT * FROM current_schema() WITH ORDINALITY AS s(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+    table "s" has 2 columns available but 3 columns specified
+}
+
+test ordinality-with-a-column-definition-list-after-the-alias-errors {
+    SELECT * FROM json_to_recordset('[{"a":1}]') WITH ORDINALITY AS t(a int);
+}
+@sqlstate 42601
+expect error {
+    WITH ORDINALITY cannot be used with a column definition list
+}
+
+test ordinality-of-a-record-function-without-a-column-definition-list-errors {
+    SELECT * FROM json_to_recordset('[{"a":1}]') WITH ORDINALITY;
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test ordinality-of-json-to-recordset {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"},{"a":2,"b":"y"}]') AS (a int, b text)) WITH ORDINALITY;
+}
+expect {
+    1|x|1
+    2|y|2
+}
+
+test ordinality-of-json-to-recordset-column-names {
+    SELECT t.ordinality, t.p, t.b
+    FROM ROWS FROM (jsonb_to_recordset('[{"a":1,"b":"x"},{"a":2,"b":"y"}]') AS (a int, b text)) WITH ORDINALITY AS t(p)
+    WHERE b = 'y';
+    SELECT r, q, p
+    FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"}]') AS (a int, b text)) WITH ORDINALITY AS t(p, q, r);
+}
+expect {
+    2|2|y
+    1|x|1
+}
+
+test column-alias-list-longer-than-defined-columns-and-ordinality-errors {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1}]') AS (a int, b text)) WITH ORDINALITY AS t(p, q, r, s);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 3 columns available but 4 columns specified
+}
+
+test ordinality-of-json-to-recordset-is-the-position-in-the-array {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":7},{},{"a":9}]') AS (a int)) WITH ORDINALITY ORDER BY ordinality DESC;
+}
+expect {
+    9|3
+    |2
+    7|1
+}
+
+test ordinality-of-json-to-recordset-on-an-empty-array {
+    SELECT count(*) FROM ROWS FROM (json_to_recordset('[]') AS (a int)) WITH ORDINALITY;
+}
+expect {
+    0
+}
+
+test ordinality-of-json-to-record-is-one {
+    SELECT * FROM ROWS FROM (json_to_record('{"a":1}') AS (a int)) WITH ORDINALITY;
+    SELECT * FROM ROWS FROM (jsonb_to_record('{"a":2}') AS (a int)) WITH ORDINALITY;
+}
+expect {
+    1|1
+    2|1
+}
+
+test ordinality-of-json-to-recordset-restarts-for-each-table-row {
+    CREATE TABLE docs(id INT, body TEXT);
+    INSERT INTO docs VALUES (1, '[{"a":10},{"a":11}]'), (2, '[{"a":20}]');
+    SELECT id, a, ordinality
+    FROM docs, ROWS FROM (json_to_recordset(body::json) AS (a int)) WITH ORDINALITY
+    ORDER BY id, ordinality;
+}
+expect {
+    1|10|1
+    1|11|2
+    2|20|1
+}
+
+test with-ordinality-after-the-alias-is-a-syntax-error {
+    SELECT * FROM generate_series(1, 2) AS g WITH ORDINALITY;
+}
+@sqlstate 42601
+expect error {
+}
+
+test with-ordinality-on-a-subquery-is-a-syntax-error {
+    SELECT * FROM (SELECT 1) WITH ORDINALITY;
+}
+@sqlstate 42601
+expect error {
+}
+
+test ordinality-is-a-valid-column-name {
+    CREATE TABLE kw(ordinality INT);
+    INSERT INTO kw VALUES (7);
+    SELECT ordinality FROM kw;
+}
+expect {
+    7
+}

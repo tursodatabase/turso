@@ -1253,6 +1253,18 @@ expect {
     0
 }
 
+test unnest-argument-is-a-table-column-with-the-name-of-a-column-of-unnest {
+    CREATE TABLE unnest_names (input int[], unnest int[]);
+    INSERT INTO unnest_names VALUES ('{1,2}', '{7}');
+    SELECT u FROM unnest_names, unnest(input) AS u;
+    SELECT u FROM unnest_names, unnest(unnest) AS u;
+}
+expect {
+    1
+    2
+    7
+}
+
 test unnest-pgdump-correlated {
     CREATE TABLE unnest_tags (id int, tags text[]);
     INSERT INTO unnest_tags VALUES (1, ARRAY['a', 'b']), (2, ARRAY['c']), (3, NULL);
@@ -1333,6 +1345,39 @@ expect {
     1|a
     1|b
     2|c
+}
+
+test json-to-recordset-column-list-inside-rows-from {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"},{"a":2,"b":"y"}]') AS (a int, b text));
+    SELECT * FROM ROWS FROM (jsonb_to_record('{"a":3}') AS (a int));
+}
+expect {
+    1|x
+    2|y
+    3
+}
+
+test column-alias-list-renames-columns-defined-inside-rows-from {
+    SELECT t.p, t.b FROM ROWS FROM (json_to_recordset('[{"a":1,"b":"x"}]') AS (a int, b text)) AS t(p);
+    SELECT t.p, t.q FROM ROWS FROM (json_to_recordset('[{"a":2,"b":"y"}]') AS (a int, b text)) AS t(p, q);
+}
+expect {
+    1|x
+    2|y
+}
+
+test column-alias-list-longer-than-columns-defined-inside-rows-from-errors {
+    SELECT * FROM ROWS FROM (json_to_recordset('[{"a":1}]') AS (a int, b text)) AS t(p, q, r);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 2 columns available but 3 columns specified
+}
+
+test column-definition-list-on-a-function-that-does-not-return-record-errors {
+    SELECT * FROM unnest(ARRAY[1]) AS u(a int);
+}
+expect error {
 }
 
 test json-to-record-requires-column-list {
