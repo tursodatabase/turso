@@ -832,8 +832,7 @@ impl InteractionType {
                     // run.
                     let is_seq_schema_lag =
                         e.starts_with("sequence \"") && e.contains("does not exist");
-                    let is_table_schema_lag = e.starts_with("no such table:");
-                    if !is_seq_schema_lag && !is_table_schema_lag {
+                    if !is_seq_schema_lag {
                         panic!("Unexpected parse error: {e}");
                     }
                     return Err(turso_core::LimboError::ParseError(e));

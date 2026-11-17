@@ -11010,6 +11010,31 @@ mod tests {
         page
     }
 
+    #[test]
+    fn btree_init_page_zeros_unallocated_space() {
+        const PAGE_SIZE: usize = 4096;
+        let page = Arc::new(Page::new(2));
+        {
+            let inner = page.get();
+            let buf = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+            // Poison the buffer so any stale bytes are detectable.
+            buf.as_ptr().fill(0xAB);
+            inner.set_buffer(buf);
+        }
+        page.set_loaded();
+
+        btree_init_page(&page, PageType::TableLeaf, 0, PAGE_SIZE);
+
+        let inner = page.get();
+        let buf = inner.as_ptr();
+        let header_size = inner.header_size();
+        // Every byte after the page header must be zero.
+        assert!(
+            buf[header_size..].iter().all(|&b| b == 0),
+            "unallocated space after page header contains non-zero bytes (stale data leak)"
+        );
+    }
+
     /// Deterministic coverage for the allocation-failure window created by routing
     /// overflow-cell payloads through `TursoAllocator`: in
     /// `OverwriteCellState::ClearOverflowPagesAndOverwrite`, `drop_cell` mutates the

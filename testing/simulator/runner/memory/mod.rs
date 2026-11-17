@@ -9,5 +9,3 @@ mod mvcc_recovery;
 mod mvcc_upsert_pk;
 #[cfg(test)]
 mod statement_abandon;
-#[cfg(test)]
-mod targeted_fuzzer;

@@ -707,7 +707,12 @@ impl Shadow for CreateIndex {
         let table = env
             .iter_mut()
             .find(|t| t.name == self.table_name)
-            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist. CREATE INDEX statement ignored.", self.table_name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Table {} does not exist. CREATE INDEX statement ignored.",
+                    self.table_name
+                )
+            })?;
         table.indexes.push(self.index.clone());
         Ok(vec![])
     }
