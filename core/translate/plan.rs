@@ -2637,20 +2637,27 @@ impl<T: From<usize>> BitSet<T>
 where
     usize: From<T>,
 {
+    #[inline]
     pub fn set(&mut self, index: T) -> Result<(), alloc::TryReserveError> {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
-        } else {
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if overflow_idx >= overflow.len() {
-                overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
-                overflow.resize(overflow_idx + 1, 0);
-            }
-            overflow[overflow_idx] |= 1 << bit;
+            return Ok(());
         }
+        self.set_overflow_bit(index)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_overflow_bit(&mut self, index: usize) -> Result<(), alloc::TryReserveError> {
+        let overflow_idx = (index - Self::INLINE_BITS) / 64;
+        let bit = (index - Self::INLINE_BITS) % 64;
+        let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if overflow_idx >= overflow.len() {
+            overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
+            overflow.resize(overflow_idx + 1, 0);
+        }
+        overflow[overflow_idx] |= 1 << bit;
         Ok(())
     }
 
@@ -2748,17 +2755,25 @@ where
         }
     }
 
+    #[inline]
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
-        if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if self_ov.len() < other_ov.len() {
-                self_ov.try_reserve(other_ov.len() - self_ov.len())?;
-                self_ov.resize(other_ov.len(), 0);
-            }
-            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
-                *s |= o;
-            }
+        match &other.overflow {
+            None => Ok(()),
+            Some(other_ov) => self.union_overflow_with(other_ov),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn union_overflow_with(&mut self, other_ov: &[u64]) -> Result<(), alloc::TryReserveError> {
+        let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if self_ov.len() < other_ov.len() {
+            self_ov.try_reserve(other_ov.len() - self_ov.len())?;
+            self_ov.resize(other_ov.len(), 0);
+        }
+        for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+            *s |= o;
         }
         Ok(())
     }
