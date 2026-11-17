@@ -737,6 +737,82 @@ expect {
     7
 }
 
+test pg-get-expr-text-default {
+    CREATE TABLE demo (a text DEFAULT 'x', b varchar(10) DEFAULT 'it''s', c text DEFAULT '');
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    'x'::text
+    'it''s'::character varying
+    ''::text
+}
+
+test pg-get-expr-number-default {
+    CREATE TABLE demo (
+        a int DEFAULT 7, b bigint DEFAULT 7, c int DEFAULT -1, d numeric(10, 2) DEFAULT 1.5,
+        e bigint DEFAULT 3000000000, f numeric(10, 2) DEFAULT -1.5, g int DEFAULT 1 + 2
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    7
+    7
+    '-1'::integer
+    1.5
+    '3000000000'::bigint
+    '-1.5'::numeric
+    (1 + 2)
+}
+
+test pg-get-expr-lowest-number-default {
+    CREATE TABLE demo (
+        a int DEFAULT -2147483648, b bigint DEFAULT -2147483649,
+        c bigint DEFAULT -9223372036854775808, d int DEFAULT -0
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    '-2147483648'::integer
+    '-2147483649'::bigint
+    '-9223372036854775808'::bigint
+    0
+}
+
+test pg-get-expr-negative-zero-decimal-default {
+    CREATE TABLE demo (
+        a numeric(10, 2) DEFAULT -0.0, b numeric(10, 2) DEFAULT -0.00, c numeric(10, 2) DEFAULT -0.10
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    0.0
+    0.00
+    '-0.10'::numeric
+}
+
+test pg-get-expr-boolean-default {
+    CREATE TABLE demo (a boolean DEFAULT true, b boolean DEFAULT false, c boolean DEFAULT (1 > 0));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    true
+    false
+    (1 > 0)
+}
+
+# tursopg does not print the cast of a function's argument and shows the
+# default as the engine stores it.
+test pg-get-expr-default-with-function-of-literal {
+    CREATE TABLE demo (a text DEFAULT lower('X'));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
+}
+expect {
+    lower('X'::text)
+}
+expect @tursopg {
+    lower ('X')
+}
+
 test pg-get-expr-null-oid-is-null {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(adbin, NULL, true) FROM pg_attrdef;
@@ -757,13 +833,110 @@ test pg-get-expr-null-oid-does-not-hide-invalid-expression {
 @sqlstate 42883
 expect error {}
 
-@skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
 test pg-get-expr-check-constraint {
     CREATE TABLE checked (val int CHECK (val > 0));
-    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
 }
 expect {
-    val > 0
+    (val > 0)
+}
+
+test pg-get-expr-check-constraint-with-like {
+    CREATE TABLE checked (owner text CHECK (owner LIKE 'a%'), code varchar(10) CHECK (code NOT LIKE 'x_'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((code)::text !~~ 'x_'::text)
+    (owner ~~ 'a%'::text)
+}
+
+test pg-get-expr-check-constraint-with-text-literal {
+    CREATE TABLE checked (owner text CHECK (owner <> 'it''s'), code varchar(10) CHECK (code = 'x'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((code)::text = 'x'::text)
+    (owner <> 'it''s'::text)
+}
+
+test pg-get-expr-check-constraint-with-in-list {
+    CREATE TABLE checked (id int CHECK (id IN (1, 2)), owner text CHECK (owner NOT IN ('a', 'b')));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (id = ANY (ARRAY[1, 2]))
+    (owner <> ALL (ARRAY['a'::text, 'b'::text]))
+}
+
+test pg-get-expr-check-constraint-on-numeric-column {
+    CREATE TABLE checked (price numeric(10, 2) CHECK (price > 0), rate numeric(4, 2) CHECK (rate <= 1.5));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > (0)::numeric)
+    (rate <= 1.5)
+}
+
+test pg-get-expr-check-constraint-with-lowest-number {
+    CREATE TABLE checked (
+        id int, big bigint,
+        CONSTRAINT a_integer CHECK (id > -2147483648),
+        CONSTRAINT b_bigint CHECK (big > -2147483649),
+        CONSTRAINT c_lowest_bigint CHECK (big > -9223372036854775808),
+        CONSTRAINT d_zero CHECK (id > -0)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (id > '-2147483648'::integer)
+    (big > '-2147483649'::bigint)
+    (big > '-9223372036854775808'::bigint)
+    (id > 0)
+}
+
+test pg-get-expr-check-constraint-with-negative-zero-decimal {
+    CREATE TABLE checked (
+        price numeric(10, 2),
+        CONSTRAINT a_zero CHECK (price > -0.0),
+        CONSTRAINT b_two_places CHECK (price > -0.00),
+        CONSTRAINT c_not_zero CHECK (price > -0.10)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > 0.0)
+    (price > 0.00)
+    (price > '-0.10'::numeric)
+}
+
+test pg-get-expr-check-constraint-on-several-columns {
+    CREATE TABLE checked (
+        low int, high int, done boolean, note text,
+        CONSTRAINT a_range CHECK (low >= 0 AND low < high),
+        CONSTRAINT b_between CHECK (high BETWEEN 1 AND 100),
+        CONSTRAINT c_flag CHECK (done),
+        CONSTRAINT d_note CHECK (note IS NOT NULL OR NOT done)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((low >= 0) AND (low < high))
+    ((high >= 1) AND (high <= 100))
+    done
+    ((note IS NOT NULL) OR (NOT done))
+}
+
+# tursopg does not print the casts of the || operator and shows the condition
+# as the engine stores it.
+test pg-get-expr-check-constraint-with-concatenation {
+    CREATE TABLE checked (owner text CHECK (owner || 'x' <> 'ax'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
+}
+expect {
+    ((owner || 'x'::text) <> 'ax'::text)
+}
+expect @tursopg {
+    (owner || 'x') != 'ax'
 }
 
 test percentile-cont-within-group {
