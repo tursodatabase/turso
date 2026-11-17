@@ -1,7 +1,9 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{compound_column_collation, CollationSeq};
+use crate::translate::collate::{
+    check_column_types, compound_column_collation, compound_column_values, CollationSeq,
+};
 use crate::translate::emitter::{
     select::{emit_materialized_build_inputs, emit_query},
     LimitCtx, Resolver, TranslateCtx,
@@ -839,7 +841,14 @@ fn compound_collations(
         .map(|(select, _)| select)
         .chain([right_most])
         .collect();
-    (0..right_most.result_columns.len())
+    let columns = 0..right_most.result_columns.len();
+    for column in columns.clone() {
+        check_column_types(
+            compound_column_values(&arms, column, resolver),
+            resolver.schema(),
+        )?;
+    }
+    columns
         .map(|column| compound_column_collation(&arms, column, resolver))
         .collect()
 }

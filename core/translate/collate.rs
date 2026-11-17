@@ -627,6 +627,27 @@ pub fn compound_column_collation(
     first_collation(compound_column_exprs(arms, column, resolver))
 }
 
+/// Fails when the values of one result column, from each SELECT of a compound
+/// or each row of VALUES, have types that don't compare (see
+/// [check_types_compare]). Unlike in a comparison, a string literal or a
+/// parameter here keeps its text, which compares with the stored form of a
+/// custom type: in `SELECT tm UNION SELECT '10:00'` for a time tm, '10:00' is
+/// not the time 10:00:00. So it matches only a type that compares with text,
+/// such as varchar.
+pub(crate) fn check_column_types<'a, 'c, 's: 'c>(
+    exprs: impl IntoIterator<Item = (&'a Expr, ExprContext<'c, 's>)>,
+    schema: &Schema,
+) -> Result<()> {
+    let mut types: SmallVec<[ExprType; 2]> = SmallVec::new();
+    for (expr, context) in exprs {
+        types.push(match is_untyped_operand(expr)? {
+            true => ExprType::Builtin(BuiltinType::Text),
+            false => type_of(expr, &context.type_env()),
+        });
+    }
+    check_types_compare(&types, schema)
+}
+
 /// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
 /// where `arms` are its SELECTs. The COLLATE applies to the column of every
 /// SELECT, so it is an error when any of them has a type that takes none, as
@@ -653,6 +674,25 @@ fn compound_column_exprs<'a, 's>(
             &select.result_columns[column].expr,
             ExprContext::new(Some(&select.table_references), resolver),
         )
+    })
+}
+
+/// The values of column `column` of every SELECT in `arms`, each with the
+/// context its columns refer to: the result column of a SELECT, and the value
+/// in each row of a VALUES list, whose result columns are placeholders.
+pub(crate) fn compound_column_values<'a, 's>(
+    arms: &'a [&'a SelectPlan],
+    column: usize,
+    resolver: &'a Resolver<'s>,
+) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + 'a {
+    arms.iter().flat_map(move |select| {
+        let context = ExprContext::new(Some(&select.table_references), resolver);
+        let result_column = select
+            .values
+            .is_empty()
+            .then(|| &select.result_columns[column].expr);
+        let rows = select.values.iter().map(move |row| &row[column]);
+        rows.chain(result_column).map(move |expr| (expr, context))
     })
 }
 

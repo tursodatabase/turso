@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_text_collation, CollationSeq},
+        collate::{check_column_types, compound_column_values, expr_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -3193,6 +3193,33 @@ pub(super) fn query_output_columns(
         _ => None,
     };
 
+    // Each column read from a VALUES list or a recursive CTE has one type, so
+    // the values every row or SELECT gives it must have types that compare. A
+    // compound SELECT checks its columns in compound_collations. An INSERT's
+    // VALUES rows are not read as a table: each row is converted to the
+    // target columns.
+    let arms: alloc::Vec<&SelectPlan> = match plan {
+        Plan::Select(select) if !select.values.is_empty() => {
+            core::iter::once(select.as_ref()).try_collect()?
+        }
+        Plan::RecursiveCte(recursive_cte) => [
+            recursive_cte.initial_query.as_ref(),
+            recursive_cte.recursive_query.as_ref(),
+        ]
+        .into_iter()
+        .flat_map(recursive_cte_query_selects)
+        .try_collect()?,
+        Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::Delete(_) | Plan::Update(_) => {
+            core::iter::empty().try_collect()?
+        }
+    };
+    for column in 0..result_columns.len() {
+        check_column_types(
+            compound_column_values(&arms, column, resolver),
+            resolver.schema(),
+        )?;
+    }
+
     let mut columns = result_columns
         .iter()
         .enumerate()
@@ -3249,6 +3276,22 @@ pub(super) fn query_output_columns(
         column_types.try_push(result_type)?;
     }
     Ok((columns, column_types))
+}
+
+/// The SELECTs of a recursive CTE's initial or recursive query.
+pub(crate) fn recursive_cte_query_selects(query: &Plan) -> impl Iterator<Item = &SelectPlan> {
+    let (left, right_most): (&[(SelectPlan, ast::CompoundOperator)], &SelectPlan) = match query {
+        Plan::Select(select) => (&[], select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => (left, right_most),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("a recursive CTE's queries are SELECTs")
+        }
+    };
+    left.iter()
+        .map(|(select, _)| select)
+        .chain(core::iter::once(right_most))
 }
 
 fn subquery_output_columns(

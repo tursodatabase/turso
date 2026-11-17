@@ -1943,3 +1943,51 @@ expect {
     json_tree|3
     series|3
 }
+
+# A compound SELECT, a VALUES list and a recursive CTE fill one column from
+# several SELECTs or rows, so the values they give must have types that
+# compare. A string literal there is text.
+
+@requires strict "uses STRICT tables"
+test cmp-union-of-time-and-string-literal-is-not-supported {
+    -- The literal would sort as the text '10:00' among the stored times.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO a VALUES (1, '09:30'), (2, '23:59:59');
+    SELECT tm FROM a UNION SELECT '10:00' ORDER BY 1;
+}
+expect error {
+    cannot compare type time with type text
+}
+
+test cmp-values-of-string-literal-and-time-is-not-supported {
+    -- The literal would sort as the text '9:00' among the times.
+    SELECT column1 FROM (VALUES (CAST('10:00' AS time)), ('9:00')) ORDER BY 1;
+}
+expect error {
+    cannot compare type time with type text
+}
+
+@requires strict "uses STRICT tables"
+test cmp-insert-values-of-string-literal-and-time {
+    -- Each value is stored as a time, so the string literal needs no type of its own.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, tm time) STRICT;
+    INSERT INTO a VALUES (1, '9:45'), (2, CAST('10:00' AS time));
+    SELECT tm FROM a ORDER BY id;
+}
+expect {
+    09:45:00
+    10:00:00
+}
+
+test cmp-recursive-cte-of-time-and-string-literal-is-not-supported {
+    -- The recursive SELECT's literal would sort as the text '9:00' among the times.
+    WITH RECURSIVE r(x, n) AS (
+        SELECT CAST('10:00' AS time), 0
+        UNION ALL
+        SELECT '9:00', n + 1 FROM r WHERE n < 1
+    )
+    SELECT x FROM r ORDER BY x;
+}
+expect error {
+    cannot compare type time with type text
+}

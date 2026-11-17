@@ -16,3 +16,18 @@ expect {
 expect @tursopg error {
     cannot compare type date with type timestamp
 }
+
+test union-of-time-and-string-literal {
+    CREATE TABLE a (id int, tm time);
+    INSERT INTO a VALUES (1, '09:30'), (2, '23:59:59');
+    SELECT tm FROM a UNION SELECT '10:00' ORDER BY 1;
+}
+expect {
+    09:30:00
+    10:00:00
+    23:59:59
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cannot compare type time with type text
+}

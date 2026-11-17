@@ -17,7 +17,8 @@ use crate::translate::expr::{
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
-    GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState, WhereTerm,
+    recursive_cte_query_selects, GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState,
+    WhereTerm,
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries,
@@ -1437,24 +1438,10 @@ pub(crate) fn resolve_recursive_cte_queue_order(
     recursive_query: &Plan,
     resolver: &Resolver,
 ) -> Result<Option<Vec<super::plan::CompoundOrderByKey>>> {
-    fn collect_selects<'a>(plan: &'a Plan, out: &mut Vec<&'a SelectPlan>) {
-        match plan {
-            Plan::Select(plan) => out.push(plan),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                out.extend(left.iter().map(|(plan, _)| plan));
-                out.push(right_most);
-            }
-            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
-                unreachable!("recursive CTE queries must be SELECT plans")
-            }
-        }
-    }
-
-    let mut plans = Vec::new();
-    collect_selects(initial_query, &mut plans);
-    collect_selects(recursive_query, &mut plans);
+    let plans: Vec<&SelectPlan> = [initial_query, recursive_query]
+        .into_iter()
+        .flat_map(recursive_cte_query_selects)
+        .collect();
     resolve_compound_order_by(order_by, &plans, resolver)
 }
 

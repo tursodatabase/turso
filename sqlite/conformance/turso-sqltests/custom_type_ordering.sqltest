@@ -325,31 +325,27 @@ expect {
     CREATE TYPE rt_type BASE text ENCODE value DECODE value
 }
 
-# --- A sort never fails: values that are not of the type still get a place ---
+# --- A sorted column holding a typed value and a string literal ---
 
+# A compound column of numeric and text has no one order, so it is refused.
 @requires strict "uses STRICT tables"
-test numeric-order-puts-text-that-is-not-a-number-after-numbers {
+test numeric-and-text-in-one-sorted-column-is-refused {
     CREATE TABLE t(n numeric(10,2)) STRICT;
     INSERT INTO t VALUES (2), (1);
     SELECT n FROM t UNION ALL SELECT 'x' UNION ALL SELECT '1e100000000' ORDER BY 1;
 }
-expect {
-    1.00
-    2.00
-    1e100000000
-    x
+expect error {
+    cannot compare type numeric with type text
 }
 
 @requires strict "uses STRICT tables"
-test numeric-order-puts-text-that-is-not-a-number-after-numbers-desc {
+test numeric-and-text-in-one-sorted-column-is-refused-desc {
     CREATE TABLE t(n numeric(10,2)) STRICT;
     INSERT INTO t VALUES (2), (1);
     SELECT n FROM t UNION ALL SELECT 'x' ORDER BY 1 DESC;
 }
-expect {
-    x
-    2.00
-    1.00
+expect error {
+    cannot compare type numeric with type text
 }
 
 @requires strict "uses STRICT tables"
