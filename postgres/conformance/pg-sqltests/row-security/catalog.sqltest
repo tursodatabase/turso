@@ -106,6 +106,22 @@ expect {
     p7|((n <> ALL (ARRAY[(1)::bigint, (2)::bigint])) AND (abs(id) > 1) AND ((- n) > 1))
 }
 
+# PostgreSQL types a negative number by its value, so -2147483648 is an
+# integer, and prints a numeric constant as numeric_out does.
+test pg-policy-prints-number-constants-as-postgres-does {
+    CREATE TABLE pp_docs_11 (id INT, n BIGINT, m NUMERIC(10, 2));
+    CREATE POLICY p1 ON pp_docs_11 USING (id > -2147483648 AND n > -2147483649);
+    CREATE POLICY p2 ON pp_docs_11 USING (m > 5. AND m > 007.50 AND m > -0.0 AND m > -1.5);
+    SELECT polname, pg_get_expr(polqual, polrelid)
+    FROM pg_policy
+    WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'pp_docs_11')
+    ORDER BY polname;
+}
+expect {
+    p1|((id > '-2147483648'::integer) AND (n > '-2147483649'::bigint))
+    p2|((m > '5'::numeric) AND (m > 7.50) AND (m > 0.0) AND (m > '-1.5'::numeric))
+}
+
 # A condition that tursopg cannot print as pg_get_expr does is shown as
 # CREATE POLICY wrote it, which PostgreSQL reads back, rather than as the
 # engine's SQL.
