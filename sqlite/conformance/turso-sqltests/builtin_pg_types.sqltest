@@ -700,3 +700,65 @@ test timestamp-compare-with-other-text-with-and-without-index {
 expect {
     1|1|1|1
 }
+
+
+# PostgreSQL rounds a timestamp(3) to milliseconds. Turso does not implement
+# that precision, so a modifier on a type that takes none is an error.
+@requires strict "uses STRICT tables"
+test timestamp-type-modifier-is-refused {
+    CREATE TABLE tm(ts timestamp(3)) STRICT;
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-type-modifier-is-refused-in-add-column {
+    CREATE TABLE tm(id integer) STRICT;
+    ALTER TABLE tm ADD COLUMN ts timestamp(3);
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
+
+test timestamp-type-modifier-is-refused-in-cast {
+    SELECT CAST('2024-01-01 10:00:00.123456' AS timestamp(3));
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
+
+# A DEFAULT or a generated column is compiled when a row is written, so the
+# INSERT fails.
+@requires strict "uses STRICT tables"
+test timestamp-type-modifier-is-refused-in-default {
+    CREATE TABLE tm(id integer, ts timestamp DEFAULT (CAST('2024-01-01 10:00:00.123456' AS timestamp(3)))) STRICT;
+    INSERT INTO tm(id) VALUES (1);
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-type-modifier-is-refused-in-generated-column {
+    CREATE TABLE tm(s text, ts timestamp AS (CAST(s AS timestamp(3)))) STRICT;
+    INSERT INTO tm(s) VALUES ('2024-01-01 10:00:00.123456');
+}
+expect error {
+    a type modifier on type "timestamp" is not supported
+}
+
+test date-type-modifier-is-refused-in-array-cast {
+    SELECT CAST('{2024-01-01}' AS date(3)[]);
+}
+expect error {
+    a type modifier on type "date" is not supported
+}
+
+test domain-type-modifier-is-refused-in-cast {
+    CREATE DOMAIN dd AS date;
+    SELECT CAST('2024-01-01' AS dd(3));
+}
+expect error {
+    a type modifier on type "dd" is not supported
+}

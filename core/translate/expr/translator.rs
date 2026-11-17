@@ -952,7 +952,9 @@ fn emit_custom_type_cast(
 /// column of the type stores it, or None when the CAST is SQLite's CAST. A
 /// domain stores through every type under it, then checks its constraints on
 /// the stored value. A CAST with type arguments applies their limits too:
-/// CAST('3.504' AS numeric(10,2)) is 3.50. Array types are not covered here.
+/// CAST('3.504' AS numeric(10,2)) is 3.50. A modifier on a type with no
+/// parameters is an error: CAST(x AS timestamp(3)). Array types are not
+/// covered here.
 fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
@@ -965,6 +967,7 @@ fn custom_type_cast_chain(
     else {
         return Ok(None);
     };
+    resolved.leaf().check_type_modifier(type_name)?;
     if resolved.is_domain() {
         return Ok(Some(resolved));
     }

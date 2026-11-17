@@ -988,6 +988,19 @@ impl TypeDef {
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
     }
 
+    /// Fails if `type_name` has a modifier such as the `(3)` in `date(3)` and
+    /// this type has no parameters. PostgreSQL gives some of these a meaning
+    /// Turso does not implement, such as the precision of `timestamp(3)`.
+    pub fn check_type_modifier(&self, type_name: &ast::Type) -> Result<()> {
+        if type_name.size.is_some() && self.user_params().next().is_none() {
+            return Err(LimboError::NotSupported(format!(
+                "a type modifier on type \"{}\"",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// Returns the original SQL used to create this type or domain.
     pub fn to_sql(&self) -> &str {
         &self.sql
