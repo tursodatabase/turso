@@ -2621,9 +2621,20 @@ impl Database {
     }
 
     #[cfg(feature = "conn_raw_api")]
+    pub(crate) fn ensure_external_restore_supported(&self) -> Result<()> {
+        if self.encryption_cipher() != CipherMode::None {
+            return Err(LimboError::InvalidArgument(
+                "external restore is not supported with built-in encryption".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        self.ensure_external_restore_supported()?;
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
