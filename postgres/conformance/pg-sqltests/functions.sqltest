@@ -757,13 +757,78 @@ test pg-get-expr-null-oid-does-not-hide-invalid-expression {
 @sqlstate 42883
 expect error {}
 
-@skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
 test pg-get-expr-check-constraint {
     CREATE TABLE checked (val int CHECK (val > 0));
-    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
 }
 expect {
-    val > 0
+    (val > 0)
+}
+
+test pg-get-expr-check-constraint-with-like {
+    CREATE TABLE checked (owner text CHECK (owner LIKE 'a%'), code varchar(10) CHECK (code NOT LIKE 'x_'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((code)::text !~~ 'x_'::text)
+    (owner ~~ 'a%'::text)
+}
+
+test pg-get-expr-check-constraint-with-text-literal {
+    CREATE TABLE checked (owner text CHECK (owner <> 'it''s'), code varchar(10) CHECK (code = 'x'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((code)::text = 'x'::text)
+    (owner <> 'it''s'::text)
+}
+
+test pg-get-expr-check-constraint-with-in-list {
+    CREATE TABLE checked (id int CHECK (id IN (1, 2)), owner text CHECK (owner NOT IN ('a', 'b')));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (id = ANY (ARRAY[1, 2]))
+    (owner <> ALL (ARRAY['a'::text, 'b'::text]))
+}
+
+test pg-get-expr-check-constraint-on-numeric-column {
+    CREATE TABLE checked (price numeric(10, 2) CHECK (price > 0), rate numeric(4, 2) CHECK (rate <= 1.5));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > (0)::numeric)
+    (rate <= 1.5)
+}
+
+test pg-get-expr-check-constraint-on-several-columns {
+    CREATE TABLE checked (
+        low int, high int, done boolean, note text,
+        CONSTRAINT a_range CHECK (low >= 0 AND low < high),
+        CONSTRAINT b_between CHECK (high BETWEEN 1 AND 100),
+        CONSTRAINT c_flag CHECK (done),
+        CONSTRAINT d_note CHECK (note IS NOT NULL OR NOT done)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    ((low >= 0) AND (low < high))
+    ((high >= 1) AND (high <= 100))
+    done
+    ((note IS NOT NULL) OR (NOT done))
+}
+
+# tursopg does not print the casts of the || operator and shows the condition
+# as the engine stores it.
+test pg-get-expr-check-constraint-with-concatenation {
+    CREATE TABLE checked (owner text CHECK (owner || 'x' <> 'ax'));
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
+}
+expect {
+    ((owner || 'x'::text) <> 'ax'::text)
+}
+expect @tursopg {
+    (owner || 'x') != 'ax'
 }
 
 test percentile-cont-within-group {

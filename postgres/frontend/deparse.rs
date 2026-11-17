@@ -1,5 +1,6 @@
-//! PostgreSQL's text of a row-level security condition, as `pg_get_expr`
-//! prints it for `pg_policy.polqual` and `pg_policies.qual`.
+//! PostgreSQL's text of a row-level security condition or a CHECK
+//! condition, as `pg_get_expr` prints it for `pg_policy.polqual`,
+//! `pg_policies.qual` and `pg_constraint.conbin`.
 //!
 //! The catalog stores what the engine compiled the condition into, so this
 //! turns the engine's forms back into PostgreSQL's: `GLOB 'a*'` is printed

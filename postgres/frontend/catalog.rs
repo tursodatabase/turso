@@ -2624,7 +2624,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(render_expr(&chk.expr)), // conbin
+                    Value::build_text(check_condition_text(&chk.expr, btree)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -4404,6 +4404,13 @@ fn constraint_column_list<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The text of a CHECK condition of `table` as PostgreSQL's `pg_get_expr`
+/// prints it. A condition with a form the printer does not know is shown as
+/// the engine's SQL.
+fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
+    crate::deparse::condition_text(condition, table).unwrap_or_else(|| render_expr(condition))
 }
 
 fn render_expr(expr: &ast::Expr) -> String {
