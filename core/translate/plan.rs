@@ -275,6 +275,15 @@ impl WhereTermOrigin {
             Self::Where | Self::Join(_) => None,
         }
     }
+
+    /// Whether the term passes an argument to a table-valued function, as
+    /// `hidden_column = +t.j` does for `json_each(t.j)`. It compares nothing.
+    pub fn passes_argument(self) -> bool {
+        match self {
+            Self::TableFunction(_) => true,
+            Self::Where | Self::Join(_) => false,
+        }
+    }
 }
 
 /// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.

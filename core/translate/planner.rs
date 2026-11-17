@@ -3329,8 +3329,14 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
     resolver: &Resolver,
 ) -> Result<()> {
     for mut expr in vtab_predicates.drain(..) {
+        // `hidden_column = +argument` passes the argument to the function. The
+        // user wrote no comparison, so only the argument is bound and checked,
+        // as a scalar function's argument is.
+        let Expr::Binary(_, ast::Operator::Equals, argument) = &mut expr else {
+            unreachable!("a table-function argument is built as `hidden_column = +argument`");
+        };
         bind_and_rewrite_expr(
-            &mut expr,
+            argument,
             Some(table_references),
             Some(result_columns),
             resolver,

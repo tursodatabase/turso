@@ -842,8 +842,10 @@ pub fn constraints_from_where_clause(
                     .map(|_| {
                         comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
                     });
+                // A virtual table has no index, so a table-function argument
+                // needs no collation to pick one.
                 let cmp_collation = match operator.as_ast_operator() {
-                    Some(op) if op.is_comparison() => {
+                    Some(op) if op.is_comparison() && !term.origin.passes_argument() => {
                         Some(decide_once(&mut term_collations[i], || {
                             comparison_collation(
                                 lhs,

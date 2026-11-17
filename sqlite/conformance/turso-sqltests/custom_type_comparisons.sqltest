@@ -1927,3 +1927,19 @@ expect {
     numbers|1
     varchar-text|1
 }
+
+# A table-valued function's argument is passed to the function, not compared,
+# so it may have any type.
+@requires strict "uses STRICT tables"
+test cmp-table-function-argument-of-any-type {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, j jsonb, ia integer[]) STRICT;
+    INSERT INTO a VALUES (1, '{"a":1,"b":2}', ARRAY[1,2,3]);
+    SELECT 'json_each', count(*) FROM a, json_each(a.j);
+    SELECT 'json_tree', count(*) FROM a LEFT JOIN json_tree(a.j);
+    SELECT 'series', count(*) FROM a, generate_series(1, array_length(a.ia));
+}
+expect {
+    json_each|2
+    json_tree|3
+    series|3
+}

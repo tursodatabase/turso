@@ -2298,7 +2298,8 @@ fn build_where_term_info(
     where_clause
         .iter()
         .map(|term| {
-            let equal_tables = if term.consumed {
+            // A hash join joins two B-tree tables, never a table-valued function.
+            let equal_tables = if term.consumed || term.origin.passes_argument() {
                 None
             } else {
                 tables_in_hashable_equal_test(&term.expr, table_references, subqueries, resolver)?
