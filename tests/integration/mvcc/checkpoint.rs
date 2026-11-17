@@ -89,10 +89,10 @@ fn collection_yields_while_walking_many_schema_rows() {
     );
     assert!(
         checkpoint
-            .machine
-            .collected_table_rows()
-            .all(|(row_id, _)| row_id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID),
-        "schema rows are walked before the rows of any table"
+            .collected_table_rowids(SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .len()
+            < MANY_ROWS,
+        "the yield must come before all catalog rows have been collected"
     );
 
     checkpoint.step_until(CheckpointState::CollectIndexRows);

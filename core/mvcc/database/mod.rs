@@ -3094,7 +3094,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 let header_write = tx.header_dirty.load(Ordering::Acquire);
                 // Read only is not only exclusive to empty write set, we could be writing the
                 // database header here.
-                let read_only = write_set_is_empty && !header_write;
+                let read_only =
+                    write_set_is_empty && tx.btree_changes.lock().is_empty() && !header_write;
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
@@ -3344,7 +3345,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // going through CommitEnd. CommitEnd updates last_committed_tx_ts
                 // which would make a read-only transaction look like a write,
                 // causing spurious Busy errors from acquire_exclusive_tx.
-                if tx.write_set.lock().is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
+                if tx.write_set.lock().is_empty()
+                    && tx.btree_changes.lock().is_empty()
+                    && !tx.header_dirty.load(Ordering::Acquire)
+                {
                     turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"

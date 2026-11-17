@@ -5533,3 +5533,32 @@ fn checkpoint_ordering_survives_index_drop_at_a_later_snapshot() {
         .checkpoint_index_infos(after)
         .contains_key(&id));
 }
+
+#[test]
+fn checkpoint_btree_lifecycle_without_catalog_rows() {
+    use crate::storage::btree_descriptor::BtreeDescriptor;
+    let db = MvccTestDb::new();
+    let id = MVTableId::new(db.mvcc_store.get_next_table_id());
+    let tx = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
+    db.mvcc_store.insert_table_id_to_rootpage(id, None);
+    db.mvcc_store
+        .record_created_btree(tx, id.into(), BtreeDescriptor::Table);
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root = db
+        .mvcc_store
+        .current_root_page(&id)
+        .expect("empty B-tree creation must be checkpointed without a catalog row");
+    let tx = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(id, 1, "storage only"))
+        .unwrap();
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(db.mvcc_store.current_root_page(&id), Some(root));
+    let tx = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
+    db.mvcc_store.record_dropped_btree(tx, root as i64);
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx).unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(db.mvcc_store.current_root_page(&id).is_none());
+}
