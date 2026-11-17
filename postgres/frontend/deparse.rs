@@ -616,19 +616,34 @@ fn number_text(value: &str) -> Option<Printed> {
     is_decimal.then(|| Printed::constant(value, PgType::Numeric))
 }
 
-/// A negative number, which PostgreSQL prints quoted with its type, such as
-/// `'-1'::integer`.
-fn negative_number_text(value: &str) -> Option<Printed> {
-    let positive = number_text(value)?;
-    let (type_name, ty) = match positive.ty {
-        PgType::Integer => ("integer", PgType::Integer),
-        PgType::Bigint => ("bigint", PgType::Bigint),
-        PgType::Numeric => ("numeric", PgType::Numeric),
-        _ => return None,
-    };
-    let digits = positive.text.trim_start_matches('\'');
-    let digits = digits.split('\'').next().unwrap_or(digits);
-    Some(Printed::constant(format!("'-{digits}'::{type_name}"), ty))
+/// The negation of the number `positive`, which PostgreSQL prints quoted
+/// with its type, such as `'-1'::integer`. The type is the one the negative
+/// number fits in: `-2147483648` is an `integer`, though `2147483648` is a
+/// `bigint`. `-0` is printed as `0`, and `-0.0` as `0.0`.
+fn negative_number_text(positive: &str) -> Option<Printed> {
+    if let Ok(number) = format!("-{positive}").parse::<i64>() {
+        if number == 0 {
+            return Some(Printed::constant("0", PgType::Integer));
+        }
+        let (type_name, ty) = if i32::try_from(number).is_ok() {
+            ("integer", PgType::Integer)
+        } else {
+            ("bigint", PgType::Bigint)
+        };
+        return Some(Printed::constant(format!("'{number}'::{type_name}"), ty));
+    }
+    let positive = number_text(positive)?;
+    if positive.ty != PgType::Numeric {
+        return None;
+    }
+    let is_zero = positive.text.chars().all(|c| c == '0' || c == '.');
+    if is_zero {
+        return Some(positive);
+    }
+    Some(Printed::constant(
+        format!("'-{}'::numeric", positive.text),
+        PgType::Numeric,
+    ))
 }
 
 /// The text of an engine string literal, which keeps its quotes.
@@ -701,6 +716,16 @@ mod tests {
             ),
             ("current_user () = 'x'", "(CURRENT_USER = 'x'::name)"),
             ("\"id\" = 2147483648", "(id = '2147483648'::bigint)"),
+            ("\"id\" > - 0", "(id > 0)"),
+            ("\"price\" > - 0.0", "(price > 0.0)"),
+            ("\"price\" > - 0.00", "(price > 0.00)"),
+            ("\"price\" > - 0.10", "(price > '-0.10'::numeric)"),
+            ("\"id\" > - 2147483648", "(id > '-2147483648'::integer)"),
+            ("\"n\" > - 2147483649", "(n > '-2147483649'::bigint)"),
+            (
+                "\"n\" > - 9223372036854775808",
+                "(n > '-9223372036854775808'::bigint)",
+            ),
             (
                 "\"id\" > 0 AND (\"id\" > 1 AND \"id\" > 2)",
                 "((id > 0) AND ((id > 1) AND (id > 2)))",
@@ -743,8 +768,15 @@ mod tests {
     fn negative_number_literals_print_quoted_with_their_type() {
         for (stored, expected) in [
             ("-1", "'-1'::integer"),
+            ("-0", "0"),
+            ("-2147483648", "'-2147483648'::integer"),
+            ("-2147483649", "'-2147483649'::bigint"),
             ("-3000000000", "'-3000000000'::bigint"),
+            ("-9223372036854775808", "'-9223372036854775808'::bigint"),
             ("-1.5", "'-1.5'::numeric"),
+            ("-0.0", "0.0"),
+            ("-0.00", "0.00"),
+            ("-0.10", "'-0.10'::numeric"),
         ] {
             let default = ast::Expr::Literal(ast::Literal::Numeric(stored.to_string()));
             assert_eq!(

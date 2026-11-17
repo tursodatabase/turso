@@ -764,6 +764,32 @@ expect {
     (1 + 2)
 }
 
+test pg-get-expr-lowest-number-default {
+    CREATE TABLE demo (
+        a int DEFAULT -2147483648, b bigint DEFAULT -2147483649,
+        c bigint DEFAULT -9223372036854775808, d int DEFAULT -0
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    '-2147483648'::integer
+    '-2147483649'::bigint
+    '-9223372036854775808'::bigint
+    0
+}
+
+test pg-get-expr-negative-zero-decimal-default {
+    CREATE TABLE demo (
+        a numeric(10, 2) DEFAULT -0.0, b numeric(10, 2) DEFAULT -0.00, c numeric(10, 2) DEFAULT -0.10
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
+}
+expect {
+    0.0
+    0.00
+    '-0.10'::numeric
+}
+
 test pg-get-expr-boolean-default {
     CREATE TABLE demo (a boolean DEFAULT true, b boolean DEFAULT false, c boolean DEFAULT (1 > 0));
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef ORDER BY adnum;
@@ -849,6 +875,38 @@ test pg-get-expr-check-constraint-on-numeric-column {
 expect {
     (price > (0)::numeric)
     (rate <= 1.5)
+}
+
+test pg-get-expr-check-constraint-with-lowest-number {
+    CREATE TABLE checked (
+        id int, big bigint,
+        CONSTRAINT a_integer CHECK (id > -2147483648),
+        CONSTRAINT b_bigint CHECK (big > -2147483649),
+        CONSTRAINT c_lowest_bigint CHECK (big > -9223372036854775808),
+        CONSTRAINT d_zero CHECK (id > -0)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (id > '-2147483648'::integer)
+    (big > '-2147483649'::bigint)
+    (big > '-9223372036854775808'::bigint)
+    (id > 0)
+}
+
+test pg-get-expr-check-constraint-with-negative-zero-decimal {
+    CREATE TABLE checked (
+        price numeric(10, 2),
+        CONSTRAINT a_zero CHECK (price > -0.0),
+        CONSTRAINT b_two_places CHECK (price > -0.00),
+        CONSTRAINT c_not_zero CHECK (price > -0.10)
+    );
+    SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    (price > 0.0)
+    (price > 0.00)
+    (price > '-0.10'::numeric)
 }
 
 test pg-get-expr-check-constraint-on-several-columns {

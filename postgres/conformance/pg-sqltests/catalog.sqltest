@@ -1468,6 +1468,19 @@ expect {
     CHECK (done)
 }
 
+test pg-get-constraintdef-check-constraint-with-lowest-number {
+    CREATE TABLE checked (
+        id int, big bigint,
+        CONSTRAINT a_integer CHECK (id > -2147483648),
+        CONSTRAINT b_bigint CHECK (big > -9223372036854775808)
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((id > '-2147483648'::integer))
+    CHECK ((big > '-9223372036854775808'::bigint))
+}
+
 # tursopg does not print the casts of the || operator and shows the condition
 # as the engine stores it.
 test pg-get-constraintdef-check-constraint-with-concatenation {
