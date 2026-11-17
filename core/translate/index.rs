@@ -45,7 +45,8 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema::{self, SQLITE_TABLEID};
+use super::sqlite_schema_rows::{emit_schema_entry, SchemaEntryType};
 
 fn canonical_create_index_sql(
     stmt: &ast::Stmt,
