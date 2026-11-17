@@ -111,7 +111,6 @@ use crate::{
     schema::Trigger,
     storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
-    translate::emitter::TransactionMode,
     vdbe::metrics::ConnectionMetrics,
 };
 pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -119,6 +118,7 @@ use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
+pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 

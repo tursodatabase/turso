@@ -3472,7 +3472,7 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
+    pub fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
             crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
@@ -4984,7 +4984,7 @@ impl Connection {
     }
 
     /// Get MVCC transaction ID and mode for a specific database.
-    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
@@ -5335,7 +5335,7 @@ impl Connection {
 
     /// Get the MvStore for a specific database.
     /// Returns None for databases without MVCC or for bootstrap connections.
-    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+    pub fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }

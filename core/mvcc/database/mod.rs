@@ -588,8 +588,8 @@ impl LogRecord {
     /// [`DurableStorage::serialize_row_version`] and
     /// [`DurableStorage::serialize_database_header`] instead so the bytes are
     /// appended one op at a time.
-    #[cfg(test)]
-    pub(crate) fn for_test(
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn for_test(
         tx_timestamp: TxID,
         row_versions: &[(RowID, RowVersion)],
         header: Option<DatabaseHeader>,
@@ -606,7 +606,7 @@ impl LogRecord {
     }
 
     /// Test-only: append one row-version op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn push_row_version_for_test(&mut self, row_id: &RowID, row_version: &RowVersion) {
         crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)
             .serialize_op_entry(row_id, row_version, None)
@@ -615,7 +615,7 @@ impl LogRecord {
     }
 
     /// Test-only: append a `DatabaseHeader` op to the payload buffer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn set_header_for_test(&mut self, header: &DatabaseHeader) {
         assert!(!self.has_header, "header op appended twice in test");
         crate::mvcc::persistent_storage::logical_log::LogSerializer::new(&mut self.buf)

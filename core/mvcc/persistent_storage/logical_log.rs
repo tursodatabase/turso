@@ -302,12 +302,12 @@ const LOG_HDR_SALT_SIZE: usize = 8;
 const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
-pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
-pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
+pub const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
-pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
+pub const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
 // Fixed AAD width for one encrypted chunk:
 // salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
 const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
