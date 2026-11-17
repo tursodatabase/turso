@@ -35,16 +35,7 @@ pub(crate) fn emit_create_internal_table(
         root: root_reg,
         flags: CreateBTreeFlags::new_table(),
     });
-    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .expect("every database has sqlite_schema")
-    });
-    let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: schema_cursor_id,
-        root_page: 1i64.into(),
-        db: MAIN_DB_ID,
-    });
+    let schema_cursor_id = open_sqlite_schema_for_write(program, resolver, MAIN_DB_ID);
     emit_schema_entry(
         program,
         resolver,
@@ -74,6 +65,29 @@ pub(crate) struct InternalTable {
     pub(crate) table: Arc<BTreeTable>,
     pub(crate) root_page: RegisterOrLiteral<i64>,
 }
+
+/// Opens `sqlite_schema` of the given database for writing and returns the
+/// cursor.
+pub(crate) fn open_sqlite_schema_for_write(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+) -> usize {
+    let sqlite_schema = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .expect("every database has sqlite_schema")
+    });
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(SQLITE_SCHEMA_ROOT_PAGE),
+        db: database_id,
+    });
+    cursor_id
+}
+
+/// `sqlite_schema` is at the first page of every database.
+const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_schema_entry(

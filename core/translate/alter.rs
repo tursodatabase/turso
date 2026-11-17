@@ -17,6 +17,7 @@ use super::{
         self, check_column_type, validate_check_expr, validate_default_expr,
         validate_generated_function_calls, SQLITE_TABLEID,
     },
+    sqlite_schema_rows::open_sqlite_schema_for_write,
     update::translate_update_for_schema_change,
 };
 use crate::{
@@ -205,18 +206,7 @@ fn emit_rename_autoincrement_backing_table_entry(
     let new_backing_name = sequence_backing_table_name(&new_seq_name);
     let new_backing_sql = sequence_backing_table_sql(&new_seq_name);
 
-    let Some(sqlite_schema) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-    }) else {
-        return;
-    };
-
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-        db: database_id,
-    });
+    let cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let old_backing_reg = program.emit_string8_new_reg(old_backing_name);
     program.mark_last_insn_constant();
@@ -1683,13 +1673,7 @@ pub fn translate_alter_table(
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
                 })?;
 
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: database_id,
-            });
+            let cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns().len();
@@ -2325,13 +2309,7 @@ pub fn translate_alter_table(
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
                 })?;
 
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: database_id,
-            });
+            let cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns().len();
@@ -3241,12 +3219,7 @@ fn translate_rename_virtual_table(
             LimboError::ParseError("sqlite_schema table not found in schema".to_string())
         })?;
 
-    let schema_cur = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: schema_cur,
-        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-        db: database_id,
-    });
+    let schema_cur = open_sqlite_schema_for_write(program, resolver, database_id);
 
     program.cursor_loop(schema_cur, |program, rowid| {
         let ncols = sqlite_schema.columns().len();
