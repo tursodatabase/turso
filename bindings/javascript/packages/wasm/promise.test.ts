@@ -53,40 +53,10 @@ test('vector-test', async () => {
 test('explain', async () => {
     const db = await connect(":memory:");
     const stmt = await db.prepare("EXPLAIN SELECT 1");
-    expect(stmt.columns()).toEqual([
-        {
-            "name": "addr",
-            "type": "INTEGER",
-        },
-        {
-            "name": "opcode",
-            "type": "TEXT",
-        },
-        {
-            "name": "p1",
-            "type": "INTEGER",
-        },
-        {
-            "name": "p2",
-            "type": "INTEGER",
-        },
-        {
-            "name": "p3",
-            "type": "INTEGER",
-        },
-        {
-            "name": "p4",
-            "type": "TEXT",
-        },
-        {
-            "name": "p5",
-            "type": "INTEGER",
-        },
-        {
-            "name": "comment",
-            "type": "TEXT",
-        },
-    ].map(x => ({ ...x, column: null, database: null, table: null })));
+    expect(stmt.columns()).toEqual(
+        ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"]
+            .map(name => ({ name, column: null, database: null, table: null, type: null }))
+    );
     expect(await stmt.all()).toEqual([
         {
             "addr": 0,
@@ -234,7 +204,7 @@ test('on-disk db', async () => {
     await db1.exec("CREATE TABLE t(x)");
     await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
     const stmt1 = await db1.prepare("SELECT * FROM t WHERE x % 2 = ?");
-    expect(stmt1.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+    expect(stmt1.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
     const rows1 = await stmt1.all([1]);
     expect(rows1).toEqual([{ x: 1 }, { x: 3 }]);
     stmt1.close();
@@ -242,7 +212,7 @@ test('on-disk db', async () => {
 
     const db2 = await connect(path);
     const stmt2 = await db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
-    expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+    expect(stmt2.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
     const rows2 = await stmt2.all([1]);
     expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
     await db2.close();

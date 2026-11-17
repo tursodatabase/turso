@@ -210,7 +210,17 @@ This function is currently not supported.
 
 #### columns() ⇒ array of objects
 
-This function is currently not supported.
+Returns the columns in the result set returned by this prepared statement. Each object has the column's name and, when the result column reads a table column, that column's name, table, database and declared type, as in better-sqlite3. Other columns, such as expressions, have `null` in those fields.
+
+```js
+db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(40))");
+db.prepare("SELECT id, name AS display, id + 1 AS next FROM users").columns();
+// [
+//   { name: "id", column: "id", table: "users", database: "main", type: "INTEGER" },
+//   { name: "display", column: "name", table: "users", database: "main", type: "VARCHAR(40)" },
+//   { name: "next", column: null, table: null, database: null, type: null },
+// ]
+```
 
 #### bind([...bindParameters]) ⇒ this
 

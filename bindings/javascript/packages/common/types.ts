@@ -62,9 +62,9 @@ export const STEP_SLEEP = 4;
 export interface TableColumn {
     name: string,
     type: string | null,
-    column: null,
-    table: null,
-    database: null
+    column: string | null,
+    table: string | null,
+    database: string | null
 }
 
 /** [step constant, milliseconds to wait before stepping again (nonzero only for STEP_SLEEP)] */

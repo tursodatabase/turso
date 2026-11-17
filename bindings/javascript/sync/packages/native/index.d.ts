@@ -202,9 +202,9 @@ export interface QueryOptions {
 export interface TableColumn {
   name: string
   type?: string | null
-  column?: undefined
-  table?: undefined
-  database?: undefined
+  column?: string | null
+  table?: string | null
+  database?: string | null
 }
 export declare class GeneratorHolder {
   resumeSync(error?: string | undefined | null): GeneratorResponse
