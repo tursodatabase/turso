@@ -326,6 +326,24 @@ fn pg_attribute_rows_are_kept_when_the_database_is_reopened(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn pg_attribute_is_filled_when_a_database_has_none(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let written_by_statements = attribute_rows_of_tables_of_many_kinds(&conn);
+
+    // A database that an earlier version made has no pg_attribute table.
+    conn.inner()
+        .execute("DROP TABLE pg_catalog.pg_attribute")
+        .unwrap();
+    drop(conn);
+    let db = db.reopen();
+
+    assert_eq!(
+        attribute_rows(&db.connect_postgres()),
+        written_by_statements
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn vacuum_keeps_pg_attribute(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE plain (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
