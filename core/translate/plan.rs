@@ -877,7 +877,7 @@ pub struct SelectPlan {
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
+    pub values: Vec<Vec<Box<Expr>>>,
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
     pub window: Option<Window>,
