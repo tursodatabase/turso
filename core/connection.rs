@@ -1591,19 +1591,6 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
-        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
-            let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                MEMORY_PATH,
-                flags,
-                db_opts,
-                None,
-                dialect,
-            )?;
-            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-            return Ok((io, conn));
-        }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
@@ -1618,6 +1605,26 @@ impl Connection {
             }
             (None, None) => None,
         };
+        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                encryption_opts.clone(),
+                dialect,
+            )?;
+            let conn = db.connect(
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(
+                    encryption_opts
+                        .as_ref()
+                        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+                        .transpose()?,
+                ),
+            )?;
+            return Ok((io, conn));
+        }
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -1631,13 +1638,12 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        if let Some(cipher) = opts.cipher {
-            let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
-        }
-        if let Some(hexkey) = opts.hexkey {
-            let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
-        }
+        let key = opts
+            .hexkey
+            .as_deref()
+            .map(EncryptionKey::from_hex_string)
+            .transpose()?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key))?;
         Ok((io, conn))
     }
 
