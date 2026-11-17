@@ -1253,7 +1253,7 @@ impl SnapshotRows for PgProcTable {
             probin TEXT,
             prosqlbody TEXT,
             proconfig TEXT,
-            proacl TEXT,
+            proacl TEXT[],
             tableoid INTEGER HIDDEN
         )";
     const TABLE_OID: Option<i64> = Some(1255);
