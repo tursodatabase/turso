@@ -429,6 +429,7 @@ impl PostgreSQLTranslator {
                         &tbl_name,
                         &mut serial_sequences,
                         &mut check_names,
+                        create.if_not_exists,
                     )?;
                     columns.push(col);
                 }
@@ -656,6 +657,7 @@ impl PostgreSQLTranslator {
         tbl_name: &ast::QualifiedName,
         serial_sequences: &mut Vec<SerialSequence>,
         check_names: &mut std::collections::HashSet<String>,
+        if_not_exists: bool,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -766,7 +768,8 @@ impl PostgreSQLTranslator {
                     has_identity = true;
                     let (sequence_name, option_nodes) =
                         identity_sequence_name(&constraint.options, tbl_name)?;
-                    let options = SequenceOptions::new(&option_nodes, Some(&pg_type))?;
+                    let options =
+                        SequenceOptions::new(&option_nodes, Some(&pg_type), if_not_exists)?;
                     default_expr = Some(self.serial_default(
                         tbl_name,
                         &name,
@@ -5484,7 +5487,7 @@ impl PostgreSQLTranslator {
         let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
-        let options = SequenceOptions::new(&seq.options, None)?;
+        let options = SequenceOptions::new(&seq.options, None, seq.if_not_exists)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
@@ -5862,10 +5865,15 @@ pub struct SequenceOptions {
 
 impl SequenceOptions {
     /// The options of a sequence of the type `data_type`, or of the type an `AS`
-    /// option names.
+    /// option names. With `if_not_exists`, the statement does nothing when the
+    /// sequence (or the table of an identity column) already exists, so the
+    /// checks of the bounds and of INCREMENT are left to core, which makes them
+    /// only when it creates the sequence; PostgreSQL likewise skips the
+    /// statement before checking them.
     pub fn new(
         options: &[pg_query::protobuf::Node],
         data_type: Option<&str>,
+        if_not_exists: bool,
     ) -> Result<Self, ParseError> {
         let mut cycle = false;
 
@@ -5960,7 +5968,7 @@ impl SequenceOptions {
         // init_params reads them, so that the first error is the one it
         // reports. Core checks the bounds again when it makes the sequence.
         let increment = read(increment_elem)?;
-        if increment == Some(0) {
+        if increment == Some(0) && !if_not_exists {
             return Err(invalid("INCREMENT must not be zero".to_string()));
         }
         let ascending = increment.unwrap_or(1) > 0;
@@ -5968,19 +5976,19 @@ impl SequenceOptions {
         let mut min_value = read_bound("MINVALUE", min_elem)?;
         let min = min_value.unwrap_or(if ascending { 1 } else { type_min });
         let max = max_value.unwrap_or(if ascending { type_max } else { -1 });
-        if min >= max {
+        if min >= max && !if_not_exists {
             return Err(invalid(format!(
                 "MINVALUE ({min}) must be less than MAXVALUE ({max})"
             )));
         }
         let start = read(start_elem)?;
         let first = start.unwrap_or(if ascending { min } else { max });
-        if first < min {
+        if !if_not_exists && first < min {
             return Err(invalid(format!(
                 "START value ({first}) cannot be less than MINVALUE ({min})"
             )));
         }
-        if first > max {
+        if !if_not_exists && first > max {
             return Err(invalid(format!(
                 "START value ({first}) cannot be greater than MAXVALUE ({max})"
             )));
@@ -7249,21 +7257,6 @@ fn extract_type_name_from_typename(
     Ok(name)
 }
 
-/// Extract an integer value from a DefElem's arg node.
-fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
-    use pg_query::protobuf::node::Node;
-    match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
-        Some(Node::Integer(i)) => Some(i.ival as i64),
-        // A decimal past int4, such as `3_000_000_000`, is a Float, and may hold
-        // underscores between its digits.
-        Some(Node::Float(f)) => non_decimal_literal_as_decimal(&f.fval)
-            .unwrap_or_else(|| f.fval.replace('_', ""))
-            .parse::<i64>()
-            .ok(),
-        _ => None,
-    }
-}
-
 /// The integer value of a sequence option, read as PostgreSQL reads it into a
 /// bigint: a number with a fraction or an exponent, such as `1.5` or `1e3`, is
 /// invalid input (22P02), and an integer past the bigint range is out of range
@@ -7271,26 +7264,29 @@ fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
 /// options only numbers; None for an option without one.
 fn sequence_option_int(elem: &pg_query::protobuf::DefElem) -> Result<Option<i64>, ParseError> {
     use pg_query::protobuf::node::Node;
-    let Some(Node::Float(f)) = elem.arg.as_ref().and_then(|n| n.node.as_ref()) else {
-        return Ok(extract_def_elem_int(elem));
+    use std::num::IntErrorKind;
+    let written = match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
+        Some(Node::Integer(i)) => return Ok(Some(i64::from(i.ival))),
+        // A decimal past int4, such as `3_000_000_000`, is a Float, and may hold
+        // underscores between its digits.
+        Some(Node::Float(f)) => &f.fval,
+        _ => return Ok(None),
     };
-    if let Some(value) = extract_def_elem_int(elem) {
-        return Ok(Some(value));
-    }
-    let digits = non_decimal_literal_as_decimal(&f.fval).unwrap_or_else(|| f.fval.replace('_', ""));
-    let unsigned = digits.strip_prefix('-').unwrap_or(&digits);
-    let is_integer = !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit());
-    Err(if is_integer {
-        ParseError::Sqlstate {
-            sqlstate: SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-            message: format!("value \"{}\" is out of range for type bigint", f.fval),
-        }
-    } else {
-        ParseError::Sqlstate {
-            sqlstate: SQLSTATE_INVALID_TEXT_REPRESENTATION,
-            message: format!("invalid input syntax for type bigint: \"{}\"", f.fval),
-        }
-    })
+    let digits =
+        non_decimal_literal_as_decimal(written).unwrap_or_else(|| written.replace('_', ""));
+    digits
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|error| match error.kind() {
+            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => ParseError::Sqlstate {
+                sqlstate: SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                message: format!("value \"{written}\" is out of range for type bigint"),
+            },
+            _ => ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                message: format!("invalid input syntax for type bigint: \"{written}\""),
+            },
+        })
 }
 
 fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {

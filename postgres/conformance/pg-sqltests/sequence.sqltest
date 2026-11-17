@@ -672,3 +672,40 @@ test sequence-start-checked-before-cache-is-read {
 expect error {
     START value \(100\) cannot be greater than MAXVALUE \(10\)
 }
+
+# IF NOT EXISTS on an existing sequence does nothing, whatever the bounds:
+# PostgreSQL checks them only when it makes the sequence.
+test sequence-if-not-exists-skips-an-existing-sequence-with-bad-bounds {
+    CREATE SEQUENCE seq_ine;
+    CREATE SEQUENCE IF NOT EXISTS seq_ine START 0;
+    CREATE SEQUENCE IF NOT EXISTS seq_ine MINVALUE 5 MAXVALUE 1;
+    CREATE SEQUENCE IF NOT EXISTS seq_ine INCREMENT 0;
+    SELECT nextval('seq_ine');
+}
+expect {
+    1
+}
+
+test sequence-if-not-exists-checks-the-bounds-of-a-new-sequence {
+    CREATE SEQUENCE IF NOT EXISTS seq_ine_new START 0;
+}
+@sqlstate 22023
+expect error {
+    START value \(0\) cannot be less than MINVALUE \(1\)
+}
+
+test sequence-if-not-exists-checks-the-increment-of-a-new-sequence {
+    CREATE SEQUENCE IF NOT EXISTS seq_ine_incr INCREMENT 0;
+}
+@sqlstate 22023
+expect error {
+    INCREMENT must not be zero
+}
+
+test sequence-if-not-exists-checks-minvalue-below-maxvalue-of-a-new-sequence {
+    CREATE SEQUENCE IF NOT EXISTS seq_ine_range MINVALUE 5 MAXVALUE 1;
+}
+@sqlstate 22023
+expect error {
+    MINVALUE \(5\) must be less than MAXVALUE \(1\)
+}
