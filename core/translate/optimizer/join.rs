@@ -464,6 +464,18 @@ struct WhereTermInfo {
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
 }
 
+/// What the join order search reads about the `WHERE` terms. The search does
+/// not change the terms, so this is built once for each search.
+struct WhereTermsInfo {
+    /// One entry for each `WHERE` term, in the same order.
+    terms: Vec<WhereTermInfo>,
+    /// For each table, the union of the table masks of the terms that read it.
+    table_connections: Vec<TableMask>,
+    /// The positions of the unconsumed terms that do more work than one simple
+    /// condition.
+    terms_with_extra_work: Vec<usize>,
+}
+
 impl JoinN {
     pub fn table_numbers(&self) -> impl Iterator<Item = usize> + use<'_> {
         self.data.iter().map(|(table_number, _)| *table_number)
@@ -501,7 +513,7 @@ fn join_lhs_and_rhs<'a, 'w>(
     joined_tables: &[JoinedTable],
     where_clause: &'w [WhereTerm],
     multi_index_work: &[MultiIndexTableWork<'w>],
-    where_terms: &[WhereTermInfo],
+    where_terms: &WhereTermsInfo,
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -580,9 +592,7 @@ fn join_lhs_and_rhs<'a, 'w>(
     };
 
     let has_join_constraint = lhs.is_some()
-        && where_terms.iter().any(|term| {
-            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
-        });
+        && tables_are_connected(&lhs_mask, rhs_table_number, &where_terms.table_connections);
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
             build_self_constraint_selectivity(rhs_constraints, rhs_table_number);
@@ -872,13 +882,17 @@ fn join_lhs_and_rhs<'a, 'w>(
                     rhs_constraints,
                     &lhs_mask,
                     where_clause,
-                    where_terms.iter().enumerate().filter_map(|(index, term)| {
-                        let (left, right, owner) = term.equal_tables?;
-                        // An outer join condition belongs to that join only.
-                        owner
-                            .is_none_or(|owner| owner == rhs_table_reference.internal_id)
-                            .then_some((index, left, right))
-                    }),
+                    where_terms
+                        .terms
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, term)| {
+                            let (left, right, owner) = term.equal_tables?;
+                            // An outer join condition belongs to that join only.
+                            owner
+                                .is_none_or(|owner| owner == rhs_table_reference.internal_id)
+                                .then_some((index, left, right))
+                        }),
                     max_distinct_build_keys,
                     build_cardinality,
                     probe_cardinality,
@@ -1324,11 +1338,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(
+    let where_terms = WhereTermsInfo::new(
         where_clause,
         table_references,
         subqueries,
         planning_context.resolver,
+        num_tables,
     )?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
@@ -1399,7 +1414,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         };
     }
     let mut best_plan = naive_plan;
-    let table_connections = table_connections(num_tables, &where_terms)?;
+    let table_connections = where_terms.table_connections.as_slice();
 
     // Reuse a single mutable join order to avoid allocating join orders per permutation.
     let mut join_order = Vec::with_capacity(num_tables);
@@ -1536,7 +1551,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     continue;
                 }
 
-                if !tables_are_connected(&lhs_mask, rhs_idx, &table_connections)
+                if !tables_are_connected(&lhs_mask, rhs_idx, table_connections)
                     && has_connected_legal_candidate(
                         &lhs_mask,
                         num_tables,
@@ -1777,7 +1792,7 @@ fn compute_greedy_join_order<'a, 'w>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &'w [WhereTerm],
     multi_index_work: &[MultiIndexTableWork<'w>],
-    where_terms: &[WhereTermInfo],
+    where_terms: &WhereTermsInfo,
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1799,7 +1814,7 @@ fn compute_greedy_join_order<'a, 'w>(
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
-    let table_connections = table_connections(num_tables, where_terms)?;
+    let table_connections = where_terms.table_connections.as_slice();
 
     // Pick the starting table using local filters and directed indexed-seek benefits.
     let first_idx = find_best_starting_table(
@@ -1863,13 +1878,13 @@ fn compute_greedy_join_order<'a, 'w>(
         };
         let must_stay_connected = remaining.iter().any(|candidate| {
             candidate_is_legal(candidate)
-                && tables_are_connected(&current_mask, candidate, &table_connections)
+                && tables_are_connected(&current_mask, candidate, table_connections)
         });
 
         for idx in &remaining {
             if !candidate_is_legal(idx)
                 || (must_stay_connected
-                    && !tables_are_connected(&current_mask, idx, &table_connections))
+                    && !tables_are_connected(&current_mask, idx, table_connections))
             {
                 continue;
             }
@@ -2248,7 +2263,7 @@ fn compute_naive_left_deep_plan<'a, 'w>(
     constraints: &'a [TableConstraints],
     where_clause: &'w [WhereTerm],
     multi_index_work: &[MultiIndexTableWork<'w>],
-    where_terms: &[WhereTermInfo],
+    where_terms: &WhereTermsInfo,
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -2331,6 +2346,31 @@ fn compute_naive_left_deep_plan<'a, 'w>(
     Ok(best_plan)
 }
 
+impl WhereTermsInfo {
+    fn new(
+        where_clause: &[WhereTerm],
+        table_references: &TableReferences,
+        subqueries: &[NonFromClauseSubquery],
+        resolver: &Resolver,
+        num_tables: usize,
+    ) -> Result<Self> {
+        let terms = build_where_term_info(where_clause, table_references, subqueries, resolver)?;
+        let table_connections = table_connections(num_tables, &terms)?;
+        let terms_with_extra_work = where_clause
+            .iter()
+            .zip(&terms)
+            .enumerate()
+            .filter(|(_, (term, info))| !term.consumed && info.extra_steps > 0)
+            .map(|(term_idx, _)| term_idx)
+            .collect();
+        Ok(Self {
+            terms,
+            table_connections,
+            terms_with_extra_work,
+        })
+    }
+}
+
 /// Read the table IDs and extra work for each `WHERE` term once.
 fn build_where_term_info(
     where_clause: &[WhereTerm],
@@ -2366,20 +2406,21 @@ fn build_where_term_info(
 /// Return the extra `WHERE` work that can run after this table.
 fn ready_where_work(
     where_clause: &[WhereTerm],
-    where_terms: &[WhereTermInfo],
+    where_terms: &WhereTermsInfo,
     joined_mask: &TableMask,
     rhs_table_number: usize,
     rhs_table_id: TableInternalId,
 ) -> SmallVec<[(usize, usize); 4]> {
-    where_clause
+    where_terms
+        .terms_with_extra_work
         .iter()
-        .zip(where_terms)
-        .enumerate()
-        .filter_map(|(term_idx, (term, info))| {
-            if term.consumed || info.extra_steps == 0 {
-                return None;
-            }
-            let ready = match term.origin.join_origin().and_then(JoinOrigin::outer_table) {
+        .filter_map(|&term_idx| {
+            let info = &where_terms.terms[term_idx];
+            let outer_table = where_clause[term_idx]
+                .origin
+                .join_origin()
+                .and_then(JoinOrigin::outer_table);
+            let ready = match outer_table {
                 Some(table_id) => table_id == rhs_table_id,
                 None => {
                     info.table_mask.get(rhs_table_number)
@@ -2642,11 +2683,12 @@ mod tests {
             Operator::Or,
             Box::new(check(second_id)),
         ))];
-        let where_terms = build_where_term_info(
+        let where_terms = WhereTermsInfo::new(
             &two_table_where,
             &table_references,
             &[],
             &Resolver::empty_for_tests(),
+            2,
         )?;
 
         let mut joined_mask = TableMask::default();
@@ -2657,7 +2699,7 @@ mod tests {
 
         joined_mask.set(1)?;
         let ready = ready_where_work(&two_table_where, &where_terms, &joined_mask, 1, second_id);
-        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        assert_eq!(ready.as_slice(), &[(0, where_terms.terms[0].extra_steps)]);
         let mut term = WhereTerm::from(Expr::Binary(
             Box::new(check(first_id)),
             Operator::Or,
@@ -2665,11 +2707,12 @@ mod tests {
         ));
         term.origin = WhereTermOrigin::Join(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
-        let where_terms = build_where_term_info(
+        let where_terms = WhereTermsInfo::new(
             &outer_join_where,
             &table_references,
             &[],
             &Resolver::empty_for_tests(),
+            2,
         )?;
 
         let mut joined_mask = TableMask::default();
@@ -2680,7 +2723,7 @@ mod tests {
 
         joined_mask.set(1)?;
         let ready = ready_where_work(&outer_join_where, &where_terms, &joined_mask, 1, second_id);
-        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        assert_eq!(ready.as_slice(), &[(0, where_terms.terms[0].extra_steps)]);
         Ok(())
     }
 
