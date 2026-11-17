@@ -1,6 +1,7 @@
 use super::{Connection, SchemaReparseGuard, TransactionState};
 use crate::alloc::TryClone;
 use crate::namespace::NamespaceId;
+use crate::schema::load::{NamespaceNames, SchemaLoader, SchemaRows};
 use crate::schema::SequencesByNamespace;
 use crate::sync::Arc;
 use crate::util::IOExt;
@@ -24,25 +25,20 @@ pub struct ReparseSchemaInner {
     /// Held for the whole reparse so a concurrent reparse on this connection
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
-    fresh: Schema,
+    /// Runs the steps converted to [`LoadStep`](crate::schema::load::LoadStep)
+    /// and holds the schema that is being read.
+    loader: SchemaLoader,
     /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
     preserved_sequences: Option<SequencesByNamespace>,
-    /// The `sqlite_schema` scan, which also collects the indexes and
-    /// materialized views that are built once the types are loaded.
-    parse: Box<crate::util::ParseSchemaRowsState>,
     phase: ReparsePhase,
 }
 
 enum ReparsePhase {
-    /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
-    ParseSchema,
-    /// Loading the names of the namespaces from the namespaces table.
-    LoadNamespaces {
-        stmt: Box<Statement>,
-        rows: Vec<(i64, String)>,
-    },
+    /// Running the steps of the schema loader: the schema rows and the
+    /// names of the namespaces.
+    RunLoadSteps,
     /// Recovering sequence descriptors from each `__turso_internal_seq_*`
     /// backing table via SQL (or grafting the VACUUM-preserved map). The
     /// per-backing-table descriptor read yields IO, so the worklist and the
@@ -66,13 +62,10 @@ enum ReparsePhase {
         watermark_row: Option<(i64, bool)>,
     },
     /// Loading custom type definitions from the internal types table.
-    LoadTypes {
-        stmt: Box<Statement>,
-        type_rows: Vec<String>,
-    },
-    /// Loading the CREATE TYPE statements `type_sqls`, then building the
-    /// materialized views and indexes collected by the `sqlite_schema` scan.
-    BuildIndexes { type_sqls: Vec<String> },
+    LoadTypes { stmt: Box<Statement> },
+    /// Loading the CREATE TYPE statements, then building the materialized
+    /// views and indexes that the schema rows step collected.
+    BuildIndexes,
     /// Loading the dialect's own schema state, such as the PostgreSQL
     /// frontend's relation catalog: `stmt` reads one query into `rows`, the
     /// rows of the queries before it are in `results`, and `queries` are
@@ -188,24 +181,27 @@ impl Connection {
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
         // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
-        // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
-        // with a new clean schema that has the same header cookie.
-        self.install_schema_keeping_dialect_schema(&fresh)?;
-
-        let stmt = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
+        // But in this occasion it will always reprepare, and we get an error. So we trick the statement:
+        // the loader swaps our schema with a new clean schema that has the same header cookie
+        // before it prepares its first statement.
+        let mut loader = SchemaLoader::new(
+            fresh,
+            vec![
+                Box::new(SchemaRows::new(self.clone())),
+                Box::new(NamespaceNames::new(self.clone())),
+            ],
+        );
+        loader.prepare_next_statement(self)?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
-        let mv_tx = if self.is_mvcc_bootstrap_connection() {
-            None
-        } else {
-            self.get_mv_tx()
-        };
+        if self.is_mvcc_bootstrap_connection() {
+            self.set_mv_tx(None);
+        }
         Ok(ReparseSchemaInner {
             _guard: guard,
-            fresh,
+            loader,
             preserved_sequences,
-            parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
-            phase: ReparsePhase::ParseSchema,
+            phase: ReparsePhase::RunLoadSteps,
         })
     }
 
@@ -221,54 +217,8 @@ impl Connection {
                 unreachable!("drive_reparse_building requires Building state");
             };
             match &mut inner.phase {
-                ReparsePhase::ParseSchema => {
-                    // Resolver so attached-db qualifiers in temp triggers can be
-                    // mapped to their actual index on this connection.
-                    let attached_resolver = |name: &str| -> Option<usize> {
-                        self.qualifiers
-                            .database_id(&crate::util::normalize_ident(name))
-                    };
-                    crate::return_if_io!(crate::util::parse_schema_rows(
-                        &mut inner.parse,
-                        &mut inner.fresh,
-                        &self.syms.read(),
-                        &attached_resolver,
-                        self.db.dialect().as_ref(),
-                    ));
-
-                    // Under a dialect without namespaces, a table of that name
-                    // is an ordinary table.
-                    if inner.fresh.supports_namespaces()
-                        && inner.fresh.has_table(
-                            NamespaceId::ROOT,
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-                        )
-                    {
-                        // Install the schema so the namespaces table can be read.
-                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT id, name FROM {}",
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-                        ))?;
-                        inner.phase = ReparsePhase::LoadNamespaces {
-                            stmt: Box::new(stmt),
-                            rows: Vec::new(),
-                        };
-                    } else {
-                        inner
-                            .fresh
-                            .load_namespace_names(self.dialect().as_ref(), &[])?;
-                        inner.phase = ReparsePhase::populate_sequences();
-                    }
-                }
-                ReparsePhase::LoadNamespaces { stmt, rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
-                        Ok(())
-                    }));
-                    inner
-                        .fresh
-                        .load_namespace_names(self.dialect().as_ref(), rows)?;
+                ReparsePhase::RunLoadSteps => {
+                    crate::return_if_io!(inner.loader.run(self));
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::populate_sequences();
                 }
@@ -287,12 +237,18 @@ impl Connection {
                     // descriptor SELECTs can resolve the backing tables.
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.set_sequences_by_namespace(sequences);
+                            inner
+                                .loader
+                                .load
+                                .schema
+                                .set_sequences_by_namespace(sequences);
                             *pending = Some(crate::alloc::vec![]);
                         } else {
-                            let work = inner.fresh.sequence_backing_table_names();
+                            let work = inner.loader.load.schema.sequence_backing_table_names();
                             if !work.is_empty() {
-                                self.install_schema_keeping_dialect_schema(&inner.fresh)?;
+                                self.install_schema_keeping_dialect_schema(
+                                    &inner.loader.load.schema,
+                                )?;
                             }
                             *pending = Some(work);
                         }
@@ -313,8 +269,14 @@ impl Connection {
                         };
                         let (backing_table_name, seq_name) = entry;
                         let normalized = crate::util::normalize_ident(&seq_name);
-                        let (namespace, sequence_name) = inner.fresh.demangle_name(&normalized);
-                        if inner.fresh.has_sequence(namespace, sequence_name) {
+                        let (namespace, sequence_name) =
+                            inner.loader.load.schema.demangle_name(&normalized);
+                        if inner
+                            .loader
+                            .load
+                            .schema
+                            .has_sequence(namespace, sequence_name)
+                        {
                             *idx += 1;
                             *stmt = None;
                             *meta = None;
@@ -355,7 +317,9 @@ impl Connection {
                         }
                         let sequence = seq.take().expect("sequence set above");
                         inner
-                            .fresh
+                            .loader
+                            .load
+                            .schema
                             .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
@@ -367,41 +331,39 @@ impl Connection {
                     // Decide whether to load custom types next.
                     if self.experimental_custom_types_enabled()
                         && inner
-                            .fresh
+                            .loader
+                            .load
+                            .schema
                             .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         // Temporarily install the schema so we can query against it.
-                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
+                        self.install_schema_keeping_dialect_schema(&inner.loader.load.schema)?;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
                         ))?;
                         inner.phase = ReparsePhase::LoadTypes {
                             stmt: Box::new(stmt),
-                            type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::BuildIndexes { type_sqls: vec![] };
+                        inner.phase = ReparsePhase::BuildIndexes;
                     }
                 }
-                ReparsePhase::LoadTypes { stmt, type_rows } => {
+                ReparsePhase::LoadTypes { stmt } => {
+                    let type_sqls = &mut inner.loader.load.type_sqls;
                     crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        type_rows.push(row.get::<&str>(1)?.to_string());
+                        type_sqls.push(row.get::<&str>(1)?.to_string());
                         Ok(())
                     }));
-                    inner.phase = ReparsePhase::BuildIndexes {
-                        type_sqls: std::mem::take(type_rows),
-                    };
+                    inner.phase = ReparsePhase::BuildIndexes;
                 }
-                ReparsePhase::BuildIndexes { type_sqls } => {
-                    crate::util::populate_types_views_then_indices(
+                ReparsePhase::BuildIndexes => {
+                    inner.loader.load.load_types_then_build_views_and_indexes(
                         self.dialect().as_ref(),
-                        &mut inner.parse,
-                        &mut inner.fresh,
                         &self.syms.read(),
-                        type_sqls,
+                        self.mv_store().is_some(),
                     )?;
-                    inner.phase = self.load_dialect_schema_phase(&inner.fresh)?;
+                    inner.phase = self.load_dialect_schema_phase(&inner.loader.load.schema)?;
                 }
                 ReparsePhase::LoadDialectSchema {
                     stmt,
@@ -422,10 +384,10 @@ impl Connection {
                         *stmt = Box::new(self.prepare_engine_metadata_read(&sql)?);
                         continue;
                     }
-                    inner.fresh.dialect_schema = Some(
+                    inner.loader.load.schema.dialect_schema = Some(
                         self.db
                             .dialect()
-                            .build_schema_state(&inner.fresh, results)?,
+                            .build_schema_state(&inner.loader.load.schema, results)?,
                     );
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
@@ -440,7 +402,7 @@ impl Connection {
                     let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
                         unreachable!("state is Building");
                     };
-                    let fresh = inner.fresh;
+                    let fresh = inner.loader.into_schema();
                     tracing::debug!(
                         "reparse_schema: schema_version={}, tables={:?}",
                         fresh.schema_version,
@@ -482,7 +444,7 @@ impl Connection {
     /// statement compiled in between must not see it empty: without it, no
     /// role exists and no table has an owner, privileges or row-level
     /// security.
-    fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
+    pub(crate) fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
         self.with_schema_mut(|schema| {
             let mut installed = fresh.try_clone()?;
             installed.dialect_schema.clone_from(&schema.dialect_schema);
