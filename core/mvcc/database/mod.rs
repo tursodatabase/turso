@@ -9540,10 +9540,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .block(|| pager.with_header(|header| header.schema_cookie))?
                     .get(),
             );
-        let mut fresh = Schema::with_options(
-            connection.db.experimental_custom_types_enabled(),
-            connection.db.dialect().as_ref(),
-        )?;
+        let mut fresh = connection
+            .db
+            .dialect()
+            .new_schema(connection.db.experimental_custom_types_enabled())?;
         fresh.schema_version = cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes = crate::alloc::vec![];
@@ -10580,10 +10580,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .as_ref()
             .map(|header| header.schema_cookie.get())
             .unwrap_or(fallback_cookie);
-        let mut fresh = Schema::with_options(
-            connection.db.experimental_custom_types_enabled(),
-            connection.db.dialect().as_ref(),
-        )?;
+        let mut fresh = connection
+            .db
+            .dialect()
+            .new_schema(connection.db.experimental_custom_types_enabled())?;
         fresh.schema_version = cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes =

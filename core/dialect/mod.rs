@@ -20,7 +20,7 @@ pub(crate) use engine::EngineDialect;
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
-    schema::{BTreeTable, RelationKind, Schema},
+    schema::{BTreeTable, RelationKind, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
@@ -150,6 +150,19 @@ pub struct ScalarFuncContext<'a> {
 // adopted (pedrocarlo is working on it) and stores the identity kind itself.
 pub const IDENTITY_TABLE_SQL_MARKER: &str = "/* turso_identity";
 
+impl dyn Dialect {
+    /// The schema a database of this dialect has before its objects are
+    /// read from the file. Called when a database is opened and on every
+    /// schema rebuild.
+    pub fn new_schema(&self, enable_custom_types: bool) -> Result<Schema> {
+        Ok(self
+            .schema_builder(enable_custom_types)?
+            .supports_namespaces(self.supports_namespaces())
+            .default_namespaces(self.default_namespaces())
+            .build())
+    }
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -252,19 +265,15 @@ pub trait Dialect: Send + Sync + 'static {
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
 
-    /// Install the dialect's catalog tables into a freshly constructed
-    /// schema.
+    /// Starts the schema a database of this dialect has before its objects
+    /// are read from the file. The default has the catalog tables and
+    /// built-in types that every dialect has. A dialect with catalog tables
+    /// of its own adds them to the default (constructed with
+    /// [`crate::VirtualTable::new_internal`], which requires no connection).
     ///
-    /// Called by [`Schema::with_options`] on every schema
-    /// construction and rebuild, so catalog tables survive rebuilds
-    /// structurally instead of being re-registered by hand. The SQLite
-    /// dialect registers the standard built-in catalog here; other
-    /// dialects typically compose with it via
-    /// [`engine::register_builtin_catalog`] and then add their own tables
-    /// (constructed with [`crate::VirtualTable::new_internal`], which
-    /// requires no connection).
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
+    /// [`Dialect::new_schema`] finishes the schema.
+    fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
+        crate::schema::builtin::schema_builder(enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {

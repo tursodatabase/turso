@@ -67,7 +67,7 @@ impl VirtualTable {
     /// parsed to derive the column metadata. Schema dialects use this to
     /// construct catalog tables (e.g. a `pg_catalog` surface) with a
     /// non-table-valued-function kind and install them through
-    /// [`crate::dialect::Dialect::register_catalog`].
+    /// [`crate::dialect::Dialect::schema_builder`].
     pub fn new_internal(
         name: String,
         sql: String,

@@ -1664,7 +1664,9 @@ mod tests {
 
     /// The built-in types plus `cents`.
     fn test_schema() -> Schema {
-        let mut schema = Schema::new();
+        let mut schema = crate::schema::builtin::schema_builder(true)
+            .unwrap()
+            .build();
         schema
             .add_type_from_sql(
                 "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",

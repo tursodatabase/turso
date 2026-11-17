@@ -1,6 +1,7 @@
 use rustc_hash::FxHashMap as HashMap;
 use turso_core::alloc::vec;
 use turso_core::alloc::*;
+use turso_core::dialect::Dialect;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::*;
 use turso_core::sync::Arc;
@@ -16,7 +17,7 @@ use turso_sqlite::SqliteDialect;
 
 #[test]
 fn a_new_schema_has_only_the_root_namespace_with_the_schema_table() {
-    let schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let ids: std::vec::Vec<NamespaceId> = schema.namespace_ids().collect();
     assert_eq!(ids, vec![NamespaceId::ROOT]);
     assert!(schema
@@ -108,7 +109,7 @@ fn test_column_definition_matches_create_table() -> Result<()> {
 
 #[test]
 fn test_schema_loading_accepts_generated_columns() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     schema
         .handle_schema_row(
@@ -134,7 +135,7 @@ fn test_schema_loading_accepts_generated_columns() {
 
 #[test]
 fn test_schema_row_vtab_with_nonzero_root_page_is_corrupt() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     let result = schema.handle_schema_row(
         "table",
@@ -159,7 +160,7 @@ fn test_schema_row_vtab_with_nonzero_root_page_is_corrupt() {
 
 #[test]
 fn test_schema_row_with_zero_root_page_takes_virtual_table_path() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     // Root page 0 must route to virtual-table handling; with no such
     // module registered, that path fails module resolution instead of
@@ -185,7 +186,7 @@ fn test_schema_row_with_zero_root_page_takes_virtual_table_path() {
 
 #[test]
 fn test_schema_row_with_zero_root_page_rejects_malformed_sql() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     let result = schema.handle_schema_row(
         "table",
@@ -208,7 +209,7 @@ fn test_schema_row_with_zero_root_page_rejects_malformed_sql() {
 
 #[test]
 fn test_schema_row_table_with_virtual_table_substring_is_btree() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
 
     // A regular table whose SQL merely contains virtual-table syntax
     // (e.g. in a DEFAULT literal) must classify as a B-tree table.
@@ -235,7 +236,7 @@ fn test_schema_row_table_with_virtual_table_substring_is_btree() {
 
 #[test]
 fn test_named_unique_constraint_propagates_through_schema() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let table_sql =
         r#"CREATE TABLE t_u (id INT PRIMARY KEY, code TEXT CONSTRAINT t_u_code_uq UNIQUE)"#;
 
@@ -288,7 +289,7 @@ fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
 
 #[test]
 fn a_namespace_holds_only_its_own_objects() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -315,7 +316,7 @@ fn a_namespace_holds_only_its_own_objects() {
 
 #[test]
 fn removing_a_namespace_removes_its_objects() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(7);
     schema.add_namespace(other, "other");
     schema
@@ -331,7 +332,7 @@ fn removing_a_namespace_removes_its_objects() {
 
 #[test]
 fn a_cloned_schema_keeps_every_namespace() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(2);
     schema.add_namespace(other, "other");
     schema
@@ -343,7 +344,7 @@ fn a_cloned_schema_keeps_every_namespace() {
 
 #[test]
 fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -380,7 +381,7 @@ fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
 
 #[test]
 fn schema_wide_scans_see_every_namespace() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema
@@ -416,7 +417,7 @@ fn schema_wide_scans_see_every_namespace() {
 
 #[test]
 fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
-    let mut schema = Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     let other = NamespaceId::new(1);
     schema.add_namespace(other, "other");
     schema

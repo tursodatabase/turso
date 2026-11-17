@@ -795,12 +795,12 @@ impl Connection {
     }
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(
-            self.db.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )
-        .expect("built-in type definitions are malformed");
+        // new_schema only fails if built-in type SQL is malformed (programmer bug).
+        let mut schema = self
+            .db
+            .dialect()
+            .new_schema(self.db.experimental_custom_types_enabled())
+            .expect("built-in type definitions are malformed");
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -1579,10 +1579,10 @@ impl Connection {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(
-            self.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )?;
+        let mut fresh = self
+            .db
+            .dialect()
+            .new_schema(self.experimental_custom_types_enabled())?;
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
@@ -5690,7 +5690,9 @@ mod tests {
             schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
-        let fresh = Schema::with_options(false, &EngineDialect).unwrap();
+        let fresh = crate::schema::builtin::schema_builder(false)
+            .unwrap()
+            .build();
         assert!(fresh.dialect_schema.is_none());
 
         conn.install_schema_keeping_dialect_schema(&fresh).unwrap();
