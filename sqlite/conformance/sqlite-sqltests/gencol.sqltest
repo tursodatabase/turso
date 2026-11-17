@@ -6984,3 +6984,54 @@ setup gencol_virtual_columns_update {
 snapshot gencol_update_computes_virtual_columns_once {
     UPDATE t SET a = 5 WHERE b = 3;
 }
+
+test gencol_upsert_check_on_virtual_column_sees_column_affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (typeof(b)) CHECK (c = 'integer'));
+    INSERT INTO t(id, b) VALUES (1, 5);
+    INSERT INTO t(id, b) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET b = '6';
+    SELECT id, b, c FROM t;
+}
+expect {
+    1|6|integer
+}
+
+setup gencol_virtual_columns_upsert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (id + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_upsert
+snapshot gencol_upsert_computes_virtual_columns_once {
+    INSERT INTO t(id, b) VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET b = excluded.b + 1 RETURNING c, d;
+}
+
+# COERCE stores the SET value 2.5 as 2.50, so RETURNING must show the virtual
+# column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_returning_virtual_column_reads_coerced_set_value {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    INSERT INTO prices(id, val) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET val = 2.5 RETURNING doubled;
+    SELECT doubled FROM prices;
+}
+expect {
+    5.00
+    5.00
+}
+
+# A type with only a DECODE reads the stored 5 as 10, so RETURNING must show the
+# virtual column that a read of the row gives.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_upsert_returning_virtual_column_reads_decoded_set_value {
+    CREATE TYPE dbl BASE integer DECODE value * 2;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v dbl, c INT AS (CAST(v AS INTEGER) * 1)) STRICT;
+    INSERT INTO t(id, v) VALUES (1, 1);
+    INSERT INTO t(id, v) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET v = 5 RETURNING c;
+    SELECT c FROM t;
+}
+expect {
+    10
+    10
+}
