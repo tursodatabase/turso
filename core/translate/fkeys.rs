@@ -1978,7 +1978,7 @@ fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedNam
 fn generate_cascade_delete_stmt(
     child_table: &str,
     child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -1987,9 +1987,7 @@ fn generate_cascade_delete_stmt(
         tbl_name: qualified_table_name(child_table, db_name),
         indexed: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
+            child_cols, fk_ref, ctx,
         ))),
         returning: vec![],
         truncate: false,
@@ -2001,7 +1999,7 @@ fn generate_cascade_delete_stmt(
 fn generate_set_null_stmt(
     child_table: &str,
     child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -2021,9 +2019,7 @@ fn generate_set_null_stmt(
         sets,
         from: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
+            child_cols, fk_ref, ctx,
         ))),
         returning: vec![],
     })
@@ -2034,7 +2030,7 @@ fn generate_set_null_stmt(
 fn generate_set_default_stmt(
     child_table: &BTreeTable,
     child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -2062,9 +2058,7 @@ fn generate_set_default_stmt(
         sets,
         from: None,
         where_clause: Some(Box::new(build_fk_match_where_clause(
-            child_cols,
-            parent_collations,
-            ctx,
+            child_cols, fk_ref, ctx,
         ))),
         returning: vec![],
     })
@@ -2075,7 +2069,7 @@ fn generate_set_default_stmt(
 fn generate_cascade_update_stmt(
     child_table: &str,
     child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
     db_name: Option<&str>,
 ) -> ast::Stmt {
@@ -2099,7 +2093,7 @@ fn generate_cascade_update_stmt(
         })
         .collect();
 
-    let where_clause = build_fk_match_where_clause(child_cols, parent_collations, ctx);
+    let where_clause = build_fk_match_where_clause(child_cols, fk_ref, ctx);
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
@@ -2116,23 +2110,29 @@ fn generate_cascade_update_stmt(
 /// fk_col1 = ?1 AND fk_col2 = ?2 ...
 ///
 /// As in SQLite's `fkActionTrigger`, the parent key value is the left operand
-/// and has the parent column's collation, so the comparison uses it.
+/// and has the parent column's collation and custom type, so the comparison
+/// uses them.
 fn build_fk_match_where_clause(
     child_cols: &[String],
-    parent_collations: &[CollationSeq],
+    fk_ref: &ResolvedFkRef,
     ctx: &FkSubprogramContext,
 ) -> Expr {
-    turso_assert!(child_cols.len() == parent_collations.len());
+    turso_assert!(child_cols.len() == fk_ref.parent_collations.len());
+    turso_assert!(child_cols.len() == fk_ref.parent_custom_types.len());
     let mut conditions: Vec<Expr> = Vec::with_capacity(child_cols.len());
 
-    for (i, (col, collation)) in child_cols.iter().zip(parent_collations).enumerate() {
+    let parent_keys = fk_ref
+        .parent_collations
+        .iter()
+        .zip(&fk_ref.parent_custom_types);
+    for (i, (col, (collation, custom_type))) in child_cols.iter().zip(parent_keys).enumerate() {
         let param_idx = ctx.old_param_index(i);
         let parent_key = ast::Variable::for_column(
             u32::try_from(param_idx.get())
                 .ok()
                 .and_then(std::num::NonZeroU32::new)
                 .expect("fk parameter index must fit into NonZeroU32"),
-            None,
+            custom_type.clone(),
             Some(&collation.name()),
         );
         let cond = Expr::Binary(
@@ -2183,7 +2183,7 @@ fn fire_fk_cascade_delete(
     let stmt = generate_cascade_delete_stmt(
         &fk_ref.child_table.name,
         child_cols,
-        &fk_ref.parent_collations,
+        fk_ref,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2214,7 +2214,7 @@ fn fire_fk_set_null(
     let stmt = generate_set_null_stmt(
         &fk_ref.child_table.name,
         child_cols,
-        &fk_ref.parent_collations,
+        fk_ref,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2245,7 +2245,7 @@ fn fire_fk_set_default(
     let stmt = generate_set_default_stmt(
         &fk_ref.child_table,
         child_cols,
-        &fk_ref.parent_collations,
+        fk_ref,
         &subprog_ctx,
         db_name.as_deref(),
     );
@@ -2277,7 +2277,7 @@ fn fire_fk_cascade_update(
     let stmt = generate_cascade_update_stmt(
         &fk_ref.child_table.name,
         child_cols,
-        &fk_ref.parent_collations,
+        fk_ref,
         &subprog_ctx,
         db_name.as_deref(),
     );

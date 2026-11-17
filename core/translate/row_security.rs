@@ -27,9 +27,12 @@ use crate::{
     translate::{
         emitter::{with_columns_in_registers, Resolver},
         expr::{
-            bind_and_rewrite_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
-            walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
+            bind_and_rewrite_expr,
+            expr_type::{type_of, ColumnCustomType, ExprType},
+            translate_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+            BindingBehavior, NoConstantOptReason, WalkControl,
         },
+        expr_context::ExprContext,
         plan::{JoinInfo, JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
         planner::break_predicate_at_and_boundaries,
         roles,
@@ -528,13 +531,28 @@ fn compute_scalar_selects_once(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
+        // The register holds the subquery's value, so it has the value's type.
+        // The register can only name a custom type, so an array value gets none.
+        let env = ExprContext::new(Some(table_references), resolver);
+        let custom_type = match type_of(&value, &env.type_env()) {
+            ExprType::Custom { type_def, params } => {
+                Some(Box::new(ColumnCustomType { type_def, params }.type_name()))
+            }
+            ExprType::Array { .. }
+            | ExprType::Builtin(_)
+            | ExprType::Untyped
+            | ExprType::Null
+            | ExprType::Unknown
+            | ExprType::NotKnownYet
+            | ExprType::RowValue => None,
+        };
         let register = program.alloc_register();
         program.emit_once_per_statement(|program| {
             translate_expr(program, Some(table_references), &value, register, resolver)
         })?;
         *expr = ast::Expr::Register {
             register,
-            custom_type: None,
+            custom_type,
         };
         Ok(WalkControl::SkipChildren)
     })?;

@@ -331,3 +331,40 @@ test set-default-encodes-default-value {
 expect {
     8
 }
+
+# An FK action finds the child rows by comparing them with the old parent key,
+# which has the parent column's type. A date only compares with a date.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-on-date-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(d date PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, d date
+        REFERENCES parent(d) ON DELETE CASCADE ON UPDATE CASCADE) STRICT;
+    INSERT INTO parent VALUES ('2024-01-01'), ('2024-02-01');
+    INSERT INTO child VALUES (1, '2024-01-01'), (2, '2024-02-01');
+
+    UPDATE parent SET d = '2024-03-01' WHERE d = '2024-02-01';
+    DELETE FROM parent WHERE d = '2024-01-01';
+    SELECT id, d FROM child;
+}
+expect {
+    2|2024-03-01
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test set-null-on-uuid-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(u uuid PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, u uuid
+        REFERENCES parent(u) ON DELETE SET NULL) STRICT;
+    INSERT INTO parent VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    INSERT INTO child VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+
+    DELETE FROM parent;
+    SELECT id, u IS NULL FROM child;
+}
+expect {
+    1|1
+}

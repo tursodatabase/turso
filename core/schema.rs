@@ -12,6 +12,7 @@ use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::expr_type::column_custom_type_of;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
@@ -4745,18 +4746,29 @@ impl Schema {
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut parent_collations: Vec<CollationSeq> =
             Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut parent_custom_types: Vec<Option<ast::Type>> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
-            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
+            let (p, collation, parent_affinity, custom_type) = match parent_tbl.get_column(pc) {
                 Some((i, column)) if column.is_rowid_alias() => {
-                    (i, CollationSeq::BINARY, column.affinity())
+                    (i, CollationSeq::BINARY, column.affinity(), None)
                 }
-                Some((i, column)) => (i, column.collation(), column.affinity()),
+                Some((i, column)) => (
+                    i,
+                    column.collation(),
+                    column.affinity(),
+                    column_custom_type_of(column, parent_tbl.is_strict, self)
+                        .map(|ty| ty.type_name()),
+                ),
                 None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
-                    (0, CollationSeq::BINARY, Affinity::Integer)
+                    (0, CollationSeq::BINARY, Affinity::Integer, None)
                 }
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            parent_custom_types
+                .push_within_capacity(custom_type)
+                .expect("parent FK type vector was preallocated to parent_cols.len()");
             key_affinities
                 .push_within_capacity(crate::translate::expr::do_comparison_affinity(
                     parent_affinity,
@@ -4819,6 +4831,7 @@ impl Schema {
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
             parent_collations: parent_collations.into_boxed_slice(),
+            parent_custom_types: parent_custom_types.into_boxed_slice(),
             key_affinities: key_affinities.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
@@ -7944,6 +7957,10 @@ pub struct ResolvedFkRef {
     /// with the parent column's collation), and only an index with these
     /// collations can enforce the parent key or find the child rows.
     pub parent_collations: BoxedSlice<CollationSeq>,
+    /// The custom type of each parent key column, None for a column without
+    /// one and for the rowid. An FK action compares the old parent key with
+    /// the child key as a value of this type.
+    pub parent_custom_types: BoxedSlice<Option<ast::Type>>,
     /// The affinity applied when a child key is compared with a parent key,
     /// as SQLite compares `parent_col = child_col`.
     pub key_affinities: BoxedSlice<Affinity>,
