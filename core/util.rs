@@ -1425,6 +1425,9 @@ pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
 
 // we don't need to verify the numeric literal here, as it is already verified by the parser
 pub fn parse_numeric_literal(text: &str) -> Result<Value> {
+    if let Some(value) = parse_short_decimal_integer(text) {
+        return Ok(Value::from_i64(value));
+    }
     // a single extra underscore ("_") character can exist between any two digits
     let text = if text.contains('_') {
         std::borrow::Cow::Owned(text.replace('_', ""))
@@ -1457,6 +1460,24 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         unreachable!();
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
+}
+
+/// The value of `text` if it has only ASCII digits, at most 18 of them. Such
+/// a number always fits in an `i64`.
+fn parse_short_decimal_integer(text: &str) -> Option<i64> {
+    let digits = text.as_bytes();
+    if digits.is_empty() || digits.len() > 18 {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value * 10 + i64::from(digit);
+    }
+    Some(value)
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
@@ -3360,6 +3381,20 @@ pub mod tests {
     #[test]
     fn test_parse_numeric_literal_integer() {
         assert_eq!(parse_numeric_literal("123").unwrap(), Value::from_i64(123));
+        assert_eq!(parse_numeric_literal("0").unwrap(), Value::from_i64(0));
+        assert_eq!(parse_numeric_literal("007").unwrap(), Value::from_i64(7));
+        assert_eq!(
+            parse_numeric_literal("999999999999999999").unwrap(),
+            Value::from_i64(999_999_999_999_999_999)
+        );
+        assert_eq!(
+            parse_numeric_literal("9223372036854775807").unwrap(),
+            Value::from_i64(i64::MAX)
+        );
+        assert_eq!(
+            parse_numeric_literal("-9223372036854775808").unwrap(),
+            Value::from_i64(i64::MIN)
+        );
         assert_eq!(
             parse_numeric_literal("9_223_372_036_854_775_807").unwrap(),
             Value::from_i64(9223372036854775807)
