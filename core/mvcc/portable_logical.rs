@@ -4,8 +4,8 @@ use crate::mvcc::persistent_storage::logical_log::{
     log_write, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED,
     PROTO_WIRE_VARINT,
 };
-use crate::types::{ImmutableRecordRef, ValueRef};
-use crate::{LimboError, Numeric, Result};
+use crate::schema::{SchemaRecord, SchemaRowType};
+use crate::Result;
 use std::collections::{HashMap, HashSet};
 
 const TX_FIELD_STRING_TABLE: u64 = 12;
@@ -30,63 +30,12 @@ pub(crate) fn is_portable_logical_name(name: &str) -> bool {
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
 
-/// Decoded subset of a `sqlite_schema` record needed to materialize stable
-/// portable object-map entries at MVCC commit time.
-#[derive(Clone, Debug)]
-pub(crate) struct PortableSchemaRow {
-    pub(crate) row_type: String,
-    pub(crate) name: String,
-    pub(crate) rootpage: i64,
+pub(crate) fn is_portable_table_schema_row(row: &SchemaRecord) -> bool {
+    row.root_page != 0 && row.row_type == SchemaRowType::Table && is_portable_schema_row(row)
 }
 
-pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
-    let record = ImmutableRecordRef::from_bin_record(record_bytes);
-    let column_count = record.column_count();
-    if column_count < 5 {
-        return Err(LimboError::Corrupt(format!(
-            "sqlite_schema record must have at least 5 columns, got {column_count}",
-        )));
-    }
-
-    let text = |value: ValueRef<'_>, field: &str| -> Result<String> {
-        match value {
-            ValueRef::Text(text) => Ok(text.as_str().to_string()),
-            other => Err(LimboError::Corrupt(format!(
-                "{field} must be text in sqlite_schema record, got {other:?}"
-            ))),
-        }
-    };
-    let integer = |value: ValueRef<'_>, field: &str| -> Result<i64> {
-        match value {
-            ValueRef::Numeric(Numeric::Integer(value)) => Ok(value),
-            other => Err(LimboError::Corrupt(format!(
-                "{field} must be integer in sqlite_schema record, got {other:?}"
-            ))),
-        }
-    };
-    let (row_type, name, rootpage) = record.get_three_values(0, 1, 3)?;
-    let (row_type, name, rootpage) = (
-        text(row_type, "sqlite_schema.type")?,
-        text(name, "sqlite_schema.name")?,
-        integer(rootpage, "sqlite_schema.rootpage")?,
-    );
-    Ok(PortableSchemaRow {
-        row_type,
-        name,
-        rootpage,
-    })
-}
-
-pub(crate) fn is_portable_table_schema_row(row: &PortableSchemaRow) -> bool {
-    row.rootpage != 0 && row.row_type.eq_ignore_ascii_case("table") && is_portable_schema_row(row)
-}
-
-pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
-    is_portable_logical_name(&row.name)
-        && (row.row_type.eq_ignore_ascii_case("table")
-            || row.row_type.eq_ignore_ascii_case("index")
-            || row.row_type.eq_ignore_ascii_case("trigger")
-            || row.row_type.eq_ignore_ascii_case("view"))
+pub(crate) fn is_portable_schema_row(row: &SchemaRecord) -> bool {
+    is_portable_logical_name(&row.name) && row.row_type != SchemaRowType::Other
 }
 
 pub(crate) struct PortableLogicalBuilder<'a> {

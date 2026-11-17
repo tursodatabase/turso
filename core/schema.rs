@@ -1,3 +1,8 @@
+mod record;
+mod store;
+pub use record::{SchemaRecord, SchemaRowType};
+pub use store::{SchemaStore, SqliteSchemaStore};
+
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;

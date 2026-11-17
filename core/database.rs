@@ -3597,6 +3597,11 @@ impl Database {
         self.dialect.clone()
     }
 
+    /// How this database stores its schema, as its dialect says.
+    pub(crate) fn schema_store(&self) -> &dyn crate::schema::SchemaStore {
+        self.dialect.schema_store()
+    }
+
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
         let name = table.name.clone();
         self.with_schema_mut(|schema| schema.add_virtual_table(NamespaceId::ROOT, table))?;
