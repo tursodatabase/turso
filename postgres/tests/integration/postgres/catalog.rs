@@ -64,6 +64,12 @@ fn test_physical_catalog_tableoid_is_hidden(db: TempDatabase) {
         4
     );
     assert_eq!(
+        conn.prepare("SELECT * FROM pg_attribute")
+            .unwrap()
+            .num_columns(),
+        26
+    );
+    assert_eq!(
         conn.prepare("SELECT * FROM pg_catalog.pg_depend")
             .unwrap()
             .num_columns(),
@@ -265,4 +271,81 @@ fn test_alter_table_preserves_catalog_names_after_reopen(db: TempDatabase) {
             vec![Value::build_text("public"), Value::build_text("Mixed")],
         ]
     );
+}
+
+/// Every row of `pg_attribute`, with the hidden `tableoid`.
+fn attribute_rows(conn: &turso_pg::PgConnection) -> Vec<Vec<Value>> {
+    conn.query("SELECT *, tableoid FROM pg_catalog.pg_attribute ORDER BY attrelid, attnum")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+}
+
+/// Creates and alters tables with columns of many kinds and returns the
+/// rows that `pg_attribute` has for them.
+fn attribute_rows_of_tables_of_many_kinds(conn: &turso_pg::PgConnection) -> Vec<Vec<Value>> {
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'happy')")
+        .unwrap();
+    conn.execute("CREATE DOMAIN positive AS INTEGER NOT NULL CHECK (VALUE > 0)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE plain (id SERIAL PRIMARY KEY, name TEXT NOT NULL, m mood, p positive, \
+         tags TEXT[], twice INTEGER GENERATED ALWAYS AS (id * 2) STORED)",
+    )
+    .unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute(
+        "CREATE TABLE app.items (id INTEGER GENERATED ALWAYS AS IDENTITY, \"it's\" TEXT DEFAULT 'x')",
+    )
+    .unwrap();
+    conn.execute("ALTER TABLE plain ADD COLUMN extra NUMERIC(10, 2) DEFAULT 1")
+        .unwrap();
+    conn.execute("ALTER TABLE plain RENAME COLUMN name TO full_name")
+        .unwrap();
+    conn.execute("ALTER TABLE app.items DROP COLUMN \"it's\"")
+        .unwrap();
+    conn.execute("ALTER TABLE app.items ADD COLUMN \"it's\" TEXT")
+        .unwrap();
+    let rows = attribute_rows(conn);
+    assert_eq!(rows.len(), 9);
+    rows
+}
+
+#[turso_macros::test(mvcc)]
+fn pg_attribute_rows_are_kept_when_the_database_is_reopened(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let written_by_statements = attribute_rows_of_tables_of_many_kinds(&conn);
+    drop(conn);
+    let db = db.reopen();
+
+    assert_eq!(
+        attribute_rows(&db.connect_postgres()),
+        written_by_statements
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn vacuum_keeps_pg_attribute(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE plain (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    let before = attribute_rows(&conn);
+    assert_eq!(before.len(), 2);
+
+    // VACUUM of an MVCC database needs its changes checkpointed first.
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().execute("VACUUM").unwrap();
+
+    for conn in [conn, db.connect_postgres()] {
+        assert_eq!(attribute_rows(&conn), before);
+        assert_eq!(
+            conn.prepare("SELECT * FROM pg_attribute")
+                .unwrap()
+                .num_columns(),
+            26
+        );
+    }
 }
