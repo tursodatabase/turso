@@ -105,8 +105,11 @@ exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,
-`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
-stored SQL; relation oid and pretty printing do not change the output),
+`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (prints `CHECK`
+constraints in `pg_constraint.conbin` as PostgreSQL does for the forms the
+manual lists under `CREATE POLICY`, and returns TursoPG's stored SQL for
+other forms and for column defaults; relation oid and pretty printing do not
+change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`, `age(timestamp[, timestamp])`

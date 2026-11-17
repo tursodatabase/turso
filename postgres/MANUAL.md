@@ -186,6 +186,13 @@ PostgreSQL reads back but prints differently. `pg_policies` shows the same
 policies by schema, table and role names, with their conditions printed the
 same way.
 
+`pg_get_expr(conbin, conrelid)` prints the `CHECK` constraints in
+`pg_constraint` the same way: `CHECK (owner LIKE 'a%')` is shown as
+`(owner ~~ 'a%'::text)`. A `CHECK` condition with a form outside that list
+is shown as the engine stores it, which PostgreSQL may not read back: `LIKE`
+with a pattern that is not a constant, for example, is shown with the
+engine's own functions and operators.
+
 Materialized views store the rows of their query when they are refreshed, so
 a role that reads a materialized view built on a table with row-level
 security sees the rows that were stored, as in PostgreSQL.
