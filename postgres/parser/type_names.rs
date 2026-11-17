@@ -26,8 +26,8 @@ pub type TypeLookup<'a> = dyn Fn(Option<&str>, &str) -> Option<PgType> + 'a;
 pub(crate) enum TypeKind {
     /// A built-in type of PostgreSQL.
     BuiltIn(BuiltInType),
-    /// The array type of a built-in type that is not polymorphic, written
-    /// with an underscore, such as `_int4`.
+    /// The array type of a built-in type, written with an underscore, such
+    /// as `_int4` or `_record`.
     BuiltInArray(BuiltInType),
     /// A type that PostgreSQL defines outside the lists of built-in types.
     System,
@@ -37,16 +37,20 @@ pub(crate) enum TypeKind {
 
 /// What `name` of `schema` names, or None when it names no type.
 /// `_int4` names the array type of `int4`, and `_mood` the array type of
-/// `mood`. PostgreSQL has no array type of a polymorphic type.
+/// `mood`. PostgreSQL has array types of the base types, and of the
+/// pseudo-types `record` and `cstring` only.
 pub(crate) fn type_kind(
     type_lookup: &TypeLookup<'_>,
     schema: Option<&str>,
     name: &str,
 ) -> Option<TypeKind> {
-    let array_of = name
-        .strip_prefix('_')
-        .and_then(|element| built_in_type(schema, element))
-        .filter(|kind| *kind != BuiltInType::Polymorphic);
+    let array_of = name.strip_prefix('_').and_then(|element| {
+        built_in_type(schema, element).filter(|kind| match kind {
+            BuiltInType::Base => true,
+            BuiltInType::Pseudo => PSEUDO_TYPES_WITH_ARRAYS.contains(&element),
+            BuiltInType::Polymorphic => false,
+        })
+    });
     if let Some(kind) = built_in_type(schema, name) {
         Some(TypeKind::BuiltIn(kind))
     } else if let Some(kind) = array_of {
@@ -136,8 +140,8 @@ pub(crate) fn type_name_text(type_name: &TypeName) -> Result<String, ParseError>
     Ok(text)
 }
 
-// FIXME: the three lists that follow are written by hand, and they must
-// follow the PostgreSQL version of pg_query.
+// FIXME: the lists that follow are written by hand, and they must follow
+// the PostgreSQL version of pg_query.
 
 /// The types that stand for the types of a function's arguments.
 const POLYMORPHIC_TYPES: &[&str] = &[
@@ -171,6 +175,9 @@ const PSEUDO_TYPES: &[&str] = &[
     "void",
     "unknown",
 ];
+
+/// The pseudo-types that have an array type, such as `_record`.
+const PSEUDO_TYPES_WITH_ARRAYS: &[&str] = &["record", "cstring"];
 
 /// The built-in base, range and multirange types, by the names pg_query
 /// gives them: `int` is `int4` and `double precision` is `float8`, for

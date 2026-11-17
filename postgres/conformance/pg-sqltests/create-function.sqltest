@@ -522,6 +522,16 @@ expect error {
     SQL functions cannot have arguments of type record\[\]
 }
 
+# PostgreSQL has array types of `record` and `cstring`, but not of the other
+# pseudo-types.
+test void-array-parameter-named-with-underscore {
+    CREATE FUNCTION f(_void) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+}
+@sqlstate 42704
+expect error {
+    type _void does not exist
+}
+
 # `_int4` is the array type of `int4`.
 test array-parameter-named-with-underscore {
     CREATE FUNCTION f(_int4) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
