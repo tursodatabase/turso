@@ -3546,10 +3546,10 @@ impl PostgreSQLTranslator {
                 // $1, $2, etc. — translate to Variable("$N")
                 let index =
                     std::num::NonZeroU32::new(param_ref.number as u32).ok_or_else(|| {
-                        ParseError::ParseError(format!(
-                            "there is no parameter ${}",
-                            param_ref.number
-                        ))
+                        ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_UNDEFINED_PARAMETER,
+                            message: format!("there is no parameter ${}", param_ref.number),
+                        }
                     })?;
 
                 Ok(ast::Expr::Variable(ast::Variable::indexed(index)))
