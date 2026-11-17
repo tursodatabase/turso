@@ -135,6 +135,7 @@ Turso provides several built-in custom types available in STRICT tables:
 | `date` | TEXT | ISO 8601 date (YYYY-MM-DD) |
 | `time` | TEXT | ISO 8601 time (HH:MM:SS) |
 | `timestamp` | TEXT | ISO 8601 datetime |
+| `interval` | BLOB | Months, days and microseconds, displayed as PostgreSQL does (`1 year 2 mons 3 days 04:05:06`) |
 | `varchar(N)` | TEXT | Text with maximum length constraint |
 | `numeric(P,S)` | BLOB | Fixed-point decimal with precision and scale |
 | `smallint` | INTEGER | Integer constrained to -32768..32767 |
@@ -164,6 +165,43 @@ INSERT INTO events VALUES (
 ```
 
 For the full custom types reference including ENCODE/DECODE/COERCE, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
+
+#### interval
+
+An `interval` reads two input forms:
+
+- the form PostgreSQL prints, such as `'1 year 2 mons -3 days +04:05:06.789'`;
+- whole numbers with units, such as `'2 weeks -3 hours'` or `'90 minutes'`. The units are `year`,
+  `mon`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond` and `microsecond`, each
+  also in the plural. A number with no unit, at the end, is seconds.
+
+Intervals compare by length, counting a month as 30 days, so
+`'1 day'` equals `'24 hours'` in comparisons, indexes, `UNIQUE` and `GROUP BY`. Each value keeps its
+months, days and time apart, so `'1 mon'` equals `'30 days'` but prints as `1 mon`.
+
+```sql
+CREATE TABLE waits (iv interval UNIQUE) STRICT;
+INSERT INTO waits VALUES ('1 day');
+INSERT INTO waits VALUES ('24 hours');
+-- Error: UNIQUE constraint failed: waits.iv
+SELECT iv FROM waits WHERE iv = '24 hours';
+-- 1 day
+```
+
+Turso refuses with an error, rather than reading differently from PostgreSQL:
+
+- every other input form, such as `'1.5 days'`, `'1 day ago'`, `'2 hrs'`, `'P1D'` or `'infinity'`,
+  and also input PostgreSQL rejects, such as `'abc'`;
+- a type modifier, as in `interval(3)` or `interval day`;
+- functions that read their arguments' values, such as `sum`, `avg`, `abs`, `length`, `iif` or `lag`,
+  called on an interval, and `coalesce`, `ifnull` and the scalar `min`, `max` and `nullif`, which can
+  return another argument unconverted. `count`, `likely`, `unlikely`, `first_value`, `last_value` and
+  the aggregates `min` and `max` work;
+- `LIKE`, `GLOB` and `REGEXP` with an interval on either side. `CAST(iv AS text) LIKE '%day%'` works;
+- `CAST` from an interval to anything other than `text` or `interval`, and to an interval from a value of another
+  type, such as an integer;
+- a generated column that reads an interval column, and `ALTER COLUMN` that changes a column to or
+  from `interval`.
 
 ### Composite Types: STRUCT and UNION
 

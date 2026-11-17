@@ -1,0 +1,610 @@
+@database :memory:
+
+# The built-in interval type: a length of time in months, days and
+# microseconds, printed as PostgreSQL prints it. Expected values are
+# PostgreSQL 17's.
+
+@requires strict "uses STRICT tables"
+test interval-reads-and-prints-as-postgres {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    INSERT INTO r VALUES (1, '1 day'), (2, '24 hours'), (3, '1 year 2 mons 3 days 04:05:06.5'), (4, '-1 day');
+    INSERT INTO r VALUES (5, '1 day -1 hour'), (6, '2 weeks'), (7, '0'), (8, '-1 days +23:59:58.5');
+    INSERT INTO r VALUES (9, '90 minutes'), (10, '-2 mons +3 days -04:05:06'), (11, NULL);
+    SELECT id, iv FROM r ORDER BY id;
+}
+expect {
+    1|1 day
+    2|24:00:00
+    3|1 year 2 mons 3 days 04:05:06.5
+    4|-1 days
+    5|1 day -01:00:00
+    6|14 days
+    7|00:00:00
+    8|-1 days +23:59:58.5
+    9|01:30:00
+    10|-2 mons +3 days -04:05:06
+    11|
+}
+
+@requires strict "uses STRICT tables"
+test interval-compares-by-length {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    INSERT INTO c VALUES (1, '1 day'), (2, '24 hours'), (3, '1 mon'), (4, '30 days'), (5, '31 days');
+    SELECT a.id, b.id FROM c a JOIN c b ON a.iv = b.iv AND a.id < b.id ORDER BY a.id;
+    SELECT id FROM c WHERE iv > '1 mon' ORDER BY id;
+}
+expect {
+    1|2
+    3|4
+    5
+}
+
+@requires strict "uses STRICT tables"
+test interval-order-by {
+    CREATE TABLE o(iv interval) STRICT;
+    INSERT INTO o VALUES ('31 days'), ('1 mon 2 days'), ('-1 day'), ('00:00:01'), ('1 year'), ('-1 mon');
+    SELECT iv FROM o ORDER BY iv;
+    SELECT iv FROM o ORDER BY iv DESC LIMIT 2;
+}
+expect {
+    -1 mons
+    -1 days
+    00:00:01
+    31 days
+    1 mon 2 days
+    1 year
+    1 year
+    1 mon 2 days
+}
+
+@requires strict "uses STRICT tables"
+test interval-unique-compares-by-length {
+    CREATE TABLE waits(iv interval UNIQUE) STRICT;
+    INSERT INTO waits VALUES ('1 day');
+    INSERT INTO waits VALUES ('24 hours');
+}
+expect error {
+    UNIQUE constraint failed: waits.iv
+}
+
+@requires strict "uses STRICT tables"
+test interval-unique-month-is-30-days {
+    CREATE TABLE u(iv interval UNIQUE) STRICT;
+    INSERT INTO u VALUES ('1 mon');
+    INSERT INTO u VALUES ('30 days');
+}
+expect error {
+    UNIQUE constraint failed: u.iv
+}
+
+@requires strict "uses STRICT tables"
+test interval-primary-key-compares-by-length {
+    CREATE TABLE p(iv interval PRIMARY KEY) STRICT;
+    INSERT INTO p VALUES ('1 day');
+    INSERT INTO p VALUES ('24 hours');
+}
+expect error {
+    UNIQUE constraint failed: p.iv
+}
+
+@requires strict "uses STRICT tables"
+test interval-range-uses-index {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    CREATE INDEX si ON s(iv);
+    EXPLAIN QUERY PLAN SELECT id FROM s WHERE iv > '1 day';
+}
+expect {
+    1|0|0|SEARCH s USING COVERING INDEX si (iv>?)
+}
+
+@requires strict "uses STRICT tables"
+test interval-lookup-through-index-matches-scan {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    INSERT INTO s VALUES (1, '1 day'), (2, '2 days'), (3, '1 hour'), (4, '1 mon'), (5, NULL);
+    CREATE INDEX si ON s(iv);
+    SELECT id FROM s WHERE iv = '24 hours';
+    SELECT id FROM s WHERE iv > '23 hours' ORDER BY iv;
+    SELECT id FROM s WHERE iv BETWEEN '1 hour' AND '30 days' ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+    4
+    1
+    2
+    3
+    4
+}
+
+@requires strict "uses STRICT tables"
+test interval-group-by {
+    CREATE TABLE g(iv interval) STRICT;
+    INSERT INTO g VALUES ('1 day'), ('24 hours'), ('2 days'), ('48:00:00'), ('1 hour'), ('25 hours');
+    SELECT count(*) FROM g GROUP BY iv ORDER BY count(*), min(iv);
+    SELECT count(DISTINCT iv) FROM g;
+}
+expect {
+    1
+    1
+    2
+    2
+    4
+}
+
+@requires strict "uses STRICT tables"
+test interval-min-max {
+    CREATE TABLE o(iv interval) STRICT;
+    INSERT INTO o VALUES ('31 days'), ('1 mon 2 days'), ('-1 day'), ('1 year'), ('-1 mon');
+    SELECT min(iv), max(iv) FROM o;
+}
+expect {
+    -1 mons|1 year
+}
+
+# coalesce and ifnull can return another argument as it is: here `24 hours`,
+# where PostgreSQL prints `24:00:00`.
+@requires strict "uses STRICT tables"
+test interval-coalesce-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT coalesce(iv, '24 hours') FROM o;
+}
+expect error {
+    function coalesce\(interval, text\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-ifnull-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT ifnull(iv, CAST('0' AS interval)) FROM o;
+}
+expect error {
+    function ifnull\(interval, interval\) is not supported
+}
+
+# Scalar max, min and nullif compare an interval with a value of any type, and
+# put every number after every interval.
+@requires strict "uses STRICT tables"
+test interval-scalar-max-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT max(iv, 0) FROM o;
+}
+expect error {
+    function max\(interval, integer\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-scalar-min-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT min(iv, CAST('1 day' AS interval)) FROM o;
+}
+expect error {
+    function min\(interval, interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-nullif-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT nullif(iv, 0) FROM o;
+}
+expect error {
+    function nullif\(interval, integer\) is not supported
+}
+
+# SQLite's functions that read values would read an interval's printed form
+# as text or as its leading number.
+@requires strict "uses STRICT tables"
+test interval-sum-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT sum(iv) FROM o;
+}
+expect error {
+    function sum\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-avg-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT avg(iv) FROM o;
+}
+expect error {
+    function avg\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-abs-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT abs(iv) FROM o;
+}
+expect error {
+    function abs\(interval\) is not supported
+}
+
+# typeof would report the storage class, blob, rather than interval.
+@requires strict "uses STRICT tables"
+test interval-typeof-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT typeof(iv) FROM o;
+}
+expect error {
+    function typeof\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-length-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT length(iv) FROM o;
+}
+expect error {
+    function length\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-iif-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT iif(iv, 1, 2) FROM o;
+}
+expect error {
+    function iif\(interval, integer, integer\) is not supported
+}
+
+# `x LIKE y` calls like(y, x), which would match the interval's printed text.
+@requires strict "uses STRICT tables"
+test interval-like-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT iv LIKE '%day%' FROM o;
+}
+expect error {
+    function like\(text, interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-like-pattern-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT 'x' NOT LIKE iv ESCAPE '!' FROM o;
+}
+expect error {
+    function like\(interval, text, text\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-glob-is-refused {
+    CREATE TABLE o(iv interval) STRICT;
+    SELECT iv GLOB '*day*' FROM o;
+}
+expect error {
+    function glob\(text, interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-cast-to-text-before-like {
+    CREATE TABLE o(iv interval) STRICT;
+    INSERT INTO o VALUES ('1 day');
+    SELECT CAST(iv AS text) LIKE '%day%' FROM o;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test interval-check-calling-abs-fails-insert {
+    CREATE TABLE c(iv interval, CHECK (abs(iv) IS NOT NULL)) STRICT;
+    INSERT INTO c VALUES ('1 day');
+}
+expect error {
+    function abs\(interval\) is not supported
+}
+
+# A CHECK compares the stored interval by length, not its printed form.
+@requires strict "uses STRICT tables"
+test interval-check-compares-by-length {
+    CREATE TABLE jc(iv interval CHECK (iv < CAST('2 days' AS interval))) STRICT;
+    INSERT INTO jc VALUES ('25 hours');
+    SELECT iv FROM jc;
+}
+expect {
+    25:00:00
+}
+
+@requires strict "uses STRICT tables"
+test interval-check-compares-by-length-fails {
+    CREATE TABLE jc(iv interval CHECK (iv < CAST('2 days' AS interval))) STRICT;
+    INSERT INTO jc VALUES ('49 hours');
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test interval-default-calling-abs-is-refused {
+    CREATE TABLE d(x real DEFAULT (abs(CAST('1 day' AS interval)))) STRICT;
+}
+expect error {
+    function abs\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-default-casting-to-integer-is-refused-add-column {
+    CREATE TABLE d(id INTEGER) STRICT;
+    ALTER TABLE d ADD COLUMN x integer DEFAULT (CAST(CAST('1 day' AS interval) AS integer));
+}
+expect error {
+    cast from interval to integer is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-default-calling-abs-is-refused-alter-column {
+    CREATE TABLE d(id INTEGER, x real) STRICT;
+    ALTER TABLE d ALTER COLUMN x TO x real DEFAULT (abs(CAST('1 day' AS interval)));
+}
+expect error {
+    function abs\(interval\) is not supported
+}
+
+# A generated column's expression is not checked against the types of the
+# columns it reads, so it may not read an interval column.
+@requires strict "uses STRICT tables"
+test interval-generated-column-on-interval-is-refused {
+    CREATE TABLE g(iv interval, n integer GENERATED ALWAYS AS (length(iv))) STRICT;
+}
+expect error {
+    a generated column on a column of type interval is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-generated-column-on-interval-is-refused-add-column {
+    CREATE TABLE g(iv interval) STRICT;
+    ALTER TABLE g ADD COLUMN n integer GENERATED ALWAYS AS (length(iv));
+}
+expect error {
+    a generated column on a column of type interval is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-generated-column-on-interval-is-refused-alter-column {
+    CREATE TABLE g(iv interval, n integer) STRICT;
+    ALTER TABLE g ALTER COLUMN n TO n integer GENERATED ALWAYS AS (length(iv));
+}
+expect error {
+    a generated column on a column of type interval is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-generated-column-calling-abs-is-refused {
+    CREATE TABLE g(id INTEGER, n real GENERATED ALWAYS AS (abs(CAST('1 day' AS interval)))) STRICT;
+}
+expect error {
+    function abs\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-check-calling-length-fails-add-column {
+    CREATE TABLE c(id INTEGER) STRICT;
+    ALTER TABLE c ADD COLUMN iv interval CHECK (length(iv) > 0);
+}
+expect error {
+    function length\(interval\) is not supported
+}
+
+# The CHECKs, indexes and generated columns that read a column are not checked
+# again for its new type.
+@requires strict "uses STRICT tables"
+test interval-alter-column-to-interval-is-refused {
+    CREATE TABLE c(id INTEGER, v text) STRICT;
+    ALTER TABLE c ALTER COLUMN v TO v interval;
+}
+expect error {
+    ALTER COLUMN on a column of type interval is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-alter-column-from-interval-is-refused {
+    CREATE TABLE c(id INTEGER, iv interval) STRICT;
+    ALTER TABLE c ALTER COLUMN iv TO iv text;
+}
+expect error {
+    ALTER COLUMN on a column of type interval is not supported
+}
+
+@requires custom_types "interval is a custom type"
+test interval-casts {
+    SELECT CAST('1 day' AS interval), CAST(CAST('25 hours' AS interval) AS text);
+}
+expect {
+    1 day|25:00:00
+}
+
+# Text, NULL, an ANY value and a subquery's value cast to interval. The
+# interval's ENCODE refuses a value that is not text.
+@requires strict "uses STRICT tables"
+test interval-cast-sources {
+    CREATE TABLE s(s text, a any, iv interval) STRICT;
+    INSERT INTO s VALUES ('1 day', '2 days', '3 days');
+    SELECT CAST(s AS interval), CAST(a AS interval), CAST(iv AS interval), CAST(NULL AS interval) IS NULL FROM s;
+    SELECT CAST((SELECT s FROM s) AS interval);
+}
+expect {
+    1 day|2 days|3 days|1
+    1 day
+}
+
+@requires strict "uses STRICT tables"
+test interval-cast-of-subquery-is-refused {
+    CREATE TABLE s(iv interval) STRICT;
+    SELECT CAST((SELECT iv FROM s) AS integer);
+}
+expect error {
+    cast from interval to integer is not supported
+}
+
+# The check of what a function reads leaves a function that does not exist to
+# translation.
+@requires strict "uses STRICT tables"
+test interval-unknown-function {
+    CREATE TABLE s(iv interval) STRICT;
+    SELECT no_such_function(iv) FROM s;
+}
+expect error {
+    no such function: no_such_function
+}
+
+@requires custom_types "interval is a custom type"
+test interval-cast-from-integer-is-refused {
+    SELECT CAST(42 AS interval);
+}
+expect error {
+    cast from integer to interval is not supported
+}
+
+@requires custom_types "interval is a custom type"
+test interval-cast-to-integer-is-refused {
+    SELECT CAST(CAST('1 day' AS interval) AS integer);
+}
+expect error {
+    cast from interval to integer is not supported
+}
+
+# A CAST with no type gives a value of no type, which SQLite's functions read.
+@requires custom_types "interval is a custom type"
+test interval-cast-to-no-type-is-refused {
+    SELECT CAST(CAST('1 day' AS interval) AS);
+}
+expect error {
+    cast from interval to any is not supported
+}
+
+# A column declared `interval` in a table that is not STRICT has INTEGER
+# affinity (the name contains "INT"), so it holds no intervals.
+@requires custom_types "interval is a custom type"
+test interval-cast-of-non-strict-column-is-refused {
+    CREATE TABLE ns(iv interval);
+    INSERT INTO ns VALUES ('1 day');
+    SELECT CAST(iv AS interval) FROM ns;
+}
+expect error {
+    cast from integer to interval is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-type-modifier-is-refused {
+    CREATE TABLE tm(iv interval(3)) STRICT;
+}
+expect error {
+    a type modifier on type "interval" is not supported
+}
+
+@requires custom_types "interval is a custom type"
+test interval-invalid-input {
+    SELECT CAST('abc' AS interval);
+}
+expect error {
+    interval input form "abc" is not supported
+}
+
+@requires custom_types "interval is a custom type"
+test interval-field-out-of-range {
+    SELECT CAST('2147483648 days' AS interval);
+}
+expect error {
+    interval field value out of range: "2147483648 days"
+}
+
+@requires custom_types "interval is a custom type"
+test interval-out-of-range {
+    SELECT CAST('178956971 years' AS interval);
+}
+expect error {
+    interval out of range
+}
+
+# PostgreSQL reads this form; Turso reads only PostgreSQL's output form and
+# `[+-]N unit` sequences.
+@requires custom_types "interval is a custom type"
+test interval-iso-8601-is-refused {
+    SELECT CAST('P1D' AS interval);
+}
+expect error {
+    interval input form "P1D" is not supported
+}
+
+# Functions that hand their arguments back read no value, so they take intervals.
+@requires strict "uses STRICT tables"
+test interval-functions-that-hand-values-back {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    INSERT INTO w VALUES (1, '1 day'), (2, NULL), (3, '2 hours');
+    SELECT id, likely(iv), unlikely(iv) FROM w ORDER BY id;
+    SELECT id, first_value(iv) OVER (ORDER BY id), last_value(iv) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w ORDER BY id;
+}
+expect {
+    1|1 day|1 day
+    2||
+    3|02:00:00|02:00:00
+    1|1 day|02:00:00
+    2|1 day|02:00:00
+    3|1 day|02:00:00
+}
+
+# lag, lead, nth_value and likelihood read some of their arguments as
+# numbers, so any interval argument is refused.
+@requires strict "uses STRICT tables"
+test interval-lag-is-refused {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    SELECT lag(iv) OVER (ORDER BY id) FROM w;
+}
+expect error {
+    function lag\(interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-lag-offset-is-refused {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    SELECT lag(id, iv) OVER (ORDER BY id) FROM w;
+}
+expect error {
+    function lag\(integer, interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-lead-offset-is-refused {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    SELECT lead(id, iv) OVER (ORDER BY id) FROM w;
+}
+expect error {
+    function lead\(integer, interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-nth-value-row-number-is-refused {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    SELECT nth_value(id, iv) OVER (ORDER BY id) FROM w;
+}
+expect error {
+    function nth_value\(integer, interval\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test interval-likelihood-probability-is-refused {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, iv interval) STRICT;
+    SELECT likelihood(id, iv) FROM w;
+}
+expect error {
+    function likelihood\(integer, interval\) is not supported
+}
+
+# The type of a subquery's result is known only once the subquery is planned.
+@requires strict "uses STRICT tables"
+test interval-abs-of-subquery-is-refused {
+    CREATE TABLE j(iv interval) STRICT;
+    SELECT abs((SELECT iv FROM j));
+}
+expect error {
+    function abs\(interval\) is not supported
+}
+
+@requires custom_types "interval is a custom type"
+test interval-cast-of-interval-and-null {
+    SELECT CAST(CAST('1 day' AS interval) AS interval), CAST(NULL AS interval) IS NULL;
+}
+expect {
+    1 day|1
+}

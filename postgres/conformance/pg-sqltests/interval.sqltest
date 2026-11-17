@@ -1,0 +1,587 @@
+# The interval type: input, output, comparison, casts and functions. The
+# session time zone is UTC on both servers.
+#
+# Where tursopg refuses something PostgreSQL does, the default block shows
+# PostgreSQL's result and an `expect @tursopg error` block shows the refusal.
+
+@database :memory:
+
+# tursopg reads PostgreSQL's output form and `[+-]N unit` sequences, and
+# refuses every other form with 0A000.
+test interval-accepted-forms {
+    CREATE TABLE r (id int, iv interval);
+    INSERT INTO r VALUES (1, '1 day 6:00:00'), (2, '-1 day 23:59:58.500000'), (3, '0:00:00'), (4, '1 years 2 mons 3 days 04:05:06.5');
+    INSERT INTO r VALUES (5, '1 days 6 hours'), (6, '0'), (7, '1 mon 2 day 03:04:05.000006'), (8, '-00:00:01.500000'), (9, '30:00:00');
+    INSERT INTO r VALUES (10, '1 hour -30 minutes'), (11, '-1 years -2 mons +3 days -04:05:06'), (12, '2 weeks 5 milliseconds 6 microseconds'), (13, '-5 seconds');
+    SELECT id, iv, CAST(iv AS text) FROM r ORDER BY id;
+}
+expect {
+    1|1 day 06:00:00|1 day 06:00:00
+    2|-1 days +23:59:58.5|-1 days +23:59:58.5
+    3|00:00:00|00:00:00
+    4|1 year 2 mons 3 days 04:05:06.5|1 year 2 mons 3 days 04:05:06.5
+    5|1 day 06:00:00|1 day 06:00:00
+    6|00:00:00|00:00:00
+    7|1 mon 2 days 03:04:05.000006|1 mon 2 days 03:04:05.000006
+    8|-00:00:01.5|-00:00:01.5
+    9|30:00:00|30:00:00
+    10|00:30:00|00:30:00
+    11|-1 years -2 mons +3 days -04:05:06|-1 years -2 mons +3 days -04:05:06
+    12|14 days 00:00:00.005006|14 days 00:00:00.005006
+    13|-00:00:05|-00:00:05
+}
+
+test interval-fraction-of-a-second-unit {
+    SELECT '-1 days 86398.500000 seconds'::interval;
+}
+expect {
+    -1 days +23:59:58.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "-1 days 86398.500000 seconds" is not supported
+}
+
+test interval-ago {
+    SELECT '1 day ago'::interval;
+}
+expect {
+    -1 days
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1 day ago" is not supported
+}
+
+test interval-abbreviated-unit {
+    SELECT '2 hr 3 m'::interval;
+}
+expect {
+    02:03:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "2 hr 3 m" is not supported
+}
+
+# Intervals compare by length, with a month of 30 days.
+test interval-compares-by-length {
+    CREATE TABLE c (id int, iv interval);
+    INSERT INTO c VALUES (1, '1 day'), (2, '24 hours'), (3, '1 mon'), (4, '30 days'), (5, '31 days');
+    SELECT a.id, b.id FROM c a JOIN c b ON a.iv = b.iv AND a.id < b.id ORDER BY a.id;
+    SELECT id FROM c WHERE iv > '1 mon' ORDER BY id;
+    SELECT id FROM c WHERE iv = interval '86400 seconds' ORDER BY id;
+}
+expect {
+    1|2
+    3|4
+    5
+    1
+    2
+}
+
+test interval-order-by {
+    CREATE TABLE o (iv interval);
+    INSERT INTO o VALUES ('31 days'), ('1 mon 2 days'), ('-1 day'), ('00:00:01'), ('1 year'), ('-1 mon');
+    SELECT iv FROM o ORDER BY iv;
+    SELECT iv FROM o ORDER BY iv DESC LIMIT 2;
+}
+expect {
+    -1 mons
+    -1 days
+    00:00:01
+    31 days
+    1 mon 2 days
+    1 year
+    1 year
+    1 mon 2 days
+}
+
+test interval-unique-compares-by-length {
+    CREATE TABLE u (iv interval UNIQUE);
+    INSERT INTO u VALUES ('1 mon');
+    INSERT INTO u VALUES ('30 days');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint
+}
+
+test interval-primary-key-compares-by-length {
+    CREATE TABLE p (iv interval PRIMARY KEY);
+    INSERT INTO p VALUES ('1 day');
+    INSERT INTO p VALUES ('24 hours');
+}
+@sqlstate 23505
+expect error {
+    duplicate key value violates unique constraint
+}
+
+test interval-index-lookup {
+    CREATE TABLE s (id int, iv interval);
+    CREATE INDEX s_iv ON s (iv);
+    INSERT INTO s VALUES (1, '1 day'), (2, '2 days'), (3, '1 hour');
+    SELECT id FROM s WHERE iv = '24 hours';
+    SELECT id FROM s WHERE iv > '23 hours' ORDER BY id;
+}
+expect {
+    1
+    1
+    2
+}
+
+test interval-group-by {
+    CREATE TABLE g (iv interval);
+    INSERT INTO g VALUES ('1 day'), ('24 hours'), ('2 days'), ('48:00:00'), ('1 hour'), ('25 hours');
+    SELECT count(*) FROM g GROUP BY iv ORDER BY count(*), min(iv);
+    SELECT count(DISTINCT iv) FROM g;
+}
+expect {
+    1
+    1
+    2
+    2
+    4
+}
+
+test interval-min-max {
+    CREATE TABLE o (iv interval);
+    INSERT INTO o VALUES ('31 days'), ('1 mon 1 day'), ('-1 day'), ('1 year'), ('-1 mon');
+    SELECT min(iv), max(iv) FROM o;
+}
+expect {
+    -1 mons|1 year
+}
+
+test interval-coalesce {
+    SELECT coalesce(NULL::interval, '24 hours');
+}
+expect {
+    24:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function coalesce\(interval, text\) is not supported
+}
+
+test interval-nullif {
+    SELECT nullif(interval '1 day', interval '24 hours') IS NULL;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function nullif\(interval, interval\) is not supported
+}
+
+test interval-like {
+    CREATE TABLE o (iv interval);
+    SELECT iv LIKE '%day%' FROM o;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: interval ~~ unknown
+}
+# tursopg runs PostgreSQL's case-sensitive LIKE as GLOB.
+@sqlstate 0A000
+expect @tursopg error {
+    function glob\(text, interval\) is not supported
+}
+
+test interval-cast-to-text-before-like {
+    CREATE TABLE o (id int, iv interval);
+    INSERT INTO o VALUES (1, '1 day'), (2, '1 mon');
+    SELECT id FROM o WHERE iv::text LIKE '%day%';
+}
+expect {
+    1
+}
+
+test interval-sum {
+    CREATE TABLE o (iv interval);
+    INSERT INTO o VALUES ('1 day'), ('2 hours');
+    SELECT sum(iv) FROM o;
+}
+expect {
+    1 day 02:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function sum\(interval\) is not supported
+}
+
+test interval-avg {
+    CREATE TABLE o (iv interval);
+    INSERT INTO o VALUES ('1 day'), ('2 hours');
+    SELECT avg(iv) FROM o;
+}
+expect {
+    13:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function avg\(interval\) is not supported
+}
+
+test interval-abs {
+    CREATE TABLE o (iv interval);
+    SELECT abs(iv) FROM o;
+}
+@sqlstate 42883
+expect error {
+    function abs\(interval\) does not exist
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function abs\(interval\) is not supported
+}
+
+# tursopg creates the table and refuses the CHECK when a row is written.
+test interval-check-calling-abs-is-refused {
+    CREATE TABLE c1 (iv interval, CHECK (abs(iv) IS NOT NULL));
+    INSERT INTO c1 VALUES ('1 day');
+}
+@sqlstate 42883
+expect error {
+    function abs\(interval\) does not exist
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function abs\(interval\) is not supported
+}
+
+test interval-column-check-calling-length-is-refused {
+    CREATE TABLE c2 (id int, iv interval CHECK (length(iv) > 0));
+    INSERT INTO c2 VALUES (1, '1 day');
+}
+@sqlstate 42883
+expect error {
+    function length\(interval\) does not exist
+}
+@sqlstate 0A000
+expect @tursopg error {
+    function length\(interval\) is not supported
+}
+
+test interval-casts {
+    SELECT CAST('1 day' AS interval), '1 day'::interval, interval '1 day', CAST(interval '1 day' AS text), '25 hours'::interval::text;
+}
+expect {
+    1 day|1 day|1 day|1 day|25:00:00
+}
+
+test interval-cast-from-integer {
+    SELECT 42::interval;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type integer to interval
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cast from integer to interval is not supported
+}
+
+test interval-cast-to-integer {
+    SELECT interval '1 day'::integer;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type interval to integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cast from interval to integer is not supported
+}
+
+test interval-cast-to-time {
+    SELECT interval '1 day 01:00'::time;
+}
+expect {
+    01:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cast from interval to time is not supported
+}
+
+test interval-cast-from-time {
+    SELECT time '01:00'::interval;
+}
+expect {
+    01:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    cast from time to interval is not supported
+}
+
+test interval-type-modifier {
+    CREATE TABLE tm (iv interval(3));
+    INSERT INTO tm VALUES ('1.123456 seconds');
+    SELECT iv FROM tm;
+}
+expect {
+    00:00:01.123
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a type modifier on interval is not supported
+}
+
+test interval-field-qualifier {
+    CREATE TABLE tf (iv interval day);
+    INSERT INTO tf VALUES ('1 day 02:00');
+    SELECT iv FROM tf;
+}
+expect {
+    1 day
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a type modifier on interval is not supported
+}
+
+test interval-literal-field-qualifier {
+    SELECT INTERVAL '1' DAY;
+}
+expect {
+    1 day
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a type modifier in a cast is not supported
+}
+
+# tursopg gives the same 0A000 for input PostgreSQL rejects as for forms it
+# does not read.
+test interval-invalid-input {
+    SELECT 'abc'::interval;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: "abc"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "abc" is not supported
+}
+
+test interval-unknown-unit {
+    SELECT '1 fortnight'::interval;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: "1 fortnight"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1 fortnight" is not supported
+}
+
+test interval-repeated-unit {
+    SELECT '1 day 1 days'::interval;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type interval: "1 day 1 days"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1 day 1 days" is not supported
+}
+
+test interval-field-out-of-range {
+    SELECT '2147483648 days'::interval;
+}
+@sqlstate 22015
+expect error {
+    interval field value out of range: "2147483648 days"
+}
+
+test interval-minutes-out-of-range {
+    SELECT '1:60'::interval;
+}
+@sqlstate 22015
+expect error {
+    interval field value out of range: "1:60"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1:60" is not supported
+}
+
+test interval-out-of-range {
+    SELECT '178956971 years'::interval;
+}
+@sqlstate 22008
+expect error {
+    interval out of range
+}
+
+test interval-infinite-values-are-refused {
+    SELECT '178956970 years 7 mons 2147483647 days 2562047788:00:54.775807'::interval;
+}
+expect {
+    infinity
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the interval of 2147483647 months, 2147483647 days and 9223372036854775807 microseconds is not supported
+}
+
+test interval-infinity {
+    SELECT 'infinity'::interval;
+}
+expect {
+    infinity
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "infinity" is not supported
+}
+
+test interval-iso-8601 {
+    SELECT 'P1DT2H'::interval;
+}
+expect {
+    1 day 02:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "P1DT2H" is not supported
+}
+
+test interval-at-form {
+    SELECT '@ 1 day'::interval;
+}
+expect {
+    1 day
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "@ 1 day" is not supported
+}
+
+test interval-sql-standard-form {
+    SELECT '1-2'::interval;
+}
+expect {
+    1 year 2 mons
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1-2" is not supported
+}
+
+test interval-fraction-of-a-day {
+    SELECT '1.5 days'::interval;
+}
+expect {
+    1 day 12:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1.5 days" is not supported
+}
+
+test interval-fraction-of-a-month {
+    SELECT '1.5 mons'::interval;
+}
+expect {
+    1 mon 15 days
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1.5 mons" is not supported
+}
+
+test interval-seven-fraction-digits {
+    SELECT '00:00:00.1234567'::interval;
+}
+expect {
+    00:00:00.123457
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "00:00:00.1234567" is not supported
+}
+
+test interval-sixty-seconds {
+    SELECT '1:59:60'::interval;
+}
+expect {
+    02:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1:59:60" is not supported
+}
+
+test interval-minutes-and-seconds-field {
+    SELECT '1:30.5'::interval;
+}
+expect {
+    00:01:30.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1:30.5" is not supported
+}
+
+test interval-unit-joined-to-next-field {
+    SELECT '1h30m'::interval;
+}
+expect {
+    01:30:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    interval input form "1h30m" is not supported
+}
+
+test interval-age {
+    SELECT age(timestamp '2001-04-10 12:00:00.5', timestamp '2000-02-14 14:30:16');
+    SELECT age(timestamp '2000-02-14', timestamp '2001-04-10');
+}
+expect {
+    1 year 1 mon 24 days 21:29:44.5
+    -1 years -1 mons -25 days
+}
+
+# tursopg has no + operator for a timestamp and an interval.
+test interval-plus-timestamp {
+    SELECT timestamp '2020-01-01' + interval '1 day';
+}
+expect {
+    2020-01-02 00:00:00
+}
+expect @tursopg error {
+    operator does not exist: timestamp \+ interval
+}
+
+test interval-catalog {
+    CREATE TABLE r (iv interval);
+    SELECT a.atttypid FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname = 'r' AND a.attname = 'iv';
+    SELECT typname, typlen, typarray FROM pg_type WHERE oid = 1186;
+    SELECT typname, typelem FROM pg_type WHERE oid = 1187;
+}
+expect {
+    1186
+    interval|16|1187
+    _interval|1186
+}
+
+test interval-array {
+    CREATE TABLE a (iv interval[]);
+    INSERT INTO a VALUES (ARRAY[interval '1 day']);
+    SELECT iv FROM a;
+}
+expect {
+    {"1 day"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    an array of type interval, whose elements
+}
