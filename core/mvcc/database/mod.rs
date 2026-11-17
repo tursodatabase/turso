@@ -2407,7 +2407,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         continue;
                     }
                     for row_version in row_versions.read().iter() {
-                        let Some(identity) = sqlite_schema_btree_identity(id.table_id, row_version)
+                        let Some(identity) =
+                            sqlite_schema_btree_identity(id.table_id, row_version)?
                         else {
                             continue;
                         };
