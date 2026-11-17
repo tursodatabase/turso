@@ -1924,6 +1924,8 @@ pub fn emit_schema_entry(
     Ok(())
 }
 
+type AutoindexRegisters = Vec<(usize, Arc<crate::types::IndexInfo>)>;
+
 /// Check if an automatic PRIMARY KEY index is required for the table.
 /// If so, create a register for the index root page and return it.
 ///
@@ -1938,7 +1940,7 @@ fn collect_autoindexes(
     program: &mut ProgramBuilder,
     tbl_name: &str,
     resolver: &Resolver,
-) -> Result<Option<Vec<(usize, Arc<crate::types::IndexInfo>)>>> {
+) -> Result<Option<AutoindexRegisters>> {
     let mut table = create_table(
         tbl_name,
         body,

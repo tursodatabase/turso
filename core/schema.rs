@@ -1,5 +1,7 @@
 mod btree;
 pub(crate) mod mvcc;
+#[cfg(feature = "conn_raw_api")]
+pub(crate) mod portable;
 
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;

@@ -34,7 +34,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 ParsedOp::UpsertIndex { table_id, .. } => (*table_id, true, false),
                 ParsedOp::DeleteIndex { table_id, .. } => (*table_id, true, true),
                 ParsedOp::UpdateHeader { header, .. } => {
-                    self.global_header.write().replace(header.clone());
+                    self.global_header.write().replace(*header);
                     continue;
                 }
                 ParsedOp::BtreeChanges { .. } => continue,
@@ -54,11 +54,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let live =
                     object.begin <= timestamp && object.end.is_none_or(|end| end > timestamp);
                 if !live {
-                    if index {
-                        continue;
-                    }
                     return Err(LimboError::Corrupt(
-                        "table log entry has no live table descriptor".into(),
+                        "row log entry has no live B-tree descriptor".into(),
                     ));
                 }
                 match (&object.descriptor, index) {
@@ -146,7 +143,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 _ => unreachable!("only row records reach row replay"),
             }
         }
-        if let Some((rows, types)) = catalog {
+        if let Some(crate::schema::mvcc::CatalogFrame {
+            schema_rows: rows,
+            type_sqls: types,
+        }) = catalog
+        {
             let schema = self.recover_build_schema(
                 connection,
                 &rows,

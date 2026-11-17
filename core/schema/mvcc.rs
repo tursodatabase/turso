@@ -302,17 +302,17 @@ pub(crate) fn recovered_tombstone<A: ConcurrentAllocator>(
     )?)
 }
 
+pub(crate) struct CatalogFrame {
+    pub(crate) schema_rows: HashMap<i64, ImmutableRecord>,
+    pub(crate) type_sqls: std::collections::BTreeMap<i64, String>,
+}
+
 pub(crate) fn stage_recovered_catalog<Clock: LogicalClock, A: ConcurrentAllocator>(
     mvstore: &MvStore<Clock, A>,
     connection: &Connection,
     ctx: &crate::mvcc::database::RecoverCtx,
     frame: &[crate::mvcc::persistent_storage::logical_log::ParsedOp],
-) -> Result<
-    Option<(
-        HashMap<i64, ImmutableRecord>,
-        std::collections::BTreeMap<i64, String>,
-    )>,
-> {
+) -> Result<Option<CatalogFrame>> {
     use crate::mvcc::persistent_storage::logical_log::ParsedOp;
     use std::collections::BTreeMap;
     let mut schema_rows_after: Option<HashMap<i64, ImmutableRecord>> = None;
@@ -390,11 +390,9 @@ pub(crate) fn stage_recovered_catalog<Clock: LogicalClock, A: ConcurrentAllocato
     if type_sqls_after.is_some() && schema_rows_after.is_none() {
         schema_rows_after = Some(ctx.schema_rows.clone());
     }
-    Ok(schema_rows_after.map(|rows| {
-        (
-            rows,
-            type_sqls_after.unwrap_or_else(|| ctx.type_sqls.clone()),
-        )
+    Ok(schema_rows_after.map(|schema_rows| CatalogFrame {
+        schema_rows,
+        type_sqls: type_sqls_after.unwrap_or_else(|| ctx.type_sqls.clone()),
     }))
 }
 

@@ -1019,8 +1019,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         });
     }
 
-    /// Stage a root-binding removal for deferred application at commit.
-
     /// Collect all committed versions that need to be written to the B-tree.
     /// We must only write to the B-tree if:
     /// 1. The row has not already been checkpointed in a previous checkpoint.
@@ -1495,8 +1493,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn get_current_row_version(&self, write_set_index: usize) -> Option<&(RowID, RowVersion)> {
         self.write_set.get(write_set_index)
     }
-
-    /// Mutably get the current row version to write to the B-tree
 
     /// Check if we have more rows to write
     fn has_more_rows(&self, write_set_index: usize) -> bool {

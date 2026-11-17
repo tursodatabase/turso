@@ -5646,3 +5646,81 @@ fn recover_table_and_index_without_catalog_rows() {
     assert!(store.current_root_page(&table).is_some());
     assert!(store.current_root_page(&index).is_some());
 }
+
+#[test]
+fn legacy_catalog_frames_then_explicit_lifecycle_recover_and_checkpoint() {
+    use crate::mvcc::persistent_storage::logical_log::LogicalLog;
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let store = db.get_mvcc_store();
+        let io = conn.get_pager().io.clone();
+        let mut log = LogicalLog::new(store.storage.get_logical_log_file(), io.clone(), None);
+        let catalog = ImmutableRecord::from_values(
+            &[
+                Value::build_text("table"),
+                Value::build_text("legacy_t"),
+                Value::build_text("legacy_t"),
+                Value::from_i64(-1000),
+                Value::build_text("CREATE TABLE legacy_t(v TEXT)"),
+            ],
+            5,
+        )
+        .unwrap();
+        for (timestamp, row) in [
+            (
+                1000,
+                Row::new_table_row(
+                    RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(100)),
+                    catalog.as_blob(),
+                )
+                .unwrap(),
+            ),
+            (
+                1001,
+                generate_simple_string_row((-1000).into(), 1, "old format"),
+            ),
+        ] {
+            let version = RowVersion {
+                id: timestamp,
+                begin: PackedTs::pack(Some(TxTimestampOrID::Timestamp(timestamp))),
+                end: PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: WalPos::ORIGIN,
+            };
+            let record = LogRecord::for_test(timestamp, &[(row.id, version)], None);
+            io.wait_for_completion(log.log_tx(record).unwrap()).unwrap();
+        }
+    }
+    db.restart();
+    {
+        let conn = db.connect();
+        assert_eq!(
+            get_rows(&conn, "SELECT v FROM legacy_t"),
+            vec![vec![Value::build_text("old format")]]
+        );
+        conn.execute("INSERT INTO legacy_t VALUES ('new format')")
+            .unwrap();
+        conn.execute("CREATE INDEX legacy_i ON legacy_t(v DESC)")
+            .unwrap();
+    }
+    db.restart();
+    {
+        let conn = db.connect();
+        assert_eq!(
+            get_rows(&conn, "SELECT count(*) FROM legacy_t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP TABLE legacy_t").unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}

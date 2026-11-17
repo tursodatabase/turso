@@ -5464,7 +5464,7 @@ fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
 /// readers that use it: the checkpoint reads `sqlite_schema` rows, and the
 /// commit reads the primary key for portable logical changes.
 #[test]
-fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
+fn test_tombstones_do_not_need_catalog_payloads() {
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -5508,7 +5508,7 @@ fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
         tombstone.payload(row_id).len()
     };
     assert_eq!(tombstone_payload_len(&user_row), 0);
-    assert!(tombstone_payload_len(&schema_row) > 0);
+    assert_eq!(tombstone_payload_len(&schema_row), 0);
     db.conn.execute("COMMIT").unwrap();
 
     db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -7064,10 +7064,10 @@ fn test_build_log_record_yields_for_large_write_set() {
         finished.load(Ordering::SeqCst),
         "LogRecordPrepared yield never fired — BuildLogRecord did not complete"
     );
-    // n_rows = 3 * BATCH_SIZE → 2 yields per pass × 2 passes = 4 chunked yields.
+    // n_rows = 3 * BATCH_SIZE → 2 chunked yields.
     assert_eq!(
-        chunked_io_yields, 4,
-        "with {n_rows} rows, expected exactly 4 chunked IO yields between \
+        chunked_io_yields, 2,
+        "with {n_rows} rows, expected exactly 2 chunked IO yields between \
          BuildLogRecordStart and LogRecordPrepared, got {chunked_io_yields}"
     );
 

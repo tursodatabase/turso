@@ -62,7 +62,7 @@
 //!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
-//! - `version: u8` (`LOG_VERSION`)
+//! - `version: u8` (2: recovery frames, 3: portable extensions, 4: B-tree descriptors)
 //! - `flags: u8` (bits 1..7 must be zero; bit 0 is currently reserved/ignored)
 //! - `hdr_len: u16` (`>= 56`)
 //! - `salt: u64` (random salt, regenerated on each log truncation)
@@ -85,7 +85,7 @@
 //!   entries serialized directly:
 //!   - `tag: u8` (`OP_*`)
 //!   - `flags: u8` (`OP_FLAG_BTREE_RESIDENT`, `OP_FLAG_PORTABLE_EXTENSION`)
-//!   - `table_id: i32` (must be negative)
+//!   - `table_id: i32` (negative for row operations; zero for header and lifecycle operations)
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
 //!   - if `OP_FLAG_PORTABLE_EXTENSION` is set:
@@ -112,6 +112,17 @@
 //! - `OP_DELETE_TABLE`: `rowid_varint`
 //! - `OP_UPSERT_INDEX`: serialized index key record
 //! - `OP_DELETE_INDEX`: serialized index key record
+//! - `OP_UPDATE_HEADER`: database header bytes
+//! - `OP_BTREE_CHANGES` (version 4): `count: u32`, then lifecycle entries:
+//!   - create: `1: u8 || object_id: i64 || descriptor_len: u32 || descriptor_bytes`
+//!   - drop: `2: u8 || object_id: i64`
+//!   Object IDs must be less than -1 and fit the row operation's signed 32-bit domain.
+//!   Descriptors have their own version byte and store stable comparison names.
+//!
+//! Every newly written transaction has one lifecycle batch, even when it is empty.
+//! Replay applies that batch before row operations. Frames without a batch use the
+//! legacy catalog adapter. A header can be upgraded in place while keeping earlier
+//! version 2/3 frames; frame bytes and their CRC chain are unchanged.
 //!
 //! `OP_FLAG_BTREE_RESIDENT` means the row existed in the B-tree before MVCC started tracking it.
 //! Recovery preserves this bit because checkpoint/GC logic depends on it.
@@ -4029,7 +4040,11 @@ mod tests {
                 None,
             );
             #[cfg(feature = "conn_raw_api")]
-            let old = { let mut old = old; old.portable_changes_enabled = portable; old };
+            let old = {
+                let mut old = old;
+                old.portable_changes_enabled = portable;
+                old
+            };
             io.wait_for_completion(log.log_tx(old).unwrap()).unwrap();
             for timestamp in [20, 30] {
                 let mut next = crate::mvcc::database::LogRecord::for_test(timestamp, &[], None);

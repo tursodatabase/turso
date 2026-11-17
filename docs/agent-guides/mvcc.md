@@ -56,10 +56,15 @@ Database
 ## Key Files
 
 - `core/mvcc/mod.rs` - Module overview
-- `core/mvcc/database/mod.rs` - Main implementation (~3000 lines)
+- `core/mvcc/database/mod.rs` - Transactions and version storage
 - `core/mvcc/cursor.rs` - Merged MVCC + B-tree cursor
 - `core/mvcc/persistent_storage/logical_log.rs` - Disk format
 - `core/mvcc/database/checkpoint.rs` - Checkpoint logic
+- `core/mvcc/database/replay.rs` - Replay using B-tree descriptors
+- `core/mvcc/database/legacy_recovery.rs` - Compatibility replay for older logs
+- `core/storage/btree_descriptor.rs` - B-tree kind and durable comparison metadata
+- `core/schema/mvcc.rs` - Catalog cache recovery and root-page rewriting
+- `core/schema/portable.rs` - SQL names and primary keys for portable log consumers
 
 ## Checkpointing
 
@@ -69,7 +74,37 @@ Flushes row versions to B-tree periodically.
 PRAGMA mvcc_checkpoint_threshold = <pages>;
 ```
 
-Process: acquire lock → begin pager txn → write rows → commit → truncate log → fsync → release.
+The checkpoint selects a committed snapshot, collects B-tree lifecycle changes and row
+versions, and opens a pager transaction. It destroys dropped B-trees, allocates new ones,
+and writes rows using the stored comparison metadata. Root mappings and the durable
+replay boundary become visible only after the pager transaction commits. Log truncation
+follows the existing WAL durability protocol.
+
+### B-tree lifecycle and catalog boundaries
+
+`CreateBtree` records a logical object ID and a `BtreeDescriptor` in the transaction.
+An index descriptor contains the resolved sort direction, collation, NULL ordering,
+rowid presence, and uniqueness information. `Destroy` records the logical object ID
+being dropped. Savepoint and transaction rollback undo these changes; commit publishes
+object lifetimes together with the committed timestamp.
+
+Each new logical-log frame includes a lifecycle batch, including an empty batch for
+transactions that only change rows. Version 4 readers use those batches to replay
+storage changes and decode index keys without consulting SQL definitions. Descriptor
+encoding uses stable collation and type-order names rather than process-local IDs.
+Readers still accept version 2 and 3 frames, including older frames preceding a
+version 4 append. Their schema-based inference is isolated in `legacy_recovery.rs`.
+
+Checkpoint does not derive creation or deletion from `sqlite_schema` row versions and
+does not reconstruct `Schema` to find index ordering. Catalog rows use ordinary row
+version selection. The schema adapter rewrites logical root placeholders after
+allocation and updates the SQL schema cache after publication. Portable-log consumers
+use a separate schema adapter to attach SQL names and primary keys.
+
+The SQLite database file remains unchanged. On opening a checkpointed database,
+bootstrap imports descriptors from the already-loaded schema once. This is also the
+compatibility boundary for databases created before descriptor logging; the SQLite
+file does not contain a separate persistent B-tree descriptor catalog.
 
 ## Current Limitations
 
