@@ -348,7 +348,9 @@ impl PgConn {
         self.write_message(b'S', &[])
     }
 
-    fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
+    /// Sends one protocol message of type `tag` with the given body as is,
+    /// for bodies the `send_*` methods cannot build, such as invalid UTF-8.
+    pub fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         self.writer.write_all(&[tag])?;
         self.writer
             .write_all(&((body.len() as u32 + 4).to_be_bytes()))?;

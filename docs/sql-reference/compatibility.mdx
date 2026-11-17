@@ -97,3 +97,11 @@ remains unsupported. These settings do not add timeout enforcement, row-level
 security, function-body validation, synchronized scans, or additional diagnostic
 message levels. Previously accepted no-op requests for unsupported modes now
 raise an error rather than reporting that those modes took effect.
+
+## PostgreSQL protocol text that is not valid UTF-8
+
+Query text, statement names and portal names that contain bytes that are not
+valid UTF-8 are refused with SQLSTATE `0A000`; PostgreSQL raises `22021`. They
+are also refused when they contain the character U+FFFD, which PostgreSQL
+accepts, because the server cannot tell it from an invalid byte that was
+replaced while reading the message.

@@ -32,7 +32,7 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{NoopQueryParser, QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
@@ -41,7 +41,9 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
 use pgwire::messages::data::{DataRow, FORMAT_CODE_BINARY, FORMAT_CODE_TEXT};
-use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Sync as PgSync};
+use pgwire::messages::extendedquery::{
+    Bind, BindComplete, Describe, Execute, Parse, ParseComplete, Sync as PgSync,
+};
 use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
@@ -225,6 +227,7 @@ impl TursoPgHandler {
         let conn = &self.conn;
         let parse_error =
             |error: turso_pg_parser::ParseError| pg_error(sql_parse_error(error).into());
+        refuse_replaced_bytes("query text", &query.query)?;
         turso_pg_parser::parse(&query.query).map_err(parse_error)?;
         let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;
         if statements.is_empty() {
@@ -305,6 +308,17 @@ where
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
     type QueryParser = NoopQueryParser;
+
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = parse(client, &message, self.query_parser()).await;
+        finish_query(client, &self.conn, result, true).await
+    }
 
     async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
     where
@@ -435,6 +449,36 @@ impl ExtendedQueryHandler for TursoPgHandler {
     }
 }
 
+/// Stores the statement of a Parse message, as pgwire's own Parse handler
+/// does, but returns its errors so that [`finish_query`] reports them.
+async fn parse<C>(client: &mut C, message: &Parse, parser: Arc<NoopQueryParser>) -> PgWireResult<()>
+where
+    C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::PortalStore: PortalStore<Statement = String>,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    // pgwire reads an empty statement name as None.
+    let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+    refuse_replaced_bytes("a statement name", name)?;
+    refuse_replaced_bytes("query text", &message.query)?;
+    let parameter_types: Vec<_> = message
+        .type_oids
+        .iter()
+        .copied()
+        .map(Type::from_oid)
+        .collect();
+    let statement = parser
+        .parse_sql(client, &message.query, &parameter_types)
+        .await?;
+    let statement = StoredStatement::new(name.to_owned(), statement, parameter_types);
+    client.portal_store().put_statement(Arc::new(statement));
+    client
+        .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+        .await?;
+    Ok(())
+}
+
 /// Creates the portal of a Bind message, as pgwire's own Bind handler does,
 /// but returns its errors so that [`finish_query`] reports them.
 async fn bind<C>(client: &mut C, message: &Bind) -> PgWireResult<()>
@@ -444,6 +488,11 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
+    // Names are refused where statements and portals are created, so a name
+    // with U+FFFD in Bind, Execute, Describe or Close finds nothing.
+    if let Some(portal) = &message.portal_name {
+        refuse_replaced_bytes("a portal name", portal)?;
+    }
     // pgwire reads an empty statement name as None.
     let name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
     let Some(statement) = client.portal_store().get_statement(name) else {
@@ -456,6 +505,24 @@ where
         .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
         .await?;
     Ok(())
+}
+
+/// pgwire reads the strings of protocol messages with `String::from_utf8_lossy`
+/// (`get_cstring` in pgwire's messages/codec.rs), which turns bytes that are
+/// not valid UTF-8 into U+FFFD. A U+FFFD in such a string is the only sign of
+/// that, so tursopg refuses every U+FFFD rather than run or store text other
+/// than what the client sent. PostgreSQL refuses only the invalid bytes.
+fn refuse_replaced_bytes(what: &str, text: &str) -> PgWireResult<()> {
+    if !text.contains(char::REPLACEMENT_CHARACTER) {
+        return Ok(());
+    }
+    Err(pg_error(
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{what} with invalid UTF-8 or U+FFFD is not supported"),
+        )
+        .into(),
+    ))
 }
 
 /// Refuses the format codes of a Bind message that tursopg cannot follow:
@@ -2086,6 +2153,42 @@ mod tests {
             assert_eq!(messages.last().unwrap().1, b"E", "{sql}");
             assert_block_aborted(&mut client, sql);
         }
+    }
+
+    #[test]
+    fn text_that_is_not_valid_utf8_is_refused() {
+        /// A message's type byte and body.
+        type Message = (u8, &'static [u8]);
+        let (mut client, _conn) = copy_test_client();
+        let parse_select_1: Message = (b'P', b"\0SELECT 1\0\0\0");
+        let sync: Message = (b'S', b"");
+        let cases: [(&str, &[Message]); 4] = [
+            ("Query", &[(b'Q', b"SELECT 'a\xffb'\0")]),
+            ("Parse query", &[(b'P', b"\0SELECT 'a\xffb'\0\0\0"), sync]),
+            ("Parse name", &[(b'P', b"s\xff\0SELECT 1\0\0\0"), sync]),
+            (
+                "Bind portal name",
+                &[parse_select_1, (b'B', b"p\xff\0\0\0\0\0\0\0\0"), sync],
+            ),
+        ];
+        for (context, messages) in cases {
+            query_messages(&mut client, "BEGIN");
+            for &(tag, body) in messages {
+                client.write_message(tag, body).unwrap();
+            }
+            let replies = read_until_ready(&mut client);
+            assert_eq!(
+                error_of(&replies).0,
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "{context}"
+            );
+            assert_block_aborted(&mut client, context);
+        }
+        // A U+FFFD the client sent is refused too, since it looks the same.
+        let messages = query_messages(&mut client, "SELECT '\u{FFFD}'");
+        assert_eq!(error_of(&messages).0, SQLSTATE_FEATURE_NOT_SUPPORTED);
+        let messages = query_messages(&mut client, "SELECT 'é'");
+        assert_eq!(data_row(&messages), vec![Some("é".to_string())]);
     }
 
     fn query_messages(client: &mut PgConn, sql: &str) -> Vec<(u8, Vec<u8>)> {

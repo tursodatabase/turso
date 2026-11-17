@@ -642,7 +642,7 @@ Upgrade is not supported.
 | Full SSL support | ❌ Not supported | SSLRequest answered with "SSL not available"; plaintext only |
 | IPv6 support | 🟡 Partial | Server binds whatever address it is given, including IPv6 literals; no dual-stack handling |
 | V2 client protocol | ❌ Not supported | |
-| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; binary format works for `text`, `varchar`, `bpchar`, `name` and `bytea` parameters and results, and for `bool`, `int2`, `int4`, `int8` and `float8` results, and is refused with 0A000 for other types (for results, before the first row); Execute row limits ignored (no portal suspension); text COPY TO STDOUT in simple queries; no COPY FROM STDIN, CancelRequest, or NotificationResponse; a simple query with several statements runs each statement in its own transaction, not in one implicit transaction block |
+| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; query text and statement or portal names with invalid UTF-8 or U+FFFD refused with 0A000; binary format works for `text`, `varchar`, `bpchar`, `name` and `bytea` parameters and results, and for `bool`, `int2`, `int4`, `int8` and `float8` results, and is refused with 0A000 for other types (for results, before the first row); Execute row limits ignored (no portal suspension); text COPY TO STDOUT in simple queries; no COPY FROM STDIN, CancelRequest, or NotificationResponse; a simple query with several statements runs each statement in its own transaction, not in one implicit transaction block |
 
 ## Platforms
 
