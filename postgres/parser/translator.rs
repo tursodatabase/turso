@@ -2916,7 +2916,14 @@ impl PostgreSQLTranslator {
 
         let qualified_name = function_qualified_name(func_name);
         if let Some(function) = rewritten_function(func_name) {
-            return translate_rewritten_function(function, range_func, qualified_name, args, alias);
+            return translate_rewritten_function(
+                function,
+                range_func,
+                qualified_name,
+                args,
+                alias,
+                func_call.funcname.len() > 1,
+            );
         }
         if returns_record {
             return self.translate_json_to_record(
@@ -5605,12 +5612,26 @@ impl PostgreSQLTranslator {
 struct RewrittenFunction {
     name: &'static str,
     in_main_schema: bool,
-    check_arg_count: fn(usize) -> Result<(), ParseError>,
+    /// Refuses a call, given its number of arguments and whether its name has a schema.
+    check_arg_count: fn(usize, bool) -> Result<(), ParseError>,
     /// The column of the engine's table function that holds each column of the result,
     /// and the name PostgreSQL gives that column, for a call with this many arguments.
     columns: fn(usize) -> Vec<(ast::Expr, String)>,
     /// The column of the engine's table function that holds WITH ORDINALITY.
     ordinality: fn(usize) -> ast::Expr,
+}
+
+/// The most arrays one call of unnest() in FROM can take.
+pub const MAX_UNNEST_ARRAYS: usize = 100;
+
+/// The column of the unnest table function with the elements of its `array`th argument,
+/// counted from 1.
+pub fn unnest_column_name(array: usize) -> String {
+    if array == 1 {
+        "unnest".to_string()
+    } else {
+        format!("unnest{array}")
+    }
 }
 
 fn rewritten_function(name: &str) -> Option<&'static RewrittenFunction> {
@@ -5623,21 +5644,40 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 2] = [
     RewrittenFunction {
         name: "unnest",
         in_main_schema: true,
-        check_arg_count: |count| {
-            if count != 1 {
-                return Err(ParseError::ParseError(
-                    "unnest currently requires exactly one array".into(),
-                ));
+        check_arg_count: |count, schema_qualified| {
+            if count == 0 || (schema_qualified && count > 1) {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+                    message: if count == 0 {
+                        "function unnest() does not exist".into()
+                    } else {
+                        format!("function unnest with {count} arguments does not exist")
+                    },
+                });
+            }
+            if count > MAX_UNNEST_ARRAYS {
+                return Err(ParseError::not_supported(format!(
+                    "unnest() with more than {MAX_UNNEST_ARRAYS} arrays"
+                )));
             }
             Ok(())
         },
-        columns: |_| vec![(ast::Expr::Id(exact_name("unnest")), "unnest".into())],
+        columns: |count| {
+            (1..=count)
+                .map(|array| {
+                    (
+                        ast::Expr::Id(exact_name(unnest_column_name(array))),
+                        "unnest".to_string(),
+                    )
+                })
+                .collect()
+        },
         ordinality: |_| ast::Expr::Id(exact_name("ordinality")),
     },
     RewrittenFunction {
         name: "generate_series",
         in_main_schema: true,
-        check_arg_count: |count| {
+        check_arg_count: |count, _| {
             if !(2..=3).contains(&count) {
                 return Err(ParseError::Sqlstate {
                     sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
@@ -5677,8 +5717,9 @@ fn translate_rewritten_function(
     qualified_name: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
     alias: Option<ast::As>,
+    schema_qualified: bool,
 ) -> Result<ast::SelectTable, ParseError> {
-    (function.check_arg_count)(args.len())?;
+    (function.check_arg_count)(args.len(), schema_qualified)?;
     let (mut sources, mut default_names): (Vec<_>, Vec<_>) =
         (function.columns)(args.len()).into_iter().unzip();
     if let ([name], Some(table_alias)) = (default_names.as_mut_slice(), &range_func.alias) {
