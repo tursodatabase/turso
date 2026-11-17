@@ -1,0 +1,129 @@
+# extract and date_trunc on date, timestamp and timestamptz. The session time
+# zone is UTC on both servers.
+
+@database :memory:
+
+test extract-fields-of-a-date {
+    CREATE TABLE ed (v date);
+    INSERT INTO ed VALUES ('2021-01-03'), ('2024-02-29');
+    SELECT v, extract(year from v), extract(quarter from v), extract(month from v),
+        extract(week from v), extract(day from v), extract(dow from v),
+        extract(doy from v), extract(epoch from v)
+    FROM ed ORDER BY v;
+}
+expect {
+    2021-01-03|2021|1|1|53|3|0|3|1609632000
+    2024-02-29|2024|1|2|9|29|4|60|1709164800
+}
+
+test extract-of-a-timestamp-is-a-numeric-with-six-decimal-seconds {
+    CREATE TABLE ets (v timestamp);
+    INSERT INTO ets VALUES ('1969-12-31 23:59:59.5'), ('2024-01-05 10:00:00');
+    SELECT v, extract(hour from v), extract(MINUTE from v), extract(second from v),
+        extract(epoch from v), extract(second from v) + 1
+    FROM ets ORDER BY v;
+}
+expect {
+    1969-12-31 23:59:59.5|23|59|59.500000|-0.500000|60.500000
+    2024-01-05 10:00:00|10|0|0.000000|1704448800.000000|1.000000
+}
+
+test extract-of-a-timestamptz-reads-it-in-utc {
+    CREATE TABLE etz (v timestamptz);
+    INSERT INTO etz VALUES ('2024-02-29 23:30:00-02');
+    SELECT extract(day from v), extract(hour from v), extract(epoch from v) FROM etz;
+}
+expect {
+    1|1|1709256600.000000
+}
+
+test date-trunc-of-a-timestamp-is-a-timestamp {
+    CREATE TABLE dt (v timestamp);
+    INSERT INTO dt VALUES ('2021-01-03 10:30:15.123456'), ('2024-08-14 23:59:59.999999'), ('2024-08-15 00:00:00');
+    SELECT date_trunc('second', v), date_trunc('minute', v), date_trunc('hour', v),
+        date_trunc('week', v), date_trunc('month', v), date_trunc('quarter', v),
+        date_trunc('YEAR', v)
+    FROM dt WHERE date_trunc('day', v) <> '2024-08-15' ORDER BY v;
+}
+expect {
+    2021-01-03 10:30:15|2021-01-03 10:30:00|2021-01-03 10:00:00|2020-12-28 00:00:00|2021-01-01 00:00:00|2021-01-01 00:00:00|2021-01-01 00:00:00
+    2024-08-14 23:59:59|2024-08-14 23:59:00|2024-08-14 23:00:00|2024-08-12 00:00:00|2024-08-01 00:00:00|2024-07-01 00:00:00|2024-01-01 00:00:00
+}
+
+test date-trunc-of-a-date-is-a-timestamptz {
+    CREATE TABLE dd (v date);
+    INSERT INTO dd VALUES ('2024-02-29');
+    SELECT date_trunc('week', v) FROM dd WHERE date_trunc('day', v) = '2024-02-29';
+}
+expect {
+    2024-02-26 00:00:00+00
+}
+
+test extract-and-date-trunc-of-null-are-null {
+    CREATE TABLE dn (v date);
+    INSERT INTO dn VALUES (NULL);
+    SELECT (extract(year from v) IS NULL)::int, (date_trunc('day', v) IS NULL)::int FROM dn;
+}
+expect {
+    1|1
+}
+
+test extract-of-a-string-constant-is-not-supported {
+    SELECT extract(year from '2024-01-05');
+}
+@sqlstate 0A000
+expect error {
+    extract takes only a value of type date, timestamp or timestamptz
+}
+@sqlstate 42725
+expect @postgres error {
+    function pg_catalog\.extract\(unknown, unknown\) is not unique
+}
+
+test extract-of-another-field-is-not-supported {
+    SELECT extract(isodow from date '2024-01-07');
+}
+expect {
+    7
+}
+@sqlstate 0A000
+expect @tursopg error {
+    extract\(isodow FROM date\) is not supported
+}
+
+test date-trunc-to-another-unit-is-not-supported {
+    SELECT date_trunc('decade', timestamp '2024-01-05');
+}
+expect {
+    2020-01-01 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    date_trunc\('decade', \.\.\.\) is not supported
+}
+
+test date-trunc-of-a-unit-that-is-not-a-constant-is-not-supported {
+    CREATE TABLE du (u text, v timestamp);
+    INSERT INTO du VALUES ('day', '2024-01-05 10:00:00');
+    SELECT date_trunc(u, v) FROM du;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    date_trunc takes only a string constant as its unit
+}
+
+test date-trunc-in-a-check-constraint-is-not-supported {
+    CREATE TABLE ck (v timestamp CHECK (date_trunc('day', v) = v));
+    INSERT INTO ck VALUES ('2024-01-05');
+    SELECT v FROM ck;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    is not supported in a CHECK constraint
+}

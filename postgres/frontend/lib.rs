@@ -4,6 +4,7 @@ mod auth_members;
 mod catalog;
 mod classes;
 mod copy;
+mod datetime_functions;
 mod error;
 mod functions;
 mod open;

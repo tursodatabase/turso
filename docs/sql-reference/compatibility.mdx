@@ -97,3 +97,12 @@ remains unsupported. These settings do not add timeout enforcement, row-level
 security, function-body validation, synchronized scans, or additional diagnostic
 message levels. Previously accepted no-op requests for unsupported modes now
 raise an error rather than reporting that those modes took effect.
+
+## PostgreSQL date and time functions
+
+`extract(field FROM x)` and `date_trunc(unit, x)` work as in PostgreSQL for `x` of type `date`, `timestamp` or `timestamptz`:
+
+- `extract` fields: `year`, `quarter`, `month`, `week`, `day`, `dow`, `doy`, `epoch`, `hour`, `minute`, `second`
+- `date_trunc` units: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`
+
+Other fields and units, a unit that is not a string constant, and an `x` that is a string constant, `NULL` or parameter (write `date '2024-01-05'`) raise an error with SQLSTATE `0A000`. So does a call in a `CHECK` constraint.
