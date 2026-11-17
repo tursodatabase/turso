@@ -2073,3 +2073,22 @@ test cmp-coalesce-of-date-and-timestamp-in-trigger-when-is-not-supported {
 expect error {
     cannot compare type date with type timestamp
 }
+
+# A recursive CTE's column holds what each of its SELECTs gives it. When the
+# initial SELECT gives NULL, the column still holds the values of the recursive
+# SELECT.
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-recursive-cte-of-null-and-timestamp-is-not-supported {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO a VALUES (1, '2024-01-05');
+    WITH RECURSIVE r(x, n) AS (
+        SELECT NULL, 0
+        UNION ALL
+        SELECT CAST('2024-01-05 00:00' AS timestamp), n + 1 FROM r WHERE n < 1
+    )
+    SELECT a.id FROM a, r WHERE a.d = r.x;
+}
+expect error {
+    cannot compare type date with type timestamp
+}

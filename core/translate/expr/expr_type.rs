@@ -588,8 +588,7 @@ fn column_reference_type(
 }
 
 /// The type of column `column` of a query's result. In a compound SELECT it is
-/// [compound_column_type], and in a recursive CTE the type the first SELECT
-/// gives it, as in PostgreSQL.
+/// [compound_column_type] of its SELECTs.
 pub(crate) fn query_column_type(plan: &Plan, column: usize, resolver: &Resolver) -> ExprType {
     match plan {
         Plan::Select(select) => select_column_type(select, column, resolver),
@@ -602,7 +601,11 @@ pub(crate) fn query_column_type(plan: &Plan, column: usize, resolver: &Resolver)
             column,
             resolver,
         ),
-        Plan::RecursiveCte(plan) => query_column_type(&plan.initial_query, column, resolver),
+        // A recursive CTE is planned only as the body of a WITH clause, and its
+        // columns are typed by query_output_columns.
+        Plan::RecursiveCte(_) => {
+            unreachable!("prepare_select_plan returns only SELECTs and compound SELECTs")
+        }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE and UPDATE plans have no result columns")
         }

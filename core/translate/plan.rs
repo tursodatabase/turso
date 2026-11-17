@@ -3202,13 +3202,10 @@ pub(super) fn query_output_columns(
         Plan::Select(select) if !select.values.is_empty() => {
             core::iter::once(select.as_ref()).try_collect()?
         }
-        Plan::RecursiveCte(recursive_cte) => [
-            recursive_cte.initial_query.as_ref(),
-            recursive_cte.recursive_query.as_ref(),
-        ]
-        .into_iter()
-        .flat_map(recursive_cte_query_selects)
-        .try_collect()?,
+        Plan::RecursiveCte(recursive_cte) => {
+            recursive_cte_selects(&recursive_cte.initial_query, &recursive_cte.recursive_query)
+                .try_collect()?
+        }
         Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::Delete(_) | Plan::Update(_) => {
             core::iter::empty().try_collect()?
         }
@@ -3219,6 +3216,15 @@ pub(super) fn query_output_columns(
             resolver.schema(),
         )?;
     }
+
+    // A recursive CTE's column holds what each of its SELECTs gives it, as a
+    // compound's does: in `SELECT NULL UNION ALL SELECT j FROM r, t` it holds
+    // the values of j. Its affinity comes from its result columns alone.
+    let type_arms = match plan {
+        Plan::CompoundSelect { .. } => compound_arms.as_deref(),
+        Plan::RecursiveCte(_) => Some(arms.as_slice()),
+        Plan::Select(_) | Plan::Delete(_) | Plan::Update(_) => None,
+    };
 
     let mut columns = result_columns
         .iter()
@@ -3257,7 +3263,7 @@ pub(super) fn query_output_columns(
         // text collation of the leftmost SELECT only, as in SQLite. The
         // compound itself removes duplicates with the collation of
         // `compound_column_collation`, which looks at every SELECT.
-        let result_type = match &compound_arms {
+        let result_type = match type_arms {
             Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
             None => type_of(result_expr, &env),
         };
@@ -3278,20 +3284,29 @@ pub(super) fn query_output_columns(
     Ok((columns, column_types))
 }
 
-/// The SELECTs of a recursive CTE's initial or recursive query.
-pub(crate) fn recursive_cte_query_selects(query: &Plan) -> impl Iterator<Item = &SelectPlan> {
-    let (left, right_most): (&[(SelectPlan, ast::CompoundOperator)], &SelectPlan) = match query {
-        Plan::Select(select) => (&[], select),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => (left, right_most),
-        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("a recursive CTE's queries are SELECTs")
-        }
-    };
-    left.iter()
-        .map(|(select, _)| select)
-        .chain(core::iter::once(right_most))
+/// The SELECTs of a recursive CTE: those of its initial query, then those of
+/// its recursive query.
+pub(crate) fn recursive_cte_selects<'a>(
+    initial_query: &'a Plan,
+    recursive_query: &'a Plan,
+) -> impl Iterator<Item = &'a SelectPlan> {
+    [initial_query, recursive_query]
+        .into_iter()
+        .flat_map(|query| {
+            let (left, right_most): (&[(SelectPlan, ast::CompoundOperator)], &SelectPlan) =
+                match query {
+                    Plan::Select(select) => (&[], select),
+                    Plan::CompoundSelect {
+                        left, right_most, ..
+                    } => (left, right_most),
+                    Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {
+                        unreachable!("a recursive CTE's queries are SELECTs")
+                    }
+                };
+            left.iter()
+                .map(|(select, _)| select)
+                .chain(core::iter::once(right_most))
+        })
 }
 
 fn subquery_output_columns(
