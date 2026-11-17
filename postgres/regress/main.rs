@@ -21,9 +21,12 @@
 //!
 //! The transcript emulation mirrors what `pg_regress` gets out of
 //! `psql -X -a -q` with pg_regress's pinned environment (the equivalent
-//! settings are sent as startup parameters). If every test starts failing
-//! with uniform, systematic diffs, suspect a drift between this emulation
-//! and psql before suspecting the server.
+//! settings are sent as startup parameters). tursopg refuses the TimeZone,
+//! DateStyle and IntervalStyle that pg_regress sets, so only
+//! `--server postgres` sends them, and on tursopg the tests whose output
+//! depends on them fail. If every test starts failing with uniform,
+//! systematic diffs, suspect a drift between this emulation and psql before
+//! suspecting the server.
 //!
 //! The meta-commands the corpus uses are interpreted: psql variables
 //! (`\set`, `\getenv`, interpolation of `:name`, `:'name'`, `:"name"`),
@@ -74,6 +77,17 @@ struct Args {
     /// Maximum diff lines to print per failed test (0 = unlimited).
     #[arg(long, default_value_t = 40)]
     max_diff_lines: usize,
+
+    /// The server that the DSN points to.
+    #[arg(long, value_enum, default_value_t = Server::Tursopg)]
+    server: Server,
+}
+
+/// The server that the runner connects to.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Server {
+    Tursopg,
+    Postgres,
 }
 
 /// Exit codes: 0 all passed, 1 output mismatches, 2 harness error,
@@ -110,7 +124,7 @@ fn run(args: &Args) -> Result<RunResult> {
         .clone()
         .or_else(|| std::env::var("PGREGRESS_DSN").ok())
         .unwrap_or_else(|| DEFAULT_DSN.to_string());
-    let params = ConnParams::parse(&dsn)?;
+    let params = ConnParams::parse(&dsn, args.server)?;
 
     let mut scripts = Vec::new();
     for path in &args.paths {
@@ -1468,11 +1482,12 @@ struct ConnParams {
     user: String,
     password: Option<String>,
     database: String,
+    server: Server,
 }
 
 impl ConnParams {
     /// Parses a `postgres://[user[:password]@]host[:port][/database]` DSN.
-    fn parse(dsn: &str) -> Result<ConnParams> {
+    fn parse(dsn: &str, server: Server) -> Result<ConnParams> {
         let rest = dsn
             .strip_prefix("postgres://")
             .or_else(|| dsn.strip_prefix("postgresql://"))
@@ -1508,7 +1523,29 @@ impl ConnParams {
             user,
             password,
             database: database.to_string(),
+            server,
         })
+    }
+
+    /// The startup parameters of a test's session: pg_regress's psql
+    /// environment (PGAPPNAME, PGTZ, PGDATESTYLE and PGOPTIONS). tursopg
+    /// refuses pg_regress's TimeZone, DateStyle and IntervalStyle, so only
+    /// PostgreSQL gets them.
+    fn startup_parameters(&self, test_name: &str) -> Vec<(&'static str, String)> {
+        let mut parameters = vec![
+            ("user", self.user.clone()),
+            ("database", self.database.clone()),
+            ("application_name", format!("pg_regress/{test_name}")),
+        ];
+        match self.server {
+            Server::Postgres => parameters.extend([
+                ("options", "-c intervalstyle=postgres_verbose".to_owned()),
+                ("datestyle", "Postgres, MDY".to_owned()),
+                ("timezone", "America/Los_Angeles".to_owned()),
+            ]),
+            Server::Tursopg => {}
+        }
+        parameters
     }
 }
 
@@ -1518,9 +1555,7 @@ struct PgConn {
 }
 
 impl PgConn {
-    /// Connects and performs the startup handshake. The startup parameters
-    /// replicate pg_regress's psql environment (PGTZ, PGDATESTYLE, PGOPTIONS,
-    /// PGAPPNAME) so transcripts are byte-reproducible.
+    /// Connects and performs the startup handshake.
     fn connect(params: &ConnParams, test_name: &str) -> Result<PgConn> {
         let stream = TcpStream::connect((params.host.as_str(), params.port))
             .with_context(|| format!("connecting to {}:{}", params.host, params.port))?;
@@ -1538,14 +1573,7 @@ impl PgConn {
 
         let mut startup = Vec::new();
         startup.extend_from_slice(&196608u32.to_be_bytes()); // protocol 3.0
-        for (k, v) in [
-            ("user", params.user.as_str()),
-            ("database", params.database.as_str()),
-            ("application_name", &format!("pg_regress/{test_name}")),
-            ("options", "-c intervalstyle=postgres_verbose"),
-            ("datestyle", "Postgres, MDY"),
-            ("timezone", "America/Los_Angeles"),
-        ] {
+        for (k, v) in params.startup_parameters(test_name) {
             startup.extend_from_slice(k.as_bytes());
             startup.push(0);
             startup.extend_from_slice(v.as_bytes());

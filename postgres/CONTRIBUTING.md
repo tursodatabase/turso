@@ -60,6 +60,10 @@ cargo run -p tursopg -- --server 127.0.0.1:5432 /tmp/regress.db &
 cargo run -p turso_pg_regress -- --dsn 'postgres://127.0.0.1:5432/regression'
 ```
 
+Add `--server postgres` when the DSN points at real PostgreSQL. The runner then
+also sends the TimeZone, DateStyle and IntervalStyle that pg_regress uses, which
+tursopg refuses.
+
 ## Differential dump fuzzing
 
 The Rust crate [`dump-fuzzer/`](dump-fuzzer/) uses Hegel to generate SQL, load it
