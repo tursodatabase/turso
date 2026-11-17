@@ -2057,7 +2057,9 @@ mod immutable_record {
             &self.payload
         }
 
-        #[inline]
+        // The sorter and the MVCC cursors call this once per row. The
+        // compiler inlines it into Sorter::next only in some builds.
+        #[inline(always)]
         #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
             let blob = self.as_blob_mut();
