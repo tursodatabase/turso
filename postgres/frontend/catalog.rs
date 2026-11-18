@@ -98,6 +98,10 @@ impl Dialect for PostgresDialect {
         Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(turso_sqlite::SqliteDialect)
+    }
+
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.

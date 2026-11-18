@@ -4,6 +4,7 @@
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
 
+use std::sync::Arc;
 use turso_core::{Dialect, Result};
 use turso_parser::{ast, parser::Parser};
 
@@ -29,5 +30,9 @@ impl Dialect for SqliteDialect {
 
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition> {
         Ok(Parser::new(sql.as_bytes()).parse_column_definition(true)?)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 }

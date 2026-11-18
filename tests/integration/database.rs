@@ -563,6 +563,10 @@ fn test_errors_on_zero_divisor_dialect() {
         ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
             turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
         }
+
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(SqliteDialect)
+        }
         fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             SqliteDialect.parse(sql)
         }
