@@ -13,7 +13,7 @@ setup t_b_n_ts_j_jb_arr_u_with_rows {
     INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
 }
 
-# C-01 (S1): boolean true: raw value, inside json_build_object
+# C-01 (S2): boolean true: raw value, inside json_build_object
 test gap-c-01-boolean-true-raw-value-inside-json-build-object {
     CREATE TABLE t (v boolean);
     INSERT INTO t VALUES (true);
@@ -61,7 +61,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-05 (S1): numeric(10,2) 1.005: raw value, inside json_build_object
+# C-05 (S2): numeric(10,2) 1.005: raw value, inside json_build_object
 test gap-c-05-numeric-10-2-1-005-raw-value-inside-json-build-o {
     CREATE TABLE t (v numeric(10,2));
     INSERT INTO t VALUES (1.005);
@@ -73,7 +73,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-06 (S1): numeric 1.50: raw value, inside json_build_object
+# C-06 (S2): numeric 1.50: raw value, inside json_build_object
 test gap-c-06-numeric-1-50-raw-value-inside-json-build-object {
     CREATE TABLE t (v numeric);
     INSERT INTO t VALUES (1.50);
@@ -85,7 +85,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-07 (S1): numeric 123456789012345678901234567890.123: raw value, inside json_build_object
+# C-07 (S2): numeric 123456789012345678901234567890.123: raw value, inside json_build_object
 test gap-c-07-numeric-123456789012345678901234567890-123-raw-v {
     CREATE TABLE t (v numeric);
     INSERT INTO t VALUES (123456789012345678901234567890.123);
@@ -181,7 +181,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# C-15 (S1): timestamp '2026-10-08T12:00:00.5': raw value, inside json_build_object
+# C-15 (S2): timestamp '2026-10-08T12:00:00.5': raw value, inside json_build_object
 test gap-c-15-timestamp-2026-10-08t12-00-00-5-raw-value-inside {
     CREATE TABLE t (v timestamp);
     INSERT INTO t VALUES ('2026-10-08T12:00:00.5');
@@ -205,7 +205,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-17 (S1): timestamptz '2026-10-08T12:00:00.123456Z': raw value, inside json_build_object
+# C-17 (S2): timestamptz '2026-10-08T12:00:00.123456Z': raw value, inside json_build_object
 test gap-c-17-timestamptz-2026-10-08t12-00-00-123456z-raw-valu {
     CREATE TABLE t (v timestamptz);
     INSERT INTO t VALUES ('2026-10-08T12:00:00.123456Z');
@@ -217,7 +217,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-18 (S1): interval '1 day 2 hours': raw value, inside json_build_object
+# C-18 (S2): interval '1 day 2 hours': raw value, inside json_build_object
 test gap-c-18-interval-1-day-2-hours-raw-value-inside-json-bui {
     CREATE TABLE t (v interval);
     INSERT INTO t VALUES ('1 day 2 hours');
@@ -229,7 +229,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# C-19 (S1): interval '90 minutes': raw value, inside json_build_object
+# C-19 (S2): interval '90 minutes': raw value, inside json_build_object
 test gap-c-19-interval-90-minutes-raw-value-inside-json-build {
     CREATE TABLE t (v interval);
     INSERT INTO t VALUES ('90 minutes');
@@ -241,7 +241,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# C-20 (S1): json '{"b": 2,  "a":1}': raw value, inside json_build_object
+# C-20 (S2): json '{"b": 2,  "a":1}': raw value, inside json_build_object
 test gap-c-20-json-b-2-a-1-raw-value-inside-json-build-object {
     CREATE TABLE t (v json);
     INSERT INTO t VALUES ('{"b": 2,  "a":1}');
@@ -253,7 +253,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-21 (S1): jsonb '{"b": 2,  "a":1, "c": {"z": 1.50}}': raw value, inside json_build_object
+# C-21 (S2): jsonb '{"b": 2,  "a":1, "c": {"z": 1.50}}': raw value, inside json_build_object
 test gap-c-21-jsonb-b-2-a-1-c-z-1-50-raw-value-inside-json-bui {
     CREATE TABLE t (v jsonb);
     INSERT INTO t VALUES ('{"b": 2,  "a":1, "c": {"z": 1.50}}');
@@ -399,7 +399,7 @@ expect {
 @sqlstate 23000
 expect @tursopg error {}
 
-# C-40 (S1): json_agg of mixed-type row
+# C-40 (S2): json_agg of mixed-type row
 @setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-40-json-agg-of-mixed-type-row {
     SELECT json_agg(json_build_object('b', b, 'n', n, 'ts', ts, 'j', j, 'jb', jb, 'u', u)) FROM t;

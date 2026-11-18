@@ -24,6 +24,7 @@ setup t_id {
 }
 
 # D-01 (S1): FK not enforced by default
+# D-02 had the same SQL. This test covers it.
 @setup parent_id_child_id_pid_with_rows
 test gap-d-01-fk-not-enforced-by-default {
     INSERT INTO child VALUES (2, 99);
@@ -308,7 +309,7 @@ test gap-d-30-varchar-n-too-long {
 @sqlstate 22001
 expect error {}
 
-# D-31 (S2): char(n) too long
+# D-31 (S3): char(n) too long
 test gap-d-31-char-n-too-long {
     CREATE TABLE t (s char(3));
     INSERT INTO t VALUES ('abcd');
@@ -408,7 +409,7 @@ test gap-d-42-write-in-read-only-transaction {
 @sqlstate 25006
 expect error {}
 
-# D-44 (S3): unknown type in cast
+# D-44 (S1): unknown type in cast
 test gap-d-44-unknown-type-in-cast {
     SELECT 1::nosuchtype;
 }

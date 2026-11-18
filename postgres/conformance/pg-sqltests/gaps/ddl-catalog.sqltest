@@ -725,7 +725,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-64 (S2): partitioned table without partitions rejects insert
+# E-64 (S3): partitioned table without partitions rejects insert
 test gap-e-64-partitioned-table-without-partitions-rejects-ins {
     CREATE TABLE m (id int, d date) PARTITION BY RANGE (d);
     INSERT INTO m VALUES (1, '2026-10-08');
@@ -972,7 +972,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-97 (S3): CREATE TABLE in pg_catalog
+# E-97 (S1): CREATE TABLE in pg_catalog
 test gap-e-97-create-table-in-pg-catalog {
     CREATE TABLE pg_catalog.zz (id int);
 }

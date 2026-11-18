@@ -292,7 +292,7 @@ test gap-a-35-invalid-timestamptz {
 @sqlstate 22007
 expect error {}
 
-# A-36 (S2): timestamptz equality across offsets
+# A-36 (S1): timestamptz equality across offsets
 test gap-a-36-timestamptz-equality-across-offsets {
     SELECT '2026-10-08 14:00:00+02'::timestamptz = '2026-10-08 12:00:00Z'::timestamptz;
 }
@@ -321,7 +321,7 @@ expect {
 @sqlstate 22007
 expect @tursopg error {}
 
-# A-39 (S1): invalid date (Feb 30)
+# A-39 (S3): invalid date (Feb 30)
 test gap-a-39-invalid-date-feb-30 {
     SELECT '2026-02-30'::date;
 }
@@ -340,7 +340,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-42 (S1): interval input forms
+# A-42 (S2): interval input forms
 test gap-a-42-interval-input-forms {
     SELECT '1 day 2 hours'::interval, '90 minutes'::interval, 'P1DT2H'::interval;
 }
@@ -461,7 +461,7 @@ expect {
     1
 }
 
-# A-61 (S3): text column = int literal (PG: no operator)
+# A-61 (S1): text column = int literal (PG: no operator)
 test gap-a-61-text-column-int-literal-pg-no-operator {
     CREATE TABLE t (s text);
     INSERT INTO t VALUES ('1');
@@ -512,7 +512,7 @@ expect {
     t
 }
 
-# A-66 (S3): insert integer 1 into bool column
+# A-66 (S1): insert integer 1 into bool column
 @setup t_b
 test gap-a-66-insert-integer-1-into-bool-column {
     INSERT INTO t VALUES (1) RETURNING b;

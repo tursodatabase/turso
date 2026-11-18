@@ -19,7 +19,7 @@ setup v_x_with_rows {
 }
 
 @backend postgres
-setup auth_uid_from_claims_on_postgres {
+setup auth_role_from_claims_on_postgres {
     CREATE SCHEMA auth;
     CREATE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS $$ SELECT coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'))::text $$;
 }
@@ -1201,7 +1201,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-116 (S2): to_char(timestamptz)
+# B-116 (S1): to_char(timestamptz)
 test gap-b-116-to-char-timestamptz {
     SELECT to_char('2026-10-08 12:00:00+00'::timestamptz, 'YYYY-MM-DD HH24:MI');
 }
@@ -1222,7 +1222,7 @@ expect {
 expect @tursopg error {}
 
 # B-126 (S2): auth.role() reads the role claim
-@setup auth_uid_from_claims_on_postgres
+@setup auth_role_from_claims_on_postgres
 test gap-b-126-auth-role-reads-the-role-claim {
     SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}', false);
     SELECT auth.role();
