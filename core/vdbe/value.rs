@@ -724,7 +724,7 @@ impl Value {
                 },
                 Some(ignore) => match ignore.cast_text_ref() {
                     Some(ignore) => {
-                        let input = self.to_string();
+                        let input = self.cast_text_ref().expect("a NULL value returns above");
                         let mut chars = input.chars().peekable();
                         let mut out =
                             <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
@@ -3102,6 +3102,10 @@ mod tests {
         let input = Value::build_text("aabb");
         let expected = Value::Null;
         assert_eq!(input.exec_unhex(Some(&Value::Null)), expected);
+
+        let input = Value::from_i64(1234);
+        let expected = blob(&[0x12, 0x34]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
     }
 
     #[test]
