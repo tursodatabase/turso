@@ -927,6 +927,13 @@ fn use_pushed_change_hint_for_local_replay(
     !raw_page_replay_on_sql_conn && matches!(stream_kind, DbChangesStreamKind::LegacyPages)
 }
 
+/// Main WAL state after the PASSIVE checkpoint of its synced frames.
+struct SyncedWalCheckpoint {
+    main_wal_salt: Option<Vec<u32>>,
+    /// Main WAL frames up to this one hold the last synced state.
+    watermark: u64,
+}
+
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn read_db_meta<Ctx>(
         coro: &Coro<Ctx>,
@@ -1375,7 +1382,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(conn)
     }
 
-    async fn checkpoint_passive<Ctx>(&self, coro: &Coro<Ctx>) -> Result<(Option<Vec<u32>>, u64)> {
+    async fn checkpoint_passive<Ctx>(&self, coro: &Coro<Ctx>) -> Result<SyncedWalCheckpoint> {
         let watermark = self.meta().revert_since_wal_watermark;
         tracing::info!(
             "checkpoint(path={:?}): revert_since_wal_watermark={}",
@@ -1403,7 +1410,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 meta.revert_since_wal_salt = main_wal_salt.clone();
             })
             .await?;
-            return Ok((main_wal_salt, 0));
+            return Ok(SyncedWalCheckpoint {
+                main_wal_salt,
+                watermark: 0,
+            });
         }
         // we do this Passive checkpoint in order to transfer all synced frames to the DB file and make history of revert DB valid
         // if we will not do that we will be in situation where WAL in the revert DB is not valid relative to the DB file
@@ -1420,7 +1430,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
             ));
         }
-        Ok((main_wal_salt, watermark))
+        Ok(SyncedWalCheckpoint {
+            main_wal_salt,
+            watermark,
+        })
     }
 
     pub async fn stats<Ctx>(&self, coro: &Coro<Ctx>) -> Result<SyncEngineStats> {
@@ -1488,7 +1501,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             return Ok(());
         }
 
-        let (main_wal_salt, watermark) = self.checkpoint_passive(coro).await?;
+        let SyncedWalCheckpoint {
+            main_wal_salt,
+            watermark,
+        } = self.checkpoint_passive(coro).await?;
 
         tracing::info!(
             "checkpoint(path={:?}): passive checkpoint is done",
@@ -2181,7 +2197,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
-        let (_, watermark) = self.checkpoint_passive(coro).await?;
+        let watermark = self.checkpoint_passive(coro).await?.watermark;
 
         let revert_conn = self.open_revert_db_conn(coro).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
