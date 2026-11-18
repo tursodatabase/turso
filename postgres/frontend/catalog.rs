@@ -279,34 +279,36 @@ impl Dialect for PostgresDialect {
         crate::schema_state::build_schema_state(schema, results)
     }
 
-    fn translate_catalog_changes(
+    fn translate_relation_changes(
         &self,
         program: &mut turso_core::ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[turso_core::CatalogChange],
+        changes: &[turso_core::RelationChange<'_>],
     ) -> turso_core::Result<()> {
-        match changes {
-            [turso_core::CatalogChange::CreateRole { name, options }] => {
-                return crate::roles::translate_create_role(program, schema, name, options);
-            }
-            [change @ turso_core::CatalogChange::GrantRole { .. }] => {
-                return crate::auth_members::translate_grant_role(
-                    program, schema, connection, change,
-                );
-            }
-            _ => {}
-        }
-        crate::classes::translate_catalog_changes(program, schema, connection, changes)
+        crate::classes::translate_relation_changes(program, schema, connection, changes)
     }
 
-    fn apply_catalog_change(
+    fn translate_access_statement(
         &self,
-        schema: &mut Schema,
-        change: &turso_core::CatalogChange,
-        values: &[Value],
+        program: &mut turso_core::ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        statement: &turso_core::AccessStatement<'_>,
     ) -> turso_core::Result<()> {
-        crate::schema_state::apply_catalog_change(schema, change, values)
+        match statement {
+            turso_core::AccessStatement::CreateRole { name, options } => {
+                crate::roles::translate_create_role(program, schema, name, options)
+            }
+            turso_core::AccessStatement::GrantRole {
+                revoke,
+                roles,
+                grantees,
+            } => crate::auth_members::translate_grant_role(
+                program, schema, connection, *revoke, roles, grantees,
+            ),
+            _ => crate::classes::translate_access_statement(program, schema, connection, statement),
+        }
     }
 
     /// The built-in superuser is found by its name, `postgres`, too.
