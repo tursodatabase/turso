@@ -6,7 +6,7 @@
 
 use crate::{
     namespace::NamespaceId,
-    schema::{RelationKind, Schema},
+    schema::{load::LoadStep, RelationKind, Schema},
     translate::{emitter::Resolver, sqlite_schema_rows::open_sqlite_schema_for_write},
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Connection, LimboError, Result, Value,
@@ -26,6 +26,13 @@ pub trait Catalog: Send + Sync {
         ctx: &WriteContext<'_>,
         change: &CatalogWrite<'_>,
     ) -> Result<AfterWrites>;
+
+    /// The steps that read what this catalog stores besides the engine's own
+    /// tables. They run after the engine's steps, when a database is opened
+    /// and when a connection reads its schema again.
+    fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+        Vec::new()
+    }
 }
 
 /// The statement that a [`Catalog`] writes for.
