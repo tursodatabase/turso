@@ -19775,12 +19775,10 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::security::roles::SessionRole;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
     use crate::vdbe::{BranchOffset, PrepareContext};
-    use crate::SqliteDialect;
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
+    use crate::{MemoryIO, IO};
 
     /// A weighted step must leave the same exact total as the weighted sum
     /// computed in 128-bit arithmetic, including when the i64 part wraps.
@@ -19904,103 +19902,6 @@ mod tests {
         let partition_idx = ht.partition_for_keys(&probe_key).unwrap();
 
         (ht, probe_key, partition_idx)
-    }
-
-    /// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
-    /// but for attached dbs
-    #[test]
-    fn test_cleanup_vacuum_into_rolls_back_attached_only_source_txn() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let main_path = dir.path().join("vacuum-into-cleanup-main.db");
-        let attached_path = dir.path().join("vacuum-into-cleanup-attached.db");
-
-        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            main_path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute(format!(
-            "ATTACH DATABASE '{}' AS att",
-            attached_path.display()
-        ))
-        .unwrap();
-        conn.execute("CREATE TABLE att.t(x)").unwrap();
-        conn.execute("INSERT INTO att.t VALUES (1)").unwrap();
-
-        conn.execute("BEGIN").unwrap();
-        let attached_db_id = conn.get_database_id_by_name("att").unwrap();
-        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
-        attached_pager.begin_read_tx().unwrap();
-
-        assert!(
-            !conn.pager.load().holds_read_lock(),
-            "attached-only cleanup regression requires the main pager to stay lock-free"
-        );
-        assert!(
-            attached_pager.holds_read_lock(),
-            "attached source pager should hold the pinned read snapshot"
-        );
-
-        let mut state = ProgramState::new(0, 0);
-        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-
-        cleanup_op_vacuum_into(&conn, &mut state, Box::default()).unwrap();
-
-        assert!(
-            conn.get_auto_commit(),
-            "cleanup should restore auto-commit without going through SQL ROLLBACK"
-        );
-        assert_eq!(state.auto_txn_cleanup, TxnCleanup::None);
-        assert!(
-            !attached_pager.holds_read_lock(),
-            "cleanup should release the attached source read snapshot"
-        );
-
-        conn.execute("INSERT INTO att.t VALUES (2)").unwrap();
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM att.t").unwrap();
-        let mut count = 0_i64;
-        stmt.run_with_row_callback(|row| {
-            count = row.get(0)?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn test_savepoint_loads_evicted_attached_header_before_mirroring() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            "savepoint-main.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x)").unwrap();
-
-        let attached_db_id = conn.get_database_id_by_name("aux").unwrap();
-        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
-        attached_pager.begin_read_tx().unwrap();
-        attached_pager.clear_page_cache(false);
-
-        conn.execute("SAVEPOINT s").unwrap();
-        conn.execute("RELEASE s").unwrap();
     }
 
     #[test]

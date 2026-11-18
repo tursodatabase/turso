@@ -961,3 +961,30 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_savepoint_loads_evicted_attached_header_before_mirroring() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "savepoint-main.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
+    conn.execute("CREATE TABLE aux.t(x)").unwrap();
+
+    let attached_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
+    attached_pager.begin_read_tx().unwrap();
+    attached_pager.clear_page_cache(false);
+
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("RELEASE s").unwrap();
+}
