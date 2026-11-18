@@ -133,6 +133,8 @@ pub(crate) struct SchemaLoader {
     steps: VecDeque<Box<dyn LoadStep>>,
     /// The statement of the current step that is being read.
     statement: Option<Box<Statement>>,
+    /// Whether `statement` is a [`LoadQuery::engine_metadata_read`].
+    statement_reads_engine_metadata: bool,
     install: SchemaInstall,
     /// Whether the connection's schema is the one that the current step
     /// started with.
@@ -165,6 +167,7 @@ impl SchemaLoader {
             load: SchemaLoad::new(schema),
             steps: steps.into(),
             statement: None,
+            statement_reads_engine_metadata: false,
             install,
             current_step_schema_installed: false,
         }
@@ -183,7 +186,18 @@ impl SchemaLoader {
                 .expect("a prepared statement belongs to a step");
             let statement = self.statement.as_mut().expect("prepared above");
             let load = &mut self.load;
-            match statement.run_with_row_callback_nonblock(|row| step.row(load, row)) {
+            let reads_engine_metadata = self.statement_reads_engine_metadata;
+            let on_row = |row: &Row| {
+                // A step of a dialect's catalog has no connection to check
+                // this with, so the check is here for every such read.
+                turso_assert!(
+                    !reads_engine_metadata
+                        || !matches!(conn.get_tx_state(), TransactionState::None),
+                    "engine metadata must be read in a transaction"
+                );
+                step.row(load, row)
+            };
+            match statement.run_with_row_callback_nonblock(on_row) {
                 Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                 Ok(IOResult::Done(())) => {}
                 Err(err) => return Err(step.query_failed(QueryFailure::Read, *err).into()),
@@ -227,6 +241,8 @@ impl SchemaLoader {
                 .prepare_with_origin(&query.sql, query.origin)
                 .map_err(|err| step.query_failed(QueryFailure::Prepare, err))?;
             self.statement = Some(Box::new(statement));
+            self.statement_reads_engine_metadata =
+                query.origin == StatementOrigin::EngineMetadataRead;
             return Ok(true);
         }
     }
@@ -271,6 +287,7 @@ pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box
         steps.push(Box::new(ViewsAndIndexes::new(conn.clone())));
     }
     steps.push(Box::new(DialectState::new(conn.clone())));
+    steps.extend(conn.db.dialect().catalog().load_steps());
     steps
 }
 
