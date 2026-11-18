@@ -383,7 +383,9 @@ impl Value {
     pub fn exec_quote(&self) -> Self {
         match self {
             Value::Null => Value::build_text("NULL"),
-            Value::Numeric(Numeric::Integer(i)) => Value::build_text(i.to_string()),
+            Value::Numeric(Numeric::Integer(i)) => {
+                Value::build_text(IntegerText::new(*i).as_str().to_owned())
+            }
             Value::Numeric(Numeric::Float(f)) => {
                 Value::build_text(format_float_for_quote(f64::from(*f)))
             }
@@ -396,16 +398,19 @@ impl Value {
                 Value::build_text(quoted)
             }
             Value::Text(s) => {
-                let mut quoted = String::with_capacity(s.as_str().len() + 2);
+                // The text ends at the first NUL, and each quote is doubled.
+                let text = sqlite_text_prefix(s.as_str());
+                let quotes = text.bytes().filter(|&b| b == b'\'').count();
+                let mut quoted = String::with_capacity(text.len() + quotes + 2);
                 quoted.push('\'');
-                for c in s.as_str().chars() {
-                    if c == '\0' {
-                        break;
-                    } else if c == '\'' {
-                        quoted.push('\'');
-                        quoted.push(c);
-                    } else {
-                        quoted.push(c);
+                if quotes == 0 {
+                    quoted.push_str(text);
+                } else {
+                    for (i, part) in text.split('\'').enumerate() {
+                        if i > 0 {
+                            quoted.push_str("''");
+                        }
+                        quoted.push_str(part);
                     }
                 }
                 quoted.push('\'');
@@ -2467,6 +2472,25 @@ mod tests {
         let expected_blob = blob(b"example");
         let expected_len = Value::from_i64(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
+    }
+
+    #[test]
+    fn quote_doubles_each_quote_before_the_first_nul() {
+        for (text, expected) in [
+            ("", "''"),
+            ("'", "''''"),
+            ("''", "''''''"),
+            ("'a'", "'''a'''"),
+            ("é'ü", "'é''ü'"),
+            ("a'\0'b", "'a'''"),
+            ("\0'", "''"),
+        ] {
+            assert_eq!(
+                Value::build_text(text).exec_quote(),
+                Value::build_text(expected),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
