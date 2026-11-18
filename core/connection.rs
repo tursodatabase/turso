@@ -3769,13 +3769,14 @@ impl Connection {
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
-            let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
+            let sql = Self::sequence_descriptor_query(backing_table_name);
             let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
-                     \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
-                ))
+                Self::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    seq_name,
+                    "cannot prepare descriptor SELECT",
+                    &err,
+                )
             })?;
             *stmt = Some(Box::new(prepared));
             // Fresh statement → clear any descriptor captured for a prior backing
@@ -3785,21 +3786,17 @@ impl Connection {
         }
         let s = stmt.as_mut().expect("stmt set above");
         match s.run_with_row_callback_nonblock(|row| {
-            *meta = Some((
-                row.get::<i64>(0)?,
-                row.get::<i64>(1)?,
-                row.get::<i64>(2)?,
-                row.get::<i64>(3)?,
-                row.get::<i64>(4)? != 0,
-            ));
+            *meta = Some(Self::sequence_descriptor_from_row(row)?);
             Ok(())
         }) {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
-            Err(err) => Err(LimboError::Corrupt(format!(
-                "internal sequence backing table \"{backing_table_name}\" for sequence \
-                 \"{seq_name}\": descriptor row read failed: {err}"
-            ))
+            Err(err) => Err(Self::sequence_backing_table_corrupt(
+                backing_table_name,
+                seq_name,
+                "descriptor row read failed",
+                &err,
+            )
             .into()),
         }
     }
@@ -3807,7 +3804,7 @@ impl Connection {
     /// Build a `Sequence` from a descriptor row captured by
     /// [`Self::read_seq_descriptor_row_nonblock`]. An absent/invalid descriptor
     /// is on-disk corruption (see that method's doc).
-    fn sequence_from_descriptor_meta(
+    pub(crate) fn sequence_from_descriptor_meta(
         seq_name: &str,
         backing_table_name: &str,
         meta: Option<(i64, i64, i64, i64, bool)>,
@@ -3847,40 +3844,36 @@ impl Connection {
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
-            let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
-            let sql = format!(
-                "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
-            );
+            let sql = Self::sequence_watermark_query(backing_table_name, seq);
             let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
-                     \"{}\": cannot prepare watermark SELECT: {err}",
-                    seq.name
-                ))
+                Self::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    &seq.name,
+                    "cannot prepare watermark SELECT",
+                    &err,
+                )
             })?;
             *stmt = Some(Box::new(prepared));
             *row = None;
         }
         let s = stmt.as_mut().expect("stmt set above");
         match s.run_with_row_callback_nonblock(|r| {
-            let value = r.get::<i64>(0)?;
-            let is_called = r.get::<i64>(1)? != 0;
-            *row = Some((value, is_called));
+            *row = Some(Self::sequence_watermark_row(r)?);
             Ok(())
         }) {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
-            Err(err) => Err(LimboError::Corrupt(format!(
-                "internal sequence backing table \"{backing_table_name}\" for sequence \
-                 \"{}\": watermark row read failed: {err}",
-                seq.name
-            ))
+            Err(err) => Err(Self::sequence_backing_table_corrupt(
+                backing_table_name,
+                &seq.name,
+                "watermark row read failed",
+                &err,
+            )
             .into()),
         }
     }
 
-    fn sequence_watermark_from_row(
+    pub(crate) fn sequence_watermark_from_row(
         backing_table_name: &str,
         seq: &crate::schema::Sequence,
         row: Option<(i64, bool)>,
@@ -3894,6 +3887,55 @@ impl Connection {
         })?;
         Ok(crate::mvcc::database::first_unsafe_sequence_watermark(
             seq, value, is_called,
+        ))
+    }
+
+    /// The statement that reads the row `(start, inc, min, max, cycle)` of a
+    /// sequence backing table.
+    pub(crate) fn sequence_descriptor_query(backing_table_name: &str) -> String {
+        let escaped = backing_table_name.replace('"', "\"\"");
+        format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1")
+    }
+
+    /// The row of [`Self::sequence_descriptor_query`].
+    pub(crate) fn sequence_descriptor_from_row(row: &Row) -> Result<(i64, i64, i64, i64, bool)> {
+        Ok((
+            row.get::<i64>(0)?,
+            row.get::<i64>(1)?,
+            row.get::<i64>(2)?,
+            row.get::<i64>(3)?,
+            row.get::<i64>(4)? != 0,
+        ))
+    }
+
+    /// The statement that reads the row `(value, is_called)` that the
+    /// watermark of `seq` is derived from.
+    pub(crate) fn sequence_watermark_query(
+        backing_table_name: &str,
+        seq: &crate::schema::Sequence,
+    ) -> String {
+        let escaped = backing_table_name.replace('"', "\"\"");
+        let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
+        format!("SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1")
+    }
+
+    /// The row of [`Self::sequence_watermark_query`].
+    pub(crate) fn sequence_watermark_row(row: &Row) -> Result<(i64, bool)> {
+        Ok((row.get::<i64>(0)?, row.get::<i64>(1)? != 0))
+    }
+
+    /// The error for a statement on a sequence backing table that failed
+    /// with `err`. The backing table is the engine's own, so the failure
+    /// means the file is corrupt.
+    pub(crate) fn sequence_backing_table_corrupt(
+        backing_table_name: &str,
+        seq_name: &str,
+        problem: &str,
+        err: &LimboError,
+    ) -> LimboError {
+        LimboError::Corrupt(format!(
+            "internal sequence backing table \"{backing_table_name}\" for sequence \
+             \"{seq_name}\": {problem}: {err}"
         ))
     }
 
