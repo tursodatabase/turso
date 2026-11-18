@@ -5231,6 +5231,52 @@ mod tests {
     }
 
     #[test]
+    fn owner_column_of_a_sequence_of_an_attached_database_cannot_be_changed() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_mvcc(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            conn.execute("CREATE SEQUENCE s").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "ALTER SEQUENCE aux.s OWNED BY aux.t.v",
+            "ALTER SEQUENCE aux.s OWNED BY NONE",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn views_of_an_attached_database_cannot_be_created_or_dropped() {
         let dir = tempdir().unwrap();
         let attached_path = dir.path().join("attached.db");
