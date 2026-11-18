@@ -3591,8 +3591,7 @@ impl Database {
     where
         T: InternalVirtualTable + 'static,
     {
-        let dialect = self.dialect();
-        self.with_schema_mut(|schema| schema.register_internal_vtab(dialect.as_ref(), table))
+        self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
 
     /// The SQL dialect this database was opened with.

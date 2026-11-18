@@ -1484,15 +1484,11 @@ impl SchemaBuilder {
     }
 
     /// Adds the virtual table `table` to the root namespace.
-    pub fn internal_vtab<T>(
-        mut self,
-        dialect: &(impl crate::dialect::Dialect + ?Sized),
-        table: T,
-    ) -> crate::Result<Self>
+    pub fn internal_vtab<T>(mut self, table: T) -> crate::Result<Self>
     where
         T: crate::vtab::InternalVirtualTable + 'static,
     {
-        self.schema.register_internal_vtab(dialect, table)?;
+        self.schema.register_internal_vtab(table)?;
         Ok(self)
     }
 
@@ -2140,16 +2136,12 @@ impl Schema {
     /// Intended for callers that want to surface state as a queryable table
     /// without going through `CREATE VIRTUAL TABLE` — for example, extensions
     /// that contribute metadata tables or alternative-dialect catalogs.
-    pub fn register_internal_vtab<T>(
-        &mut self,
-        dialect: &(impl crate::dialect::Dialect + ?Sized),
-        table: T,
-    ) -> crate::Result<String>
+    pub fn register_internal_vtab<T>(&mut self, table: T) -> crate::Result<String>
     where
         T: crate::vtab::InternalVirtualTable + 'static,
     {
         let objects = self.namespace_mut(NamespaceId::ROOT);
-        let vtab = crate::vtab::VirtualTable::wrap_internal_table(dialect, table)?;
+        let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
         let name = vtab.name.clone();
         let lookup_name = normalize_ident(&name);
         objects.tables.insert(

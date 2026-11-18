@@ -1,10 +1,11 @@
 use crate::sync::Arc;
 use crate::util::{escape_sql_string_literal, normalize_ident, quote_identifier};
+use crate::vtab::column_definition;
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
 use strum::IntoEnumIterator;
 use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, ResultCode};
-use turso_parser::ast::PragmaName;
+use turso_parser::ast::{self, PragmaName};
 
 bitflags! {
     // Flag names match those used in SQLite:
@@ -263,7 +264,7 @@ pub(crate) struct PragmaVirtualTable {
 }
 
 impl PragmaVirtualTable {
-    pub(crate) fn functions() -> Vec<(PragmaVirtualTable, String)> {
+    pub(crate) fn functions() -> Vec<(PragmaVirtualTable, Vec<ast::ColumnDefinition>)> {
         PragmaName::iter()
             .filter(|name| {
                 *name != PragmaName::LegacyFileFormat
@@ -285,20 +286,17 @@ impl PragmaVirtualTable {
             .collect()
     }
 
-    fn create(pragma_name: String, pragma: Pragma) -> (Self, String) {
+    fn create(pragma_name: String, pragma: Pragma) -> (Self, Vec<ast::ColumnDefinition>) {
         let mut max_arg_count = 0;
         let mut has_pragma_arg = false;
 
-        let mut sql = String::from("CREATE TABLE x (");
-        let col_defs = pragma
+        let mut columns: Vec<ast::ColumnDefinition> = pragma
             .columns
             .iter()
-            .map(|col| format!("\"{col}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(&col_defs);
+            .map(|col| column_definition(col, ""))
+            .collect();
         if pragma.flags.contains(PragmaFlags::Result1) {
-            sql.push_str(", arg HIDDEN");
+            columns.push(column_definition("arg", "HIDDEN"));
             max_arg_count += 1;
             has_pragma_arg = true;
         }
@@ -306,10 +304,9 @@ impl PragmaVirtualTable {
             .flags
             .intersects(PragmaFlags::SchemaOpt | PragmaFlags::SchemaReq)
         {
-            sql.push_str(", schema HIDDEN");
+            columns.push(column_definition("schema", "HIDDEN"));
             max_arg_count += 1;
         }
-        sql.push(')');
 
         (
             PragmaVirtualTable {
@@ -318,7 +315,7 @@ impl PragmaVirtualTable {
                 max_arg_count,
                 has_pragma_arg,
             },
-            sql,
+            columns,
         )
     }
 

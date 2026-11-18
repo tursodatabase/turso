@@ -1,9 +1,8 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
-use crate::schema::Column;
+use crate::schema::{Column, FromDefinitionFlags};
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
 use crate::types::IOResultOr;
-use crate::util::columns_from_create_table_body;
 use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -46,42 +45,34 @@ impl VirtualTable {
 
     /// Wrap an `InternalVirtualTable` implementation so it can appear in a
     /// `Schema`'s catalog. The table's `name()` becomes the catalog name and
-    /// its `sql()` is parsed to derive the column metadata. Returns an error
-    /// if the SQL string is not a valid `CREATE TABLE` statement.
-    pub(crate) fn wrap_internal_table<T>(
-        dialect: &(impl crate::dialect::Dialect + ?Sized),
-        table: T,
-    ) -> crate::Result<Arc<VirtualTable>>
+    /// its `columns()` give the column metadata.
+    pub(crate) fn wrap_internal_table<T>(table: T) -> crate::Result<Arc<VirtualTable>>
     where
         T: InternalVirtualTable + 'static,
     {
         let name = table.name();
-        let sql = table.sql();
+        let columns = table.columns();
         Ok(Arc::new(Self::new_internal(
-            dialect,
             name,
-            sql,
+            &columns,
             VTabKind::TableValuedFunction,
             Arc::new(RwLock::new(table)),
         )?))
     }
 
     /// Build a virtual table around an [`InternalVirtualTable`]
-    /// implementation. `sql` must be a `CREATE TABLE` statement; it is
-    /// parsed to derive the column metadata. Schema dialects use this to
-    /// construct catalog tables (e.g. a `pg_catalog` surface) with a
-    /// non-table-valued-function kind and install them through
-    /// [`crate::dialect::Dialect::schema_builder`].
+    /// implementation. Schema dialects use this to construct catalog tables
+    /// (e.g. a `pg_catalog` surface) with a non-table-valued-function kind
+    /// and install them through [`crate::dialect::Dialect::schema_builder`].
     pub fn new_internal(
-        dialect: &(impl crate::dialect::Dialect + ?Sized),
         name: String,
-        sql: String,
+        columns: &[ast::ColumnDefinition],
         kind: VTabKind,
         table: Arc<RwLock<dyn InternalVirtualTable>>,
     ) -> crate::Result<Self> {
         Ok(VirtualTable {
             name,
-            columns: Self::resolve_columns(dialect, sql)?,
+            columns: Self::columns_from_definitions(columns)?,
             kind,
             vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
@@ -147,29 +138,37 @@ impl VirtualTable {
         dialect: &(impl crate::dialect::Dialect + ?Sized),
         schema: String,
     ) -> crate::Result<Vec<Column>> {
-        if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
-            crate::dialect::parse_statement(dialect, &schema)?.ok_or_else(|| {
-                LimboError::ParseError(
-                    "Failed to parse schema from virtual table module".to_string(),
-                )
-            })?
-        {
-            let mut columns = columns_from_create_table_body(&body)?;
-            // Like SQLite, HIDDEN marks the column and is not part of its declared type.
-            for column in columns.iter_mut().filter(|column| column.hidden()) {
-                column.ty_str = column
-                    .ty_str
-                    .split(' ')
-                    .filter(|word| !word.eq_ignore_ascii_case("HIDDEN"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-            }
-            Ok(columns)
+        if let ast::Cmd::Stmt(ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        }) = crate::dialect::parse_statement(dialect, &schema)?.ok_or_else(|| {
+            LimboError::ParseError("Failed to parse schema from virtual table module".to_string())
+        })? {
+            Self::columns_from_definitions(&columns)
         } else {
             Err(LimboError::ParseError(
                 "Failed to parse schema from virtual table module".to_string(),
             ))
         }
+    }
+
+    pub(crate) fn columns_from_definitions(
+        definitions: &[ast::ColumnDefinition],
+    ) -> crate::Result<Vec<Column>> {
+        let mut columns = definitions
+            .iter()
+            .map(|definition| Column::from_definition(definition, FromDefinitionFlags::empty()))
+            .collect::<crate::Result<Vec<Column>>>()?;
+        // Like SQLite, HIDDEN marks the column and is not part of its declared type.
+        for column in columns.iter_mut().filter(|column| column.hidden()) {
+            column.ty_str = column
+                .ty_str
+                .split(' ')
+                .filter(|word| !word.eq_ignore_ascii_case("HIDDEN"))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        Ok(columns)
     }
 
     pub fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
@@ -642,11 +641,29 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
         constraints: &[turso_ext::ConstraintInfo],
         order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode>;
-    fn sql(&self) -> String;
+    /// The columns of the table, as a `CREATE TABLE` statement would define
+    /// them. [`column_definition`] makes one.
+    fn columns(&self) -> Vec<ast::ColumnDefinition>;
     /// Whether only a superuser may read the table. True for tables that
     /// show the database file, because they show the rows row-level
     /// security hides. There is no default, so a new table must say.
     fn superuser_only(&self) -> bool;
+}
+
+/// The definition of a column named `name` with the declared type
+/// `declared_type`, as `CREATE TABLE` would parse `name declared_type`. An
+/// empty `declared_type` declares no type. As in SQLite, the word `HIDDEN`
+/// in the type hides the column from `SELECT *`.
+pub fn column_definition(name: &str, declared_type: &str) -> ast::ColumnDefinition {
+    ast::ColumnDefinition {
+        col_name: ast::Name::exact(name.to_string()),
+        col_type: (!declared_type.is_empty()).then(|| ast::Type {
+            name: declared_type.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+        constraints: Vec::new(),
+    }
 }
 
 pub trait InternalVirtualTableCursor: Send + Sync {
@@ -681,8 +698,11 @@ mod tests {
         fn name(&self) -> String {
             self.name.to_string()
         }
-        fn sql(&self) -> String {
-            format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+        fn columns(&self) -> Vec<ast::ColumnDefinition> {
+            vec![
+                column_definition("key", "TEXT"),
+                column_definition("value", "INTEGER"),
+            ]
         }
         fn superuser_only(&self) -> bool {
             false
