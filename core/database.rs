@@ -503,16 +503,19 @@ pub struct ConnectOpts {
     role: SessionRole,
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
+    portable_logical_changes: bool,
 }
 
 impl ConnectOpts {
     /// Creates settings for a connection that runs as `role`, without
-    /// encryption and without an external page codec.
+    /// encryption, without an external page codec and without portable
+    /// logical changes.
     pub fn new(role: SessionRole) -> Self {
         Self {
             role,
             encryption_key: None,
             page_codec: None,
+            portable_logical_changes: false,
         }
     }
 
@@ -528,6 +531,13 @@ impl ConnectOpts {
     /// for this connection and is not cached on the shared `Database`.
     pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
         self.page_codec = Some(page_codec);
+        self
+    }
+
+    /// Sets [`Connection::set_portable_logical_changes_enabled`] before the
+    /// connection runs any statement. Has no effect without `conn_raw_api`.
+    pub fn with_portable_logical_changes_enabled(mut self, enabled: bool) -> Self {
+        self.portable_logical_changes = enabled;
         self
     }
 }
@@ -1664,6 +1674,7 @@ impl Database {
                             role: SessionRole::Superuser,
                             encryption_key: state.encryption_key.clone(),
                             page_codec: page_codec.clone(),
+                            portable_logical_changes: false,
                         },
                         ConnectionContext::default(),
                         false,
@@ -1794,6 +1805,7 @@ impl Database {
                                     role: SessionRole::Superuser,
                                     encryption_key: state.encryption_key.clone(),
                                     page_codec: page_codec.clone(),
+                                    portable_logical_changes: false,
                                 },
                                 ConnectionContext::default(),
                                 true,
@@ -2665,6 +2677,7 @@ impl Database {
         let ConnectOpts {
             encryption_key,
             page_codec,
+            portable_logical_changes,
             ..
         } = opts;
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2701,6 +2714,7 @@ impl Database {
             default_cache_size,
             context,
         )?;
+        conn.set_portable_logical_changes_enabled(portable_logical_changes);
         if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
         }

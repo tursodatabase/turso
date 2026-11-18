@@ -8,8 +8,10 @@ use turso_core::{
 
 /// Opens a PostgreSQL database and initializes its catalog before returning it.
 /// `options` must use `PostgresDialect`; `connect_opts` supplies the bootstrap
-/// connection's encryption key and superuser role. Drop the state after an
-/// error before retrying the open.
+/// connection's encryption key and superuser role. A caller that enables
+/// portable logical changes on its connections must enable them here too, so
+/// the catalog commit is the first log frame and carries the portable header.
+/// Drop the state after an error before retrying the open.
 pub fn open_database_async(
     state: &mut OpenDatabaseState,
     io: Arc<dyn IO>,
