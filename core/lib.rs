@@ -48,19 +48,19 @@ pub mod vector;
 
 #[cfg(feature = "cli_only")]
 pub(crate) mod btree_dump;
-pub(crate) mod sync;
+pub mod sync;
 pub(crate) mod thread;
 
 mod assert;
-mod attach;
-mod connection;
+pub mod attach;
+pub mod connection;
 mod connection_hooks;
 mod database;
 pub mod dialect;
 mod error;
 mod ext;
 mod fast_lock;
-mod function;
+pub mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
 mod incremental;
@@ -92,11 +92,14 @@ mod util;
 mod uuid;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod vdbe;
-mod vtab;
+pub mod vtab;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
-pub use function::{ExternalFunc, Func};
+pub use function::{ExternalFunc, Func, ScalarFunc};
+/// The ENCODE of the built-in date and time types, also used by the PostgreSQL
+/// frontend to check input in `pg_input_is_valid`.
+pub use functions::datetime_input::exec_temporal_encode;
 /// The printf engine backing the SQL printf()/format() functions, also used
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.
@@ -108,14 +111,14 @@ use crate::{
     schema::Trigger,
     storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
-    translate::emitter::TransactionMode,
     vdbe::metrics::ConnectionMetrics,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
+pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 
@@ -125,7 +128,10 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, ReparseSchemaState, Row, StepResult, StorageStats,
+    StorageStatsRead, SymbolTable,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 pub use database::is_memory_like;
@@ -139,11 +145,12 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::Dialect;
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
+pub use dialect::{CatalogChange, Dialect, NewOwner, OwnerColumn};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
+    SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,
 };
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
@@ -167,6 +174,7 @@ pub use io::{
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use security::roles::SessionRole;
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
@@ -176,7 +184,9 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
+pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::sequence::{emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
@@ -189,7 +199,9 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
-pub use vdbe::array::{array_values_from_any, text_array_literal};
+pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};
+pub use vdbe::builder::{CursorType, ProgramBuilder};
+pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

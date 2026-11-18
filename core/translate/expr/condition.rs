@@ -53,7 +53,14 @@ pub(super) fn translate_in_list(
 ) -> Result<()> {
     let lhs_arity = expr_vector_size(lhs)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
-    let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    translate_row_value(
+        program,
+        referenced_tables,
+        lhs,
+        lhs_arity,
+        lhs_reg,
+        resolver,
+    )?;
     let mut check_null_reg = 0;
     let mut check_null_in_row_values_reg = 0;
     let label_ok = program.allocate_label();
@@ -96,7 +103,17 @@ pub(super) fn translate_in_list(
     for (i, expr) in rhs.iter().enumerate() {
         let last_condition = i == rhs.len() - 1;
         let rhs_reg = program.alloc_registers(lhs_arity);
-        let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
+        translate_compared_operand(program, referenced_tables, expr, lhs, rhs_reg, resolver)?;
+        // The left side as it is compared with this element.
+        let lhs_reg = translate_in_lhs_for_element(
+            program,
+            referenced_tables,
+            lhs,
+            lhs_reg,
+            lhs_arity,
+            expr,
+            resolver,
+        )?;
 
         if lhs_arity == 1 {
             // Scalar comparison path

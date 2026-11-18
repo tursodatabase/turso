@@ -2,7 +2,7 @@ use crate::common::{do_flush, limbo_exec_rows_fallible, run_query, TempDatabase}
 use asserting::prelude::*;
 use rand::{rng, RngCore};
 use std::fs::OpenOptions;
-use turso_core::ConnectOpts;
+use turso_core::{ConnectOpts, SessionRole};
 
 /// Test that truncating a database file results in a ShortRead error.
 #[test]
@@ -117,7 +117,10 @@ fn test_truncated_wal_returns_short_read_error() {
         let existing_db = TempDatabase::new_with_existent(&db_path);
 
         // Error occurs during connect() when reading WAL frames
-        match existing_db.db.connect(ConnectOpts::new()) {
+        match existing_db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+        {
             Ok(_) => panic!("Connection to database with truncated WAL must fail"),
             Err(err) => {
                 let err_string = err.to_string();
@@ -163,7 +166,10 @@ fn test_truncated_header_returns_short_read_error() {
     // Opening the database should fail with a short read error
     {
         let existing_db = TempDatabase::new_with_existent(&db_path);
-        match existing_db.db.connect(ConnectOpts::new()) {
+        match existing_db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+        {
             Ok(_) => panic!("Connection to database with truncated header must fail"),
             Err(err) => {
                 let err_string = err.to_string();

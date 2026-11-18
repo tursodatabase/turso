@@ -7,12 +7,13 @@
 # script starts a throwaway PostgreSQL container with Docker, runs the
 # command, and removes the container.
 #
-# To test against another PostgreSQL version, set POSTGRES_VERSION, for
-# example POSTGRES_VERSION=18. To upgrade the version for everyone, change
-# the default below.
+# The default is PostgreSQL 18, the version in postgres/version. To try
+# another version locally, set POSTGRES_VERSION to a tag of the postgres
+# Docker image, for example POSTGRES_VERSION=17.
 set -euo pipefail
 
-POSTGRES_VERSION="${POSTGRES_VERSION:-17}"
+VERSION_FILE="$(dirname "${BASH_SOURCE[0]}")/../version"
+POSTGRES_VERSION="${POSTGRES_VERSION:-$(cat "$VERSION_FILE")}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:$POSTGRES_VERSION}"
 
 if [[ -n "${PG_DSN:-}" ]]; then

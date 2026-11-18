@@ -553,7 +553,7 @@ impl From<Text> for String {
 pub type ValueBlob = crate::alloc::Vec<u8>;
 
 #[inline]
-pub(crate) fn value_blob_from_slice(
+pub fn value_blob_from_slice(
     bytes: &[u8],
 ) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
     bytes.try_to_vec()
@@ -955,7 +955,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+    pub fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
         match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {

@@ -678,10 +678,14 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
                 SubqueryType::RowValue {
                     result_reg_start,
                     num_regs,
+                    row_count_reg,
                 } => {
                     resources
                         .register_ranges
                         .insert((*result_reg_start, *num_regs));
+                    if let Some(row_count_reg) = row_count_reg {
+                        resources.register_ranges.insert((*row_count_reg, 1));
+                    }
                 }
                 SubqueryType::In { cursor_id, .. } => {
                     resources.cursor_ids.insert(*cursor_id);
@@ -883,6 +887,9 @@ fn detect_simple_aggregate(
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
         || !plan.aggregates.first().unwrap().order_by().is_empty()
+        // The fast paths read the table without the loop that checks its
+        // row-level security filter.
+        || plan.table_references.joined_tables()[0].row_filter.is_some()
     {
         return Ok(None);
     }
@@ -1071,6 +1078,62 @@ fn optimize_select_plan_form(
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
+/// SQLite removes DISTINCT in the same cases.
+fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool> {
+    let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
+        [] if plan.distinctness.is_distinct() && plan.group_by.is_none() => {
+            plan.result_columns.iter().map(|col| &col.expr).collect()
+        }
+        [agg] if agg.is_distinct() => plan
+            .group_by
+            .iter()
+            .flat_map(|group_by| &group_by.exprs)
+            .chain(&agg.args)
+            .collect(),
+        _ => return Ok(false),
+    };
+    let [table] = plan.table_references.joined_tables() else {
+        return Ok(false);
+    };
+    let Some(btree) = table.btree() else {
+        return Ok(false);
+    };
+    let ctx = ExprContext::new(Some(&plan.table_references), resolver);
+    let mut selected = Vec::new();
+    for expr in exprs {
+        match expr {
+            ast::Expr::RowId { table: t, .. } if *t == table.internal_id => return Ok(true),
+            ast::Expr::Column {
+                table: t,
+                column,
+                is_rowid_alias,
+                ..
+            } if *t == table.internal_id => {
+                if *is_rowid_alias {
+                    return Ok(true);
+                }
+                selected.push((*column, ctx.expr_collation(expr)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(resolver.with_schema(table.namespace.database_id, |schema| {
+        schema
+            .indices_including_backing(table.namespace.id, table.table.get_name())
+            .any(|index| {
+                index.unique
+                    && index.where_clause.is_none()
+                    && index.columns.iter().all(|ic| {
+                        ic.expr.is_none()
+                            && btree.columns()[ic.pos_in_table].notnull()
+                            && selected.iter().any(|(pos, collation)| {
+                                *pos == ic.pos_in_table && *collation == ic.collation
+                            })
+                    })
+            })
+    }))
+}
+
 /// Find the table reads for one version of a query.
 fn find_select_plan_form(
     plan: &mut SelectPlan,
@@ -1086,6 +1149,13 @@ fn find_select_plan_form(
     let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
+
+    if distinct_is_redundant(plan, resolver)? {
+        match plan.aggregates.first_mut() {
+            Some(agg) => agg.distinctness = super::plan::Distinctness::NonDistinct,
+            None => plan.distinctness = super::plan::Distinctness::NonDistinct,
+        }
+    }
 
     // A rewrite can move MATCH terms out of a subquery, so do this after the
     // query form has been chosen.
@@ -2722,7 +2792,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: true,
+        allow_automatic_index: resolver.automatic_index,
         resolver,
     };
 
@@ -4932,6 +5002,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::EngineDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         )
     }
 

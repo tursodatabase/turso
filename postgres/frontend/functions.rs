@@ -1,16 +1,21 @@
-use crate::catalog::PG_DATABASE_OWNER_OID;
+use crate::acl::{acl_role_name, Privileges as AclPrivileges};
+use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
-use turso_core::security::roles::{RoleCatalog, RoleId};
+use turso_core::security::roles::RoleId;
+
+use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
+    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
+    Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
@@ -43,6 +48,19 @@ macro_rules! scalar_functions {
 }
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
+    let options = register_scalar_functions(options);
+    options.extension_function(
+        pg_scalar_function(
+            "array_to_json",
+            FunctionArity::OneOf(&[1, 2]),
+            true,
+            |_, args| exec_array_to_json(args),
+        )
+        .receiving_argument_types(),
+    )
+}
+
+fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
@@ -69,7 +87,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             exec_json_strip_nulls(args[0].get_value())?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
-            .map(|type_oid| exec_pg_format_type(type_oid, int_arg(args, 1, -1))),
+            .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
         "pg_get_indexdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -126,6 +144,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "pg_generate_series_ordinality"(FunctionArity::Exact(3), true) => {
+            exec_generate_series_ordinality(int_arg(args, 0, 0), int_arg(args, 1, 0), int_arg(args, 2, 1))?
+        },
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -189,6 +210,18 @@ struct Timestamptz(String);
 
 impl ScalarReturn for Timestamptz {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `json` value in its text form. Returning one gives the function the type
+/// `json`, as in PostgreSQL, instead of text.
+struct Json(String);
+
+impl ScalarReturn for Json {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("json"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -302,7 +335,9 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    let role = acl_role_name(&role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string()));
+    let role = acl_role_name(
+        &role_name_by_oid(&connection_roles(conn), owner).unwrap_or_else(|| owner.to_string()),
+    );
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -314,13 +349,6 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
     Ok(Some(turso_core::text_array_literal(
         entries.iter().map(String::as_str),
     )))
-}
-
-fn acl_role_name(name: &str) -> String {
-    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return name.to_string();
-    }
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[derive(strum::EnumString)]
@@ -358,20 +386,8 @@ impl AclObjectKind {
         let no_privileges = AclPrivileges::empty();
         match self {
             Self::Column => (no_privileges, no_privileges),
-            Self::Table => (
-                no_privileges,
-                AclPrivileges::INSERT
-                    | AclPrivileges::SELECT
-                    | AclPrivileges::UPDATE
-                    | AclPrivileges::DELETE
-                    | AclPrivileges::TRUNCATE
-                    | AclPrivileges::REFERENCES
-                    | AclPrivileges::TRIGGER,
-            ),
-            Self::Sequence => (
-                no_privileges,
-                AclPrivileges::SELECT | AclPrivileges::UPDATE | AclPrivileges::USAGE,
-            ),
+            Self::Table => (no_privileges, AclPrivileges::RELATION),
+            Self::Sequence => (no_privileges, AclPrivileges::SEQUENCE),
             Self::Database => (
                 AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
                 AclPrivileges::CREATE | AclPrivileges::TEMPORARY | AclPrivileges::CONNECT,
@@ -388,52 +404,6 @@ impl AclObjectKind {
             Self::ForeignDataWrapper | Self::ForeignServer => (no_privileges, AclPrivileges::USAGE),
             Self::Type => (AclPrivileges::USAGE, AclPrivileges::USAGE),
         }
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy)]
-    struct AclPrivileges: u16 {
-        const INSERT = 1 << 0;
-        const SELECT = 1 << 1;
-        const UPDATE = 1 << 2;
-        const DELETE = 1 << 3;
-        const TRUNCATE = 1 << 4;
-        const REFERENCES = 1 << 5;
-        const TRIGGER = 1 << 6;
-        const EXECUTE = 1 << 7;
-        const USAGE = 1 << 8;
-        const CREATE = 1 << 9;
-        const TEMPORARY = 1 << 10;
-        const CONNECT = 1 << 11;
-        const SET = 1 << 12;
-        const ALTER_SYSTEM = 1 << 13;
-    }
-}
-
-impl fmt::Display for AclPrivileges {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (privilege, letter) in [
-            (Self::INSERT, "a"),
-            (Self::SELECT, "r"),
-            (Self::UPDATE, "w"),
-            (Self::DELETE, "d"),
-            (Self::TRUNCATE, "D"),
-            (Self::REFERENCES, "x"),
-            (Self::TRIGGER, "t"),
-            (Self::EXECUTE, "X"),
-            (Self::USAGE, "U"),
-            (Self::CREATE, "C"),
-            (Self::TEMPORARY, "T"),
-            (Self::CONNECT, "c"),
-            (Self::SET, "s"),
-            (Self::ALTER_SYSTEM, "A"),
-        ] {
-            if self.contains(privilege) {
-                f.write_str(letter)?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -644,13 +614,26 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+/// The position of `value` in the series that starts at `start` and moves by `step`.
+fn exec_generate_series_ordinality(value: i64, start: i64, step: i64) -> Result<i64> {
+    if step == 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "step size cannot equal zero",
+        ));
+    }
+    let steps_from_start = (i128::from(value) - i128::from(start)) / i128::from(step);
+    i64::try_from(steps_from_start + 1)
+        .map_err(|_| sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
+}
+
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
-    role_name_in(&conn.role_catalog(), role)
+    role_name_in(&connection_roles(conn), role)
 }
 
 /// The role of a connection is normally in the catalog, but it may have been
 /// dropped by another connection since the connection was opened.
-fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
+pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
     match crate::catalog::postgres_roles(roles).find(|found| found.id == role) {
         Some(role) => Ok(role.name),
         None => Err(sqlstate_error(
@@ -661,16 +644,7 @@ fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
 }
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
-    role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
-}
-
-fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
-    if oid == PG_DATABASE_OWNER_OID {
-        return Some("pg_database_owner".to_string());
-    }
-    crate::catalog::postgres_roles(&conn.role_catalog())
-        .find(|role| crate::catalog::role_oid(role.id) == oid)
-        .map(|role| role.name)
+    role_name_by_oid(&connection_roles(conn), oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
@@ -696,19 +670,21 @@ fn exec_version() -> String {
 /// form so the result reads back identically regardless of
 /// standard_conforming_strings.
 fn exec_quote_literal(value: &Value) -> Option<String> {
-    if matches!(value, Value::Null) {
-        return None;
+    match value {
+        Value::Null => None,
+        Value::Text(t) => Some(quote_literal(t.as_str())),
+        other => Some(quote_literal(&other.to_string())),
     }
-    let text = match value {
-        Value::Text(t) => t.as_str().to_string(),
-        other => other.to_string(),
-    };
-    let quoted = if text.contains('\\') {
+}
+
+/// `text` as PostgreSQL's quote_literal() writes it: in single quotes, with
+/// quotes doubled, and as an escape string when it has a backslash.
+pub(crate) fn quote_literal(text: &str) -> String {
+    if text.contains('\\') {
         format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
     } else {
         format!("'{}'", text.replace('\'', "''"))
-    };
-    Some(quoted)
+    }
 }
 
 /// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
@@ -729,6 +705,181 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     let mut stripped = String::with_capacity(json.len());
     copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
     Ok(Some(stripped))
+}
+
+/// `array_to_json(array [, pretty])`: the array as a JSON array, with line
+/// feeds between its elements when `pretty` is true. After the arguments come
+/// their type names, such as `boolean[]`, because an element's stored value
+/// doesn't tell its type: a boolean is stored as 1, and a bytea like a nested
+/// array, as a blob.
+fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
+    let (args, types) = args.split_at(args.len() / 2);
+    let array = args[0].get_value();
+    let pretty = match args.get(1).map(Register::get_value) {
+        None => false,
+        Some(Value::Null) => return Ok(None),
+        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
+    };
+    if matches!(array, Value::Null) {
+        return Ok(None);
+    }
+    let array_type = types[0].get_value().to_string();
+    let element_type = array_type.trim_end_matches("[]");
+    let dimensions = (array_type.len() - element_type.len()) / 2;
+    let element = JsonElement::of_type(element_type);
+    let mut json = String::new();
+    write_json_array(
+        array,
+        &JsonArrayLayout {
+            element,
+            dimensions,
+            separator: if pretty { ",\n " } else { "," },
+        },
+        &mut json,
+    )?;
+    Ok(Some(Json(json)))
+}
+
+struct JsonArrayLayout {
+    element: JsonElement,
+    /// The number of array levels, or 0 when the argument's type doesn't say.
+    dimensions: usize,
+    separator: &'static str,
+}
+
+/// How an array element is written as JSON, which depends on its type.
+#[derive(Clone, Copy)]
+enum JsonElement {
+    /// `true` or `false`.
+    Boolean,
+    /// A JSON number, or a JSON string for Infinity and -Infinity.
+    Number,
+    /// The value as it is, since it is already JSON.
+    Json,
+    /// `"\\x0102"`: the bytes in hex, as a string.
+    Bytea,
+    /// A JSON string with a `T` between the date and the time.
+    Timestamp,
+    /// Like Timestamp, followed by the UTC offset `+00:00`.
+    Timestamptz,
+    /// The value's text, as a JSON string.
+    Text,
+    /// The argument's type doesn't say: numbers are written as numbers, text as
+    /// strings and a blob as a nested array.
+    Unknown,
+}
+
+impl JsonElement {
+    fn of_type(name: &str) -> Self {
+        match name {
+            "boolean" => Self::Boolean,
+            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
+            "json" | "jsonb" => Self::Json,
+            // A cast to bytea is a cast to blob, so a blob is a bytea.
+            "bytea" | "blob" => Self::Bytea,
+            "timestamp" => Self::Timestamp,
+            "timestamptz" => Self::Timestamptz,
+            "anyarray" | "any" | "unknown" | "null" => Self::Unknown,
+            _ => Self::Text,
+        }
+    }
+}
+
+fn write_json_array(array: &Value, layout: &JsonArrayLayout, json: &mut String) -> Result<()> {
+    write_json_array_level(array, layout, layout.separator, 1, json)
+}
+
+fn write_json_array_level(
+    array: &Value,
+    layout: &JsonArrayLayout,
+    separator: &str,
+    level: usize,
+    json: &mut String,
+) -> Result<()> {
+    let elements = turso_core::array_values_from_any(array)
+        .ok_or_else(|| undefined_function("array_to_json", &[pg_type_name(array)]))?;
+    json.push('[');
+    for (i, element) in elements.iter().enumerate() {
+        if i > 0 {
+            json.push_str(separator);
+        }
+        let inner_level = level < layout.dimensions
+            || (matches!(element, Value::Blob(_)) && !matches!(layout.element, JsonElement::Bytea));
+        match element {
+            Value::Null => json.push_str("null"),
+            // Only the outermost level gets line feeds, as in PostgreSQL.
+            _ if inner_level => write_json_array_level(element, layout, ",", level + 1, json)?,
+            _ => write_json_element(element, layout.element, json),
+        }
+    }
+    json.push(']');
+    Ok(())
+}
+
+fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
+    match (kind, element) {
+        (JsonElement::Boolean, Value::Numeric(Numeric::Integer(0))) => json.push_str("false"),
+        (JsonElement::Boolean, Value::Numeric(_)) => json.push_str("true"),
+        (JsonElement::Json, Value::Text(text)) => json.push_str(text.as_str()),
+        (JsonElement::Timestamp, Value::Text(text)) => {
+            write_json_string(&text.as_str().replacen(' ', "T", 1), json)
+        }
+        (JsonElement::Timestamptz, Value::Text(text)) => write_json_string(
+            &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
+            json,
+        ),
+        (JsonElement::Text, Value::Numeric(number)) => {
+            write_json_string(&Value::Numeric(*number).to_string(), json)
+        }
+        (_, Value::Numeric(Numeric::Integer(number))) => json.push_str(&number.to_string()),
+        (_, Value::Numeric(Numeric::Float(number))) => {
+            let text = float8_text(f64::from(*number));
+            if number.is_finite() {
+                json.push_str(&text);
+            } else {
+                // JSON has no infinity, so PostgreSQL writes it as a string.
+                write_json_string(&text, json);
+            }
+        }
+        (_, Value::Text(text)) => write_json_string(text.as_str(), json),
+        (_, Value::Blob(bytes)) => {
+            write_json_string(&format!("\\x{}", hex::encode(bytes.as_slice())), json)
+        }
+        (_, Value::Null) => json.push_str("null"),
+    }
+}
+
+fn write_json_string(text: &str, json: &mut String) {
+    json.push_str(&serde_json::to_string(text).expect("a string serializes"));
+}
+
+/// A float8 in PostgreSQL's text form: the shortest digits that read back as
+/// the same number, in scientific notation when the exponent is below -4 or
+/// 15 or more, as in `1e+20` and `1e-05`.
+fn float8_text(value: f64) -> String {
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("scientific notation has an exponent");
+    let exponent: i32 = exponent.parse().expect("the exponent is a number");
+    if (-4..15).contains(&exponent) {
+        format!("{value}")
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
 }
 
 /// The nesting limit of the walk below, the same as core's jsonb parser. Past
@@ -1055,7 +1206,8 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
     }
 }
 
-fn exec_pg_format_type(type_oid: i64, typemod: i64) -> String {
+/// The name of a type as `format_type` prints it.
+fn format_type(type_oid: i64, typemod: i64) -> String {
     match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),
@@ -1187,23 +1339,15 @@ fn exec_age(args: &[Register]) -> Result<Value> {
 }
 
 /// Reads a timestamp in the form the timestamp type stores, `YYYY-MM-DD
-/// HH:MM:SS[.f]`, or a date in the form the date type stores, `YYYY-MM-DD`,
-/// as midnight of that day, since PostgreSQL casts a date to a timestamp.
-/// The timestamp type keeps an hour of 24 as written, so `24:00:00` is
-/// midnight at the end of the day.
+/// HH:MM:SS[.f]` (the timestamptz type stores the same form, in UTC), or a
+/// date in the form the date type stores, `YYYY-MM-DD`, as midnight of that
+/// day, since PostgreSQL casts a date to a timestamp.
 fn parse_timestamp(text: &str) -> Result<NaiveDateTime> {
-    let (text_without_hour_24, extra_days) = match text.split_once(" 24:") {
-        Some((date, time)) => (format!("{date} 00:{time}"), 1),
-        None => (text.to_string(), 0),
-    };
-    NaiveDateTime::parse_from_str(&text_without_hour_24, "%Y-%m-%d %H:%M:%S%.f")
+    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| {
-            NaiveDate::parse_from_str(&text_without_hour_24, "%Y-%m-%d")
-                .map(|date| date.and_time(NaiveTime::MIN))
+            NaiveDate::parse_from_str(text, "%Y-%m-%d").map(|date| date.and_time(NaiveTime::MIN))
         })
-        .ok()
-        .and_then(|timestamp| timestamp.checked_add_signed(TimeDelta::days(extra_days)))
-        .ok_or_else(|| {
+        .map_err(|_| {
             LimboError::InvalidArgument(format!(
                 "invalid input syntax for type timestamp: \"{text}\""
             ))
@@ -1426,69 +1570,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => {
-            // Accept YYYY-MM-DD
-            let parts: Vec<&str> = trimmed.split('-').collect();
-            if parts.len() == 3
-                && parts[0].parse::<i32>().is_ok()
-                && parts[1].parse::<u32>().is_ok_and(|m| (1..=12).contains(&m))
-                && parts[2].parse::<u32>().is_ok_and(|d| (1..=31).contains(&d))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type date: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "timestamp" | "timestamp without time zone" => {
-            // Accept YYYY-MM-DD HH:MM:SS[.fff]
-            if parse_timestamp_prefix(trimmed).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type timestamp: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "timestamptz" | "timestamp with time zone" => {
-            // Accept YYYY-MM-DD HH:MM:SS[.fff][+/-HH[:MM]]
-            let (base, _tz) = match trimmed.rfind('+') {
-                Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
-                _ => match trimmed.rfind('-') {
-                    Some(pos) if pos > 10 => (&trimmed[..pos], Some(&trimmed[pos..])),
-                    _ => (trimmed, None),
-                },
-            };
-            if parse_timestamp_prefix(base).is_some() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type timestamp with time zone: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
-        "time" | "time without time zone" => {
-            // Accept HH:MM:SS[.fff]
-            let time_part = trimmed.split('.').next().unwrap_or(trimmed);
-            let parts: Vec<&str> = time_part.split(':').collect();
-            if parts.len() >= 2
-                && parts.len() <= 3
-                && parts[0].parse::<u32>().is_ok_and(|h| (0..=23).contains(&h))
-                && parts[1].parse::<u32>().is_ok_and(|m| (0..=59).contains(&m))
-                && (parts.len() < 3 || parts[2].parse::<u32>().is_ok_and(|s| (0..=59).contains(&s)))
-            {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type time: \"{input}\""),
-                    "22007".to_string(),
-                ))
-            }
-        }
+        "date" => check_temporal_input(input, "date"),
+        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
+        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
+        "time" | "time without time zone" => check_temporal_input(input, "time"),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1592,47 +1677,22 @@ pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Parse a YYYY-MM-DD HH:MM:SS[.fff] prefix, returning Some(()) if valid.
-fn parse_timestamp_prefix(s: &str) -> Option<()> {
-    let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
-    if parts.len() != 2 {
-        return None;
+/// Reads `input` as the date or time type `type_name` does when it stores a
+/// value, so `pg_input_is_valid` and the type agree on what is valid.
+fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, String)> {
+    match exec_temporal_encode(
+        &Value::build_text(input.to_string()),
+        &Value::build_text(type_name),
+    ) {
+        Ok(_) => None,
+        Err(LimboError::InvalidDate(message)) => {
+            Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
+        }
+        Err(LimboError::DatetimeFieldOverflow(message)) => {
+            Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
+        }
+        Err(other) => unreachable!("temporal_encode of text failed with {other}"),
     }
-    // Validate date part
-    let date_parts: Vec<&str> = parts[0].split('-').collect();
-    if date_parts.len() != 3
-        || date_parts[0].parse::<i32>().is_err()
-        || !date_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (1..=12).contains(&m))
-        || !date_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|d| (1..=31).contains(&d))
-    {
-        return None;
-    }
-    // Validate time part (strip fractional seconds)
-    let time_str = parts[1].split('.').next().unwrap_or(parts[1]);
-    let time_parts: Vec<&str> = time_str.split(':').collect();
-    if time_parts.len() < 2
-        || time_parts.len() > 3
-        || !time_parts[0]
-            .parse::<u32>()
-            .is_ok_and(|h| (0..=23).contains(&h))
-        || !time_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (0..=59).contains(&m))
-    {
-        return None;
-    }
-    if time_parts.len() == 3
-        && !time_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|s| (0..=59).contains(&s))
-    {
-        return None;
-    }
-    Some(())
 }
 
 /// Minimal JSON validation without requiring serde_json.
@@ -1804,13 +1864,18 @@ mod tests {
 
     #[test]
     fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
-        let with_alice = RoleCatalog::new(&[vec![
-            Value::from_i64(1),
-            Value::build_text("alice"),
-            Value::from_i64(0),
-        ]])
+        let with_alice = RoleCatalog::new(
+            &[vec![
+                Value::from_i64(1),
+                Value::build_text("alice"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+            ]],
+            &[],
+        )
         .unwrap();
-        let without_alice = RoleCatalog::new(&[]).unwrap();
+        let without_alice = RoleCatalog::new(&[], &[]).unwrap();
         let alice = with_alice.get_by_name("alice").unwrap().id;
         assert_eq!(role_name_in(&with_alice, alice).unwrap(), "alice");
 
@@ -1820,5 +1885,44 @@ mod tests {
             role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
             "postgres"
         );
+    }
+
+    #[test]
+    fn array_to_json_writes_infinite_floats_as_strings() {
+        let record = turso_core::types::ImmutableRecord::from_values(
+            &[
+                Value::from_f64(f64::INFINITY),
+                Value::from_f64(f64::NEG_INFINITY),
+                Value::from_f64(1.5),
+            ],
+            3,
+        )
+        .unwrap();
+        let layout = JsonArrayLayout {
+            element: JsonElement::Number,
+            dimensions: 1,
+            separator: ",",
+        };
+        let mut json = String::new();
+        write_json_array(&Value::Blob(record.as_blob().clone()), &layout, &mut json).unwrap();
+        assert_eq!(json, r#"["Infinity","-Infinity",1.5]"#);
+    }
+
+    #[test]
+    fn float8_text_is_postgres_float8_output() {
+        for (value, text) in [
+            (1.0, "1"),
+            (-0.0, "-0"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e-4, "0.0001"),
+            (1.5e-5, "1.5e-05"),
+            (123456789012345.0, "123456789012345"),
+            (1e15, "1e+15"),
+            (1e20, "1e+20"),
+            (-1.25e300, "-1.25e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+        ] {
+            assert_eq!(float8_text(value), text, "{value:e}");
+        }
     }
 }

@@ -347,6 +347,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: 1,
+                    ..
                 },
             ..
         } => {
@@ -1155,7 +1156,7 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
 
 /// The arguments of `iif(c1, v1, c2, v2, ..., else)` that it may return:
 /// every second one from the second on, and a last one without a condition.
-pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<ast::Expr>> {
+pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<ast::Expr>> + Clone {
     let has_else = args.len() % 2 == 1;
     args.iter()
         .enumerate()
@@ -1209,7 +1210,10 @@ fn declared_return_type(
 /// exact numbers, such as numeric, mixed with an integer or a decimal is that
 /// type without parameters. A custom type mixed with any other type counts as
 /// the type it is stored as. Any other mix is `Any`.
-fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
+pub(crate) fn common_type<'e>(
+    exprs: impl Iterator<Item = &'e ast::Expr>,
+    env: &TypeEnv,
+) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
@@ -1348,6 +1352,18 @@ fn is_domain(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if type_def.is_domain)
 }
 
+/// The type's name with each domain replaced by its base type: `boolean[]`
+/// for an array of a domain over boolean.
+pub(crate) fn name_without_domains(ty: ExprType, schema: &Schema) -> String {
+    match ty {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => ExprType::array(without_domain(*element, schema), dimensions).to_string(),
+        scalar => without_domain(scalar, schema).to_string(),
+    }
+}
+
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it reads as. Other types are
 /// returned unchanged.
@@ -1395,7 +1411,6 @@ mod tests {
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{Cmd, OneSelect, ResultColumn, Stmt};
-    use turso_parser::parser::Parser;
 
     impl PartialEq for ExprType {
         fn eq(&self, other: &Self) -> bool {
@@ -1572,6 +1587,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             Arc::new(crate::EngineDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         );
         let env = TypeEnv::new(None, &resolver);
         let mismatches: Vec<String> = cases
@@ -1619,8 +1635,9 @@ mod tests {
 
     fn parse_expr(sql: &str) -> ast::Expr {
         let select_sql = format!("SELECT {sql}");
-        let mut parser = Parser::new(select_sql.as_bytes());
-        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) = parser.next_cmd() else {
+        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
+            crate::dialect::engine::parse_statement(&select_sql)
+        else {
             panic!("not a SELECT: {sql}");
         };
         let OneSelect::Select { mut columns, .. } = select.body.select else {
@@ -1647,7 +1664,9 @@ mod tests {
 
     /// The built-in types plus `cents`.
     fn test_schema() -> Schema {
-        let mut schema = Schema::new();
+        let mut schema = crate::schema::builtin::schema_builder(true)
+            .unwrap()
+            .build();
         schema
             .add_type_from_sql(
                 "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",

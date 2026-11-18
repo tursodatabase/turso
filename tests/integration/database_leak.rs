@@ -4,7 +4,7 @@
 //! must not accumulate per-database state in process-global structures.
 
 use std::sync::{Arc, Weak};
-use turso_core::{ConnectOpts, Database, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Database, OpenFlags, SessionRole, StepResult};
 use turso_sqlite::SqliteDialect;
 
 /// Run a small MVCC workload on a fresh database at `path`, then drop all
@@ -23,7 +23,9 @@ fn open_run_drop_mvcc(
     )
     .unwrap();
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
 
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")

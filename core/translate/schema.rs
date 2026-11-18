@@ -1,3 +1,4 @@
+use crate::dialect::CatalogChange;
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -6,9 +7,11 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+
+use crate::schema::RelationKind;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
+    BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
     TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
     TURSO_TYPES_TABLE_NAME,
 };
@@ -28,12 +31,11 @@ use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
-use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
-    column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
-    normalize_ident, quote_identifier, walk_expr_with_subqueries, walk_schema_expressions,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    check_expr_references_column, column_declared_type, dequote, escape_sql_string_literal,
+    is_builtin_strict_type, normalize_ident, quote_identifier, walk_expr_with_subqueries,
+    walk_schema_expressions, SchemaExprOwner, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -1139,10 +1141,11 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    bound_sequence_names: bool,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
-    let (mut body, ctas_info) = match body {
+    let (body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
             let (info, col_defs) = derive_ctas_schema(
                 select,
@@ -1221,6 +1224,9 @@ pub fn translate_create_table(
         );
     }
 
+    if relation_name_is_taken(resolver, namespace, &normalized_tbl_name, if_not_exists)? {
+        return Ok(());
+    }
     // Check for name conflicts with existing schema objects
     if let Some(object_type) = resolver.with_schema(database_id, |s| {
         s.get_object_type(namespace.id, &normalized_tbl_name)
@@ -1259,9 +1265,6 @@ pub fn translate_create_table(
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
-    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
-        && bind_default_sequence_names(&mut body, resolver)?;
-
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
         columns,
@@ -1375,11 +1378,15 @@ pub fn translate_create_table(
     // the schema dialect format the SQL to store (the SQLite dialect renders
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
+    // The resolver's dialect is the one the statement was parsed with: the
+    // engine's own for an engine schema statement, which stores plain SQLite
+    // text, the connection's otherwise.
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else if bound_sequence_names {
-        connection
-            .dialect()
+        resolver
+            .catalog
+            .dialect
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
@@ -1387,8 +1394,9 @@ pub fn translate_create_table(
                 body: body.clone(),
             })?
     } else {
-        connection
-            .dialect()
+        resolver
+            .catalog
+            .dialect
             .format_table_sql(input, &tbl_name_in_sql, &body)?
     };
 
@@ -1474,6 +1482,7 @@ pub fn translate_create_table(
         Some(sql),
     )?;
 
+    let mut autoindex_names = vec![];
     if let Some(index_regs) = index_regs {
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
@@ -1492,7 +1501,31 @@ pub fn translate_create_table(
                 index_reg,
                 None,
             )?;
+            autoindex_names.push(index_name);
         }
+    }
+
+    if dialect_relation_hooks_apply(connection, database_id)? {
+        let mut changes = vec![CatalogChange::Create {
+            namespace: namespace.id,
+            name: normalized_tbl_name.clone(),
+            kind: RelationKind::Table,
+            table: None,
+        }];
+        for index_name in autoindex_names {
+            changes.push(CatalogChange::Create {
+                namespace: namespace.id,
+                name: index_name,
+                kind: RelationKind::Index,
+                table: Some(normalized_tbl_name.clone()),
+            });
+        }
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &changes,
+        )?;
     }
 
     // Create the backing table for the hidden AUTOINCREMENT sequence. The
@@ -1576,26 +1609,6 @@ pub fn translate_create_table(
     }
 
     Ok(())
-}
-
-/// Binds the sequences named in the column defaults of `body` to the
-/// schemas they resolve to now. See [`bind_sequence_names`].
-fn bind_default_sequence_names(
-    body: &mut ast::CreateTableBody,
-    resolver: &Resolver,
-) -> Result<bool> {
-    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Ok(false);
-    };
-    let mut bound = false;
-    for column in columns {
-        for constraint in &mut column.constraints {
-            if let ast::ColumnConstraint::Default(expr) = &mut constraint.constraint {
-                bound |= bind_sequence_names(expr, resolver)?;
-            }
-        }
-    }
-    Ok(bound)
 }
 
 /// Translates `CREATE SCHEMA name`: a new namespace of the main
@@ -1726,7 +1739,6 @@ fn open_namespaces_table_for_writing(
                 &format!(
                     "CREATE TABLE {TURSO_NAMESPACES_TABLE_NAME}(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
                 ),
-                &[],
             )?;
             (created.table, created.root_page)
         }
@@ -2197,6 +2209,28 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
+    let owned_sequences = if table.btree().is_some() && namespace.database_id == MAIN_DB_ID {
+        resolver.catalog.dialect.owned_sequences(
+            resolver.schema(),
+            namespace.id,
+            &normalize_ident(name),
+            None,
+        )
+    } else {
+        Vec::new()
+    };
+    if let Some(usage) = find_object_using_sequence(
+        resolver,
+        connection,
+        namespace,
+        &owned_sequences,
+        DroppedWithSequences::Table(&normalize_ident(name)),
+    )? {
+        bail_parse_error!(
+            "cannot drop table {} because other objects depend on it: {usage}",
+            normalize_ident(name)
+        );
+    }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
@@ -2441,6 +2475,32 @@ pub fn translate_drop_table(
             .cloned()
             .collect()
     });
+
+    // Dropping a table also drops its indexes, the automatic ones among
+    // them, so the dialect hears about all of them.
+    if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
+        let mut changes: Vec<_> = owned_sequences
+            .iter()
+            .map(|sequence| CatalogChange::Drop {
+                namespace: namespace.id,
+                name: sequence.clone(),
+            })
+            .collect();
+        changes.push(CatalogChange::Drop {
+            namespace: namespace.id,
+            name: normalize_ident(name),
+        });
+        changes.extend(indices.iter().map(|index| CatalogChange::Drop {
+            namespace: namespace.id,
+            name: index.name.clone(),
+        }));
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &changes,
+        )?;
+    }
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -2853,6 +2913,12 @@ pub fn translate_drop_table(
         )?;
     }
 
+    for sequence in &owned_sequences {
+        crate::translate::sequence::emit_drop_sequence_cleanup(
+            program, resolver, namespace, sequence,
+        )?;
+    }
+
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
@@ -2862,6 +2928,111 @@ pub fn translate_drop_table(
     });
 
     Ok(())
+}
+
+/// What a statement drops together with the sequences it checks. The
+/// expressions of the dropped object do not count as uses of them.
+#[derive(Clone, Copy)]
+pub(crate) enum DroppedWithSequences<'a> {
+    Nothing,
+    Table(&'a str),
+    Column { table: &'a str, column: &'a str },
+}
+
+/// Describes the first object that still calls a sequence function on one
+/// of `sequences` of `namespace` once `dropped` is gone: a column default,
+/// generated column, CHECK constraint, row security policy, index, view or
+/// trigger. Objects of the namespace that the connection is dropping do not
+/// count.
+// FIXME: this walks every expression the schema stores. Replace it with the
+// dependency rows of pg_depend once they are stored.
+pub(crate) fn find_object_using_sequence(
+    resolver: &Resolver,
+    connection: &Connection,
+    namespace: NamespaceRef,
+    sequences: &[String],
+    dropped: DroppedWithSequences,
+) -> Result<Option<String>> {
+    if sequences.is_empty() {
+        return Ok(None);
+    }
+    let namespace_being_dropped = (namespace.database_id == MAIN_DB_ID)
+        .then(|| connection.namespace_being_dropped())
+        .flatten();
+    let is_dropped_table = |owner_namespace: NamespaceId, table_name: &str| {
+        owner_namespace == namespace.id
+            && matches!(dropped, DroppedWithSequences::Table(table) if table == table_name)
+    };
+    let is_dropped_column = |owner_namespace: NamespaceId, table_name: &str, column: &str| {
+        owner_namespace == namespace.id
+            && matches!(
+                dropped,
+                DroppedWithSequences::Column { table: dropped_table, column: dropped_column }
+                    if dropped_table == table_name && dropped_column.eq_ignore_ascii_case(column)
+            )
+    };
+    let is_dropped = |database_id: usize, owner_namespace: NamespaceId, owner: &SchemaExprOwner| {
+        if database_id != namespace.database_id {
+            return false;
+        }
+        if namespace_being_dropped == Some(owner_namespace) {
+            return true;
+        }
+        match owner {
+            SchemaExprOwner::ColumnDefault { table, column } => {
+                is_dropped_table(owner_namespace, table.get_name())
+                    || column.name.as_deref().is_some_and(|column| {
+                        is_dropped_column(owner_namespace, table.get_name(), column)
+                    })
+            }
+            SchemaExprOwner::CheckConstraint { table, constraint } => {
+                is_dropped_table(owner_namespace, table.get_name())
+                    || constraint.column.as_deref().is_some_and(|column| {
+                        is_dropped_column(owner_namespace, table.get_name(), column)
+                            && check_expr_references_column(
+                                &constraint.expr,
+                                &normalize_ident(column),
+                            )
+                    })
+            }
+            SchemaExprOwner::GeneratedColumn { table, .. }
+            | SchemaExprOwner::Policy { table, .. } => {
+                is_dropped_table(owner_namespace, table.get_name())
+            }
+            SchemaExprOwner::Index(index) => is_dropped_table(owner_namespace, &index.table_name),
+            SchemaExprOwner::Trigger(trigger) => {
+                is_dropped_table(owner_namespace, &trigger.table_name)
+            }
+            SchemaExprOwner::View(_) | SchemaExprOwner::MaterializedView(_) => false,
+        }
+    };
+    let checked_sequence_called_by = |expr: &ast::Expr| {
+        crate::translate::sequence::sequence_called_by(expr, resolver)
+            .filter(|(sequence_namespace, sequence)| {
+                sequence_namespace.database_id == namespace.database_id
+                    && sequence_namespace.id == namespace.id
+                    && sequences.contains(sequence)
+            })
+            .map(|(_, sequence)| sequence)
+    };
+    let dialect = resolver.catalog.dialect.as_ref();
+    let mut usage = None;
+    for (database_id, _, _) in connection.list_all_databases() {
+        resolver.with_schema(database_id, |schema| {
+            walk_schema_expressions(schema, dialect, &mut |owner_namespace, owner, expr| {
+                if usage.is_none() && !is_dropped(database_id, owner_namespace, &owner) {
+                    usage = checked_sequence_called_by(expr)
+                        .map(|sequence| format!("{owner} depends on sequence {sequence}"));
+                }
+                Ok(if usage.is_some() {
+                    WalkControl::SkipChildren
+                } else {
+                    WalkControl::Continue
+                })
+            })
+        })?;
+    }
+    Ok(usage)
 }
 
 /// Validate an encode or decode expression for safety.
@@ -2938,7 +3109,6 @@ fn persist_type_definition(
             resolver,
             TURSO_TYPES_TABLE_NAME,
             &format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
-            &[],
         )?;
         (types_table, types_root_page) = (created.table, created.root_page);
     }
@@ -2996,9 +3166,8 @@ fn persist_type_definition(
 
 /// Creates one of the engine's own tables in the main database the first
 /// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
-/// in the in-memory schema, and the same for each of `create_index_sqls`.
-/// Returns the table and the root page that the new B-tree will have, and
-/// each index with its root page.
+/// in the in-memory schema. Returns the table and the root page that the new
+/// B-tree will have.
 ///
 /// `SetCookie` is what marks the transaction as having changed the schema,
 /// so that a rollback restores the connection schema (see
@@ -3010,7 +3179,6 @@ pub(crate) fn emit_create_internal_table(
     resolver: &Resolver,
     table_name: &str,
     create_sql: &str,
-    create_index_sqls: &[&str],
 ) -> Result<InternalTable> {
     let root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
@@ -3040,34 +3208,6 @@ pub(crate) fn emit_create_internal_table(
         Some(create_sql.to_string()),
     )?;
     let table = Arc::new(BTreeTable::from_sql(create_sql, 0)?);
-    let mut indexes = Vec::with_capacity(create_index_sqls.len());
-    for create_index_sql in create_index_sqls {
-        let index = Arc::new(Index::from_sql(
-            resolver.catalog.symbol_table,
-            create_index_sql,
-            0,
-            &table,
-            resolver.schema(),
-        )?);
-        let index_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: MAIN_DB_ID,
-            root: index_root_reg,
-            flags: CreateBTreeFlags::new_index(),
-        });
-        emit_schema_entry(
-            program,
-            resolver,
-            schema_cursor_id,
-            None,
-            SchemaEntryType::Index,
-            &index.name,
-            table_name,
-            index_root_reg,
-            Some(create_index_sql.to_string()),
-        )?;
-        indexes.push((index, RegisterOrLiteral::Register(index_root_reg)));
-    }
     emit_schema_cookie(resolver, program);
     program.emit_insn(Insn::ParseSchema {
         db: MAIN_DB_ID,
@@ -3077,7 +3217,6 @@ pub(crate) fn emit_create_internal_table(
     Ok(InternalTable {
         table,
         root_page: RegisterOrLiteral::Register(root_reg),
-        indexes,
     })
 }
 
@@ -3085,7 +3224,6 @@ pub(crate) fn emit_create_internal_table(
 pub(crate) struct InternalTable {
     pub(crate) table: Arc<BTreeTable>,
     pub(crate) root_page: RegisterOrLiteral<i64>,
-    pub(crate) indexes: Vec<(Arc<Index>, RegisterOrLiteral<i64>)>,
 }
 
 /// Marks the transaction as having changed the schema, so that a rollback restores the connection
@@ -3097,6 +3235,64 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
+}
+
+/// Whether the statement tells the dialect about the relations it creates,
+/// renames or drops, through the [`crate::Dialect`] relation hooks. Only new
+/// DDL of a user against the main database does: a nested statement replays
+/// stored schema text, as VACUUM does when it copies a database, and the
+/// MVCC bootstrap connection replays log entries; both carry the dialect's
+/// schema state as data already. Relations of other databases, temp among
+/// them, have no dialect schema state. Fails for DDL of a user against an
+/// attached database when the dialect does not allow it.
+pub(crate) fn dialect_relation_hooks_apply(
+    connection: &Arc<Connection>,
+    database_id: usize,
+) -> Result<bool> {
+    if connection.is_nested_stmt() || connection.is_mvcc_bootstrap_connection() {
+        return Ok(false);
+    }
+    if crate::is_attached_db(database_id)
+        && !connection
+            .db
+            .dialect()
+            .supports_relation_ddl_in_attached_databases()
+    {
+        bail_parse_error!(
+            "creating, renaming or dropping relations in an attached database is not supported"
+        );
+    }
+    Ok(database_id == MAIN_DB_ID)
+}
+
+/// Whether a relation of `namespace` already has `name`, in a dialect whose
+/// relation names are unique per schema across kinds. Ok(true) when
+/// `if_not_exists` makes the statement skip; an error when the name is
+/// taken and the statement has no IF NOT EXISTS; Ok(false) when the name
+/// is free, or the dialect keeps its own, kind-specific rules.
+pub(crate) fn relation_name_is_taken(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    name: &str,
+    if_not_exists: bool,
+) -> Result<bool> {
+    if !resolver
+        .catalog
+        .dialect
+        .relation_names_unique_across_kinds()
+    {
+        return Ok(false);
+    }
+    let taken = resolver.with_schema(namespace.database_id, |schema| {
+        schema.relation_kind(namespace.id, name).is_some()
+    });
+    if !taken {
+        return Ok(false);
+    }
+    if if_not_exists {
+        return Ok(true);
+    }
+    bail_parse_error!("relation \"{name}\" already exists")
 }
 
 pub fn translate_create_type(
@@ -3407,9 +3603,9 @@ fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver
              create {normalized_name} before {name}"
         );
     }
-    if let Some(owner) =
-        find_in_any_database(resolver, |schema| find_cast_to_type(schema, &registry_key))?
-    {
+    if let Some(owner) = find_in_any_database(resolver, |schema| {
+        find_cast_to_type(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+    })? {
         bail_parse_error!("cannot create {kind} {normalized_name}: {owner} already casts to it");
     }
     Ok(())
@@ -3452,9 +3648,9 @@ pub fn translate_drop_type(
 
     // Check if anything in any database uses this type
     let registry_key = type_registry_key(type_name);
-    if let Some(type_use) =
-        find_in_any_database(resolver, |schema| find_type_use(schema, &registry_key))?
-    {
+    if let Some(type_use) = find_in_any_database(resolver, |schema| {
+        find_type_use(schema, resolver.catalog.dialect.as_ref(), &registry_key)
+    })? {
         bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
     }
 
@@ -3563,7 +3759,11 @@ fn find_in_any_database(
 
 /// Describes the first object in `schema` that uses the type: a column of
 /// that type, or any stored expression that casts to it.
-fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_type_use(
+    schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
+    registry_key: &str,
+) -> Result<Option<String>> {
     for namespace in schema.namespace_ids() {
         for table in schema.tables(namespace) {
             for column in table.columns() {
@@ -3577,13 +3777,17 @@ fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> 
             }
         }
     }
-    find_cast_to_type(schema, registry_key)
+    find_cast_to_type(schema, dialect, registry_key)
 }
 
 /// Describes the first stored expression in `schema` that casts to the type.
-fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+fn find_cast_to_type(
+    schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
+    registry_key: &str,
+) -> Result<Option<String>> {
     let mut type_use = None;
-    walk_schema_expressions(schema, &mut |owner, expr| {
+    walk_schema_expressions(schema, dialect, &mut |_, owner, expr| {
         if type_use.is_none() && is_cast_to_type(expr, registry_key) {
             type_use = Some(owner.to_string());
         }
@@ -3617,6 +3821,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         is_domain: _,
         accepts_collate: _,
         range_offsets: _,
+        stored_form_sorts_in_value_order: _,
         sql: _,
         domain_checks,
         kind,

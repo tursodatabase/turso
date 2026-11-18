@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows};
-use turso_core::{ConnectOpts, Database, IO};
+use turso_core::{ConnectOpts, Database, SessionRole, IO};
 use turso_sqlite::SqliteDialect;
 
 fn memory_database(mvcc: bool) -> Arc<Database> {
@@ -21,7 +21,9 @@ fn memory_database(mvcc: bool) -> Arc<Database> {
 }
 
 fn memory_connection(mvcc: bool) -> Arc<turso_core::Connection> {
-    memory_database(mvcc).connect(ConnectOpts::new()).unwrap()
+    memory_database(mvcc)
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap()
 }
 
 #[test]
@@ -283,8 +285,12 @@ fn mvcc_checkpoint_activity_does_not_disturb_a_failing_transaction() {
     // fails with an ordinary error must survive: its write activity is
     // measured against its own write set, not the shared pager.
     let db = memory_database(true);
-    let conn1 = db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
         .unwrap();

@@ -646,6 +646,11 @@ fn update_pragma(
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
+            if !connection.dialect().supports_capture_data_changes() {
+                crate::bail_parse_error!(
+                    "capture_data_changes is not supported with this frontend"
+                );
+            }
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             // InitCdcVersion handles everything at execution time:
@@ -789,6 +794,11 @@ fn update_pragma(
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::AutomaticIndex => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_automatic_index(enabled);
             Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
@@ -1803,6 +1813,13 @@ fn query_pragma(
             let ignored = connection.check_constraints_ignored();
             let register = program.alloc_register();
             program.emit_int(ignored as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::AutomaticIndex => {
+            let enabled = connection.automatic_index();
+            program.emit_bool(enabled, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

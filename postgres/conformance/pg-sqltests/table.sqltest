@@ -40,6 +40,37 @@ expect {
 }
 
 @setup users
+test table-update-column-list-from-row {
+    UPDATE users SET (name, age) = ('bobby', 26) WHERE id = 2;
+    UPDATE users SET active = true, (name, age) = ROW('caroline', 36) WHERE id = 3;
+    UPDATE users SET (age) = ROW(31) WHERE id = 1;
+    SELECT name, age, active FROM users ORDER BY id;
+}
+expect {
+    alice|31|t
+    bobby|26|f
+    caroline|36|t
+}
+
+@setup users
+test table-update-column-list-from-subquery {
+    UPDATE users SET (name, age) = (SELECT name, age FROM users WHERE id = 3) WHERE id = 1;
+    SELECT name, age FROM users ORDER BY id;
+}
+expect {
+    carol|35
+    bob|25
+    carol|35
+}
+
+@setup users
+test table-update-column-list-from-a-plain-value-errors {
+    UPDATE users SET (age) = (31);
+}
+@sqlstate 0A000
+expect error {source for a multiple-column UPDATE item must be a sub-SELECT or ROW}
+
+@setup users
 test table-delete {
     DELETE FROM users WHERE age > 34;
     SELECT count(*) FROM users;
@@ -483,6 +514,15 @@ setup upsert {
 }
 
 @setup upsert
+test table-upsert-updates-column-list-from-row {
+    INSERT INTO upsert_t VALUES (1, 5, 7) ON CONFLICT (a) DO UPDATE SET (k, b) = (excluded.k + 1, excluded.b);
+    SELECT a, k, b FROM upsert_t;
+}
+expect {
+    1|6|7
+}
+
+@setup upsert
 test table-upsert-existing-row-updated-twice-rejected {
     INSERT INTO upsert_t VALUES (1, 10, 1), (1, 11, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
 }
@@ -620,6 +660,61 @@ test table-sequence-whose-name-has-double-quotes {
 }
 expect {
     "s"
+}
+
+test table-serial-sequence-takes-the-first-free-name {
+    CREATE TABLE zz_free_id_seq (a int);
+    CREATE SEQUENCE zz_free_id_seq1;
+    CREATE TABLE zz_free (id serial, b int);
+    SELECT relname, relkind FROM pg_class WHERE relname LIKE 'zz_free_id_seq%' ORDER BY relname;
+}
+expect {
+    zz_free_id_seq|r
+    zz_free_id_seq1|S
+    zz_free_id_seq2|S
+}
+
+test table-serial-column-draws-from-its-own-sequence-when-another-has-its-name {
+    CREATE SEQUENCE zz_busy_id_seq START 100;
+    CREATE TABLE zz_busy (id serial, b int);
+    INSERT INTO zz_busy (b) VALUES (10), (20);
+    SELECT id, b FROM zz_busy ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+test table-serial-sequence-of-a-schema-whose-name-has-a-quote-takes-a-free-name {
+    CREATE SCHEMA "zz_o'k";
+    CREATE TABLE "zz_o'k".t_id_seq (a int);
+    CREATE TABLE "zz_o'k".t (id serial, b int);
+    INSERT INTO "zz_o'k".t (b) VALUES (1);
+    SELECT id, b FROM "zz_o'k".t;
+}
+expect {
+    1|1
+}
+
+test table-serial-sequence-of-a-schema-whose-name-has-a-dot-takes-a-free-name {
+    CREATE SCHEMA "zz_a.b";
+    CREATE TABLE "zz_a.b".t_id_seq (a int);
+    CREATE TABLE "zz_a.b".t (id serial, b int);
+    INSERT INTO "zz_a.b".t (b) VALUES (1);
+    SELECT id, b FROM "zz_a.b".t;
+}
+expect {
+    1|1
+}
+
+test table-serial-sequence-of-a-table-whose-name-has-a-quote-takes-a-free-name {
+    CREATE TABLE "zz_q'_id_seq" (a int);
+    CREATE TABLE "zz_q'" (id serial, b int);
+    INSERT INTO "zz_q'" (b) VALUES (1);
+    SELECT id, b FROM "zz_q'";
+}
+expect {
+    1|1
 }
 
 test drop-materialized-view-on-a-view-errors {
@@ -760,4 +855,217 @@ test array-of-booleans-from-literal-and-aggregate {
 expect {
     1|0
     1
+}
+
+test table-insert-values-shorter-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-longer-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3, 4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-shorter-row-without-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u VALUES (1, 2, 3), (4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-different-row-length-with-default {
+    CREATE TABLE u (id int, a int, b int DEFAULT 9);
+    INSERT INTO u VALUES (1, 2, DEFAULT), (3, 4);
+}
+@sqlstate 42601
+expect error {}
+
+@skip-if postgres "PostgreSQL supports ALTER VIEW ... RENAME"
+test alter-view-rename-is-not-supported {
+    CREATE TABLE rn_view_base (id INT);
+    CREATE VIEW rn_view AS SELECT id FROM rn_view_base;
+    ALTER VIEW rn_view RENAME TO rn_view_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER VIEW ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER INDEX ... RENAME"
+test alter-index-rename-is-not-supported {
+    CREATE TABLE rn_index_base (id INT);
+    CREATE INDEX rn_index ON rn_index_base (id);
+    ALTER INDEX rn_index RENAME TO rn_index_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER INDEX ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TYPE ... RENAME"
+test alter-type-rename-is-not-supported {
+    CREATE TYPE rn_type AS ENUM ('a');
+    ALTER TYPE rn_type RENAME TO rn_type_renamed;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TYPE ... RENAME is not supported
+}
+
+@skip-if postgres "PostgreSQL supports ALTER TABLE ... RENAME CONSTRAINT"
+test alter-table-rename-constraint-is-not-supported {
+    CREATE TABLE rn_constrained (id INT CONSTRAINT rn_positive CHECK (id > 0));
+    ALTER TABLE rn_constrained RENAME CONSTRAINT rn_positive TO rn_still_positive;
+}
+@sqlstate 0A000
+expect error {
+    ALTER TABLE ... RENAME CONSTRAINT is not supported
+}
+
+test update-set-default-uses-column-default {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int DEFAULT 7, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT a, b FROM defaults_t;
+}
+expect {
+    7|x
+}
+
+test update-set-default-without-column-default-sets-null {
+    DROP TABLE IF EXISTS defaults_t;
+    CREATE TABLE defaults_t (a int, b text);
+    INSERT INTO defaults_t (a, b) VALUES (1, 'x');
+    UPDATE defaults_t SET a = DEFAULT;
+    SELECT CASE WHEN a IS NULL THEN 1 ELSE 0 END, b FROM defaults_t;
+}
+expect {
+    1|x
+}
+
+test serial-primary-key-counts-apart-from-explicit-keys {
+    DROP TABLE IF EXISTS sk_a;
+    CREATE TABLE sk_a (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_a (v) VALUES ('a');
+    INSERT INTO sk_a (id, v) VALUES (100, 'b');
+    INSERT INTO sk_a (v) VALUES ('c');
+    SELECT id, v FROM sk_a ORDER BY v;
+}
+expect {
+    1|a
+    100|b
+    2|c
+}
+
+test serial-primary-key-rejects-null {
+    DROP TABLE IF EXISTS sk_n;
+    CREATE TABLE sk_n (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_n (id, v) VALUES (NULL, 'x');
+}
+@sqlstate 23502
+expect error {}
+
+test serial-primary-key-default-collides-with-explicit-key {
+    DROP TABLE IF EXISTS sk_c;
+    CREATE TABLE sk_c (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_c (id, v) VALUES (1, 'x');
+    INSERT INTO sk_c (v) VALUES ('y');
+}
+@sqlstate 23505
+expect error {}
+
+test bigserial-and-smallserial-primary-keys-use-sequence {
+    DROP TABLE IF EXISTS sk_b;
+    DROP TABLE IF EXISTS sk_s;
+    CREATE TABLE sk_b (id bigserial PRIMARY KEY, v text);
+    CREATE TABLE sk_s (id smallserial PRIMARY KEY, v text);
+    INSERT INTO sk_b (v) VALUES ('a');
+    INSERT INTO sk_b (id, v) VALUES (50, 'b');
+    INSERT INTO sk_b (v) VALUES ('c');
+    INSERT INTO sk_s (v) VALUES ('a');
+    INSERT INTO sk_s (id, v) VALUES (50, 'b');
+    INSERT INTO sk_s (v) VALUES ('c');
+    SELECT id FROM sk_b UNION ALL SELECT id + 1000 FROM sk_s ORDER BY 1;
+}
+expect {
+    1
+    2
+    50
+    1001
+    1002
+    1050
+}
+
+test integer-primary-key-rejects-null {
+    DROP TABLE IF EXISTS sk_i;
+    CREATE TABLE sk_i (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_i (id, v) VALUES (NULL, 'x');
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-uses-column-default {
+    DROP TABLE IF EXISTS sk_d;
+    CREATE TABLE sk_d (id integer PRIMARY KEY DEFAULT 7, v text);
+    INSERT INTO sk_d (v) VALUES ('x');
+    SELECT id, v FROM sk_d;
+}
+expect {
+    7|x
+}
+
+test integer-table-level-primary-key-uses-column-default {
+    DROP TABLE IF EXISTS sk_t;
+    CREATE TABLE sk_t (id int DEFAULT 9, v text, PRIMARY KEY (id));
+    INSERT INTO sk_t (v) VALUES ('x');
+    SELECT id, v FROM sk_t;
+}
+expect {
+    9|x
+}
+
+test integer-primary-key-without-default-rejects-insert-that-omits-it {
+    DROP TABLE IF EXISTS sk_o;
+    CREATE TABLE sk_o (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_o (v) VALUES ('x');
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-rejects-null-from-select {
+    DROP TABLE IF EXISTS sk_q;
+    CREATE TABLE sk_q (id integer PRIMARY KEY, v text);
+    INSERT INTO sk_q (id, v) SELECT NULL, 'x';
+}
+@sqlstate 23502
+expect error {}
+
+test integer-primary-key-default-keyword-uses-column-default {
+    DROP TABLE IF EXISTS sk_k;
+    CREATE TABLE sk_k (id integer PRIMARY KEY DEFAULT 7, v text);
+    INSERT INTO sk_k VALUES (DEFAULT, 'x'), (8, 'y');
+    SELECT id, v FROM sk_k ORDER BY id;
+}
+expect {
+    7|x
+    8|y
+}
+
+test serial-primary-key-on-conflict-do-update {
+    DROP TABLE IF EXISTS sk_u;
+    CREATE TABLE sk_u (id serial PRIMARY KEY, v text);
+    INSERT INTO sk_u (v) VALUES ('a');
+    INSERT INTO sk_u (id, v) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+    INSERT INTO sk_u (v) VALUES ('c');
+    SELECT id, v FROM sk_u ORDER BY id;
+}
+expect {
+    1|b
+    2|c
 }

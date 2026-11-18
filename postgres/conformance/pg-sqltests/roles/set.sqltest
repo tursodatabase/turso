@@ -1,0 +1,235 @@
+# SET ROLE, RESET ROLE and the other ways to change the current role through
+# the PostgreSQL frontend.
+# PostgreSQL roles belong to the whole server, not to one database, so every
+# test uses its own role names.
+
+@database :memory:
+
+test set-role-changes-current-user {
+    CREATE ROLE sr_current;
+    SET ROLE sr_current;
+    SELECT current_user;
+}
+expect {
+    sr_current
+}
+
+test set-role-keeps-session-user {
+    CREATE ROLE sr_session;
+    SET ROLE sr_session;
+    SELECT CASE WHEN session_user = 'sr_session' THEN 'changed' ELSE 'kept' END;
+}
+expect {
+    kept
+}
+
+test reset-role-returns-to-session-user {
+    CREATE ROLE sr_reset;
+    SET ROLE sr_reset;
+    RESET ROLE;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-none-returns-to-session-user {
+    CREATE ROLE sr_none;
+    SET ROLE sr_none;
+    SET ROLE NONE;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-while-another-role-is-set-changes-to-it {
+    CREATE ROLE st_first;
+    CREATE ROLE st_second;
+    SET ROLE st_first;
+    SET ROLE st_second;
+    SELECT current_user;
+}
+expect {
+    st_second
+}
+
+test set-role-to-default-returns-to-session-user {
+    CREATE ROLE st_default;
+    SET ROLE st_default;
+    SET ROLE TO DEFAULT;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-with-quoted-uppercase-setting-name-changes-current-user {
+    CREATE ROLE sr_quoted_name;
+    SET "ROLE" TO sr_quoted_name;
+    SELECT current_user;
+}
+expect {
+    sr_quoted_name
+}
+
+test reset-role-with-quoted-uppercase-setting-name-returns-to-session-user {
+    CREATE ROLE sr_quoted_reset;
+    SET ROLE sr_quoted_reset;
+    RESET "ROLE";
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test discard-all-returns-to-session-user {
+    CREATE ROLE sr_discard;
+    SET ROLE sr_discard;
+    DISCARD ALL;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-in-rolled-back-transaction-is-undone {
+    CREATE ROLE sr_rolled_back;
+    BEGIN;
+    SET ROLE sr_rolled_back;
+    SELECT current_user;
+    ROLLBACK;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    sr_rolled_back
+    session user
+}
+
+test set-role-in-committed-transaction-is-kept {
+    CREATE ROLE sr_committed;
+    BEGIN;
+    SET ROLE sr_committed;
+    COMMIT;
+    SELECT current_user;
+}
+expect {
+    sr_committed
+}
+
+test set-role-to-role-created-in-rolled-back-transaction-is-undone {
+    BEGIN;
+    CREATE ROLE sr_created_and_rolled_back;
+    SET ROLE sr_created_and_rolled_back;
+    ROLLBACK;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-local-role-ends-at-commit {
+    CREATE ROLE sr_local;
+    BEGIN;
+    SET LOCAL ROLE sr_local;
+    SELECT current_user;
+    COMMIT;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    sr_local
+    session user
+}
+
+test set-local-role-outside-a-transaction-ends-with-its-statement {
+    CREATE ROLE sr_local_outside;
+    SET LOCAL ROLE sr_local_outside;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test rollback-to-savepoint-restores-the-role {
+    CREATE ROLE sr_savepoint;
+    BEGIN;
+    SAVEPOINT s;
+    SET ROLE sr_savepoint;
+    SELECT current_user;
+    ROLLBACK TO SAVEPOINT s;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+    COMMIT;
+}
+expect {
+    sr_savepoint
+    session user
+}
+
+test show-role-names-the-role-set-with-set-role {
+    CREATE ROLE sr_show;
+    SHOW role;
+    SET ROLE sr_show;
+    SHOW role;
+    SELECT current_setting('role');
+}
+expect {
+    none
+    sr_show
+    sr_show
+}
+
+test set-config-sets-the-role {
+    CREATE ROLE sr_set_config;
+    SELECT set_config('role', 'sr_set_config', false);
+    SELECT current_user;
+}
+expect {
+    sr_set_config
+    sr_set_config
+}
+
+test reset-all-keeps-the-role {
+    CREATE ROLE sr_reset_all;
+    SET ROLE sr_reset_all;
+    RESET ALL;
+    SELECT current_user;
+}
+expect {
+    sr_reset_all
+}
+
+test set-role-to-missing-role-fails {
+    SET ROLE sr_missing;
+}
+expect error {
+    role "sr_missing" does not exist
+}
+
+test set-role-public-fails {
+    SET ROLE public;
+}
+expect error {
+    role "public" does not exist
+}
+
+@skip-if postgres "PostgreSQL supports SET SESSION AUTHORIZATION"
+test set-session-authorization-is-not-supported {
+    CREATE ROLE un_session;
+    SET SESSION AUTHORIZATION un_session;
+}
+@sqlstate 0A000
+expect error {
+    SET session_authorization is not supported
+}
+
+test reset-role-restores-superuser-privileges {
+    CREATE TABLE sr_restore (x int);
+    INSERT INTO sr_restore VALUES (1);
+    CREATE ROLE sr_restorer;
+    SET ROLE sr_restorer;
+    RESET ROLE;
+    SELECT x FROM sr_restore;
+}
+expect {
+    1
+}

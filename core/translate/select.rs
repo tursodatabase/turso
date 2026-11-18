@@ -6,6 +6,7 @@ use super::plan::{
     Window,
 };
 use crate::schema::Table;
+use crate::security::policy::Command;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
@@ -24,6 +25,7 @@ use crate::translate::planner::{
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
+use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
 };
@@ -358,6 +360,13 @@ fn prepare_one_select_plan(
                     &mut vtab_predicates,
                     &mut table_references,
                     connection,
+                )?;
+                row_security::filter_rows(
+                    &[Command::Select],
+                    &mut table_references,
+                    &mut where_predicates,
+                    resolver,
+                    program,
                 )?;
             }
 

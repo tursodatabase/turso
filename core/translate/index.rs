@@ -1,4 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
+use crate::dialect::CatalogChange;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -44,7 +45,7 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use super::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -162,6 +163,9 @@ pub fn translate_create_index(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
+    if schema::relation_name_is_taken(resolver, namespace, &idx_name, if_not_exists)? {
+        return Ok(());
+    }
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
     let schema_unique = resolver.with_schema(database_id, |s| {
@@ -354,6 +358,20 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Create {
+                namespace: namespace.id,
+                name: idx_name.clone(),
+                kind: crate::schema::RelationKind::Index,
+                table: Some(tbl_name),
+            }],
+        )?;
+    }
+
     emit_refill_index(
         program,
         resolver,
@@ -465,6 +483,7 @@ pub(crate) fn emit_refill_index(
             namespace,
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         }],
         vec![],
     );
@@ -1159,7 +1178,7 @@ pub(crate) fn expression_type_ordering(
 }
 
 /// The type of an index expression over `table`'s columns.
-fn expression_type(
+pub(crate) fn expression_type(
     expr: &Expr,
     table: &BTreeTable,
     schema: &Schema,
@@ -1416,6 +1435,7 @@ pub fn translate_drop_index(
     qualified_name: &QualifiedName,
     resolver: &Resolver,
     if_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let idx_name = normalize_ident(qualified_name.name.as_str());
@@ -1479,6 +1499,18 @@ pub fn translate_drop_index(
         database_id,
         Some(SQLITE_TABLEID),
     )?;
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Drop {
+                namespace: namespace.id,
+                name: idx_name.clone(),
+            }],
+        )?;
+    }
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -1718,15 +1750,18 @@ pub fn translate_optimize(
 #[cfg(test)]
 mod tests {
     use super::canonical_create_index_sql;
-    use turso_parser::{ast, parser::Parser};
+    use turso_parser::ast;
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-        let mut parser = Parser::new(b"CREATE INDEX aux.idx1 ON t1(name);");
-        let stmt = match parser.next_cmd().unwrap().unwrap() {
-            ast::Cmd::Stmt(stmt) => stmt,
-            other => panic!("expected statement, got {other:?}"),
-        };
+        let stmt =
+            match crate::dialect::engine::parse_statement("CREATE INDEX aux.idx1 ON t1(name);")
+                .unwrap()
+                .unwrap()
+            {
+                ast::Cmd::Stmt(stmt) => stmt,
+                other => panic!("expected statement, got {other:?}"),
+            };
 
         // let's confirm that the stmt does carry `aux`
         let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {
