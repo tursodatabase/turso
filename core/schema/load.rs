@@ -1,17 +1,18 @@
 //! Reading a schema from the database file: a list of steps, and one driver
 //! that runs the statements of each step.
 
-use crate::connection::Connection;
+use crate::connection::{Connection, TransactionState};
 use crate::namespace::NamespaceId;
 use crate::schema::{
     Schema, Sequence, SequencesByNamespace, StoredMaterializedView, TURSO_NAMESPACES_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::statement::StatementOrigin;
 use crate::sync::Arc;
 use crate::types::{IOResult, IOResultOr};
 use crate::util::UnparsedFromSqlIndex;
 use crate::vdbe::Row;
-use crate::{turso_assert, LimboError, Result, Statement, SymbolTable};
+use crate::{turso_assert, LimboError, Result, Statement, Value};
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::VecDeque;
 
@@ -78,7 +79,7 @@ pub(crate) struct SchemaLoad {
     /// after the types are loaded, and None after that.
     unbuilt: Option<UnbuiltViewsAndIndexes>,
     /// The CREATE TYPE statements of the custom types table.
-    pub(crate) type_sqls: Vec<String>,
+    type_sqls: Vec<String>,
 }
 
 #[derive(Default)]
@@ -98,36 +99,13 @@ impl SchemaLoad {
             type_sqls: Vec::new(),
         }
     }
-
-    /// Loads the custom types of `type_sqls`, then builds the materialized
-    /// views and indexes that the schema rows step collected.
-    pub(crate) fn load_types_then_build_views_and_indexes(
-        &mut self,
-        syms: &SymbolTable,
-        mvcc_enabled: bool,
-    ) -> Result<()> {
-        let unbuilt = self
-            .unbuilt
-            .take()
-            .expect("views and indexes are built once");
-        self.schema.populate_types_views_then_indices(
-            syms,
-            &self.type_sqls,
-            unbuilt.materialized_view_info,
-            unbuilt.dbsp_state_roots,
-            unbuilt.dbsp_state_index_roots,
-            unbuilt.from_sql_indexes,
-            unbuilt.automatic_indices,
-            mvcc_enabled,
-        )
-    }
 }
 
 /// Runs the steps of a schema load one after the other. It holds what is
 /// the same for every step: preparing each statement against the schema read
 /// so far, yielding on I/O, and passing the rows to the step.
 pub(crate) struct SchemaLoader {
-    pub(crate) load: SchemaLoad,
+    load: SchemaLoad,
     /// The steps not finished yet. The first one is the current step.
     steps: VecDeque<Box<dyn LoadStep>>,
     /// The statement of the current step that is being read.
@@ -206,7 +184,7 @@ impl SchemaLoader {
 }
 
 /// Reads the schema rows: tables, views, triggers, and the indexes and
-/// materialized views that are built once the custom types are loaded.
+/// materialized views that [`ViewsAndIndexes`] builds later.
 pub(crate) struct SchemaRows {
     conn: Arc<Connection>,
     queried: bool,
@@ -492,5 +470,144 @@ impl LoadStep for Sequences {
             }
             (SequenceRead::NotStarted | SequenceRead::DescriptorRead { .. }, _) => err,
         }
+    }
+}
+
+/// Reads the CREATE TYPE statements from the custom types table.
+pub(crate) struct CustomTypes {
+    conn: Arc<Connection>,
+    queried: bool,
+}
+
+impl CustomTypes {
+    pub(crate) fn new(conn: Arc<Connection>) -> Self {
+        Self {
+            conn,
+            queried: false,
+        }
+    }
+}
+
+impl LoadStep for CustomTypes {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+        if self.queried {
+            return Ok(None);
+        }
+        self.queried = true;
+        if self.conn.experimental_custom_types_enabled()
+            && load
+                .schema
+                .has_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+        {
+            return Ok(Some(LoadQuery::internal_helper(format!(
+                "SELECT name, sql FROM {TURSO_TYPES_TABLE_NAME}"
+            ))));
+        }
+        Ok(None)
+    }
+
+    fn row(&mut self, load: &mut SchemaLoad, row: &Row) -> Result<()> {
+        load.type_sqls.push(row.get::<&str>(1)?.to_string());
+        Ok(())
+    }
+}
+
+/// Loads the custom types that [`CustomTypes`] read, then builds the
+/// materialized views and indexes that [`SchemaRows`] read. It has no
+/// statement of its own.
+pub(crate) struct ViewsAndIndexes {
+    conn: Arc<Connection>,
+}
+
+impl ViewsAndIndexes {
+    pub(crate) fn new(conn: Arc<Connection>) -> Self {
+        Self { conn }
+    }
+}
+
+impl LoadStep for ViewsAndIndexes {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+        let unbuilt = load
+            .unbuilt
+            .take()
+            .expect("views and indexes are built once");
+        load.schema.populate_types_views_then_indices(
+            &self.conn.syms.read(),
+            &load.type_sqls,
+            unbuilt.materialized_view_info,
+            unbuilt.dbsp_state_roots,
+            unbuilt.dbsp_state_index_roots,
+            unbuilt.from_sql_indexes,
+            unbuilt.automatic_indices,
+            self.conn.mv_store().is_some(),
+        )?;
+        Ok(None)
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+        unreachable!("building views and indexes has no statement")
+    }
+}
+
+/// Reads the dialect's own schema state, such as the PostgreSQL frontend's
+/// relation catalog, with the statements of
+/// [`Dialect::schema_state_queries`](crate::dialect::Dialect::schema_state_queries),
+/// and builds it with
+/// [`Dialect::build_schema_state`](crate::dialect::Dialect::build_schema_state).
+pub(crate) struct DialectState {
+    conn: Arc<Connection>,
+    /// The statements not started yet, or None before the first call of
+    /// `next_query`.
+    queries: Option<VecDeque<String>>,
+    /// The rows so far of the statement being read.
+    rows: Vec<Vec<Value>>,
+    /// The rows of each finished statement.
+    results: Vec<Vec<Vec<Value>>>,
+}
+
+impl DialectState {
+    pub(crate) fn new(conn: Arc<Connection>) -> Self {
+        Self {
+            conn,
+            queries: None,
+            rows: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+}
+
+impl LoadStep for DialectState {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+        let queries = self.queries.get_or_insert_with(|| {
+            self.conn
+                .db
+                .dialect()
+                .schema_state_queries(&load.schema)
+                .into()
+        });
+        Ok(queries.pop_front().map(LoadQuery::engine_metadata_read))
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> Result<()> {
+        turso_assert!(
+            !matches!(self.conn.get_tx_state(), TransactionState::None),
+            "dialect schema state must be read in a transaction"
+        );
+        self.rows.push(row.get_values().cloned().collect());
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+        self.results.push(std::mem::take(&mut self.rows));
+        let queries = self.queries.as_ref().expect("set by next_query");
+        if queries.is_empty() {
+            load.schema.dialect_schema = Some(
+                self.conn
+                    .db
+                    .dialect()
+                    .build_schema_state(&load.schema, &self.results)?,
+            );
+        }
+        Ok(())
     }
 }
