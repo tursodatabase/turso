@@ -901,6 +901,29 @@ test table-insert-values-different-row-length-with-default {
 @sqlstate 42601
 expect error {}
 
+# A VALUES list with a WITH of its own reads its own CTEs first.
+test table-insert-values-own-with-hides-insert-with {
+    CREATE TABLE u (id int);
+    WITH c AS (SELECT 1 AS x) INSERT INTO u WITH c AS (SELECT 2 AS x) VALUES ((SELECT x FROM c));
+    SELECT id FROM u;
+}
+expect {
+    2
+}
+
+test table-insert-values-with-own-order-by-or-limit {
+    CREATE TABLE u (id int);
+    INSERT INTO u VALUES (2), (1) ORDER BY 1 LIMIT 1;
+    SELECT id FROM u;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ORDER BY, LIMIT or OFFSET on VALUES is not supported
+}
+
 @skip-if postgres "PostgreSQL supports ALTER VIEW ... RENAME"
 test alter-view-rename-is-not-supported {
     CREATE TABLE rn_view_base (id INT);

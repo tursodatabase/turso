@@ -2041,16 +2041,23 @@ impl PostgreSQLTranslator {
             }
         };
 
-        let (body, columns) = if !select_stmt.values_lists.is_empty() {
-            if !select_stmt.sort_clause.is_empty()
-                || select_stmt.limit_count.is_some()
-                || select_stmt.limit_offset.is_some()
-                || !select_stmt.locking_clause.is_empty()
-            {
-                return Err(ParseError::not_supported(
-                    "ORDER BY, LIMIT or OFFSET on INSERT ... VALUES",
-                ));
-            }
+        let has_values = !select_stmt.values_lists.is_empty();
+        let (body, columns) = if has_values && has_own_select_clauses(select_stmt) {
+            // As in PostgreSQL, a VALUES list with a WITH, ORDER BY, LIMIT or
+            // locking clause of its own is read as a query,
+            // `SELECT * FROM (VALUES ...)`.
+            // translate_select refuses all of these clauses except the WITH.
+            let select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: self.select_star_from(select_stmt)?,
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            (ast::InsertBody::Select(select, upsert), columns)
+        } else if has_values {
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
             let (rows, default_mask) =
                 self.translate_values(&select_stmt.values_lists, has_explicit_columns)?;
@@ -2078,7 +2085,7 @@ impl PostgreSQLTranslator {
                 (ast::InsertBody::DefaultValues, filtered_columns)
             } else {
                 let select = ast::Select {
-                    with: self.translate_with_clause(&select_stmt.with_clause)?,
+                    with: None,
                     body: ast::SelectBody {
                         select: ast::OneSelect::Values(rows),
                         compounds: vec![],
@@ -2327,6 +2334,14 @@ impl PostgreSQLTranslator {
 
         // VALUES clause: standalone VALUES (1,'a'), (2,'b') ...
         if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            if !select.sort_clause.is_empty()
+                || select.limit_count.is_some()
+                || select.limit_offset.is_some()
+            {
+                return Err(ParseError::not_supported(
+                    "ORDER BY, LIMIT or OFFSET on VALUES",
+                ));
+            }
             let mut rows = Vec::new();
             for row_node in &select.values_lists {
                 let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
@@ -2352,14 +2367,12 @@ impl PostgreSQLTranslator {
                 select: ast::OneSelect::Values(rows),
                 compounds: vec![],
             };
-            let order_by = self.translate_order_by(&select.sort_clause)?;
-            let limit = self.translate_select_limit(select)?;
             let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
                 with,
                 body,
-                order_by,
-                limit,
+                order_by: vec![],
+                limit: None,
             });
         }
 
@@ -2537,6 +2550,14 @@ impl PostgreSQLTranslator {
         if !is_set_operation(stmt) && !has_own_select_clauses(stmt) {
             return self.translate_one_select(stmt);
         }
+        self.select_star_from(stmt)
+    }
+
+    /// `SELECT * FROM (stmt)`.
+    fn select_star_from(
+        &self,
+        stmt: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::OneSelect, ParseError> {
         Ok(ast::OneSelect::Select {
             distinctness: None,
             columns: vec![ast::ResultColumn::Star],
@@ -12477,22 +12498,11 @@ mod tests {
     }
 
     #[test]
-    fn test_values_order_by_nulls_ordering() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "VALUES (1), (NULL), (2) ORDER BY 1 NULLS LAST";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        let ast::Stmt::Select(select) = translated else {
-            panic!("expected Select statement");
-        };
-        assert!(
-            matches!(select.body.select, ast::OneSelect::Values(_)),
-            "expected a VALUES body, got {:?}",
-            select.body.select
+    fn test_values_order_by_nulls_ordering_is_not_supported() {
+        assert_not_supported(
+            "VALUES (1), (NULL), (2) ORDER BY 1 NULLS LAST",
+            "ORDER BY, LIMIT or OFFSET on VALUES",
         );
-        assert_eq!(select.order_by.len(), 1);
-        assert_eq!(select.order_by[0].nulls, Some(ast::NullsOrder::Last));
     }
 
     #[test]
@@ -13572,7 +13582,7 @@ mod tests {
     fn fail_closed_insert_values_clauses() {
         assert_not_supported(
             "INSERT INTO t (VALUES (2), (1) ORDER BY 1 LIMIT 1)",
-            "INSERT ... VALUES",
+            "ORDER BY, LIMIT or OFFSET on VALUES",
         );
         assert_translates("INSERT INTO t (WITH c AS (SELECT 1) VALUES (1))");
         assert_translates("WITH c AS (SELECT 1) INSERT INTO t VALUES (1)");

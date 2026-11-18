@@ -889,6 +889,46 @@ expect {
     3|abc
 }
 
+# A VALUES list with a WITH of its own is read as a query, so its rows share a
+# type and DEFAULT is refused. With a WITH on the INSERT itself, the rows keep
+# their own types.
+test datetime-insert-values-with-own-with-rows-share-a-type {
+    CREATE TABLE w (id int, s text);
+    INSERT INTO w WITH c AS (SELECT 1) VALUES (1, now()), (2, '2024-01-01');
+    WITH c AS (SELECT 1) INSERT INTO w VALUES (3, now()), (4, '2024-01-01');
+    SELECT id, s FROM w WHERE id IN (2, 4) ORDER BY id;
+}
+expect {
+    2|2024-01-01 00:00:00+00
+    4|2024-01-01
+}
+
+test datetime-insert-values-with-own-with-timestamptz-and-integer-is-refused {
+    CREATE TABLE w (id int, s text);
+    INSERT INTO w WITH c AS (SELECT 1) VALUES (1, now()), (2, 5);
+}
+@sqlstate 42804
+expect error {
+    VALUES types timestamp with time zone and integer cannot be matched
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamptz with type integer is not supported
+}
+
+test datetime-insert-values-with-own-with-refuses-default {
+    CREATE TABLE w (id int, s text DEFAULT 'dflt');
+    INSERT INTO w WITH c AS (SELECT 1) VALUES (1, DEFAULT), (2, now());
+}
+@sqlstate 42601
+expect error {
+    DEFAULT is not allowed in this context
+}
+@sqlstate 42601
+expect @tursopg error {
+    DEFAULT is only valid in INSERT VALUES
+}
+
 # A VALUES list used as a value or as the right side of IN has the type of its
 # column, so a string literal next to it is read as a timestamptz.
 test datetime-timestamptz-values-list-as-subquery {

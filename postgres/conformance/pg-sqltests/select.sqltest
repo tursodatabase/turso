@@ -156,6 +156,17 @@ test values-in-union-rows-of-different-lengths-errors {
 expect error {
 }
 
+test values-with-order-by-and-limit {
+    VALUES (2), (1) ORDER BY 1 LIMIT 1;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    ORDER BY, LIMIT or OFFSET on VALUES is not supported
+}
+
 test column-alias-list-longer-than-subquery-errors {
     SELECT * FROM (SELECT 1, 2) AS s(a, b, c);
 }
