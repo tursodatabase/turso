@@ -236,7 +236,7 @@ impl<'a> TypeEnv<'a> {
             // The schema is read without the connection's dialect. Both
             // dialects resolve built-in functions the same way.
             Self::Table { syms, .. } | Self::TypeBody { syms, .. } => {
-                match crate::dialect::engine::resolve_builtin_function(name, arg_count)? {
+                match crate::dialect::resolve_builtin_function(name, arg_count)? {
                     Some(func) => Ok(Some(func)),
                     None => Ok(syms.resolve_function(name, arg_count).map(Func::External)),
                 }
@@ -1352,6 +1352,18 @@ fn is_domain(ty: &ExprType) -> bool {
     matches!(ty, ExprType::Custom { type_def, .. } if type_def.is_domain)
 }
 
+/// The type's name with each domain replaced by its base type: `boolean[]`
+/// for an array of a domain over boolean.
+pub(crate) fn name_without_domains(ty: ExprType, schema: &Schema) -> String {
+    match ty {
+        ExprType::Array {
+            element,
+            dimensions,
+        } => ExprType::array(without_domain(*element, schema), dimensions).to_string(),
+        scalar => without_domain(scalar, schema).to_string(),
+    }
+}
+
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it reads as. Other types are
 /// returned unchanged.
@@ -1399,7 +1411,6 @@ mod tests {
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{Cmd, OneSelect, ResultColumn, Stmt};
-    use turso_parser::parser::Parser;
 
     impl PartialEq for ExprType {
         fn eq(&self, other: &Self) -> bool {
@@ -1624,8 +1635,9 @@ mod tests {
 
     fn parse_expr(sql: &str) -> ast::Expr {
         let select_sql = format!("SELECT {sql}");
-        let mut parser = Parser::new(select_sql.as_bytes());
-        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) = parser.next_cmd() else {
+        let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
+            crate::dialect::parse_statement(&crate::EngineDialect, &select_sql)
+        else {
             panic!("not a SELECT: {sql}");
         };
         let OneSelect::Select { mut columns, .. } = select.body.select else {
@@ -1652,9 +1664,12 @@ mod tests {
 
     /// The built-in types plus `cents`.
     fn test_schema() -> Schema {
-        let mut schema = Schema::new();
+        let mut schema = crate::schema::builtin::schema_builder(&crate::EngineDialect, true)
+            .unwrap()
+            .build();
         schema
             .add_type_from_sql(
+                &crate::EngineDialect,
                 "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
                 &SymbolTable::new(),
             )

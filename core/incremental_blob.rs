@@ -30,6 +30,7 @@ use crate::namespace::NamespaceId;
 use crate::translate::collate::CollationSeq;
 use std::num::NonZero;
 use std::sync::Arc;
+use turso_parser::ast::Privilege;
 
 use crate::alloc::TursoSliceExt;
 use crate::schema::{BTreeTable, Column, Schema};
@@ -353,7 +354,7 @@ impl Connection {
         let root = table_ref.root_page;
         let program = build_blob_program(self, table_ref, root, record_column, rowid, read_write)?;
         let pager = self.get_pager();
-        let mut stmt = Statement::new(program, pager.clone(), QueryMode::Normal, 0);
+        let mut stmt = Statement::new(program, self.clone(), pager.clone(), QueryMode::Normal, 0);
         // Excluded from the explicit-checkpoint guard's active-statement
         // count: the handle parks at its row for its whole lifetime, and an
         // open blob handle must not block checkpointing until it is closed.
@@ -401,7 +402,7 @@ fn check_blob_privileges(
     read_write: bool,
 ) -> Result<()> {
     let role = conn.current_role();
-    if schema.roles.is_superuser(role) {
+    if conn.dialect().role_is_superuser(schema, role) {
         return Ok(());
     }
     let denied = |action| {
@@ -415,7 +416,7 @@ fn check_blob_privileges(
     }
     if conn
         .dialect()
-        .role_may_read(schema, NamespaceId::ROOT, table, role)
+        .role_has_privilege(schema, NamespaceId::ROOT, table, role, Privilege::Select)
     {
         return Ok(());
     }
@@ -563,6 +564,6 @@ fn build_blob_program(
     b.preassign_label_to_next_insn(l_end);
 
     conn.with_schema_mut(|schema| b.epilogue(schema))?;
-    b.build(conn.clone(), false, "incremental blob io")
+    b.build(conn, false, "incremental blob io")
         .map_err(|e| LimboError::InternalError(format!("blob program build failed: {e}")))
 }

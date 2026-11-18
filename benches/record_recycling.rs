@@ -9,7 +9,9 @@ use divan::{black_box, AllocProfiler};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
 use turso_benches::Bencher;
-use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, MemoryIO, SessionRole, Statement, StepResult, Value,
+};
 use turso_sqlite::SqliteDialect;
 
 #[global_allocator]
@@ -31,7 +33,9 @@ fn open_database(mvcc: bool) -> (Arc<Database>, Arc<Connection>) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     if mvcc {
         execute(&db, &conn, "PRAGMA journal_mode = 'mvcc'");
     }

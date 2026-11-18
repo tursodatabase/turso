@@ -2,7 +2,7 @@ use crate::common::{rusqlite_integrity_check, ExecRows, TempDatabase};
 use crate::queued_io::QueuedIo;
 use asserting::prelude::*;
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, LimboError, StepResult, IO};
+use turso_core::{ConnectOpts, Database, LimboError, SessionRole, StepResult, IO};
 use turso_sqlite::SqliteDialect;
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
@@ -604,7 +604,7 @@ fn test_select_fails_while_drop_waits_for_io() -> anyhow::Result<()> {
         let dir = tempfile::TempDir::new()?;
         let path = dir.path().join("select-during-drop-io.db");
         let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("PRAGMA page_size=512")?;
         conn.execute("PRAGMA cache_size=9")?;
         conn.execute("PRAGMA journal_mode='wal'")?;
@@ -709,7 +709,7 @@ fn test_drop_fails_while_select_waits_for_its_first_page() -> anyhow::Result<()>
     let dir = tempfile::TempDir::new()?;
     let path = dir.path().join("drop-during-select-io.db");
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("PRAGMA page_size=512")?;
     conn.execute("PRAGMA cache_size=9")?;
     conn.execute("PRAGMA cache_spill=ON")?;
@@ -753,7 +753,7 @@ fn test_drop_fails_while_insert_waits_for_io_after_abandoned_delete() -> anyhow:
     let dir = tempfile::TempDir::new()?;
     let path = dir.path().join("drop-during-insert-io.db");
     let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("PRAGMA page_size=512")?;
     conn.execute("PRAGMA cache_size=9")?;
     conn.execute("PRAGMA cache_spill=ON")?;

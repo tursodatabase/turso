@@ -292,6 +292,7 @@ fn translate_integrity_check_for_schema(
                 },
                 indexed: None,
                 plan_estimate: None,
+                row_filter: None,
             }],
             vec![],
         );

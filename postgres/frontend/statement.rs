@@ -679,7 +679,7 @@ impl std::ops::Deref for Statement {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SessionRole, IO};
     use turso_sqlite::SqliteDialect;
 
     #[test]
@@ -694,7 +694,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.set_foreign_keys_enabled(true);
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
             .unwrap();

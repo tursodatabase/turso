@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
-use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
+use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, SessionRole, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 use turso_sqlite::SqliteDialect;
@@ -543,7 +543,9 @@ pub unsafe extern "C" fn sqlite3_open(
         Arc::new(SqliteDialect),
     ) {
         Ok(db) => {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
             let filename = match filename_str {
                 ":memory:" => CString::new("".to_string()).unwrap(),
                 _ => CString::from(filename_cstr),
@@ -772,7 +774,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect(ConnectOpts::new()) {
+    match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
@@ -3804,6 +3806,7 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use turso_core::SessionRole;
 
     #[test]
     fn structured_constraint_errors_keep_sqlite_codes() {
@@ -4556,7 +4559,12 @@ mod tests {
                 Arc::new(SqliteDialect),
             )
             .unwrap();
-            (path, database.connect(ConnectOpts::new()).unwrap())
+            (
+                path,
+                database
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap(),
+            )
         };
         let (ro_path, ro_conn) = open("ro.db");
         ro_conn.execute("CREATE TABLE t(x)").unwrap();

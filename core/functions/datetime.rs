@@ -940,49 +940,45 @@ where
                 return Value::Null;
             }
 
-            let mut res = String::new();
+            let mut res = String::with_capacity(32);
             if func_type == "date" {
-                if p.y < 0 {
-                    write!(res, "-{:04}-{:02}-{:02}", p.y.abs(), p.m, p.d).unwrap();
-                } else {
-                    write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap();
-                }
+                push_date(&mut res, &p);
             } else if func_type == "time" {
-                write!(res, "{:02}:{:02}", p.h, p.min).unwrap();
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
-                }
+                push_time(&mut res, &p);
             } else {
-                if p.y < 0 {
-                    write!(
-                        res,
-                        "-{:04}-{:02}-{:02} {:02}:{:02}",
-                        p.y.abs(),
-                        p.m,
-                        p.d,
-                        p.h,
-                        p.min
-                    )
-                    .unwrap();
-                } else {
-                    write!(
-                        res,
-                        "{:04}-{:02}-{:02} {:02}:{:02}",
-                        p.y, p.m, p.d, p.h, p.min
-                    )
-                    .unwrap();
-                }
-
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
-                }
+                push_date(&mut res, &p);
+                res.push(' ');
+                push_time(&mut res, &p);
             }
             Value::from_text(res)
         }
+    }
+}
+
+/// Append `[-]YYYY-MM-DD`.
+fn push_date(res: &mut String, p: &DateTime) {
+    if p.y < 0 {
+        res.push('-');
+        push_zero_padded(res, i64::from(p.y.abs()), 4);
+    } else {
+        push_zero_padded(res, i64::from(p.y), 4);
+    }
+    res.push('-');
+    push_zero_padded(res, i64::from(p.m), 2);
+    res.push('-');
+    push_zero_padded(res, i64::from(p.d), 2);
+}
+
+/// Append `HH:MM:SS`, or `HH:MM:SS.SSS` with the `subsec` modifier.
+fn push_time(res: &mut String, p: &DateTime) {
+    push_zero_padded(res, i64::from(p.h), 2);
+    res.push(':');
+    push_zero_padded(res, i64::from(p.min), 2);
+    if p.use_subsec {
+        write!(res, ":{:06.3}", p.s).unwrap();
+    } else {
+        res.push(':');
+        push_zero_padded(res, i64::from(p.s as i32), 2);
     }
 }
 
@@ -1392,9 +1388,15 @@ where
         }
 
         match chars.next() {
-            Some('d') => write!(res, "{:02}", p.d).unwrap(),
+            Some('d') => push_zero_padded(&mut res, i64::from(p.d), 2),
             Some('e') => write!(res, "{:2}", p.d).unwrap(),
-            Some('F') => write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap(),
+            Some('F') => {
+                push_zero_padded(&mut res, i64::from(p.y), 4);
+                res.push('-');
+                push_zero_padded(&mut res, i64::from(p.m), 2);
+                res.push('-');
+                push_zero_padded(&mut res, i64::from(p.d), 2);
+            }
             Some('f') => {
                 let mut s = p.s;
                 if s > 59.999 {
@@ -1416,7 +1418,7 @@ where
                 y_iso.compute_ymd();
                 write!(res, "{:04}", y_iso.y).unwrap();
             }
-            Some('H') => write!(res, "{:02}", p.h).unwrap(),
+            Some('H') => push_zero_padded(&mut res, i64::from(p.h), 2),
             Some('I') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
                 write!(res, "{h:02}").unwrap();
@@ -1435,11 +1437,15 @@ where
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
                 write!(res, "{h:2}").unwrap();
             }
-            Some('m') => write!(res, "{:02}", p.m).unwrap(),
-            Some('M') => write!(res, "{:02}", p.min).unwrap(),
+            Some('m') => push_zero_padded(&mut res, i64::from(p.m), 2),
+            Some('M') => push_zero_padded(&mut res, i64::from(p.min), 2),
             Some('p') => write!(res, "{}", if p.h >= 12 { "PM" } else { "AM" }).unwrap(),
             Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
-            Some('R') => write!(res, "{:02}:{:02}", p.h, p.min).unwrap(),
+            Some('R') => {
+                push_zero_padded(&mut res, i64::from(p.h), 2);
+                res.push(':');
+                push_zero_padded(&mut res, i64::from(p.min), 2);
+            }
             Some('s') => {
                 let s = (p.i_jd - 210866760000000) as f64 / 1000.0;
                 if p.use_subsec {
@@ -1448,8 +1454,14 @@ where
                     write!(res, "{}", s.floor()).unwrap();
                 }
             }
-            Some('S') => write!(res, "{:02}", p.s as i32).unwrap(),
-            Some('T') => write!(res, "{:02}:{:02}:{:02}", p.h, p.min, p.s as i32).unwrap(),
+            Some('S') => push_zero_padded(&mut res, i64::from(p.s as i32), 2),
+            Some('T') => {
+                push_zero_padded(&mut res, i64::from(p.h), 2);
+                res.push(':');
+                push_zero_padded(&mut res, i64::from(p.min), 2);
+                res.push(':');
+                push_zero_padded(&mut res, i64::from(p.s as i32), 2);
+            }
             Some('u') => {
                 let mut w = days_after_sun(&p);
                 if w == 0 {
@@ -1476,7 +1488,7 @@ where
                 let w = (days_after_jan1(&p) - days_after_mon(&p) + 7) / 7;
                 write!(res, "{w:02}").unwrap();
             }
-            Some('Y') => write!(res, "{:04}", p.y).unwrap(),
+            Some('Y') => push_zero_padded(&mut res, i64::from(p.y), 4),
             Some('%') => res.push('%'),
             _ => return Value::Null,
         }
@@ -1506,10 +1518,43 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
     }
 }
 
+/// Append `value` as `write!(res, "{value:0width$}")` does: zero padded to
+/// `width` characters, with the sign counted in the width.
+fn push_zero_padded(res: &mut String, value: i64, width: usize) {
+    let mut buf = [0u8; 20];
+    let digits = crate::numeric::write_decimal_digits(&mut buf, value.unsigned_abs());
+    let negative = value < 0;
+    if negative {
+        res.push('-');
+    }
+    for _ in digits.len() + usize::from(negative)..width {
+        res.push('0');
+    }
+    for &digit in digits {
+        res.push(char::from(digit));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::clock::DefaultClock;
+
+    #[test]
+    fn push_zero_padded_matches_fmt() {
+        for value in (-12_345i64..12_345).chain([
+            i64::MIN,
+            i64::MAX,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+        ]) {
+            for width in 0..7 {
+                let mut res = String::new();
+                push_zero_padded(&mut res, value, width);
+                assert_eq!(res, format!("{value:0width$}"));
+            }
+        }
+    }
 
     #[test]
     fn test_valid_get_date_from_time_value() {

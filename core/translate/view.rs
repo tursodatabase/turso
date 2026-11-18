@@ -1,18 +1,17 @@
-use crate::dialect::RelationChange;
+use crate::dialect::CatalogChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::view::extract_view_columns;
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
-use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
     schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
-    escape_sql_string_literal, extract_view_columns, normalize_ident,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
@@ -249,11 +248,11 @@ pub fn translate_create_materialized_view(
     // The view is a relation of the dialect's; its hidden state tables are
     // engine objects and are not.
     if schema::dialect_relation_hooks_apply(&connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             &connection,
-            &[RelationChange::Create {
+            &[CatalogChange::Create {
                 namespace: namespace.id,
                 name: normalized_view_name,
                 kind: crate::schema::RelationKind::MaterializedView,
@@ -445,16 +444,12 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
-    let mut select_stmt = select_stmt.clone();
-    if resolver.catalog.dialect.binds_names_at_create() {
-        bind_sequence_names_in_select(&mut select_stmt, resolver)?;
-    }
     let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
     let sql = create_view_to_str(
         "VIEW",
         &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
         columns,
-        &select_stmt,
+        select_stmt,
     );
 
     // Open cursor to sqlite_schema table
@@ -483,11 +478,11 @@ pub fn translate_create_view(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             connection,
-            &[RelationChange::Create {
+            &[CatalogChange::Create {
                 namespace: namespace.id,
                 name: normalized_view_name,
                 kind: crate::schema::RelationKind::View,
@@ -672,11 +667,11 @@ pub fn translate_drop_view(
     }
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
+        resolver.catalog.dialect.translate_catalog_changes(
             program,
             resolver.schema(),
             connection,
-            &[RelationChange::Drop {
+            &[CatalogChange::Drop {
                 namespace: namespace.id,
                 name: normalized_view_name.clone(),
             }],

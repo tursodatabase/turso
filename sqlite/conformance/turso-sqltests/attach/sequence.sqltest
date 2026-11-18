@@ -199,3 +199,36 @@ test currval-does-not-survive-detach-and-reuse-of-the-database-id {
 expect error {
     currval of sequence "s" is not yet defined in this session
 }
+
+test drop-sequence-refuses-an-attached-sequence-a-main-table-uses {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.du_seq;
+    CREATE TABLE du_tbl(a INTEGER DEFAULT (nextval('aux.du_seq')), b);
+    DROP SEQUENCE aux.du_seq;
+}
+expect error {
+    cannot drop sequence du_seq because other objects depend on it: the default of column a in table du_tbl depends on sequence du_seq
+}
+
+test drop-sequence-refuses-a-main-sequence-an-attached-table-uses {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE dw_seq;
+    CREATE TABLE aux.dw_tbl(a INTEGER DEFAULT (nextval('dw_seq')), b);
+    DROP SEQUENCE dw_seq;
+}
+expect error {
+    cannot drop sequence dw_seq because other objects depend on it: the default of column a in table dw_tbl depends on sequence dw_seq
+}
+
+test drop-sequence-ignores-a-sequence-of-the-same-name-in-another-database {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE dx_seq;
+    CREATE SEQUENCE aux.dx_seq;
+    CREATE TABLE dx_tbl(a INTEGER DEFAULT (nextval('dx_seq')), b);
+    DROP SEQUENCE aux.dx_seq;
+    INSERT INTO dx_tbl(b) VALUES ('x');
+    SELECT a FROM dx_tbl;
+}
+expect {
+    1
+}

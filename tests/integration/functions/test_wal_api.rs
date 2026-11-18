@@ -10,6 +10,7 @@ use turso_core::{
 };
 
 use crate::common::{rng_from_time, ExecRows, TempDatabase};
+use turso_core::SessionRole;
 
 // TODO: mvcc
 #[turso_macros::test()]
@@ -976,7 +977,9 @@ fn test_db_share_same_file() {
             .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
-    let conn1 = db1.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db1
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1.wal_auto_actions_disable();
 
     conn1.execute("create table a(x, y)").unwrap();
@@ -1001,7 +1004,9 @@ fn test_db_share_same_file() {
             .wal_path(format!("{}-wal-copy", path.to_str().unwrap())),
     )
     .unwrap();
-    let conn2 = db2.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn2.wal_auto_actions_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();
@@ -1115,7 +1120,9 @@ fn wal_insert_end_syncs_committed_frames() {
         let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
         let db = turso_core::Database::open_file(io.clone(), "target.db", Arc::new(SqliteDialect))
             .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA synchronous = FULL").unwrap();
         let mut frame = [0u8; 24 + 4096];
         conn.wal_insert_begin().unwrap();
@@ -1125,7 +1132,7 @@ fn wal_insert_end_syncs_committed_frames() {
         }
         conn.wal_insert_end(force_commit).unwrap();
         let rows: Vec<(i64,)> = db
-            .connect(ConnectOpts::new())
+            .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .exec_rows("SELECT count(*) FROM t");
         assert_eq!(rows, [(1,)]);
@@ -1233,7 +1240,9 @@ fn wal_get_frame_does_not_write_into_buffer_after_it_returns_error() {
     });
     let db =
         turso_core::Database::open_file(io.clone(), "repro.db", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     let mut frame = [0u8; 24 + 4096];
     io.fail_next_step

@@ -735,229 +735,186 @@ pub fn constraints_from_where_clause(
     params: &CostModelParams,
     resolver: &Resolver,
 ) -> Result<Vec<TableConstraints>> {
-    let mut constraints = Vec::new();
     // A term's collation is the same for every table it constrains, and
     // deciding it means working out the types of its operands, so each term's
     // collation is decided at most once, the first time a table needs it.
     let mut term_collations: Vec<Option<CollationSeq>> = vec![None; where_clause.len()];
+    table_references
+        .joined_tables()
+        .iter()
+        .map(|table_reference| {
+            table_constraints_from_where_clause(
+                table_reference,
+                where_clause,
+                &mut term_collations,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                params,
+                resolver,
+            )
+        })
+        .collect()
+}
 
-    // For each table, collect all the Constraints and all potential index candidates that may use them.
-    for table_reference in table_references.joined_tables() {
-        let rowid_alias_column = table_reference
-            .columns()
-            .iter()
-            .position(|c| c.is_rowid_alias());
+/// Collect the [Constraint]s that `where_clause` puts on one table, and the
+/// index candidates that can use them. [constraints_from_where_clause] does
+/// this for every table of `table_references`.
+///
+/// `term_collations` has one slot for each term of `where_clause`. A slot holds
+/// the collation of the term after a table needed it.
+#[expect(clippy::too_many_arguments)]
+pub fn table_constraints_from_where_clause(
+    table_reference: &JoinedTable,
+    where_clause: &[WhereTerm],
+    term_collations: &mut [Option<CollationSeq>],
+    table_references: &TableReferences,
+    available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+    resolver: &Resolver,
+) -> Result<TableConstraints> {
+    let rowid_alias_column = table_reference
+        .columns()
+        .iter()
+        .position(|c| c.is_rowid_alias());
 
-        let mut cs = TableConstraints {
-            table_id: table_reference.internal_id,
-            constraints: Vec::new(),
-            temporary_index_terms: SmallVec::new(),
-            candidates: available_indexes
-                .indexes_for_table(table_reference.internal_id)
-                .map_or(Vec::new(), |indexes| {
-                    indexes
-                        .iter()
-                        // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
-                        // pattern matching rather than btree index scans
-                        .filter(|index| index.index_method.is_none())
-                        // A partial index can omit rows that a later RIGHT JOIN
-                        // or FULL JOIN must keep.
-                        .filter(|index| {
-                            index.where_clause.is_none()
-                                || !table_references
-                                    .is_left_of_right_or_full_join(table_reference.internal_id)
-                        })
-                        .map(|index| ConstraintUseCandidate {
-                            index: Some(index.clone()),
-                            refs: Vec::new(),
-                        })
-                        .collect()
-                }),
-        };
-        // Add a candidate for the rowid index, which is always available when the table has a rowid alias.
-        cs.candidates.push(ConstraintUseCandidate {
-            index: None,
-            refs: Vec::new(),
-        });
+    let mut cs = TableConstraints {
+        table_id: table_reference.internal_id,
+        constraints: Vec::new(),
+        temporary_index_terms: SmallVec::new(),
+        candidates: available_indexes
+            .indexes_for_table(table_reference.internal_id)
+            .map_or(Vec::new(), |indexes| {
+                indexes
+                    .iter()
+                    // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
+                    // pattern matching rather than btree index scans
+                    .filter(|index| index.index_method.is_none())
+                    // A partial index can omit rows that a later RIGHT JOIN
+                    // or FULL JOIN must keep.
+                    .filter(|index| {
+                        index.where_clause.is_none()
+                            || !table_references
+                                .is_left_of_right_or_full_join(table_reference.internal_id)
+                    })
+                    .map(|index| ConstraintUseCandidate {
+                        index: Some(index.clone()),
+                        refs: Vec::new(),
+                    })
+                    .collect()
+            }),
+    };
+    // Add a candidate for the rowid index, which is always available when the table has a rowid alias.
+    cs.candidates.push(ConstraintUseCandidate {
+        index: None,
+        refs: Vec::new(),
+    });
 
-        let index_for_column = |column_pos| {
-            selectivity_index_for_column(schema, table_reference, available_indexes, column_pos)
-        };
+    let index_for_column = |column_pos| {
+        selectivity_index_for_column(schema, table_reference, available_indexes, column_pos)
+    };
 
-        for (i, term) in where_clause.iter().enumerate() {
-            let join_origin = term.origin.join_origin();
-            // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
-            // regardless of which tables the constraint references.
-            if let Some(outer_join_tbl) = join_origin.and_then(JoinOrigin::outer_table) {
-                if outer_join_tbl != table_reference.internal_id {
-                    continue;
-                }
+    for (i, term) in where_clause.iter().enumerate() {
+        let join_origin = term.origin.join_origin();
+        // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
+        // regardless of which tables the constraint references.
+        if let Some(outer_join_tbl) = join_origin.and_then(JoinOrigin::outer_table) {
+            if outer_join_tbl != table_reference.internal_id {
+                continue;
             }
+        }
 
-            // A term must not constrain the loop of a table that an outer join
-            // can null-extend, except in the three cases below. Consuming the
-            // term into the access path filters that table's rows, which
-            // changes which rows of the other side count as unmatched. The
-            // join then emits NULL rows that never see the term.
-            //
-            // Exception 1: terms from this table's own ON clause define what
-            // counts as a match, so they are always fine.
-            //
-            // Exception 2: on the right side of a plain LEFT JOIN, the engine
-            // re-checks consumed WHERE terms when it emits the NULL row. Any
-            // operator except `IS` is never true on a NULL row, so the
-            // re-check removes that row. This does not apply to `IS`, to an ON
-            // term of a later join, or to a table at or left of a RIGHT JOIN or
-            // FULL JOIN, whose unmatched-row pass can bypass the access path.
-            //
-            // Exception 3: a table-function argument defines its source.
-            // It is not a post-join filter on that source.
-            let can_use_before_null_extension = |is_op: bool| {
-                let table = table_reference.internal_id;
-                term.origin.table_function_table() == Some(table)
-                    || join_origin.is_some_and(|origin| origin.right_table() == table)
-                    || (!table_references.is_at_or_left_of_right_or_full_join(table)
-                        && ((join_origin.is_none() && !is_op)
-                            || !table_references.outer_join_may_null_extend(table)))
-            };
+        // A term must not constrain the loop of a table that an outer join
+        // can null-extend, except in the three cases below. Consuming the
+        // term into the access path filters that table's rows, which
+        // changes which rows of the other side count as unmatched. The
+        // join then emits NULL rows that never see the term.
+        //
+        // Exception 1: terms from this table's own ON clause define what
+        // counts as a match, so they are always fine.
+        //
+        // Exception 2: on the right side of a plain LEFT JOIN, the engine
+        // re-checks consumed WHERE terms when it emits the NULL row. Any
+        // operator except `IS` is never true on a NULL row, so the
+        // re-check removes that row. This does not apply to `IS`, to an ON
+        // term of a later join, or to a table at or left of a RIGHT JOIN or
+        // FULL JOIN, whose unmatched-row pass can bypass the access path.
+        //
+        // Exception 3: a table-function argument defines its source.
+        // It is not a post-join filter on that source.
+        let can_use_before_null_extension = |is_op: bool| {
+            let table = table_reference.internal_id;
+            term.origin.table_function_table() == Some(table)
+                || join_origin.is_some_and(|origin| origin.right_table() == table)
+                || (!table_references.is_at_or_left_of_right_or_full_join(table)
+                    && ((join_origin.is_none() && !is_op)
+                        || !table_references.outer_join_may_null_extend(table)))
+        };
 
-            // Try to extract as binary expression first
-            if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
-                // `x IS TRUE` checks whether x is true; it does not compare x
-                // with 1. For example, `2 IS TRUE` is true, so an index lookup
-                // for 1 would miss that row. The same rule applies to FALSE,
-                // and it holds through parentheses and COLLATE: `x IS (TRUE)`
-                // is still a truth test (see [truth_test_rhs]).
-                if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
-                    && truth_test_rhs(rhs).is_some()
-                {
-                    continue;
+        // Try to extract as binary expression first
+        if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+            // `x IS TRUE` checks whether x is true; it does not compare x
+            // with 1. For example, `2 IS TRUE` is true, so an index lookup
+            // for 1 would miss that row. The same rule applies to FALSE,
+            // and it holds through parentheses and COLLATE: `x IS (TRUE)`
+            // is still a truth test (see [truth_test_rhs]).
+            if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
+                && truth_test_rhs(rhs).is_some()
+            {
+                continue;
+            }
+            // Resolve the comparison affinity once per term per SQLite's
+            // `comparisonAffinity` (see `Constraint::comparison_affinity`)
+            // and propagate it to every constraint derived from this term.
+            let cmp_aff = operator
+                .as_ast_operator()
+                .filter(|op| op.is_comparison())
+                .map(|_| {
+                    comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
+                });
+            let cmp_collation = match operator.as_ast_operator() {
+                Some(op) if op.is_comparison() => {
+                    Some(decide_once(&mut term_collations[i], || {
+                        comparison_collation(
+                            lhs,
+                            rhs,
+                            &ExprContext::new(Some(table_references), resolver),
+                        )
+                    })?)
                 }
-                // Resolve the comparison affinity once per term per SQLite's
-                // `comparisonAffinity` (see `Constraint::comparison_affinity`)
-                // and propagate it to every constraint derived from this term.
-                let cmp_aff = operator
-                    .as_ast_operator()
-                    .filter(|op| op.is_comparison())
-                    .map(|_| {
-                        comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
-                    });
-                let cmp_collation = match operator.as_ast_operator() {
-                    Some(op) if op.is_comparison() => {
-                        Some(decide_once(&mut term_collations[i], || {
-                            comparison_collation(
-                                lhs,
-                                rhs,
-                                &ExprContext::new(Some(table_references), resolver),
-                            )
-                        })?)
-                    }
-                    _ => None,
-                };
-                let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
-                let outer_join_compatible = can_use_before_null_extension(is_op);
-                // See [Constraint::null_matching]. The constraining value sits
-                // on the opposite side of the constrained column.
-                let null_matching = |constraining_expr: &ast::Expr| {
-                    is_op && !is_non_null_literal(constraining_expr)
-                };
-                // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
-                match lhs {
-                    ast::Expr::Column { table, column, .. } => {
-                        if *table == table_reference.internal_id {
-                            let table_column = &table_reference.table.columns()[*column];
-                            cs.constraints.push(Constraint {
-                                where_clause_pos: (i, BinaryExprSide::Rhs),
-                                operator,
-                                table_col_pos: Some(*column),
-                                expr: None,
-                                constraining_expr: None,
-                                lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    Some(table_column),
-                                    operator,
-                                    null_matching(rhs),
-                                    index_for_column(*column),
-                                    params,
-                                    false,
-                                ),
-                                usable: true,
-                                outer_join_compatible,
-                                is_rowid: false,
-                                comparison_affinity: cmp_aff,
-                                null_matching: null_matching(rhs),
-                                collation: cmp_collation,
-                            });
-                        }
-                    }
-                    ast::Expr::RowId { table, .. } => {
-                        if *table == table_reference.internal_id {
-                            let (col, col_pos) = if let Some(alias) = rowid_alias_column {
-                                (Some(&table_reference.table.columns()[alias]), Some(alias))
-                            } else {
-                                (None, None)
-                            };
-                            cs.constraints.push(Constraint {
-                                where_clause_pos: (i, BinaryExprSide::Rhs),
-                                operator,
-                                table_col_pos: col_pos,
-                                expr: None,
-                                constraining_expr: None,
-                                lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    col,
-                                    operator,
-                                    null_matching(rhs),
-                                    None,
-                                    params,
-                                    true,
-                                ),
-                                usable: true,
-                                outer_join_compatible,
-                                is_rowid: true,
-                                comparison_affinity: cmp_aff,
-                                null_matching: null_matching(rhs),
-                                collation: cmp_collation,
-                            });
-                        }
-                    }
-                    _ if expression_matches_table(
-                        lhs,
-                        table_reference,
-                        table_references,
-                        subqueries,
-                    ) =>
-                    {
-                        let selectivity = estimate_constraint_selectivity(
-                            schema,
-                            table_reference,
-                            None,
-                            operator,
-                            null_matching(rhs),
-                            None,
-                            params,
-                            false,
-                        );
-                        tracing::debug!(
-                            table = table_reference.table.get_name(),
-                            where_clause_pos = i,
-                            operator = ?operator,
-                            lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity,
-                            "expr constraint (lhs matches table)"
-                        );
+                _ => None,
+            };
+            let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
+            let outer_join_compatible = can_use_before_null_extension(is_op);
+            // See [Constraint::null_matching]. The constraining value sits
+            // on the opposite side of the constrained column.
+            let null_matching =
+                |constraining_expr: &ast::Expr| is_op && !is_non_null_literal(constraining_expr);
+            // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
+            match lhs {
+                ast::Expr::Column { table, column, .. } => {
+                    if *table == table_reference.internal_id {
+                        let table_column = &table_reference.table.columns()[*column];
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
-                            table_col_pos: None,
-                            expr: Some(lhs.clone()),
+                            table_col_pos: Some(*column),
+                            expr: None,
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity,
+                            selectivity: estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                Some(table_column),
+                                operator,
+                                null_matching(rhs),
+                                index_for_column(*column),
+                                params,
+                                false,
+                            ),
                             usable: true,
                             outer_join_compatible,
                             is_rowid: false,
@@ -966,104 +923,104 @@ pub fn constraints_from_where_clause(
                             collation: cmp_collation,
                         });
                     }
-                    _ => {}
-                };
-                match rhs {
-                    ast::Expr::Column { table, column, .. } => {
-                        if *table == table_reference.internal_id {
-                            let table_column = &table_reference.table.columns()[*column];
-                            cs.constraints.push(Constraint {
-                                where_clause_pos: (i, BinaryExprSide::Lhs),
-                                operator: opposite_cmp_op(operator),
-                                table_col_pos: Some(*column),
-                                expr: None,
-                                constraining_expr: None,
-                                lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    Some(table_column),
-                                    operator,
-                                    null_matching(lhs),
-                                    index_for_column(*column),
-                                    params,
-                                    false,
-                                ),
-                                usable: true,
-                                outer_join_compatible,
-                                is_rowid: false,
-                                comparison_affinity: cmp_aff,
-                                null_matching: null_matching(lhs),
-                                collation: cmp_collation,
-                            });
-                        }
-                    }
-                    ast::Expr::RowId { table, .. } => {
-                        if *table == table_reference.internal_id {
-                            let (col, col_pos) = if let Some(alias) = rowid_alias_column {
-                                (Some(&table_reference.table.columns()[alias]), Some(alias))
-                            } else {
-                                (None, None)
-                            };
-                            cs.constraints.push(Constraint {
-                                where_clause_pos: (i, BinaryExprSide::Lhs),
-                                operator: opposite_cmp_op(operator),
-                                table_col_pos: col_pos,
-                                expr: None,
-                                constraining_expr: None,
-                                lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                                selectivity: estimate_constraint_selectivity(
-                                    schema,
-                                    table_reference,
-                                    col,
-                                    operator,
-                                    null_matching(lhs),
-                                    None,
-                                    params,
-                                    true,
-                                ),
-                                usable: true,
-                                outer_join_compatible,
-                                is_rowid: true,
-                                comparison_affinity: cmp_aff,
-                                null_matching: null_matching(lhs),
-                                collation: cmp_collation,
-                            });
-                        }
-                    }
-                    _ if expression_matches_table(
-                        rhs,
-                        table_reference,
-                        table_references,
-                        subqueries,
-                    ) =>
-                    {
-                        let selectivity = estimate_constraint_selectivity(
-                            schema,
-                            table_reference,
-                            None,
+                }
+                ast::Expr::RowId { table, .. } => {
+                    if *table == table_reference.internal_id {
+                        let (col, col_pos) = if let Some(alias) = rowid_alias_column {
+                            (Some(&table_reference.table.columns()[alias]), Some(alias))
+                        } else {
+                            (None, None)
+                        };
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
-                            null_matching(lhs),
-                            None,
-                            params,
-                            false,
-                        );
-                        tracing::debug!(
-                            table = table_reference.table.get_name(),
-                            where_clause_pos = i,
-                            operator = ?operator,
-                            lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity,
-                            "expr constraint (rhs matches table)"
-                        );
+                            table_col_pos: col_pos,
+                            expr: None,
+                            constraining_expr: None,
+                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                            selectivity: estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                col,
+                                operator,
+                                null_matching(rhs),
+                                None,
+                                params,
+                                true,
+                            ),
+                            usable: true,
+                            outer_join_compatible,
+                            is_rowid: true,
+                            comparison_affinity: cmp_aff,
+                            null_matching: null_matching(rhs),
+                            collation: cmp_collation,
+                        });
+                    }
+                }
+                _ if expression_matches_table(
+                    lhs,
+                    table_reference,
+                    table_references,
+                    subqueries,
+                ) =>
+                {
+                    let selectivity = estimate_constraint_selectivity(
+                        schema,
+                        table_reference,
+                        None,
+                        operator,
+                        null_matching(rhs),
+                        None,
+                        params,
+                        false,
+                    );
+                    tracing::debug!(
+                        table = table_reference.table.get_name(),
+                        where_clause_pos = i,
+                        operator = ?operator,
+                        lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
+                        selectivity,
+                        "expr constraint (lhs matches table)"
+                    );
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Rhs),
+                        operator,
+                        table_col_pos: None,
+                        expr: Some(lhs.clone()),
+                        constraining_expr: None,
+                        lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                        selectivity,
+                        usable: true,
+                        outer_join_compatible,
+                        is_rowid: false,
+                        comparison_affinity: cmp_aff,
+                        null_matching: null_matching(rhs),
+                        collation: cmp_collation,
+                    });
+                }
+                _ => {}
+            };
+            match rhs {
+                ast::Expr::Column { table, column, .. } => {
+                    if *table == table_reference.internal_id {
+                        let table_column = &table_reference.table.columns()[*column];
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
-                            table_col_pos: None,
-                            expr: Some(rhs.clone()),
+                            table_col_pos: Some(*column),
+                            expr: None,
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity,
+                            selectivity: estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                Some(table_column),
+                                operator,
+                                null_matching(lhs),
+                                index_for_column(*column),
+                                params,
+                                false,
+                            ),
                             usable: true,
                             outer_join_compatible,
                             is_rowid: false,
@@ -1072,26 +1029,187 @@ pub fn constraints_from_where_clause(
                             collation: cmp_collation,
                         });
                     }
-                    _ => {}
-                };
-            }
-
-            // IN expressions are handled separately from binary expressions above because:
-            // - as_binary_components returns (&Expr, ConstraintOperator, &Expr) - a single RHS
-            // - InList has Vec<Expr> as RHS, SubqueryResult has a different structure entirely
-            // - They don't fit the binary expression abstraction without a more complex return type
-
-            // Handle IN list: col IN (val1, val2, ...)
-            if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
-                let estimated_values = rhs.len() as f64;
-                let mut rhs_mask = TableMask::default();
-                for rhs_expr in rhs.iter() {
-                    rhs_mask.union_with(&table_mask_from_expr(
-                        rhs_expr,
-                        table_references,
-                        subqueries,
-                    )?)?;
                 }
+                ast::Expr::RowId { table, .. } => {
+                    if *table == table_reference.internal_id {
+                        let (col, col_pos) = if let Some(alias) = rowid_alias_column {
+                            (Some(&table_reference.table.columns()[alias]), Some(alias))
+                        } else {
+                            (None, None)
+                        };
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Lhs),
+                            operator: opposite_cmp_op(operator),
+                            table_col_pos: col_pos,
+                            expr: None,
+                            constraining_expr: None,
+                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                            selectivity: estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                col,
+                                operator,
+                                null_matching(lhs),
+                                None,
+                                params,
+                                true,
+                            ),
+                            usable: true,
+                            outer_join_compatible,
+                            is_rowid: true,
+                            comparison_affinity: cmp_aff,
+                            null_matching: null_matching(lhs),
+                            collation: cmp_collation,
+                        });
+                    }
+                }
+                _ if expression_matches_table(
+                    rhs,
+                    table_reference,
+                    table_references,
+                    subqueries,
+                ) =>
+                {
+                    let selectivity = estimate_constraint_selectivity(
+                        schema,
+                        table_reference,
+                        None,
+                        operator,
+                        null_matching(lhs),
+                        None,
+                        params,
+                        false,
+                    );
+                    tracing::debug!(
+                        table = table_reference.table.get_name(),
+                        where_clause_pos = i,
+                        operator = ?operator,
+                        lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
+                        selectivity,
+                        "expr constraint (rhs matches table)"
+                    );
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Lhs),
+                        operator: opposite_cmp_op(operator),
+                        table_col_pos: None,
+                        expr: Some(rhs.clone()),
+                        constraining_expr: None,
+                        lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                        selectivity,
+                        usable: true,
+                        outer_join_compatible,
+                        is_rowid: false,
+                        comparison_affinity: cmp_aff,
+                        null_matching: null_matching(lhs),
+                        collation: cmp_collation,
+                    });
+                }
+                _ => {}
+            };
+        }
+
+        // IN expressions are handled separately from binary expressions above because:
+        // - as_binary_components returns (&Expr, ConstraintOperator, &Expr) - a single RHS
+        // - InList has Vec<Expr> as RHS, SubqueryResult has a different structure entirely
+        // - They don't fit the binary expression abstraction without a more complex return type
+
+        // Handle IN list: col IN (val1, val2, ...)
+        if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
+            let estimated_values = rhs.len() as f64;
+            let mut rhs_mask = TableMask::default();
+            for rhs_expr in rhs.iter() {
+                rhs_mask.union_with(&table_mask_from_expr(
+                    rhs_expr,
+                    table_references,
+                    subqueries,
+                )?)?;
+            }
+            let table_stats = schema.analyze_stats.table_stats(
+                table_reference.namespace.id,
+                table_reference.table.get_name(),
+            );
+            let row_count = table_stats
+                .and_then(|s| s.row_count)
+                .unwrap_or(params.rows_per_table_fallback as u64)
+                as f64;
+            let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
+            // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
+            // is the LHS column's affinity; the RHS literals are not folded.
+            let cmp_aff = Some(get_expr_affinity(
+                lhs,
+                &TableMetadata::new(Some(table_references)),
+            ));
+            let cmp_collation = Some(decide_once(&mut term_collations[i], || {
+                in_list_collation(
+                    lhs,
+                    rhs,
+                    &ExprContext::new(Some(table_references), resolver),
+                )
+            })?);
+
+            match lhs.as_ref() {
+                ast::Expr::Column { table, column, .. }
+                    if *table == table_reference.internal_id =>
+                {
+                    let is_rowid = rowid_alias_column == Some(*column);
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Rhs),
+                        operator: ConstraintOperator::In {
+                            not: *not,
+                            estimated_values,
+                        },
+                        table_col_pos: Some(*column),
+                        expr: None,
+                        constraining_expr: None,
+                        lhs_mask: rhs_mask,
+                        selectivity,
+                        usable: false, // IN uses a separate seek path, not the range-seek model
+                        outer_join_compatible: can_use_before_null_extension(false),
+                        is_rowid,
+                        comparison_affinity: cmp_aff,
+                        null_matching: false,
+                        collation: cmp_collation,
+                    });
+                }
+                ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Rhs),
+                        operator: ConstraintOperator::In {
+                            not: *not,
+                            estimated_values,
+                        },
+                        table_col_pos: rowid_alias_column,
+                        expr: None,
+                        constraining_expr: None,
+                        lhs_mask: rhs_mask,
+                        selectivity,
+                        usable: false,
+                        outer_join_compatible: can_use_before_null_extension(false),
+                        is_rowid: true,
+                        comparison_affinity: cmp_aff,
+                        null_matching: false,
+                        collation: cmp_collation,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Handle IN subquery: col IN (SELECT ...)
+        if let ast::Expr::SubqueryResult {
+            subquery_id,
+            lhs: Some(lhs_expr),
+            not_in,
+            query_type: ast::SubqueryType::In { affinity_str, .. },
+        } = &term.expr
+        {
+            // Find the subquery to check if it's correlated
+            let subquery = subqueries
+                .iter()
+                .find(|s| s.internal_id == *subquery_id)
+                .expect("subquery not found");
+            // Only use as constraint if NOT correlated
+            if !subquery.correlated {
                 let table_stats = schema.analyze_stats.table_stats(
                     table_reference.namespace.id,
                     table_reference.table.get_name(),
@@ -1100,22 +1218,39 @@ pub fn constraints_from_where_clause(
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
                     as f64;
-                let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
-                // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
-                // is the LHS column's affinity; the RHS literals are not folded.
-                let cmp_aff = Some(get_expr_affinity(
-                    lhs,
-                    &TableMetadata::new(Some(table_references)),
-                ));
-                let cmp_collation = Some(decide_once(&mut term_collations[i], || {
-                    in_list_collation(
-                        lhs,
-                        rhs,
-                        &ExprContext::new(Some(table_references), resolver),
-                    )
-                })?);
+                // Use the inner plan's row count instead of always using 25.
+                // FIXME: The plan does not estimate distinct result values.
+                // Until it does, cap this estimate at the square root of the
+                // table row count.
+                let planned_rows = match &subquery.state {
+                    SubqueryState::Unevaluated {
+                        plan: Some(inner_plan),
+                    } => match inner_plan.as_ref() {
+                        Plan::Select(plan) => plan.estimated_output_rows,
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let estimated_values = planned_rows
+                    .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
+                    .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
+                let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+                // SQLite's `comparisonAffinity` for IN-subquery combines the
+                // LHS column affinity with each result column via
+                // `sqlite3CompareAffinity` — that result is already cached on
+                // `SubqueryType::In::affinity_str`. For a single-LHS-column
+                // IN it is the first character; row-value IN has no single
+                // resolved affinity and is left as `None`.
+                let is_row_value = matches!(
+                    unwrap_parens(lhs_expr.as_ref()).ok(),
+                    Some(ast::Expr::Parenthesized(exprs)) if exprs.len() != 1
+                );
+                let cmp_aff = (!is_row_value)
+                    .then(|| affinity_str.chars().next().map(Affinity::from_char))
+                    .flatten();
+                let cmp_collation = Some(in_subquery_collation(subquery)?);
 
-                match lhs.as_ref() {
+                match lhs_expr.as_ref() {
                     ast::Expr::Column { table, column, .. }
                         if *table == table_reference.internal_id =>
                     {
@@ -1123,15 +1258,15 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator: ConstraintOperator::In {
-                                not: *not,
+                                not: *not_in,
                                 estimated_values,
                             },
                             table_col_pos: Some(*column),
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: rhs_mask,
+                            lhs_mask: TableMask::default(), // non-correlated = no dependencies
                             selectivity,
-                            usable: false, // IN uses a separate seek path, not the range-seek model
+                            usable: false, // IN uses a separate seek path (consider_in_list_seek)
                             outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid,
                             comparison_affinity: cmp_aff,
@@ -1143,13 +1278,13 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator: ConstraintOperator::In {
-                                not: *not,
+                                not: *not_in,
                                 estimated_values,
                             },
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             constraining_expr: None,
-                            lhs_mask: rhs_mask,
+                            lhs_mask: TableMask::default(),
                             selectivity,
                             usable: false,
                             outer_join_compatible: can_use_before_null_extension(false),
@@ -1162,227 +1297,121 @@ pub fn constraints_from_where_clause(
                     _ => {}
                 }
             }
-
-            // Handle IN subquery: col IN (SELECT ...)
-            if let ast::Expr::SubqueryResult {
-                subquery_id,
-                lhs: Some(lhs_expr),
-                not_in,
-                query_type: ast::SubqueryType::In { affinity_str, .. },
-            } = &term.expr
-            {
-                // Find the subquery to check if it's correlated
-                let subquery = subqueries
-                    .iter()
-                    .find(|s| s.internal_id == *subquery_id)
-                    .expect("subquery not found");
-                // Only use as constraint if NOT correlated
-                if !subquery.correlated {
-                    let table_stats = schema.analyze_stats.table_stats(
-                        table_reference.namespace.id,
-                        table_reference.table.get_name(),
-                    );
-                    let row_count = table_stats
-                        .and_then(|s| s.row_count)
-                        .unwrap_or(params.rows_per_table_fallback as u64)
-                        as f64;
-                    // Use the inner plan's row count instead of always using 25.
-                    // FIXME: The plan does not estimate distinct result values.
-                    // Until it does, cap this estimate at the square root of the
-                    // table row count.
-                    let planned_rows = match &subquery.state {
-                        SubqueryState::Unevaluated {
-                            plan: Some(inner_plan),
-                        } => match inner_plan.as_ref() {
-                            Plan::Select(plan) => plan.estimated_output_rows,
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    let estimated_values = planned_rows
-                        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
-                        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
-                    let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
-                    // SQLite's `comparisonAffinity` for IN-subquery combines the
-                    // LHS column affinity with each result column via
-                    // `sqlite3CompareAffinity` — that result is already cached on
-                    // `SubqueryType::In::affinity_str`. For a single-LHS-column
-                    // IN it is the first character; row-value IN has no single
-                    // resolved affinity and is left as `None`.
-                    let is_row_value = matches!(
-                        unwrap_parens(lhs_expr.as_ref()).ok(),
-                        Some(ast::Expr::Parenthesized(exprs)) if exprs.len() != 1
-                    );
-                    let cmp_aff = (!is_row_value)
-                        .then(|| affinity_str.chars().next().map(Affinity::from_char))
-                        .flatten();
-                    let cmp_collation = Some(in_subquery_collation(subquery)?);
-
-                    match lhs_expr.as_ref() {
-                        ast::Expr::Column { table, column, .. }
-                            if *table == table_reference.internal_id =>
-                        {
-                            let is_rowid = rowid_alias_column == Some(*column);
-                            cs.constraints.push(Constraint {
-                                where_clause_pos: (i, BinaryExprSide::Rhs),
-                                operator: ConstraintOperator::In {
-                                    not: *not_in,
-                                    estimated_values,
-                                },
-                                table_col_pos: Some(*column),
-                                expr: None,
-                                constraining_expr: None,
-                                lhs_mask: TableMask::default(), // non-correlated = no dependencies
-                                selectivity,
-                                usable: false, // IN uses a separate seek path (consider_in_list_seek)
-                                outer_join_compatible: can_use_before_null_extension(false),
-                                is_rowid,
-                                comparison_affinity: cmp_aff,
-                                null_matching: false,
-                                collation: cmp_collation,
-                            });
-                        }
-                        ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
-                            cs.constraints.push(Constraint {
-                                where_clause_pos: (i, BinaryExprSide::Rhs),
-                                operator: ConstraintOperator::In {
-                                    not: *not_in,
-                                    estimated_values,
-                                },
-                                table_col_pos: rowid_alias_column,
-                                expr: None,
-                                constraining_expr: None,
-                                lhs_mask: TableMask::default(),
-                                selectivity,
-                                usable: false,
-                                outer_join_compatible: can_use_before_null_extension(false),
-                                is_rowid: true,
-                                comparison_affinity: cmp_aff,
-                                null_matching: false,
-                                collation: cmp_collation,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            }
         }
-        // sort equalities first so that index keys will be properly constructed.
-        // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
-        // A stable partition, not a comparison: comparing two equalities as
-        // "less" in both directions is not a valid ordering, and now that `IS`
-        // counts as an equality there are more pairs that would hit it.
-        cs.constraints
-            .sort_by_key(|c| !is_equality_operator(c.operator));
+    }
+    // sort equalities first so that index keys will be properly constructed.
+    // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
+    // A stable partition, not a comparison: comparing two equalities as
+    // "less" in both directions is not a valid ordering, and now that `IS`
+    // counts as an equality there are more pairs that would hit it.
+    cs.constraints
+        .sort_by_key(|c| !is_equality_operator(c.operator));
 
-        // For each constraint we found, add a reference to it for each index that may be able to use it.
-        for (i, constraint) in cs.constraints.iter_mut().enumerate() {
-            // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
-            if !constraint.usable || !constraint.outer_join_compatible {
-                continue;
-            }
+    // For each constraint we found, add a reference to it for each index that may be able to use it.
+    for (i, constraint) in cs.constraints.iter_mut().enumerate() {
+        // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
+        if !constraint.usable || !constraint.outer_join_compatible {
+            continue;
+        }
 
-            if constraint.is_rowid
-                || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
-            {
-                let rowid_candidate = cs
-                    .candidates
-                    .iter_mut()
-                    .find_map(|candidate| {
-                        if candidate.index.is_none() {
-                            Some(candidate)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
-                rowid_candidate.refs.push(ConstraintRef {
-                    constraint_vec_pos: i,
-                    index_col_pos: 0,
-                    sort_order: SortOrder::Asc,
-                    nulls_order: ast::NullsOrder::First,
-                });
-            }
-            for index in available_indexes
-                .indexes_for_table(table_reference.internal_id)
-                .into_iter()
-                .flat_map(|indexes| indexes.iter())
-                .filter(|idx| idx.index_method.is_none())
-            {
-                if let Some(position_in_index) = match constraint.table_col_pos {
-                    Some(pos) => index.column_table_pos_to_index_pos(pos),
-                    None => constraint.expr.as_ref().and_then(|e| {
-                        let normalized =
-                            normalize_expr_for_index_matching(e, table_reference, table_references);
-                        index.expression_to_index_pos(&normalized)
-                    }),
-                } {
-                    // An index seek compares keys with the index column's
-                    // collation, so the index serves the term only when that
-                    // is the collation the term compares with.
-                    if !constraint.index_column_can_serve(&index.columns[position_in_index]) {
+        if constraint.is_rowid
+            || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
+        {
+            let rowid_candidate = cs
+                .candidates
+                .iter_mut()
+                .find_map(|candidate| {
+                    if candidate.index.is_none() {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            rowid_candidate.refs.push(ConstraintRef {
+                constraint_vec_pos: i,
+                index_col_pos: 0,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            });
+        }
+        for index in available_indexes
+            .indexes_for_table(table_reference.internal_id)
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .filter(|idx| idx.index_method.is_none())
+        {
+            if let Some(position_in_index) = match constraint.table_col_pos {
+                Some(pos) => index.column_table_pos_to_index_pos(pos),
+                None => constraint.expr.as_ref().and_then(|e| {
+                    let normalized =
+                        normalize_expr_for_index_matching(e, table_reference, table_references);
+                    index.expression_to_index_pos(&normalized)
+                }),
+            } {
+                // An index seek compares keys with the index column's
+                // collation, so the index serves the term only when that
+                // is the collation the term compares with.
+                if !constraint.index_column_can_serve(&index.columns[position_in_index]) {
+                    continue;
+                }
+                if let Some(table_col_pos) = constraint.table_col_pos {
+                    let constrained_column = &table_reference.table.columns()[table_col_pos];
+                    if constrained_column.index_order_differs_from_value_order(
+                        schema,
+                        table_reference.table.is_strict(),
+                    ) && constraint.operator != ast::Operator::Equals.into()
+                    {
                         continue;
                     }
-                    if let Some(table_col_pos) = constraint.table_col_pos {
-                        let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        if constrained_column.index_order_differs_from_value_order(
-                            schema,
-                            table_reference.table.is_strict(),
-                        ) && constraint.operator != ast::Operator::Equals.into()
-                        {
-                            continue;
-                        }
-                        let idx_col_aff = constrained_column.comparison_affinity();
-                        if !constraint.satisfies_index_affinity(idx_col_aff) {
-                            continue;
-                        }
+                    let idx_col_aff = constrained_column.comparison_affinity();
+                    if !constraint.satisfies_index_affinity(idx_col_aff) {
+                        continue;
                     }
-                    if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
-                        if candidate.index.as_ref().is_some_and(|i| {
-                            Arc::ptr_eq(index, i)
-                                && (index.where_clause.is_none()
-                                    || can_use_partial_index(index, table_reference, where_clause))
-                        }) {
-                            Some(candidate)
-                        } else {
-                            None
-                        }
+                }
+                if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
+                    if candidate.index.as_ref().is_some_and(|i| {
+                        Arc::ptr_eq(index, i)
+                            && (index.where_clause.is_none()
+                                || can_use_partial_index(index, table_reference, where_clause))
                     }) {
-                        index_candidate.refs.push(ConstraintRef {
-                            constraint_vec_pos: i,
-                            index_col_pos: position_in_index,
-                            sort_order: index.columns[position_in_index].order,
-                            nulls_order: index.columns[position_in_index].effective_nulls_order(),
-                        });
+                        Some(candidate)
+                    } else {
+                        None
                     }
+                }) {
+                    index_candidate.refs.push(ConstraintRef {
+                        constraint_vec_pos: i,
+                        index_col_pos: position_in_index,
+                        sort_order: index.columns[position_in_index].order,
+                        nulls_order: index.columns[position_in_index].effective_nulls_order(),
+                    });
                 }
             }
         }
-
-        for candidate in cs.candidates.iter_mut() {
-            // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
-            candidate.refs.sort_by_key(|cref| cref.index_col_pos);
-        }
-        cs.candidates.retain(|c| {
-            if let Some(idx) = &c.index {
-                if idx.where_clause.is_some()
-                    && c.refs.is_empty()
-                    && !can_use_partial_index(idx, table_reference, where_clause)
-                {
-                    // A partial index with no column constraints can still drive a
-                    // scan, but only if every conjunct of its WHERE clause is implied
-                    // by the query's WHERE. Otherwise it would skip rows the query
-                    // needs.
-                    return false;
-                }
-            }
-            true
-        });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema);
-        constraints.push(cs);
     }
 
-    Ok(constraints)
+    for candidate in cs.candidates.iter_mut() {
+        // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
+        candidate.refs.sort_by_key(|cref| cref.index_col_pos);
+    }
+    cs.candidates.retain(|c| {
+        if let Some(idx) = &c.index {
+            if idx.where_clause.is_some()
+                && c.refs.is_empty()
+                && !can_use_partial_index(idx, table_reference, where_clause)
+            {
+                // A partial index with no column constraints can still drive a
+                // scan, but only if every conjunct of its WHERE clause is implied
+                // by the query's WHERE. Otherwise it would skip rows the query
+                // needs.
+                return false;
+            }
+        }
+        true
+    });
+    cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema);
+    Ok(cs)
 }
 
 /// The collation in `slot`, deciding it with `decide` if it is not decided yet.
@@ -2140,8 +2169,6 @@ pub struct AnalyzedTerm {
 pub struct IndexableTermSummary {
     /// The constrained table column, if any.
     pub table_col_pos: Option<usize>,
-    /// The other tables referenced by the constraining expression.
-    pub lhs_mask: TableMask,
     /// The chosen index for this term, or `None` for rowid access.
     pub best_index: Option<Arc<Index>>,
 }
@@ -2217,6 +2244,9 @@ fn analyze_binary_term_index_info<'a>(
     })
 }
 
+/// Summarize a binary term that constrains `table_id` with a value that does
+/// not depend on another table of the query, such as `t.a = 5`. Return `None`
+/// for other terms, such as the join term `t.a = u.b`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn summarize_binary_term_for_index(
     expr: &ast::Expr,
@@ -2238,6 +2268,11 @@ pub(crate) fn summarize_binary_term_for_index(
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
+    if !lhs_mask.is_empty() {
+        return None;
+    }
     let comparison_collation = comparison_collation(
         lhs,
         rhs,
@@ -2267,21 +2302,8 @@ pub(crate) fn summarize_binary_term_for_index(
         return None;
     }
 
-    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
-        .unwrap_or_else(|_| TableMask::default());
-
-    let table_pos = table_references
-        .joined_tables()
-        .iter()
-        .position(|t| t.internal_id == table_id)
-        .expect("target table must exist in table_references");
-    if lhs_mask.get(table_pos) {
-        return None;
-    }
-
     Some(IndexableTermSummary {
         table_col_pos,
-        lhs_mask,
         best_index,
     })
 }

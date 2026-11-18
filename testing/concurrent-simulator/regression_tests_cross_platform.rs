@@ -1,7 +1,7 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, IO, OpenFlags, Statement};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, IO, OpenFlags, SessionRole, Statement};
 use turso_sqlite::SqliteDialect;
 use turso_whopper::{IOFaultConfig, SimulatorIO};
 
@@ -43,7 +43,9 @@ fn test_concurrent_commit_no_yield_spin() {
     )
     .expect("open db");
 
-    let setup = db.connect(ConnectOpts::new()).expect("setup conn");
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("setup conn");
     setup
         .execute("PRAGMA journal_mode = 'mvcc'")
         .expect("enable mvcc");
@@ -52,8 +54,12 @@ fn test_concurrent_commit_no_yield_spin() {
         .expect("create table");
     setup.close().expect("close setup");
 
-    let conn1 = db.connect(ConnectOpts::new()).expect("conn1");
-    let conn2 = db.connect(ConnectOpts::new()).expect("conn2");
+    let conn1 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("conn1");
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("conn2");
 
     let mut stmt = conn1.prepare("BEGIN CONCURRENT").expect("prepare");
     run_to_done(&mut stmt, &io);
@@ -108,7 +114,9 @@ fn test_concurrent_commit_no_yield_spin() {
     assert!(done1, "commit1 should have completed");
     assert!(done2, "commit2 should have completed");
 
-    let verify = db.connect(ConnectOpts::new()).expect("verify conn");
+    let verify = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("verify conn");
     let mut stmt = verify.prepare("SELECT COUNT(*) FROM t").expect("prepare");
     let mut count = 0i64;
     loop {
@@ -327,7 +335,9 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         Arc::new(SqliteDialect),
     )
     .expect("open db");
-    let conn = db.connect(ConnectOpts::new()).expect("connect");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect");
     for (_, sql) in fts_sim_schema() {
         conn.execute(&sql).expect("create the FTS table and index");
     }

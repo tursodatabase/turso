@@ -216,7 +216,12 @@ pub fn translate_analyze(
         let sql = "CREATE TABLE sqlite_stat1(tbl,idx,stat)";
         // The root_page==0 is false, but we don't rely on it, and there's no
         // way to initialize it with a correct value.
-        sqlite_stat1_btreetable = Arc::new(BTreeTable::from_sql(sql, 0)?);
+        sqlite_stat1_btreetable = Arc::new(BTreeTable::from_stored_sql(
+            resolver.catalog.dialect.as_ref(),
+            sql,
+            0,
+            false,
+        )?);
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
         let table = resolver

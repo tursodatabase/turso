@@ -1083,11 +1083,6 @@ fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
         }
     };
 
-    // NUL character produces no output (matches SQLite behavior)
-    if c == '\0' {
-        return;
-    }
-
     // Precision on %c repeats the character that many times (default 1)
     let repeat = spec.precision.unwrap_or(1).max(1);
     let s: String = repeat_n(c, repeat).collect();
@@ -1626,12 +1621,11 @@ mod tests {
                 vec![text("character: %c"), float(42.5)],
                 text("character: 4"),
             ),
-            // Empty string → NUL char → no output (matches SQLite)
-            (vec![text("character: %c"), text("")], text("character: ")),
-            // NULL → coerces to empty string → NUL → no output
+            // Empty strings and NULL produce a NUL character.
+            (vec![text("character: %c"), text("")], text("character: \0")),
             (
                 vec![text("character: %c"), Register::Value(Value::Null)],
-                text("character: "),
+                text("character: \0"),
             ),
         ];
         for (input, expected) in test_cases {

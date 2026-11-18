@@ -362,10 +362,11 @@ fn prepare_one_select_plan(
                     connection,
                 )?;
                 row_security::filter_rows(
-                    Command::Select,
-                    &table_references,
+                    &[Command::Select],
+                    &mut table_references,
                     &mut where_predicates,
                     resolver,
+                    program,
                 )?;
             }
 
@@ -936,10 +937,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
-                values: values
-                    .into_iter()
-                    .map(|values| values.into_iter().map(|value| *value).collect())
-                    .collect(),
+                values,
                 window: None,
                 non_from_clause_subqueries,
                 input_cardinality_hint: None,

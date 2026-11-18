@@ -4,6 +4,7 @@ mod tests {
     use asserting::prelude::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use turso_core::SessionRole;
     use turso_sqlite::SqliteDialect;
 
     #[test]
@@ -846,7 +847,7 @@ mod tests {
                 path.to_str().unwrap(),
                 Arc::new(SqliteDialect),
             )
-            .and_then(|db| db.connect(turso_core::ConnectOpts::new()))
+            .and_then(|db| db.connect(turso_core::ConnectOpts::new(SessionRole::Superuser)))
             .and_then(|conn| conn.execute("SELECT 1"))
             .unwrap_err()
             .to_string();

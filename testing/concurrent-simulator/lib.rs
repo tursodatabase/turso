@@ -70,6 +70,7 @@ pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
 }
 pub use io::{IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
+use turso_core::SessionRole;
 use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
 
 struct InstalledYieldInjector<'a> {
@@ -779,7 +780,7 @@ impl Whopper {
             }
         };
 
-        let bootstrap_conn = match db.connect(ConnectOpts::new()) {
+        let bootstrap_conn = match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
             Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
             Err(e) => {
                 return Err(anyhow::anyhow!("Connection failed: {}", e));
@@ -1254,10 +1255,12 @@ impl Whopper {
             )));
             if let Err(e) = op.init_op(&mut ctx) {
                 let err = e.to_string().to_lowercase();
-                // Allow "no such table/index" and "already exists" errors
+                // Allow "no such table/index" and "already exists" errors, and
+                // the refusal to drop a sequence that a table still uses
                 if err.contains("no such")
                     || err.contains("already exists")
                     || err.contains("not exist")
+                    || err.contains("other objects depend on it")
                 {
                     debug!("init operation skipped: {}", err);
                     return Ok(());
@@ -1726,7 +1729,7 @@ impl Whopper {
 
         for i in 0..self.max_connections {
             let conn = db
-                .connect(ConnectOpts::new())
+                .connect(ConnectOpts::new(SessionRole::Superuser))
                 .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
             let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
             self.context.fibers.push(SimulatorFiber {

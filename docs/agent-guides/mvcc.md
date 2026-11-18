@@ -59,7 +59,7 @@ Database
 - `core/mvcc/database/mod.rs` - Main implementation (~3000 lines)
 - `core/mvcc/cursor.rs` - Merged MVCC + B-tree cursor
 - `core/mvcc/persistent_storage/logical_log.rs` - Disk format
-- `core/mvcc/database/checkpoint_state_machine.rs` - Checkpoint logic
+- `core/mvcc/database/checkpoint.rs` - Checkpoint logic
 
 ## Checkpointing
 
@@ -69,7 +69,7 @@ Flushes row versions to B-tree periodically.
 PRAGMA mvcc_checkpoint_threshold = <pages>;
 ```
 
-Process: acquire lock → begin pager txn → write rows → commit → truncate log → fsync → release.
+Process: acquire lock → begin pager txn → write rows → commit → backfill WAL → fsync DB file → truncate log → truncate WAL → release.
 
 ## Current Limitations
 
