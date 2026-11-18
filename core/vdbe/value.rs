@@ -1377,17 +1377,18 @@ impl Value {
         let pattern = sqlite_text_prefix(pattern);
         let text = sqlite_text_prefix(text);
 
+        // An escape character that is not in the pattern has no effect.
+        let has_escape = escape.is_some_and(|e| pattern.contains(e));
+
         // ASCII pattern and text without an escape character, the usual
         // case: match the bytes directly. This comes before the wildcard
         // scans below, which cost more per row than the match itself.
-        if escape.is_none()
+        if !has_escape
             && crate::types::is_ascii(pattern.as_bytes())
             && crate::types::is_ascii(text.as_bytes())
         {
             return Ok(like_ascii(pattern.as_bytes(), text.as_bytes()));
         }
-
-        let has_escape = escape.is_some_and(|e| pattern.contains(e));
 
         // 1. Exact match (no wildcards)
         if !has_escape && !pattern.contains(['%', '_']) {
@@ -3124,6 +3125,18 @@ mod tests {
                     Value::exec_like(pattern_str, text_str, None).unwrap(),
                     expected,
                     "exec_like: pattern {pattern_str:?}, text {text_str:?}"
+                );
+                // The patterns do not contain the escape character.
+                assert_eq!(
+                    super::pattern_compare(pattern_str, text_str, &super::LIKE_INFO, Some('\\'))
+                        == super::CompareResult::Match,
+                    expected,
+                    "pattern_compare with escape: pattern {pattern_str:?}, text {text_str:?}"
+                );
+                assert_eq!(
+                    Value::exec_like(pattern_str, text_str, Some('\\')).unwrap(),
+                    expected,
+                    "exec_like with escape: pattern {pattern_str:?}, text {text_str:?}"
                 );
             }
         }
