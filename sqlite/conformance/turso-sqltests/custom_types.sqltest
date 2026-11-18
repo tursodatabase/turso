@@ -2241,3 +2241,24 @@ test virtual-custom-type-column-through-a-hash-join {
 expect {
     3
 }
+
+# A column that ALTER COLUMN gives a custom type takes its affinity from the
+# type's BASE, like a column created with that type. The letters of "doubled"
+# would give it REAL affinity.
+@requires strict "uses STRICT tables"
+test alter-column-to-custom-type-uses-base-affinity {
+    CREATE TYPE doubled BASE integer ENCODE value * 2 DECODE value / 2;
+    CREATE TABLE fresh(d doubled) STRICT;
+    CREATE TABLE altered(c integer) STRICT;
+    ALTER TABLE altered ALTER COLUMN c TO d doubled;
+    INSERT INTO fresh VALUES ('5');
+    INSERT INTO altered VALUES ('5');
+    SELECT 'fresh', d, typeof(d) FROM fresh;
+    SELECT 'altered', d, typeof(d) FROM altered;
+    PRAGMA integrity_check;
+}
+expect {
+    fresh|5|integer
+    altered|5|integer
+    ok
+}
