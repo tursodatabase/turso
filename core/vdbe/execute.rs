@@ -13972,16 +13972,16 @@ pub fn op_add_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_catalog_change(
+pub fn op_catalog_apply(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
-        CatalogChange {
+        CatalogApply {
             db,
-            change,
+            apply,
             value_regs
         },
         insn
@@ -13990,12 +13990,9 @@ pub fn op_catalog_change(
         .iter()
         .map(|reg| state.registers[*reg].get_value().clone())
         .collect::<Vec<Value>>();
-    let dialect = program.connection.dialect();
     program
         .connection
-        .with_database_schema_mut(*db, |schema| {
-            dialect.apply_catalog_change(schema, change, &values)
-        })??;
+        .with_database_schema_mut(*db, |schema| apply.apply(schema, &values))??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
