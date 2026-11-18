@@ -12,7 +12,7 @@
 // `StepResult::IO` rather than blocking).
 
 use crate::dialect::catalog::{CatalogWrite, CreateSequence, DropSequence, WriteContext};
-use crate::dialect::{AccessStatement, NewOwner, OwnerColumn};
+use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, WriteOrigin};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -1538,21 +1538,24 @@ pub fn translate_alter_sequence_owned_by(
         }
         None => None,
     };
-    if !schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        return Ok(());
-    }
-    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
-    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_access_statement(
+    let write_context = WriteContext::new(connection, resolver, namespace.database_id);
+    resolver.catalog.dialect.catalog().write_access(
         program,
-        resolver.schema(),
-        connection,
+        &write_context,
         &AccessStatement::ChangeOwner {
             namespace: namespace.id,
             name: &normalized_name,
             owner: &NewOwner::Column(owner_column),
         },
     )?;
+    // A catalog stores the owner column only for a user's statement about
+    // a sequence of the main database. Any other statement stored nothing,
+    // so it changes no schema.
+    if write_context.origin == WriteOrigin::Engine || namespace.database_id != crate::MAIN_DB_ID {
+        return Ok(());
+    }
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
 }

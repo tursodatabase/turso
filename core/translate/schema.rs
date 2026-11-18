@@ -2744,35 +2744,6 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
     });
 }
 
-/// Whether the statement tells the dialect about the relations it creates,
-/// renames or drops, through the [`crate::Dialect`] relation hooks. Only new
-/// DDL of a user against the main database does: a nested statement replays
-/// stored schema text, as VACUUM does when it copies a database, and the
-/// MVCC bootstrap connection replays log entries; both carry the dialect's
-/// schema state as data already. Relations of other databases, temp among
-/// them, have no dialect schema state. Fails for DDL of a user against an
-/// attached database when the dialect does not allow it. `CREATE TABLE`
-/// does not ask: the dialect's [`crate::Catalog`] decides for it.
-pub(crate) fn dialect_relation_hooks_apply(
-    connection: &Arc<Connection>,
-    database_id: usize,
-) -> Result<bool> {
-    if connection.is_nested_stmt() || connection.is_mvcc_bootstrap_connection() {
-        return Ok(false);
-    }
-    if crate::is_attached_db(database_id)
-        && !connection
-            .db
-            .dialect()
-            .supports_relation_ddl_in_attached_databases()
-    {
-        bail_parse_error!(
-            "creating, renaming or dropping relations in an attached database is not supported"
-        );
-    }
-    Ok(database_id == MAIN_DB_ID)
-}
-
 /// Whether a relation of `namespace` already has `name`, in a dialect whose
 /// relation names are unique per schema across kinds. Ok(true) when
 /// `if_not_exists` makes the statement skip; an error when the name is
