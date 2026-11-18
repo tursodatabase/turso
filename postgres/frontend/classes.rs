@@ -2307,4 +2307,63 @@ mod tests {
         }
         classes
     }
+
+    /// A table that a user can name in an attached database is in no
+    /// schema, as in a file that the SQLite frontend made.
+    #[test]
+    fn alter_table_in_an_attached_database_refuses_renames_only() {
+        use turso_core::{ConnectOpts, SessionRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+        let attached = turso_core::Database::open_file_with_flags(
+            io.clone(),
+            attached_path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts.with_mvcc(true),
+            None,
+            Arc::new(turso_sqlite::SqliteDialect),
+        )
+        .unwrap()
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+        attached
+            .execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER)")
+            .unwrap();
+        attached.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        attached.close().unwrap();
+        drop(attached);
+
+        let conn = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+        )
+        .unwrap()
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+
+        for rename in [
+            "ALTER TABLE aux.t RENAME TO t2",
+            "ALTER TABLE aux.t RENAME COLUMN b TO z",
+        ] {
+            let err = conn.execute(rename).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "creating, renaming or dropping relations in an attached database is not supported",
+                "{rename}"
+            );
+        }
+        conn.execute("ALTER TABLE aux.t RENAME COLUMN b TO b")
+            .unwrap();
+        conn.execute("ALTER TABLE aux.t ADD COLUMN d INT").unwrap();
+        conn.execute("ALTER TABLE aux.t DROP COLUMN c").unwrap();
+        conn.execute("INSERT INTO aux.t (a, b, d) VALUES (1, 2, 3)")
+            .unwrap();
+    }
 }
