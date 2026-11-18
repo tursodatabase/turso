@@ -496,7 +496,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialect::EngineDialect;
+    use crate::EngineDialect;
     use crate::security::roles::SessionRole;
     use crate::{ConnectOpts, Database};
 

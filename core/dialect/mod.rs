@@ -18,8 +18,6 @@
 //! [`Dialect::parse_internal`] of the database's dialect.
 
 pub mod catalog;
-#[cfg(test)]
-mod engine;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
@@ -27,9 +25,6 @@ pub use crate::functions::builtin::{
 pub use catalog::{
     AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
 };
-
-#[cfg(test)]
-pub(crate) use engine::EngineDialect;
 
 use crate::{
     function::ScalarFunc,

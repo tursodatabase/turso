@@ -453,9 +453,9 @@ impl StatAccum {
 mod tests {
     use super::{parse_stat_numbers, AnalyzeStats, NamespaceId};
     use crate::database::{ConnectOpts, Database, DatabaseOpts};
-    use crate::dialect::EngineDialect;
     use crate::security::roles::SessionRole;
     use crate::sync::Arc;
+    use crate::EngineDialect;
     use crate::{OpenFlags, PlatformIO, IO};
 
     #[test]

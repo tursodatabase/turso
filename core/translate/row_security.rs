@@ -934,13 +934,14 @@ mod tests {
     use super::{
         conditions_of, policy, using_condition, with_check_condition, Command, Condition, Policy,
     };
-    use crate::dialect::{Dialect, EngineDialect};
+    use crate::dialect::Dialect;
     use crate::function::Func;
     use crate::namespace::{NamespaceId, NamespaceRef};
     use crate::schema::{BTreeTable, Schema};
     use crate::security::policy::RowPolicy;
     use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
+    use crate::EngineDialect;
     use crate::{DatabaseCatalog, Qualifiers, RwLock, SymbolTable};
 
     /// The engine dialect, except that every table of a schema with dialect
