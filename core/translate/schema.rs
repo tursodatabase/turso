@@ -2770,7 +2770,8 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
 /// MVCC bootstrap connection replays log entries; both carry the dialect's
 /// schema state as data already. Relations of other databases, temp among
 /// them, have no dialect schema state. Fails for DDL of a user against an
-/// attached database when the dialect does not allow it.
+/// attached database when the dialect does not allow it. `CREATE TABLE`
+/// does not ask: the dialect's [`crate::Catalog`] decides for it.
 pub(crate) fn dialect_relation_hooks_apply(
     connection: &Arc<Connection>,
     database_id: usize,
