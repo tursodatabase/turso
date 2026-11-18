@@ -1,5 +1,6 @@
-use crate::dialect::catalog::{CatalogWrite, CreateMaterializedView, CreateView, WriteContext};
-use crate::dialect::RelationChange;
+use crate::dialect::catalog::{
+    CatalogWrite, CreateMaterializedView, CreateView, DropView, WriteContext,
+};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;
@@ -9,9 +10,7 @@ use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
-    schema::{
-        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
-    },
+    schema::{self, emit_schema_entry, SchemaEntryType},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
@@ -578,32 +577,24 @@ pub fn translate_drop_view(
         }
     }
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-            }],
-        )?;
-    }
-
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    let rowid_reg = emit_drop_view_row(
+    let write_context = WriteContext::new(connection, resolver, database_id);
+    let after_writes = resolver.catalog.dialect.catalog().write(
         program,
-        resolver,
-        namespace,
-        &normalized_view_name,
-        sqlite_schema_cursor_id,
+        &write_context,
+        &CatalogWrite::DropView(DropView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+        }),
     )?;
 
-    // If this is a materialized view, delete internal table and index
-    // entries in a second pass, one loop per internal table. We do this in
-    // separate loops to ensure we catch all entries even if they come in
-    // different orders in sqlite_schema.
+    // The tables with the state of a materialized view are engine tables,
+    // so their sqlite_schema rows are deleted here and not by the catalog.
+    let sqlite_schema_cursor_id = write_context.sqlite_schema_cursor(program);
+    let rowid_reg = write_context.sqlite_schema_rowid_reg(program);
+
+    // Delete internal table and index entries, one loop per internal table.
+    // We do this in separate loops to ensure we catch all entries even if
+    // they come in different orders in sqlite_schema.
     for dbsp_table_name in &internal_table_names {
         // Set up registers for the table name and types (outside the loop for efficiency)
         let dbsp_table_name_reg_2 = program.alloc_register();
@@ -725,6 +716,7 @@ pub fn translate_drop_view(
         namespace: namespace.id,
         view_name: normalized_view_name,
     });
+    after_writes.emit(program, database_id, None);
 
     // Update schema version (increment schema cookie)
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

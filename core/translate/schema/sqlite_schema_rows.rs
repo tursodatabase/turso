@@ -2,7 +2,7 @@
 
 use crate::dialect::catalog::{
     AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateMaterializedView, CreateTable,
-    CreateView, DropIndex, TableText, WriteContext,
+    CreateView, DropIndex, DropView, TableText, WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -49,6 +49,7 @@ impl Catalog for SqliteCatalog {
             CatalogWrite::CreateMaterializedView(view) => {
                 emit_create_materialized_view_row(program, ctx, view)
             }
+            CatalogWrite::DropView(view) => emit_drop_view_row(program, ctx, view),
         }
     }
 }
@@ -658,22 +659,25 @@ fn emit_create_materialized_view_row(
     )))
 }
 
-/// Deletes the row of a view or materialized view. Returns the register
-/// with the rowid of the deleted row.
-pub(crate) fn emit_drop_view_row(
+/// Deletes the row of a view or materialized view.
+fn emit_drop_view_row(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    namespace: NamespaceRef,
-    view_name: &str,
-    sqlite_schema_cursor_id: usize,
-) -> Result<usize> {
+    ctx: &WriteContext<'_>,
+    view: &DropView<'_>,
+) -> Result<AfterWrites> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
     let view_name_reg = program.alloc_register();
     let type_reg = program.alloc_register();
-    let rowid_reg = program.alloc_register();
+    let rowid_reg = ctx.sqlite_schema_rowid_reg(program);
 
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: resolver.mangle_name(namespace, view_name),
+        value: ctx.resolver.mangle_name(namespace, view.name),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -733,7 +737,7 @@ pub(crate) fn emit_drop_view_row(
 
     program.preassign_label_to_next_insn(end_loop_label);
 
-    Ok(rowid_reg)
+    Ok(AfterWrites::none())
 }
 
 /// The SQL text to store for a new view or materialized view.
