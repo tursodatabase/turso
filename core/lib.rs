@@ -148,7 +148,8 @@ pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
 pub use dialect::{
-    AccessStatement, CatalogChange, Dialect, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, CatalogApply, CatalogChange, Dialect, NewOwner, OwnerColumn, RelationChange,
+    RelationName,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,

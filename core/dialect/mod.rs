@@ -17,7 +17,8 @@ pub mod catalog;
 pub mod engine;
 
 pub use catalog::{
-    AccessStatement, CatalogChange, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, CatalogApply, CatalogChange, NewOwner, OwnerColumn, RelationChange,
+    RelationName,
 };
 pub(crate) use engine::EngineDialect;
 
@@ -325,20 +326,6 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Result<()> {
         let _ = (program, schema, connection);
         Err(statement.not_supported())
-    }
-
-    /// Applies `change`, which the running statement wrote to the dialect's
-    /// schema state, to the in-memory copy in `schema`. `values` are the
-    /// registers the dialect named when it emitted the instruction, such as
-    /// the id its state gave a created relation.
-    fn apply_catalog_change(
-        &self,
-        schema: &mut Schema,
-        change: &CatalogChange,
-        values: &[Value],
-    ) -> Result<()> {
-        let _ = (schema, change, values);
-        Ok(())
     }
 
     /// Whether relations can be created, renamed or dropped in an attached
