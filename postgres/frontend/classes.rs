@@ -38,8 +38,8 @@ use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, CatalogChange,
-    CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, LimboError, NewOwner,
-    Numeric, ProgramBuilder, RegisterOrLiteral, Value,
+    CmpInsFlags, CollationSeq, Connection, CursorType, GrantTarget, InsertFlags, Insn, LimboError,
+    NewOwner, Numeric, ProgramBuilder, RegisterOrLiteral, Value,
 };
 use turso_parser::ast;
 
@@ -56,6 +56,7 @@ use crate::auth_members::{
 };
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
 use crate::error::sqlstate_error;
+use crate::namespaces::{CREATE_NAMESPACE_ACLS_TABLE_SQL, NAMESPACE_ACLS_TABLE_NAME};
 use crate::policies::{self, TablePolicies};
 use crate::roles::{
     schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
@@ -313,7 +314,8 @@ impl ClassCatalog {
                 }
             }
             CatalogChange::Grant {
-                namespace, name, ..
+                target: GrantTarget::Relation { namespace, name },
+                ..
             } => {
                 let [acl] = values else {
                     return Err(LimboError::InternalError(
@@ -365,6 +367,19 @@ impl ClassCatalog {
             CatalogChange::GrantRole { .. } => {
                 return Err(LimboError::InternalError(
                     "GRANT of role membership reached the relation catalog".to_string(),
+                ));
+            }
+            CatalogChange::Grant {
+                target: GrantTarget::Namespace(_),
+                ..
+            } => {
+                return Err(LimboError::InternalError(
+                    "GRANT on a schema reached the relation catalog".to_string(),
+                ));
+            }
+            CatalogChange::DropNamespace { .. } => {
+                return Err(LimboError::InternalError(
+                    "DROP SCHEMA reached the relation catalog".to_string(),
                 ));
             }
         }
@@ -845,8 +860,7 @@ pub(crate) fn translate_catalog_changes(
             }
             CatalogChange::Grant {
                 revoke,
-                namespace,
-                name,
+                target: GrantTarget::Relation { namespace, name },
                 privileges,
                 grantees,
             } => {
@@ -1035,6 +1049,19 @@ pub(crate) fn translate_catalog_changes(
                     "GRANT of role membership reached the relation catalog".to_string(),
                 ));
             }
+            CatalogChange::Grant {
+                target: GrantTarget::Namespace(_),
+                ..
+            } => {
+                return Err(LimboError::InternalError(
+                    "GRANT on a schema reached the relation catalog".to_string(),
+                ));
+            }
+            CatalogChange::DropNamespace { .. } => {
+                return Err(LimboError::InternalError(
+                    "DROP SCHEMA reached the relation catalog".to_string(),
+                ));
+            }
         }
     }
     Ok(())
@@ -1086,7 +1113,7 @@ fn relation_object(class: &RelationClass) -> Object {
 
 /// The role oid a `GRANT` stores for `grantee`, [`PUBLIC_OID`] for
 /// everyone. A named role must exist.
-fn resolve_grantee(
+pub(crate) fn resolve_grantee(
     schema: &Schema,
     connection: &Arc<Connection>,
     grantee: &ast::Grantee,
@@ -1958,6 +1985,12 @@ pub(crate) fn initialize_schema(
     {
         statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
         statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
+    }
+    if schema
+        .get_btree_table(NamespaceId::ROOT, NAMESPACE_ACLS_TABLE_NAME)
+        .is_none()
+    {
+        statements.push(CREATE_NAMESPACE_ACLS_TABLE_SQL.to_string());
     }
     Ok(statements)
 }

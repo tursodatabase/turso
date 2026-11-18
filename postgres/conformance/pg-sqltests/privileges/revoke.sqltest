@@ -825,14 +825,14 @@ expect error {
     REVOKE of column privileges is not supported
 }
 
-@skip-if postgres "PostgreSQL supports privileges on schemas"
-test revoke-on-a-schema-is-not-supported {
-    CREATE ROLE rv_schema_grantee;
-    REVOKE USAGE ON SCHEMA public FROM rv_schema_grantee;
+@skip-if postgres "PostgreSQL supports privileges on functions"
+test revoke-on-a-function-is-not-supported {
+    CREATE ROLE rv_function_grantee;
+    REVOKE EXECUTE ON FUNCTION lower(text) FROM rv_function_grantee;
 }
 @sqlstate 0A000
 expect error {
-    REVOKE on objects other than tables and sequences is not supported
+    REVOKE on objects other than tables, sequences and schemas is not supported
 }
 
 @skip-if postgres "PostgreSQL has no __turso_internal_* tables"

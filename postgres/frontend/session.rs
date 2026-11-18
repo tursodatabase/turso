@@ -1427,9 +1427,18 @@ fn name_foreign_key_tables<'a>(
     let mut sql = sql.into_owned();
     for table in tables.iter().rev() {
         let namespace = match table.schema.as_deref() {
-            Some(schema) => conn.qualifier(&schema.to_lowercase()).ok_or_else(|| {
-                LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
-            })?,
+            Some(schema) => {
+                let schema = schema.to_lowercase();
+                let namespace = conn.qualifier(&schema).ok_or_else(|| {
+                    LimboError::ParseError(format!("schema \"{schema}\" does not exist"))
+                })?;
+                if !crate::namespaces::current_role_may_use_schema(conn, &schema) {
+                    return Err(LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(Action::Use, Object::Schema(schema)),
+                    )));
+                }
+                namespace
+            }
             None => foreign_key_table_namespace(conn, &table.name, created.as_ref()).ok_or_else(
                 || LimboError::ParseError("no schema has been selected to create in".to_string()),
             )?,
@@ -1458,7 +1467,8 @@ fn created_table(
 /// The schema that a foreign key target named without a schema is in: the
 /// first schema of the search path that has a table of that name, counting
 /// the table the statement creates, which PostgreSQL makes before its
-/// foreign keys; or else the first schema of the search path.
+/// foreign keys; or else the first schema of the search path. Schemas that
+/// the current role has no USAGE on are left out.
 fn foreign_key_table_namespace(
     conn: &Arc<Connection>,
     name: &str,
@@ -1469,6 +1479,7 @@ fn foreign_key_table_namespace(
         .search_order()
         .into_iter()
         .filter(|namespace| namespace.database_id() == turso_core::MAIN_DB_ID)
+        .filter(|namespace| crate::namespaces::current_role_may_use_schema(conn, &namespace.name))
         .collect();
     candidates
         .iter()
@@ -1672,15 +1683,15 @@ pub(crate) fn database_of(conn: &Connection, namespace: &Qualifier) -> String {
         .expect("the database of a namespace has a name")
 }
 
-/// The first schema of `search_path` that exists, which is what PostgreSQL's
-/// current_schema() returns. None when no schema of `search_path` exists.
-/// The default search_path, "$user", public, gives public, since there is no
-/// schema named after a user.
+/// The first schema of `search_path` that exists and that the current role
+/// has USAGE on, which is what PostgreSQL's current_schema() returns. None
+/// when `search_path` has no such schema. The default search_path, "$user",
+/// public, gives public, since there is no schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     conn.search_order()
         .into_iter()
-        .next()
         .map(|namespace| namespace.name)
+        .find(|name| crate::namespaces::current_role_may_use_schema(conn, name))
 }
 
 pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<String> {
@@ -1689,7 +1700,10 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
         .search_path()
         .unwrap_or_else(|| vec!["public".to_owned()])
     {
-        if catalog::namespace_exists(conn, &name) && !schemas.contains(&name) {
+        if catalog::namespace_exists(conn, &name)
+            && crate::namespaces::current_role_may_use_schema(conn, &name)
+            && !schemas.contains(&name)
+        {
             schemas.push(name);
         }
     }
@@ -1887,9 +1901,27 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
 /// the tables and the dialect the roles, tables first as in PostgreSQL. `ALL
 /// TABLES IN SCHEMA` names the tables, views and materialized views of each
 /// schema, `ALL SEQUENCES IN SCHEMA` its sequences, and no statement when
-/// there are none.
+/// there are none. `ON SCHEMA` names the schemas themselves.
 fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<DeferredStatement>> {
+    let grant_statement = |objects| DeferredStatement {
+        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
+            revoke: stmt.revoke,
+            objects,
+            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
+        })),
+        context: CommandContext::Default,
+    };
     let relations = match &stmt.tables {
+        PgGrantTables::Schemas(schemas) => {
+            let namespaces = schemas
+                .iter()
+                .map(|schema| grantable_schema(conn, stmt, schema))
+                .collect::<Result<_>>()?;
+            return Ok(vec![grant_statement(ast::GrantObjects::Namespaces {
+                privileges: stmt.privileges.clone(),
+                namespaces,
+            })]);
+        }
         PgGrantTables::Named(tables) => tables.clone(),
         PgGrantTables::AllInSchemas(schemas) => {
             let mut relations = Vec::new();
@@ -1947,18 +1979,27 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
         }
         return Ok(Vec::new());
     }
-    Ok(vec![DeferredStatement {
-        command: DeferredCommand::Ast(ast::Stmt::Grant(ast::Grant {
-            revoke: stmt.revoke,
-            objects: ast::GrantObjects::Relations {
-                privileges: stmt.privileges.clone(),
-                on_sequences: stmt.on_sequences,
-                relations,
-            },
-            grantees: stmt.roles.iter().map(PgGrantee::to_ast).collect(),
-        })),
-        context: CommandContext::Default,
-    }])
+    Ok(vec![grant_statement(ast::GrantObjects::Relations {
+        privileges: stmt.privileges.clone(),
+        on_sequences: stmt.on_sequences,
+        relations,
+    })])
+}
+
+/// The namespace of `schema`, which a GRANT or REVOKE names after `ON
+/// SCHEMA`. The schemas of the system catalogs are not stored, so they have
+/// no privileges to change: every role uses them.
+fn grantable_schema(conn: &Connection, stmt: &PgGrantStmt, schema: &str) -> Result<ast::Name> {
+    check_schema_exists(conn, schema)?;
+    let schema = schema.to_lowercase();
+    if matches!(schema.as_str(), "pg_catalog" | "information_schema") {
+        let statement = if stmt.revoke { "REVOKE" } else { "GRANT" };
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("{statement} on system schema {schema} is not supported"),
+        ));
+    }
+    Ok(ast::Name::exact(schema))
 }
 
 fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {

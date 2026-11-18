@@ -177,6 +177,9 @@ pub fn translate(
             .role_is_superuser(resolver.schema(), connection.current_role())
     {
         resolver.role_is_not_superuser = true;
+        resolver
+            .catalog
+            .set_namespace_user(Some(connection.current_role()));
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
 
@@ -595,7 +598,7 @@ fn translate_statement(
             schema::translate_create_schema(&name, resolver, program)?;
         }
         ast::Stmt::DropSchema { name } => {
-            schema::translate_drop_schema(&name, resolver, program)?;
+            schema::translate_drop_schema(&name, resolver, program, connection)?;
         }
         ast::Stmt::CreatePolicy(policy) => {
             row_security::translate_create_policy(&policy, resolver, program, connection)?;

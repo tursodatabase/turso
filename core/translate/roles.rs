@@ -8,7 +8,8 @@
 //!
 //! A role that is not a superuser reads and writes the tables it owns or was
 //! granted privileges on, which row-level security limits, and switches
-//! roles. It may not use a sequence or change the schema it does not own.
+//! roles. It creates relations in the namespaces it has CREATE on. It may
+//! not use a sequence or change the schema it does not own.
 
 use crate::namespace::NamespaceRef;
 use crate::sync::Arc;
@@ -23,7 +24,7 @@ use crate::translate::plan::{NonFromClauseSubquery, SubqueryState};
 use crate::translate::row_security::translate_change;
 use crate::translate::schema::emit_schema_cookie;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{bail_parse_error, CatalogChange, LimboError, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, CatalogChange, GrantTarget, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
@@ -38,6 +39,8 @@ pub fn check_statement_privileges(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    check_usage_of_named_namespaces(stmt, resolver)?;
+    let role = connection.current_role();
     let denial = match stmt {
         // The privileges on the tables a statement reads and writes are
         // checked when it resolves them, with check_privilege.
@@ -62,11 +65,17 @@ pub fn check_statement_privileges(
             Action::CreateTemporary,
             Object::Database(MAIN_SCHEMA_NAME.to_string()),
         ),
-        ast::Stmt::CreateTable { tbl_name, .. } => create_in_schema_denial(tbl_name),
+        ast::Stmt::CreateTable { tbl_name, .. } => {
+            return check_create_in_namespace_of(resolver, role, tbl_name)
+        }
         ast::Stmt::CreateView { view_name, .. }
-        | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
+        | ast::Stmt::CreateMaterializedView { view_name, .. } => {
+            return check_create_in_namespace_of(resolver, role, view_name)
+        }
         ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
-        ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
+        ast::Stmt::CreateSequence { seq_name, .. } => {
+            return check_create_in_namespace_of(resolver, role, seq_name)
+        }
         ast::Stmt::AlterSequenceOwnedBy { seq_name, .. } => {
             let namespace = crate::translate::sequence::sequence_namespace(seq_name, resolver)
                 .ok()
@@ -91,8 +100,7 @@ pub fn check_statement_privileges(
         // not exist is reported as such.
         ast::Stmt::Grant(_) => return Ok(()),
         // PostgreSQL lets the table's owner index it when it also has CREATE
-        // on the index's schema, which only a superuser has until GRANT
-        // exists, as for CREATE TABLE.
+        // on the index's schema, as for CREATE TABLE.
         ast::Stmt::CreateIndex {
             idx_name, tbl_name, ..
         } => {
@@ -101,7 +109,7 @@ pub fn check_statement_privileges(
             let mut qualified = ast::QualifiedName::single(tbl_name.clone());
             qualified.namespace.clone_from(&idx_name.namespace);
             if may_act_as_owner_of_table(resolver, connection, &qualified) {
-                create_in_schema_denial(idx_name)
+                return check_create_in_namespace_of(resolver, role, idx_name);
             } else {
                 PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
             }
@@ -122,32 +130,37 @@ pub fn check_statement_privileges(
                 // The owner may give its relation to a role it may set
                 // itself, such as a role it is a member of, as in
                 // PostgreSQL. Anyone else must be the owner.
-                ast::AlterTableBody::OwnerTo { role, .. } if owner => {
-                    match settable_role(resolver, connection, role) {
-                        // As in PostgreSQL, a new owner also needs CREATE on
-                        // the relation's schema, which only a superuser has
-                        // until GRANT on schemas exists. Giving the relation
-                        // to the role that owns it changes nothing.
+                ast::AlterTableBody::OwnerTo {
+                    role: new_owner, ..
+                } if owner => {
+                    match settable_role(resolver, connection, new_owner) {
+                        // Giving the relation to the role that owns it
+                        // changes nothing.
                         Some(new_owner)
-                            if resolver
-                                .catalog
-                                .dialect
-                                .role_is_superuser(resolver.schema(), new_owner)
-                                || table_owner(resolver, &alter.name) == Some(new_owner) =>
+                            if table_owner(resolver, &alter.name) == Some(new_owner) =>
                         {
                             return Ok(())
                         }
-                        Some(_) => create_in_schema_denial(&alter.name),
+                        // As in PostgreSQL, a new owner also needs CREATE on
+                        // the relation's schema.
+                        Some(new_owner) => {
+                            return check_create_in_namespace_of_relation(
+                                resolver,
+                                new_owner,
+                                &alter.name,
+                            )
+                        }
                         None => PermissionDenied::privilege(
                             Action::SetRole,
-                            Object::Role(role_spec_name(role)),
+                            Object::Role(role_spec_name(new_owner)),
                         ),
                     }
                 }
                 ast::AlterTableBody::OwnerTo { .. } => owner_denial(),
-                // Renaming also needs CREATE on the schema, as in
-                // PostgreSQL, which only a superuser has until GRANT exists.
-                ast::AlterTableBody::RenameTo(_) if owner => create_in_schema_denial(&alter.name),
+                // Renaming also needs CREATE on the schema, as in PostgreSQL.
+                ast::AlterTableBody::RenameTo(_) if owner => {
+                    return check_create_in_namespace_of_relation(resolver, role, &alter.name)
+                }
                 // The owner may run every other ALTER on its relation.
                 _ if owner => return Ok(()),
                 _ => owner_denial(),
@@ -249,6 +262,76 @@ pub fn check_statement_privileges(
         ast::Stmt::Detach { .. } => database_denial(Action::Detach),
     };
     Err(permission_denied(denial))
+}
+
+/// Fails if `stmt` names a table or a sequence with a namespace that the
+/// role may not look up names in. As in PostgreSQL, this covers the query
+/// of a new view and the expressions of a new table, which are not looked
+/// up again for the roles that use the view or the table later.
+fn check_usage_of_named_namespaces(stmt: &ast::Stmt, resolver: &Resolver) -> Result<()> {
+    let mut names = NamespaceQualifiedNames { resolver };
+    crate::util::visit_stmt(stmt, &mut names)?;
+    match stmt {
+        ast::Stmt::CreateView { select, .. } | ast::Stmt::CreateMaterializedView { select, .. } => {
+            crate::util::visit_select(select, &mut names)
+        }
+        ast::Stmt::CreateTable {
+            body:
+                ast::CreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    ..
+                },
+            ..
+        } => {
+            let column_exprs = columns
+                .iter()
+                .flat_map(|column| &column.constraints)
+                .filter_map(|constraint| match &constraint.constraint {
+                    ast::ColumnConstraint::Default(expr)
+                    | ast::ColumnConstraint::Check { expr, .. }
+                    | ast::ColumnConstraint::Generated { expr, .. } => Some(expr),
+                    _ => None,
+                });
+            let table_exprs =
+                constraints
+                    .iter()
+                    .filter_map(|constraint| match &constraint.constraint {
+                        ast::TableConstraint::Check { expr, .. } => Some(expr),
+                        _ => None,
+                    });
+            for expr in column_exprs.chain(table_exprs) {
+                crate::util::visit_expr_with_subqueries(expr, &mut names)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Checks every table and every sequence that a statement names with a
+/// namespace.
+struct NamespaceQualifiedNames<'r, 'a> {
+    resolver: &'r Resolver<'a>,
+}
+
+impl crate::util::AstVisitor for NamespaceQualifiedNames<'_, '_> {
+    fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
+        if let Some(namespace) = crate::translate::sequence::namespace_of_sequence_called_by(expr) {
+            self.resolver.catalog.check_namespace_usage(&namespace)?;
+        }
+        Ok(WalkControl::Continue)
+    }
+
+    fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
+        match &name.namespace {
+            Some(namespace) => self
+                .resolver
+                .catalog
+                .check_namespace_usage(namespace.as_str()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Whether the current role may run an owner-gated statement on the table or
@@ -554,6 +637,62 @@ pub(crate) fn check_pragma_function(resolver: &Resolver, pragma_name: &str) -> R
     )))
 }
 
+/// Fails unless `role` has CREATE on the namespace that a new object named
+/// `name` goes to. A name whose namespace does not resolve is let through,
+/// so the statement fails in translation with its usual error.
+fn check_create_in_namespace_of(
+    resolver: &Resolver,
+    role: RoleId,
+    name: &ast::QualifiedName,
+) -> Result<()> {
+    match resolver.resolve_namespace_for_create(name) {
+        Ok(namespace) => check_create_in_namespace(resolver, role, namespace),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Fails unless `role` has CREATE on the namespace of the existing table or
+/// view that `name` names. A relation that does not resolve is let through,
+/// so the statement fails in translation with its usual error.
+fn check_create_in_namespace_of_relation(
+    resolver: &Resolver,
+    role: RoleId,
+    name: &ast::QualifiedName,
+) -> Result<()> {
+    match resolver.find_existing_table(name) {
+        Ok(Some(namespace)) => check_create_in_namespace(resolver, role, namespace),
+        Ok(None) | Err(_) => Ok(()),
+    }
+}
+
+/// Fails unless `role` has CREATE on `namespace`. Only the namespaces of the
+/// main database have privileges that a dialect stores; a role that is not
+/// a superuser creates nothing in another database.
+fn check_create_in_namespace(
+    resolver: &Resolver,
+    role: RoleId,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    if namespace.database_id == MAIN_DB_ID
+        && resolver.catalog.dialect.role_has_namespace_privilege(
+            resolver.schema(),
+            namespace.id,
+            role,
+            ast::Privilege::Create,
+        )
+    {
+        return Ok(());
+    }
+    let name = resolver
+        .catalog
+        .name_of_namespace(namespace)
+        .unwrap_or_else(|| MAIN_SCHEMA_NAME.to_string());
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Create,
+        Object::Schema(name),
+    )))
+}
+
 fn create_in_schema_denial(name: &ast::QualifiedName) -> PermissionDenied {
     let schema = name
         .namespace
@@ -570,22 +709,29 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT` and `REVOKE`. Of privileges on relations, the dialect changes
-/// the privileges it stores with each relation, through its relation hooks,
-/// as it stores ownership. Of roles, the dialect stores the membership,
-/// through the same hook as its other catalog changes.
+/// `GRANT` and `REVOKE`. Of privileges on relations or namespaces, the
+/// dialect changes the privileges it stores with each of them. Of roles, the
+/// dialect stores the membership. Both go through the same hook as its other
+/// catalog changes.
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let (privileges, on_sequences, relations) = match &grant.objects {
+    let (privileges, targets) = match &grant.objects {
         ast::GrantObjects::Relations {
             privileges,
             on_sequences,
             relations,
-        } => (privileges, on_sequences, relations),
+        } => (
+            privileges,
+            relation_grant_targets(relations, *on_sequences, resolver)?,
+        ),
+        ast::GrantObjects::Namespaces {
+            privileges,
+            namespaces,
+        } => (privileges, namespace_grant_targets(namespaces, resolver)?),
         ast::GrantObjects::Roles(roles) => {
             let change = CatalogChange::GrantRole {
                 revoke: grant.revoke,
@@ -595,7 +741,35 @@ pub fn translate_grant(
             return translate_change(change, resolver, program, connection);
         }
     };
-    let mut changes = Vec::with_capacity(relations.len());
+    let changes: Vec<_> = targets
+        .into_iter()
+        .map(|target| CatalogChange::Grant {
+            revoke: grant.revoke,
+            target,
+            privileges: privileges.clone(),
+            grantees: grant.grantees.clone(),
+        })
+        .collect();
+    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.translate_catalog_changes(
+        program,
+        resolver.schema(),
+        connection,
+        &changes,
+    )?;
+    emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// The relations of the main database that `relations` name, each of which
+/// must exist and, with `on_sequences`, be a sequence.
+fn relation_grant_targets(
+    relations: &[ast::QualifiedName],
+    on_sequences: bool,
+    resolver: &Resolver,
+) -> Result<Vec<GrantTarget>> {
+    let mut targets = Vec::with_capacity(relations.len());
     for qualified_name in relations {
         let normalized_name = crate::util::normalize_ident(qualified_name.name.as_str());
         // A schema that does not exist is reported as such, not as a
@@ -614,7 +788,7 @@ pub fn translate_grant(
         if kind == ast::RelationKind::Index {
             bail_parse_error!("\"{normalized_name}\" is an index");
         }
-        if *on_sequences && kind != ast::RelationKind::Sequence {
+        if on_sequences && kind != ast::RelationKind::Sequence {
             bail_parse_error!("\"{normalized_name}\" is not a sequence");
         }
         // Only the main database has dialect schema state to store the
@@ -622,24 +796,30 @@ pub fn translate_grant(
         if namespace.database_id != MAIN_DB_ID {
             continue;
         }
-        changes.push(crate::CatalogChange::Grant {
-            revoke: grant.revoke,
+        targets.push(GrantTarget::Relation {
             namespace: namespace.id,
             name: normalized_name,
-            privileges: privileges.clone(),
-            grantees: grant.grantees.clone(),
         });
     }
-    let schema_cookie = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
-    program.begin_write_on_database(MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
-        program,
-        resolver.schema(),
-        connection,
-        &changes,
-    )?;
-    emit_schema_cookie(resolver, program);
-    Ok(())
+    Ok(targets)
+}
+
+/// The namespaces of the main database that `namespaces` name, each of which
+/// must exist.
+fn namespace_grant_targets(
+    namespaces: &[ast::Name],
+    resolver: &Resolver,
+) -> Result<Vec<GrantTarget>> {
+    namespaces
+        .iter()
+        .map(|name| {
+            let normalized_name = crate::util::normalize_ident(name.as_str());
+            resolver
+                .with_schema(MAIN_DB_ID, |s| s.namespace_named(&normalized_name))
+                .map(GrantTarget::Namespace)
+                .ok_or_else(|| LimboError::ParseError(format!("no such schema: {normalized_name}")))
+        })
+        .collect()
 }
 
 /// `CREATE ROLE`: the dialect stores the role, through the same hook as its

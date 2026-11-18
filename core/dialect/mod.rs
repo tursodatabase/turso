@@ -72,15 +72,17 @@ pub enum CatalogChange {
         old_name: String,
         new_name: String,
     },
-    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
-    /// relation FROM grantees` when `revoke` is set.
+    /// `GRANT privileges ON target TO grantees`, or `REVOKE privileges ON
+    /// target FROM grantees` when `revoke` is set.
     Grant {
         revoke: bool,
-        namespace: NamespaceId,
-        name: String,
+        target: GrantTarget,
         privileges: Vec<Privilege>,
         grantees: Vec<Grantee>,
     },
+    /// `DROP SCHEMA`: the namespace is gone, with what the dialect stores
+    /// for it. Its id may name another namespace later.
+    DropNamespace { namespace: NamespaceId },
     /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
     /// `enabled` is false.
     SetRowSecurity {
@@ -114,6 +116,17 @@ pub enum CatalogChange {
         roles: Vec<String>,
         grantees: Vec<Grantee>,
     },
+}
+
+/// What a [`CatalogChange::Grant`] gives privileges on, in the main database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantTarget {
+    /// A table, view, materialized view or sequence.
+    Relation {
+        namespace: NamespaceId,
+        name: String,
+    },
+    Namespace(NamespaceId),
 }
 
 /// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
@@ -542,6 +555,21 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Vec<String> {
         let _ = (schema, namespace, table, column);
         Vec::new()
+    }
+
+    /// Whether `role` has `privilege` on `namespace` of the main database,
+    /// from the privileges the dialect stores: USAGE to look up the objects
+    /// in the namespace by name, CREATE to make new ones there. A dialect
+    /// without privileges gives every role both.
+    fn role_has_namespace_privilege(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        role: RoleId,
+        privilege: Privilege,
+    ) -> bool {
+        let _ = (schema, namespace, role, privilege);
+        true
     }
 
     /// Whether `role` has `privilege` on relation `name` of `namespace`,

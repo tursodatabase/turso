@@ -1601,12 +1601,17 @@ pub enum GrantObjects {
         on_sequences: bool,
         relations: Vec<QualifiedName>,
     },
+    /// `privileges ON SCHEMA namespaces`.
+    Namespaces {
+        privileges: Vec<Privilege>,
+        namespaces: Vec<Name>,
+    },
     /// `roles`: each grantee becomes a member of each of the roles, which
     /// are named.
     Roles(Vec<String>),
 }
 
-/// A privilege on a relation.
+/// A privilege on a relation or on a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Privilege {
@@ -1619,7 +1624,9 @@ pub enum Privilege {
     Trigger,
     Maintain,
     Usage,
-    /// `ALL [PRIVILEGES]`: every privilege that the kind of relation has.
+    /// Only a namespace has it: making new objects in the namespace.
+    Create,
+    /// `ALL [PRIVILEGES]`: every privilege that the kind of object has.
     All,
 }
 

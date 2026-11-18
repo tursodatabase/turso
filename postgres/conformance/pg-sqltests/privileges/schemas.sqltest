@@ -1,7 +1,12 @@
-# What the privileges on a schema let a role do through the PostgreSQL
-# frontend. Creating, renaming or indexing a table needs CREATE on its schema.
+# GRANT and REVOKE on schemas through the PostgreSQL frontend, and what the
+# privileges on a schema let a role do. Creating, renaming or indexing a table
+# needs CREATE on its schema.
 # PostgreSQL roles belong to the whole server, not to one database, so every
 # test uses its own role names.
+#
+# The privileges are stored in the schema's access control list, which
+# pg_namespace.nspacl shows in PostgreSQL's aclitem[] form: U is USAGE and C
+# is CREATE.
 
 @database :memory:
 
@@ -56,4 +61,788 @@ test owner-may-not-index-without-create-on-the-schema {
 @sqlstate 42501
 expect error {
     permission denied for schema public
+}
+
+test grant-usage-on-schema-is-stored-in-its-list {
+    CREATE ROLE sg_usage;
+    CREATE SCHEMA sg_usage_s;
+    GRANT USAGE ON SCHEMA sg_usage_s TO sg_usage;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_usage_s';
+}
+expect {
+    {postgres=UC/postgres,sg_usage=U/postgres}
+}
+
+test grant-create-on-schema-is-stored-in-its-list {
+    CREATE ROLE sg_create;
+    CREATE SCHEMA sg_create_s;
+    GRANT CREATE ON SCHEMA sg_create_s TO sg_create;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_create_s';
+}
+expect {
+    {postgres=UC/postgres,sg_create=C/postgres}
+}
+
+test grant-all-on-schema-gives-usage-and-create {
+    CREATE ROLE sg_all;
+    CREATE SCHEMA sg_all_s;
+    GRANT ALL PRIVILEGES ON SCHEMA sg_all_s TO sg_all;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_all_s';
+}
+expect {
+    {postgres=UC/postgres,sg_all=UC/postgres}
+}
+
+test grant-on-several-schemas-to-several-roles {
+    CREATE ROLE sg_many_a;
+    CREATE ROLE sg_many_b;
+    CREATE SCHEMA sg_many_s;
+    CREATE SCHEMA sg_many_t;
+    GRANT USAGE ON SCHEMA sg_many_s, sg_many_t TO sg_many_a, sg_many_b, PUBLIC;
+    SELECT nspname, nspacl FROM pg_namespace WHERE nspname LIKE 'sg_many_%' ORDER BY nspname;
+}
+expect {
+    sg_many_s|{postgres=UC/postgres,sg_many_a=U/postgres,sg_many_b=U/postgres,=U/postgres}
+    sg_many_t|{postgres=UC/postgres,sg_many_a=U/postgres,sg_many_b=U/postgres,=U/postgres}
+}
+
+test second-grant-adds-to-the-entry-of-the-role {
+    CREATE ROLE sg_twice;
+    CREATE SCHEMA sg_twice_s;
+    GRANT USAGE ON SCHEMA sg_twice_s TO sg_twice;
+    GRANT CREATE ON SCHEMA sg_twice_s TO sg_twice;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_twice_s';
+}
+expect {
+    {postgres=UC/postgres,sg_twice=UC/postgres}
+}
+
+test schema-has-no-list-before-any-grant {
+    CREATE SCHEMA sg_untouched_s;
+    SELECT coalesce(nspacl::text, 'null') FROM pg_namespace WHERE nspname = 'sg_untouched_s';
+}
+expect {
+    null
+}
+
+test grant-on-public-adds-to-its-list {
+    CREATE ROLE sg_public;
+    GRANT CREATE ON SCHEMA public TO sg_public;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'public';
+}
+expect {
+    {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner,sg_public=C/pg_database_owner}
+}
+
+test revoke-on-schema-takes-the-privilege-out-of-the-list {
+    CREATE ROLE sv_revoke;
+    CREATE SCHEMA sv_revoke_s;
+    GRANT ALL ON SCHEMA sv_revoke_s TO sv_revoke;
+    REVOKE CREATE ON SCHEMA sv_revoke_s FROM sv_revoke;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sv_revoke_s';
+}
+expect {
+    {postgres=UC/postgres,sv_revoke=U/postgres}
+}
+
+test revoke-of-every-privilege-drops-the-entry {
+    CREATE ROLE sv_revoke_all;
+    CREATE SCHEMA sv_revoke_all_s;
+    GRANT USAGE ON SCHEMA sv_revoke_all_s TO sv_revoke_all;
+    REVOKE ALL ON SCHEMA sv_revoke_all_s FROM sv_revoke_all;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sv_revoke_all_s';
+}
+expect {
+    {postgres=UC/postgres}
+}
+
+test revoke-of-a-privilege-never-granted-stores-the-default-list {
+    CREATE ROLE sv_never;
+    CREATE SCHEMA sv_never_s;
+    REVOKE USAGE ON SCHEMA sv_never_s FROM sv_never;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sv_never_s';
+}
+expect {
+    {postgres=UC/postgres}
+}
+
+test revoke-usage-on-public-from-public {
+    REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'public';
+}
+expect {
+    {pg_database_owner=UC/pg_database_owner}
+}
+
+test schema-created-after-a-drop-does-not-get-the-dropped-list {
+    CREATE ROLE sg_dropped;
+    CREATE SCHEMA sg_dropped_s;
+    GRANT USAGE ON SCHEMA sg_dropped_s TO sg_dropped;
+    DROP SCHEMA sg_dropped_s;
+    CREATE SCHEMA sg_dropped_t;
+    SELECT coalesce(nspacl::text, 'null') FROM pg_namespace WHERE nspname = 'sg_dropped_t';
+}
+expect {
+    null
+}
+
+test grant-on-missing-schema-fails {
+    CREATE ROLE sg_missing_schema;
+    GRANT USAGE ON SCHEMA sg_no_such_schema TO sg_missing_schema;
+}
+@sqlstate 3F000
+expect error {
+    schema "sg_no_such_schema" does not exist
+}
+
+test grant-on-schema-to-missing-role-fails {
+    CREATE SCHEMA sg_missing_role_s;
+    GRANT USAGE ON SCHEMA sg_missing_role_s TO sg_no_such_role;
+}
+@sqlstate 42704
+expect error {
+    role "sg_no_such_role" does not exist
+}
+
+test grant-on-schema-checks-the-schema-before-the-role {
+    GRANT USAGE ON SCHEMA sg_no_such_schema_2 TO sg_no_such_role_2;
+}
+@sqlstate 3F000
+expect error {
+    schema "sg_no_such_schema_2" does not exist
+}
+
+test grant-of-a-table-privilege-on-schema-fails {
+    CREATE ROLE sg_select;
+    CREATE SCHEMA sg_select_s;
+    GRANT SELECT ON SCHEMA sg_select_s TO sg_select;
+}
+@sqlstate 0LP01
+expect error {
+    invalid privilege type SELECT for schema
+}
+
+test role-without-privileges-on-schema-may-not-grant {
+    CREATE ROLE sg_stranger;
+    CREATE ROLE sg_stranger_friend;
+    CREATE SCHEMA sg_stranger_s;
+    SET ROLE sg_stranger;
+    GRANT USAGE ON SCHEMA sg_stranger_s TO sg_stranger_friend;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sg_stranger_s
+}
+
+test role-with-usage-but-no-grant-option-grants-nothing {
+    CREATE ROLE sg_user;
+    CREATE ROLE sg_user_friend;
+    CREATE SCHEMA sg_user_s;
+    GRANT USAGE ON SCHEMA sg_user_s TO sg_user;
+    SET ROLE sg_user;
+    GRANT USAGE ON SCHEMA sg_user_s TO sg_user_friend;
+    RESET ROLE;
+    SELECT nspacl FROM pg_namespace WHERE nspname = 'sg_user_s';
+}
+expect {
+    {postgres=UC/postgres,sg_user=U/postgres}
+}
+
+@skip-if postgres "PostgreSQL stores privileges on its system schemas"
+test grant-on-a-system-schema-is-not-supported {
+    CREATE ROLE sg_system;
+    GRANT USAGE ON SCHEMA pg_catalog TO sg_system;
+}
+@sqlstate 0A000
+expect error {
+    GRANT on system schema pg_catalog is not supported
+}
+
+test select-on-a-table-is-not-enough-without-usage-on-its-schema {
+    CREATE ROLE su_no_usage;
+    CREATE SCHEMA su_no_usage_s;
+    CREATE TABLE su_no_usage_s.t (id INT);
+    GRANT ALL ON su_no_usage_s.t TO su_no_usage;
+    SET ROLE su_no_usage;
+    SELECT id FROM su_no_usage_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_no_usage_s
+}
+
+test usage-on-the-schema-lets-a-role-read-its-table {
+    CREATE ROLE su_usage;
+    CREATE SCHEMA su_usage_s;
+    CREATE TABLE su_usage_s.t (id INT);
+    INSERT INTO su_usage_s.t VALUES (1), (2);
+    GRANT SELECT ON su_usage_s.t TO su_usage;
+    GRANT USAGE ON SCHEMA su_usage_s TO su_usage;
+    SET ROLE su_usage;
+    SELECT id FROM su_usage_s.t ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test usage-on-the-schema-does-not-give-its-tables {
+    CREATE ROLE su_only_usage;
+    CREATE SCHEMA su_only_usage_s;
+    CREATE TABLE su_only_usage_s.t (id INT);
+    GRANT USAGE ON SCHEMA su_only_usage_s TO su_only_usage;
+    SET ROLE su_only_usage;
+    SELECT id FROM su_only_usage_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table t
+}
+
+test usage-granted-to-public-lets-every-role-read {
+    CREATE ROLE su_public;
+    CREATE SCHEMA su_public_s;
+    CREATE TABLE su_public_s.t (id INT);
+    INSERT INTO su_public_s.t VALUES (7);
+    GRANT SELECT ON su_public_s.t TO su_public;
+    GRANT USAGE ON SCHEMA su_public_s TO PUBLIC;
+    SET ROLE su_public;
+    SELECT id FROM su_public_s.t;
+}
+expect {
+    7
+}
+
+test member-has-the-usage-of-the-role-it-inherits-from {
+    CREATE ROLE su_group;
+    CREATE ROLE su_member;
+    GRANT su_group TO su_member;
+    CREATE SCHEMA su_group_s;
+    CREATE TABLE su_group_s.t (id INT);
+    INSERT INTO su_group_s.t VALUES (3);
+    GRANT SELECT ON su_group_s.t TO su_group;
+    GRANT USAGE ON SCHEMA su_group_s TO su_group;
+    SET ROLE su_member;
+    SELECT id FROM su_group_s.t;
+}
+expect {
+    3
+}
+
+test revoke-usage-stops-a-role-reading-the-schemas-tables {
+    CREATE ROLE su_revoked;
+    CREATE SCHEMA su_revoked_s;
+    CREATE TABLE su_revoked_s.t (id INT);
+    GRANT SELECT ON su_revoked_s.t TO su_revoked;
+    GRANT USAGE ON SCHEMA su_revoked_s TO su_revoked;
+    REVOKE USAGE ON SCHEMA su_revoked_s FROM su_revoked;
+    SET ROLE su_revoked;
+    SELECT id FROM su_revoked_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_revoked_s
+}
+
+test writes-need-usage-on-the-schema-too {
+    CREATE ROLE su_writer;
+    CREATE SCHEMA su_writer_s;
+    CREATE TABLE su_writer_s.t (id INT);
+    GRANT ALL ON su_writer_s.t TO su_writer;
+    SET ROLE su_writer;
+    INSERT INTO su_writer_s.t VALUES (1);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_writer_s
+}
+
+test missing-table-in-a-schema-without-usage-is-a-permission-error {
+    CREATE ROLE su_missing;
+    CREATE SCHEMA su_missing_s;
+    SET ROLE su_missing;
+    SELECT * FROM su_missing_s.no_such_table;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_missing_s
+}
+
+test owner-of-a-table-needs-usage-on-its-schema {
+    CREATE ROLE su_owner;
+    CREATE SCHEMA su_owner_s;
+    CREATE TABLE su_owner_s.t (id INT);
+    ALTER TABLE su_owner_s.t OWNER TO su_owner;
+    SET ROLE su_owner;
+    SELECT id FROM su_owner_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_owner_s
+}
+
+test search-path-skips-a-schema-without-usage {
+    CREATE ROLE su_path;
+    CREATE SCHEMA su_path_s;
+    CREATE TABLE su_path_s.su_path_t (id INT);
+    GRANT SELECT ON su_path_s.su_path_t TO su_path;
+    SET search_path TO su_path_s;
+    SET ROLE su_path;
+    SELECT id FROM su_path_t;
+}
+@sqlstate 42P01
+expect error {
+    relation "su_path_t" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such object: su_path_t
+}
+
+test search-path-finds-a-table-in-a-schema-with-usage {
+    CREATE ROLE su_path_ok;
+    CREATE SCHEMA su_path_ok_s;
+    CREATE TABLE su_path_ok_s.su_path_ok_t (id INT);
+    INSERT INTO su_path_ok_s.su_path_ok_t VALUES (5);
+    GRANT SELECT ON su_path_ok_s.su_path_ok_t TO su_path_ok;
+    GRANT USAGE ON SCHEMA su_path_ok_s TO su_path_ok;
+    SET search_path TO su_path_ok_s;
+    SET ROLE su_path_ok;
+    SELECT id FROM su_path_ok_t;
+}
+expect {
+    5
+}
+
+test search-path-goes-on-to-the-next-schema-with-usage {
+    CREATE ROLE su_next;
+    CREATE SCHEMA su_next_hidden;
+    CREATE SCHEMA su_next_shown;
+    CREATE TABLE su_next_hidden.su_next_t (id INT);
+    CREATE TABLE su_next_shown.su_next_t (id INT);
+    INSERT INTO su_next_hidden.su_next_t VALUES (1);
+    INSERT INTO su_next_shown.su_next_t VALUES (2);
+    GRANT SELECT ON su_next_hidden.su_next_t, su_next_shown.su_next_t TO su_next;
+    GRANT USAGE ON SCHEMA su_next_shown TO su_next;
+    SET search_path TO su_next_hidden, su_next_shown;
+    SET ROLE su_next;
+    SELECT id FROM su_next_t;
+}
+expect {
+    2
+}
+
+test every-role-has-usage-on-public-by-default {
+    CREATE ROLE su_default;
+    CREATE TABLE su_default_t (id INT);
+    INSERT INTO su_default_t VALUES (9);
+    GRANT SELECT ON su_default_t TO su_default;
+    SET ROLE su_default;
+    SELECT id FROM public.su_default_t;
+}
+expect {
+    9
+}
+
+test revoke-usage-on-public-from-public-hides-its-tables {
+    CREATE ROLE su_public_revoked;
+    CREATE TABLE su_public_revoked_t (id INT);
+    GRANT SELECT ON su_public_revoked_t TO su_public_revoked;
+    REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+    SET ROLE su_public_revoked;
+    SELECT id FROM public.su_public_revoked_t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test view-reads-a-table-of-a-schema-its-reader-has-no-usage-on {
+    CREATE ROLE su_view_reader;
+    CREATE SCHEMA su_view_s;
+    CREATE TABLE su_view_s.t (id INT);
+    INSERT INTO su_view_s.t VALUES (4);
+    CREATE VIEW su_view_v AS SELECT id FROM su_view_s.t;
+    GRANT SELECT ON su_view_v TO su_view_reader;
+    SET ROLE su_view_reader;
+    SELECT id FROM su_view_v;
+}
+expect {
+    4
+}
+
+test nextval-of-a-sequence-named-with-a-schema-needs-usage {
+    CREATE ROLE su_nextval;
+    CREATE SCHEMA su_nextval_s;
+    CREATE SEQUENCE su_nextval_s.q;
+    GRANT ALL ON su_nextval_s.q TO su_nextval;
+    SET ROLE su_nextval;
+    SELECT nextval('su_nextval_s.q');
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_nextval_s
+}
+
+test setval-of-a-sequence-named-with-a-schema-needs-usage {
+    CREATE ROLE su_setval;
+    CREATE SCHEMA su_setval_s;
+    CREATE SEQUENCE su_setval_s.q;
+    GRANT ALL ON su_setval_s.q TO su_setval;
+    SET ROLE su_setval;
+    SELECT setval('su_setval_s.q', 5);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_setval_s
+}
+
+test currval-of-a-sequence-named-with-a-schema-needs-usage {
+    CREATE ROLE su_currval;
+    CREATE SCHEMA su_currval_s;
+    CREATE SEQUENCE su_currval_s.q;
+    GRANT ALL ON su_currval_s.q TO su_currval;
+    SET ROLE su_currval;
+    SELECT currval('su_currval_s.q');
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_currval_s
+}
+
+test nextval-with-usage-on-the-schema-of-the-sequence {
+    CREATE ROLE su_nextval_ok;
+    CREATE SCHEMA su_nextval_ok_s;
+    CREATE SEQUENCE su_nextval_ok_s.q;
+    GRANT USAGE ON SCHEMA su_nextval_ok_s TO su_nextval_ok;
+    GRANT ALL ON su_nextval_ok_s.q TO su_nextval_ok;
+    SET ROLE su_nextval_ok;
+    SELECT nextval('su_nextval_ok_s.q');
+}
+expect {
+    1
+}
+
+test column-default-uses-a-sequence-of-a-schema-the-writer-has-no-usage-on {
+    CREATE ROLE su_coldef;
+    CREATE SCHEMA su_coldef_s;
+    CREATE SEQUENCE su_coldef_s.q;
+    CREATE TABLE su_coldef_t (id INT DEFAULT nextval('su_coldef_s.q'), x INT);
+    GRANT ALL ON su_coldef_t TO su_coldef;
+    GRANT ALL ON su_coldef_s.q TO su_coldef;
+    SET ROLE su_coldef;
+    INSERT INTO su_coldef_t (x) VALUES (7);
+    SELECT id, x FROM su_coldef_t;
+}
+expect {
+    1|7
+}
+
+test view-uses-a-sequence-of-a-schema-its-reader-has-no-usage-on {
+    CREATE ROLE su_view_seq;
+    CREATE SCHEMA su_view_seq_s;
+    CREATE SEQUENCE su_view_seq_s.q;
+    CREATE VIEW su_view_seq_v AS SELECT nextval('su_view_seq_s.q') AS n;
+    GRANT SELECT ON su_view_seq_v TO su_view_seq;
+    GRANT ALL ON su_view_seq_s.q TO su_view_seq;
+    SET ROLE su_view_seq;
+    SELECT n FROM su_view_seq_v;
+}
+expect {
+    1
+}
+
+test column-default-of-a-new-table-needs-usage-on-the-schema-of-its-sequence {
+    CREATE ROLE su_new_default;
+    CREATE SCHEMA su_new_default_s;
+    CREATE SEQUENCE su_new_default_s.q;
+    GRANT ALL ON su_new_default_s.q TO su_new_default;
+    GRANT CREATE ON SCHEMA public TO su_new_default;
+    SET ROLE su_new_default;
+    CREATE TABLE su_new_default_t (id INT DEFAULT nextval('su_new_default_s.q'));
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_default_s
+}
+
+test new-view-needs-usage-on-the-schemas-of-its-tables {
+    CREATE ROLE su_new_view;
+    CREATE SCHEMA su_new_view_s;
+    CREATE TABLE su_new_view_s.t (id INT);
+    GRANT SELECT ON su_new_view_s.t TO su_new_view;
+    GRANT CREATE ON SCHEMA public TO su_new_view;
+    SET ROLE su_new_view;
+    CREATE VIEW su_new_view_v AS SELECT id FROM su_new_view_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_view_s
+}
+
+test new-view-needs-usage-on-the-schema-of-a-table-in-a-subquery {
+    CREATE ROLE su_new_view_sub;
+    CREATE SCHEMA su_new_view_sub_s;
+    CREATE TABLE su_new_view_sub_s.t (id INT);
+    GRANT SELECT ON su_new_view_sub_s.t TO su_new_view_sub;
+    GRANT CREATE ON SCHEMA public TO su_new_view_sub;
+    SET ROLE su_new_view_sub;
+    CREATE VIEW su_new_view_sub_v AS SELECT (SELECT max(id) FROM su_new_view_sub_s.t) AS m;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_view_sub_s
+}
+
+test new-materialized-view-needs-usage-on-the-schemas-of-its-tables {
+    CREATE ROLE su_new_matview;
+    CREATE SCHEMA su_new_matview_s;
+    CREATE TABLE su_new_matview_s.t (id INT);
+    GRANT SELECT ON su_new_matview_s.t TO su_new_matview;
+    GRANT CREATE ON SCHEMA public TO su_new_matview;
+    SET ROLE su_new_matview;
+    CREATE MATERIALIZED VIEW su_new_matview_v AS SELECT id FROM su_new_matview_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_new_matview_s
+}
+
+test create-table-as-needs-usage-on-the-schemas-of-its-tables {
+    CREATE ROLE su_ctas;
+    CREATE SCHEMA su_ctas_s;
+    CREATE TABLE su_ctas_s.t (id INT);
+    GRANT SELECT ON su_ctas_s.t TO su_ctas;
+    GRANT CREATE ON SCHEMA public TO su_ctas;
+    SET ROLE su_ctas;
+    CREATE TABLE su_ctas_t AS SELECT id FROM su_ctas_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_ctas_s
+}
+
+test foreign-key-needs-usage-on-the-schema-of-the-table-it-references {
+    CREATE ROLE su_fk;
+    CREATE SCHEMA su_fk_s;
+    CREATE TABLE su_fk_s.t (id INT PRIMARY KEY);
+    GRANT ALL ON su_fk_s.t TO su_fk;
+    GRANT CREATE ON SCHEMA public TO su_fk;
+    SET ROLE su_fk;
+    CREATE TABLE su_fk_t (id INT REFERENCES su_fk_s.t (id));
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema su_fk_s
+}
+
+test superuser-needs-no-usage {
+    CREATE SCHEMA su_super_s;
+    CREATE TABLE su_super_s.t (id INT);
+    INSERT INTO su_super_s.t VALUES (6);
+    REVOKE ALL ON SCHEMA su_super_s FROM postgres;
+    SELECT id FROM su_super_s.t;
+}
+expect {
+    6
+}
+
+test current-schemas-leaves-out-a-schema-without-usage {
+    CREATE ROLE su_current;
+    CREATE SCHEMA su_current_hidden;
+    CREATE SCHEMA su_current_shown;
+    GRANT USAGE ON SCHEMA su_current_shown TO su_current;
+    SET search_path TO su_current_hidden, su_current_shown;
+    SET ROLE su_current;
+    SELECT current_schema(), current_schemas(false);
+}
+expect {
+    su_current_shown|{su_current_shown}
+}
+
+test create-on-the-schema-lets-a-role-create-a-table {
+    CREATE ROLE sc_creator;
+    GRANT CREATE ON SCHEMA public TO sc_creator;
+    SET ROLE sc_creator;
+    CREATE TABLE sc_creator_t (id INT);
+    INSERT INTO sc_creator_t VALUES (1);
+    SELECT id FROM sc_creator_t;
+}
+expect {
+    1
+}
+
+test role-owns-the-table-it-creates {
+    CREATE ROLE sc_owner;
+    GRANT CREATE ON SCHEMA public TO sc_owner;
+    SET ROLE sc_owner;
+    CREATE TABLE sc_owner_t (id INT);
+    RESET ROLE;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'sc_owner_t';
+}
+expect {
+    sc_owner
+}
+
+test all-on-a-schema-lets-a-role-create-and-read-in-it {
+    CREATE ROLE sc_all;
+    CREATE SCHEMA sc_all_s;
+    GRANT ALL ON SCHEMA sc_all_s TO sc_all;
+    SET ROLE sc_all;
+    CREATE TABLE sc_all_s.t (id INT);
+    INSERT INTO sc_all_s.t VALUES (2);
+    SELECT id FROM sc_all_s.t;
+}
+expect {
+    2
+}
+
+test create-on-the-schema-lets-a-role-create-a-view-a-sequence-and-an-index {
+    CREATE ROLE sc_kinds;
+    GRANT CREATE ON SCHEMA public TO sc_kinds;
+    SET ROLE sc_kinds;
+    CREATE TABLE sc_kinds_t (id INT);
+    CREATE INDEX sc_kinds_i ON sc_kinds_t (id);
+    CREATE VIEW sc_kinds_v AS SELECT id FROM sc_kinds_t;
+    CREATE SEQUENCE sc_kinds_s;
+    INSERT INTO sc_kinds_t VALUES (nextval('sc_kinds_s'));
+    SELECT id FROM sc_kinds_v;
+}
+expect {
+    1
+}
+
+test create-on-the-schema-lets-a-role-create-a-table-with-a-serial-column {
+    CREATE ROLE sc_serial;
+    GRANT CREATE ON SCHEMA public TO sc_serial;
+    SET ROLE sc_serial;
+    CREATE TABLE sc_serial_t (id SERIAL, x INT);
+    INSERT INTO sc_serial_t (x) VALUES (10), (20);
+    SELECT id, x FROM sc_serial_t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+test create-on-the-schema-lets-the-owner-rename-its-table {
+    CREATE ROLE sc_renamer;
+    GRANT CREATE ON SCHEMA public TO sc_renamer;
+    SET ROLE sc_renamer;
+    CREATE TABLE sc_rename_old (id INT);
+    ALTER TABLE sc_rename_old RENAME TO sc_rename_new;
+    SELECT count(*) FROM sc_rename_new;
+}
+expect {
+    0
+}
+
+test owner-gives-its-table-to-a-role-with-create-on-the-schema {
+    CREATE ROLE sc_giver;
+    CREATE ROLE sc_taker;
+    GRANT sc_taker TO sc_giver;
+    GRANT CREATE ON SCHEMA public TO sc_taker;
+    CREATE TABLE sc_given_t (id INT);
+    ALTER TABLE sc_given_t OWNER TO sc_giver;
+    SET ROLE sc_giver;
+    ALTER TABLE sc_given_t OWNER TO sc_taker;
+    RESET ROLE;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'sc_given_t';
+}
+expect {
+    sc_taker
+}
+
+test owner-may-not-give-its-table-to-a-role-without-create-on-the-schema {
+    CREATE ROLE sc_giver2;
+    CREATE ROLE sc_taker2;
+    GRANT sc_taker2 TO sc_giver2;
+    CREATE TABLE sc_given2_t (id INT);
+    ALTER TABLE sc_given2_t OWNER TO sc_giver2;
+    SET ROLE sc_giver2;
+    ALTER TABLE sc_given2_t OWNER TO sc_taker2;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema public
+}
+
+test usage-on-the-schema-does-not-let-a-role-create-in-it {
+    CREATE ROLE sc_usage_only;
+    CREATE SCHEMA sc_usage_only_s;
+    GRANT USAGE ON SCHEMA sc_usage_only_s TO sc_usage_only;
+    SET ROLE sc_usage_only;
+    CREATE TABLE sc_usage_only_s.t (id INT);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_usage_only_s
+}
+
+test revoke-create-stops-a-role-creating-in-the-schema {
+    CREATE ROLE sc_revoked;
+    CREATE SCHEMA sc_revoked_s;
+    GRANT ALL ON SCHEMA sc_revoked_s TO sc_revoked;
+    REVOKE CREATE ON SCHEMA sc_revoked_s FROM sc_revoked;
+    SET ROLE sc_revoked;
+    CREATE TABLE sc_revoked_s.t (id INT);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_revoked_s
+}
+
+test qualified-create-needs-no-usage-but-reading-the-table-does {
+    CREATE ROLE sc_no_usage;
+    CREATE SCHEMA sc_no_usage_s;
+    GRANT CREATE ON SCHEMA sc_no_usage_s TO sc_no_usage;
+    SET ROLE sc_no_usage;
+    CREATE TABLE sc_no_usage_s.t (id INT);
+    SELECT id FROM sc_no_usage_s.t;
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_no_usage_s
+}
+
+test create-without-a-schema-names-the-schema-of-the-search-path-it-is-refused-in {
+    CREATE ROLE sc_path;
+    CREATE SCHEMA sc_path_s;
+    GRANT USAGE ON SCHEMA sc_path_s TO sc_path;
+    SET search_path TO sc_path_s;
+    SET ROLE sc_path;
+    CREATE TABLE sc_path_t (id INT);
+}
+@sqlstate 42501
+expect error {
+    permission denied for schema sc_path_s
+}
+
+test create-without-a-schema-goes-to-the-first-schema-with-usage {
+    CREATE ROLE sc_first;
+    CREATE SCHEMA sc_first_hidden;
+    CREATE SCHEMA sc_first_shown;
+    GRANT CREATE ON SCHEMA sc_first_hidden TO sc_first;
+    GRANT ALL ON SCHEMA sc_first_shown TO sc_first;
+    SET search_path TO sc_first_hidden, sc_first_shown;
+    SET ROLE sc_first;
+    CREATE TABLE sc_first_t (id INT);
+    RESET ROLE;
+    SELECT schemaname FROM pg_tables WHERE tablename = 'sc_first_t';
+}
+expect {
+    sc_first_shown
+}
+
+test create-without-a-schema-fails-when-no-schema-of-the-search-path-has-usage {
+    CREATE ROLE sc_none;
+    CREATE SCHEMA sc_none_s;
+    GRANT CREATE ON SCHEMA sc_none_s TO sc_none;
+    SET search_path TO sc_none_s;
+    SET ROLE sc_none;
+    CREATE TABLE sc_none_t (id INT);
+}
+@sqlstate 3F000
+expect error {
+    no schema has been selected to create in
 }

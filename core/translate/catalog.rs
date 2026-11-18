@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
@@ -7,6 +7,8 @@ use crate::alloc::TursoIteratorExt;
 use crate::function::Func;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::Schema;
+use crate::security::permission::{Action, Object, PermissionDenied};
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::util::normalize_ident;
 use crate::{DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
@@ -44,6 +46,10 @@ pub(crate) struct CatalogContext<'a> {
     /// The first one is where CREATE puts an object whose name has no
     /// qualifier.
     search_order: Vec<NamespaceRef>,
+    /// The role that needs USAGE on a namespace of the main database to
+    /// look up a name in it. None when no privilege limits the lookup, as
+    /// for a superuser and for the engine's own statements.
+    namespace_user: Cell<Option<RoleId>>,
 }
 
 /// Context for restricting table resolution while compiling the body of a
@@ -98,6 +104,7 @@ impl<'a> CatalogContext<'a> {
                 .into_iter()
                 .map(|namespace| namespace.target)
                 .collect(),
+            namespace_user: Cell::new(None),
         }
     }
 
@@ -115,11 +122,18 @@ impl<'a> CatalogContext<'a> {
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             search_order: self.search_order.clone(),
+            namespace_user: self.namespace_user.clone(),
         }
     }
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    /// Sets the role that needs USAGE on a namespace to look up a name in
+    /// it, or None for no such check, and returns what was set before.
+    pub(crate) fn set_namespace_user(&self, role: Option<RoleId>) -> Option<RoleId> {
+        self.namespace_user.replace(role)
     }
 
     pub fn has_temp_database(&self) -> bool {
@@ -305,15 +319,46 @@ impl<'a> CatalogContext<'a> {
             return Some(NamespaceRef::root_of(crate::TEMP_DB_ID));
         }
 
-        self.search_order
-            .iter()
-            .copied()
+        self.usable_search_order()
             .find(|namespace| {
                 self.with_schema(namespace.database_id, |schema| {
                     namespace_has_object(schema, namespace.id, object_name)
                 })
             })
-            .or_else(|| self.search_order.first().copied())
+            .or_else(|| self.usable_search_order().next())
+    }
+
+    /// The namespaces of the search order that the statement may look up
+    /// names in. As in PostgreSQL, a namespace that the role has no USAGE
+    /// on is left out, as if it was not on the search path.
+    fn usable_search_order(&self) -> impl Iterator<Item = NamespaceRef> + '_ {
+        self.search_order
+            .iter()
+            .copied()
+            .filter(|namespace| self.may_use_namespace(*namespace))
+    }
+
+    /// Whether the statement may look up names in `namespace`. The body of
+    /// a view or trigger looks up its names for whoever uses it: as in
+    /// PostgreSQL, only the role that created it needed USAGE.
+    fn may_use_namespace(&self, namespace: NamespaceRef) -> bool {
+        let Some(role) = self.namespace_user.get() else {
+            return true;
+        };
+        if namespace.database_id != crate::MAIN_DB_ID
+            || namespace.id.is_root()
+            || self.database_scope.borrow().is_some()
+        {
+            return true;
+        }
+        self.with_schema(crate::MAIN_DB_ID, |schema| {
+            self.dialect.role_has_namespace_privilege(
+                schema,
+                namespace.id,
+                role,
+                ast::Privilege::Usage,
+            )
+        })
     }
 
     /// The namespace of the table, view or materialized view named
@@ -532,8 +577,35 @@ impl<'a> CatalogContext<'a> {
 
     /// The namespace that the qualifier of `qualified_name` refers to, or
     /// the one an unqualified name is in: the scope's own namespace inside
-    /// the body of a trigger or a view, else the root of main.
+    /// the body of a trigger or a view, else the root of main. Fails when
+    /// the statement may not look up names in the namespace of the
+    /// qualifier.
     pub(crate) fn resolve_namespace(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<NamespaceRef> {
+        let resolved = self.resolve_namespace_without_usage_check(qualified_name)?;
+        if let Some(name) = &qualified_name.namespace {
+            if !self.may_use_namespace(resolved) {
+                return Err(namespace_usage_denied(name.as_str()));
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Fails if the statement may not look up names in the namespace called
+    /// `name`. A namespace that does not exist passes, so that the lookup of
+    /// the name reports it.
+    pub(crate) fn check_namespace_usage(&self, name: &str) -> Result<()> {
+        match self.namespace_named(&normalize_ident(name)) {
+            Some(namespace) if !self.may_use_namespace(namespace) => {
+                Err(namespace_usage_denied(name))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn resolve_namespace_without_usage_check(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<NamespaceRef> {
@@ -577,15 +649,17 @@ impl<'a> CatalogContext<'a> {
     }
 
     /// Resolve the namespace that CREATE puts an object named
-    /// `qualified_name` in.
+    /// `qualified_name` in. As in PostgreSQL, a qualified name needs no
+    /// USAGE on its namespace here, and a name without a qualifier goes to
+    /// the first namespace of the search order that the role has USAGE on.
     pub(crate) fn resolve_namespace_for_create(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<NamespaceRef> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_namespace(qualified_name);
+            return self.resolve_namespace_without_usage_check(qualified_name);
         }
-        self.search_order.first().copied().ok_or_else(|| {
+        self.usable_search_order().next().ok_or_else(|| {
             LimboError::ParseError("no schema has been selected to create in".to_string())
         })
     }
@@ -614,4 +688,11 @@ impl<'a> CatalogContext<'a> {
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.qualifiers.name_of(namespace)
     }
+}
+
+fn namespace_usage_denied(namespace_name: &str) -> LimboError {
+    LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
+        Action::Use,
+        Object::Schema(normalize_ident(namespace_name)),
+    )))
 }

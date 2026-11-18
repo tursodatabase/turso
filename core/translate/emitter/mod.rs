@@ -400,9 +400,11 @@ impl<'a> Resolver<'a> {
     pub(crate) fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
         let role_is_not_superuser = std::mem::replace(&mut self.role_is_not_superuser, false);
+        let namespace_user = self.catalog.set_namespace_user(None);
         let result = f(self);
         self.row_security_role = role;
         self.role_is_not_superuser = role_is_not_superuser;
+        self.catalog.set_namespace_user(namespace_user);
         result
     }
 

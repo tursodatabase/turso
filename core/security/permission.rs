@@ -114,6 +114,8 @@ pub enum Action {
     Read,
     /// Insert, update or delete rows.
     Write,
+    /// Look up an object in a schema by its name.
+    Use,
     /// Create an object.
     Create,
     /// Create a temporary object.
@@ -147,6 +149,7 @@ impl fmt::Display for Action {
         let name = match self {
             Action::Read => "read",
             Action::Write => "write",
+            Action::Use => "use",
             Action::Create => "create",
             Action::CreateTemporary => "create temporary",
             Action::CreateTrigger => "create trigger",
