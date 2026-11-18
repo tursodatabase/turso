@@ -545,13 +545,13 @@ impl PragmaVirtualTableCursor {
 mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
-    use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
+    use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect};
 
     #[test]
     fn filter_starts_each_pragma_scan_at_rowid_one() {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
+            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();

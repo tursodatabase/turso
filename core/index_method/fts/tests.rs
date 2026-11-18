@@ -33,7 +33,7 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         "1e-46",
     ] {
         let result = FtsIndexAttachment::new(
-            &crate::EngineDialect,
+            &crate::SqliteDialect,
             IndexMethodConfiguration {
                 table_name: "w".to_string(),
                 index_name: "wx".to_string(),
@@ -105,7 +105,7 @@ fn field_weights_rename_column() {
 
 fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(
-        &crate::EngineDialect,
+        &crate::SqliteDialect,
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -169,7 +169,7 @@ fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
 
 fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
     let attachment = FtsIndexAttachment::new(
-        &crate::EngineDialect,
+        &crate::SqliteDialect,
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -1115,7 +1115,7 @@ mod allocation_failures {
         let db = crate::Database::open(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
                 .db_opts(crate::DatabaseOpts::default().with_index_method(true))
                 .allocators(DatabaseAllocators {
                     fts: DynAllocator::new(allocator.clone()),

@@ -19779,7 +19779,7 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
     use crate::vdbe::{BranchOffset, PrepareContext};
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     /// A weighted step must leave the same exact total as the weighted sum
@@ -19921,7 +19921,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -19985,7 +19985,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db

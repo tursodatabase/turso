@@ -106,7 +106,7 @@ extern crate self as turso_core;
 #[path = "../sqlite/frontend/lib.rs"]
 mod turso_sqlite;
 #[cfg(test)]
-pub(crate) use turso_sqlite::SqliteDialect as EngineDialect;
+pub(crate) use turso_sqlite::SqliteDialect;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;

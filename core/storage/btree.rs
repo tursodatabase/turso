@@ -10890,7 +10890,7 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 #[cfg(test)]
 mod tests {
     use crate::security::roles::SessionRole;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -11075,7 +11075,7 @@ mod tests {
             #[allow(clippy::arc_with_non_send_sync)]
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db =
-                Database::open_file(io, "overflow-cell-fault.db", Arc::new(EngineDialect)).unwrap();
+                Database::open_file(io, "overflow-cell-fault.db", Arc::new(SqliteDialect)).unwrap();
             let conn = db
                 .connect(crate::ConnectOpts::new(SessionRole::Superuser))
                 .unwrap();
@@ -11223,7 +11223,7 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(EngineDialect)).unwrap();
+            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -11348,7 +11348,7 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, "resume-overflow-yield.db", Arc::new(EngineDialect)).unwrap();
+            Database::open_file(io, "resume-overflow-yield.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -11781,7 +11781,7 @@ mod tests {
     fn empty_btree_in_database() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();

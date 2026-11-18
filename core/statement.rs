@@ -1808,7 +1808,7 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     #[test]
@@ -2174,7 +2174,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new(SessionRole::Superuser))
     }

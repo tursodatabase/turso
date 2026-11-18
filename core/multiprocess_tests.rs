@@ -124,7 +124,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
 }
 
@@ -139,7 +139,7 @@ fn open_multiprocess_db_with_flags(
         flags,
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(EngineDialect),
+        Arc::new(SqliteDialect),
     )
 }
 
@@ -228,7 +228,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str, Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -250,7 +250,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -1213,7 +1213,7 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     );
 
     let input = "insert into child_table(value) values ('parent-schema')";
-    let (cmd, _) = crate::dialect::Dialect::parse_internal(&EngineDialect, input).unwrap();
+    let (cmd, _) = crate::dialect::Dialect::parse_internal(&SqliteDialect, input).unwrap();
     let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
         panic!("translated statement input did not parse as a statement");
     };
@@ -2005,7 +2005,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db

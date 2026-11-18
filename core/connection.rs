@@ -5052,8 +5052,8 @@ mod tests {
     use crate::attach::AttachDatabaseState;
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
-    use crate::EngineDialect;
     use crate::IOResult;
+    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5064,7 +5064,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new(SessionRole::Superuser))

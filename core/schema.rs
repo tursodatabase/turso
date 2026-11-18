@@ -9256,7 +9256,7 @@ impl Index {
 mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
 
     #[test]
     fn builtin_types_read_as_the_kind_their_decode_gives() {
@@ -9271,7 +9271,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_custom_types(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -9296,7 +9296,7 @@ mod tests {
         let mut schema = Schema::new();
         schema
             .insert_type_from_sql(
-                &EngineDialect,
+                &SqliteDialect,
                 "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
             )
             .unwrap();
@@ -9332,7 +9332,7 @@ mod tests {
         );
 
         let ordered = Schema::new()
-            .order_persisted_materialized_views(&EngineDialect, views)
+            .order_persisted_materialized_views(&SqliteDialect, views)
             .unwrap();
         assert_eq!(
             ordered
@@ -9364,7 +9364,7 @@ mod tests {
         );
 
         let error = Schema::new()
-            .order_persisted_materialized_views(&EngineDialect, views)
+            .order_persisted_materialized_views(&SqliteDialect, views)
             .unwrap_err();
         assert!(matches!(error, LimboError::Corrupt(_)));
     }
@@ -9402,7 +9402,7 @@ mod tests {
             schema.add_btree_table(
                 NamespaceId::ROOT,
                 Arc::new(BTreeTable::from_stored_sql(
-                    &EngineDialect,
+                    &SqliteDialect,
                     &sql,
                     root_page,
                     false,
@@ -9603,7 +9603,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_no_virtual_columns() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&EngineDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
         assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
@@ -9614,7 +9614,7 @@ mod tests {
     #[test]
     fn gencol_graph_linear_chain() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)",
             0,
             false,
@@ -9635,7 +9635,7 @@ mod tests {
     #[test]
     fn gencol_graph_diamond() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
             0,
             false,
@@ -9658,7 +9658,7 @@ mod tests {
     #[test]
     fn gencol_graph_multiple_stored_roots() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)",
             0,
             false,
@@ -9676,7 +9676,7 @@ mod tests {
     #[test]
     fn gencol_graph_empty_input() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL)",
             0,
             false,
@@ -9689,7 +9689,7 @@ mod tests {
     #[test]
     fn gencol_graph_disjoint_components() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
             0,
             false,
@@ -9709,7 +9709,7 @@ mod tests {
             sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
         }
         sql.push(')');
-        let t = BTreeTable::from_stored_sql(&EngineDialect, &sql, 0, false)?;
+        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
         // affected-by({c0}) = {c0..c49}
         let affected = t.columns_affected_by_update([0])?;
         assert_eq!(affected.count(), 50);
@@ -9727,7 +9727,7 @@ mod tests {
             sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
         }
         sql.push(')');
-        let t = BTreeTable::from_stored_sql(&EngineDialect, &sql, 0, false)?;
+        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
         assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
         assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
         Ok(())
@@ -9736,7 +9736,7 @@ mod tests {
     #[test]
     fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL)",
             0,
             false,
@@ -9752,7 +9752,7 @@ mod tests {
     #[test]
     fn gencol_graph_transpose_duality() -> Result<()> {
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
             0,
             false,
@@ -9780,7 +9780,7 @@ mod tests {
     fn gencol_graph_idempotence() -> Result<()> {
         // affected_by(affected_by(xs)) == affected_by(xs).
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
             0,
             false,
@@ -9795,7 +9795,7 @@ mod tests {
     fn gencol_graph_union_monotonicity() -> Result<()> {
         // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
         let t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
             0,
             false,
@@ -9815,7 +9815,7 @@ mod tests {
         // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
         // rebuilds correctly.
         let original = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL)",
             0,
             false,
@@ -9844,7 +9844,7 @@ mod tests {
     #[test]
     fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
         let mut t = BTreeTable::from_stored_sql(
-            &EngineDialect,
+            &SqliteDialect,
             "CREATE TABLE t(a, b AS (a) VIRTUAL)",
             0,
             false,
@@ -9861,7 +9861,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_of_table_without_generated_columns_is_built_on_first_use() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&EngineDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
         assert!(t.peek_column_dependencies().is_none());
 
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);

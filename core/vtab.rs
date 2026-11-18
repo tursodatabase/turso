@@ -666,7 +666,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
@@ -761,7 +761,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let name = db
@@ -807,7 +807,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let name = db

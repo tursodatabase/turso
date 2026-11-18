@@ -3797,8 +3797,8 @@ mod database_tests {
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
         storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
-        DatabaseStorage, EngineDialect, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, IO,
+        DatabaseStorage, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
+        PlatformIO, SqliteDialect, IO,
     };
 
     #[test]
@@ -4166,7 +4166,7 @@ mod database_tests {
         let file = io.open_file(path, OpenFlags::Create, true).unwrap();
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
-        let options = OpenOptions::new(Arc::new(EngineDialect))
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(opts)
@@ -4222,9 +4222,9 @@ mod database_tests {
         let path = path.to_str().unwrap();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-        let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
         let file_key = DatabaseKey::File(crate::io::get_file_id(path).unwrap());
-        let reopened = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
+        let reopened = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
         assert!(Arc::ptr_eq(&db, &reopened));
         drop(reopened);
         assert!(DATABASE_MANAGER.lock().contains_key(&file_key));
@@ -4233,7 +4233,7 @@ mod database_tests {
 
         let name = "registry-entry-is-removed-when-last-database-reference-drops";
         let memory_key = DatabaseKey::SharedMemory(name.to_string());
-        let db = Database::open_shared_memory(name, Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_shared_memory(name, Arc::new(SqliteDialect)).unwrap();
         assert!(DATABASE_MANAGER.lock().contains_key(&memory_key));
         drop(db);
         assert!(!DATABASE_MANAGER.lock().contains_key(&memory_key));
@@ -4539,7 +4539,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(EngineDialect),
+                Arc::new(SqliteDialect),
             )
             .unwrap();
             let conn = db
@@ -4569,7 +4569,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new(SessionRole::Superuser))

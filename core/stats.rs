@@ -455,7 +455,7 @@ mod tests {
     use crate::database::{ConnectOpts, Database, DatabaseOpts};
     use crate::security::roles::SessionRole;
     use crate::sync::Arc;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{OpenFlags, PlatformIO, IO};
 
     #[test]
@@ -476,7 +476,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         (dir, db)

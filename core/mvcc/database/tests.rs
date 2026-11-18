@@ -1,5 +1,5 @@
 use crate::namespace::NamespaceId;
-use crate::EngineDialect;
+use crate::SqliteDialect;
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
@@ -327,7 +327,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -796,7 +796,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -842,7 +842,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -880,7 +880,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             self.opts,
             self.enc_opts.clone(),
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         self.db.replace(db);
         Ok(())
@@ -5241,7 +5241,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -5266,7 +5266,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let db = Database::open(
         io,
         &path_str,
-        crate::OpenOptions::new(Arc::new(EngineDialect))
+        crate::OpenOptions::new(Arc::new(SqliteDialect))
             .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();

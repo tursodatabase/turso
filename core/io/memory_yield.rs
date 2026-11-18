@@ -212,7 +212,7 @@ mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
     use crate::vdbe::StepResult;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -340,7 +340,7 @@ mod tests {
             OpenFlags::Create,
             crate::DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
