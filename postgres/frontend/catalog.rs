@@ -307,15 +307,6 @@ impl Dialect for PostgresDialect {
         }
     }
 
-    fn apply_catalog_change(
-        &self,
-        schema: &mut Schema,
-        change: &turso_core::CatalogChange,
-        values: &[Value],
-    ) -> turso_core::Result<()> {
-        crate::schema_state::apply_catalog_change(schema, change, values)
-    }
-
     /// The built-in superuser is found by its name, `postgres`, too.
     fn role_by_name(&self, schema: &Schema, name: &str) -> Option<RoleId> {
         engine_role_by_name(schema_roles(schema), name)
