@@ -561,10 +561,17 @@ impl Value {
             (start, end)
         }
 
-        let start_value = start_value.exec_cast("INT")?;
-        let length_value = length_value
-            .map(|value| value.exec_cast("INT"))
-            .transpose()?;
+        /// `CAST(value AS INT)`. The arguments are usually integers already, and
+        /// for them this skips the general cast.
+        fn cast_to_int(value: &Value) -> std::result::Result<Value, crate::alloc::TryReserveError> {
+            match value {
+                Value::Numeric(Numeric::Integer(i)) => Ok(Value::from_i64(*i)),
+                value => value.exec_cast("INT"),
+            }
+        }
+
+        let start_value = cast_to_int(start_value)?;
+        let length_value = length_value.map(cast_to_int).transpose()?;
 
         // If length is explicitly NULL, return NULL (SQLite behavior)
         if matches!(length_value, Some(Value::Null)) {
