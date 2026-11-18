@@ -1152,6 +1152,6 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
         &self,
         enable_custom_types: bool,
     ) -> Result<turso_core::schema::SchemaBuilder> {
-        turso_core::schema::builtin::schema_builder(self, enable_custom_types)
+        turso_sqlite::schema_builder(self, enable_custom_types)
     }
 }
