@@ -1,4 +1,4 @@
-use crate::{types::AsValueRef, Value, ValueRef};
+use crate::{turso_debug_assert, types::AsValueRef, Value, ValueRef};
 
 pub mod decimal;
 pub mod nonnan;
@@ -770,7 +770,7 @@ enum FloatParts {
     Special(String),
     Normal {
         negative: bool,
-        digits: Vec<u8>,
+        digits: DecimalDigits,
         exp: i32,
     },
 }
@@ -820,7 +820,7 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
         }
     }
 
-    let mut digits = decimal_digits(u64::from(d));
+    let mut digits = DecimalDigits::new(u64::from(d));
     let mut decimal_pos = digits.len() as i32 + exp;
 
     'out: {
@@ -837,7 +837,7 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
                     digits[i] = b'0';
                 }
 
-                digits.insert(0, b'1');
+                digits.push_carry(b'1');
                 decimal_pos += 1;
             }
         }
@@ -854,14 +854,59 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
     }
 }
 
-/// The decimal digits of `n` as ASCII bytes, with no leading zeros.
-fn decimal_digits(n: u64) -> Vec<u8> {
-    let mut buf = [0u8; 20];
-    let written = write_decimal_digits(&mut buf, n);
-    // One more byte for the carry digit of a rounding.
-    let mut digits = Vec::with_capacity(written.len() + 1);
-    digits.extend_from_slice(written);
-    digits
+/// The decimal digits of a float as ASCII bytes, in `buf[start..end]`. A
+/// `u64` has at most 20 digits, which go after the first byte of `buf`. The
+/// first byte stays free for the carry digit of a rounding.
+struct DecimalDigits {
+    buf: [u8; 21],
+    start: usize,
+    end: usize,
+}
+
+impl DecimalDigits {
+    /// The decimal digits of `n`, with no leading zeros.
+    fn new(n: u64) -> Self {
+        let mut buf = [0u8; 21];
+        let after_carry: &mut [u8; 20] = (&mut buf[1..])
+            .try_into()
+            .expect("the buffer has 20 bytes after the carry byte");
+        let len = write_decimal_digits(after_carry, n).len();
+        Self {
+            buf,
+            start: 21 - len,
+            end: 21,
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.end = self.end.min(self.start + len);
+    }
+
+    /// Put `digit` before the other digits.
+    fn push_carry(&mut self, digit: u8) {
+        turso_debug_assert!(self.start > 0, "a rounding adds only one carry digit");
+        self.start -= 1;
+        self.buf[self.start] = digit;
+    }
+
+    fn pop(&mut self) {
+        turso_debug_assert!(self.end > self.start);
+        self.end -= 1;
+    }
+}
+
+impl std::ops::Deref for DecimalDigits {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+}
+
+impl std::ops::DerefMut for DecimalDigits {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..self.end]
+    }
 }
 
 fn format_float_scientific(v: f64, precision: usize) -> String {
@@ -1019,6 +1064,8 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+    // The rounding carries into a new leading digit.
+    assert_eq!(format_float(9.999999999999998), "10.0");
 }
 
 #[test]
