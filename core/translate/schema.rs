@@ -305,6 +305,7 @@ fn resolve_check_expr_type(
                 );
             }
         }
+        ast::Expr::Collate(inner, _) => resolve_check_expr_type(inner, columns, resolver),
         ast::Expr::Cast { type_name, .. } => {
             if let Some(ref tn) = type_name {
                 resolve_type_name(&dequote(&tn.name), resolver)
@@ -3207,7 +3208,12 @@ pub(crate) fn emit_create_internal_table(
         root_reg,
         Some(create_sql.to_string()),
     )?;
-    let table = Arc::new(BTreeTable::from_sql(create_sql, 0)?);
+    let table = Arc::new(BTreeTable::from_stored_sql(
+        resolver.catalog.dialect.as_ref(),
+        create_sql,
+        0,
+        false,
+    )?);
     emit_schema_cookie(resolver, program);
     program.emit_insn(Insn::ParseSchema {
         db: MAIN_DB_ID,

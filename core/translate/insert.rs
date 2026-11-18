@@ -864,7 +864,6 @@ pub fn translate_insert(
     })?;
 
     if insertion.has_generated_columns() {
-        //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_generated_columns(
             program,
             &ctx.table.columns_topo_sort()?,

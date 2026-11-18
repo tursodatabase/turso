@@ -549,6 +549,24 @@ fn test_errors_on_zero_divisor_dialect() {
         fn name(&self) -> &'static str {
             SqliteDialect.name()
         }
+
+        fn parse_internal(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            turso_sqlite::SqliteDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+            turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(SqliteDialect)
+        }
         fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             SqliteDialect.parse(sql)
         }
@@ -572,13 +590,6 @@ fn test_errors_on_zero_divisor_dialect() {
             body: &turso_parser::ast::CreateTableBody,
         ) -> turso_core::Result<String> {
             SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-        fn register_catalog(
-            &self,
-            schema: &mut turso_core::schema::Schema,
-            enable_custom_types: bool,
-        ) -> turso_core::Result<()> {
-            SqliteDialect.register_catalog(schema, enable_custom_types)
         }
         fn resolve_function(
             &self,

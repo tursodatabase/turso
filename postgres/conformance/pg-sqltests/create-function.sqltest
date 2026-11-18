@@ -875,10 +875,10 @@ expect @tursopg error {
 }
 
 test named-argument {
-    SELECT make_interval(days => 1);
+    SELECT jsonb_path_exists('{"a": 1}', '$.a', silent => true);
 }
 expect {
-    1 day
+    t
 }
 @sqlstate 0A000
 expect @tursopg error {

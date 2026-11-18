@@ -1213,7 +1213,7 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     );
 
     let input = "insert into child_table(value) values ('parent-schema')";
-    let (cmd, _) = crate::dialect::engine::parse(input).unwrap();
+    let (cmd, _) = crate::dialect::Dialect::parse_internal(&EngineDialect, input).unwrap();
     let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
         panic!("translated statement input did not parse as a statement");
     };

@@ -69,7 +69,7 @@ Flushes row versions to B-tree periodically.
 PRAGMA mvcc_checkpoint_threshold = <pages>;
 ```
 
-Process: acquire lock → begin pager txn → write rows → commit → truncate log → fsync → release.
+Process: acquire lock → begin pager txn → write rows → commit → backfill WAL → fsync DB file → truncate log → truncate WAL → release.
 
 ## Current Limitations
 

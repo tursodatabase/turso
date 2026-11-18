@@ -1,6 +1,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use turso_core::alloc::TryClone;
+use turso_core::dialect::Dialect;
 use turso_core::function::ExternalFunc;
 use turso_core::namespace::NamespaceId;
 use turso_core::native_ext::*;
@@ -1219,6 +1220,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             let table = turso_core::vtab::VirtualTable::table(
+                &SqliteDialect,
                 Some("arguments"),
                 "argument_module",
                 args,
@@ -1258,7 +1260,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
     ))
     .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    let mut schema = turso_core::schema::Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     schema
         .handle_schema_row(
             "table",
@@ -1314,6 +1316,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                 }
             } else {
                 let result = turso_core::vtab::VirtualTable::table(
+                    &SqliteDialect,
                     Some("arguments"),
                     "c_arguments_module",
                     args,

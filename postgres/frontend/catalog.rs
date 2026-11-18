@@ -15,9 +15,10 @@ use turso_core::{
         generated_expr_with_names, BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet,
         AUTOINCREMENT_SEQ_PREFIX,
     },
+    security::policy::RowPolicy,
     security::roles::RoleId,
-    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, NamespaceRef,
-    OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
+    text_array_literal, walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError,
+    NamespaceId, NamespaceRef, OpenOptions, Result, Statement, Value, WalkControl, MAIN_DB_ID,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
@@ -63,7 +64,7 @@ impl Dialect for PostgresDialect {
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
-            return turso_core::dialect::engine::parse(sql);
+            return self.parse_internal(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
@@ -80,8 +81,25 @@ impl Dialect for PostgresDialect {
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
-            Err(_) => turso_core::dialect::engine::parse(sql),
+            Err(_) => self.parse_internal(sql),
         }
+    }
+
+    fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        Ok((cmd, parser.offset()))
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> Result<turso_parser::ast::ColumnDefinition> {
+        Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(turso_sqlite::SqliteDialect)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -89,7 +107,7 @@ impl Dialect for PostgresDialect {
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
-                canonical_table_sql_ast(sql)?
+                canonical_table_sql_ast(self, sql)?
             else {
                 unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
             };
@@ -123,7 +141,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return canonical_table_sql_ast(sql);
+            return canonical_table_sql_ast(self, sql);
         };
 
         let parse_result =
@@ -142,7 +160,7 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::table_sql_for_replay(sql);
+            return turso_core::dialect::table_sql_for_replay(self, sql);
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -191,7 +209,7 @@ impl Dialect for PostgresDialect {
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        let sql = turso_core::dialect::engine::format_table_sql(tbl_name, body)?;
+        let sql = turso_core::dialect::format_table_sql(tbl_name, body)?;
         let identity_marker = identity_table_sql_marker(
             table_columns(body)
                 .iter()
@@ -199,10 +217,6 @@ impl Dialect for PostgresDialect {
                 .filter_map(|(position, column)| Some((position, column.identity_kind()?))),
         );
         Ok(format!("{identity_marker}{sql}"))
-    }
-
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::engine::register_builtin_catalog(schema, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -218,7 +232,7 @@ impl Dialect for PostgresDialect {
         if name.eq_ignore_ascii_case("random") {
             return Ok(None);
         }
-        turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -406,9 +420,9 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// The `CREATE TABLE` of stored table SQL that is SQLite text, with its
 /// identity columns marked as the SQL says.
-fn canonical_table_sql_ast(sql: &str) -> Result<ast::Stmt> {
+fn canonical_table_sql_ast(dialect: &PostgresDialect, sql: &str) -> Result<ast::Stmt> {
     let (identity_columns, sql) = split_identity_table_sql_marker(sql)?;
-    let mut stmt = turso_core::dialect::engine::parse_table_sql_ast(sql)?;
+    let mut stmt = turso_core::dialect::parse_table_sql_ast(dialect, sql)?;
     let ast::Stmt::CreateTable { body, .. } = &mut stmt else {
         unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
     };
@@ -499,11 +513,17 @@ pub(crate) fn is_system_table_name(name: &str) -> bool {
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
 fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+    pg_type_oid(ty_str).unwrap_or(25) // default to text
+}
+
+/// The oid of the PostgreSQL type of a column declared as `ty_str`, or None
+/// for a type name tursopg does not know.
+pub(crate) fn pg_type_oid(ty_str: &str) -> Option<i64> {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
     };
-    match base.to_uppercase().as_str() {
+    let oid = match base.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" => 23,
         "SMALLINT" | "INT2" => 21,
         "BIGINT" | "INT8" => 20,
@@ -526,8 +546,9 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
-        _ => 25, // default to text
-    }
+        _ => return None,
+    };
+    Some(oid)
 }
 
 /// The oid of relation `name` of `namespace`, from its stored class row.
@@ -1569,6 +1590,175 @@ impl SnapshotRows for PgTablesTable {
 }
 
 #[derive(Debug)]
+struct PgPolicyTable;
+
+impl SnapshotRows for PgPolicyTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_policy (
+            oid INTEGER,
+            polname TEXT,
+            polrelid INTEGER,
+            polcmd TEXT,
+            polpermissive BOOLEAN,
+            polroles INTEGER[],
+            polqual TEXT,
+            polwithcheck TEXT,
+            tableoid INTEGER HIDDEN
+        )";
+    /// PostgreSQL's oid of pg_policy.
+    const TABLE_OID: Option<i64> = Some(3256);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    /// `polqual` and `polwithcheck` hold the conditions as text, which
+    /// `pg_get_expr` returns as it is.
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        catalog_policies(&schema)
+            .into_iter()
+            .map(|policy| {
+                let roles = policy
+                    .roles
+                    .iter()
+                    .map(|role| role_oid(*role).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                vec![
+                    Value::from_i64(policy.oid),
+                    Value::build_text(policy.policy.name.clone()),
+                    Value::from_i64(policy.table_oid),
+                    Value::build_text(
+                        crate::policies::command_letter(policy.policy.command).to_string(),
+                    ),
+                    Value::from_i64(i64::from(policy.policy.permissive)),
+                    Value::build_text(format!("{{{roles}}}")),
+                    policy.qual.map_or(Value::Null, Value::build_text),
+                    policy.with_check.map_or(Value::Null, Value::build_text),
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgPoliciesTable;
+
+impl SnapshotRows for PgPoliciesTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_policies (
+            schemaname TEXT,
+            tablename TEXT,
+            policyname TEXT,
+            permissive TEXT,
+            roles TEXT[],
+            cmd TEXT,
+            qual TEXT,
+            with_check TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    /// As PostgreSQL's view: `roles` is `{public}` for PUBLIC and the role
+    /// names in order otherwise.
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let schema = conn.current_schema();
+        let role_catalog = schema_roles(&schema);
+        catalog_policies(&schema)
+            .into_iter()
+            .map(|policy| {
+                let mut roles: Vec<String> = if policy.roles == [RoleId::PUBLIC] {
+                    vec!["public".to_string()]
+                } else {
+                    policy
+                        .roles
+                        .iter()
+                        .filter_map(|role| role_name_by_oid(role_catalog, role_oid(*role)))
+                        .collect()
+                };
+                roles.sort();
+                let permissive = if policy.policy.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                };
+                let command = match policy.policy.command {
+                    ast::PolicyCommand::All => "ALL",
+                    ast::PolicyCommand::Select => "SELECT",
+                    ast::PolicyCommand::Insert => "INSERT",
+                    ast::PolicyCommand::Update => "UPDATE",
+                    ast::PolicyCommand::Delete => "DELETE",
+                };
+                vec![
+                    Value::build_text(schema_name_of(&schema, policy.namespace).to_string()),
+                    Value::build_text(policy.table_name.to_string()),
+                    Value::build_text(policy.policy.name.clone()),
+                    Value::build_text(permissive),
+                    Value::build_text(text_array_literal(roles.iter().map(String::as_str))),
+                    Value::build_text(command),
+                    policy.qual.map_or(Value::Null, Value::build_text),
+                    policy.with_check.map_or(Value::Null, Value::build_text),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// A row-level security policy as the catalogs show it.
+struct CatalogPolicy<'a> {
+    oid: i64,
+    table_oid: i64,
+    namespace: NamespaceId,
+    table_name: &'a str,
+    policy: &'a RowPolicy,
+    /// The roles the policy applies to: only [`RoleId::PUBLIC`] when it is
+    /// one of them, as PostgreSQL stores them.
+    roles: Vec<RoleId>,
+    /// The `USING` condition as PostgreSQL prints it.
+    qual: Option<String>,
+    /// The `WITH CHECK` condition as PostgreSQL prints it.
+    with_check: Option<String>,
+}
+
+/// The policies of every table, ordered by table oid and then as created.
+fn catalog_policies(schema: &Schema) -> Vec<CatalogPolicy<'_>> {
+    let Some(catalog) = crate::classes::class_catalog(schema) else {
+        return Vec::new();
+    };
+    let mut policies = Vec::new();
+    for class in catalog.classes() {
+        if class.relpolicies.is_empty() {
+            continue;
+        }
+        let Some(table) = schema.get_btree_table(class.relnamespace, &class.relname) else {
+            continue;
+        };
+        // A condition the printer cannot print as pg_get_expr does is shown
+        // as CREATE POLICY wrote it, which PostgreSQL also reads.
+        let condition_text = |condition: &Option<ast::Expr>, written: &Option<String>| {
+            let condition = condition.as_ref()?;
+            crate::deparse::condition_text(condition, &table).or_else(|| written.clone())
+        };
+        for (details, policy) in class.relpolicies.iter() {
+            let roles = if policy.roles.contains(&RoleId::PUBLIC) {
+                vec![RoleId::PUBLIC]
+            } else {
+                policy.roles.clone()
+            };
+            policies.push(CatalogPolicy {
+                oid: details.oid,
+                table_oid: class.oid,
+                namespace: class.relnamespace,
+                table_name: &class.relname,
+                policy,
+                roles,
+                qual: condition_text(&policy.using_expr, &details.using_sql),
+                with_check: condition_text(&policy.check_expr, &details.check_sql),
+            });
+        }
+    }
+    policies
+}
+
+#[derive(Debug)]
 struct PgIndexesTable;
 
 impl SnapshotRows for PgIndexesTable {
@@ -2451,7 +2641,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(render_expr(&chk.expr)), // conbin
+                    Value::build_text(check_condition_text(&chk.expr, btree)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2502,15 +2692,18 @@ impl SnapshotRows for PgAttrdefTable {
                 if col.identity.is_some() {
                     continue;
                 }
-                let adbin = match (&col.default, col.generated_type()) {
-                    (Some(default_expr), _) => render_expr(default_expr),
+                let default = match (&col.default, col.generated_type()) {
+                    (Some(default_expr), _) => default_expr.as_ref().clone(),
                     (None, GeneratedType::Stored { expr, .. }) => {
-                        let named = generated_expr_with_names(expr, btree.columns())
-                            .expect("stored generated column expression resolves its columns");
-                        render_expr(&named)
+                        generated_expr_with_names(expr, btree.columns())
+                            .expect("stored generated column expression resolves its columns")
                     }
                     (None, _) => continue,
                 };
+                // A default with a form the printer does not know is shown
+                // as the engine's SQL.
+                let adbin = crate::deparse::default_text(&default, btree, &col.ty_str)
+                    .unwrap_or_else(|| render_expr(&default));
                 rows.push(vec![
                     Value::from_i64(attrdef_oid),        // oid
                     Value::from_i64(table_oid),          // adrelid
@@ -2787,7 +2980,12 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
+        SnapshotCatalog::<PgPolicyTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_policies",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgPoliciesTable>(PhantomData),
     );
     options = options.native_module(
         "pg_trigger",
@@ -4202,7 +4400,10 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
+                return Some(format!(
+                    "CHECK ({})",
+                    check_condition_text(&chk.expr, btree)
+                ));
             }
             constraint_oid += 1;
         }
@@ -4228,9 +4429,22 @@ fn constraint_column_list<'a>(
         .join(", ")
 }
 
+/// The text of a CHECK condition of `table` as PostgreSQL's `pg_get_expr`
+/// prints it. A condition with a form the printer does not know is shown as
+/// the engine's SQL.
+fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
+    crate::deparse::condition_text(condition, table).unwrap_or_else(|| render_expr(condition))
+}
+
 fn render_expr(expr: &ast::Expr) -> String {
     let mut expr = expr.clone();
     walk_expr_mut(&mut expr, &mut |expr| {
+        // The translator compiles PostgreSQL's binary collations to BINARY.
+        if let ast::Expr::Collate(_, collation) = expr {
+            if collation.as_str().eq_ignore_ascii_case("binary") {
+                *collation = ast::Name::from_string("\"C\"");
+            }
+        }
         if let ast::Expr::FunctionCall { name, args, .. } = expr {
             if args.is_empty() {
                 if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
@@ -4249,7 +4463,7 @@ fn render_expr(expr: &ast::Expr) -> String {
         }
         Ok(WalkControl::Continue)
     })
-    .expect("rewriting role functions does not fail");
+    .expect("rewriting role functions and collations does not fail");
     expr.to_string()
 }
 
@@ -4509,8 +4723,13 @@ mod tests {
                 .add_btree_table(
                     public,
                     Arc::new(
-                        BTreeTable::from_sql(&format!("CREATE TABLE {name} ({columns})"), 2)
-                            .unwrap(),
+                        BTreeTable::from_stored_sql(
+                            &PostgresDialect,
+                            &format!("CREATE TABLE {name} ({columns})"),
+                            2,
+                            false,
+                        )
+                        .unwrap(),
                     ),
                 )
                 .unwrap();
@@ -4523,7 +4742,11 @@ mod tests {
     #[test]
     fn postgres_rejects_without_rowid_schema() {
         let sql = "CREATE TABLE t(a TEXT PRIMARY KEY, b) WITHOUT ROWID";
-        assert!(!BTreeTable::from_sql(sql, 2).unwrap().has_rowid);
+        assert!(
+            !BTreeTable::from_stored_sql(&PostgresDialect, sql, 2, false)
+                .unwrap()
+                .has_rowid
+        );
         let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -4558,6 +4781,7 @@ mod tests {
             "pg_settings",
             "pg_extension",
             "pg_policy",
+            "pg_policies",
             "pg_trigger",
             "pg_statistic_ext",
             "pg_inherits",

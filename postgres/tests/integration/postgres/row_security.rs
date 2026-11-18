@@ -81,6 +81,10 @@ fn policies_are_visible_to_another_connection_and_kept_after_reopening() {
     conn.execute("DROP POLICY second ON documents").unwrap();
 
     assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["1"]]);
+    let listed_policies = "SELECT oid, polname, pg_get_expr(polqual, polrelid) FROM pg_policy";
+    let policies = rows(&alice, listed_policies);
+    assert_eq!(policies.len(), 1);
+    assert_eq!(policies[0][1..], ["first", "(id = 1)"]);
     conn.close().unwrap();
     alice.close().unwrap();
     drop(conn);
@@ -90,6 +94,7 @@ fn policies_are_visible_to_another_connection_and_kept_after_reopening() {
     let alice = db.connect_postgres();
     alice.execute("SET ROLE alice").unwrap();
     assert_eq!(rows(&alice, "SELECT id FROM documents"), vec![vec!["1"]]);
+    assert_eq!(rows(&alice, listed_policies), policies);
 }
 
 #[test]

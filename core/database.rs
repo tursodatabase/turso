@@ -857,10 +857,9 @@ impl Database {
             allocators,
             path,
             wal_path,
-            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                enable_custom_types,
-                dialect.as_ref(),
-            )?))),
+            schema: Arc::new(Mutex::new(Arc::new(
+                dialect.new_schema(enable_custom_types)?,
+            ))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -1823,7 +1822,9 @@ impl Database {
                         .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
                     {
                         let namespace_rows = conn.query_stored_namespaces()?;
-                        db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
+                        db.with_schema_mut(|schema| {
+                            schema.load_namespace_names(db.dialect().as_ref(), &namespace_rows)
+                        })?;
                     }
 
                     state.phase = OpenDbAsyncPhase::LoadingDialectSchema;
@@ -3590,7 +3591,8 @@ impl Database {
     where
         T: InternalVirtualTable + 'static,
     {
-        self.with_schema_mut(|schema| schema.register_internal_vtab(table))
+        let dialect = self.dialect();
+        self.with_schema_mut(|schema| schema.register_internal_vtab(dialect.as_ref(), table))
     }
 
     /// The SQL dialect this database was opened with.

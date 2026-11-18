@@ -2633,18 +2633,18 @@ impl ProgramBuilder {
     #[turso_macros::trace_stack]
     pub fn build(
         self,
-        connection: Arc<Connection>,
+        connection: &Connection,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
-        let prepare_context = PrepareContext::from_connection(&connection);
+        let prepare_context = PrepareContext::from_connection(connection);
         let prepared = self.build_prepared_program(
             prepare_context,
             connection.custom_collations(),
             change_cnt_on,
             sql,
         )?;
-        Ok(Program::from_prepared(Arc::new(prepared), connection))
+        Ok(Program::from_prepared(Arc::new(prepared)))
     }
 }
 

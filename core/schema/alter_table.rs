@@ -64,7 +64,9 @@ mod rename_column_view {
     }
 
     /// `namespace` is the namespace of the view, where its names resolve.
+    #[allow(clippy::too_many_arguments)]
     pub fn rewrite_view_sql_for_column_rename(
+        dialect: &dyn crate::dialect::Dialect,
         view_sql: &str,
         schema: &Schema,
         namespace: NamespaceId,
@@ -75,6 +77,7 @@ mod rename_column_view {
     ) -> Result<Option<RewrittenView>> {
         let mut visiting_views = HashSet::default();
         rewrite_view_sql_for_column_rename_inner(
+            dialect,
             view_sql,
             schema,
             namespace,
@@ -88,6 +91,7 @@ mod rename_column_view {
 
     #[allow(clippy::too_many_arguments)]
     fn rewrite_view_sql_for_column_rename_inner(
+        dialect: &dyn crate::dialect::Dialect,
         view_sql: &str,
         schema: &Schema,
         namespace: NamespaceId,
@@ -97,7 +101,7 @@ mod rename_column_view {
         new_column: &str,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
-        let cmd = crate::dialect::engine::parse_statement(view_sql)
+        let cmd = crate::dialect::parse_statement(dialect, view_sql)
             .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}")))?;
         let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
             temporary,
@@ -123,6 +127,7 @@ mod rename_column_view {
                 view_columns_from_select(&original_select, schema, namespace, &view_columns)?;
 
             let ctx = ViewRewriteCtx::new(
+                dialect,
                 schema,
                 namespace,
                 target_table,
@@ -257,6 +262,7 @@ mod rename_column_view {
     }
 
     struct ViewRewriteCtx<'a> {
+        dialect: &'a dyn crate::dialect::Dialect,
         schema: &'a Schema,
         /// The namespace of the view being rewritten.
         namespace: NamespaceId,
@@ -274,6 +280,7 @@ mod rename_column_view {
 
     impl<'a> ViewRewriteCtx<'a> {
         fn new(
+            dialect: &'a dyn crate::dialect::Dialect,
             schema: &'a Schema,
             namespace: NamespaceId,
             target_table: &'a str,
@@ -282,6 +289,7 @@ mod rename_column_view {
             new_column: &'a str,
         ) -> Self {
             Self {
+                dialect,
                 schema,
                 namespace,
                 target_table,
@@ -622,6 +630,7 @@ mod rename_column_view {
 
                         let mut rename_map = HashMap::default();
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename_inner(
+                            ctx.dialect,
                             &view.sql,
                             ctx.schema,
                             ctx.namespace,

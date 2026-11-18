@@ -272,7 +272,8 @@ impl PgConn {
         }
     }
 
-    fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
+    /// Writes one raw frontend message frame.
+    pub fn write_message(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         self.writer.write_all(&[tag])?;
         self.writer
             .write_all(&((body.len() as u32 + 4).to_be_bytes()))?;

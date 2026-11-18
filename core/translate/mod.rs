@@ -151,7 +151,7 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
+            connection.dialect().get_internal_dialect()
         } else {
             connection.dialect()
         },
@@ -197,7 +197,7 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(connection, change_cnt_on, input)
+    program.build(&connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -777,7 +777,7 @@ mod tests {
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let cmd = crate::dialect::engine::parse_statement("SELECT 'x' REGEXP 'y'")
+        let cmd = crate::dialect::parse_statement(&crate::EngineDialect, "SELECT 'x' REGEXP 'y'")
             .transpose()
             .unwrap()
             .unwrap();
@@ -818,9 +818,13 @@ mod tests {
             .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
-        let malformed_seq =
-            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
-                .expect("malformed sqlite_sequence SQL should parse");
+        let malformed_seq = BTreeTable::from_stored_sql(
+            &crate::EngineDialect,
+            "CREATE TABLE sqlite_sequence(name)",
+            seq_root_page,
+            false,
+        )
+        .expect("malformed sqlite_sequence SQL should parse");
         schema.insert_table(
             NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -830,10 +834,11 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
-            .transpose()
-            .unwrap()
-            .unwrap();
+        let cmd =
+            crate::dialect::parse_statement(&crate::EngineDialect, "INSERT INTO t(v) VALUES('x')")
+                .transpose()
+                .unwrap()
+                .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -877,10 +882,11 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
-            .transpose()
-            .unwrap()
-            .unwrap();
+        let cmd =
+            crate::dialect::parse_statement(&crate::EngineDialect, "INSERT INTO t(v) VALUES('x')")
+                .transpose()
+                .unwrap()
+                .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),

@@ -127,7 +127,7 @@ simulator covers and tests.
 | PRAGMA module_list               | No         |                                                  |
 | PRAGMA optimize                  | No         |                                                  |
 | PRAGMA page_count                | No         |                                                  |
-| PRAGMA page_size                 | No         |                                                  |
+| PRAGMA page_size                 | Yes        | Set on every connection, from the seed           |
 | PRAGMA parser_trace              | No         |                                                  |
 | PRAGMA pragma_list               | No         |                                                  |
 | PRAGMA query_only                | No         |                                                  |

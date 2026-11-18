@@ -795,12 +795,12 @@ impl Connection {
     }
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(
-            self.db.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )
-        .expect("built-in type definitions are malformed");
+        // new_schema only fails if built-in type SQL is malformed (programmer bug).
+        let mut schema = self
+            .db
+            .dialect()
+            .new_schema(self.db.experimental_custom_types_enabled())
+            .expect("built-in type definitions are malformed");
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -1235,7 +1235,7 @@ impl Connection {
                 // An engine schema statement is the engine's own SQLite text,
                 // whatever the database's dialect parses.
                 if matches!(origin, StatementOrigin::EngineSchemaWrite) {
-                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                    self.dialect().parse_internal(sql)?
                 } else {
                     self.parse_sql(sql)?
                 }
@@ -1255,6 +1255,7 @@ impl Connection {
 
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 byte_offset_end,
@@ -1311,6 +1312,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 0,
@@ -1579,10 +1581,10 @@ impl Connection {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(
-            self.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )?;
+        let mut fresh = self
+            .db
+            .dialect()
+            .new_schema(self.experimental_custom_types_enabled())?;
         fresh.schema_version = cookie;
 
         fresh.copy_table_valued_functions(&self.schema.read());
@@ -1657,7 +1659,9 @@ impl Connection {
                             rows: Vec::new(),
                         };
                     } else {
-                        inner.fresh.load_namespace_names(&[])?;
+                        inner
+                            .fresh
+                            .load_namespace_names(self.dialect().as_ref(), &[])?;
                         inner.phase = ReparsePhase::populate_sequences();
                     }
                 }
@@ -1666,7 +1670,9 @@ impl Connection {
                         rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
                         Ok(())
                     }));
-                    inner.fresh.load_namespace_names(rows)?;
+                    inner
+                        .fresh
+                        .load_namespace_names(self.dialect().as_ref(), rows)?;
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::populate_sequences();
                 }
@@ -1793,6 +1799,7 @@ impl Connection {
                 }
                 ReparsePhase::BuildIndexes { type_sqls } => {
                     crate::util::populate_types_views_then_indices(
+                        self.dialect().as_ref(),
                         &mut inner.parse,
                         &mut inner.fresh,
                         &self.syms.read(),
@@ -1963,7 +1970,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1985,7 +1992,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -2005,7 +2012,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -2028,7 +2035,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 
@@ -3204,6 +3211,7 @@ impl Connection {
 
             // The schema already holds every stored type.
             match schema.populate_types_views_then_indices(
+                self.dialect().as_ref(),
                 &syms,
                 &[],
                 materialized_view_info,
@@ -3472,7 +3480,7 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
+    pub fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
             crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
@@ -4984,7 +4992,7 @@ impl Connection {
     }
 
     /// Get MVCC transaction ID and mode for a specific database.
-    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
@@ -5335,7 +5343,7 @@ impl Connection {
 
     /// Get the MvStore for a specific database.
     /// Returns None for databases without MVCC or for bootstrap connections.
-    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+    pub fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
@@ -5690,7 +5698,9 @@ mod tests {
             schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
-        let fresh = Schema::with_options(false, &EngineDialect).unwrap();
+        let fresh = crate::schema::builtin::schema_builder(&EngineDialect, false)
+            .unwrap()
+            .build();
         assert!(fresh.dialect_schema.is_none());
 
         conn.install_schema_keeping_dialect_schema(&fresh).unwrap();

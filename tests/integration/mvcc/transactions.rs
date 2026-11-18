@@ -791,7 +791,7 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
 
 /// Insert a synthetic table and a single row via the MVCC store, then commit.
 /// Used by restart / recovery tests to seed durable state before a restart cycle.
-fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
+pub(super) fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
     let max_root_page = get_rows(
@@ -878,7 +878,7 @@ fn test_restart() {
     }
 }
 
-fn get_record_value(row: &Row) -> ImmutableRecord {
+pub(super) fn get_record_value(row: &Row) -> ImmutableRecord {
     let mut record = ImmutableRecord::new(1024).unwrap();
     record.start_serialization(row.payload()).unwrap();
     record

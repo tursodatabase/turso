@@ -60,7 +60,7 @@ use crate::{
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     add_implied_column_equalities, can_use_partial_index, constraints_from_where_clause,
-    partial_index, partial_index_predicate_terms, Constraint,
+    partial_index, partial_index_predicate_terms, table_constraints_from_where_clause, Constraint,
 };
 use cost::{estimate_scan_cost, estimate_sort_cpu_cost, Cost};
 use join::{
@@ -2956,16 +2956,18 @@ fn plan_unmatched_right_rows(
             table.join_info = None;
         }
         let unmatched_table = &tables_for_unmatched_rows.joined_tables()[table_index];
-        let mut constraints_for_unmatched_rows = constraints_from_where_clause(
+        let mut term_collations = vec![None; where_clause_for_unmatched_rows.len()];
+        let mut constraints_for_unmatched_rows = table_constraints_from_where_clause(
+            unmatched_table,
             &where_clause_for_unmatched_rows,
+            &mut term_collations,
             &tables_for_unmatched_rows,
             available_indexes,
             subqueries,
             schema,
             params,
             resolver,
-        )?
-        .swap_remove(table_index);
+        )?;
         // The main plan already checked the INDEXED BY index. The unmatched-row
         // read follows the same hint, as in SQLite.
         if let Some(indexed) = &table.indexed {
@@ -3021,6 +3023,8 @@ fn plan_unmatched_right_rows(
             1.0,
             base_row_count,
             params,
+            // This read is planned once, so there is no work to share.
+            None,
         )?
         else {
             // The rowid candidate, or the INDEXED BY candidate, can always scan the table.

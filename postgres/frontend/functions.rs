@@ -2,7 +2,7 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
@@ -15,10 +15,11 @@ use turso_core::{
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -97,7 +98,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "to_char"(FunctionArity::Exact(2), true) => {
             exec_to_char(args[0].get_value(), &text_arg(args, 1))
         },
-        "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
@@ -143,6 +143,9 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "pg_generate_series_ordinality"(FunctionArity::Exact(3), true) => {
+            exec_generate_series_ordinality(int_arg(args, 0, 0), int_arg(args, 1, 0), int_arg(args, 2, 1))?
+        },
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -610,6 +613,19 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+/// The position of `value` in the series that starts at `start` and moves by `step`.
+fn exec_generate_series_ordinality(value: i64, start: i64, step: i64) -> Result<i64> {
+    if step == 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "step size cannot equal zero",
+        ));
+    }
+    let steps_from_start = (i128::from(value) - i128::from(start)) / i128::from(step);
+    i64::try_from(steps_from_start + 1)
+        .map_err(|_| sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
+}
+
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
     role_name_in(&connection_roles(conn), role)
 }
@@ -653,19 +669,21 @@ fn exec_version() -> String {
 /// form so the result reads back identically regardless of
 /// standard_conforming_strings.
 fn exec_quote_literal(value: &Value) -> Option<String> {
-    if matches!(value, Value::Null) {
-        return None;
+    match value {
+        Value::Null => None,
+        Value::Text(t) => Some(quote_literal(t.as_str())),
+        other => Some(quote_literal(&other.to_string())),
     }
-    let text = match value {
-        Value::Text(t) => t.as_str().to_string(),
-        other => other.to_string(),
-    };
-    let quoted = if text.contains('\\') {
+}
+
+/// `text` as PostgreSQL's quote_literal() writes it: in single quotes, with
+/// quotes doubled, and as an escape string when it has a backslash.
+pub(crate) fn quote_literal(text: &str) -> String {
+    if text.contains('\\') {
         format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
     } else {
         format!("'{}'", text.replace('\'', "''"))
-    };
-    Some(quoted)
+    }
 }
 
 /// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
@@ -1253,115 +1271,6 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
         _ => return None,
     };
     Some(pg_to_char_numeric(num, format))
-}
-
-/// age(end, start) the way PostgreSQL's timestamp_age computes it: subtract the
-/// timestamps field by field and borrow from the next larger field, where a
-/// borrowed month is as long as the earlier timestamp's month. age(start)
-/// measures from midnight of the current date.
-fn exec_age(args: &[Register]) -> Result<Value> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Numeric(_) | Value::Blob(_)))
-    {
-        let argument_types = args
-            .iter()
-            .map(|arg| match arg.get_value() {
-                Value::Null => "unknown",
-                Value::Numeric(Numeric::Integer(_)) => "integer",
-                Value::Numeric(Numeric::Float(_)) => "numeric",
-                Value::Text(_) => "timestamp",
-                Value::Blob(_) => "bytea",
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(LimboError::InvalidArgument(format!(
-            "function age({argument_types}) does not exist"
-        )));
-    }
-    let mut timestamps = Vec::with_capacity(args.len());
-    for arg in args {
-        match arg.get_value() {
-            Value::Text(text) => timestamps.push(parse_timestamp(text.as_str())?),
-            _ => return Ok(Value::Null),
-        }
-    }
-    let (end, start) = match timestamps[..] {
-        [start] => (Utc::now().date_naive().and_time(NaiveTime::MIN), start),
-        [end, start] => (end, start),
-        _ => unreachable!("age() is declared with one or two arguments"),
-    };
-    let (later, earlier, sign) = if end < start {
-        (start, end, -1)
-    } else {
-        (end, start, 1)
-    };
-
-    let micros_of_day = |t: NaiveDateTime| {
-        i64::from(t.num_seconds_from_midnight()) * 1_000_000 + i64::from(t.nanosecond() / 1000)
-    };
-    let mut micros = micros_of_day(later) - micros_of_day(earlier);
-    let mut days = i64::from(later.day()) - i64::from(earlier.day());
-    let mut months = i64::from(later.year() - earlier.year()) * 12 + i64::from(later.month())
-        - i64::from(earlier.month());
-    if micros < 0 {
-        micros += 86_400_000_000;
-        days -= 1;
-    }
-    if days < 0 {
-        days += i64::from(earlier.num_days_in_month());
-        months -= 1;
-    }
-    Ok(Value::build_text(format_interval(
-        sign * months,
-        sign * days,
-        sign * micros,
-    )))
-}
-
-/// Reads a timestamp in the form the timestamp type stores, `YYYY-MM-DD
-/// HH:MM:SS[.f]` (the timestamptz type stores the same form, in UTC), or a
-/// date in the form the date type stores, `YYYY-MM-DD`, as midnight of that
-/// day, since PostgreSQL casts a date to a timestamp.
-fn parse_timestamp(text: &str) -> Result<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| {
-            NaiveDate::parse_from_str(text, "%Y-%m-%d").map(|date| date.and_time(NaiveTime::MIN))
-        })
-        .map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "invalid input syntax for type timestamp: \"{text}\""
-            ))
-        })
-}
-
-/// Formats an interval like PostgreSQL's interval_out with IntervalStyle
-/// postgres, e.g. `-1 years -9 mons -7 days -03:04:05.5`. All parts must have
-/// the same sign.
-fn format_interval(months: i64, days: i64, micros: i64) -> String {
-    let mut parts = Vec::new();
-    for (value, unit) in [(months / 12, "year"), (months % 12, "mon"), (days, "day")] {
-        if value != 0 {
-            let plural = if value == 1 { "" } else { "s" };
-            parts.push(format!("{value} {unit}{plural}"));
-        }
-    }
-    if parts.is_empty() || micros != 0 {
-        let sign = if micros < 0 { "-" } else { "" };
-        let seconds = micros.abs() / 1_000_000;
-        let mut time = format!(
-            "{sign}{:02}:{:02}:{:02}",
-            seconds / 3600,
-            seconds / 60 % 60,
-            seconds % 60
-        );
-        let fraction = micros.abs() % 1_000_000;
-        if fraction != 0 {
-            time.push_str(format!(".{fraction:06}").trim_end_matches('0'));
-        }
-        parts.push(time);
-    }
-    parts.join(" ")
 }
 
 /// pg_input_is_valid(text, type) → boolean

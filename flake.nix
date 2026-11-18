@@ -72,6 +72,7 @@
             nodejs
             toolchain
             uv
+            rustPlatform.bindgenHook
           ] ++ lib.optionals pkgs.stdenv.isDarwin [
             apple-sdk
           ];

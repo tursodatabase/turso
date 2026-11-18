@@ -5,6 +5,7 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use serde::{Deserialize, Serialize};
+use turso_core::storage::sqlite3_ondisk::PageSize;
 
 use crate::profiles::ProfileType;
 
@@ -173,6 +174,12 @@ pub struct SimulatorCLI {
     pub mvcc: Option<bool>,
     #[clap(
         long,
+        help = "Page size in bytes, a power of two from 512 to 65536 [default: drawn from the seed]",
+        value_parser = parse_page_size
+    )]
+    pub page_size: Option<u32>,
+    #[clap(
+        long,
         help = "Keep all database and plan files",
         default_value_t = false
     )]
@@ -316,4 +323,31 @@ impl ValueParserFactory for ProfileType {
 
 const fn normal_or_miri<T: Copy>(normal_val: T, miri_val: T) -> T {
     if cfg!(miri) { miri_val } else { normal_val }
+}
+
+fn parse_page_size(value: &str) -> Result<u32, String> {
+    let size = value.parse::<u32>().map_err(|e| e.to_string())?;
+    if PageSize::new(size).is_none() {
+        return Err("must be a power of two from 512 to 65536".to_string());
+    }
+    Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_size_flag_accepts_exactly_the_valid_sizes() {
+        let valid = [
+            "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536",
+        ];
+        let invalid = ["0", "1", "256", "1000", "131072"];
+        for (sizes, accepted) in [(&valid[..], true), (&invalid[..], false)] {
+            for &size in sizes {
+                let parsed = SimulatorCLI::try_parse_from(["limbo_sim", "--page-size", size]);
+                assert_eq!(parsed.is_ok(), accepted, "--page-size {size}");
+            }
+        }
+    }
 }
