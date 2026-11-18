@@ -120,6 +120,8 @@ pub(crate) struct SchemaLoader {
     steps: VecDeque<Box<dyn LoadStep>>,
     /// The statement of the current step that is being read.
     statement: Option<Box<Statement>>,
+    /// Whether `statement` is a [`LoadQuery::engine_metadata_read`].
+    statement_reads_engine_metadata: bool,
     install: SchemaInstall,
     /// Whether the connection's schema is the one that the current step
     /// started with.
@@ -152,6 +154,7 @@ impl SchemaLoader {
             load: SchemaLoad::new(schema),
             steps: steps.into(),
             statement: None,
+            statement_reads_engine_metadata: false,
             install,
             current_step_schema_installed: false,
         }
@@ -170,7 +173,18 @@ impl SchemaLoader {
                 .expect("a prepared statement belongs to a step");
             let statement = self.statement.as_mut().expect("prepared above");
             let load = &mut self.load;
-            match statement.run_with_row_callback_nonblock(|row| step.row(load, row)) {
+            let reads_engine_metadata = self.statement_reads_engine_metadata;
+            let on_row = |row: &Row| {
+                // A step of a dialect's catalog has no connection to check
+                // this with, so the check is here for every such read.
+                turso_assert!(
+                    !reads_engine_metadata
+                        || !matches!(conn.get_tx_state(), TransactionState::None),
+                    "engine metadata must be read in a transaction"
+                );
+                step.row(load, row)
+            };
+            match statement.run_with_row_callback_nonblock(on_row) {
                 Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                 Ok(IOResult::Done(())) => {}
                 Err(err) => return Err(step.query_failed(QueryFailure::Read, *err).into()),
@@ -214,6 +228,8 @@ impl SchemaLoader {
                 .prepare_with_origin(&query.sql, query.origin)
                 .map_err(|err| step.query_failed(QueryFailure::Prepare, err))?;
             self.statement = Some(Box::new(statement));
+            self.statement_reads_engine_metadata =
+                query.origin == StatementOrigin::EngineMetadataRead;
             return Ok(true);
         }
     }
@@ -258,6 +274,7 @@ pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box
         steps.push(Box::new(ViewsAndIndexes::new(conn.clone())));
     }
     steps.push(Box::new(DialectState::new(conn.clone())));
+    steps.extend(conn.db.dialect().catalog().load_steps());
     steps
 }
 
@@ -708,10 +725,14 @@ impl LoadStep for DialectState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialect::EngineDialect;
+    use crate::dialect::{
+        AfterWrites, Catalog, CatalogWrite, EngineDialect, SqliteCatalog, WriteContext,
+    };
     use crate::security::roles::SessionRole;
     use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sync::Mutex;
     use crate::util::IOExt;
+    use crate::vdbe::builder::ProgramBuilder;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
 
     const NAMESPACE: NamespaceId = NamespaceId::new(7);
@@ -824,5 +845,106 @@ mod tests {
         io.block(|| loader.run(&conn)).unwrap();
 
         assert!(Arc::ptr_eq(&loader.into_schema(), &shared));
+    }
+
+    /// A dialect whose catalog has one load step of its own.
+    struct DialectWithACatalogStep {
+        catalog: CatalogWithAStep,
+    }
+
+    impl crate::dialect::Dialect for DialectWithACatalogStep {
+        fn name(&self) -> &'static str {
+            "catalog-step-test"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            EngineDialect.parse(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            EngineDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> Result<turso_parser::ast::ColumnDefinition> {
+            EngineDialect.parse_internal_column_definition(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn crate::dialect::Dialect> {
+            Arc::new(EngineDialect)
+        }
+
+        fn catalog(&self) -> &dyn Catalog {
+            &self.catalog
+        }
+    }
+
+    struct CatalogWithAStep {
+        /// For each time the step ran: whether the schema being read had
+        /// the table `t`.
+        table_seen_by_each_load: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Catalog for CatalogWithAStep {
+        fn write(
+            &self,
+            program: &mut ProgramBuilder,
+            ctx: &WriteContext<'_>,
+            change: &CatalogWrite<'_>,
+        ) -> Result<AfterWrites> {
+            SqliteCatalog.write(program, ctx, change)
+        }
+
+        fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+            vec![Box::new(LooksForTheTable {
+                queried: false,
+                table_seen_by_each_load: self.table_seen_by_each_load.clone(),
+            })]
+        }
+    }
+
+    /// Reads one row as engine metadata, and records whether the schema
+    /// being read has the table `t`.
+    struct LooksForTheTable {
+        queried: bool,
+        table_seen_by_each_load: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl LoadStep for LooksForTheTable {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried)
+                .then(|| LoadQuery::engine_metadata_read("SELECT count(*) FROM sqlite_schema"));
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            self.table_seen_by_each_load
+                .lock()
+                .push(load.schema().has_table(NamespaceId::ROOT, "t"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
+        let table_seen_by_each_load = Arc::new(Mutex::new(Vec::new()));
+        let dialect = Arc::new(DialectWithACatalogStep {
+            catalog: CatalogWithAStep {
+                table_seen_by_each_load: table_seen_by_each_load.clone(),
+            },
+        });
+        let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert_eq!(*table_seen_by_each_load.lock(), [false]);
+        conn.execute("CREATE TABLE t (x)").unwrap();
+
+        conn.force_reparse_schema_without_publish().unwrap();
+
+        assert_eq!(*table_seen_by_each_load.lock(), [false, true]);
     }
 }
