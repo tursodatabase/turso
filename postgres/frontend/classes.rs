@@ -31,7 +31,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use turso_core::dialect::catalog::DropTable;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
@@ -41,9 +40,9 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
-    CreateTable, CursorType, InsertFlags, Insn, LimboError, LoadQuery, LoadStep, NewOwner, Numeric,
-    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, RenameTable, Row, SchemaLoad,
-    SqliteCatalog, Value, WriteContext, WriteOrigin,
+    CreateTable, CursorType, DropTable, InsertFlags, Insn, LimboError, LoadQuery, LoadStep,
+    NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, RenameTable,
+    Row, SchemaLoad, SqliteCatalog, Value, WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
