@@ -1390,6 +1390,23 @@ impl Value {
             return Ok(like_ascii(pattern.as_bytes(), text.as_bytes()));
         }
 
+        // The same with an escape character in the pattern. An escape
+        // character that is a wildcard is not a wildcard any more, and the
+        // general matcher handles that case.
+        if let Some(escape) = escape
+            .filter(|&e| has_escape && e.is_ascii() && e != '%' && e != '_')
+            .and_then(|e| u8::try_from(e).ok())
+        {
+            if crate::types::is_ascii(pattern.as_bytes()) && crate::types::is_ascii(text.as_bytes())
+            {
+                return Ok(like_ascii_escaped(
+                    pattern.as_bytes(),
+                    text.as_bytes(),
+                    escape,
+                ));
+            }
+        }
+
         // 1. Exact match (no wildcards)
         if !has_escape && !pattern.contains(['%', '_']) {
             return Ok(pattern.eq_ignore_ascii_case(text));
@@ -1815,6 +1832,53 @@ const LIKE_INFO: PatternInfo = PatternInfo {
 /// `pattern_compare` with `LIKE_INFO` for every ASCII input (see the tests).
 fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
     wildcard_ascii::<b'%', b'_', true>(pattern, text)
+}
+
+/// LIKE over ASCII bytes with the escape character `escape`, which is not `%`
+/// or `_`. The escape makes the next pattern byte a literal, which compares
+/// without case as the other letters do, and a pattern that ends with the
+/// escape matches nothing. Same answers as `pattern_compare` with `LIKE_INFO`
+/// for every ASCII input (see the tests). Out of line, so that the usual
+/// matcher without an escape character stays small.
+#[inline(never)]
+fn like_ascii_escaped(pattern: &[u8], text: &[u8], escape: u8) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut backtrack: Option<(usize, usize)> = None;
+    while t < text.len() {
+        let matched = match pattern.get(p) {
+            Some(b'%') => {
+                backtrack = Some((p, t));
+                p += 1;
+                continue;
+            }
+            Some(&c) if c == escape => match pattern.get(p + 1) {
+                Some(literal) if literal.eq_ignore_ascii_case(&text[t]) => {
+                    p += 2;
+                    true
+                }
+                Some(_) => false,
+                None => return false,
+            },
+            Some(&c) if c == b'_' || c.eq_ignore_ascii_case(&text[t]) => {
+                p += 1;
+                true
+            }
+            _ => false,
+        };
+        if matched {
+            t += 1;
+            continue;
+        }
+        match backtrack {
+            Some((star_p, star_t)) => {
+                p = star_p + 1;
+                t = star_t + 1;
+                backtrack = Some((star_p, t));
+            }
+            None => return false,
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'%')
 }
 
 /// GLOB without a set over ASCII bytes: `?` matches one byte, `*` any run of
@@ -3383,6 +3447,29 @@ mod tests {
                     Value::exec_like(pattern_str, text_str, Some('\\')).unwrap(),
                     expected,
                     "exec_like with escape: pattern {pattern_str:?}, text {text_str:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn like_ascii_escaped_agrees_with_pattern_compare() {
+        for pattern in words(b"a%_\\", 5) {
+            for text in words(b"aA%\\", 4) {
+                let pattern_str = std::str::from_utf8(&pattern).unwrap();
+                let text_str = std::str::from_utf8(&text).unwrap();
+                let expected =
+                    super::pattern_compare(pattern_str, text_str, &super::LIKE_INFO, Some('\\'))
+                        == super::CompareResult::Match;
+                assert_eq!(
+                    super::like_ascii_escaped(&pattern, &text, b'\\'),
+                    expected,
+                    "pattern {pattern_str:?}, text {text_str:?}"
+                );
+                assert_eq!(
+                    Value::exec_like(pattern_str, text_str, Some('\\')).unwrap(),
+                    expected,
+                    "exec_like: pattern {pattern_str:?}, text {text_str:?}"
                 );
             }
         }
