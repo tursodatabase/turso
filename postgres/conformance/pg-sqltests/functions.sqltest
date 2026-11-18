@@ -2438,3 +2438,170 @@ test table-function-argument-names-the-column-of-the-function-before-it {
 expect {
     3
 }
+
+test json-each-returns-the-key-and-the-value-of-each-member {
+    SELECT * FROM json_each('{"a":1,"b":"x","c":[1,2],"d":null,"e":true,"f":false,"g":{"h":1},"i":2.5}');
+}
+expect {
+    a|1
+    b|"x"
+    c|[1,2]
+    d|null
+    e|true
+    f|false
+    g|{"h":1}
+    i|2.5
+}
+
+test json-each-has-only-the-columns-key-and-value {
+    SELECT * FROM json_each('{"a":1}') AS j WHERE j.key = 'a' AND j.value::text = '1';
+}
+expect {
+    a|1
+}
+
+test json-each-key-is-text-and-value-is-json {
+    SELECT key || '!', value -> 'h' FROM json_each('{"a":{"h":5}}');
+}
+expect {
+    a!|5
+}
+
+test json-each-keeps-the-order-and-the-repeated-keys {
+    SELECT * FROM json_each('{"b":1,"a":2,"b":3}');
+}
+expect {
+    b|1
+    a|2
+    b|3
+}
+
+test json-each-of-an-empty-object-has-no-rows {
+    SELECT count(*) FROM json_each('{}');
+}
+expect {
+    0
+}
+
+test json-each-of-null-has-no-rows {
+    SELECT count(*) FROM json_each(NULL::json);
+}
+expect {
+    0
+}
+
+test json-each-of-an-array-errors {
+    SELECT * FROM json_each('[1]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-an-empty-array-errors {
+    SELECT * FROM json_each('[]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-a-scalar-errors {
+    SELECT * FROM json_each('1');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct a scalar
+}
+
+test json-each-of-json-null-errors {
+    SELECT * FROM json_each('null');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct a scalar
+}
+
+test json-each-with-ordinality {
+    SELECT * FROM json_each('{"a":10,"b":20}') WITH ORDINALITY;
+}
+expect {
+    a|10|1
+    b|20|2
+}
+
+test json-each-with-column-aliases {
+    SELECT k, v FROM json_each('{"a":1}') AS j(k, v);
+}
+expect {
+    a|1
+}
+
+test json-each-with-ordinality-and-column-aliases {
+    SELECT k, v, n FROM json_each('{"a":1,"b":2}') WITH ORDINALITY AS j(k, v, n);
+}
+expect {
+    a|1|1
+    b|2|2
+}
+
+test json-each-reads-a-column-of-an-earlier-table {
+    CREATE TABLE json_each_docs (id int, doc json);
+    INSERT INTO json_each_docs VALUES (1, '{"a":1,"b":2}'), (2, '{"c":3}');
+    SELECT id, key, value FROM json_each_docs, json_each(doc) ORDER BY id, key;
+}
+expect {
+    1|a|1
+    1|b|2
+    2|c|3
+}
+
+test json-each-restarts-the-ordinality-for-each-row {
+    CREATE TABLE json_each_ordinality_docs (id int, doc json);
+    INSERT INTO json_each_ordinality_docs VALUES (1, '{"a":1,"b":2}'), (2, '{"c":3}');
+    SELECT id, key, ordinality FROM json_each_ordinality_docs, json_each(doc) WITH ORDINALITY ORDER BY id, ordinality;
+}
+expect {
+    1|a|1
+    1|b|2
+    2|c|1
+}
+
+test json-each-with-the-schema-name {
+    SELECT * FROM pg_catalog.json_each('{"a":1}');
+}
+expect {
+    a|1
+}
+
+test json-each-without-an-argument-errors {
+    SELECT * FROM json_each();
+}
+@sqlstate 42883
+expect error {
+}
+
+test json-each-with-two-arguments-errors {
+    SELECT * FROM json_each('{"a":1}', '{"b":2}');
+}
+@sqlstate 42883
+expect error {
+}
+
+test json-each-with-a-column-definition-list-errors {
+    SELECT * FROM json_each('{"a":1}') AS j(k text, v json);
+}
+@sqlstate 42601
+expect error {
+}
+
+test json-tree-is-not-a-function-of-postgresql {
+    SELECT * FROM json_tree('{"a":1}');
+}
+@sqlstate 42883
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    json_tree as a function in FROM is not supported
+}
