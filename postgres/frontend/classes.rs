@@ -560,6 +560,17 @@ impl Catalog for PostgresCatalog {
                     new_name: column.new_name.as_str(),
                 }],
             )?,
+            CatalogWrite::AlterColumn(column) => translate_relation_changes(
+                program,
+                ctx.schema,
+                ctx.connection,
+                &[RelationChange::ColumnRenamed {
+                    namespace: column.namespace,
+                    table: column.table,
+                    old_name: column.old_name,
+                    new_name: column.definition.col_name.as_str(),
+                }],
+            )?,
         }
         Ok(after_writes)
     }
@@ -733,6 +744,7 @@ fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
     match change {
         CatalogWrite::RenameTable(table) => !table.is_virtual,
         CatalogWrite::RenameColumn(column) => column.old_name != column.new_name.as_str(),
+        CatalogWrite::AlterColumn(column) => column.old_name != column.definition.col_name.as_str(),
         _ => true,
     }
 }
