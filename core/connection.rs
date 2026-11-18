@@ -1255,6 +1255,7 @@ impl Connection {
 
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 byte_offset_end,
@@ -1311,6 +1312,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 0,
@@ -1968,7 +1970,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1990,7 +1992,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -2010,7 +2012,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -2033,7 +2035,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 

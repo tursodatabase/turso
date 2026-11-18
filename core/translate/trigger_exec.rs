@@ -608,8 +608,7 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    let built_subprogram = subprogram_builder.build(connection, true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
