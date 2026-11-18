@@ -645,13 +645,7 @@ impl ToTokens for SelectPlan {
         context: &C,
     ) -> Result<(), S::Error> {
         if !self.values.is_empty() {
-            ast::OneSelect::Values(
-                self.values
-                    .iter()
-                    .map(|values| values.iter().map(|v| Box::from(v.clone())).collect())
-                    .collect(),
-            )
-            .to_tokens(s, context)?;
+            ast::OneSelect::Values(self.values.clone()).to_tokens(s, context)?;
         } else {
             s.append(TokenType::TK_SELECT, None)?;
             if self.distinctness.is_distinct() {

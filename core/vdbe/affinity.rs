@@ -184,25 +184,26 @@ impl Affinity {
     /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
     #[expect(clippy::self_named_constructors)]
     pub fn affinity(datatype: &str) -> Self {
-        let datatype = datatype.to_ascii_uppercase();
+        let datatype = datatype.as_bytes();
+        let contains = |needle: &[u8]| contains_ignore_ascii_case(datatype, needle);
 
         // Rule 1: INT -> INTEGER affinity
-        if datatype.contains("INT") {
+        if contains(b"INT") {
             return Affinity::Integer;
         }
 
         // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
-        if datatype.contains("CHAR") || datatype.contains("CLOB") || datatype.contains("TEXT") {
+        if contains(b"CHAR") || contains(b"CLOB") || contains(b"TEXT") {
             return Affinity::Text;
         }
 
         // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-        if datatype.contains("BLOB") || datatype.is_empty() {
+        if contains(b"BLOB") || datatype.is_empty() {
             return Affinity::Blob;
         }
 
         // Rule 4: REAL/FLOA/DOUB -> REAL affinity
-        if datatype.contains("REAL") || datatype.contains("FLOA") || datatype.contains("DOUB") {
+        if contains(b"REAL") || contains(b"FLOA") || contains(b"DOUB") {
             return Affinity::Real;
         }
 
@@ -358,6 +359,15 @@ impl Affinity {
             _ => false,
         }
     }
+}
+
+/// Whether `haystack` contains `needle`, an upper-case ASCII string, when
+/// ASCII letters are compared without case. This is the same as
+/// `haystack.to_ascii_uppercase().contains(needle)`, without the copy.
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[derive(Debug, PartialEq)]
@@ -724,6 +734,71 @@ fn stringify_register(val: ValueRef) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_matches_upper_case_search() {
+        fn old_affinity(datatype: &str) -> Affinity {
+            let datatype = datatype.to_ascii_uppercase();
+            if datatype.contains("INT") {
+                Affinity::Integer
+            } else if datatype.contains("CHAR")
+                || datatype.contains("CLOB")
+                || datatype.contains("TEXT")
+            {
+                Affinity::Text
+            } else if datatype.contains("BLOB") || datatype.is_empty() {
+                Affinity::Blob
+            } else if datatype.contains("REAL")
+                || datatype.contains("FLOA")
+                || datatype.contains("DOUB")
+            {
+                Affinity::Real
+            } else {
+                Affinity::Numeric
+            }
+        }
+        for datatype in [
+            "",
+            "INT",
+            "int",
+            "Integer",
+            "BIGINT",
+            "VARCHAR(10)",
+            "nvarchar",
+            "clob",
+            "Text",
+            "blob",
+            "BLOB",
+            "real",
+            "Float",
+            "double precision",
+            "DOUB",
+            "numeric",
+            "DECIMAL(10,5)",
+            "boolean",
+            "date",
+            "in",
+            "i",
+            "chr",
+            "\u{130}nt",
+            "\u{131}NT",
+            "\u{e9}text",
+            "x\u{1f600}int",
+            "POINT",
+            "TINYBLOB",
+            "CHARINT",
+            "flo",
+            "FLOA",
+            "ReAlLy",
+            "  int  ",
+        ] {
+            assert_eq!(
+                Affinity::affinity(datatype),
+                old_affinity(datatype),
+                "{datatype:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_apply_numeric_affinity_partial_numbers() {
