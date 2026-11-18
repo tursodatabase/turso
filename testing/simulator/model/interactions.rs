@@ -960,9 +960,7 @@ fn reopen_database(env: &mut SimulatorEnv, power_loss: bool) -> Result<()> {
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new()
-                    .with_autovacuum(true)
-                    .with_attach(true),
+                turso_core::DatabaseOpts::new().with_attach(true),
                 None,
                 Arc::new(SqliteDialect),
             ) {

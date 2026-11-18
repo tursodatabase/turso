@@ -76,7 +76,6 @@ default = [
     "series",
     "encryption",
     "percentile",
-    "autovacuum",
     "conn_raw_api",
 ]
 fs = ["turso_core/fs"]
@@ -86,7 +85,6 @@ json = ["turso_core/json"]
 series = ["turso_core/series"]
 encryption = ["turso_core/encryption"]
 percentile = ["turso_core/percentile"]
-autovacuum = ["turso_core/autovacuum"]
 conn_raw_api = []
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]

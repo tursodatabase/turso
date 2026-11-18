@@ -42,7 +42,7 @@ for testcase in "$CORPUS_DIR"/*; do
     LLVM_PROFILE_FILE="$COV_PROFILE_DIR/turso_${COUNT}.profraw" \
         timeout 5 "$COV_BINARY" -q -m list \
         --experimental-views \
-        --experimental-index-method --experimental-autovacuum --experimental-attach \
+        --experimental-index-method --experimental-attach \
         < "$testcase" > /dev/null 2>&1 || true
 
     if [ $((COUNT % 100)) -eq 0 ]; then

@@ -61,8 +61,7 @@ fn default_db_opts() -> DatabaseOpts {
         opts = opts
             .with_vacuum(true)
             .with_without_rowid(true)
-            .with_attach(true)
-            .with_autovacuum(true);
+            .with_attach(true);
     }
     opts
 }

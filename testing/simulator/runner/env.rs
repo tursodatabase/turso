@@ -1803,9 +1803,7 @@ impl SimulatorEnv {
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_autovacuum(true)
-                .with_attach(true),
+            turso_core::DatabaseOpts::new().with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -2053,9 +2051,7 @@ impl SimulatorEnv {
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_autovacuum(true)
-                .with_attach(true),
+            turso_core::DatabaseOpts::new().with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {

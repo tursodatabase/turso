@@ -5,8 +5,8 @@
 # The anchored pattern proves the prefix is gone.
 
 test invalid-argument-error-has-no-prefix {
-    PRAGMA auto_vacuum = 1;
+    DETACH DATABASE nosuch;
 }
 expect error {
-    ^Autovacuum is not enabled\. Use --experimental-autovacuum flag to enable it\.$
+    ^no such database: nosuch$
 }

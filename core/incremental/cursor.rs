@@ -279,7 +279,6 @@ mod tests {
                 enable_load_extension: false,
                 enable_encryption: false,
                 enable_index_method: false,
-                enable_autovacuum: false,
                 enable_vacuum: false,
                 enable_attach: false,
                 enable_multiprocess_wal: false,

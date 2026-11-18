@@ -27,7 +27,6 @@ These rules apply to both `VACUUM` and `VACUUM INTO`:
 - The connection must be in autocommit mode — neither form can run inside an explicit `BEGIN` transaction.
 - No other statement may be active on the same connection.
 - The connection must not be in `query_only` mode.
-- The source database must not have `auto_vacuum = incremental`. Incremental autovacuum is not supported.
 
 ## VACUUM
 
@@ -76,6 +75,7 @@ When the database uses MVCC (`PRAGMA journal_mode = mvcc`), additional rules app
 - Reserved space, text encoding, user version, and application ID are copied from the source.
 - The page size is copied from the source, unless a valid `PRAGMA page_size = N` ran earlier on the same connection. Then the destination uses `N` and the source keeps its own page size. An in-memory source always uses its own page size. A requested size of 512 becomes 1024 when the source has more than 32 reserved bytes per page. An in-place `VACUUM` drops the requested size.
 - If the source uses MVCC, the destination is created with MVCC enabled but with fresh state. The source's MVCC metadata table is not copied across.
+- The destination never has auto-vacuum, even when the source does, because Turso does not support auto-vacuum.
 - The file is fully synced and a TRUNCATE checkpoint is performed before the statement returns, so the destination is durable without further action.
 
 <Warning>
@@ -149,7 +149,6 @@ VACUUM;
 | `Cannot execute VACUUM in query_only mode` | `VACUUM` or `VACUUM INTO` run on a connection where `PRAGMA query_only` is set. |
 | `cannot VACUUM from within a transaction` / `cannot VACUUM INTO from within a transaction` | Run inside an explicit `BEGIN`. |
 | `cannot VACUUM - SQL statements in progress` | Another statement is still active on the same connection. |
-| `Incremental auto-vacuum is not supported` | The source database has `auto_vacuum = incremental`. Applies to both `VACUUM` and `VACUUM INTO`. |
 | `VACUUM requires a WAL-mode database` | In-place `VACUUM` on a non-WAL database. |
 | `cannot VACUUM an in-memory database` | In-place `VACUUM` on an in-memory database. |
 | `ReadOnly` | In-place `VACUUM` on a read-only database. |

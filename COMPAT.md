@@ -219,7 +219,7 @@ avoid this window.
 |----------------------------------|------------|----------------------------------------------|
 | PRAGMA analysis_limit            | ❌ No         |                                              |
 | PRAGMA application_id            | ✅ Yes        |                                              |
-| PRAGMA auto_vacuum               | 🚧 Partial    | Read works; write requires `--experimental-autovacuum` |
+| PRAGMA auto_vacuum               | 🚧 Partial    | Read works; setting it does nothing |
 | PRAGMA automatic_index           | ✅ Yes        |                                              |
 | PRAGMA busy_timeout              | ✅ Yes         |                                              |
 | PRAGMA cache_size                | ✅ Yes        |                                              |
