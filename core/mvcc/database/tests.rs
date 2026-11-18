@@ -570,8 +570,7 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
     use crate::alloc::{DynAllocator, TursoVecInExt};
     use crate::mvcc::database::WalPos;
 
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
+    let store = empty_mv_store();
     let lwm_sampled_while_idle = store.sample_gc_lwm();
     assert_eq!(lwm_sampled_while_idle, u64::MAX);
 
@@ -924,10 +923,12 @@ pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
 /// for the boundary-straddle data-loss path (review finding #1).
 #[test]
 fn test_checkpoint_snapshot_ts_clamps_below_inflight_preparing() {
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
-    let pager = db.conn.pager.load().clone();
-    let inflight = store.begin_tx(pager).unwrap();
+    let store = empty_mv_store();
+    let inflight: TxID = 1;
+    store.txs.insert(
+        inflight,
+        new_tx_in::<crate::alloc::DynAllocator>(inflight, 1, TransactionState::Active),
+    );
 
     // Out-of-order finalize: a higher-ts commit advanced the watermark to 1000 while
     // `inflight` is still Preparing at the lower end_ts 500.
@@ -1790,8 +1791,7 @@ fn test_commit_dependency_speculative_ignore() {
 fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     use crate::mvcc::cursor::IndexShadowScan;
 
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
+    let store = empty_mv_store();
     let table_id = MVTableId::from(-999_i64);
 
     // Single-column ascending integer index key.
@@ -1857,12 +1857,12 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
     assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(10))
+        .btree_row_is_valid(&store, table_id, reader_id, &idx_key(10))
         .unwrap());
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
     assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(30))
+        .btree_row_is_valid(&store, table_id, reader_id, &idx_key(30))
         .unwrap());
 
     let reader = store.txs.get(&reader_id).unwrap();
@@ -3575,21 +3575,33 @@ fn test_gc_shrinks_version_chain_capacity() {
 #[cfg(not(nightly))]
 #[test]
 fn test_one_version_is_stored_inside_its_chain() {
-    let db = MvccTestDb::new();
+    let store = empty_mv_store();
     let table_id: MVTableId = (-2).into();
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    let tx = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    db.mvcc_store
+    let tx: TxID = 1;
+    store.txs.insert(
+        tx,
+        new_tx_in::<crate::alloc::DynAllocator>(tx, 1, TransactionState::Active),
+    );
+    store
         .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
         .unwrap();
-    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    let entry = store.rows.get(&row_id).unwrap();
     let versions = entry.value().read();
     let chain_start = std::ptr::addr_of!(*versions) as usize;
     let chain = chain_start..chain_start + std::mem::size_of_val(&*versions);
     assert!(chain.contains(&(versions.as_ptr() as usize)));
+}
+
+/// An MVCC store that belongs to no database.
+fn empty_mv_store() -> crate::MvStore {
+    MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("empty-mv-store.db-log"),
+        crate::alloc::DynAllocator::default(),
+        false,
+    )
+    .unwrap()
 }
 
 /// A version chain stores its versions inline, so the size of `RowVersion` is a
