@@ -2,17 +2,19 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use std::{fmt, sync::Arc};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
     exec_printf_values, exec_temporal_encode, exec_timestamp_encode, exec_timestamptz_encode,
     format_timestamp, format_timestamptz, timestamp_of_micros, Connection, ExternalFunc, IOResult,
-    LimboError, Numeric, OpenOptions, Register, Result, Value, POSTGRES_EPOCH_IN_UNIX_MICROS,
+    LimboError, Numeric, OpenOptions, Register, Result, Value, WallClockInstant,
+    POSTGRES_EPOCH_IN_UNIX_MICROS,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
@@ -27,13 +29,14 @@ use turso_pg_parser::sqlstate::{
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
 /// the body returns.
 macro_rules! scalar_functions {
-    ($options:expr, |$connection:ident, $args:ident| {
+    ($options:expr, |$context:ident, $connection:ident, $args:ident| {
         $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $($(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
+                let $connection = $context.connection;
                 Ok($body)
             };
             options = options.extension_function(pg_scalar_function(
@@ -61,7 +64,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
-    scalar_functions!(options, |connection, args| {
+    scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
@@ -147,19 +150,28 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(format_timestamptz(Utc::now().naive_utc())),
+        // The time the transaction started, or the statement outside a
+        // transaction.
+        "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(timestamp_at(context.statement_times().transaction)?))
+        },
+        "statement_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(timestamp_at(context.statement_times().statement)?))
+        },
+        // The clock at each call.
+        "clock_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(timestamp_at(context.current_time())?))
+        },
         // CURRENT_TIMESTAMP(precision).
         "current_timestamp"(FunctionArity::Exact(1), false) => {
-            Timestamptz(format_timestamptz(current_time_rounded(args)?))
+            Timestamptz(format_timestamptz(transaction_time_rounded(context, args)?))
         },
         // LOCALTIMESTAMP and LOCALTIMESTAMP(precision). The session's time
         // zone is always UTC.
         "localtimestamp"(FunctionArity::OneOf(&[0, 1]), false) => {
             let now = match args {
-                [] => Utc::now().naive_utc(),
-                _ => current_time_rounded(args)?,
+                [] => timestamp_at(context.statement_times().transaction)?,
+                _ => transaction_time_rounded(context, args)?,
             };
             Timestamp(format_timestamp(now))
         },
@@ -172,7 +184,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
@@ -186,7 +198,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 }
 
 impl<O> fmt::Debug for PgScalarFunction<O> {
@@ -209,8 +221,8 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
 impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
-        Ok(IOResult::Done((self.step)(connection, args)?))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<O> {
+        Ok(IOResult::Done((self.step)(context, args)?))
     }
 }
 
@@ -1295,8 +1307,12 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
 /// PostgreSQL's time starts.
 const POSTGRES_EPOCH_IN_UNIX_SECONDS: i64 = POSTGRES_EPOCH_IN_UNIX_MICROS / 1_000_000;
 
-/// The current time rounded to `args[0]` digits after the decimal point.
-fn current_time_rounded(args: &[Register]) -> Result<NaiveDateTime> {
+/// The time the transaction started, rounded to `args[0]` digits after the
+/// decimal point.
+fn transaction_time_rounded(
+    context: &ScalarFuncContext<'_>,
+    args: &[Register],
+) -> Result<NaiveDateTime> {
     let precision = int4_arg(args, 0)?;
     // PostgreSQL lowers a precision above 6 to 6 and sends a warning. tursopg
     // sends no warnings, so it refuses such a precision.
@@ -1306,8 +1322,17 @@ fn current_time_rounded(args: &[Register]) -> Result<NaiveDateTime> {
             format!("a precision of {precision} is not supported"),
         ));
     };
-    let micros = Utc::now().timestamp_micros() - POSTGRES_EPOCH_IN_UNIX_MICROS;
+    let micros = micros_since_postgres_epoch(context.statement_times().transaction);
     supported_timestamp(round_to_precision(micros, precision))
+}
+
+/// The timestamp of `instant`.
+fn timestamp_at(instant: WallClockInstant) -> Result<NaiveDateTime> {
+    supported_timestamp(micros_since_postgres_epoch(instant))
+}
+
+fn micros_since_postgres_epoch(instant: WallClockInstant) -> i64 {
+    instant.secs * 1_000_000 + i64::from(instant.micros) - POSTGRES_EPOCH_IN_UNIX_MICROS
 }
 
 /// Rounds microseconds since 2000-01-01 to `precision` digits after the
