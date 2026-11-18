@@ -17,8 +17,7 @@ pub mod catalog;
 pub mod engine;
 
 pub use catalog::{
-    AccessStatement, CatalogApply, CatalogChange, NewOwner, OwnerColumn, RelationChange,
-    RelationName,
+    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
 };
 pub(crate) use engine::EngineDialect;
 
