@@ -2,7 +2,7 @@ mod sqlite_schema_rows;
 
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
-    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_drop_view_row,
+    alloc_sqlite_schema_cursor, create_view_sql, emit_create_internal_table, emit_drop_view_row,
     emit_open_sqlite_schema_cursor, emit_schema_entry, open_sqlite_schema_for_write,
     SchemaEntryType,
 };

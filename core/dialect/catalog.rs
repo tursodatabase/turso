@@ -135,6 +135,8 @@ pub enum CatalogWrite<'a> {
     DropSequence(DropSequence<'a>),
     /// `DROP TABLE`, of a virtual table too.
     DropTable(DropTable<'a>),
+    /// `CREATE VIEW`.
+    CreateView(CreateView<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -253,6 +255,21 @@ pub struct DropTable<'a> {
     /// Two registers that the catalog may overwrite while it deletes its
     /// rows. The statement reads neither before it writes it again.
     pub scratch_regs: [usize; 2],
+}
+
+/// A new view. It has no B-tree.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateView<'a> {
+    /// The namespace of the view in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the view in its namespace.
+    pub name: &'a str,
+    /// The name as the statement spells it.
+    pub written_name: &'a ast::Name,
+    /// The names the statement gives the view's columns. Empty when it
+    /// gives none.
+    pub columns: &'a [ast::IndexedColumn],
+    pub select: &'a ast::Select,
 }
 
 /// What a statement emits after all of its schema writes, so that the
