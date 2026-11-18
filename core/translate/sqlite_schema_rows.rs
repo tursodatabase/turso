@@ -1,17 +1,121 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
-use crate::namespace::NamespaceId;
+use crate::dialect::catalog::{
+    AfterWrites, Catalog, CatalogWrite, CreateTable, TableText, WriteContext,
+};
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::emitter::{
-    emit_cdc_autocommit_commit, emit_cdc_insns, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
+use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
+use turso_parser::ast;
+
+/// The catalog of a SQLite database: a row of `sqlite_schema` per object,
+/// with the SQL text that creates it.
+#[derive(Debug)]
+pub struct SqliteCatalog;
+
+impl Catalog for SqliteCatalog {
+    fn write(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &WriteContext<'_>,
+        change: &CatalogWrite<'_>,
+    ) -> Result<AfterWrites> {
+        match change {
+            CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
+        }
+    }
+}
+
+/// Writes the row of a new table and a row for each of its automatic
+/// indexes.
+fn emit_create_table_rows(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    table: &CreateTable<'_>,
+) -> Result<AfterWrites> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: table.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, table.name);
+    let sql = table_sql(resolver, namespace, table)?;
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.as_ref().map(|x| x.0),
+        SchemaEntryType::Table,
+        &stored_name,
+        &stored_name,
+        table.root_reg,
+        Some(sql),
+    )?;
+    for index in table.automatic_indexes {
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Index,
+            &index.name,
+            &stored_name,
+            index.root_reg,
+            None,
+        )?;
+    }
+
+    Ok(AfterWrites::parse_sqlite_schema_rows(format!(
+        "tbl_name = '{}' AND type != 'trigger'",
+        escape_sql_string_literal(&stored_name)
+    )))
+}
+
+/// The SQL text to store for a new table. The resolver's dialect is the
+/// one the statement was parsed with: the engine's own for an engine schema
+/// statement, which stores plain SQLite text, the connection's otherwise.
+/// The SQLite dialect renders canonical text from the AST; a frontend
+/// dialect keeps its own input text.
+fn table_sql(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table: &CreateTable<'_>,
+) -> Result<String> {
+    let dialect = &resolver.catalog.dialect;
+    let name_in_sql = ast::QualifiedName {
+        namespace: None,
+        name: resolver.name_in_sql(namespace, table.written_name),
+        alias: None,
+    };
+    match table.text {
+        TableText::FromSelect(sql) => Ok(sql.to_string()),
+        TableText::Rewritten => dialect.format_rewritten_table_sql(&ast::Stmt::CreateTable {
+            temporary: table.temporary,
+            if_not_exists: table.if_not_exists,
+            tbl_name: name_in_sql,
+            body: table.body.clone(),
+        }),
+        TableText::Statement(input) => dialect.format_table_sql(input, &name_in_sql, table.body),
+    }
+}
 
 /// Creates one of the engine's own tables in the main database the first
 /// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
