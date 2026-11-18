@@ -95,6 +95,8 @@ pub enum CatalogWrite<'a> {
     RenameTable(RenameTable<'a>),
     /// `ALTER TABLE ... RENAME COLUMN`.
     RenameColumn(RenameColumn<'a>),
+    /// `ALTER TABLE ... ALTER COLUMN`.
+    AlterColumn(AlterColumn<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -230,6 +232,25 @@ pub struct RewrittenView {
     pub name: String,
     /// The new `CREATE VIEW` text.
     pub sql: String,
+}
+
+/// A column that gets a new definition in place of its old one. Its new
+/// name, if it changes, replaces the old one in the table's indexes and in
+/// the foreign keys of other tables.
+#[derive(Debug, Clone, Copy)]
+pub struct AlterColumn<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table.
+    pub table: &'a str,
+    /// The table's name as the statement spells it.
+    pub written_table_name: &'a str,
+    /// The column's name before the statement, as the table has it.
+    pub old_name: &'a str,
+    /// The old name as the statement spells it.
+    pub written_old_name: &'a str,
+    /// The column's new name, type and constraints.
+    pub definition: &'a ast::ColumnDefinition,
 }
 
 /// What a statement emits after all of its schema writes, so that the
