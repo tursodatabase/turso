@@ -2,13 +2,15 @@
 //! express: bound parameters, a database reopen, two commands in one prepared
 //! statement, MVCC, and a query after a failed statement.
 //!
-//! Each test asserts the PostgreSQL result. A test of an open gap has
-//! `#[ignore = "<gap id>: <reason>"]`. Run the open gaps with
-//! `cargo test -p turso_pg_tests --test integration_tests gaps:: -- --ignored`.
-//! When you fix a gap, remove its `#[ignore]`. See postgres/CONTRIBUTING.md.
+//! A test of a gap that matches PostgreSQL asserts the PostgreSQL result. A
+//! test of an open gap has `tursopg_returns_wrong_result` in its name and
+//! asserts the current wrong tursopg result. A comment above it gives the
+//! PostgreSQL result. When you fix a gap, its test fails: change the assert to
+//! the PostgreSQL result and remove `tursopg_returns_wrong_result` from the
+//! name. See postgres/CONTRIBUTING.md.
 //!
 //! Results are rows joined by ` ; ` and cells joined by `|`, or
-//! `ERROR <sqlstate>`. The expected values are the PostgreSQL 18 results in
+//! `ERROR <sqlstate>`. PostgreSQL results are the PostgreSQL 18 results in
 //! the form the embedded API returns them: booleans as `1` and `0`, and
 //! timestamptz in UTC without the offset.
 
@@ -17,9 +19,10 @@ use std::num::NonZero;
 use turso_core::{Numeric, Value};
 
 // A-03 (S1): bool $n param cast (text param)
+// tursopg: boolean text params all cast to false.
+// PostgreSQL: 1|1|0|1
 #[turso_macros::test(views)]
-#[ignore = "A-03: boolean text params all cast to false"]
-fn gap_a_03_bool_n_param_cast_text_param(db: TempDatabase) {
+fn gap_a_03_tursopg_returns_wrong_result_bool_n_param_cast_text_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::boolean, $2::boolean, $3::boolean, $4::boolean",
         params: &[
@@ -31,33 +34,35 @@ fn gap_a_03_bool_n_param_cast_text_param(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "1|1|0|1");
+    assert_eq!(out, "0|0|0|0");
 }
 
 // A-05 (S1): bool invalid param
+// tursopg: an invalid boolean param casts to false instead of failing.
+// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-#[ignore = "A-05: an invalid boolean param casts to false instead of failing"]
-fn gap_a_05_bool_invalid_param(db: TempDatabase) {
+fn gap_a_05_tursopg_returns_wrong_result_bool_invalid_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::boolean",
         params: &[P::Text("maybe")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 22P02");
+    assert_eq!(out, "0");
 }
 
 // A-12 (S1): invalid int param cast
+// tursopg: an invalid bigint param casts to 0 instead of failing.
+// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-#[ignore = "A-12: an invalid bigint param casts to 0 instead of failing"]
-fn gap_a_12_invalid_int_param_cast(db: TempDatabase) {
+fn gap_a_12_tursopg_returns_wrong_result_invalid_int_param_cast(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::bigint",
         params: &[P::Text("abc")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 22P02");
+    assert_eq!(out, "0");
 }
 
 // A-15: int param text -> int arithmetic
@@ -73,29 +78,31 @@ fn gap_a_15_int_param_text_int_arithmetic(db: TempDatabase) {
 }
 
 // A-18 (S1): invalid uuid param cast
+// tursopg: an invalid uuid param is accepted.
+// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-#[ignore = "A-18: an invalid uuid param is accepted"]
-fn gap_a_18_invalid_uuid_param_cast(db: TempDatabase) {
+fn gap_a_18_tursopg_returns_wrong_result_invalid_uuid_param_cast(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::uuid",
         params: &[P::Text("nope")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 22P02");
+    assert_eq!(out, "nope");
 }
 
 // A-29 (S2): numeric $n param
+// tursopg: a numeric(p,s) cast of a param is not supported.
+// PostgreSQL: 12.35
 #[turso_macros::test(views)]
-#[ignore = "A-29: a numeric(p,s) cast of a param is not supported"]
-fn gap_a_29_numeric_n_param(db: TempDatabase) {
+fn gap_a_29_tursopg_returns_wrong_result_numeric_n_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::numeric(10,2)",
         params: &[P::Text("12.345")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "12.35");
+    assert_eq!(out, "ERROR 0A000");
 }
 
 // A-33: timestamptz $n param with offset
@@ -111,29 +118,31 @@ fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
 }
 
 // A-41 (S2): date $n param
+// tursopg: a date cast of a param is not supported.
+// PostgreSQL: 2026-10-08
 #[turso_macros::test(views)]
-#[ignore = "A-41: a date cast of a param is not supported"]
-fn gap_a_41_date_n_param(db: TempDatabase) {
+fn gap_a_41_tursopg_returns_wrong_result_date_n_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::date",
         params: &[P::Text("2026-10-08")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2026-10-08");
+    assert_eq!(out, "ERROR 0A000");
 }
 
 // A-49 (S1): invalid jsonb param
+// tursopg: an invalid jsonb param is accepted.
+// PostgreSQL: ERROR 22P02
 #[turso_macros::test(views)]
-#[ignore = "A-49: an invalid jsonb param is accepted"]
-fn gap_a_49_invalid_jsonb_param(db: TempDatabase) {
+fn gap_a_49_tursopg_returns_wrong_result_invalid_jsonb_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::jsonb",
         params: &[P::Text("{bad")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 22P02");
+    assert_eq!(out, "{bad");
 }
 
 // A-53: = ANY($1::bigint[]) text param
@@ -251,9 +260,12 @@ fn gap_a_69_untyped_1_2026_10_08_14_00_02_into_timestamptz_c(db: TempDatabase) {
 }
 
 // A-70 (S1): insert jsonb text param into jsonb column
+// tursopg: a jsonb param is not normalized.
+// PostgreSQL: {"a": 2, "b": 1}
 #[turso_macros::test(views)]
-#[ignore = "A-70: a jsonb param is not normalized"]
-fn gap_a_70_insert_jsonb_text_param_into_jsonb_column(db: TempDatabase) {
+fn gap_a_70_tursopg_returns_wrong_result_insert_jsonb_text_param_into_jsonb_column(
+    db: TempDatabase,
+) {
     let out = GapCase {
         setup: &["CREATE TABLE t (j jsonb)"],
         sql: "INSERT INTO t VALUES ($1) RETURNING j",
@@ -261,7 +273,7 @@ fn gap_a_70_insert_jsonb_text_param_into_jsonb_column(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, r#"{"a": 2, "b": 1}"#);
+    assert_eq!(out, r#"{"b":1,"a":2}"#);
 }
 
 // A-71: where bool col = $1 text 'true'
@@ -411,9 +423,10 @@ fn gap_b_24_in_list_with_params(db: TempDatabase) {
 }
 
 // B-27 (S2): col > ANY($1::int[])
+// tursopg: > ANY with an array param fails with a syntax error.
+// PostgreSQL: 3
 #[turso_macros::test(views)]
-#[ignore = "B-27: > ANY with an array param fails with a syntax error"]
-fn gap_b_27_col_any_1_int(db: TempDatabase) {
+fn gap_b_27_tursopg_returns_wrong_result_col_any_1_int(db: TempDatabase) {
     let out = GapCase {
         setup: &[
             "CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean)",
@@ -424,7 +437,7 @@ fn gap_b_27_col_any_1_int(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "3");
+    assert_eq!(out, "ERROR 42601");
 }
 
 // B-32: int[] @> $1::int[]
@@ -444,9 +457,10 @@ fn gap_b_32_int_1_int(db: TempDatabase) {
 }
 
 // B-44 (S1): jsonb @> $1::jsonb param
+// tursopg: jsonb @> with a param returns no rows.
+// PostgreSQL: 2
 #[turso_macros::test(views)]
-#[ignore = "B-44: jsonb @> with a param returns no rows"]
-fn gap_b_44_jsonb_1_jsonb_param(db: TempDatabase) {
+fn gap_b_44_tursopg_returns_wrong_result_jsonb_1_jsonb_param(db: TempDatabase) {
     let out = GapCase {
         setup: &[
             "CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean)",
@@ -457,7 +471,7 @@ fn gap_b_44_jsonb_1_jsonb_param(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2");
+    assert_eq!(out, "");
 }
 
 // B-54: jsonb ->  param key
@@ -493,9 +507,10 @@ fn gap_b_89_limit_offset_with_text_params(db: TempDatabase) {
 }
 
 // B-118 (S2): json_populate_recordset
+// tursopg: json_populate_recordset with a row type fails with 42P01.
+// PostgreSQL: 1|a
 #[turso_macros::test(views)]
-#[ignore = "B-118: json_populate_recordset with a row type fails with 42P01"]
-fn gap_b_118_json_populate_recordset(db: TempDatabase) {
+fn gap_b_118_tursopg_returns_wrong_result_json_populate_recordset(db: TempDatabase) {
     let out = GapCase {
         setup: &["CREATE TABLE r (id int, s text)"],
         sql: "SELECT id, s FROM json_populate_recordset(null::r, $1)",
@@ -503,7 +518,7 @@ fn gap_b_118_json_populate_recordset(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "1|a");
+    assert_eq!(out, "ERROR 42P01");
 }
 
 // B-119: json_to_recordset with column defs
@@ -554,16 +569,17 @@ fn gap_d_43_statement_after_error_in_tx_25p02(db: TempDatabase) {
 }
 
 // D-50 (S1): prepared statement with two commands
+// tursopg: a prepared statement with two commands runs the first one.
+// PostgreSQL: ERROR 42601
 #[turso_macros::test(views)]
-#[ignore = "D-50: a prepared statement with two commands runs the first one"]
-fn gap_d_50_prepared_statement_with_two_commands(db: TempDatabase) {
+fn gap_d_50_tursopg_returns_wrong_result_prepared_statement_with_two_commands(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT 1; SELECT 2",
         fk_off: true,
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 42601");
+    assert_eq!(out, "1");
 }
 
 // E-36: schema survives reopen
@@ -668,9 +684,12 @@ fn gap_e_77_ddl_in_a_schema_right_after_create_schema_mvcc(db: TempDatabase) {
 }
 
 // E-78 (S2): CREATE MATERIALIZED VIEW then select (MVCC)
+// tursopg: CREATE MATERIALIZED VIEW is rejected in MVCC mode.
+// PostgreSQL: 1
 #[turso_macros::test(views)]
-#[ignore = "E-78: CREATE MATERIALIZED VIEW is rejected in MVCC mode"]
-fn gap_e_78_create_materialized_view_then_select_mvcc(db: TempDatabase) {
+fn gap_e_78_tursopg_returns_wrong_result_create_materialized_view_then_select_mvcc(
+    db: TempDatabase,
+) {
     let out = GapCase {
         setup: &[
             "CREATE TABLE t (id int)",
@@ -682,7 +701,7 @@ fn gap_e_78_create_materialized_view_then_select_mvcc(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "1");
+    assert_eq!(out, "[SETUP-ERR 42601] ERROR 42P01");
 }
 
 // E-83: enum column rejects an unknown label after reopen
