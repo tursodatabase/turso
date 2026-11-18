@@ -1,0 +1,28 @@
+@database :memory:
+
+test add-column-keeps-inline-unique-constraint-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a CONSTRAINT "My U" UNIQUE ON CONFLICT IGNORE);
+    ALTER TABLE t ADD COLUMN q;
+    SELECT sql LIKE '%CONSTRAINT "My U" UNIQUE ON CONFLICT IGNORE%' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    1
+}
+
+test drop-column-keeps-inline-unique-constraint-name {
+    CREATE TABLE t (a CONSTRAINT "My U" UNIQUE, b, c);
+    ALTER TABLE t DROP COLUMN c;
+    SELECT sql LIKE '%CONSTRAINT "My U" UNIQUE%' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    1
+}
+
+test add-column-quotes-inline-unique-constraint-name {
+    CREATE TABLE t (a CONSTRAINT "odd""name" UNIQUE);
+    ALTER TABLE t ADD COLUMN b;
+    SELECT sql LIKE '%CONSTRAINT "odd""name" UNIQUE%' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    1
+}
