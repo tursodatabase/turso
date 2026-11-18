@@ -47,6 +47,7 @@ mod statement;
 mod statement_lifecycle;
 mod statement_metadata;
 mod statement_reset;
+mod stats;
 mod stmt_journal;
 mod stmt_readonly;
 mod storage;
