@@ -650,8 +650,16 @@ fn join_lhs_and_rhs<'a, 'w>(
                 }
             })
         });
+        // Without these two conditions, allow_hash_join below is false for
+        // every build table, and the checks of the build table only give
+        // values to the debug log.
+        let hash_join_is_possible = !rhs_has_selective_seek && !probe_table_is_prior_build;
+        let log_hash_join_checks = tracing::enabled!(tracing::Level::DEBUG);
 
         for build_table_idx in &lhs_mask {
+            if !hash_join_is_possible && !log_hash_join_checks {
+                break;
+            }
             if build_table_idx != last_lhs_table_idx {
                 continue;
             }
