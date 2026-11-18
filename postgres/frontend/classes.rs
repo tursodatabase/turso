@@ -669,7 +669,7 @@ impl Catalog for PostgresCatalog {
                 owner: NewOwner::Column(_),
                 ..
             } if !writes_class_rows(ctx)? => Ok(()),
-            _ => translate_access_statement(program, ctx.schema, ctx.connection, statement),
+            _ => emit_class_row_access_changes(program, ctx.schema, ctx.connection, statement),
         }
     }
 
@@ -688,7 +688,7 @@ fn change_class_rows(
     if !writes_class_rows(ctx)? {
         return Ok(());
     }
-    translate_relation_changes(program, ctx.schema, ctx.connection, changes)
+    emit_class_row_changes(program, ctx.schema, ctx.connection, changes)
 }
 
 /// Whether the relations of the statement get class rows. Only the
@@ -765,7 +765,7 @@ fn class_rows_of_renamed_table<'a>(table: &RenameTable<'a>) -> Vec<RelationChang
 }
 
 /// A relation that a statement created, dropped or renamed, or a column of
-/// one that it renamed. [`translate_relation_changes`] makes the same change
+/// one that it renamed. [`emit_class_row_changes`] makes the same change
 /// to the class rows.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RelationChange<'a> {
@@ -799,7 +799,7 @@ pub(crate) enum RelationChange<'a> {
 /// row per created relation, owned by the current role, which is what
 /// PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row for a dropped
 /// one; a rename keeps the oid and owner.
-pub(crate) fn translate_relation_changes(
+pub(crate) fn emit_class_row_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
     connection: &Arc<Connection>,
@@ -901,8 +901,7 @@ pub(crate) fn translate_relation_changes(
     Ok(())
 }
 
-/// [`turso_core::Dialect::translate_access_statement`] for the statements
-/// that change a class row. `ALTER ... OWNER TO` sets the owner, with
+/// Emits the bytecode of the [`AccessStatement`]s that change a class row. `ALTER ... OWNER TO` sets the owner, with
 /// PostgreSQL's errors for a missing role (42704) and a catalog relation
 /// (42501). A sequence a serial column owns changes owner with its table
 /// only, as in PostgreSQL: on its own it fails with `cannot change owner of
@@ -911,7 +910,7 @@ pub(crate) fn translate_relation_changes(
 /// which only warns. `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` sets
 /// `relrowsecurity` of the table's row, which a catalog table does not have
 /// (42501).
-pub(crate) fn translate_access_statement(
+fn emit_class_row_access_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
     connection: &Arc<Connection>,
