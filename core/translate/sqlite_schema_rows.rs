@@ -1,21 +1,24 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::catalog::{
-    AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateTable, TableText, WriteContext,
+    AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateTable, DropIndex, TableText,
+    WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
-    emit_cdc_autocommit_commit, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
 use crate::translate::index::canonical_create_index_sql;
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
@@ -34,6 +37,7 @@ impl Catalog for SqliteCatalog {
         match change {
             CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
             CatalogWrite::CreateIndex(index) => emit_create_index_row(program, ctx, index),
+            CatalogWrite::DropIndex(index) => emit_delete_index_row(program, ctx, index),
         }
     }
 }
@@ -160,6 +164,138 @@ fn emit_create_index_row(
         "name = '{}' AND type = 'index'",
         escape_sql_string_literal(&stored_name)
     )))
+}
+
+/// Deletes the row of an index.
+fn emit_delete_index_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    index: &DropIndex<'_>,
+) -> Result<AfterWrites> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: index.namespace,
+    };
+
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+
+    // According to sqlite should emit Null instruction
+    // but why?
+    let null_reg = program.alloc_register();
+    program.emit_null(null_reg, None);
+
+    // String8; r[3] = 'some idx name'
+    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, index.name));
+    // String8; r[4] = 'index'
+    let index_str_reg = program.emit_string8_new_reg("index".to_string());
+
+    // for r[5]=rowid
+    let row_id_reg = program.alloc_register();
+
+    // We're going to use this cursor to search through sqlite_schema
+    let sqlite_table = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+        .unwrap();
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Read sqlite_schema.name into dest_reg
+    let dest_reg = program.alloc_register();
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, dest_reg);
+
+    // if current column is not index_name then jump to Next
+    // skip if sqlite_schema.name != index_name_reg
+    let next_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: index_name_reg,
+        rhs: dest_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::NOCASE,
+    });
+
+    // read type of table
+    // skip if sqlite_schema.type != 'index' (index_str_reg)
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, dest_reg);
+    // if current column is not index then jump to Next
+    program.emit_insn(Insn::Ne {
+        lhs: index_str_reg,
+        rhs: dest_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: row_id_reg,
+    });
+
+    let label_once_end = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: label_once_end,
+    });
+    program.preassign_label_to_next_insn(label_once_end);
+
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
+            Some(emit_cdc_full_record(
+                program,
+                resolver,
+                sqlite_table.columns(),
+                sqlite_schema_cursor_id,
+                row_id_reg,
+            )?)
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::DELETE,
+            cdc_cursor_id,
+            row_id_reg,
+            before_record_reg,
+            None,
+            None,
+            SQLITE_TABLEID,
+        )?;
+    }
+
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(loop_end_label);
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
+    }
+
+    Ok(AfterWrites::none())
 }
 
 /// Gives a cursor for writing `sqlite_schema` of the given database its
