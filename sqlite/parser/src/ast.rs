@@ -1049,7 +1049,7 @@ pub enum UnaryOperator {
 /// `SELECT` statement
 // https://sqlite.org/lang_select.html
 // https://sqlite.org/syntax/factored-select-stmt.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Select {
     /// CTE
@@ -1060,6 +1060,18 @@ pub struct Select {
     pub order_by: Vec<SortedColumn>, // ORDER BY term does not match any column in the result set
     /// `LIMIT`
     pub limit: Option<Limit>,
+}
+
+impl Clone for Select {
+    #[turso_macros::grow_stack_when_low]
+    fn clone(&self) -> Self {
+        Self {
+            with: self.with.clone(),
+            body: self.body.clone(),
+            order_by: self.order_by.clone(),
+            limit: self.limit.clone(),
+        }
+    }
 }
 
 /// `SELECT` body
@@ -1123,13 +1135,23 @@ pub enum OneSelect {
 
 /// `SELECT` ... `FROM` clause
 // https://sqlite.org/syntax/join-clause.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FromClause {
     /// table
     pub select: Box<SelectTable>, // FIXME mandatory
     /// `JOIN`ed tabled
     pub joins: Vec<JoinedSelectTable>,
+}
+
+impl Clone for FromClause {
+    #[turso_macros::grow_stack_when_low]
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            joins: self.joins.clone(),
+        }
+    }
 }
 
 /// `SELECT` distinctness
@@ -2400,6 +2422,19 @@ pub struct With {
     pub recursive: bool,
     /// CTEs
     pub ctes: Vec<CommonTableExpr>,
+}
+
+impl Drop for With {
+    fn drop(&mut self) {
+        drop_ctes(std::mem::take(&mut self.ctes));
+    }
+}
+
+/// A CTE can have its own `WITH` clause, so the drop of nested CTEs recurses
+/// once for each level.
+#[turso_macros::grow_stack_when_low]
+fn drop_ctes(ctes: Vec<CommonTableExpr>) {
+    drop(ctes);
 }
 
 /// CTE materialization

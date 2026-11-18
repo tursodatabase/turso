@@ -73,11 +73,14 @@ struct CteDefinition {
     references_itself: bool,
 }
 
-fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<Vec<CteDefinition>> {
+fn collect_cte_definitions(
+    mut with: With,
+    program: &mut ProgramBuilder,
+) -> Result<Vec<CteDefinition>> {
     let mut definitions = Vec::with_capacity(with.ctes.len());
     let mut referenced_table_names_by_cte = Vec::with_capacity(with.ctes.len());
 
-    for cte in with.ctes {
+    for cte in std::mem::take(&mut with.ctes) {
         let name = normalize_ident(cte.tbl_name.as_str());
         if definitions
             .iter()

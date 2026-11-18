@@ -7337,6 +7337,7 @@ dependencies = [
  "memchr",
  "miette",
  "serde",
+ "stacker",
  "strum",
  "strum_macros",
  "thiserror 2.0.16",

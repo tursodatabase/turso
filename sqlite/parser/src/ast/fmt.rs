@@ -1325,6 +1325,7 @@ impl ToTokens for UnaryOperator {
 
 impl_display_for_to_tokens!(Select);
 impl ToTokens for Select {
+    #[turso_macros::grow_stack_when_low]
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,
@@ -1449,6 +1450,7 @@ impl ToTokens for OneSelect {
 
 impl_display_for_to_tokens!(FromClause);
 impl ToTokens for FromClause {
+    #[turso_macros::grow_stack_when_low]
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
         s: &mut S,

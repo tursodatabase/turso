@@ -2180,6 +2180,7 @@ impl<'a> Parser<'a> {
     /// Parse an expression, bounding both the parser's recursion depth and the
     /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
     /// `last_expr_height` holds the height of the returned expression.
+    #[turso_macros::grow_stack_when_low]
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
@@ -3068,6 +3069,7 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn parse_from_clause(&mut self) -> Result<FromClause> {
         let tok = peek_expect!(
             self,
@@ -3483,6 +3485,7 @@ impl<'a> Parser<'a> {
         })
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn parse_select(&mut self) -> Result<Select> {
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)
@@ -5624,6 +5627,35 @@ mod tests {
             assert!(formatted.contains(comment), "formatted SQL: {formatted}");
             Parser::new(formatted.as_bytes()).next().unwrap().unwrap();
         }
+    }
+
+    #[test]
+    fn deeply_nested_queries_parse_format_and_clone_on_a_small_stack() {
+        let depth = 1000;
+        let queries = [
+            format!(
+                "SELECT * FROM {}(SELECT 1){}",
+                "(SELECT * FROM ".repeat(depth),
+                ")".repeat(depth)
+            ),
+            format!("SELECT * FROM {}t{}", "(".repeat(depth), ")".repeat(depth)),
+            (0..depth).fold("SELECT 1".to_string(), |inner, level| {
+                format!("WITH c{level} AS ({inner}) SELECT * FROM c{level}")
+            }),
+        ];
+
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                for sql in queries {
+                    let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+                    assert_eq!(cmd.to_string(), format!("{sql};"));
+                    drop(cmd.clone());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

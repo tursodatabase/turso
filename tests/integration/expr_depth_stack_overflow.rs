@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
-use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole, IO};
+use rusqlite::types::Value as SqliteValue;
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, SessionRole, IO};
 use turso_parser::MAX_EXPR_DEPTH;
+
+use crate::common::limbo_exec_rows;
 
 struct GenExpr {
     name: &'static str,
@@ -187,4 +190,46 @@ fn upsert_with_a_change_check_per_column_runs_on_a_1_mib_stack() {
     );
 
     run_with_stack(1 << 20, vec![create, upsert.clone(), upsert]).unwrap();
+}
+
+const SMALL_STACK: usize = 1 << 20;
+
+#[test]
+fn long_unary_operator_chains_do_not_overflow_the_stack() {
+    let plus_chain = format!("SELECT {}1", "+".repeat(MAX_EXPR_DEPTH - 1));
+    let minus_chain = format!("SELECT {}1", "- ".repeat(MAX_EXPR_DEPTH - 1));
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| {
+        let mut rows = limbo_exec_rows(conn, &plus_chain);
+        rows.extend(limbo_exec_rows(conn, &minus_chain));
+        rows
+    });
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![SqliteValue::Integer(1)],
+            vec![SqliteValue::Integer(-1)]
+        ]
+    );
+}
+
+fn on_thread_with_stack<T: Send + 'static>(
+    stack_size: usize,
+    work: impl FnOnce(&Arc<Connection>) -> T + Send + 'static,
+) -> T {
+    std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(move || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))
+                .expect("failed to open database");
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .expect("failed to connect");
+            work(&conn)
+        })
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked while running the stack depth test")
 }
