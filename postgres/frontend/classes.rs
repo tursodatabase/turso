@@ -39,9 +39,9 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
-    CreateIndex, CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn,
-    ProgramBuilder, RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value,
-    WriteContext, WriteOrigin,
+    CreateIndex, CursorType, DropIndex, InsertFlags, Insn, LimboError, NewOwner, Numeric,
+    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog,
+    Value, WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -448,6 +448,10 @@ impl Catalog for PostgresCatalog {
         ctx: &WriteContext<'_>,
         change: &CatalogWrite<'_>,
     ) -> turso_core::Result<AfterWrites> {
+        if let CatalogWrite::DropIndex(index) = change {
+            delete_index_class_row(program, ctx, index)?;
+            return SqliteCatalog.write(program, ctx, change);
+        }
         let after_writes = SqliteCatalog.write(program, ctx, change)?;
         if !writes_class_rows(ctx)? {
             return Ok(after_writes);
@@ -471,6 +475,7 @@ impl Catalog for PostgresCatalog {
                 translate_relation_changes(program, ctx.schema, ctx.connection, &changes)?;
             }
             CatalogWrite::CreateIndex(index) => write_index_class_row(program, ctx, index)?,
+            CatalogWrite::DropIndex(_) => unreachable!("DROP INDEX returned above"),
         }
         Ok(after_writes)
     }
@@ -511,6 +516,27 @@ fn write_index_class_row(
             name: index.name,
             kind: RelationKind::Index,
             table: Some(index.table),
+        }],
+    )
+}
+
+/// Deletes the class row of an index, if the index has one. DROP INDEX
+/// deletes it before the engine's `sqlite_schema` row.
+fn delete_index_class_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    index: &DropIndex<'_>,
+) -> turso_core::Result<()> {
+    if !writes_class_rows(ctx)? {
+        return Ok(());
+    }
+    translate_relation_changes(
+        program,
+        ctx.schema,
+        ctx.connection,
+        &[RelationChange::Dropped {
+            namespace: index.namespace,
+            name: index.name,
         }],
     )
 }

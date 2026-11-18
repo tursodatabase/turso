@@ -1,10 +1,9 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
-use crate::dialect::catalog::{CatalogWrite, CreateIndex, WriteContext};
-use crate::dialect::RelationChange;
+use crate::dialect::catalog::{CatalogWrite, CreateIndex, DropIndex, WriteContext};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
-use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
+use crate::namespace::{is_reserved_object_name, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
     Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
@@ -13,7 +12,7 @@ use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
     collate::{key_collation, CollationSeq, TextCollation},
-    emitter::{prepare_cdc_if_necessary, Resolver},
+    emitter::Resolver,
     expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
@@ -41,8 +40,7 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{self, SQLITE_TABLEID};
-use super::sqlite_schema_rows::emit_delete_index_row;
+use super::schema;
 
 pub(super) fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -1452,26 +1450,15 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(
+    let write_context = WriteContext::new(connection, resolver, database_id);
+    let after_writes = resolver.catalog.dialect.catalog().write(
         program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
+        &write_context,
+        &CatalogWrite::DropIndex(DropIndex {
+            namespace: namespace.id,
+            name: &idx_name,
+        }),
     )?;
-
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: &idx_name,
-            }],
-        )?;
-    }
-
-    emit_delete_index_row(program, resolver, namespace, &idx_name, cdc_table)?;
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -1480,6 +1467,7 @@ pub fn translate_drop_index(
         value: current_schema_version as i32 + 1,
         p5: 0,
     });
+    after_writes.emit(program, database_id, None);
 
     let index = maybe_index.unwrap();
     if index.index_method.is_some() && !index.is_backing_btree_index() {
