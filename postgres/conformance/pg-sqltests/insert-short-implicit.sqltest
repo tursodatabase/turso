@@ -1,0 +1,31 @@
+@database :memory:
+
+test implicit-insert-trailing-defaults {
+    CREATE TABLE short_values(id int, y text DEFAULT 'fallback', z int DEFAULT 9);
+    INSERT INTO short_values VALUES (1);
+    INSERT INTO short_values VALUES (2, 'hi'), (3, 'bye');
+    INSERT INTO short_values SELECT 5;
+    INSERT INTO short_values SELECT id+10 FROM short_values WHERE id < 3;
+    SELECT * FROM short_values ORDER BY id;
+}
+expect {
+    1|fallback|9
+    2|hi|9
+    3|bye|9
+    5|fallback|9
+    11|fallback|9
+    12|fallback|9
+}
+
+test implicit-insert-null-subquery-and-explicit-column {
+    CREATE TABLE short_extra(id int, y text DEFAULT 'fallback', z int DEFAULT 9);
+    INSERT INTO short_extra(id) VALUES (20);
+    INSERT INTO short_extra VALUES (21, NULL);
+    INSERT INTO short_extra VALUES ((SELECT 22));
+    SELECT * FROM short_extra ORDER BY id;
+}
+expect {
+    20|fallback|9
+    21||9
+    22|fallback|9
+}
