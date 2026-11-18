@@ -99,6 +99,10 @@ impl Dialect for PostgresDialect {
         Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(turso_sqlite::SqliteDialect)
+    }
+
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
@@ -4437,6 +4441,12 @@ fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
 fn render_expr(expr: &ast::Expr) -> String {
     let mut expr = expr.clone();
     walk_expr_mut(&mut expr, &mut |expr| {
+        // The translator compiles PostgreSQL's binary collations to BINARY.
+        if let ast::Expr::Collate(_, collation) = expr {
+            if collation.as_str().eq_ignore_ascii_case("binary") {
+                *collation = ast::Name::from_string("\"C\"");
+            }
+        }
         if let ast::Expr::FunctionCall { name, args, .. } = expr {
             if args.is_empty() {
                 if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
@@ -4455,7 +4465,7 @@ fn render_expr(expr: &ast::Expr) -> String {
         }
         Ok(WalkControl::Continue)
     })
-    .expect("rewriting role functions does not fail");
+    .expect("rewriting role functions and collations does not fail");
     expr.to_string()
 }
 

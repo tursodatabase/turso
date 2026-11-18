@@ -17,12 +17,14 @@
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
 //! [`Dialect::parse_internal`] of the database's dialect.
 
+#[cfg(test)]
 mod engine;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
 
+#[cfg(test)]
 pub(crate) use engine::EngineDialect;
 
 use crate::{
@@ -213,6 +215,11 @@ pub trait Dialect: Send + Sync + 'static {
     /// Parse the column definition that core keeps for `ALTER TABLE`, such
     /// as `b INTEGER DEFAULT 0`. The text is SQLite syntax in every dialect.
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition>;
+
+    /// The dialect for the statements that core and the frontend run for
+    /// themselves. Those statements are SQLite syntax and expect SQLite
+    /// rules in every database.
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect>;
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.

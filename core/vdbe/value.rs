@@ -1,7 +1,7 @@
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
+    numeric::{format_float, format_float_for_quote, IntegerText, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
@@ -1527,7 +1527,9 @@ impl Value {
                 Value::Null => continue,
                 Value::Text(s) => result.push_str(s.as_str()),
                 Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
-                Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
+                Value::Numeric(Numeric::Integer(i)) => {
+                    result.push_str(IntegerText::new(*i).as_str())
+                }
                 Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),
             }
         }

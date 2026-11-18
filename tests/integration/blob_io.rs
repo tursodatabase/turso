@@ -95,8 +95,14 @@ fn run_blob_program(
     b.emit_halt_err(1, "row not found".to_string());
     b.preassign_label_to_next_insn(l_end);
     conn.with_schema_mut(|schema| b.epilogue(schema)).unwrap();
-    let program = b.build(conn.clone(), false, "blob io test").unwrap();
-    let mut stmt = Statement::new(program, conn.get_pager(), QueryMode::Normal, 0);
+    let program = b.build(conn, false, "blob io test").unwrap();
+    let mut stmt = Statement::new(
+        program,
+        conn.clone(),
+        conn.get_pager(),
+        QueryMode::Normal,
+        0,
+    );
     stmt.run_collect_rows().unwrap()
 }
 
@@ -884,6 +890,10 @@ impl Dialect for SecretTableDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 
     fn role_has_privilege(

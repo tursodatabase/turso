@@ -5993,11 +5993,15 @@ impl BTreeTable {
         &self,
         column_index: usize,
         definition: &ColumnDefinition,
+        schema: &Schema,
     ) -> Result<Column> {
         let mut column = Column::from_definition(
             definition,
             FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, self.is_strict),
         )?;
+        if self.is_strict {
+            column.resolve_custom_type(schema)?;
+        }
         if self.columns()[column_index].primary_key() && !self.primary_key_is_inline {
             if column.is_generated() {
                 bail_parse_error!(
@@ -6472,17 +6476,24 @@ impl BTreeTable {
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
+        let mut has_generated_columns = false;
         {
             let mut guard = self.columns_mut();
             for i in 0..guard.len() {
                 if guard[i].is_generated() {
+                    has_generated_columns = true;
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
                 }
             }
         }
-        self.column_graph()?;
+        // Building the graph finds cycles and self references in generated
+        // columns. A table without generated columns has none of them, so
+        // column_graph() builds its graph on first use.
+        if has_generated_columns {
+            self.column_graph()?;
+        }
         Ok(())
     }
 
@@ -9821,6 +9832,16 @@ mod tests {
         // Any access through columns_mut() wipes the cache, even if we don't mutate.
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_of_table_without_generated_columns_is_built_on_first_use() -> Result<()> {
+        let t = BTreeTable::from_stored_sql(&EngineDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        assert!(t.peek_column_dependencies().is_none());
+
+        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
+        assert!(t.peek_column_dependencies().is_some());
         Ok(())
     }
 

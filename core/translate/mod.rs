@@ -151,7 +151,7 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
+            connection.dialect().get_internal_dialect()
         } else {
             connection.dialect()
         },
@@ -197,7 +197,7 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(connection, change_cnt_on, input)
+    program.build(&connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

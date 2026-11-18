@@ -979,6 +979,10 @@ mod tests {
             EngineDialect.parse_internal_column_definition(sql)
         }
 
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(EngineDialect)
+        }
+
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
             EngineDialect.parse_table_sql(sql, root_page)
         }
