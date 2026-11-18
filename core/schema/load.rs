@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 
 /// One part of reading a schema from the database file. A step runs
 /// statements against the schema read so far and puts their rows into it.
-pub(crate) trait LoadStep: Send {
+pub trait LoadStep: Send {
     /// The next statement of this step, or None when the step has no more.
     /// A step without statements does its work here.
     fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>>;
@@ -41,7 +41,7 @@ pub(crate) trait LoadStep: Send {
 }
 
 /// A statement of a [`LoadStep`].
-pub(crate) struct LoadQuery {
+pub struct LoadQuery {
     sql: String,
     origin: StatementOrigin,
 }
@@ -49,7 +49,7 @@ pub(crate) struct LoadQuery {
 impl LoadQuery {
     /// A read of an engine table, as
     /// [`Connection::prepare_engine_metadata_read`] prepares it.
-    pub(crate) fn engine_metadata_read(sql: impl Into<String>) -> Self {
+    pub fn engine_metadata_read(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
             origin: StatementOrigin::EngineMetadataRead,
@@ -57,7 +57,7 @@ impl LoadQuery {
     }
 
     /// A helper statement, as [`Connection::prepare_internal`] prepares it.
-    pub(crate) fn internal_helper(sql: impl Into<String>) -> Self {
+    pub fn internal_helper(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
             origin: StatementOrigin::InternalHelper,
@@ -67,13 +67,13 @@ impl LoadQuery {
 
 /// Where a statement of a [`LoadStep`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueryFailure {
+pub enum QueryFailure {
     Prepare,
     Read,
 }
 
 /// A schema that is being read.
-pub(crate) struct SchemaLoad {
+pub struct SchemaLoad {
     /// The connection or the database may share this schema. A step that
     /// changes it then changes a copy, which [`Schema::try_make_mut`] makes.
     schema: Arc<Schema>,
@@ -101,11 +101,11 @@ impl SchemaLoad {
         }
     }
 
-    pub(crate) fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    pub(crate) fn schema_mut(&mut self) -> Result<&mut Schema> {
+    pub fn schema_mut(&mut self) -> Result<&mut Schema> {
         Ok(Schema::try_make_mut(&mut self.schema)?)
     }
 }
