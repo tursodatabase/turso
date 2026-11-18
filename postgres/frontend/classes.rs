@@ -39,9 +39,9 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
-    CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn, ProgramBuilder,
-    RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value, WriteContext,
-    WriteOrigin,
+    CreateIndex, CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn,
+    ProgramBuilder, RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value,
+    WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -470,6 +470,7 @@ impl Catalog for PostgresCatalog {
                 }
                 translate_relation_changes(program, ctx.schema, ctx.connection, &changes)?;
             }
+            CatalogWrite::CreateIndex(index) => write_index_class_row(program, ctx, index)?,
         }
         Ok(after_writes)
     }
@@ -493,6 +494,25 @@ fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
         ));
     }
     Ok(ctx.database_id == MAIN_DB_ID)
+}
+
+/// Writes the class row of a new index.
+fn write_index_class_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    index: &CreateIndex<'_>,
+) -> turso_core::Result<()> {
+    translate_relation_changes(
+        program,
+        ctx.schema,
+        ctx.connection,
+        &[RelationChange::Created {
+            namespace: index.namespace,
+            name: index.name,
+            kind: RelationKind::Index,
+            table: Some(index.table),
+        }],
+    )
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
