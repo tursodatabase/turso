@@ -34,6 +34,22 @@ pub trait Catalog: Send + Sync {
         change: &CatalogWrite<'_>,
     ) -> Result<AfterWrites>;
 
+    /// Emits the bytecode that stores what `statement` changes: roles,
+    /// owners, privileges or policies. A catalog that stores none refuses
+    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`,
+    /// `ALTER SEQUENCE ... OWNED BY`, `GRANT`, `REVOKE`,
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY` and
+    /// `DROP POLICY`.
+    fn write_access(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &WriteContext<'_>,
+        statement: &AccessStatement<'_>,
+    ) -> Result<()> {
+        let _ = (program, ctx);
+        Err(statement.not_supported())
+    }
+
     /// The steps that read what this catalog stores besides the engine's own
     /// tables. They run after the engine's steps, when a database is opened
     /// and when a connection reads its schema again.
@@ -568,8 +584,8 @@ pub enum RelationChange<'a> {
 }
 
 /// A statement about roles, ownership, privileges or row-level security.
-/// The engine stores none of these; the dialect does all of the work in
-/// [`Dialect::translate_access_statement`](super::Dialect::translate_access_statement).
+/// The engine stores none of these; the dialect's catalog does all of the
+/// work in [`Catalog::write_access`].
 #[derive(Debug, Clone, Copy)]
 pub enum AccessStatement<'a> {
     /// Whom the relation belongs to from now on.

@@ -2073,12 +2073,12 @@ fn translate_alter_owner(
 
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_access_statement(
-        program,
-        resolver.schema(),
-        connection,
-        &statement,
-    )?;
+    let write_context = WriteContext::new(connection, resolver, namespace.database_id);
+    resolver
+        .catalog
+        .dialect
+        .catalog()
+        .write_access(program, &write_context, &statement)?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
 }
