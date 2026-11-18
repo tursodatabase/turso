@@ -6,7 +6,7 @@ use crate::types::{TextRef, TextSubtype, Value};
 use crate::vdbe::affinity::is_space;
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::LimboError::InvalidModifier;
-use crate::{Result, ValueRef};
+use crate::{turso_debug_assert, Result, ValueRef};
 // chrono isn't used more due to incompatibility with sqlite
 use chrono::{Local, Offset, TimeZone};
 use std::borrow::Cow;
@@ -187,21 +187,22 @@ impl DateTime {
 }
 
 fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32, &str)> {
-    if z.len() < digits {
-        return None;
+    turso_debug_assert!(
+        (1..=9).contains(&digits),
+        "an i32 holds every number of 1 to 9 digits"
+    );
+    let digit_bytes = z.as_bytes().get(..digits)?;
+    let mut val = 0i32;
+    for &byte in digit_bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + i32::from(byte - b'0');
     }
-    if !z.is_char_boundary(digits) {
-        return None;
-    }
-    let bytes = z.as_bytes();
-    if !bytes.iter().take(digits).all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let slice = &z[..digits];
-    let val = slice.parse::<i32>().ok()?;
     if val < min_val || val > max_val {
         return None;
     }
+    // The bytes before `digits` are ASCII, so `digits` is a char boundary.
     Some((val, &z[digits..]))
 }
 
@@ -1521,6 +1522,27 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
 /// Append `value` as `write!(res, "{value:0width$}")` does: zero padded to
 /// `width` characters, with the sign counted in the width.
 fn push_zero_padded(res: &mut String, value: i64, width: usize) {
+    // Most date and time fields are two or four digits with no sign.
+    match (width, u16::try_from(value)) {
+        (2, Ok(value @ 0..=99)) => push_two_digits(res, value),
+        (4, Ok(value @ 0..=9999)) => {
+            push_two_digits(res, value / 100);
+            push_two_digits(res, value % 100);
+        }
+        _ => push_zero_padded_any_width(res, value, width),
+    }
+}
+
+/// Append `value`, which is less than 100, as two digits.
+fn push_two_digits(res: &mut String, value: u16) {
+    let digit = |digit: u16| {
+        char::from_digit(u32::from(digit), 10).expect("a number less than 100 has two digits")
+    };
+    res.push(digit(value / 10));
+    res.push(digit(value % 10));
+}
+
+fn push_zero_padded_any_width(res: &mut String, value: i64, width: usize) {
     let mut buf = [0u8; 20];
     let digits = crate::numeric::write_decimal_digits(&mut buf, value.unsigned_abs());
     let negative = value < 0;
