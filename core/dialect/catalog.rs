@@ -7,7 +7,13 @@
 use crate::{
     namespace::NamespaceId,
     schema::{RelationKind, Schema},
-    translate::{emitter::Resolver, sqlite_schema_rows::open_sqlite_schema_for_write},
+    translate::{
+        emitter::Resolver,
+        sqlite_schema_rows::{
+            alloc_sqlite_schema_cursor, emit_open_sqlite_schema_cursor,
+            open_sqlite_schema_for_write,
+        },
+    },
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Connection, LimboError, Result, Value,
 };
@@ -39,6 +45,8 @@ pub struct WriteContext<'a> {
     pub origin: WriteOrigin,
     pub(crate) resolver: &'a Resolver<'a>,
     sqlite_schema_cursor: Cell<Option<usize>>,
+    /// A cursor for `sqlite_schema` that has a number and is not open yet.
+    unopened_sqlite_schema_cursor: Cell<Option<usize>>,
 }
 
 impl<'a> WriteContext<'a> {
@@ -59,6 +67,7 @@ impl<'a> WriteContext<'a> {
             origin,
             resolver,
             sqlite_schema_cursor: Cell::new(None),
+            unopened_sqlite_schema_cursor: Cell::new(None),
         }
     }
 
@@ -68,9 +77,33 @@ impl<'a> WriteContext<'a> {
         if let Some(cursor_id) = self.sqlite_schema_cursor.get() {
             return cursor_id;
         }
-        let cursor_id = open_sqlite_schema_for_write(program, self.resolver, self.database_id);
+        let cursor_id = match self.unopened_sqlite_schema_cursor.take() {
+            Some(cursor_id) => {
+                emit_open_sqlite_schema_cursor(program, cursor_id, self.database_id);
+                cursor_id
+            }
+            None => open_sqlite_schema_for_write(program, self.resolver, self.database_id),
+        };
         self.sqlite_schema_cursor.set(Some(cursor_id));
         cursor_id
+    }
+
+    /// Gives the statement's `sqlite_schema` cursor its number now, for a
+    /// statement whose cursor numbers depend on it, without opening it.
+    /// [`Self::sqlite_schema_cursor`] opens it on its first call.
+    pub(crate) fn alloc_sqlite_schema_cursor(&self, program: &mut ProgramBuilder) {
+        assert!(
+            self.sqlite_schema_cursor.get().is_none()
+                && self.unopened_sqlite_schema_cursor.get().is_none(),
+            "the statement already has a sqlite_schema cursor"
+        );
+        let cursor_id = alloc_sqlite_schema_cursor(program, self.resolver, self.database_id);
+        self.unopened_sqlite_schema_cursor.set(Some(cursor_id));
+    }
+
+    /// The statement's `sqlite_schema` cursor, if a write opened it.
+    pub(crate) fn open_sqlite_schema_cursor(&self) -> Option<usize> {
+        self.sqlite_schema_cursor.get()
     }
 }
 
@@ -91,6 +124,8 @@ pub enum CatalogWrite<'a> {
     /// `CREATE TABLE`, or `CREATE TABLE ... AS SELECT` before its rows are
     /// inserted.
     CreateTable(CreateTable<'a>),
+    /// `CREATE INDEX`, before the index is filled.
+    CreateIndex(CreateIndex<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -136,6 +171,28 @@ pub struct AutomaticIndex {
     /// The name the engine gave the index, unique in the database.
     pub name: String,
     /// Register that holds the root page of the index's B-tree.
+    pub root_reg: usize,
+}
+
+/// A new index whose B-tree, or whose index method's storage, the statement
+/// has already emitted the creation of.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateIndex<'a> {
+    /// The namespace of the index and of its table in the database the
+    /// statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the index in its namespace.
+    pub name: &'a str,
+    /// The index name as the statement spells it.
+    pub written_name: &'a ast::Name,
+    /// The normalized name of the table the index is on.
+    pub table: &'a str,
+    /// The table name as the statement spells it.
+    pub written_table: &'a ast::Name,
+    /// The `CREATE INDEX` statement.
+    pub statement: &'a ast::Stmt,
+    /// Register that holds the root page of the index's B-tree, or 0 for an
+    /// index whose index method stores it elsewhere.
     pub root_reg: usize,
 }
 
