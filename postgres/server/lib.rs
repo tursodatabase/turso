@@ -617,6 +617,9 @@ fn execute_query(
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
+    let text_types: Vec<turso_pg::TextType> = (0..stmt.num_columns())
+        .map(|i| turso_pg::TextType::of_column(stmt, i))
+        .collect();
     let mut encode_failed = false;
 
     let result = stmt.run_with_row_callback(|row| {
@@ -626,7 +629,7 @@ fn execute_query(
                 .get(i)
                 .map(|fi| (fi.datatype().clone(), fi.format()))
                 .unwrap_or((Type::TEXT, FieldFormat::Text));
-            encode_value(&mut encoder, val, &pg_type, format).inspect_err(|_| {
+            encode_value(&mut encoder, val, &pg_type, format, text_types[i]).inspect_err(|_| {
                 encode_failed = true;
             })?;
         }
@@ -864,64 +867,30 @@ fn encode_value(
     val: &Value,
     pg_type: &Type,
     format: FieldFormat,
+    text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     match format {
-        FieldFormat::Binary => encode_binary(encoder, val, pg_type),
-        FieldFormat::Text => encode_text(encoder, val, pg_type)
+        FieldFormat::Binary => encode_binary(encoder, val, pg_type, text_type),
+        FieldFormat::Text => encode_text(encoder, val, text_type)
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
     }
 }
 
 /// Writes `val` in text format, whatever format the column's header names.
-fn encode_text(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> PgWireResult<()> {
-    use turso_core::Numeric::{Float, Integer};
-    let format = FieldFormat::Text;
-    let options = FormatOptions::default();
-    match val {
-        Value::Null => {
-            encoder.encode_field_with_type_and_format(&None::<i8>, pg_type, format, &options)
-        }
-        // Boolean columns: encode as true/false instead of 0/1
-        Value::Numeric(Integer(i)) if *pg_type == Type::BOOL => {
-            encoder.encode_field_with_type_and_format(&(*i != 0), pg_type, format, &options)
-        }
-        Value::Numeric(Integer(i)) => {
-            encoder.encode_field_with_type_and_format(i, pg_type, format, &options)
-        }
-        Value::Numeric(Float(f)) => {
-            encoder.encode_field_with_type_and_format(&f64::from(*f), pg_type, format, &options)
-        }
-        Value::Text(t) => {
-            let text = t.value.as_ref();
-            // For TIMESTAMPTZ columns, ensure timezone info is present so clients
-            // parse the value correctly (as UTC, not local time).
-            // TIMESTAMP (without TZ) should NOT have timezone suffix.
-            if *pg_type == Type::TIMESTAMPTZ
-                && !text.contains('+')
-                && !text.contains('Z')
-                && !text.ends_with("-00")
-            {
-                let with_tz = format!("{text}+00");
-                encoder.encode_field_with_type_and_format(
-                    &with_tz.as_str(),
-                    pg_type,
-                    format,
-                    &options,
-                )
-            } else if pg_type.name().starts_with('_') {
-                // Array types: pgwire's to_sql_text quotes strings containing
-                // {, }, or commas when the type is Kind::Array. Since we store
-                // array values as pre-formatted PG array literals (e.g.
-                // "{1,2,3}"), encode with Type::TEXT to bypass the quoting.
-                encoder.encode_field_with_type_and_format(&text, &Type::TEXT, format, &options)
-            } else {
-                encoder.encode_field_with_type_and_format(&text, pg_type, format, &options)
-            }
-        }
-        Value::Blob(b) => {
-            encoder.encode_field_with_type_and_format(&b.as_slice(), pg_type, format, &options)
-        }
-    }
+fn encode_text(
+    encoder: &mut DataRowEncoder,
+    val: &Value,
+    text_type: turso_pg::TextType,
+) -> PgWireResult<()> {
+    let text = turso_pg::value_text(val, text_type);
+    // pgwire writes a string as it is for Type::TEXT. For an array type it
+    // would quote the string, which already is an array literal like {1,2,3}.
+    encoder.encode_field_with_type_and_format(
+        &text.as_deref(),
+        &Type::TEXT,
+        FieldFormat::Text,
+        &FormatOptions::default(),
+    )
 }
 
 /// Binary format writes a value in the encoding of its column's type, not of
@@ -932,13 +901,14 @@ fn encode_binary(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
     use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
-        (Text, _) => encode_text(encoder, val, pg_type),
+        (Text, _) => encode_text(encoder, val, text_type),
         (_, Value::Null) => encoder.encode_field(&None::<i8>),
         (Bool, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i != 0)),
         (Int4, Value::Numeric(Integer(i))) => match i32::try_from(*i) {
@@ -1471,6 +1441,7 @@ mod tests {
                     &rows[0][0],
                     fields[0].datatype(),
                     fields[0].format(),
+                    turso_pg::TextType::of_column(&stmt, 0),
                 )
                 .unwrap();
                 assert_eq!(&encoder.finish().unwrap().data[..], expected, "{sql}");
@@ -1693,6 +1664,7 @@ mod tests {
                     &rows[0][0],
                     fields[0].datatype(),
                     fields[0].format(),
+                    turso_pg::TextType::of_column(&stmt, 0),
                 )
                 .unwrap();
                 let row = encoder.finish().unwrap();
@@ -1810,6 +1782,7 @@ mod tests {
             &rows[0][0],
             fields[0].datatype(),
             fields[0].format(),
+            turso_pg::TextType::of_column(&stmt, 0),
         )
         .unwrap();
         assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");

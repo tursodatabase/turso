@@ -139,6 +139,8 @@ jobs:
         run: make -C postgres/conformance build-runner
       - name: Run tests
         run: make -C postgres/conformance run
+      - name: Run tests (turso_pg embedded, without the pgwire server)
+        run: make -C postgres/conformance run-embedded
 
   sqltest-postgres:
     name: Run SQL tests (PostgreSQL)
