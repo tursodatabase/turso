@@ -21,6 +21,7 @@ pub use catalog::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateTable,
     NewOwner, OwnerColumn, RelationChange, RelationName, TableText, WriteContext, WriteOrigin,
 };
+pub use catalog::{RenameTable, RenamedIndex, TempTriggerOfRenamedTable};
 pub(crate) use engine::EngineDialect;
 
 use crate::{

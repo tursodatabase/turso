@@ -91,6 +91,8 @@ pub enum CatalogWrite<'a> {
     /// `CREATE TABLE`, or `CREATE TABLE ... AS SELECT` before its rows are
     /// inserted.
     CreateTable(CreateTable<'a>),
+    /// `ALTER TABLE ... RENAME TO`.
+    RenameTable(RenameTable<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -137,6 +139,52 @@ pub struct AutomaticIndex {
     pub name: String,
     /// Register that holds the root page of the index's B-tree.
     pub root_reg: usize,
+}
+
+/// A table that gets a new name in the same namespace. Everything stored
+/// that names the table changes with it: its indexes, the foreign keys and
+/// checks of other tables, triggers and views.
+#[derive(Debug, Clone, Copy)]
+pub struct RenameTable<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table before the statement.
+    pub old_name: &'a str,
+    /// The normalized name of the table after the statement.
+    pub new_name: &'a str,
+    /// The old name as the statement spells it.
+    pub written_old_name: &'a str,
+    /// The new name as the statement spells it.
+    pub written_new_name: &'a str,
+    /// Whether the table is a virtual table, which has no B-tree, no
+    /// indexes and no triggers.
+    pub is_virtual: bool,
+    /// The automatic indexes of the table. Their names contain the table's
+    /// name, so they are renamed with it.
+    pub automatic_indexes: &'a [RenamedIndex],
+    /// The triggers of the temp database whose text names the table.
+    pub temp_triggers: &'a [TempTriggerOfRenamedTable],
+    /// The text of the statement, for change data capture.
+    pub statement: &'a str,
+}
+
+/// An automatic index whose name changes with the name of its table.
+#[derive(Debug, Clone)]
+pub struct RenamedIndex {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// A trigger of the temp database whose text names a table of another
+/// database that is renamed.
+#[derive(Debug, Clone)]
+pub struct TempTriggerOfRenamedTable {
+    pub name: String,
+    /// The `CREATE TRIGGER` text with the table's new name.
+    pub sql: String,
+    /// Whether the trigger is on the renamed table. If not, only its body
+    /// names the table.
+    pub is_on_the_table: bool,
 }
 
 /// What a statement emits after all of its schema writes, so that the

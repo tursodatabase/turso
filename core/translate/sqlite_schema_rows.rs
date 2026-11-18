@@ -11,6 +11,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
+use crate::translate::sqlite_schema_alter_rows::emit_rename_table_rows;
 use crate::translate::ProgramBuilder;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
@@ -32,6 +33,7 @@ impl Catalog for SqliteCatalog {
     ) -> Result<AfterWrites> {
         match change {
             CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
+            CatalogWrite::RenameTable(table) => emit_rename_table_rows(program, ctx, table),
         }
     }
 }

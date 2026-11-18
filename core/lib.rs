@@ -152,6 +152,7 @@ pub use dialect::{
     Dialect, NewOwner, OwnerColumn, RelationChange, RelationName, SqliteCatalog, TableText,
     WriteContext, WriteOrigin,
 };
+pub use dialect::{RenameTable, RenamedIndex, TempTriggerOfRenamedTable};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
     SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,

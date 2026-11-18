@@ -40,8 +40,8 @@ use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
     CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn, ProgramBuilder,
-    RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value, WriteContext,
-    WriteOrigin,
+    RegisterOrLiteral, RelationChange, RelationName, RenameTable, SqliteCatalog, Value,
+    WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -449,6 +449,9 @@ impl Catalog for PostgresCatalog {
         change: &CatalogWrite<'_>,
     ) -> turso_core::Result<AfterWrites> {
         let after_writes = SqliteCatalog.write(program, ctx, change)?;
+        if !changes_class_rows(change) {
+            return Ok(after_writes);
+        }
         if !writes_class_rows(ctx)? {
             return Ok(after_writes);
         }
@@ -470,6 +473,7 @@ impl Catalog for PostgresCatalog {
                 }
                 translate_relation_changes(program, ctx.schema, ctx.connection, &changes)?;
             }
+            CatalogWrite::RenameTable(table) => rename_class_rows_of_table(program, ctx, table)?,
         }
         Ok(after_writes)
     }
@@ -493,6 +497,37 @@ fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
         ));
     }
     Ok(ctx.database_id == MAIN_DB_ID)
+}
+
+/// Whether the class table stores anything that `change` changes. A
+/// virtual table has no class row.
+fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
+    match change {
+        CatalogWrite::RenameTable(table) => !table.is_virtual,
+        _ => true,
+    }
+}
+
+/// Gives the class rows of a renamed table and of its automatic indexes
+/// their new names.
+fn rename_class_rows_of_table(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    table: &RenameTable<'_>,
+) -> turso_core::Result<()> {
+    let mut changes = vec![RelationChange::Renamed {
+        namespace: table.namespace,
+        old_name: table.old_name,
+        new_name: table.new_name,
+    }];
+    for index in table.automatic_indexes {
+        changes.push(RelationChange::Renamed {
+            namespace: table.namespace,
+            old_name: &index.old_name,
+            new_name: &index.new_name,
+        });
+    }
+    translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
