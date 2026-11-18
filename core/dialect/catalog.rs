@@ -128,6 +128,8 @@ pub enum CatalogWrite<'a> {
     CreateIndex(CreateIndex<'a>),
     /// `DROP INDEX`, before the index's B-tree is destroyed.
     DropIndex(DropIndex<'a>),
+    /// `CREATE SEQUENCE`.
+    CreateSequence(CreateSequence<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -204,6 +206,16 @@ pub struct DropIndex<'a> {
     /// The namespace of the index in the database the statement changes.
     pub namespace: NamespaceId,
     /// The normalized name of the index in its namespace.
+    pub name: &'a str,
+}
+
+/// A new sequence. Its values are in a backing table, which is an engine
+/// table that the statement creates itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateSequence<'a> {
+    /// The namespace of the sequence in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the sequence in its namespace.
     pub name: &'a str,
 }
 
