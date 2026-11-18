@@ -91,6 +91,8 @@ pub enum CatalogWrite<'a> {
     /// `CREATE TABLE`, or `CREATE TABLE ... AS SELECT` before its rows are
     /// inserted.
     CreateTable(CreateTable<'a>),
+    /// `CREATE SEQUENCE`.
+    CreateSequence(CreateSequence<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -137,6 +139,16 @@ pub struct AutomaticIndex {
     pub name: String,
     /// Register that holds the root page of the index's B-tree.
     pub root_reg: usize,
+}
+
+/// A new sequence. Its values are in a backing table, which is an engine
+/// table that the statement creates itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateSequence<'a> {
+    /// The namespace of the sequence in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the sequence in its namespace.
+    pub name: &'a str,
 }
 
 /// What a statement emits after all of its schema writes, so that the

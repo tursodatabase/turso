@@ -11,6 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
+use crate::dialect::catalog::{CatalogWrite, CreateSequence, WriteContext};
 use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
@@ -1043,7 +1044,8 @@ pub fn translate_create_sequence(
         cycle,
     )?;
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
+    let write_context = WriteContext::new(connection, resolver, database_id);
+    let sqlite_schema_cursor_id = write_context.sqlite_schema_cursor(program);
 
     emit_sequence_backing_table(
         program,
@@ -1058,21 +1060,14 @@ pub fn translate_create_sequence(
         seq.cycle,
     )?;
 
-    // The sequence is a relation of the dialect's; its backing table is an
-    // engine object and is not.
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_name,
-                kind: crate::schema::RelationKind::Sequence,
-                table: None,
-            }],
-        )?;
-    }
+    let after_writes = resolver.catalog.dialect.catalog().write(
+        program,
+        &write_context,
+        &CatalogWrite::CreateSequence(CreateSequence {
+            namespace: namespace.id,
+            name: &normalized_name,
+        }),
+    )?;
 
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
@@ -1095,6 +1090,8 @@ pub fn translate_create_sequence(
         value: schema_cookie as i32 + 1,
         p5: 0,
     });
+
+    after_writes.emit(program, database_id, None);
 
     Ok(())
 }

@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use turso_core::dialect::catalog::CreateSequence;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
@@ -470,6 +471,9 @@ impl Catalog for PostgresCatalog {
                 }
                 translate_relation_changes(program, ctx.schema, ctx.connection, &changes)?;
             }
+            CatalogWrite::CreateSequence(sequence) => {
+                emit_create_sequence_class_row(program, ctx, sequence)?
+            }
         }
         Ok(after_writes)
     }
@@ -493,6 +497,24 @@ fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
         ));
     }
     Ok(ctx.database_id == MAIN_DB_ID)
+}
+
+fn emit_create_sequence_class_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    sequence: &CreateSequence<'_>,
+) -> turso_core::Result<()> {
+    translate_relation_changes(
+        program,
+        ctx.schema,
+        ctx.connection,
+        &[RelationChange::Created {
+            namespace: sequence.namespace,
+            name: sequence.name,
+            kind: RelationKind::Sequence,
+            table: None,
+        }],
+    )
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
