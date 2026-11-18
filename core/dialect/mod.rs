@@ -22,6 +22,7 @@ pub use catalog::{
     CreateMaterializedView, CreateTable, CreateView, DropIndex, DropView, NewOwner, OwnerColumn,
     RelationChange, RelationName, TableText, WriteContext, WriteOrigin,
 };
+pub use catalog::{RenameColumn, RewrittenTrigger, RewrittenView};
 pub use catalog::{RenameTable, RenamedIndex, TempTriggerOfRenamedTable};
 pub(crate) use engine::EngineDialect;
 

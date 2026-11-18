@@ -548,6 +548,17 @@ impl Catalog for PostgresCatalog {
             )?,
             CatalogWrite::DropView(_) => unreachable!("DROP VIEW returned above"),
             CatalogWrite::RenameTable(table) => rename_class_rows_of_table(program, ctx, table)?,
+            CatalogWrite::RenameColumn(column) => translate_relation_changes(
+                program,
+                ctx.schema,
+                ctx.connection,
+                &[RelationChange::ColumnRenamed {
+                    namespace: column.namespace,
+                    table: column.table,
+                    old_name: column.old_name,
+                    new_name: column.new_name.as_str(),
+                }],
+            )?,
         }
         Ok(after_writes)
     }
@@ -715,10 +726,12 @@ fn write_created_view_class_row(
 }
 
 /// Whether the class table stores anything that `change` changes. A
-/// virtual table has no class row.
+/// virtual table has no class row, and a column that keeps its name owns
+/// the same sequences as before.
 fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
     match change {
         CatalogWrite::RenameTable(table) => !table.is_virtual,
+        CatalogWrite::RenameColumn(column) => column.old_name != column.new_name.as_str(),
         _ => true,
     }
 }
