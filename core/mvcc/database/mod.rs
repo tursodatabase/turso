@@ -1,9 +1,10 @@
 use crate::alloc::{
-    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
-    TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
+    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator, TursoVecInExt,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::sqlite_schema_row::{types_table_root_page, SqliteSchemaRow};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -43,11 +44,8 @@ use crate::PageSize;
 use crate::Result;
 #[cfg(feature = "conn_raw_api")]
 use crate::Value;
-use crate::ValueRef;
 use crate::{io::FileSyncType, io_yield_one, return_if_io};
-use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
-};
+use crate::{turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable};
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -79,7 +77,7 @@ use super::persistent_storage::logical_log::{
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
     is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
-    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
+    PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
 #[cfg(test)]
@@ -702,11 +700,12 @@ fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllo
             if row_version.end().is_some() {
                 continue;
             }
-            let Ok(row) = portable_schema_row_from_record(row_version.payload(entry.key())) else {
+            let Ok(row) = SqliteSchemaRow::from_record_bytes(row_version.payload(entry.key()))
+            else {
                 continue;
             };
-            if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
-                return Some(row.name);
+            if row.root_page == rootpage || row.root_page == alternate_rootpage {
+                return Some(row.name.to_string());
             }
         }
     }
@@ -2830,7 +2829,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         ..
                     } if *table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let rowid = rowid.row_id.to_int_or_panic();
-                        let row = portable_schema_row_from_record(record_bytes)?;
+                        let row = SqliteSchemaRow::from_record_bytes(record_bytes)?;
                         has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(rowid);
                         schema_upserts.insert(rowid, row);
@@ -2846,7 +2845,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                             ));
                         }
                         let schema_rowid = rowid.row_id.to_int_or_panic();
-                        let row = portable_schema_row_from_record(record_bytes)?;
+                        let row = SqliteSchemaRow::from_record_bytes(record_bytes)?;
                         has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(schema_rowid);
                         schema_deletes.insert(schema_rowid, row);
@@ -2874,17 +2873,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (Some(old_row), Some(new_row)) => {
                         if is_portable_table_schema_row(old_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(old_row.rootpage),
+                                portable_table_id_from_rootpage(old_row.root_page),
                                 PortableTableRef {
-                                    name: old_row.name.clone(),
+                                    name: old_row.name.to_string(),
                                 },
                             );
                         }
                         if is_portable_table_schema_row(new_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(new_row.rootpage),
+                                portable_table_id_from_rootpage(new_row.root_page),
                                 PortableTableRef {
-                                    name: new_row.name.clone(),
+                                    name: new_row.name.to_string(),
                                 },
                             );
                         }
@@ -2892,9 +2891,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (None, Some(new_row)) => {
                         if is_portable_table_schema_row(new_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(new_row.rootpage),
+                                portable_table_id_from_rootpage(new_row.root_page),
                                 PortableTableRef {
-                                    name: new_row.name.clone(),
+                                    name: new_row.name.to_string(),
                                 },
                             );
                         }
@@ -2902,9 +2901,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     (Some(old_row), None) => {
                         if is_portable_table_schema_row(old_row) {
                             table_refs_by_id.insert(
-                                portable_table_id_from_rootpage(old_row.rootpage),
+                                portable_table_id_from_rootpage(old_row.root_page),
                                 PortableTableRef {
-                                    name: old_row.name.clone(),
+                                    name: old_row.name.to_string(),
                                 },
                             );
                         }
@@ -4244,8 +4243,7 @@ pub enum RecoverLogicalLogState {
 pub struct RecoverCtx {
     reader: Box<StreamingLogicalLogReader>,
     preserved_table_valued_functions: Vec<Arc<crate::vtab::VirtualTable>>,
-    /// Fallback schema cookie (pre-read) used by `recover_build_schema` only
-    /// when `global_header` is unset.
+    /// Schema cookie of the database file header, for when `global_header` is unset.
     cookie: u32,
     persistent_tx_ts_max: u64,
     replay_cutoff_ts: u64,
@@ -9517,133 +9515,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .unwrap_or(root_page)
     }
 
-    /// Build an `Arc<Schema>` from a set of sqlite_schema rows (keyed by rowid)
-    /// and the CREATE TYPE statements `type_sqls`. Used by the checkpoint's
-    /// snapshot-consistent `BuildLocalSchemaView` (btree + MVCC-delta merge at
-    /// snapshot_ts).
-    pub(crate) fn build_schema_from_rows(
-        &self,
-        connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecordRef<'static>>,
-        type_sqls: &[String],
-        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) -> Result<Arc<Schema>> {
-        let pager = connection.pager.load().clone();
-        let cookie = self
-            .global_header
-            .read()
-            .as_ref()
-            .map(|header| header.schema_cookie.get())
-            .unwrap_or(
-                pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie))?
-                    .get(),
-            );
-        let mut fresh = connection
-            .db
-            .dialect()
-            .new_schema(connection.db.experimental_custom_types_enabled())?;
-        fresh.schema_version = cookie;
-        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
-        let mut from_sql_indexes = crate::alloc::vec![];
-        let mut automatic_indices = HashMap::default();
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
-            HashMap::default();
-        let syms = connection.syms.read();
-        let mv_store = connection.db.get_mv_store().clone();
-
-        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-        sorted_rowids.sort_unstable();
-        for rowid in &sorted_rowids {
-            let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
-            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
-            // has since materialized this object, resolve to its real positive root so the
-            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
-            // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
-            let attached_resolver = |alias: &str| -> Option<usize> {
-                connection
-                    .current_qualifiers()
-                    .database_id(&crate::util::normalize_ident(alias))
-            };
-            fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
-                root_page,
-                sql,
-                &syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                &attached_resolver,
-                connection.dialect().as_ref(),
-            )?;
-        }
-        fresh.populate_types_views_then_indices(
-            &syms,
-            type_sqls,
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-
-        Ok(Arc::new(fresh))
-    }
-
     /// Replays committed logical-log frames into the in-memory MVCC store.
     /// Only frames with `commit_ts > persistent_tx_ts_max` (the durable replay
     /// boundary from the metadata table) are applied; earlier frames were
@@ -10012,13 +9883,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let schema_rows_after =
                             schema_rows_after.get_or_insert_with(|| schema_rows.clone());
-                        let record = ImmutableRecordRef::from_bin_record(record_bytes);
-                        let column_count = record.column_count();
-                        if column_count < 5 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {column_count}",
-                            )));
-                        }
+                        // Reject a malformed row before staging it.
+                        SqliteSchemaRow::from_record_bytes(record_bytes)?;
                         crate::with_mv_store_allocation_site!(SchemaRowPayload, {
                             schema_rows_after.insert(
                                 rowid.row_id.to_int_or_panic(),
@@ -10042,11 +9908,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // schema needs those types to give indexes their columns' type
             // orders, so stage the types table the same way.
             let types_table_id = if connection.experimental_custom_types_enabled() {
-                schema_rows_after
-                    .as_ref()
-                    .unwrap_or(&schema_rows)
-                    .values()
-                    .find_map(|record| types_table_root_page(&record.as_record_ref()))
+                let schema_rows = schema_rows_after.as_ref().unwrap_or(&schema_rows);
+                types_table_root_page(schema_rows.values().map(|record| record.get_payload()))?
                     .map(|root_page| self.get_table_id_from_root_page(root_page))
             } else {
                 None
@@ -10085,13 +9948,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let schema_after = match schema_rows_after.as_ref() {
                 Some(schema_rows_after) => {
                     let type_sqls_after = type_sqls_after.as_ref().unwrap_or(&type_sqls);
-                    Some(self.recover_build_schema(
-                        connection,
-                        schema_rows_after,
-                        &type_sqls_after.values().cloned().collect::<Vec<_>>(),
-                        cookie,
-                        &ctx.preserved_table_valued_functions,
-                    )?)
+                    Some(
+                        self.build_schema_from_rows(
+                            connection,
+                            schema_rows_after
+                                .iter()
+                                .map(|(rowid, record)| (*rowid, record.get_payload())),
+                            &type_sqls_after.values().cloned().collect::<Vec<_>>(),
+                            self.global_schema_cookie().unwrap_or(cookie),
+                            &ctx.preserved_table_valued_functions,
+                        )?,
+                    )
                 }
                 None => None,
             };
@@ -10215,37 +10082,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             }
                             let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                             if is_schema_row {
-                                let record = ImmutableRecordRef::from_bin_record(row.payload());
-                                let column_count = record.column_count();
-                                if column_count < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {column_count}",
-                                    )));
-                                }
-                                let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type must be text".to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
-                                let val = match record.get_value_opt(3) {
-                                    Some(v) => v,
-                                    None => {
-                                        return Err(LimboError::InternalError(
-                                            "Expected at least 5 columns in sqlite_schema"
-                                                .to_string(),
-                                        ));
-                                    }
-                                };
-                                let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
-                                    val
-                                else {
-                                    panic!("Expected integer value for root page, got {val:?}");
-                                };
-                                let sql = match record.get_value_opt(4) {
-                                    Some(ValueRef::Text(v)) => Some(v.as_str()),
-                                    _ => None,
-                                };
+                                let SqliteSchemaRow {
+                                    row_type,
+                                    root_page,
+                                    sql,
+                                    ..
+                                } = SqliteSchemaRow::from_record_bytes(row.payload())?;
                                 let has_btree = match row_type {
                                     "index" => root_page != 0,
                                     "table" => !sql
@@ -10421,23 +10263,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
                                     continue;
                                 };
-                                if record.column_count() < 5 {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema row must have at least 5 columns, got {}",
-                                        record.column_count()
-                                    )));
-                                }
-                                let (
-                                    ValueRef::Text(row_type),
-                                    ValueRef::Numeric(Numeric::Integer(root_page)),
-                                ) = record.get_two_values(0, 3)?
-                                else {
-                                    return Err(LimboError::Corrupt(
-                                        "sqlite_schema type and root_page must be text and integer"
-                                            .to_string(),
-                                    ));
-                                };
-                                let row_type = row_type.as_str();
+                                let SqliteSchemaRow {
+                                    row_type,
+                                    root_page,
+                                    ..
+                                } = SqliteSchemaRow::from_record_bytes(record.get_payload())?;
                                 if (row_type == "table" || row_type == "index") && root_page > 0 {
                                     dropped_root_pages.insert(root_page);
                                 }
@@ -10562,34 +10392,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Build a fresh `Schema` from the recovered `sqlite_schema` rows and the
-    /// CREATE TYPE statements `type_sqls`. Sync: the schema cookie comes from
-    /// `global_header` (in-memory) or `fallback_cookie` (pre-read by the
-    /// caller); no IO here.
-    fn recover_build_schema(
-        &self,
-        connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecord>,
-        type_sqls: &[String],
-        fallback_cookie: u32,
-        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) -> Result<Arc<Schema>> {
-        let cookie = self
-            .global_header
+    /// The schema cookie in `global_header`, if a header has been loaded.
+    pub(crate) fn global_schema_cookie(&self) -> Option<u32> {
+        self.global_header
             .read()
             .as_ref()
             .map(|header| header.schema_cookie.get())
-            .unwrap_or(fallback_cookie);
+    }
+
+    /// Build a `Schema` from `sqlite_schema` records, given as (rowid, record),
+    /// and the CREATE TYPE statements `type_sqls`.
+    pub(crate) fn build_schema_from_rows<'r>(
+        &self,
+        connection: &Arc<Connection>,
+        schema_rows: impl IntoIterator<Item = (i64, &'r [u8])>,
+        type_sqls: &[String],
+        schema_cookie: u32,
+        preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
+    ) -> Result<Arc<Schema>> {
         let mut fresh = connection
             .db
             .dialect()
             .new_schema(connection.db.experimental_custom_types_enabled())?;
-        fresh.schema_version = cookie;
+        fresh.schema_version = schema_cookie;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
-        let mut from_sql_indexes =
-            crate::alloc::Vec::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG);
-        let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
-            HashMap::default();
+        let mut from_sql_indexes = crate::alloc::vec![];
+        let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView> =
@@ -10597,71 +10425,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
-        let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-        sorted_rowids.sort_unstable();
-        for rowid in &sorted_rowids {
-            let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
+        let mut schema_rows: Vec<(i64, &[u8])> = schema_rows.into_iter().collect();
+        schema_rows.sort_unstable_by_key(|(rowid, _)| *rowid);
+        for (_, record) in schema_rows {
+            let row = SqliteSchemaRow::from_record_bytes(record)?;
             // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
             // has since materialized this object, resolve to its real positive root so the
             // rebuilt schema reflects the btree page — otherwise integrity_check skips the
             // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
+            let root_page = self.resolve_root_page(row.root_page);
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
                     .current_qualifiers()
                     .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                row.row_type,
+                row.name,
+                row.table_name,
                 root_page,
-                sql,
+                row.sql,
                 &syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,
@@ -10794,16 +10577,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             false
         }
-    }
-}
-
-/// The root page of the types table, if `record` is its sqlite_schema row.
-pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> {
-    let is_types_table = matches!(record.get_value_opt(0), Some(ValueRef::Text(ty)) if ty.as_str() == "table")
-        && matches!(record.get_value_opt(1), Some(ValueRef::Text(name)) if name.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME);
-    match record.get_value_opt(3) {
-        Some(ValueRef::Numeric(Numeric::Integer(root_page))) if is_types_table => Some(root_page),
-        _ => None,
     }
 }
 
