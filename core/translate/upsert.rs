@@ -1732,19 +1732,6 @@ pub fn emit_upsert(
         }
     }
 
-    // Compute the generated columns of the NEW image for RETURNING
-    if !returning.is_empty() {
-        compute_new_row_generated_columns(
-            program,
-            ctx,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            &layout,
-            DmlRowForm::Stored,
-            resolver,
-        )?;
-    }
-
     // RETURNING from NEW image + final rowid
     if !returning.is_empty() {
         emit_returning_results(
