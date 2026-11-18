@@ -1676,7 +1676,8 @@ pub fn emit_upsert(
                 bt.name.as_str(),
                 ctx.conflict_rowid_reg, // old_rowid_reg
                 current_start,          // old_values_start
-                new_start,              // new_values_start
+                &layout,
+                new_start,                                       // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
                 upsert_namespace,
