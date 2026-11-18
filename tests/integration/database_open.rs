@@ -2139,3 +2139,227 @@ fn schema_report(conn: &Arc<Connection>) -> Vec<String> {
     report.extend(sequences);
     report
 }
+
+#[cfg(all(feature = "fs", feature = "encryption"))]
+mod explicit_page_size {
+    use super::*;
+    use turso_core::storage::sqlite3_ondisk::PageSize;
+
+    #[derive(Clone, Copy, Debug)]
+    enum OpenApi {
+        Open,
+        OpenWithStorage,
+        OpenAsync,
+        RawOpen,
+        RawOpenAsync,
+    }
+
+    #[test]
+    fn cached_opens_reject_mismatches() -> anyhow::Result<()> {
+        for encrypted in [false, true] {
+            for (actual, requested) in [(4096, 8192), (8192, 4096)] {
+                for initialized in [false, true] {
+                    let directory = tempfile::tempdir()?;
+                    let path = directory.path().join("cached.db");
+                    let path = path.to_str().unwrap();
+                    let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+                    let options = open_options(encrypted);
+                    let actual = PageSize::new(actual).unwrap();
+                    let requested = PageSize::new(requested).unwrap();
+                    let key = encrypted.then(|| EncryptionKey::new_256([1; 32]));
+                    let db = Database::open(io.clone(), path, options.clone().page_size(actual))?;
+                    let owner = db.connect(
+                        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key.clone()),
+                    )?;
+                    if initialized {
+                        owner.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO test VALUES (1, 'preserved')")?;
+                    }
+
+                    for api in [OpenApi::Open, OpenApi::OpenWithStorage, OpenApi::OpenAsync] {
+                        let error =
+                            open(io.clone(), path, options.clone().page_size(requested), api)
+                                .err()
+                                .expect("cached open accepted a mismatching page size");
+                        assert_mismatch(error, requested, actual);
+
+                        for size in [None, Some(actual)] {
+                            let mut matching = options.clone();
+                            if let Some(size) = size {
+                                matching = matching.page_size(size);
+                            }
+                            let reopened = open(io.clone(), path, matching, api)?;
+                            assert!(Arc::ptr_eq(&db, &reopened), "{api:?} missed the cache");
+                            let reader = reopened.connect(
+                                ConnectOpts::new(SessionRole::Superuser)
+                                    .with_encryption_key(key.clone()),
+                            )?;
+                            assert_eq!(reader.get_page_size(), actual);
+                            if initialized {
+                                assert_eq!(count_test_rows(&reader), 1);
+                            }
+                        }
+
+                        if encrypted {
+                            let wrong_key = options
+                                .clone()
+                                .encryption(EncryptionOpts {
+                                    cipher: "aegis256".into(),
+                                    hexkey: "02".repeat(32),
+                                })
+                                .page_size(requested);
+                            let error = open(io.clone(), path, wrong_key, api)
+                                .err()
+                                .expect("cached open accepted the wrong key");
+                            assert!(
+                                matches!(
+                                    error,
+                                    LimboError::CompletionError(
+                                        CompletionError::DecryptionError { .. }
+                                    )
+                                ),
+                                "{api:?}: {error}"
+                            );
+                        }
+                    }
+                    assert_eq!(owner.get_page_size(), actual);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cold_opens_reject_mismatches() -> anyhow::Result<()> {
+        for encrypted in [false, true] {
+            for (actual, requested) in [(4096, 8192), (8192, 4096)] {
+                let directory = tempfile::tempdir()?;
+                let path = directory.path().join("existing.db");
+                let path = path.to_str().unwrap();
+                let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+                let options = open_options(encrypted);
+                let actual = PageSize::new(actual).unwrap();
+                let requested = PageSize::new(requested).unwrap();
+                let key = encrypted.then(|| EncryptionKey::new_256([1; 32]));
+                {
+                    let db = Database::open(io.clone(), path, options.clone().page_size(actual))?;
+                    let owner = db.connect(
+                        ConnectOpts::new(SessionRole::Superuser).with_encryption_key(key.clone()),
+                    )?;
+                    owner.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO test VALUES (1, 'preserved')")?;
+                    owner.checkpoint(turso_core::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    })?;
+                }
+                let original = std::fs::read(path)?;
+
+                for api in [
+                    OpenApi::Open,
+                    OpenApi::OpenWithStorage,
+                    OpenApi::OpenAsync,
+                    OpenApi::RawOpen,
+                    OpenApi::RawOpenAsync,
+                ] {
+                    let error = open(io.clone(), path, options.clone().page_size(requested), api)
+                        .err()
+                        .expect("cold open accepted a mismatching page size");
+                    assert_mismatch(error, requested, actual);
+                    assert_eq!(std::fs::read(path)?, original);
+
+                    if encrypted {
+                        let wrong_key = options
+                            .clone()
+                            .encryption(EncryptionOpts {
+                                cipher: "aegis256".into(),
+                                hexkey: "02".repeat(32),
+                            })
+                            .page_size(requested);
+                        let error = open(io.clone(), path, wrong_key, api)
+                            .err()
+                            .expect("cold open accepted the wrong key");
+                        assert!(
+                            matches!(
+                                error,
+                                LimboError::CompletionError(
+                                    CompletionError::DecryptionError { .. }
+                                )
+                            ),
+                            "{api:?}: {error}"
+                        );
+                    }
+
+                    for size in [None, Some(actual)] {
+                        let mut matching = options.clone();
+                        if let Some(size) = size {
+                            matching = matching.page_size(size);
+                        }
+                        let reopened = open(io.clone(), path, matching, api)?;
+                        let reader = reopened.connect(
+                            ConnectOpts::new(SessionRole::Superuser)
+                                .with_encryption_key(key.clone()),
+                        )?;
+                        assert_eq!(reader.get_page_size(), actual);
+                        assert_eq!(count_test_rows(&reader), 1);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_options(encrypted: bool) -> OpenOptions {
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .flags(OpenFlags::Create)
+            .db_opts(DatabaseOpts::new().with_encryption(encrypted))
+            .encryption(encrypted.then(|| EncryptionOpts {
+                cipher: "aegis256".into(),
+                hexkey: "01".repeat(32),
+            }))
+    }
+
+    fn open(
+        io: Arc<dyn IO>,
+        path: &str,
+        mut options: OpenOptions,
+        api: OpenApi,
+    ) -> turso_core::Result<Arc<Database>> {
+        if matches!(
+            api,
+            OpenApi::OpenWithStorage | OpenApi::OpenAsync | OpenApi::RawOpenAsync
+        ) {
+            let file = io.open_file(path, OpenFlags::default(), false)?;
+            options = options.storage(Arc::new(DatabaseFile::new(file)));
+        }
+        match api {
+            OpenApi::Open | OpenApi::OpenWithStorage => Database::open(io, path, options),
+            OpenApi::RawOpen => Database::do_open(io, path, options),
+            OpenApi::OpenAsync | OpenApi::RawOpenAsync => {
+                let mut state = OpenDbAsyncState::new();
+                loop {
+                    let result = match api {
+                        OpenApi::OpenAsync => {
+                            Database::open_async(&mut state, io.clone(), path, &options)
+                        }
+                        OpenApi::RawOpenAsync => {
+                            Database::do_open_async(&mut state, io.clone(), path, &options)
+                        }
+                        _ => unreachable!(),
+                    };
+                    match result.map_err(|error| *error)? {
+                        IOResult::Done(db) => return Ok(db),
+                        IOResult::IO(pending) => pending.wait(io.as_ref())?,
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_mismatch(error: LimboError, requested: PageSize, actual: PageSize) {
+        assert!(
+            matches!(error, LimboError::InvalidArgument(ref message) if message == &format!(
+                "page size mismatch: requested {} bytes, database uses {} bytes",
+                requested.get(), actual.get()
+            )),
+            "unexpected mismatch error: {error}"
+        );
+    }
+}
