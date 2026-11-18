@@ -1,4 +1,4 @@
-use crate::dialect::catalog::{CatalogWrite, CreateView, WriteContext};
+use crate::dialect::catalog::{CatalogWrite, CreateMaterializedView, CreateView, WriteContext};
 use crate::dialect::RelationChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -10,8 +10,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
     schema::{
-        self, create_view_sql, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write,
-        SchemaEntryType,
+        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
     },
 };
 use crate::util::{
@@ -153,14 +152,6 @@ pub fn translate_create_materialized_view(
         .cloned()
         .collect::<Vec<_>>();
 
-    // Reconstruct the SQL string for storage
-    let sql = create_view_sql(
-        "MATERIALIZED VIEW",
-        &view_name.name.as_ident(),
-        columns,
-        select_stmt,
-    );
-
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
     let view_root_reg = program.alloc_register();
@@ -224,41 +215,27 @@ pub fn translate_create_materialized_view(
 
     program.preassign_label_to_next_insn(clear_done_label);
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    // Add the materialized view entry to sqlite_schema
-    emit_schema_entry(
+    let write_context = WriteContext::new(&connection, resolver, database_id);
+    let after_writes = resolver.catalog.dialect.catalog().write(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for views
-        SchemaEntryType::View,
-        &view_key,
-        &view_key,
-        view_root_reg, // btree root for materialized view data
-        Some(sql),
+        &write_context,
+        &CatalogWrite::CreateMaterializedView(CreateMaterializedView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+            written_name: &view_name.name,
+            columns,
+            select: select_stmt,
+            root_reg: view_root_reg,
+        }),
     )?;
-
-    // The view is a relation of the dialect's; its hidden state tables are
-    // engine objects and are not.
-    if schema::dialect_relation_hooks_apply(&connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            &connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-                kind: crate::schema::RelationKind::MaterializedView,
-                table: None,
-            }],
-        )?;
-    }
 
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
-    // codegen; the marker only persists compatibility metadata.
-    let mut parse_schema_names = vec![escape_sql_string_literal(&view_key)];
+    // codegen; the marker only persists compatibility metadata. They are
+    // engine tables, so their sqlite_schema rows are written here and not by
+    // the catalog.
+    let sqlite_schema_cursor_id = write_context.sqlite_schema_cursor(program);
+    let mut engine_row_names = Vec::new();
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
@@ -278,7 +255,7 @@ pub fn translate_create_materialized_view(
             Some(hidden.create_sql.clone()),
         )?;
 
-        parse_schema_names.push(escape_sql_string_literal(&hidden.table_name));
+        engine_row_names.push(escape_sql_string_literal(&hidden.table_name));
         if hidden.primary_key_index {
             let index_root_reg = program.alloc_register();
             program.emit_insn(Insn::CreateBtree {
@@ -301,21 +278,20 @@ pub fn translate_create_materialized_view(
                 index_root_reg,
                 None,
             )?;
-            parse_schema_names.push(escape_sql_string_literal(&index_name));
+            engine_row_names.push(escape_sql_string_literal(&index_name));
         }
     }
 
-    // Parse schema to load the new view (and its state table, if any)
-    let where_clause = parse_schema_names
+    let engine_rows = engine_row_names
         .iter()
         .map(|name| format!("name = '{name}'"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    program.emit_insn(Insn::ParseSchema {
-        db: database_id,
-        where_clause: Some(where_clause),
-        trigger_target_database_id: None,
-    });
+    after_writes.emit(
+        program,
+        database_id,
+        (!engine_row_names.is_empty()).then_some(engine_rows.as_str()),
+    );
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
