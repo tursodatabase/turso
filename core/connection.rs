@@ -1,3 +1,4 @@
+#[cfg(feature = "conn_raw_api")]
 use crate::alloc::TryClone;
 use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
