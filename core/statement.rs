@@ -17,7 +17,7 @@ use crate::{
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
-    turso_assert,
+    turso_assert, turso_soft_unreachable,
     vdbe::{
         self,
         explain::{
@@ -625,6 +625,7 @@ impl Statement {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
+        let mut reprepares = 0;
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
             if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
@@ -657,6 +658,21 @@ impl Statement {
                 &self.pager,
                 self.query_mode,
                 waker,
+            );
+            reprepares += 1;
+        }
+        if reprepares == MAX_SCHEMA_RETRY
+            && matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated))
+        {
+            // This really shouldn't happen. If it does, it's likely a bug
+            // (like the one from https://github.com/tursodatabase/turso/pull/12047).
+            turso_soft_unreachable!(
+                "statement still failed with SchemaUpdated after every reprepare",
+                {
+                    "sql": self.program.sql,
+                    "auto_commit": self.connection.get_auto_commit(),
+                    "tx_state": self.connection.get_tx_state()
+                }
             );
         }
 
