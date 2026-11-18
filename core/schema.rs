@@ -1483,17 +1483,50 @@ impl SchemaBuilder {
         self
     }
 
-    /// Adds the virtual table `table` to the root namespace.
-    pub fn internal_vtab<T>(
+    /// Adds the built-in type that the `CREATE TYPE` statement `sql` makes,
+    /// under its own name and under each of `aliases`.
+    ///
+    /// `accepts_collate` says whether values of the type take a COLLATE,
+    /// `range_offsets` what kind of number they are in a RANGE frame, and
+    /// `stored_form_sorts_in_value_order` whether the stored form sorts in
+    /// the same order as the values.
+    pub fn builtin_type(
         mut self,
         dialect: &(impl crate::dialect::Dialect + ?Sized),
-        table: T,
-    ) -> crate::Result<Self>
-    where
-        T: crate::vtab::InternalVirtualTable + 'static,
-    {
-        self.schema.register_internal_vtab(dialect, table)?;
-        Ok(self)
+        sql: &str,
+        aliases: &[&str],
+        accepts_collate: bool,
+        range_offsets: RangeOffsets,
+        stored_form_sorts_in_value_order: bool,
+    ) -> crate::Result<Self> {
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = crate::dialect::parse_statement(dialect, sql)
+        else {
+            return Err(crate::LimboError::InternalError(format!(
+                "failed to parse built-in type SQL: {sql}"
+            )));
+        };
+        let type_def = Arc::new(TypeDef::from_create_type(
+            &type_name,
+            &body,
+            TypeOrigin::Builtin {
+                accepts_collate,
+                range_offsets,
+                stored_form_sorts_in_value_order,
+            },
+            sql.to_string(),
+        )?);
+        for alias in aliases {
+            self = self.type_def(alias, Arc::clone(&type_def));
+        }
+        Ok(self.type_def(&type_name, type_def))
+    }
+
+    /// Adds the virtual table `table` to the root namespace.
+    pub fn virtual_table(self, table: crate::vtab::VirtualTable) -> Self {
+        let name = normalize_ident(&table.name);
+        self.table(name, Arc::new(Table::Virtual(Arc::new(table))))
     }
 
     pub fn build(self) -> Schema {
