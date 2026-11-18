@@ -1520,54 +1520,30 @@ mod immutable_record {
         write_varint(out, value)
     }
 
-    /// Writes the bytes of `value` for `serial_type` at the start of `out`
-    /// and returns how many it wrote.
+    /// Appends the bytes of `value` for `serial_type` to `out`.
     #[inline(always)]
-    fn write_value(out: &mut [u8], value: ValueRef<'_>, serial_type: SerialType) -> usize {
-        let bytes: &[u8] = match value {
-            ValueRef::Null => return 0,
-            ValueRef::Numeric(Numeric::Integer(i)) => {
-                return match serial_type.kind() {
-                    SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => 0,
-                    SerialTypeKind::I8 => {
-                        out[0] = i as u8;
-                        1
-                    }
-                    SerialTypeKind::I16 => {
-                        out[..2].copy_from_slice(&(i as i16).to_be_bytes());
-                        2
-                    }
-                    // Without the most significant byte.
-                    SerialTypeKind::I24 => {
-                        out[..3].copy_from_slice(&(i as i32).to_be_bytes()[1..]);
-                        3
-                    }
-                    SerialTypeKind::I32 => {
-                        out[..4].copy_from_slice(&(i as i32).to_be_bytes());
-                        4
-                    }
-                    // Without the two most significant bytes.
-                    SerialTypeKind::I48 => {
-                        out[..6].copy_from_slice(&i.to_be_bytes()[2..]);
-                        6
-                    }
-                    SerialTypeKind::I64 => {
-                        out[..8].copy_from_slice(&i.to_be_bytes());
-                        8
-                    }
-                    other => panic!("Serial type is not an integer: {other:?}"),
-                };
-            }
+    fn append_value(out: &mut ValueBlob, value: ValueRef<'_>, serial_type: SerialType) {
+        match value {
+            ValueRef::Null => {}
+            ValueRef::Numeric(Numeric::Integer(i)) => match serial_type.kind() {
+                SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
+                SerialTypeKind::I8 => out.push(i as u8),
+                SerialTypeKind::I16 => out.extend_from_slice(&(i as i16).to_be_bytes()),
+                // Without the most significant byte.
+                SerialTypeKind::I24 => out.extend_from_slice(&(i as i32).to_be_bytes()[1..]),
+                SerialTypeKind::I32 => out.extend_from_slice(&(i as i32).to_be_bytes()),
+                // Without the two most significant bytes.
+                SerialTypeKind::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]),
+                SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
+                other => panic!("Serial type is not an integer: {other:?}"),
+            },
             ValueRef::Numeric(Numeric::Float(f)) => {
                 let fval: f64 = f.into();
-                out[..8].copy_from_slice(&fval.to_be_bytes());
-                return 8;
+                out.extend_from_slice(&fval.to_be_bytes());
             }
-            ValueRef::Text(t) => t.value.as_bytes(),
-            ValueRef::Blob(b) => b,
-        };
-        out[..bytes.len()].copy_from_slice(bytes);
-        bytes.len()
+            ValueRef::Text(t) => out.extend_from_slice(t.value.as_bytes()),
+            ValueRef::Blob(b) => out.extend_from_slice(b),
+        }
     }
 
     #[inline(always)]
@@ -2006,21 +1982,23 @@ mod immutable_record {
                 return Err(LimboError::TooBig);
             }
             buf.try_reserve_exact(total_size)?;
-            buf.resize(total_size, 0);
+            // Only the header is zeroed before the writing pass. The values
+            // are appended after it, so the bytes of a large text or blob are
+            // written once.
+            buf.resize(header_size, 0);
 
             // Writing pass: each serial type goes into the header and each
             // value after it, the varints straight into their place.
             let mut header_pos = write_short_varint(&mut buf[..header_size], header_size as u64);
-            let mut value_pos = header_size;
             for value in values {
                 let value = value.as_value_ref();
                 let serial_type = SerialType::from(value);
                 header_pos +=
                     write_short_varint(&mut buf[header_pos..header_size], serial_type.into());
-                value_pos += write_value(&mut buf[value_pos..], value, serial_type);
+                append_value(&mut buf, value, serial_type);
             }
             crate::turso_assert!(
-                header_pos == header_size && value_pos == total_size,
+                header_pos == header_size && buf.len() == total_size,
                 "record sizing pass and writing pass disagree"
             );
             Ok(Self {
