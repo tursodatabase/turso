@@ -571,7 +571,7 @@ impl Catalog for PostgresCatalog {
                     new_name: column.definition.col_name.as_str(),
                 }],
             )?,
-            CatalogWrite::AddColumn(_) => {}
+            CatalogWrite::AddColumn(_) | CatalogWrite::DropColumn(_) => {}
         }
         Ok(after_writes)
     }
@@ -740,13 +740,14 @@ fn write_created_view_class_row(
 
 /// Whether the class table stores anything that `change` changes. A
 /// virtual table has no class row, a column that keeps its name owns the
-/// same sequences as before, and a new column owns none.
+/// same sequences as before, and a new column owns none. The sequences of
+/// a dropped column are dropped by the statement, each with its class row.
 fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
     match change {
         CatalogWrite::RenameTable(table) => !table.is_virtual,
         CatalogWrite::RenameColumn(column) => column.old_name != column.new_name.as_str(),
         CatalogWrite::AlterColumn(column) => column.old_name != column.definition.col_name.as_str(),
-        CatalogWrite::AddColumn(_) => false,
+        CatalogWrite::AddColumn(_) | CatalogWrite::DropColumn(_) => false,
         _ => true,
     }
 }
