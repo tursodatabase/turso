@@ -1345,6 +1345,58 @@ expect {
     10
 }
 
+# A term that is the whole index WHERE expression is consumed, so the index
+# read does not need b. That holds even when an earlier term already proves
+# the predicate.
+test partial-index-or-predicate-term-after-implying-term {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    SELECT a FROM t WHERE a > 5 AND (b < 5 OR a > 5) ORDER BY a;
+}
+expect {
+    10
+}
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-partial-index-or-predicate-term-after-implying-term {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE a > 5 AND (b < 5 OR a > 5);
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (a>?)
+}
+
+# Inside a larger term, the index WHERE expression is still evaluated, so the
+# index read must read b from the table.
+test partial-index-or-predicate-inside-larger-term {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    SELECT a FROM t WHERE a > 5 AND (b < 5 OR a > 5) = 1 ORDER BY a;
+}
+expect {
+    10
+}
+
+# The ON term of a later join filters the rows of v, not of t, so the index
+# on t does not consume it, and the index read must read b.
+test partial-index-or-predicate-in-on-term-of-later-join {
+    CREATE TABLE t (a, b);
+    CREATE TABLE v (y);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8), (12, 1);
+    INSERT INTO v VALUES (7), (9);
+    SELECT t.a, v.y FROM t LEFT JOIN v ON (t.b < 5 OR t.a > 5) WHERE t.a > 5 ORDER BY 1, 2;
+}
+expect {
+    10|7
+    10|9
+    12|7
+    12|9
+}
+
 # Partial index must NOT be used when the query only satisfies a subset of the
 # index WHERE conjuncts — the partial index would skip rows the query needs.
 @skip-if sqlite "query plan explanation output is different in sqlite"

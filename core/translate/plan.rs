@@ -2329,7 +2329,13 @@ impl TableReferences {
     /// SELECT lists `LOWER(name)` and an index exists on `LOWER(name)`, we
     /// can plan a covering scan because the expression value lives inside
     /// the index key.
-    pub fn register_expression_index_usage(&mut self, expr: &ast::Expr) {
+    ///
+    /// `where_term` is the WHERE term when `expr` is that whole term.
+    pub fn register_expression_index_usage(
+        &mut self,
+        expr: &ast::Expr,
+        where_term: Option<&WhereTerm>,
+    ) {
         let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
             return;
         };
@@ -2342,6 +2348,8 @@ impl TableReferences {
         };
         let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
         let may_be_null_row = self.index_cursor_may_be_null_row(table_id);
+        let proves_partial_index =
+            where_term.is_some_and(|term| table_ref.where_term_can_prove_partial_index(term));
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
             .iter_mut()
@@ -2351,6 +2359,7 @@ impl TableReferences {
                 normalized,
                 columns_mask,
                 may_be_null_row,
+                proves_partial_index,
             );
         }
     }
@@ -3113,6 +3122,9 @@ pub struct ExpressionIndexUsage {
     /// An outer join can set this table to a null row. That row computes the
     /// expression from the table columns, so the index key does not cover them.
     pub may_be_null_row: bool,
+    /// Every use of the expression is a whole WHERE term that can prove the
+    /// predicate of a partial index on this table.
+    pub only_proves_partial_index: bool,
 }
 
 /// Represents one key pair in a hash join equality condition.
@@ -3695,22 +3707,40 @@ impl JoinedTable {
         normalized_expr: ast::Expr,
         columns_mask: ColumnUsedMask,
         may_be_null_row: bool,
+        proves_partial_index: bool,
     ) {
         if columns_mask.is_empty() {
             return;
         }
-        if self
+        if let Some(usage) = self
             .expression_index_usages
-            .iter()
-            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
+            .iter_mut()
+            .find(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
         {
+            usage.only_proves_partial_index &= proves_partial_index;
             return;
         }
         self.expression_index_usages.push(ExpressionIndexUsage {
             normalized_expr: Box::new(normalized_expr),
             columns_mask,
             may_be_null_row,
+            only_proves_partial_index: proves_partial_index,
         });
+    }
+
+    /// Returns true if `term` can prove the predicate of a partial index on
+    /// this table. A term can prove it only if it filters this table's rows.
+    pub(crate) fn where_term_can_prove_partial_index(&self, term: &WhereTerm) -> bool {
+        let Some(join_info) = &self.join_info else {
+            return !term.origin.is_outer_join();
+        };
+        if join_info.is_full_outer() {
+            return false;
+        }
+        if join_info.is_outer() {
+            return term.origin.join_origin() == Some(JoinOrigin::Outer(self.internal_id));
+        }
+        true
     }
 
     /// Provided an index that may contain expression keys, remove any
@@ -3730,11 +3760,16 @@ impl JoinedTable {
             //   SELECT lower(name) FROM t;
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
+            //
+            // A WHERE term that is the whole partial index WHERE expression
+            // is consumed when the index is used (see
+            // `partial_index_predicate_terms`), so it reads no columns. The
+            // expression is still evaluated anywhere else, such as inside
+            // `(c > 0) = 1`.
+            let matches_where_clause = usage.only_proves_partial_index
+                && index.where_clause.as_ref().is_some_and(|idx_where_clause| {
+                    exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+                });
 
             let index_key_covers_columns = !usage.may_be_null_row
                 && index

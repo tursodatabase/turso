@@ -1783,18 +1783,11 @@ pub(super) fn partial_index_predicate_terms(
         .where_clause
         .as_ref()
         .expect("partial_index_predicate_terms requires a partial index");
-    let can_use_query_term = |term: &WhereTerm| -> bool {
-        let Some(join_info) = &table_reference.join_info else {
-            return !term.origin.is_outer_join();
-        };
-        if join_info.is_full_outer() {
-            return false;
-        }
-        if join_info.is_outer() {
-            return term.origin.join_origin()
-                == Some(JoinOrigin::Outer(table_reference.internal_id));
-        }
-        true
+    let usable_terms = || {
+        query_where_clause
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| table_reference.where_term_can_prove_partial_index(term))
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query
@@ -1807,15 +1800,21 @@ pub(super) fn partial_index_predicate_terms(
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
-        let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
-        })?;
-        // A query term that proves one branch of an OR makes the partial index
-        // usable, but does not make that term true for every row in the index.
-        // Keep it as a residual filter unless the whole conjunct matched.
-        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
-            matched_terms.push(term_idx);
+        // A term that is the conjunct is true for every row in the index, so
+        // it is consumed. Look for one first: a covering index read relies on
+        // it (see `JoinedTable::apply_expression_index_coverage`).
+        if let Some((term_idx, _)) =
+            usable_terms().find(|(_, term)| exprs_are_equivalent(index_conjunct, &term.expr))
+        {
+            if !matched_terms.contains(&term_idx) {
+                matched_terms.push(term_idx);
+            }
+            continue;
         }
+        // A term that only implies the conjunct, such as one that proves one
+        // branch of an OR, makes the index usable but stays a filter.
+        usable_terms()
+            .find(|(_, term)| query_term_implies_predicate(&term.expr, index_conjunct))?;
     }
     Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies

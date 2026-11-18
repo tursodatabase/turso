@@ -2217,30 +2217,31 @@ fn register_index_expression_usages_for_plan(
 ) -> Result<()> {
     table_references.reset_expression_index_usages();
 
-    let mut register = |expr: &ast::Expr| {
+    let mut register = |expr: &ast::Expr, where_term: Option<&WhereTerm>| {
         walk_expr(expr, &mut |part| {
-            table_references.register_expression_index_usage(part);
+            let whole_term = where_term.filter(|_| std::ptr::eq(part, expr));
+            table_references.register_expression_index_usage(part, whole_term);
             Ok(WalkControl::Continue)
         })
     };
 
     for rc in result_columns {
-        register(&rc.expr)?;
+        register(&rc.expr, None)?;
     }
     for (expr, _, _) in order_by {
-        register(expr)?;
+        register(expr, None)?;
     }
-    for where_term in where_clause {
-        register(&where_term.expr)?;
+    for where_term in where_clause.iter() {
+        register(&where_term.expr, Some(where_term))?;
     }
 
     if let Some(group_by) = group_by {
         for expr in &group_by.exprs {
-            register(expr)?;
+            register(expr, None)?;
         }
         if let Some(having) = &group_by.having {
             for expr in having {
-                register(expr)?;
+                register(expr, None)?;
             }
         }
     }
