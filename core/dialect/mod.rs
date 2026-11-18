@@ -27,8 +27,8 @@ pub use crate::functions::builtin::{
 pub use crate::translate::sqlite_schema_rows::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
-    CreateTable, CreateView, DropIndex, NewOwner, OwnerColumn, RelationChange, RelationName,
-    TableText, WriteContext, WriteOrigin,
+    CreateMaterializedView, CreateTable, CreateView, DropIndex, NewOwner, OwnerColumn,
+    RelationChange, RelationName, TableText, WriteContext, WriteOrigin,
 };
 
 #[cfg(test)]

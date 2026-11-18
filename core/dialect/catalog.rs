@@ -137,6 +137,8 @@ pub enum CatalogWrite<'a> {
     DropTable(DropTable<'a>),
     /// `CREATE VIEW`.
     CreateView(CreateView<'a>),
+    /// `CREATE MATERIALIZED VIEW`, before its rows are computed.
+    CreateMaterializedView(CreateMaterializedView<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -270,6 +272,26 @@ pub struct CreateView<'a> {
     /// gives none.
     pub columns: &'a [ast::IndexedColumn],
     pub select: &'a ast::Select,
+}
+
+/// A new materialized view whose B-tree the statement has already emitted
+/// the creation of. The tables that hold the state of its maintenance are
+/// the engine's, and the statement writes their rows itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateMaterializedView<'a> {
+    /// The namespace of the view in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the view in its namespace.
+    pub name: &'a str,
+    /// The name as the statement spells it.
+    pub written_name: &'a ast::Name,
+    /// The names the statement gives the view's columns. Empty when it
+    /// gives none.
+    pub columns: &'a [ast::IndexedColumn],
+    pub select: &'a ast::Select,
+    /// Register that holds the root page of the B-tree with the view's
+    /// rows.
+    pub root_reg: usize,
 }
 
 /// What a statement emits after all of its schema writes, so that the
