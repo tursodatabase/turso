@@ -305,8 +305,9 @@ pub trait Dialect: Send + Sync + 'static {
     /// Translates `changes`, which the statement being compiled makes to
     /// relations, into the bytecode that records them in the dialect's own
     /// schema state, in the same transaction as the statement's
-    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
-    /// call. Does nothing for a dialect without schema state of its own.
+    /// `sqlite_schema` rows. Does nothing for a dialect without schema state
+    /// of its own. `CREATE TABLE` does not call this: it stores the table
+    /// through [`Dialect::catalog`].
     fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
