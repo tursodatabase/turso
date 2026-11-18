@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use turso_core::dialect::catalog::{CreateSequence, DropSequence};
+use turso_core::dialect::catalog::{CreateSequence, DropSequence, DropTable};
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
@@ -450,6 +450,10 @@ impl Catalog for PostgresCatalog {
         change: &CatalogWrite<'_>,
     ) -> turso_core::Result<AfterWrites> {
         let after_writes = SqliteCatalog.write(program, ctx, change)?;
+        // A virtual table has no class row, in any database.
+        if matches!(change, CatalogWrite::DropTable(table) if table.is_virtual) {
+            return Ok(after_writes);
+        }
         if !writes_class_rows(ctx)? {
             return Ok(after_writes);
         }
@@ -477,6 +481,7 @@ impl Catalog for PostgresCatalog {
             CatalogWrite::DropSequence(sequence) => {
                 emit_drop_sequence_class_row(program, ctx, sequence)?
             }
+            CatalogWrite::DropTable(table) => emit_drop_table_class_rows(program, ctx, table)?,
         }
         Ok(after_writes)
     }
@@ -534,6 +539,27 @@ fn emit_drop_sequence_class_row(
             name: sequence.name,
         }],
     )
+}
+
+/// Deletes the class rows of the sequences that the table's columns own, of
+/// the table and of its indexes.
+fn emit_drop_table_class_rows(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    table: &DropTable<'_>,
+) -> turso_core::Result<()> {
+    let dropped = |name| RelationChange::Dropped {
+        namespace: table.namespace,
+        name,
+    };
+    let changes: Vec<_> = table
+        .owned_sequences
+        .iter()
+        .map(|sequence| dropped(sequence.as_str()))
+        .chain([dropped(table.name)])
+        .chain(table.indexes.iter().map(|index| dropped(index)))
+        .collect();
+    translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
