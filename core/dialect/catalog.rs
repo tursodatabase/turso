@@ -1,7 +1,12 @@
 //! What translation tells the dialect about a statement that changes the
-//! dialect's catalog of the main database.
+//! dialect's catalog of the main database, and what the dialect's bytecode
+//! tells the in-memory schema once the change is written.
 
-use crate::{namespace::NamespaceId, schema::RelationKind, LimboError};
+use crate::{
+    namespace::NamespaceId,
+    schema::{RelationKind, Schema},
+    LimboError, Result, Value,
+};
 use std::borrow::Cow;
 use turso_parser::ast::{self, Grantee, Privilege, RoleSpec};
 
@@ -136,12 +141,19 @@ pub struct RelationName {
     pub name: String,
 }
 
+/// What a statement's bytecode did to the dialect's tables. The dialect
+/// puts one in [`Insn::CatalogApply`](crate::Insn::CatalogApply) after the
+/// instructions that write the rows.
+pub trait CatalogApply: std::fmt::Debug + Send + Sync {
+    /// Makes the same change to the dialect's state in `schema`. `values`
+    /// are the values of the registers the instruction names, in the same
+    /// order.
+    fn apply(&self, schema: &mut Schema, values: &[Value]) -> Result<()>;
+}
+
 /// A change a statement makes to the dialect's catalog of the main
 /// database: to a relation, or to the roles. Translation tells the dialect
-/// about it through
-/// [`Dialect::translate_catalog_changes`](super::Dialect::translate_catalog_changes), and the dialect's own bytecode
-/// tells it back through [`Dialect::apply_catalog_change`](super::Dialect::apply_catalog_change) once the change
-/// is written.
+/// about it as a [`RelationChange`] or an [`AccessStatement`].
 #[derive(Debug, Clone)]
 pub enum CatalogChange {
     Create {
