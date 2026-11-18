@@ -328,23 +328,6 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Translates `statement` into the bytecode that changes the roles,
-    /// owners, privileges or policies the dialect stores. A dialect that
-    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
-    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
-    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_access_statement(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &AccessStatement<'_>,
-    ) -> Result<()> {
-        let _ = (program, schema, connection);
-        Err(statement.not_supported())
-    }
-
     /// Whether relations can be created, renamed or dropped in an attached
     /// database. The PostgreSQL frontend refuses it: its relation catalog
     /// covers only the main database, so a database file with relations

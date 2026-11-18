@@ -575,6 +575,37 @@ impl Catalog for PostgresCatalog {
         Ok(after_writes)
     }
 
+    fn write_access(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &WriteContext<'_>,
+        statement: &AccessStatement<'_>,
+    ) -> turso_core::Result<()> {
+        match statement {
+            AccessStatement::CreateRole { name, options } => {
+                crate::roles::translate_create_role(program, ctx.schema, name, options)
+            }
+            AccessStatement::GrantRole {
+                revoke,
+                roles,
+                grantees,
+            } => crate::auth_members::translate_grant_role(
+                program,
+                ctx.schema,
+                ctx.connection,
+                *revoke,
+                roles,
+                grantees,
+            ),
+            // The owner column of a sequence is in the sequence's class row.
+            AccessStatement::ChangeOwner {
+                owner: NewOwner::Column(_),
+                ..
+            } if !writes_class_rows(ctx)? => Ok(()),
+            _ => translate_access_statement(program, ctx.schema, ctx.connection, statement),
+        }
+    }
+
     fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
         crate::schema_state::load_steps()
     }
