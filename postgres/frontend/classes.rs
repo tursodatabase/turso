@@ -38,9 +38,10 @@ use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
-    CatalogApply, CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, LimboError,
-    NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationChange,
-    RelationName, Value,
+    AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
+    CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn, ProgramBuilder,
+    RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value, WriteContext,
+    WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -433,6 +434,65 @@ pub(crate) fn row_security_policies<'a>(
     class_catalog(schema)
         .and_then(|catalog| catalog.get_by_name(namespace, name))
         .map_or(&[], |class| class.relpolicies.as_slice())
+}
+
+/// The catalog of a PostgreSQL database: the engine's `sqlite_schema` rows,
+/// and a class row for each relation of the main database.
+#[derive(Debug)]
+pub(crate) struct PostgresCatalog;
+
+impl Catalog for PostgresCatalog {
+    fn write(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &WriteContext<'_>,
+        change: &CatalogWrite<'_>,
+    ) -> turso_core::Result<AfterWrites> {
+        let after_writes = SqliteCatalog.write(program, ctx, change)?;
+        if !writes_class_rows(ctx)? {
+            return Ok(after_writes);
+        }
+        match change {
+            CatalogWrite::CreateTable(table) => {
+                let mut changes = vec![RelationChange::Created {
+                    namespace: table.namespace,
+                    name: table.name,
+                    kind: RelationKind::Table,
+                    table: None,
+                }];
+                for index in table.automatic_indexes {
+                    changes.push(RelationChange::Created {
+                        namespace: table.namespace,
+                        name: &index.name,
+                        kind: RelationKind::Index,
+                        table: Some(table.name),
+                    });
+                }
+                translate_relation_changes(program, ctx.schema, ctx.connection, &changes)?;
+            }
+        }
+        Ok(after_writes)
+    }
+}
+
+/// Whether the relations of the statement get class rows. Only the
+/// relations a user creates in the main database do. A statement of the
+/// engine copies or replays a database whose class rows are stored as data
+/// already, and the temp database has no class table. Fails for a user's
+/// statement against an attached database: the class table covers only the
+/// main database, so a database file with relations made while it was
+/// attached could not be opened later.
+fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
+    if ctx.origin == WriteOrigin::Engine {
+        return Ok(false);
+    }
+    if turso_core::is_attached_db(ctx.database_id) {
+        return Err(LimboError::ParseError(
+            "creating, renaming or dropping relations in an attached database is not supported"
+                .to_string(),
+        ));
+    }
+    Ok(ctx.database_id == MAIN_DB_ID)
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL

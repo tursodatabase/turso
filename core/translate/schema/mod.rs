@@ -19,7 +19,6 @@ use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 
-use crate::schema::RelationKind;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
@@ -1456,29 +1455,6 @@ pub fn translate_create_table(
             automatic_indexes: &automatic_indexes,
         }),
     )?;
-
-    if dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![RelationChange::Created {
-            namespace: namespace.id,
-            name: &normalized_tbl_name,
-            kind: RelationKind::Table,
-            table: None,
-        }];
-        for index in &automatic_indexes {
-            changes.push(RelationChange::Created {
-                namespace: namespace.id,
-                name: &index.name,
-                kind: RelationKind::Index,
-                table: Some(&normalized_tbl_name),
-            });
-        }
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &changes,
-        )?;
-    }
 
     // Create the backing table for the hidden AUTOINCREMENT sequence. The
     // `__turso_internal_autoincrement_` prefix identifies the sequence object;
