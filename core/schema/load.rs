@@ -738,9 +738,12 @@ impl LoadStep for DialectState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialect::{AfterWrites, Catalog, CatalogWrite, SqliteCatalog, WriteContext};
     use crate::security::roles::SessionRole;
     use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sync::Mutex;
     use crate::util::IOExt;
+    use crate::vdbe::builder::ProgramBuilder;
     use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
 
@@ -854,5 +857,106 @@ mod tests {
         io.block(|| loader.run(&conn)).unwrap();
 
         assert!(Arc::ptr_eq(&loader.into_schema(), &shared));
+    }
+
+    /// A dialect whose catalog has one load step of its own.
+    struct DialectWithACatalogStep {
+        catalog: CatalogWithAStep,
+    }
+
+    impl crate::dialect::Dialect for DialectWithACatalogStep {
+        fn name(&self) -> &'static str {
+            "catalog-step-test"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> Result<turso_parser::ast::ColumnDefinition> {
+            SqliteDialect.parse_internal_column_definition(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn crate::dialect::Dialect> {
+            Arc::new(SqliteDialect)
+        }
+
+        fn catalog(&self) -> &dyn Catalog {
+            &self.catalog
+        }
+    }
+
+    struct CatalogWithAStep {
+        /// For each time the step ran: whether the schema being read had
+        /// the table `t`.
+        table_seen_by_each_load: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Catalog for CatalogWithAStep {
+        fn write(
+            &self,
+            program: &mut ProgramBuilder,
+            ctx: &WriteContext<'_>,
+            change: &CatalogWrite<'_>,
+        ) -> Result<AfterWrites> {
+            SqliteCatalog.write(program, ctx, change)
+        }
+
+        fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+            vec![Box::new(LooksForTheTable {
+                queried: false,
+                table_seen_by_each_load: self.table_seen_by_each_load.clone(),
+            })]
+        }
+    }
+
+    /// Reads one row as engine metadata, and records whether the schema
+    /// being read has the table `t`.
+    struct LooksForTheTable {
+        queried: bool,
+        table_seen_by_each_load: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl LoadStep for LooksForTheTable {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried)
+                .then(|| LoadQuery::engine_metadata_read("SELECT count(*) FROM sqlite_schema"));
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            self.table_seen_by_each_load
+                .lock()
+                .push(load.schema().has_table(NamespaceId::ROOT, "t"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
+        let table_seen_by_each_load = Arc::new(Mutex::new(Vec::new()));
+        let dialect = Arc::new(DialectWithACatalogStep {
+            catalog: CatalogWithAStep {
+                table_seen_by_each_load: table_seen_by_each_load.clone(),
+            },
+        });
+        let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert_eq!(*table_seen_by_each_load.lock(), [false]);
+        conn.execute("CREATE TABLE t (x)").unwrap();
+
+        conn.force_reparse_schema_without_publish().unwrap();
+
+        assert_eq!(*table_seen_by_each_load.lock(), [false, true]);
     }
 }
