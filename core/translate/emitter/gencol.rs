@@ -6,6 +6,20 @@ use crate::{Arc, Result};
 use super::{ProgramBuilder, Resolver};
 
 /// Emit bytecode to compute the generated columns of a row being written, in dependency order.
+///
+/// INSERT, UPDATE and UPSERT use it to compute every generated column of the new row, also the
+/// virtual columns that nothing reads:
+///
+/// - Possible optimization: skip a virtual column that no index, CHECK, NOT NULL, foreign key,
+///   trigger or RETURNING reads.
+/// - Why we do not skip it: SQLite computes every generated column of the new row before the
+///   BEFORE triggers fire, and an error in one of them stops the statement. With
+///   `d AS (abs(a))`, `INSERT INTO t(a) VALUES (-9223372036854775808)` fails with "integer
+///   overflow", also when nothing reads `d`. The `gencol_error_order_*` tests check this.
+/// - How to skip safely: skip such a column only if its expression cannot fail, for example
+///   column references, literals, arithmetic, comparisons, CASE, COALESCE and CAST. JSON
+///   functions can fail, so a column that extracts a field from a JSON document is still
+///   computed.
 #[turso_macros::trace_stack]
 pub fn compute_generated_columns(
     program: &mut ProgramBuilder,
