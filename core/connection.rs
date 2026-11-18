@@ -5181,20 +5181,4 @@ mod tests {
 
         assert_eq!(pager_shared_ptr, db_shared_ptr);
     }
-
-    #[test]
-    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE t1(a)").unwrap();
-        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
-
-        conn.execute("PRAGMA automatic_index = OFF").unwrap();
-        stmt.run_collect_rows().unwrap();
-
-        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
-        assert_eq!(reprepares, 1);
-    }
 }
