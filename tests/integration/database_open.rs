@@ -1394,3 +1394,72 @@ fn page_codec_rejects_page_size_incompatible_with_reserved_space() {
         .unwrap();
     assert_eq!(count_test_rows(&conn), 1);
 }
+
+/// Opening a database and reading its schema again go through the same
+/// steps, so the schema must be the same after both.
+#[test]
+fn schema_is_the_same_after_open_and_after_it_is_read_again() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("schema_read_again.db");
+    let opts = DatabaseOpts::new()
+        .with_custom_types(true)
+        .with_encryption(true);
+    {
+        let db = crate::common::TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        for sql in [
+            "CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'",
+            "CREATE TABLE prices (id INTEGER PRIMARY KEY, name TEXT UNIQUE, label rev) STRICT",
+            "CREATE INDEX prices_label ON prices (label)",
+            "CREATE VIEW first_price AS SELECT id, name FROM prices WHERE id < 2",
+            "CREATE SEQUENCE ids START WITH 5 INCREMENT BY 2",
+            "INSERT INTO prices VALUES (1, 'tea', 'hot'), (2, 'cake', 'sweet')",
+            "ANALYZE",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        conn.close().unwrap();
+    }
+    let db = crate::common::TempDatabase::new_with_existent_with_opts(&path, opts);
+    let conn = db.connect_limbo();
+
+    let after_open = schema_report(&conn);
+    conn.force_reparse_schema_without_publish().unwrap();
+    let after_reading_again = schema_report(&conn);
+
+    for name in ["rev", "prices_label", "cake", "ids"] {
+        assert!(
+            after_open.iter().any(|line| line.contains(name)),
+            "{name} is missing from the schema report: {after_open:#?}"
+        );
+    }
+    assert_eq!(after_open, after_reading_again);
+}
+
+/// What the connection reports about its tables, indexes, views, custom
+/// types and sequences.
+fn schema_report(conn: &Arc<Connection>) -> Vec<String> {
+    let mut report = Vec::new();
+    for sql in [
+        "SELECT * FROM pragma_table_xinfo('prices')",
+        "SELECT * FROM pragma_index_list('prices')",
+        "SELECT * FROM pragma_index_info('prices_label')",
+        "SELECT * FROM pragma_table_xinfo('first_price')",
+        "SELECT name, sql FROM sqlite_turso_types ORDER BY name",
+        "SELECT id, name, label FROM prices ORDER BY label",
+        "SELECT id, name FROM first_price ORDER BY id",
+    ] {
+        for row in crate::common::limbo_exec_rows(conn, sql) {
+            report.push(format!("{sql}: {row:?}"));
+        }
+    }
+    let mut sequences = conn.with_schema(turso_core::MAIN_DB_ID, |schema| {
+        schema
+            .sequences(turso_core::namespace::NamespaceId::ROOT)
+            .map(|sequence| format!("sequence: {sequence:?}"))
+            .collect::<Vec<_>>()
+    });
+    sequences.sort();
+    report.extend(sequences);
+    report
+}
