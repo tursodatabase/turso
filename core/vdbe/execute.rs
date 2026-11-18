@@ -17103,7 +17103,7 @@ pub fn op_drop_column(
             .table_mut(*namespace, &normalized_table_name)
             .expect("table being renamed should be in schema");
 
-        let table = Arc::get_mut(table).expect("this should be the only strong reference");
+        let table = Arc::make_mut(table);
 
         let Table::BTree(btree) = table else {
             panic!("only btree tables can be renamed");

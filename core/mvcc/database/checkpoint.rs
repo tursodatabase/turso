@@ -1994,7 +1994,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         for (_, name, table) in schema.all_tables_mut() {
             #[cfg(not(feature = "conn_raw_api"))]
             let _ = name;
-            let table = Arc::get_mut(table).expect("this should be the only reference");
+            let table = Arc::make_mut(table);
             let Some(btree_table) = table.btree_mut() else {
                 continue;
             };
