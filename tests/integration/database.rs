@@ -2,9 +2,9 @@ use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
-use turso_core::SqliteDialect;
-use turso_core::{ConnectOpts, Database, OpenFlags};
+use turso_core::{ConnectOpts, Database, OpenFlags, SessionRole};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
+use turso_sqlite::SqliteDialect;
 
 /// Regression test: DATABASE_MANAGER registry returns stale Database after
 /// the underlying file is renamed.
@@ -34,7 +34,9 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -67,7 +69,9 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -166,6 +170,31 @@ fn test_open_refuses_file_with_unknown_virtual_table_module() {
     match open_plain_file(&path) {
         Err(turso_core::LimboError::ExtensionError(msg)) => {
             assert_that!(msg).contains("fts5");
+        }
+        Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
+        Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
+    }
+}
+
+/// A double-quoted argument may hold a single quote or a comma, as in the usual
+/// fts5 `tokenize="unicode61 tokenchars '_'"` option. Opening such a file must
+/// get as far as looking up the module, like any other fts5 table.
+#[test]
+fn test_open_file_with_double_quoted_virtual_table_argument() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("fts5_tokenize.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            r#"CREATE VIRTUAL TABLE f USING fts5(text, tokenize="unicode61 tokenchars '_'");
+               CREATE VIRTUAL TABLE g USING fts5(text, tokenize="unicode61 separators ',.'");"#,
+        )
+        .unwrap();
+    drop(sqlite);
+
+    match open_plain_file(&path) {
+        Err(turso_core::LimboError::ExtensionError(msg)) => {
+            assert_that!(msg).contains("Virtual table module not found: fts5");
         }
         Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
         Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
@@ -325,7 +354,9 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -354,7 +385,9 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -508,7 +541,8 @@ fn test_do_open_skips_registry() {
 fn test_errors_on_zero_divisor_dialect() {
     use crate::common::TempDatabase;
     use std::sync::Arc;
-    use turso_core::{Dialect, LimboError, SqliteDialect};
+    use turso_core::{Dialect, LimboError};
+    use turso_sqlite::SqliteDialect;
 
     struct DivisionRaisesErrorDialect;
     impl Dialect for DivisionRaisesErrorDialect {
@@ -538,13 +572,6 @@ fn test_errors_on_zero_divisor_dialect() {
             body: &turso_parser::ast::CreateTableBody,
         ) -> turso_core::Result<String> {
             SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-        fn register_catalog(
-            &self,
-            schema: &mut turso_core::schema::Schema,
-            enable_custom_types: bool,
-        ) -> turso_core::Result<()> {
-            SqliteDialect.register_catalog(schema, enable_custom_types)
         }
         fn resolve_function(
             &self,

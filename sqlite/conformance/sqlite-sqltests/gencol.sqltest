@@ -71,6 +71,17 @@ expect {
     3|d|INTEGER|0||0|2
 }
 
+test gencol_pragma_table_xinfo_shows_stored_with_hidden_3 {
+    CREATE TABLE t1(a INTEGER, v INTEGER AS (a * 2) VIRTUAL, s INTEGER AS (a * 3) STORED, b TEXT);
+    PRAGMA table_xinfo(t1);
+}
+expect {
+    0|a|INTEGER|0||0|0
+    1|v|INTEGER|0||0|2
+    2|s|INTEGER|0||0|3
+    3|b|TEXT|0||0|0
+}
+
 # =============================================================================
 # 2. Expression Types
 # =============================================================================
@@ -3428,14 +3439,46 @@ expect {
     2|42|43
 }
 
-# ADD COLUMN STORED is rejected (SQLite allows STORED, limbo does not)
-@skip-if sqlite "limbo does not support STORED generated columns"
-test gencol_alter_add_stored_rejected {
+test gencol_alter_add_stored_to_empty_table {
     CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 2) STORED;
+    CREATE INDEX t1_b ON t1(b);
+    INSERT INTO t1(a) VALUES (3);
+    UPDATE t1 SET a = 4;
+    SELECT a, b FROM t1 WHERE b = 8;
+}
+expect {
+    4|8
+}
+
+test gencol_alter_add_stored_to_table_with_rows_rejected {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES (1);
     ALTER TABLE t1 ADD COLUMN b AS (a * 2) STORED;
 }
 expect error {
     cannot add a STORED column
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_alter_add_stored_with_custom_type_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER) STRICT;
+    ALTER TABLE t1 ADD COLUMN s cents AS (a) STORED;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support array types"
+@requires custom_types "uses array types"
+test gencol_alter_add_stored_reading_array_column_rejected {
+    CREATE TABLE t1(a INTEGER[]) STRICT;
+    ALTER TABLE t1 ADD COLUMN s TEXT AS (a) STORED;
+}
+expect error {
+    stored generated columns cannot use custom types
 }
 
 # --- RENAME COLUMN with generated columns ---
@@ -3447,6 +3490,20 @@ test gencol_rename_column_updates_expression {
 }
 expect {
     CREATE TABLE t1 (c TEXT, b TEXT AS (c))
+}
+
+test gencol_stored_rename_column_then_add_column_keeps_new_name {
+    CREATE TABLE t1 (a TEXT, b REAL, c TEXT AS (a) STORED, d REAL);
+    INSERT INTO t1(a, b, d) VALUES ('x', 1, 2);
+    ALTER TABLE t1 ADD COLUMN e TEXT;
+    ALTER TABLE t1 RENAME COLUMN a TO z;
+    ALTER TABLE t1 ADD COLUMN f TEXT;
+    SELECT sql LIKE '%AS (z)%' AND sql NOT LIKE '%(a)%' FROM sqlite_master WHERE name = 't1';
+    SELECT z, c FROM t1;
+}
+expect {
+    1
+    x|x
 }
 
 test gencol_rename_column_chain {
@@ -3651,10 +3708,19 @@ expect {
     ok
 }
 
-# --- PRAGMA table_info hides virtual columns ---
+# --- PRAGMA table_info hides generated columns ---
 
 test gencol_pragma_table_info_hides_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
+    PRAGMA table_info(t1);
+}
+expect {
+    0|a|INTEGER|0||0
+    1|c|TEXT|0||0
+}
+
+test gencol_pragma_table_info_hides_stored {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c TEXT);
     PRAGMA table_info(t1);
 }
 expect {
@@ -4082,22 +4148,383 @@ expect error {
     (bind parameters prohibited|parameters prohibited in generated columns)
 }
 
-# --- Stored generated columns rejected ---
+# --- Stored generated columns ---
 
-@skip-if sqlite "TODO support stored generated columns"
-test gencol_stored_rejected {
+test gencol_stored_basic {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2) STORED);
+    INSERT INTO t1(a) VALUES (5);
+    SELECT a, b FROM t1;
 }
-expect error {
-    Stored generated columns are not supported
+expect {
+    5|10
 }
 
-@skip-if sqlite "TODO support stored generated columns"
-test gencol_stored_generated_always_rejected {
+test gencol_stored_generated_always {
     CREATE TABLE t1(a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);
+    INSERT INTO t1(a) VALUES (3.0);
+    SELECT typeof(a), a || '', typeof(b), b FROM t1;
+}
+expect {
+    real|3.0|integer|3
+}
+
+test gencol_stored_drop_column_referenced_by_stored_column {
+    CREATE TABLE t1(a INTEGER, x INTEGER, b INTEGER AS (a * 2) STORED);
+    ALTER TABLE t1 DROP COLUMN a;
 }
 expect error {
-    Stored generated columns are not supported
+    no such column: a
+}
+
+test gencol_stored_upsert_updates_index_on_stored_column {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, c INTEGER, s INTEGER AS (c * 2) STORED);
+    CREATE INDEX t1_s ON t1(s);
+    INSERT INTO t1(a, c) VALUES (1, 1);
+    INSERT INTO t1(a, c) VALUES (1, 5) ON CONFLICT(a) DO UPDATE SET c = excluded.c;
+    SELECT a FROM t1 WHERE s = 10;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+test gencol_stored_vacuum_into_copies_table_with_stored_column {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c AS (b*2) STORED);
+    INSERT INTO t1(b) VALUES(1);
+    VACUUM INTO ':memory:';
+    SELECT b, c FROM t1;
+}
+expect {
+    1|2
+}
+
+test gencol_stored_upsert_do_update_applies_affinity_before_compute {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b REAL, g AS (typeof(b)) STORED, h AS (b || '') STORED);
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1(id, b) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET b = '4';
+    SELECT id, typeof(b), b || '', g, h FROM t1;
+}
+expect {
+    1|real|4.0|real|4.0
+}
+
+@requires trigger "needs triggers"
+test gencol_stored_upsert_do_update_before_update_trigger_sees_affinity {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b REAL, g AS (typeof(b)) STORED, h AS (b || '') STORED);
+    CREATE TABLE log(x);
+    CREATE TRIGGER t1_bu BEFORE UPDATE ON t1 BEGIN INSERT INTO log VALUES(NEW.g || ' ' || NEW.h); END;
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1(id, b) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET b = '4';
+    SELECT x FROM log;
+}
+expect {
+    real 4.0
+}
+
+test gencol_stored_update_set_generated_column_default_is_rejected {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a*2) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    UPDATE t1 SET b = DEFAULT;
+}
+expect error {}
+
+test gencol_stored_upsert_set_generated_column_default_is_rejected {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a*2) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    INSERT INTO t1(a) VALUES (1) ON CONFLICT(a) DO UPDATE SET b = DEFAULT;
+}
+expect error {}
+
+test gencol_stored_constant_expression {
+    CREATE TABLE t1(a INT, b INT AS ('12') STORED, c AS (5) STORED, d AS (NULL IS NULL) STORED);
+    CREATE INDEX t1_c ON t1(c);
+    INSERT INTO t1(a) VALUES (1), (2);
+    SELECT a, b, typeof(b), c, d FROM t1 ORDER BY a;
+    SELECT count(*) FROM t1 WHERE c = 5;
+    PRAGMA integrity_check;
+}
+expect {
+    1|12|integer|5|1
+    2|12|integer|5|1
+    2
+    ok
+}
+
+test gencol_stored_constant_expression_after_update {
+    CREATE TABLE t1(a INT, c AS (5) STORED);
+    INSERT INTO t1(a) VALUES (1), (2);
+    UPDATE t1 SET a = a + 10;
+    SELECT a, c FROM t1 ORDER BY a;
+}
+expect {
+    11|5
+    12|5
+}
+
+test gencol_stored_constant_expression_after_upsert {
+    CREATE TABLE t1(a INT PRIMARY KEY, c AS (5) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    INSERT INTO t1(a) VALUES (1) ON CONFLICT(a) DO UPDATE SET a = excluded.a + 1;
+    SELECT a, c FROM t1;
+}
+expect {
+    2|5
+}
+
+test gencol_stored_upsert_changing_pk_updates_unique_stored_column {
+    CREATE TABLE t1(a INT PRIMARY KEY, s INT AS (a * 2) STORED UNIQUE, x);
+    INSERT INTO t1(a, x) VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t1(a, x) VALUES (1, 'c') ON CONFLICT(a) DO UPDATE SET a = 10;
+    SELECT a, s, x FROM t1 WHERE s = 20;
+    PRAGMA integrity_check;
+}
+expect {
+    10|20|a
+    ok
+}
+
+test gencol_stored_depends_on_virtual_that_depends_on_stored {
+    CREATE TABLE t1(a INT, s INT AS (a * 2) STORED, v INT AS (s + 1) VIRTUAL, s2 INT AS (v * 10) STORED);
+    INSERT INTO t1(a) VALUES (1), (2);
+    SELECT a, s, v, s2 FROM t1 ORDER BY a;
+}
+expect {
+    1|2|3|30
+    2|4|5|50
+}
+
+test gencol_stored_depends_on_virtual_that_depends_on_stored_after_update {
+    CREATE TABLE t1(a INT, s INT AS (a * 2) STORED, v INT AS (s + 1) VIRTUAL, s2 INT AS (v * 10) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    UPDATE t1 SET a = 5;
+    SELECT a, s, v, s2 FROM t1;
+}
+expect {
+    5|10|11|110
+}
+
+test gencol_stored_index_on_stored_that_depends_on_virtual_chain {
+    CREATE TABLE t1(a INT, s INT AS (a * 2) STORED, v INT AS (s + 1) VIRTUAL, s2 INT AS (v * 10) STORED);
+    CREATE INDEX t1_s2 ON t1(s2);
+    INSERT INTO t1(a) VALUES (1), (2);
+    SELECT a FROM t1 WHERE s2 = 30;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+test gencol_virtual_not_null_depends_on_stored {
+    CREATE TABLE t1(a INT, s INT AS (a * 2) STORED, v INT AS (s + 1) VIRTUAL NOT NULL);
+    INSERT INTO t1(a) VALUES (1);
+    SELECT a, s, v FROM t1;
+}
+expect {
+    1|2|3
+}
+
+test gencol_virtual_check_depends_on_stored {
+    CREATE TABLE t1(a INT, s INT AS (a * 2) STORED, v INT AS (s + 1) VIRTUAL CHECK (v < 3));
+    INSERT INTO t1(a) VALUES (1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test gencol_stored_not_null_checked_after_computing {
+    CREATE TABLE t1(a, b NOT NULL AS (a) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|1
+}
+
+test gencol_stored_not_null_violation_on_update {
+    CREATE TABLE t1(a, b NOT NULL AS (a) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    UPDATE t1 SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+test gencol_update_reads_generated_column_declared_later {
+    CREATE TABLE t1(a, x AS (y + 1) NOT NULL, y AS (a * 2) STORED);
+    INSERT INTO t1(a) VALUES (1);
+    UPDATE t1 SET a = 3;
+    SELECT a, x, y FROM t1;
+}
+expect {
+    3|7|6
+}
+
+test gencol_virtual_update_reads_virtual_column_declared_later {
+    CREATE TABLE t1(a, x AS (y + 1) NOT NULL, y AS (a * 2));
+    INSERT INTO t1(a) VALUES (1);
+    UPDATE t1 SET a = 3;
+    SELECT a, x, y FROM t1;
+}
+expect {
+    3|7|6
+}
+
+test gencol_stored_drop_column_before_stored_column {
+    CREATE TABLE t1(x, a, b AS (a * 2) STORED);
+    INSERT INTO t1 VALUES (1, 2);
+    ALTER TABLE t1 DROP COLUMN x;
+    INSERT INTO t1 VALUES (5);
+    SELECT a, b FROM t1;
+}
+expect {
+    2|4
+    5|10
+}
+
+test gencol_stored_upsert_do_update_not_null_on_recomputed_column {
+    CREATE TABLE t1(a PRIMARY KEY, b, c AS (b) STORED NOT NULL);
+    INSERT INTO t1 VALUES(1,1);
+    INSERT INTO t1(a,b) VALUES(1,1) ON CONFLICT(a) DO UPDATE SET b=NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.c
+}
+
+test gencol_virtual_upsert_do_update_not_null_on_recomputed_column {
+    CREATE TABLE t1(a PRIMARY KEY, b, c AS (b) NOT NULL);
+    INSERT INTO t1 VALUES(1,1);
+    INSERT INTO t1(a,b) VALUES(1,1) ON CONFLICT(a) DO UPDATE SET b=NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.c
+}
+
+test gencol_stored_upsert_do_update_not_null_after_before_update_trigger {
+    CREATE TABLE t1(a PRIMARY KEY, b, d, c AS (CASE WHEN b = 5 THEN d ELSE 1 END) STORED NOT NULL);
+    INSERT INTO t1 VALUES(1,1,1);
+    CREATE TRIGGER tr BEFORE UPDATE ON t1 BEGIN UPDATE t1 SET d=NULL WHERE a=old.a; END;
+    INSERT INTO t1(a,b,d) VALUES(1,1,1) ON CONFLICT(a) DO UPDATE SET b=5;
+}
+expect error {
+    NOT NULL constraint failed: t1.c
+}
+
+test gencol_stored_columns_computed_in_column_order {
+    CREATE TABLE t1(a, b AS (abs(a)) STORED, c AS (json(a || 'x')) STORED);
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+test gencol_stored_columns_computed_in_column_order_reversed {
+    CREATE TABLE t1(a, c AS (json(a || 'x')) STORED, b AS (abs(a)) STORED);
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    malformed JSON
+}
+
+test gencol_error_order_virtual {
+    CREATE TABLE t1(a, b AS (c || json(a || 'x')), c AS (a), d AS (abs(a)));
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+test gencol_error_order_stored {
+    CREATE TABLE t1(a, b AS (c || json(a || 'x')) STORED, c AS (a) STORED, d AS (abs(a)) STORED);
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+test gencol_error_order_mixed {
+    CREATE TABLE t1(a, b AS (c || json(a || 'x')) STORED, c AS (a) VIRTUAL, d AS (abs(a)) STORED);
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+test gencol_error_order_virtual_chain {
+    CREATE TABLE t1(a, x AS (json(y || '[')) VIRTUAL, y AS (w) VIRTUAL, w AS (a) VIRTUAL, z AS (abs(a)) VIRTUAL);
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+test gencol_error_order_stored_chain {
+    CREATE TABLE t1(a, x AS (json(y || '[')) STORED, y AS (w) STORED, w AS (a) STORED, z AS (abs(a)) STORED);
+    INSERT INTO t1(a) VALUES(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_with_custom_type_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER, s cents AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support array types"
+@requires custom_types "uses array types"
+test gencol_stored_with_array_type_rejected {
+    CREATE TABLE t1(a INTEGER, s INTEGER[] AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_reading_custom_type_column_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a cents, s INTEGER AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support array types"
+@requires custom_types "uses array types"
+test gencol_stored_reading_array_column_rejected {
+    CREATE TABLE t1(a INTEGER[], s TEXT AS (a) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_reading_custom_type_column_through_virtual_column_rejected {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a cents, v INTEGER AS (a) VIRTUAL, s INTEGER AS (v) STORED) STRICT;
+}
+expect error {
+    stored generated columns cannot use custom types
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol_stored_next_to_unread_custom_type_column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(a INTEGER, c cents, s INTEGER AS (a * 2) STORED) STRICT;
+    INSERT INTO t1(a, c) VALUES (1, 5);
+    SELECT a, c, s FROM t1;
+}
+expect {
+    1|5|2
 }
 
 # =============================================================================

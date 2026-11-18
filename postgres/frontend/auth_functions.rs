@@ -1,10 +1,8 @@
 use crate::error::sqlstate_error;
-use crate::functions::{pg_scalar_function, Uuid};
+use crate::functions::{invalid_json, pg_scalar_function, unsupported_unicode_escape, Uuid};
 use turso_core::native_ext::FunctionArity;
 use turso_core::{Connection, OpenOptions, Result};
-use turso_pg_parser::sqlstate::{
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_UNTRANSLATABLE_CHARACTER,
-};
+use turso_pg_parser::sqlstate::SQLSTATE_INVALID_TEXT_REPRESENTATION;
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
@@ -72,17 +70,9 @@ fn setting(conn: &Connection, name: &str) -> Option<String> {
 }
 
 fn parse_claims(claims: &str) -> Result<serde_json::Value> {
-    let parsed_claims = serde_json::from_str(claims).map_err(|_| {
-        sqlstate_error(
-            SQLSTATE_INVALID_TEXT_REPRESENTATION,
-            "invalid input syntax for type json",
-        )
-    })?;
+    let parsed_claims = serde_json::from_str(claims).map_err(|_| invalid_json())?;
     if has_nul_escape(claims) {
-        return Err(sqlstate_error(
-            SQLSTATE_UNTRANSLATABLE_CHARACTER,
-            "unsupported Unicode escape sequence",
-        ));
+        return Err(unsupported_unicode_escape());
     }
     Ok(parsed_claims)
 }

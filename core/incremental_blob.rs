@@ -30,9 +30,11 @@ use crate::namespace::NamespaceId;
 use crate::translate::collate::CollationSeq;
 use std::num::NonZero;
 use std::sync::Arc;
+use turso_parser::ast::Privilege;
 
 use crate::alloc::TursoSliceExt;
 use crate::schema::{BTreeTable, Column, Schema};
+use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::storage::pager::Pager;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{CmpInsFlags, Insn, RegisterOrLiteral};
@@ -288,6 +290,7 @@ impl Connection {
                 "incremental blob I/O is not supported in MVCC mode".to_string(),
             ));
         }
+        crate::translate::row_security::check_blob_open(self, table, read_write)?;
         let fk_enforced = self.foreign_keys_enabled();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
             if schema.is_materialized_view(NamespaceId::ROOT, table)
@@ -308,6 +311,7 @@ impl Connection {
             let tbl = schema
                 .get_btree_table(NamespaceId::ROOT, table)
                 .ok_or_else(|| LimboError::InternalError(format!("no such table: {table}")))?;
+            check_blob_privileges(self, schema, &tbl.name, read_write)?;
             if !tbl.has_rowid {
                 return Err(LimboError::InternalError(format!(
                     "cannot open table without rowid: {table}"
@@ -384,6 +388,39 @@ impl Connection {
             expired: false,
         })
     }
+}
+
+/// Fails if the current role may not open a blob handle on `table`. The
+/// handle reads or writes the table outside any statement, so it is checked
+/// as a SELECT or an UPDATE of the table would be: a role that is not a
+/// superuser may not write to any table, and may read only the tables the
+/// dialect's privileges let it read.
+fn check_blob_privileges(
+    conn: &Connection,
+    schema: &Schema,
+    table: &str,
+    read_write: bool,
+) -> Result<()> {
+    let role = conn.current_role();
+    if conn.dialect().role_is_superuser(schema, role) {
+        return Ok(());
+    }
+    let denied = |action| {
+        LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
+            action,
+            Object::Table(table.to_string()),
+        )))
+    };
+    if read_write {
+        return Err(denied(Action::Write));
+    }
+    if conn
+        .dialect()
+        .role_has_privilege(schema, NamespaceId::ROOT, table, role, Privilege::Select)
+    {
+        return Ok(());
+    }
+    Err(denied(Action::Read))
 }
 
 /// Build the paused loop that holds the row's cursor open and services read/write ops

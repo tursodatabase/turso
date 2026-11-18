@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use turso_core::security::roles::RoleId;
 use turso_core::{Connection, ConnectionHooks, SavepointMemo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +30,18 @@ impl PgSessionState {
         self.settings.lock().unwrap().contains(name)
     }
 
+    /// The name of the role set with SET ROLE, or `None` if the session's
+    /// login role is current.
+    pub(crate) fn role_name(&self) -> Option<String> {
+        let settings = self.settings.lock().unwrap();
+        settings
+            .current
+            .role
+            .current()
+            .as_ref()
+            .map(|role| role.name.clone())
+    }
+
     pub(crate) fn name_as_defined(&self, name: &str) -> Option<String> {
         self.settings
             .lock()
@@ -41,14 +54,11 @@ impl PgSessionState {
     fn update_settings(
         &self,
         conn: &Connection,
-        update: impl FnOnce(&mut ConnectionSettings) -> bool,
+        update: impl FnOnce(&mut ConnectionSettings) -> Option<CoreValues>,
     ) {
-        let changed_search_path = {
-            let mut settings = self.settings.lock().unwrap();
-            update(&mut settings).then(|| settings.search_path().map(<[String]>::to_vec))
-        };
-        if let Some(search_path) = changed_search_path {
-            conn.set_search_path(search_path);
+        let changed = update(&mut self.settings.lock().unwrap());
+        if let Some(values) = changed {
+            values.apply(conn);
         }
     }
 
@@ -102,10 +112,35 @@ pub(crate) struct ConnectionSettings {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SettingValues {
     search_path: Setting<Option<Vec<String>>>,
+    /// The role set with SET ROLE, or `None` for the session's login role.
+    role: Setting<Option<SetRole>>,
     /// Custom parameters, by ascii-lowercase name. Also contains the `search_path` as the user entered it.
     named: HashMap<String, Setting<Option<String>>>,
     /// whether this struct contains any LOCAL values
     has_transaction_values: bool,
+}
+
+/// A role that SET ROLE made current.
+#[derive(Clone, Debug)]
+pub(crate) struct SetRole {
+    pub(crate) id: RoleId,
+    /// The name as it was set, which SHOW role returns.
+    pub(crate) name: String,
+}
+
+/// The values of the settings that core keeps a copy of, so core must be
+/// told when one of them changes.
+#[derive(Clone, PartialEq)]
+struct CoreValues {
+    search_path: Option<Vec<String>>,
+    role: Option<RoleId>,
+}
+
+impl CoreValues {
+    fn apply(self, conn: &Connection) {
+        conn.set_search_path(self.search_path);
+        conn.set_current_role(self.role.unwrap_or_else(|| conn.session_role()));
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -115,10 +150,6 @@ struct Setting<T> {
 }
 
 impl ConnectionSettings {
-    pub(crate) fn search_path(&self) -> Option<&[String]> {
-        self.current.search_path.current().as_deref()
-    }
-
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.current.named.get(name)?.current().as_deref()
     }
@@ -159,6 +190,11 @@ impl ConnectionSettings {
         self.current.has_transaction_values |= scope == SettingScope::Transaction;
     }
 
+    pub(crate) fn set_role(&mut self, role: Option<SetRole>, scope: SettingScope) {
+        self.current.role.set(role, scope);
+        self.current.has_transaction_values |= scope == SettingScope::Transaction;
+    }
+
     pub(crate) fn set(&mut self, name: &str, value: Option<String>, scope: SettingScope) {
         let key = name.to_ascii_lowercase();
         self.names_as_defined
@@ -175,11 +211,11 @@ impl ConnectionSettings {
         }
     }
 
-    pub(crate) fn end_statement(
+    fn end_statement(
         &mut self,
         statement_failed: bool,
         transaction_ended: bool,
-    ) -> bool {
+    ) -> Option<CoreValues> {
         let memo_before_statement = self.memo_before_statement.take();
         let memo_to_restore = if transaction_ended {
             self.memo_before_transaction
@@ -198,7 +234,7 @@ impl ConnectionSettings {
         })
     }
 
-    pub(crate) fn rollback_transaction(&mut self) -> bool {
+    fn rollback_transaction(&mut self) -> Option<CoreValues> {
         self.memo_before_statement = None;
         let memo_before_transaction = self.memo_before_transaction.take();
         self.change_current_values(|current| {
@@ -209,20 +245,34 @@ impl ConnectionSettings {
         })
     }
 
-    pub(crate) fn rollback_to_savepoint(&mut self, saved: SettingValues) -> bool {
+    fn rollback_to_savepoint(&mut self, saved: SettingValues) -> Option<CoreValues> {
         self.change_current_values(|current| current.restore(saved))
     }
 
-    fn change_current_values(&mut self, change: impl FnOnce(&mut SettingValues)) -> bool {
-        let search_path = self.current.search_path.current().clone();
+    /// Applies `change` and returns the values core keeps if any of them
+    /// changed.
+    fn change_current_values(
+        &mut self,
+        change: impl FnOnce(&mut SettingValues),
+    ) -> Option<CoreValues> {
+        let before = self.current.core_values();
         change(&mut self.current);
-        search_path != *self.current.search_path.current()
+        let after = self.current.core_values();
+        (after != before).then_some(after)
     }
 }
 
 impl SettingValues {
+    fn core_values(&self) -> CoreValues {
+        CoreValues {
+            search_path: self.search_path.current().clone(),
+            role: self.role.current().as_ref().map(|role| role.id),
+        }
+    }
+
     fn restore(&mut self, mut saved: SettingValues) {
         self.search_path = saved.search_path;
+        self.role = saved.role;
         self.has_transaction_values = saved.has_transaction_values;
         for (name, setting) in &mut self.named {
             *setting = saved.named.remove(name).unwrap_or_default();
@@ -231,6 +281,7 @@ impl SettingValues {
 
     fn end_transaction(&mut self) {
         self.search_path.end_transaction();
+        self.role.end_transaction();
         for setting in self.named.values_mut() {
             setting.end_transaction();
         }
@@ -262,6 +313,7 @@ impl<T> Setting<T> {
 
 pub(crate) enum ConfigParameter {
     SearchPath,
+    Role,
     ApplicationName,
     Fixed(&'static FixedParameter),
 }
@@ -274,6 +326,8 @@ pub(crate) enum Parameter<'a> {
 pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
     let parameter = if name.eq_ignore_ascii_case("search_path") {
         ConfigParameter::SearchPath
+    } else if name.eq_ignore_ascii_case("role") {
+        ConfigParameter::Role
     } else if name.eq_ignore_ascii_case("application_name") {
         ConfigParameter::ApplicationName
     } else if let Some(parameter) = FIXED_PARAMETERS
@@ -296,6 +350,7 @@ impl ConfigParameter {
     ) -> turso_core::Result<String> {
         match self {
             Self::SearchPath => crate::session::set_search_path(conn, value, scope),
+            Self::Role => crate::session::set_role(conn, value, scope),
             Self::ApplicationName => {
                 crate::session::session_state(conn)?.mutate(conn, |settings| {
                     settings.set(self.name(), value.map(str::to_owned), scope);
@@ -315,6 +370,10 @@ impl ConfigParameter {
         match self {
             Self::SearchPath => crate::session::search_path_setting(conn)
                 .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
+            Self::Role => conn
+                .context::<PgSessionState>()
+                .and_then(PgSessionState::role_name)
+                .unwrap_or_else(|| "none".to_owned()),
             Self::ApplicationName => conn
                 .context::<PgSessionState>()
                 .and_then(|state| state.setting(self.name()))
@@ -326,6 +385,7 @@ impl ConfigParameter {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::SearchPath => "search_path",
+            Self::Role => "role",
             Self::ApplicationName => "application_name",
             Self::Fixed(parameter) => parameter.name,
         }

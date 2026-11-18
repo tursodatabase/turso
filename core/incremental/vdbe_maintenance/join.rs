@@ -9,6 +9,7 @@ use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
@@ -539,8 +540,9 @@ pub(super) fn emit_inner_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
@@ -790,8 +792,9 @@ pub(super) fn emit_semi_or_anti_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
+        RoleId::SUPERUSER,
     );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));

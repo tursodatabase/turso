@@ -8,10 +8,14 @@ use log::debug;
 use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::vdbe::StepResult;
+use turso_core::vdbe::insn::ClearBtreeCount;
+use turso_core::vdbe::insn::Insn;
+use turso_core::{vdbe::StepResult, SessionRole};
 use turso_core::{
     CheckpointMode, ConnectOpts, Connection, LimboError, Numeric, Row, Statement, Value,
 };
+use turso_core::{Database, MemoryIO};
+use turso_sqlite::SqliteDialect;
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -896,7 +900,10 @@ fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
 #[turso_macros::test()]
 pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
-    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -911,7 +918,10 @@ pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
 
 #[turso_macros::test]
 pub fn delete_eq_correct(limbo: TempDatabase) {
-    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
         "CREATE UNIQUE INDEX t_idx ON t(c);",
@@ -927,7 +937,10 @@ pub fn delete_eq_correct(limbo: TempDatabase) {
 
 #[turso_macros::test]
 pub fn upsert_conflict(limbo: TempDatabase) {
-    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
         "INSERT INTO t VALUES (1, 2, 100);",
@@ -976,7 +989,10 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
     // quoted identifiers, because INSERT stored the joined-table identifier
     // via `Name::to_string` (which preserves quotes) instead of normalizing
     // it like DELETE/UPDATE do.
-    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
         .unwrap();
     assert_that!(limbo_exec_rows(
@@ -989,7 +1005,10 @@ pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for _ in 0..COUNT {
@@ -1039,7 +1058,10 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
-    let conn = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t (x);").unwrap();
     let mut stmts = Vec::new();
     for i in 0..COUNT {
@@ -1080,7 +1102,10 @@ pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
     conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
 
@@ -1110,7 +1135,10 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1152,7 +1180,10 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
 #[turso_macros::test]
 pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1.execute("CREATE TABLE t (x);").unwrap();
 
     conn1.execute("BEGIN").unwrap();
@@ -1236,8 +1267,14 @@ fn test_unique_complex_key() {
 #[turso_macros::test]
 pub fn test_conflict_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1256,8 +1293,14 @@ pub fn test_conflict_autocommit(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1278,8 +1321,14 @@ pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
 #[turso_macros::test]
 pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new()).unwrap();
-    let conn2 = limbo.db.connect(ConnectOpts::new()).unwrap();
+    let conn1 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = limbo
+        .db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
         .unwrap();
@@ -1312,8 +1361,8 @@ pub fn test_savepoint_rollback_uses_current_wal_snapshot(
     limbo: TempDatabase,
 ) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let conn1 = limbo.db.connect(ConnectOpts::new())?;
-    let conn2 = limbo.db.connect(ConnectOpts::new())?;
+    let conn1 = limbo.db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    let conn2 = limbo.db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
     for i in 1..=8 {
@@ -2095,9 +2144,9 @@ fn test_matview_aggregate_state_survives_reopen(tmp_db: TempDatabase) -> anyhow:
         tmp_db.db_flags,
         tmp_db.db_opts,
         None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
+        std::sync::Arc::new(SqliteDialect),
     )?;
-    let conn = db2.connect(ConnectOpts::new())?;
+    let conn = db2.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     // Deleting x=1 retracts the current minimum. Its NOCASE value is a
     // duplicate of the surviving "a", so the distinct count stays at two.
@@ -2353,4 +2402,145 @@ fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
     }
     assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
     Ok(())
+}
+
+#[test]
+fn delete_without_where_clears_table_and_index_btrees() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX items_name ON items(name)")
+        .unwrap();
+    conn.execute("CREATE INDEX items_score ON items(score) WHERE score > 0")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES(1, 'one', -1), (2, 'two', 0), (3, 'three', 1)")
+        .unwrap();
+
+    let mut statement = conn.prepare("DELETE FROM items").unwrap();
+    let instructions = &statement.get_program().insns;
+    let clears = instructions
+        .iter()
+        .filter_map(|(instruction, _)| match instruction {
+            Insn::ClearBtree { count, .. } => Some(*count),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        clears,
+        vec![
+            ClearBtreeCount::RowsWritten,
+            ClearBtreeCount::RowsWritten,
+            ClearBtreeCount::ChangesAndRowsWritten,
+        ],
+        "both indexes and then the table must be cleared, and only the table counts changes"
+    );
+    assert!(
+        instructions
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::Delete { .. })),
+        "a whole-table delete must not emit the row-at-a-time Delete opcode"
+    );
+
+    statement.run_ignore_rows().unwrap();
+    assert_eq!(statement.n_change(), 3);
+    assert_eq!(
+        statement.metrics().rows_written,
+        7,
+        "metrics must count table, full-index, and partial-index entries"
+    );
+
+    statement.reset().unwrap();
+    statement.reset_metrics();
+    statement.run_ignore_rows().unwrap();
+    assert_eq!(statement.n_change(), 0);
+    assert_eq!(statement.metrics().rows_written, 0);
+
+    statement.reset().unwrap();
+    statement.reset_metrics();
+    conn.execute("INSERT INTO items VALUES(4, 'four', -1), (5, 'five', 1)")
+        .unwrap();
+    statement.run_ignore_rows().unwrap();
+    assert_eq!(statement.n_change(), 2);
+    assert_eq!(
+        statement.metrics().rows_written,
+        5,
+        "reused statements must recount table and index entries"
+    );
+
+    statement.reset().unwrap();
+    statement.reset_metrics();
+    conn.execute(
+        "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 3000) \
+         INSERT INTO items SELECT x, printf('name-%0200d', x), x % 2 FROM c",
+    )
+    .unwrap();
+    statement.run_ignore_rows().unwrap();
+    assert_eq!(statement.n_change(), 3000);
+    assert_eq!(
+        statement.metrics().rows_written,
+        3000 + 3000 + 1500,
+        "interior cells of the index B-trees are entries, interior cells of the table are not"
+    );
+}
+
+#[test]
+fn delete_keeps_row_loop_when_rows_need_individual_processing() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    for sql in [
+        "DELETE FROM items WHERE 1",
+        "DELETE FROM items RETURNING id",
+    ] {
+        let statement = conn.prepare(sql).unwrap();
+        assert!(
+            statement
+                .get_program()
+                .insns
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+            "{sql} must process rows individually"
+        );
+    }
+
+    conn.execute("CREATE TABLE deleted_items(id)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER log_item_delete AFTER DELETE ON items \
+         BEGIN INSERT INTO deleted_items VALUES(old.id); END",
+    )
+    .unwrap();
+    let statement = conn.prepare("DELETE FROM items").unwrap();
+    assert!(
+        statement
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+        "DELETE triggers require the row loop"
+    );
+
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parents(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE children(parent_id REFERENCES parents(id))")
+        .unwrap();
+    let statement = conn.prepare("DELETE FROM parents").unwrap();
+    assert!(
+        statement
+            .get_program()
+            .insns
+            .iter()
+            .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+        "foreign-key actions require the row loop"
+    );
 }

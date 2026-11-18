@@ -30,6 +30,7 @@ name = "regression_tests_cross_platform"
 path = "regression_tests_cross_platform.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 memmap2 = "0.9"

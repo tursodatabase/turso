@@ -5,6 +5,25 @@ use crate::{Arc, Result};
 
 use super::{ProgramBuilder, Resolver};
 
+/// Emit bytecode to compute the generated columns of a row being written, in dependency order.
+#[turso_macros::trace_stack]
+pub fn compute_generated_columns(
+    program: &mut ProgramBuilder,
+    columns: &ColumnsTopologicalSort<'_>,
+    dml_ctx: &DmlColumnContext,
+    resolver: &Resolver,
+    table: &Arc<BTreeTable>,
+) -> Result<()> {
+    emit_generated_columns(
+        program,
+        columns,
+        dml_ctx,
+        resolver,
+        table,
+        GeneratedColumns::All,
+    )
+}
+
 /// Emit bytecode to compute virtual generated columns for a row.
 #[turso_macros::trace_stack]
 pub fn compute_virtual_columns(
@@ -14,18 +33,44 @@ pub fn compute_virtual_columns(
     resolver: &Resolver,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
+    emit_generated_columns(
+        program,
+        columns,
+        dml_ctx,
+        resolver,
+        table,
+        GeneratedColumns::VirtualOnly,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeneratedColumns {
+    All,
+    VirtualOnly,
+}
+
+fn emit_generated_columns(
+    program: &mut ProgramBuilder,
+    columns: &ColumnsTopologicalSort<'_>,
+    dml_ctx: &DmlColumnContext,
+    resolver: &Resolver,
+    table: &Arc<BTreeTable>,
+    which: GeneratedColumns,
+) -> Result<()> {
     let ctx = SelfTableContext::ForDML {
         dml_ctx: dml_ctx.clone(),
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         for (idx, column) in columns.iter() {
-            let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
-                continue;
+            let expr = match column.generated_type() {
+                GeneratedType::Virtual { expr, .. } => expr,
+                GeneratedType::Stored { expr, .. } if which == GeneratedColumns::All => expr,
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => continue,
             };
             let target_reg = dml_ctx.to_column_reg(idx);
             translate_expr(program, None, expr, target_reg, resolver)?;
-            if dml_ctx.holds_stored_value(idx) {
+            if column.is_virtual_generated() && dml_ctx.holds_stored_value(idx) {
                 emit_virtual_column_store(program, resolver, column, target_reg, table)?;
             }
             program.emit_column_affinity(target_reg, column.affinity());

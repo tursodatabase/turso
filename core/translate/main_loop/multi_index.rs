@@ -265,6 +265,7 @@ fn emit_in_seek_multi_index_branch(
         table_references,
         &t_ctx.resolver,
         branch.index.as_ref(),
+        source,
         ephemeral_cursor_id,
         next_value_label,
     )?;

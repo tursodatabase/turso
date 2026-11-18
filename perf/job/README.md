@@ -10,7 +10,7 @@ Files are vendored from <https://github.com/gregrahn/join-order-benchmark>:
 - `fkindexes.sql` - foreign-key indexes the benchmark assumes
 - `queries/` - the 113 queries (33 templates, variants `a`-`f`)
 
-The queries are currently used by `core/benches/prepare_benchmark.rs` to
+The queries are currently used by `benches/prepare_benchmark.rs` to
 track statement preparation (parse + plan + codegen) cost; no IMDB data is
 needed for that. To run the queries against real data, load an IMDB dump as
 described in the upstream repository.

@@ -7,13 +7,20 @@ use crate::common::{
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as StdOrdering;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
-use turso_core::SqliteDialect;
+use turso_core::io::{FileId, FileSyncType};
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, StepResult, Value,
+    Buffer, Clock, Completion, File, MemoryIO, MonotonicInstant, OpenFlags, WallClockInstant, IO,
+};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, SessionRole,
+    StepResult, Value,
 };
 use turso_parser::{ast::Cmd, parser::Parser};
+use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedSchemaRow {
@@ -211,20 +218,21 @@ fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
 
 fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
     conn.execute(
-        "CREATE TYPE rev \
+        "CREATE TYPE shout \
          BASE text \
-         ENCODE string_reverse(value) \
-         DECODE string_reverse(value) \
+         ENCODE upper(value) \
          OPERATOR '<'",
     )?;
     conn.execute(
         "CREATE TABLE words(
             id INTEGER PRIMARY KEY,
-            word rev NOT NULL DEFAULT 'banana'
+            word shout NOT NULL DEFAULT 'banana'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX words_word_idx ON words(word)")?;
-    conn.execute("INSERT INTO words(id, word) VALUES (1, 'cherry')")?;
+    // Byte order of the inputs (Cherry < apple < banana) differs from the order
+    // of the stored upper-case values (APPLE < BANANA < CHERRY).
+    conn.execute("INSERT INTO words(id, word) VALUES (1, 'Cherry')")?;
     conn.execute("INSERT INTO words(id, word) VALUES (2, 'apple')")?;
     conn.execute("INSERT INTO words(id, word) VALUES (3, 'banana')")?;
     conn.execute("INSERT INTO words(id) VALUES (4)")?;
@@ -232,30 +240,30 @@ fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result
 }
 
 fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
+    // The type has no DECODE, so words read back as they are stored (upper case).
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, word FROM words ORDER BY id");
     assert_eq!(
         rows,
         vec![
-            (1, "cherry".to_string()),
-            (2, "apple".to_string()),
-            (3, "banana".to_string()),
-            (4, "banana".to_string()),
+            (1, "CHERRY".to_string()),
+            (2, "APPLE".to_string()),
+            (3, "BANANA".to_string()),
+            (4, "BANANA".to_string()),
         ],
     );
 
-    // The index sorts the stored (reversed) text: ananab < elppa < yrrehc.
     let ordered: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM words INDEXED BY words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         ordered,
         vec![
-            (3, "banana".to_string()),
-            (4, "banana".to_string()),
-            (2, "apple".to_string()),
-            (1, "cherry".to_string()),
+            (2, "APPLE".to_string()),
+            (3, "BANANA".to_string()),
+            (4, "BANANA".to_string()),
+            (1, "CHERRY".to_string()),
         ],
-        "the stored-value order should survive when scanning the custom-type index",
+        "the order should survive when scanning the custom-type index",
     );
 
     let desc: Vec<(i64, String)> = conn.exec_rows(
@@ -264,12 +272,12 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
     assert_eq!(
         desc,
         vec![
-            (1, "cherry".to_string()),
-            (2, "apple".to_string()),
-            (4, "banana".to_string()),
-            (3, "banana".to_string()),
+            (1, "CHERRY".to_string()),
+            (4, "BANANA".to_string()),
+            (3, "BANANA".to_string()),
+            (2, "APPLE".to_string()),
         ],
-        "descending scans over the custom-type index should use the stored-value order",
+        "descending scans over the custom-type index should use the same order",
     );
 }
 
@@ -277,7 +285,7 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute(
         "CREATE TABLE extra_words(
             id INTEGER PRIMARY KEY,
-            word rev NOT NULL DEFAULT 'kiwi'
+            word shout NOT NULL DEFAULT 'kiwi'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX extra_words_word_idx ON extra_words(word)")?;
@@ -285,16 +293,15 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute("INSERT INTO extra_words(id, word) VALUES (2, 'apricot')")?;
     conn.execute("INSERT INTO extra_words(id, word) VALUES (3, 'pear')")?;
 
-    // Stored (reversed) text: iwik < raep < tocirpa.
     let rows: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM extra_words INDEXED BY extra_words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         rows,
         vec![
-            (1, "kiwi".to_string()),
-            (3, "pear".to_string()),
-            (2, "apricot".to_string()),
+            (2, "APRICOT".to_string()),
+            (1, "KIWI".to_string()),
+            (3, "PEAR".to_string()),
         ],
         "the preserved custom type should remain usable in new tables and indexes after VACUUM",
     );
@@ -2887,7 +2894,7 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
@@ -4345,7 +4352,9 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
                 1,
                 "01".to_string(),
                 "04090F0E3101".to_string(),
-                "0301026400C8".to_string(),
+                // c reads as the array of values {1,2}; the stored {100,200}
+                // is checked by the database hash below.
+                "03090102".to_string(),
                 "{1,2}".to_string()
             ),
             (
@@ -4357,9 +4366,11 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
             ),
         ]
     );
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db).hash;
 
     conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(compute_plain_vacuum_dbhash(&tmp_db).hash, before_hash);
     let after_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
     assert_eq!(after_rows, before_rows);
 
@@ -4396,6 +4407,46 @@ fn test_vacuum_keeps_a_table_with_collate_on_numeric_column() -> anyhow::Result<
     assert_eq!(rows, vec![(2,), (1,)]);
     let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
     assert_eq!(schema, vec![(stored_sql.to_string(),)]);
+    Ok(())
+}
+
+/// VACUUM replays the stored CREATE INDEX and CREATE TABLE, so a key on a lossy
+/// custom type column fails with the same error as the statement that made it.
+#[test]
+fn test_vacuum_refuses_a_key_on_a_lossy_custom_type_column() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    // (the table and key SQLite creates, the table SQL stored in its place)
+    let cases = [
+        (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT); CREATE INDEX i ON t (c);",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c ci) STRICT",
+        ),
+        (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT UNIQUE);",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c ci UNIQUE) STRICT",
+        ),
+    ];
+    for (i, (sqlite_sql, stored_sql)) in cases.into_iter().enumerate() {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join(format!("lossy_key_{i}.db"));
+        {
+            let sqlite_conn = SqliteConnection::open(&db_path)?;
+            sqlite_conn.execute_batch(&format!("{sqlite_sql} PRAGMA writable_schema = ON;"))?;
+            sqlite_conn.execute(
+                "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+                [stored_sql],
+            )?;
+        }
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TYPE ci BASE text ENCODE value DECODE lower(value) OPERATOR '<'")?;
+
+        let err = conn.execute("VACUUM").unwrap_err().to_string();
+        assert!(
+            err.contains("column 'c' of type 'ci' cannot be a key"),
+            "{stored_sql}: unexpected error: {err}"
+        );
+    }
     Ok(())
 }
 
@@ -6418,6 +6469,118 @@ fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Size of the MVCC logical log header (`LOG_HDR_SIZE`): a log of this size has
+/// no transaction frames.
+const MVCC_LOG_HEADER_SIZE: u64 = 56;
+
+#[test]
+fn test_mvcc_plain_vacuum_accepts_header_only_log() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_accepts_header_only_log.db");
+    let conn = tmp_db.connect_limbo();
+    assert_eq!(mvcc_log_file_size(&tmp_db), MVCC_LOG_HEADER_SIZE);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    drop(conn);
+    let path = tmp_db.path.clone();
+    drop(tmp_db);
+
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_eq!(mvcc_log_file_size(&reopened), MVCC_LOG_HEADER_SIZE);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_after_switching_to_mvcc_with_existing_rows() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new("test_mvcc_plain_vacuum_after_switching_to_mvcc_with_existing_rows.db");
+    let conn = tmp_db.connect_limbo();
+    let mut expected_rows = populate_mvcc_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), MVCC_LOG_HEADER_SIZE);
+    // Reading the rows loads their versions into the MVCC store, which VACUUM
+    // must drop before it rewrites the root pages.
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_integrity_and_hash(&tmp_db, &conn, &before_hash);
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    conn.execute("INSERT INTO t VALUES(1000, 'after-vacuum', 'z')")?;
+    expected_rows.push((1000, "after-vacuum".to_string()));
+    assert!(mvcc_log_file_size(&tmp_db) > MVCC_LOG_HEADER_SIZE);
+
+    // One committed frame in the log must still block VACUUM, otherwise
+    // recovery would replay it over the rewritten database file.
+    let err = conn.execute("VACUUM").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
+    );
+    drop(conn);
+    let path = tmp_db.path.clone();
+    drop(tmp_db);
+
+    // Recovery replays the frame written after VACUUM onto the vacuumed file.
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_accepts_log_with_only_a_torn_frame() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_plain_vacuum_accepts_log_with_only_a_torn_frame.db");
+    let conn = tmp_db.connect_limbo();
+    let mut expected_rows = populate_mvcc_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("INSERT INTO t VALUES(1000, 'torn', 'z')")?;
+    drop(conn);
+    let path = tmp_db.path.clone();
+    let log_path = tmp_db.path.with_extension("db-log");
+    drop(tmp_db);
+
+    // Cut the last byte off the only frame, as a crash during its commit
+    // would leave it. Recovery drops the frame but leaves its bytes in the file.
+    let log_size = std::fs::metadata(&log_path)?.len();
+    assert!(log_size > MVCC_LOG_HEADER_SIZE);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log_path)?
+        .set_len(log_size - 1)?;
+
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_eq!(mvcc_log_file_size(&reopened), log_size - 1);
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+    let before_hash = compute_plain_vacuum_dbhash(&reopened);
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_integrity_and_hash(&reopened, &conn, &before_hash);
+    drop(conn);
+    drop(reopened);
+
+    // Recovery after VACUUM still drops the torn frame.
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    // The next commit writes its frame over the torn bytes.
+    conn.execute("INSERT INTO t VALUES(1001, 'after-vacuum', 'z')")?;
+    expected_rows.push((1001, "after-vacuum".to_string()));
+    drop(conn);
+    drop(reopened);
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    Ok(())
+}
+
 #[test]
 fn test_mvcc_plain_vacuum_after_checkpoint_preserves_mvcc_state() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_mvcc(
@@ -6559,7 +6722,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
     let path = "queued-vacuum-reset-during-checkpoint.db";
     let source_wal_path = format!("{path}-wal");
     let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     populate_queued_multibatch(&conn)?;
 
@@ -6605,7 +6768,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
 
     stmt.reset()?;
 
-    let reader = db.connect(ConnectOpts::new())?;
+    let reader = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     let before_schema = normalized_schema_snapshot(&conn);
@@ -6652,6 +6815,387 @@ fn test_vacuum_into_followed_by_writes_and_indexed_read() -> anyhow::Result<()> 
     assert_eq!(
         scalar_i64(&conn, "SELECT count(*) FROM t INDEXED BY i_c WHERE c >= ''"),
         55
+    );
+
+    Ok(())
+}
+
+/// test to check that vacuum into connection state is reset if it is
+/// interrupted mid way
+#[test]
+fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
+    let did_interrupt = Arc::new(AtomicBool::new(false));
+    let conn_for_progress = conn.clone();
+    let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
+    let did_interrupt_for_handler = did_interrupt.clone();
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || {
+            if !conn_for_progress.get_auto_commit() {
+                let calls = source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+                calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+            } else {
+                false
+            }
+        })),
+    );
+
+    let dest_dir = tempfile::TempDir::new().unwrap();
+    let dest_path = dest_dir.path().join("busy_vacuum.db");
+    let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
+    let step = stmt.step().unwrap();
+    conn.set_progress_handler(0, None);
+
+    assert!(
+        matches!(step, StepResult::Busy),
+        "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+    );
+    assert!(
+        source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+        "test should interrupt after VACUUM INTO opens the source transaction"
+    );
+    assert!(
+        did_interrupt.load(Ordering::SeqCst),
+        "progress handler should have interrupted VACUUM INTO exactly once"
+    );
+    assert!(
+        conn.get_auto_commit(),
+        "Busy cleanup should roll back the source transaction before returning"
+    );
+}
+
+#[test]
+fn test_in_place_vacuum_succeeds_and_releases_source_locks() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "in-place-vacuum-design-b.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    for i in 0..128 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+            .unwrap();
+    }
+    conn.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+
+    conn.execute("VACUUM").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT count(*), coalesce(sum(id), 0) FROM t")
+        .unwrap();
+    let mut count = 0_i64;
+    let mut sum = 0_i64;
+    stmt.run_with_row_callback(|row| {
+        count = row.get(0)?;
+        sum = row.get(1)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 64);
+    assert_eq!(sum, (1..128).step_by(2).sum::<i64>());
+    assert!(conn.get_auto_commit());
+
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock());
+    assert!(!pager.holds_write_lock());
+}
+
+#[test]
+fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "in-place-vacuum-busy-before-copyback.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    for i in 0..32 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+            .unwrap();
+    }
+
+    let did_interrupt = Arc::new(AtomicBool::new(false));
+    let conn_for_progress = conn.clone();
+    let did_interrupt_for_handler = did_interrupt.clone();
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || {
+            !conn_for_progress.get_auto_commit()
+                && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+        })),
+    );
+
+    let mut stmt = conn.prepare("VACUUM").unwrap();
+    let step = stmt.step().unwrap();
+    conn.set_progress_handler(0, None);
+
+    assert!(
+        matches!(step, StepResult::Busy),
+        "progress interruption inside in-place VACUUM should surface as Busy, got {step:?}"
+    );
+    assert!(
+        did_interrupt.load(Ordering::SeqCst),
+        "test should interrupt after in-place VACUUM opens the source snapshot"
+    );
+    assert!(
+        conn.get_auto_commit(),
+        "Busy cleanup should restore auto-commit before returning"
+    );
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock());
+    assert!(!pager.holds_write_lock());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SyncCounts {
+    db: usize,
+    wal: usize,
+}
+
+struct SyncCountingIo {
+    inner: Arc<MemoryIO>,
+    tracked_db_path: String,
+    tracked_wal_path: String,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl SyncCountingIo {
+    fn new(tracked_db_path: &str) -> Self {
+        Self {
+            inner: Arc::new(MemoryIO::new()),
+            tracked_db_path: tracked_db_path.to_string(),
+            tracked_wal_path: format!("{tracked_db_path}-wal"),
+            db_syncs: Arc::new(AtomicUsize::new(0)),
+            wal_syncs: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn counts(&self) -> SyncCounts {
+        SyncCounts {
+            db: self.db_syncs.load(StdOrdering::SeqCst),
+            wal: self.wal_syncs.load(StdOrdering::SeqCst),
+        }
+    }
+}
+
+impl Clock for SyncCountingIo {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for SyncCountingIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        let inner = self.inner.open_file(path, flags, direct)?;
+        Ok(Arc::new(SyncCountingFile {
+            inner,
+            count_as_db_sync: path == self.tracked_db_path,
+            count_as_wal_sync: path == self.tracked_wal_path,
+            db_syncs: self.db_syncs.clone(),
+            wal_syncs: self.wal_syncs.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.drain_completions(completions)
+    }
+
+    fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.cancel(completions)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+struct SyncCountingFile {
+    inner: Arc<dyn File>,
+    count_as_db_sync: bool,
+    count_as_wal_sync: bool,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl File for SyncCountingFile {
+    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.pread(pos, c)
+    }
+
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> turso_core::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if self.count_as_db_sync {
+            self.db_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        if self.count_as_wal_sync {
+            self.wal_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        self.inner.sync(c, sync_type)
+    }
+
+    fn size(&self) -> turso_core::Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.truncate(len, c)
+    }
+}
+
+#[test]
+fn in_place_vacuum_with_sync_off_syncs_source_db_once_and_wal_twice() -> turso_core::Result<()> {
+    let io = Arc::new(SyncCountingIo::new("vacuum-source.db"));
+    let io_dyn: Arc<dyn IO> = io.clone();
+    let db = Database::open_file_with_flags(
+        io_dyn,
+        "vacuum-source.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.set_sync_mode(turso_core::SyncMode::Off);
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'y')")?;
+
+    let before = io.counts();
+    assert_eq!(
+        before.db, 1,
+        "creating the database does exactly one source db fsync (page 1 must be \
+         durable before the first WAL commit, even with synchronous=OFF); \
+         ordinary writes must not add more"
+    );
+
+    conn.execute("VACUUM")?;
+
+    let after = io.counts();
+    assert_eq!(
+        after.db - before.db,
+        1,
+        "in-place VACUUM must do exactly one source DB fsync before truncating WAL"
+    );
+    assert_eq!(
+        after.wal - before.wal,
+        2,
+        "in-place VACUUM with synchronous=OFF must do one WAL fsync before backfill \
+         (the checkpoint crash-atomicity barrier; VACUUM forces the checkpoint to \
+         synchronous=FULL) and one after truncation"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> turso_core::Result<()> {
+    let io = Arc::new(SyncCountingIo::new("vacuum-source-full.db"));
+    let io_dyn: Arc<dyn IO> = io.clone();
+    let db = Database::open_file_with_flags(
+        io_dyn,
+        "vacuum-source-full.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.set_sync_mode(turso_core::SyncMode::Off);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'y')")?;
+
+    conn.set_sync_mode(turso_core::SyncMode::Full);
+    let before = io.counts();
+
+    conn.execute("VACUUM")?;
+
+    let after = io.counts();
+    assert_eq!(
+        after.db - before.db,
+        1,
+        "in-place VACUUM must still do exactly one source DB fsync under synchronous=FULL"
+    );
+    assert_eq!(
+        after.wal - before.wal,
+        3,
+        "in-place VACUUM with synchronous=FULL must do one WAL fsync before publish, \
+         one before backfill (the checkpoint crash-atomicity barrier), and one after \
+         truncation"
     );
 
     Ok(())

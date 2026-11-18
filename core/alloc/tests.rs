@@ -1,5 +1,4 @@
 use super::*;
-use crate::ConnectOpts;
 use crate::DatabaseAllocators;
 use std::{
     ptr::NonNull,
@@ -113,48 +112,6 @@ fn dyn_allocator_delegates_skiplist_allocations() {
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
-#[test]
-fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
-    let allocations = StdArc::new(AtomicUsize::new(0));
-    let deallocations = StdArc::new(AtomicUsize::new(0));
-    let fts_allocations = StdArc::new(AtomicUsize::new(0));
-    let alloc = DynAllocator::new(CountingAlloc {
-        allocations: allocations.clone(),
-        deallocations,
-    });
-    let io = StdArc::new(crate::MemoryIO::new());
-    let file = crate::IO::open_file(
-        io.as_ref(),
-        "open-with-allocator.db",
-        crate::OpenFlags::Create,
-        true,
-    )
-    .unwrap();
-    let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
-    let db = crate::Database::open(
-        io,
-        "open-with-allocator.db",
-        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
-            .storage(db_file)
-            .allocators(DatabaseAllocators {
-                mv_store: alloc,
-                fts: DynAllocator::new(CountingAlloc {
-                    allocations: fts_allocations.clone(),
-                    deallocations: StdArc::new(AtomicUsize::new(0)),
-                }),
-            }),
-    )
-    .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
-
-    allocations.store(0, Ordering::Relaxed);
-    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-
-    assert!(db.get_mv_store().is_some());
-    assert!(allocations.load(Ordering::Relaxed) > 0);
-    assert_eq!(fts_allocations.load(Ordering::Relaxed), 0);
-}
-
 #[cfg(all(nightly, feature = "fts"))]
 #[test]
 fn database_fts_build_and_merge_use_only_the_fts_allocator() {
@@ -164,7 +121,7 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
     let db = crate::Database::open(
         StdArc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(StdArc::new(crate::EngineDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true))
             .allocators(DatabaseAllocators {
                 mv_store: DynAllocator::new(CountingAlloc {

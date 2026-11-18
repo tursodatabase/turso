@@ -13,5 +13,8 @@
   "dependencies": {
     "@tursodatabase/database": "file:../../../bindings/javascript/packages/native",
     "@tursodatabase/serverless": "file:.."
+  },
+  "overrides": {
+    "glob@>=10 <14": "^14.0.3"
   }
 }

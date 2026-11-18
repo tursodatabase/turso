@@ -1057,9 +1057,9 @@ test mixed-type-order-by {
     SELECT id, vals FROM mto1 ORDER BY vals;
 }
 expect {
-    3|{NULL,1}
     2|{1,2}
     1|{1,hello}
+    3|{NULL,1}
 }
 
 test order-by-null-elements {
@@ -1070,9 +1070,9 @@ test order-by-null-elements {
     SELECT id, vals FROM one1 ORDER BY vals;
 }
 expect {
-    2|{1,NULL,3}
     3|{1,2}
     1|{1,2,3}
+    2|{1,NULL,3}
 }
 
 test order-by-empty-and-null-arrays {
@@ -1085,9 +1085,9 @@ test order-by-empty-and-null-arrays {
 }
 expect {
     3|{}
+    2|{0}
     1|{NULL}
     4|{NULL,NULL}
-    2|{0}
 }
 
 test chained-array-functions {

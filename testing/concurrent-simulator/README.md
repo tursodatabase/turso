@@ -2,6 +2,50 @@
 
 Deterministic concurrent simulator for Turso.
 
+## Swarm testing
+
+A run with all workloads and fixed fault probabilities cannot get to some states.
+For example, DELETE keeps tables small, ROLLBACK discards writes, and frequent checkpoints keep the WAL short.
+With `--swarm`, the seed of each run also picks these settings:
+
+- The workloads. Each workload is off in about half of the runs. The weight of each other workload is 1/4, 1/2, 1, 2, or 4 times its usual weight.
+- The connections. In-process runs use 1 to 8 connections. Multiprocess runs use 2 to 4 processes, with 1 to 4 connections in each process.
+- The reopen, allocation fault, and checkpoint probe probabilities. In multiprocess mode, the kill probability.
+- With MVCC, the auto-checkpoint threshold: the default, 1 KiB, or 64 KiB of logical log.
+
+Two rules apply to the workloads:
+
+- A read workload that checks results always stays on, for example `PRAGMA integrity_check`. A write workload, such as `nextval`, can be off. Then the run does not use that feature.
+- If BEGIN stays on, COMMIT or ROLLBACK also stays on. Otherwise, a transaction never ends.
+
+A flag that you give keeps its value.
+For example, `--swarm --max-connections 2` always uses two connections, and the seed picks the other settings.
+`--swarm` works with the `fast`, `chaos`, and `ragnarok` modes, without `--elle`.
+The other modes use their own workloads.
+The swarm does not turn on `--enable-experimental-mvcc-passive-checkpoint`, because this checkpoint has open recovery bugs.
+
+The output shows the settings of the run:
+
+```text
+mode = fast
+seed = 14
+swarm: --max-connections 6 --reopen-probability 0.001 --allocation-fault-probability 0.01 --checkpoint-probe-probability 0
+swarm: workloads WalCheckpoint:5 CreateSimpleTable:10 SimpleSelect:5 Json:10 Update:8 Delete:8 ...
+swarm: workloads off SimpleInsert CreateIndex CreateSequence NextVal SetVal ...
+```
+
+To repeat a run, use the same seed and the same flags:
+
+```bash
+SEED=14 cargo run --release -p turso_whopper -- --mode fast --swarm
+```
+
+CI runs in-process swarm profiles for WAL and MVCC on stable and nightly Rust.
+On pull requests, iteration N uses seed N, so each pull request tests the same settings.
+On pushes to main, each iteration uses a new random seed.
+If an iteration fails, the log ends with the command that repeats the run.
+CI does not run swarm profiles in multiprocess mode, because some of these runs take about one hour.
+
 ## FTS in WAL and MVCC
 
 These profiles test full-text search (FTS) in WAL and MVCC.

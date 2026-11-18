@@ -4,7 +4,8 @@ use crate::queued_io::QueuedIo;
 use asserting::prelude::*;
 use rusqlite::types::Value as RValue;
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, SqliteDialect, StepResult, Value};
+use turso_core::{ConnectOpts, Database, IOResult, SessionRole, StepResult, Value};
+use turso_sqlite::SqliteDialect;
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_module_list_returns_list(db: TempDatabase) {
@@ -459,12 +460,57 @@ fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
 fn test_connection_pragma_waits_for_io() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());
     let db = Database::open_file(io, "pragma-waits-for-io.db", Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("CREATE TABLE t1(a)")?;
     conn.execute("INSERT INTO t1 VALUES (1)")?;
     // A new connection starts with an empty page cache.
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     assert_that!(conn.pragma("integrity_check", 10)?)
         .is_equal_to(vec![vec![Value::from_text("ok")]]);
+    Ok(())
+}
+
+/// `Connection::storage_stats` returns the page reads it needs to the
+/// caller instead of waiting for them, and then gives what the PRAGMAs give.
+#[test]
+fn test_storage_stats_returns_io_and_matches_pragmas() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(
+        io.clone(),
+        "storage-stats-returns-io.db",
+        Arc::new(SqliteDialect),
+    )?;
+    let writer = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    // The writes make the page cache of `conn` stale, so it reads page 1
+    // again.
+    writer.execute("CREATE TABLE t1(a)")?;
+    writer.execute("INSERT INTO t1 VALUES (randomblob(10000))")?;
+    writer.execute("DELETE FROM t1")?;
+
+    let mut read = conn.storage_stats();
+    let mut waits = 0;
+    let stats = loop {
+        match read.read()? {
+            IOResult::Done(stats) => break stats,
+            IOResult::IO(completions) => {
+                waits += 1;
+                completions.wait(&*io)?;
+            }
+        }
+    };
+    drop(read);
+
+    assert!(waits > 0, "page 1 was read without returning IO");
+    let pragma = |name: &str| -> anyhow::Result<i64> {
+        Ok(conn.pragma_query(name)?[0][0].as_int().unwrap())
+    };
+    assert_eq!(stats.page_size as i64, pragma("page_size")?);
+    assert_eq!(stats.page_count as i64, pragma("page_count")?);
+    assert_eq!(stats.freelist_count as i64, pragma("freelist_count")?);
+    assert!(stats.freelist_count > 0, "{stats:?}");
+    assert_eq!(stats.logical_log_bytes, 0);
+    // The read ended its read transaction, so the connection can write.
+    conn.execute("INSERT INTO t1 VALUES (1)")?;
     Ok(())
 }

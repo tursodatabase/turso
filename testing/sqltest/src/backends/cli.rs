@@ -415,8 +415,7 @@ impl DatabaseInstance for CliDatabaseInstance {
 }
 
 /// Normalize shell-decorated error output to the message `sqlite3_errmsg`
-/// would report, matching what the rust backend surfaces: parse errors read
-/// `Parse error: <message>`, runtime errors are the bare message.
+/// would report, matching what the rust backend surfaces: the bare message.
 ///
 /// The sqlite3 shell prints `Parse error near line N: <message>` followed by
 /// source-context lines, and `Runtime error near line N: <message> (<code>)`.
@@ -430,7 +429,7 @@ fn normalize_cli_error(raw: &str) -> String {
         // Older tursodb shells wrapped everything in a generic "Error: ".
         let line = line.strip_prefix("Error: ").unwrap_or(line);
         if let Some(message) = strip_shell_error_prefix(line, "Parse error") {
-            return format!("Parse error: {message}");
+            return message.to_string();
         }
         if let Some(message) = strip_shell_error_prefix(line, "Runtime error") {
             return strip_result_code(message).to_string();
@@ -548,7 +547,7 @@ mod tests {
             normalize_cli_error(
                 "Parse error near line 4: no such table: nosuch\n  CREATE TABLE...\n     ^--- error here"
             ),
-            "Parse error: no such table: nosuch"
+            "no such table: nosuch"
         );
     }
 
@@ -571,10 +570,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tursodb_miette_parse_error_keeps_parse_prefix() {
+    fn normalize_tursodb_miette_error() {
         assert_eq!(
-            normalize_cli_error("  × Parse error: no such table: main.nosuch"),
-            "Parse error: no such table: main.nosuch"
+            normalize_cli_error("  × no such table: main.nosuch"),
+            "no such table: main.nosuch"
         );
     }
 

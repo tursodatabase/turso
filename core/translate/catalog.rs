@@ -162,6 +162,14 @@ impl<'a> CatalogContext<'a> {
         self.with_database_scope(namespace, "view", view_name, f)
     }
 
+    /// The view whose query is being planned, innermost first, or None
+    /// outside any view.
+    pub(crate) fn enclosing_view(&self) -> Option<(NamespaceRef, String)> {
+        let scope = self.database_scope.borrow();
+        let scope = scope.as_ref()?;
+        (scope.kind == "view").then(|| (scope.namespace, scope.object_name.clone()))
+    }
+
     pub fn resolve_function(
         &self,
         func_name: &str,
@@ -226,10 +234,11 @@ impl<'a> CatalogContext<'a> {
                 .as_ref()
                 .map(|temp_db| temp_db.db.schema.lock().clone())
                 .unwrap_or_else(|| {
-                    // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    let mut schema =
-                        Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed");
+                    // new_schema only fails if built-in type SQL is malformed (programmer bug).
+                    let mut schema = self
+                        .dialect
+                        .new_schema(self.enable_custom_types)
+                        .expect("built-in type definitions are malformed");
                     schema.copy_table_valued_functions(self.schema);
                     Arc::new(schema)
                 }),
@@ -484,14 +493,6 @@ impl<'a> CatalogContext<'a> {
 
     fn namespace_has_trigger(schema: &Schema, namespace: NamespaceId, trigger_name: &str) -> bool {
         schema.get_trigger(namespace, trigger_name).is_some()
-    }
-
-    /// The namespace of a sequence named without a qualifier: the first
-    /// namespace of the search order that has it, or the first namespace of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.find_existing_sequence(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
     }
 
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {

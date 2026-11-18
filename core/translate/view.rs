@@ -1,17 +1,17 @@
+use crate::dialect::CatalogChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::view::extract_view_columns;
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
-use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
-    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
-    escape_sql_string_literal, extract_view_columns, normalize_ident,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
@@ -77,6 +77,9 @@ pub fn translate_create_materialized_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
+    if schema::relation_name_is_taken(resolver, namespace, &normalized_view_name, if_not_exists)? {
+        return Ok(());
+    }
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
             s.get_view(namespace.id, &normalized_view_name).is_some()
@@ -205,7 +208,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: normalized_view_name,
+        table_name: normalized_view_name.clone(),
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Next {
@@ -241,6 +244,22 @@ pub fn translate_create_materialized_view(
         view_root_reg, // btree root for materialized view data
         Some(sql),
     )?;
+
+    // The view is a relation of the dialect's; its hidden state tables are
+    // engine objects and are not.
+    if schema::dialect_relation_hooks_apply(&connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            &connection,
+            &[CatalogChange::Create {
+                namespace: namespace.id,
+                name: normalized_view_name,
+                kind: crate::schema::RelationKind::MaterializedView,
+                table: None,
+            }],
+        )?;
+    }
 
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
@@ -375,6 +394,9 @@ pub fn translate_create_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
+    if schema::relation_name_is_taken(resolver, namespace, &normalized_view_name, if_not_exists)? {
+        return Ok(());
+    }
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
             s.get_view(namespace.id, &normalized_view_name).is_some()
@@ -422,16 +444,12 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
-    let mut select_stmt = select_stmt.clone();
-    if resolver.catalog.dialect.binds_names_at_create() {
-        bind_sequence_names_in_select(&mut select_stmt, resolver)?;
-    }
     let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
     let sql = create_view_to_str(
         "VIEW",
         &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
         columns,
-        &select_stmt,
+        select_stmt,
     );
 
     // Open cursor to sqlite_schema table
@@ -458,6 +476,20 @@ pub fn translate_create_view(
         0, // Regular views don't have a btree
         Some(sql),
     )?;
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Create {
+                namespace: namespace.id,
+                name: normalized_view_name,
+                kind: crate::schema::RelationKind::View,
+                table: None,
+            }],
+        )?;
+    }
 
     // Parse schema to load the new view
     let escaped_view_name = escape_sql_string_literal(&stored_view_name);
@@ -499,6 +531,7 @@ pub fn translate_drop_view(
     resolver: &Resolver,
     view_name: &ast::QualifiedName,
     if_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
@@ -631,6 +664,18 @@ pub fn translate_drop_view(
                 });
             }
         }
+    }
+
+    if schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.translate_catalog_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[CatalogChange::Drop {
+                namespace: namespace.id,
+                name: normalized_view_name.clone(),
+            }],
+        )?;
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)

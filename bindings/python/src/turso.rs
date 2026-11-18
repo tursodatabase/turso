@@ -10,14 +10,14 @@
 //!  (e.g. the itertools library), since Python tends to be slow.
 use pyo3::{
     prelude::*,
-    types::{PyBytes, PyFloat, PyInt, PyTuple},
+    types::{PyBytes, PyFloat, PyInt, PyMemoryView, PyString, PyTuple},
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
 pub use turso_sdk_kit::IoBackend;
 
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyOverflowError};
+use pyo3::exceptions::{PyException, PyOverflowError, PyTypeError};
 
 // support equality for status codes
 #[pyclass(eq, eq_int, skip_from_py_object)]
@@ -270,6 +270,12 @@ impl PyTursoConnection {
     pub fn interrupt(&self) {
         self.connection.interrupt();
     }
+    /// Set how long (in milliseconds) a statement waits for a lock held by another
+    /// connection before it fails with [`Busy`]. A value of `0` disables waiting.
+    pub fn set_busy_timeout(&self, milliseconds: u64) {
+        self.connection
+            .set_busy_timeout(std::time::Duration::from_millis(milliseconds));
+    }
     /// Set the maximum time (in milliseconds) a single statement may run before it
     /// is interrupted and raises [`Interrupt`]. A value of `0` disables the timeout.
     pub fn set_query_timeout(&self, milliseconds: u64) {
@@ -314,11 +320,14 @@ impl PyTursoStatement {
         Ok(())
     }
 
-    /// get statement parameter slot by name (e.g. :name, @name, $name, ?1)
-    pub fn named_position(&mut self, name: &str) -> PyResult<usize> {
-        self.statement
-            .named_position(name)
-            .map_err(turso_error_to_py_err)
+    /// number of parameter slots in the statement (the largest parameter index)
+    pub fn parameters_count(&self) -> usize {
+        self.statement.parameters_count()
+    }
+
+    /// name of the parameter at the 1-based index, with its prefix (e.g. :name), or None for a `?` parameter
+    pub fn parameter_name(&self, index: usize) -> Option<String> {
+        self.statement.parameter_name(index)
     }
 
     /// step one iteration of the statement execution
@@ -433,14 +442,18 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
         ))
     } else if let Ok(float) = obj.cast::<PyFloat>() {
         Ok(Value::from_f64(float.value()))
-    } else if let Ok(string) = obj.extract::<String>() {
-        Ok(Value::Text(string.into()))
+    } else if let Ok(string) = obj.cast::<PyString>() {
+        Ok(Value::Text(string.to_str()?.to_owned().into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
+    } else if let Ok(view) = PyMemoryView::from(&obj) {
+        // as in sqlite3, any object with the buffer protocol (bytearray, memoryview) binds as a BLOB
+        let bytes = view.call_method0("tobytes")?;
+        Ok(Value::Blob(bytes.cast::<PyBytes>()?.as_bytes().to_vec()))
     } else {
-        Err(Error::new_err(
-            "unexpected parameter value, only None, numbers, strings and bytes are supported"
-                .to_string(),
-        ))
+        Err(PyTypeError::new_err(format!(
+            "type '{}' is not supported",
+            obj.get_type().name()?
+        )))
     }
 }

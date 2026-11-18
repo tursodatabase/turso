@@ -93,35 +93,50 @@ fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Re
         Some(Value::Text(t)) => t.as_str().to_owned(),
         Some(v) => v.to_string(),
     };
-    let fill_chars: Vec<char> = fill_str.chars().collect();
-    if fill_chars.is_empty() {
+    let fill_char_count = fill_str.chars().count();
+    if fill_char_count == 0 {
         return Ok(Value::build_text(s));
     }
     // The check above bounds the result in CHARACTERS, but the limit is on
     // bytes, so a multi-byte fill could still build a multi-gigabyte string
     // and abort before the downstream byte check ran: a 4-byte fill at a
-    // length of 1e9 reached about 12 GB. The padding is a cycle of
-    // `fill_chars`, so its byte length is exact arithmetic - there is no need
-    // to build it to find out.
+    // length of 1e9 reached about 12 GB. The padding is whole copies of the
+    // fill followed by a prefix of it, so its byte length is exact arithmetic.
     let pad_chars = target_len - char_count;
-    let pad_bytes = (pad_chars / fill_chars.len())
-        .checked_mul(fill_str.len())
-        .and_then(|whole| {
-            fill_chars[..pad_chars % fill_chars.len()]
-                .iter()
-                .map(|c| c.len_utf8())
-                .try_fold(whole, usize::checked_add)
-        })
+    let partial_fill = match fill_str.char_indices().nth(pad_chars % fill_char_count) {
+        Some((end, _)) => &fill_str[..end],
+        None => fill_str.as_str(),
+    };
+    let whole_fill_bytes = (pad_chars / fill_char_count).checked_mul(fill_str.len());
+    let result_bytes = whole_fill_bytes
+        .and_then(|bytes| bytes.checked_add(partial_fill.len()))
         .and_then(|bytes| bytes.checked_add(s.len()));
-    if pad_bytes.is_none_or(|bytes| bytes > Value::MAX_BLOB_LENGTH as usize) {
+    let (Some(whole_fill_bytes), Some(result_bytes)) = (whole_fill_bytes, result_bytes) else {
+        return Err(LimboError::TooBig);
+    };
+    if result_bytes > Value::MAX_BLOB_LENGTH as usize {
         return Err(LimboError::TooBig);
     }
-    let pad: String = fill_chars.iter().cycle().take(pad_chars).collect();
-    Ok(Value::build_text(if on_left {
-        format!("{pad}{s}")
-    } else {
-        format!("{s}{pad}")
-    }))
+    let mut result = String::with_capacity(result_bytes);
+    if !on_left {
+        result.push_str(&s);
+    }
+    // Copy the fill once, then keep doubling the copied part, like
+    // `str::repeat`, so a long padding takes a few large copies instead of
+    // one copy per fill.
+    let pad_start = result.len();
+    if whole_fill_bytes > 0 {
+        result.push_str(&fill_str);
+    }
+    while result.len() - pad_start < whole_fill_bytes {
+        let copied = result.len() - pad_start;
+        result.extend_from_within(pad_start..pad_start + copied.min(whole_fill_bytes - copied));
+    }
+    result.push_str(partial_fill);
+    if on_left {
+        result.push_str(&s);
+    }
+    Ok(Value::build_text(result))
 }
 
 #[cfg(test)]
@@ -179,6 +194,25 @@ mod tests {
             t("abcxyx")
         );
         assert_eq!(exec_rpad(&t("abcdef"), &i(3), None).unwrap(), t("abc"));
+    }
+
+    #[test]
+    fn pad_matches_a_cycle_of_the_fill_at_every_length() {
+        for fill in ["x", "ab", "a\u{e9}\u{1F600}"] {
+            for len in 0..40 {
+                let pad: String = fill.chars().cycle().take(len).collect();
+                assert_eq!(
+                    exec_lpad(&t("q\u{e9}"), &i(len as i64 + 2), Some(&t(fill))).unwrap(),
+                    t(&format!("{pad}q\u{e9}")),
+                    "lpad fill {fill:?} length {len}"
+                );
+                assert_eq!(
+                    exec_rpad(&t("q\u{e9}"), &i(len as i64 + 2), Some(&t(fill))).unwrap(),
+                    t(&format!("q\u{e9}{pad}")),
+                    "rpad fill {fill:?} length {len}"
+                );
+            }
+        }
     }
 
     #[test]

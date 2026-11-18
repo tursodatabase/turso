@@ -49,6 +49,18 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-keeps-autoindex-of-table-with-same-prefix {
+    CREATE TABLE activity (id INTEGER PRIMARY KEY, kind TEXT UNIQUE);
+    CREATE TABLE activity_word (kind TEXT NOT NULL, code TEXT NOT NULL, PRIMARY KEY (kind, code));
+    ALTER TABLE activity RENAME TO activity_old;
+    SELECT name, tbl_name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+}
+expect {
+    sqlite_autoindex_activity_old_1|activity_old
+    sqlite_autoindex_activity_word_1|activity_word
+}
+
+@cross-check-integrity
 test alter-table-rename-column {
     CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);
@@ -1153,6 +1165,31 @@ test alter-table-rename-column-updates-unique-sets {
 }
 expect pattern {
     CREATE TABLE t\s*\(a INTEGER, c TEXT, d INTEGER, UNIQUE\s*\(c\)\)
+}
+
+@cross-check-integrity
+test alter-table-rename-column-updates-self-referencing-foreign-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT UNIQUE, p TEXT REFERENCES t(b));
+    INSERT INTO t VALUES (1, 'x', NULL);
+    ALTER TABLE t RENAME b TO c;
+    ALTER TABLE t ADD d INTEGER;
+    INSERT INTO t VALUES (2, 'y', 'x', 0);
+    SELECT sql FROM sqlite_schema WHERE type = 'table';
+}
+expect pattern {
+    CREATE TABLE t\s*\(.*REFERENCES t\s*\(c\).*\)
+}
+
+test alter-table-rename-column-keeps-self-referencing-foreign-key-enforced {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT UNIQUE, p TEXT REFERENCES t(b));
+    INSERT INTO t VALUES (1, 'x', NULL);
+    ALTER TABLE t RENAME b TO c;
+    INSERT INTO t VALUES (2, 'y', 'missing');
+}
+expect error {
+    FOREIGN KEY constraint failed
 }
 
 @cross-check-integrity
@@ -3639,4 +3676,14 @@ test alter-table-ignores-a-subquery-in-a-named-window-frame-bound {
 }
 expect {
     ok
+}
+
+test alter-table-rename-column-changes-only-case {
+    CREATE TABLE t(a INT, b INT);
+    ALTER TABLE t RENAME COLUMN a TO A;
+    SELECT name FROM pragma_table_info('t');
+}
+expect {
+    A
+    b
 }

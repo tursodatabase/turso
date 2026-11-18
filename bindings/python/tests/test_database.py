@@ -2,6 +2,8 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
+import time
 
 import pytest
 import turso
@@ -9,11 +11,11 @@ import turso
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
 
-def connect(provider, database):
+def connect(provider, database, **kwargs):
     if provider == "turso":
-        return turso.connect(database)
+        return turso.connect(database, **kwargs)
     if provider == "sqlite3":
-        return sqlite3.connect(database)
+        return sqlite3.connect(database, **kwargs)
     raise Exception(f"Provider `{provider}` is not supported")
 
 
@@ -207,6 +209,93 @@ def test_first_rollback(provider, tmp_path):
 
     assert users == []
     conn.close()
+
+
+@pytest.mark.parametrize("timeout_kwargs", [{}, {"timeout": 5.0}])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_writer_waits_for_lock_held_by_another_connection(provider, timeout_kwargs, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = connect(provider, db_file, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO t VALUES (1)")
+
+    errors = []
+
+    def write():
+        writer = connect(provider, db_file, isolation_level=None, **timeout_kwargs)
+        try:
+            writer.execute("INSERT INTO t VALUES (2)")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        writer.close()
+
+    writer_thread = threading.Thread(target=write)
+    writer_thread.start()
+    time.sleep(0.3)
+    holder.execute("COMMIT")
+    writer_thread.join()
+
+    assert errors == []
+    assert holder.execute("SELECT x FROM t ORDER BY x").fetchall() == [(1,), (2,)]
+    holder.close()
+
+
+@pytest.mark.parametrize(
+    "timeout, busy_timeout",
+    [
+        (10.0, 10000),
+        (0.0015, 1),
+        (-1, 0),
+        (float("nan"), 0),
+        (float("-inf"), 0),
+    ],
+)
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_timeout_sets_busy_timeout_in_milliseconds(provider, timeout, busy_timeout):
+    conn = connect(provider, ":memory:", timeout=timeout)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(busy_timeout,)]
+    conn.close()
+
+
+# sqlite3 converts these with a C `(int)` cast, which is undefined for values
+# that do not fit: x86-64 gives 0 and arm64 gives 2147483647. Turso always
+# waits as long as an int allows.
+@pytest.mark.parametrize("timeout", [float("inf"), 2e16, 1e30])
+def test_timeout_too_large_for_int_waits_longest_possible(timeout):
+    conn = turso.connect(":memory:", timeout=timeout)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(2147483647,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_timeout_is_second_positional_parameter(provider):
+    module = turso if provider == "turso" else sqlite3
+    conn = module.connect(":memory:", 10.0)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(10000,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 0.2])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_writer_gives_up_after_timeout(provider, timeout, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = connect(provider, db_file, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    writer = connect(provider, db_file, isolation_level=None, timeout=timeout)
+
+    module = turso if provider == "turso" else sqlite3
+    holder.execute("BEGIN IMMEDIATE")
+    start = time.monotonic()
+    with pytest.raises(module.OperationalError, match="database is locked"):
+        writer.execute("INSERT INTO t VALUES (1)")
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= timeout
+    assert elapsed < 3
+    holder.execute("ROLLBACK")
+    writer.close()
+    holder.close()
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
@@ -498,6 +587,161 @@ def test_decimal_parameter_is_rejected(provider):
     assert cursor.fetchone() == (0,)
 
     conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "selec 1",
+        "SELECT * FROM nosuch",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3",
+        "SELECT 'a' LIKE 'a' ESCAPE 'xx'",
+        "SELECT 'a' LIKE printf('%.*c', 50001, 'a')",
+        "SELECT 'a' GLOB printf('%.*c', 50001, 'a')",
+        "SELECT json_object(1, 2)",
+        "SELECT json_set('{}', '$.a')",
+        "SELECT json_insert('{}', '$.a')",
+        "SELECT json_replace('{}', '$.a')",
+    ],
+)
+def test_sql_error_raises_operational_error(provider, sql):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (a, b)")
+    with pytest.raises(module.OperationalError):
+        conn.execute(sql).fetchall()
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize(
+    "parameters",
+    [([1],), (object(),), {"a": [1]}, 5, None, {1}, (x for x in [1])],
+    ids=["list", "object", "named-list", "not-a-sequence", "none", "set", "generator"],
+)
+def test_unsupported_parameter_raises_programming_error(provider, parameters):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    sql = "SELECT :a" if isinstance(parameters, dict) else "SELECT ?"
+    with pytest.raises(module.ProgrammingError):
+        conn.execute(sql, parameters)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize(
+    "sql, parameters, message",
+    [
+        ("SELECT ?, ?", (1,), "uses 2, and there are 1 supplied"),
+        ("SELECT ?", (1, 2), "uses 1, and there are 2 supplied"),
+        ("SELECT ?", (), "uses 1, and there are 0 supplied"),
+        ("SELECT 1", (1,), "uses 0, and there are 1 supplied"),
+        ("SELECT ?3", (1,), "uses 3, and there are 1 supplied"),
+        ("SELECT :a, :b", {"a": 1}, "binding parameter :b"),
+        ("SELECT :x", {":x": 1}, "binding parameter :x"),
+        ("SELECT ?1, ?2", {"1": "ONE"}, "binding parameter :2"),
+        ("SELECT ?", {"x": 1}, "Binding 1 has no name"),
+        ("SELECT :a, ?", {"a": 1}, "Binding 2 has no name"),
+    ],
+)
+def test_parameters_not_matching_placeholders_raise_programming_error(provider, sql, parameters, message):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    with pytest.raises(module.ProgrammingError, match=message):
+        conn.execute(sql, parameters)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_with_wrong_number_of_parameters_raises_programming_error(provider):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (a, b)")
+    with pytest.raises(module.ProgrammingError, match="uses 2, and there are 1 supplied"):
+        conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, 2), (3,)])
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_parameters_matching_placeholders_bind_by_index_and_name(provider):
+    conn = connect(provider, ":memory:")
+    assert conn.execute("SELECT ?3", (1, 2, 3)).fetchall() == [(3,)]
+    assert conn.execute("SELECT ?1", {"1": 7}).fetchall() == [(7,)]
+    assert conn.execute("SELECT :a, :a, @b", {"a": 1, "b": 2, "unused": 3}).fetchall() == [(1, 1, 2)]
+    assert conn.execute("SELECT ?, ?", [1, 2]).fetchall() == [(1, 2)]
+    assert conn.execute("SELECT ?", "a").fetchall() == [("a",)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_buffer_protocol_parameter_binds_as_blob(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (b BLOB)")
+    conn.execute("INSERT INTO t VALUES (?)", (bytearray(b"ab"),))
+    conn.executemany("INSERT INTO t VALUES (?)", [(memoryview(b"cd"),)])
+    assert conn.execute("SELECT b, typeof(b) FROM t").fetchall() == [(b"ab", "blob"), (b"cd", "blob")]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_lone_surrogate_parameter_raises_unicode_error(provider):
+    conn = connect(provider, ":memory:")
+    with pytest.raises(UnicodeEncodeError):
+        conn.execute("SELECT ?", ("\ud800",))
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize(
+    "use_after_close",
+    [
+        lambda conn, cursor: conn.execute("SELECT 1"),
+        lambda conn, cursor: conn.cursor(),
+        lambda conn, cursor: conn.commit(),
+        lambda conn, cursor: conn.in_transaction,
+        lambda conn, cursor: cursor.execute("SELECT 1"),
+        lambda conn, cursor: cursor.fetchall(),
+        lambda conn, cursor: cursor.close(),
+        lambda conn, cursor: conn.isolation_level,
+        lambda conn, cursor: conn.__enter__(),
+        lambda conn, cursor: conn.__exit__(None, None, None),
+    ],
+    ids=[
+        "execute",
+        "cursor",
+        "commit",
+        "in_transaction",
+        "cursor-execute",
+        "cursor-fetchall",
+        "cursor-close",
+        "isolation_level",
+        "enter",
+        "exit",
+    ],
+)
+def test_closed_connection_raises_programming_error(provider, use_after_close):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    cursor = conn.execute("SELECT 1 UNION ALL SELECT 2")
+    conn.close()
+    with pytest.raises(module.ProgrammingError, match="closed database"):
+        use_after_close(conn, cursor)
+    conn.close()
+
+
+def test_every_binding_exception_maps_to_dbapi_error():
+    from turso import _turso
+    from turso.lib import _map_turso_exception
+
+    exception_classes = [
+        value for value in vars(_turso).values() if isinstance(value, type) and issubclass(value, BaseException)
+    ]
+    assert exception_classes
+    for exception_class in exception_classes:
+        mapped = _map_turso_exception(exception_class("message"))
+        assert isinstance(mapped, turso.Error), exception_class.__name__
+        assert str(mapped) == "message"
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
@@ -2019,51 +2263,6 @@ def test_named_params_non_string_key_is_ignored(provider):
     cur = conn.cursor()
     cur.execute("SELECT :x", {1: "ignored", "x": 7})
     assert cur.fetchone() == (7,)
-    conn.close()
-
-
-@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
-def test_named_params_prefixed_key_currently_allowed_difference(provider):
-    conn = connect(provider, ":memory:")
-    cur = conn.cursor()
-    if provider == "sqlite3":
-        # sqlite3 expects unprefixed mapping keys and raises here.
-        with pytest.raises(Exception):
-            cur.execute("SELECT :x", {":x": 1})
-    else:
-        # NOTE: Turso currently allows this path and returns NULL instead of raising.
-        cur.execute("SELECT :x", {":x": 1})
-        assert cur.fetchone() == (None,)
-    conn.close()
-
-
-@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
-def test_named_params_plain_qmark_mapping_currently_allowed_difference(provider):
-    conn = connect(provider, ":memory:")
-    cur = conn.cursor()
-    if provider == "sqlite3":
-        # sqlite3 raises: plain '?' is positional and mapping should fail.
-        with pytest.raises(Exception):
-            cur.execute("SELECT ?", {"x": 1})
-    else:
-        # NOTE: Turso currently allows this and leaves the parameter as NULL.
-        cur.execute("SELECT ?", {"x": 1})
-        assert cur.fetchone() == (None,)
-    conn.close()
-
-
-@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
-def test_named_params_missing_indexed_qmark_currently_allowed_difference(provider):
-    conn = connect(provider, ":memory:")
-    cur = conn.cursor()
-    if provider == "sqlite3":
-        # sqlite3 raises when a required indexed parameter is not supplied.
-        with pytest.raises(Exception):
-            cur.execute("SELECT ?1, ?2", {"1": "ONE"})
-    else:
-        # NOTE: Turso currently allows partial binding and keeps missing values as NULL.
-        cur.execute("SELECT ?1, ?2", {"1": "ONE"})
-        assert cur.fetchone() == ("ONE", None)
     conn.close()
 
 

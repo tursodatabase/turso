@@ -18,6 +18,7 @@ crate-type = ["cdylib"]
 path = "rs_src/lib.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 turso_core = { workspace = true, features = ["io_uring"] }
 jni = "0.21.1"
 thiserror = { workspace = true }

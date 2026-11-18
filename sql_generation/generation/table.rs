@@ -80,10 +80,15 @@ impl Table {
 
                 dependencies.insert(i, refs);
 
+                let typ = if rng.random_bool(gen_opts.stored_prob) {
+                    GeneratedColumnType::Stored
+                } else {
+                    GeneratedColumnType::Virtual
+                };
                 columns[i].constraints.push(ColumnConstraint::Generated {
                     generated_always: false,
                     expr: Box::new(expr),
-                    typ: Some(GeneratedColumnType::Virtual),
+                    typ: Some(typ),
                 });
             }
         }

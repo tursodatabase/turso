@@ -47,6 +47,76 @@ pub enum ValueType {
     Error,
 }
 
+/// What a STRICT column of a plain type stores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrictType {
+    /// INTEGER, INT, REAL, TEXT or BLOB: only values of this storage class.
+    Stores(StorageClass),
+    /// ANY: every value, unchanged.
+    Any,
+}
+
+impl StrictType {
+    /// The STRICT column type named `type_name`, which may be quoted as a
+    /// whole like `"INT"`. None for a name a STRICT table refuses, such as
+    /// FLOAT.
+    pub fn named(type_name: &str) -> Option<Self> {
+        let name = crate::util::strip_type_name_quotes(type_name).unwrap_or(type_name);
+        turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
+            b"INTEGER" | b"INT" => Some(Self::Stores(StorageClass::Integer)),
+            b"REAL" => Some(Self::Stores(StorageClass::Real)),
+            b"BLOB" => Some(Self::Stores(StorageClass::Blob)),
+            b"TEXT" => Some(Self::Stores(StorageClass::Text)),
+            b"ANY" => Some(Self::Any),
+            _ => None,
+        })
+    }
+
+    /// The type name a STRICT column of this type is declared with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stores(StorageClass::Integer) => "INTEGER",
+            Self::Stores(StorageClass::Real) => "REAL",
+            Self::Stores(StorageClass::Text) => "TEXT",
+            Self::Stores(StorageClass::Blob) => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
+}
+
+/// A storage class other than NULL: the kind of value a STRICT column of
+/// type INTEGER, REAL, TEXT or BLOB holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StorageClass {
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl StorageClass {
+    pub fn value_type(self) -> ValueType {
+        match self {
+            Self::Integer => ValueType::Integer,
+            Self::Real => ValueType::Float,
+            Self::Text => ValueType::Text,
+            Self::Blob => ValueType::Blob,
+        }
+    }
+
+    /// The affinity of a column of this type: what turns '5' into 5 for
+    /// INTEGER and 5 into 5.0 for REAL.
+    pub fn affinity(self) -> crate::vdbe::affinity::Affinity {
+        use crate::vdbe::affinity::Affinity;
+        match self {
+            Self::Integer => Affinity::Integer,
+            Self::Real => Affinity::Real,
+            Self::Text => Affinity::Text,
+            Self::Blob => Affinity::Blob,
+        }
+    }
+}
+
 impl Display for ValueType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -483,7 +553,7 @@ impl From<Text> for String {
 pub type ValueBlob = crate::alloc::Vec<u8>;
 
 #[inline]
-pub(crate) fn value_blob_from_slice(
+pub fn value_blob_from_slice(
     bytes: &[u8],
 ) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
     bytes.try_to_vec()
@@ -885,7 +955,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+    pub fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
         match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {

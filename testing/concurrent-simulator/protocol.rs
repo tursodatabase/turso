@@ -105,8 +105,8 @@ impl WorkerResponse {
 /// (so it round-trips through `error_kind_to_limbo_error` unchanged).
 /// For unit variants, return the Display form. Using `Display` for
 /// inner-string variants would prepend the Display prefix
-/// (e.g. `"Parse error: {0}"`); the receiver would then
-/// reconstruct `LimboError::ParseError("Parse error: ...")`. A
+/// (e.g. `"Corrupt database: {0}"`); the receiver would then
+/// reconstruct `LimboError::Corrupt("Corrupt database: ...")`. A
 /// `SequenceExhausted` sends its sequence name; the direction rides in
 /// the error kind.
 pub fn limbo_error_to_message(err: &LimboError) -> String {

@@ -763,10 +763,7 @@ fn create_schema_rolls_back_with_its_transaction_and_creates_no_files(db: TempDa
     conn.execute("ROLLBACK").unwrap();
 
     let error = conn.execute("CREATE TABLE app.u (x int)").unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Parse error: schema \"app\" does not exist"
-    );
+    assert_eq!(error.to_string(), "schema \"app\" does not exist");
     let files: Vec<String> = std::fs::read_dir(db.path.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
@@ -912,7 +909,7 @@ fn a_user_cannot_name_an_object_like_a_schema_stores_its_objects(db: TempDatabas
         conn.execute("CREATE TABLE __turso_ns1_t (x int)")
             .unwrap_err()
             .to_string(),
-        "Parse error: Object name reserved for internal use: __turso_ns1_t"
+        "Object name reserved for internal use: __turso_ns1_t"
     );
     conn.execute("INSERT INTO app.t VALUES (1)").unwrap();
     let mut rows = conn.query("SELECT x FROM app.t").unwrap().unwrap();
@@ -3247,9 +3244,12 @@ fn test_postgres_insert_default(db: TempDatabase) {
     conn.execute("INSERT INTO t (id, name, score) VALUES (2, 'alice', DEFAULT), (3, DEFAULT, 99)")
         .unwrap();
 
-    // All columns DEFAULT
-    conn.execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
-        .unwrap();
+    // All columns DEFAULT: the key has no default, so it is NULL
+    let error = conn
+        .execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("null value in column \"id\""), "{error}");
 
     // Verify results
     let mut stmt = conn
@@ -3271,15 +3271,12 @@ fn test_postgres_insert_default(db: TempDatabase) {
             _ => {}
         }
     }
-    // id=DEFAULT → NULL (no default defined), all others get their defaults
-    // INTEGER PRIMARY KEY with NULL → auto-assigned rowid
     assert_eq!(
         results,
         vec![
             "1,unknown,42", // name=DEFAULT → 'unknown'
             "2,alice,0",    // score=DEFAULT → 0
             "3,unknown,99", // name=DEFAULT → 'unknown'
-            "4,unknown,0",  // all DEFAULT
         ]
     );
 }
@@ -4580,7 +4577,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
 
     let mut rows = conn
         .inner()
-        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' ORDER BY name")
+        .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB '__turso_internal_*' AND name != 'sqlite_sequence' ORDER BY name")
         .unwrap();
     let mut stored = Vec::new();
     while let StepResult::Row = rows.step().unwrap() {

@@ -175,7 +175,7 @@ fn replay_preserves_disabled_feature_metadata_without_filtering_sql(tc: TestCase
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_pg-dump-fuzzer"))
         .args([
             "--postgres-dsn",
-            "postgresql://turso@localhost/postgres",
+            "postgresql://postgres@localhost/postgres",
             "--no-progress",
         ])
         .arg("--binary")

@@ -24,8 +24,6 @@ use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
-#[cfg(test)]
-mod blob_io_tests;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -34,12 +32,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
-#[cfg(test)]
-mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
-#[cfg(test)]
-mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 #[allow(unused_imports)] // for benchmarks
@@ -1218,6 +1212,12 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// Whether this statement has passed a `Transaction` instruction and is
+    /// counted in `Connection::n_active_read_statements`.
+    pub(crate) is_active_read: bool,
+    /// Whether this statement is a DROP that has passed a `Transaction`
+    /// instruction and is counted in `Connection::n_active_destroy_statements`.
+    pub(crate) is_active_destroy: bool,
     /// Write activity on the main database when this statement became an
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
@@ -1329,6 +1329,8 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            is_active_read: false,
+            is_active_destroy: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
@@ -1401,6 +1403,10 @@ impl ProgramState {
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        turso_assert!(
+            !self.is_active_read && !self.is_active_destroy,
+            "resetting a statement still counted as an active reader"
+        );
         self.io_completions = None;
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
@@ -1518,6 +1524,23 @@ impl ProgramState {
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
         self.pending_fresh_tx = None;
+    }
+
+    /// Removes this statement from the connection's counts of reading and
+    /// dropping statements. The next `Transaction` instruction counts it again.
+    pub(crate) fn stop_counting_as_reader(&mut self, connection: &Connection) {
+        if self.is_active_read {
+            connection
+                .n_active_read_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_read = false;
+        }
+        if self.is_active_destroy {
+            connection
+                .n_active_destroy_statements
+                .fetch_sub(1, Ordering::SeqCst);
+            self.is_active_destroy = false;
+        }
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -2139,6 +2162,10 @@ pub struct PreparedProgram {
     /// Whether the statement may write more than one row; see
     /// `crate::vdbe::builder::ProgramBuilder::is_multi_write`.
     pub is_multi_write: bool,
+    /// Whether the errors of the statement's constraints leave out the
+    /// values of the row or key that broke them; see
+    /// `crate::vdbe::builder::ProgramBuilderFlags::hides_constraint_values`.
+    pub hides_constraint_values: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
@@ -2161,6 +2188,9 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Whether the program frees a b-tree (`Insn::Destroy`) or the storage of an
+    /// index method (`Insn::IndexMethodDestroy`), as DROP TABLE and DROP INDEX do.
+    pub destroys_btree: bool,
 }
 
 #[derive(Clone)]
@@ -2731,6 +2761,10 @@ impl Program {
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
+                    Ok(InsnFunctionStepResult::Interrupt) => {
+                        state.interrupt();
+                        program.interrupted_during_step(state, pager)
+                    }
                     Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
@@ -2838,7 +2872,7 @@ impl Program {
                 // its own rows, so roll back the whole transaction while
                 // returning the real preparation error to the caller.
                 let rollback_error =
-                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.clone());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
                     tracing::error!(
                         "Abort also failed after FAIL index-method preparation: \
@@ -3908,6 +3942,13 @@ impl Program {
                         _ => 0,
                     };
                     self.connection.set_changes(last_change);
+                    // The rows FAIL keeps also count in total_changes(). An
+                    // autocommit statement added them when it committed; one
+                    // inside an open transaction adds them here.
+                    if matches!(effective_resolve, ResolveType::Fail) && !can_autocommit_now {
+                        self.connection
+                            .add_total_changes(state.n_total_change.swap(0, Ordering::SeqCst));
+                    }
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
@@ -4490,7 +4531,7 @@ pub(crate) fn decode_serial_type_into_register(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConnectOpts;
+
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
@@ -4513,33 +4554,6 @@ mod tests {
         let returned = result.unwrap_err();
         assert_eq!(std::ptr::from_ref(returned.as_ref()), original);
         assert!(matches!(*returned, LimboError::InternalError(ref msg) if msg == "test error"));
-    }
-
-    #[test]
-    fn normal_step_preserves_execution_state_with_and_without_tracing() {
-        for trace in [false, true] {
-            let io = Arc::new(crate::MemoryIO::new());
-            let db =
-                crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
-            conn.set_vdbe_trace(trace);
-            let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);
-            assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Running);
-            assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
-
-            let mut stmt = conn.prepare("SELECT abs(-9223372036854775808)").unwrap();
-            assert!(matches!(stmt.step(), Err(LimboError::IntegerOverflow)));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Failed);
-
-            conn.set_progress_handler(1, Some(Box::new(|| true)));
-            let mut stmt = conn.prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT sum(x) FROM t").unwrap();
-            assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
-            assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);
-        }
     }
 
     #[test]

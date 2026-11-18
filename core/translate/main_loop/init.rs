@@ -646,11 +646,11 @@ fn emit_percentile_fraction_check(
     // (correlated) columns are constant for the inner aggregate and allowed;
     // a subquery may hide an input-column reference, so reject conservatively.
     // This must run before we emit the expression — at this point the cursors
-    // for this query's tables aren't open yet, so a local Column read would
+    // for this query's tables aren't open yet, so a local Column or RowId read would
     // panic in translate_expr.
     walk_expr(&agg.args[1], &mut |e: &Expr| -> Result<WalkControl> {
         let invalid = match e {
-            Expr::Column { table, .. } => {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 matches!(tables.find_table_by_internal_id(*table), Some((false, _)))
             }
             Expr::Subquery(_) | Expr::Exists(_) | Expr::SubqueryResult { .. } => true,

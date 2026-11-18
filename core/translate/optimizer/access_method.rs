@@ -633,7 +633,7 @@ pub(super) fn choose_best_in_seek_candidate(
                     continue;
                 }
                 let constrained_column = &rhs_table.table.columns()[col_pos];
-                let idx_aff = constrained_column.affinity();
+                let idx_aff = constrained_column.comparison_affinity();
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
@@ -659,11 +659,7 @@ pub(super) fn choose_best_in_seek_candidate(
             }
 
             let lhs_affinity = if let Some(col_pos) = constraint.table_col_pos {
-                btree
-                    .columns()
-                    .get(col_pos)
-                    .map(|col| col.affinity())
-                    .unwrap_or(Affinity::Blob)
+                btree.columns()[col_pos].comparison_affinity()
             } else {
                 Affinity::Integer
             };
@@ -1074,7 +1070,9 @@ fn find_best_access_method_for_btree(
 
         // Multi-index scans do not record matched rowids for a RIGHT or FULL JOIN,
         // so the unmatched-row pass would emit matched right rows again.
-        if keeps_right_rows {
+        // They also check each branch's conditions on rows before the loop
+        // checks their row-level security filter.
+        if keeps_right_rows || rhs_table.row_filter.is_some() {
             return Ok(Some(best_access_method));
         }
 
@@ -1847,10 +1845,11 @@ fn find_best_access_method_for_subquery(
 
     // SQLite does not build an automatic index on the right side of a
     // RIGHT JOIN or FULL JOIN. The unmatched-row pass must scan that source.
-    if rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(JoinInfo::keeps_right_rows)
+    if !planning_context.allow_automatic_index
+        || rhs_table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
     {
         return Ok(Some(AccessMethod {
             cost: scan_cost,

@@ -106,6 +106,8 @@ pub enum ExtFunc {
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
         context_owner: Arc<ExternalContext>,
+        /// Only functions core registers know it; a loaded extension can't say.
+        return_type: Option<ReturnType>,
     },
     Aggregate {
         context: usize,
@@ -122,6 +124,9 @@ pub enum ExtFunc {
         arity: crate::native_ext::FunctionArity,
         deterministic: bool,
         return_type: Option<crate::native_ext::ReturnType>,
+        /// Whether a call also gets the type name of each argument, such as
+        /// `boolean[]`, as one more text argument per argument, after them.
+        receives_argument_types: bool,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -154,6 +159,7 @@ impl Drop for ExternalContext {
 }
 
 impl ExtFunc {
+    #[allow(clippy::result_unit_err)]
     pub fn agg_args(&self) -> Result<i32, ()> {
         if let ExtFunc::Aggregate { argc, .. } | ExtFunc::NativeAggregate { argc, .. } = self {
             return Ok(*argc);
@@ -179,10 +185,22 @@ impl ExtFunc {
         }
     }
 
+    pub fn receives_argument_types(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeScalar {
+                receives_argument_types: true,
+                ..
+            }
+        )
+    }
+
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
         match self {
-            Self::NativeScalar { return_type, .. } => *return_type,
-            Self::Scalar { .. } | Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
+            Self::NativeScalar { return_type, .. } | Self::Scalar { return_type, .. } => {
+                *return_type
+            }
+            Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
         }
     }
 
@@ -223,6 +241,10 @@ impl ExtFunc {
 }
 
 impl ExternalFunc {
+    /// `return_type` is the kind of value the function returns, when it
+    /// declares one, so that the type of a call to it is known, as in a
+    /// custom type's DECODE.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_scalar(
         name: String,
         argc: i32,
@@ -231,6 +253,7 @@ impl ExternalFunc {
         callback: ScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
+        return_type: Option<ReturnType>,
     ) -> crate::Result<Self> {
         Self::validate_arg_count(argc)?;
         Ok(Self {
@@ -243,6 +266,7 @@ impl ExternalFunc {
                 context_destructor,
                 value_destructor,
                 context_owner: ExternalContext::new(context, context_destructor),
+                return_type,
             },
         })
     }
@@ -1024,6 +1048,7 @@ pub enum ScalarFunc {
     BooleanToInt,
     IntToBoolean,
     ValidateIpAddr,
+    TemporalEncode,
     // Numeric type functions
     NumericEncode,
     NumericFit,
@@ -1153,6 +1178,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::TemporalEncode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
@@ -1283,6 +1309,7 @@ impl ScalarFunc {
             | Self::Repeat
             | Self::Lpad
             | Self::Rpad
+            | Self::TemporalEncode
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1417,6 +1444,7 @@ impl Display for ScalarFunc {
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
+            Self::TemporalEncode => "temporal_encode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
@@ -1568,7 +1596,8 @@ impl ScalarFunc {
             | Self::NumericEncode
             | Self::NumericDecode
             | Self::NumericNeg => &[1],
-            Self::NumericAdd
+            Self::TemporalEncode
+            | Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
@@ -1894,10 +1923,11 @@ pub enum ResultType {
     /// `abs`: like NumberOfTheFirstArgumentsType, but a text or blob argument
     /// is not converted first and gives a real: `abs('3')` is 3.0.
     AbsOfTheFirstArgument,
-    /// A number that is a real when an argument is a real. SQLite always
-    /// returns a real, but PostgreSQL computes these exactly for an exact
-    /// argument (`round(0.25, 1)` and `mod(10, 4)`), so without a real
-    /// argument the kind of number is not known.
+    /// A number that is a real when an argument is a real, or when the first
+    /// argument is a text or blob (`round(t, 2)` of a text column `t`). SQLite
+    /// always returns a real, but PostgreSQL computes these exactly for an
+    /// exact argument (`round(0.25, 1)` and `mod(10, 4)`), so otherwise the
+    /// kind of number is not known.
     RealForARealArgument,
     /// A blob for a blob first argument, else text: `substr`.
     TextOrBlobLikeTheFirstArgument,
@@ -2010,7 +2040,7 @@ impl Func {
         false
     }
     /// Resolve a built-in function name. Thin wrapper over
-    /// [`crate::dialect::sqlite::resolve_builtin_function_name`], where the
+    /// [`crate::dialect::engine::resolve_builtin_function_name`], where the
     /// SQLite name table lives; kept on `Func` for the engine call sites
     /// that classify translated AST.
     ///
@@ -2018,7 +2048,7 @@ impl Func {
     /// loading uses this, and a schema written by an older Turso that accepted
     /// such a call must still load. Translating the call rejects it.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        crate::dialect::sqlite::resolve_builtin_function_name(name, arg_count)
+        crate::dialect::engine::resolve_builtin_function_name(name, arg_count)
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.
