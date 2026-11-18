@@ -1,6 +1,5 @@
-use crate::dialect::{
-    AutomaticIndex, CatalogWrite, CreateTable, RelationChange, TableText, WriteContext,
-};
+use crate::dialect::catalog::DropTable;
+use crate::dialect::{AutomaticIndex, CatalogWrite, CreateTable, TableText, WriteContext};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -30,8 +29,7 @@ use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sqlite_schema_rows::{
-    emit_create_internal_table, emit_delete_rows_of_table, emit_delete_temp_triggers_on_table,
-    emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
+    emit_create_internal_table, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
 };
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
@@ -2038,53 +2036,34 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
-    // r1 and r2. The delete loop overwrites both. r2 then gets the root page
-    // that `Destroy` moved, as in SQLite's bytecode.
+    // r1 and r2. The catalog may overwrite both while it deletes its rows.
+    // r2 then gets the root page that `Destroy` moved, as in SQLite's
+    // bytecode.
     let scratch_reg = program.alloc_register();
     let table_name_and_root_page_register = program.alloc_register();
-    emit_delete_rows_of_table(
-        program,
-        resolver,
-        database_id,
-        mangled_name.clone(),
-        [scratch_reg, table_name_and_root_page_register],
-    )?;
-    emit_delete_temp_triggers_on_table(program, resolver, database_id, tbl_name.name.as_str())?;
-
-    //  2. Destroy the indices within a loop
+    let normalized_name = normalize_ident(name);
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(namespace.id, tbl_name.name.as_str())
             .chain(s.get_unowned_backing_btrees(namespace.id, tbl_name.name.as_str()))
             .cloned()
             .collect()
     });
+    let index_names: Vec<&str> = indices.iter().map(|index| index.name.as_str()).collect();
+    let write_context = WriteContext::new(connection, resolver, database_id);
+    let after_writes = resolver.catalog.dialect.catalog().write(
+        program,
+        &write_context,
+        &CatalogWrite::DropTable(DropTable {
+            namespace: namespace.id,
+            name: &normalized_name,
+            is_virtual: table.btree().is_none(),
+            indexes: &index_names,
+            owned_sequences: &owned_sequences,
+            scratch_regs: [scratch_reg, table_name_and_root_page_register],
+        }),
+    )?;
 
-    // Dropping a table also drops its indexes, the automatic ones among
-    // them, so the dialect hears about all of them.
-    if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
-        let table_name = normalize_ident(name);
-        let mut changes: Vec<_> = owned_sequences
-            .iter()
-            .map(|sequence| RelationChange::Dropped {
-                namespace: namespace.id,
-                name: sequence,
-            })
-            .collect();
-        changes.push(RelationChange::Dropped {
-            namespace: namespace.id,
-            name: &table_name,
-        });
-        changes.extend(indices.iter().map(|index| RelationChange::Dropped {
-            namespace: namespace.id,
-            name: &index.name,
-        }));
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &changes,
-        )?;
-    }
+    //  2. Destroy the indices within a loop
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -2514,6 +2493,8 @@ pub fn translate_drop_table(
         value: current_schema_version as i32 + 1,
         p5: 0,
     });
+
+    after_writes.emit(program, database_id, None);
 
     Ok(())
 }
