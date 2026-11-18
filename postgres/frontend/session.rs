@@ -65,6 +65,17 @@ const SEARCH_PATH_SETTING: &str = "search_path";
 
 pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 
+/// The features that the tursopg CLI and its server open a database with.
+pub fn tursopg_database_opts() -> turso_core::DatabaseOpts {
+    turso_core::DatabaseOpts::new()
+        .with_views(true)
+        .with_custom_types(true)
+        .with_encryption(true)
+        .with_index_method(true)
+        .with_autovacuum(true)
+        .with_attach(true)
+}
+
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
 pub fn open_database(

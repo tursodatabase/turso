@@ -25,8 +25,8 @@ pub use error::{sql_parse_error, sqlstate_error, Error, ErrorReport, Result};
 pub use open::{open_database_async, OpenDatabaseState};
 pub use session::PgConnection as Connection;
 pub use session::{
-    open_database, open_database_with_io, split_statements, PgConnection, PgQueryRunner,
-    TransactionState,
+    open_database, open_database_with_io, split_statements, tursopg_database_opts, PgConnection,
+    PgQueryRunner, TransactionState,
 };
 pub use statement::{Statement, StatementResultKind};
 pub use turso_core::{
