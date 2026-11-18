@@ -413,18 +413,7 @@ pub(crate) enum InitState {
     /// Driving `init_pager` (its only IO is the DB-header read).
     InitPager(DbHeaderReadState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
-    /// `None` only while the finished pager is handed to the caller.
-    ReadPage1 { pager: Option<Box<Pager>> },
-}
-
-impl Drop for InitState {
-    /// A caller that gives up on the init while page 1 is being read must
-    /// not keep the read transaction open, or it blocks checkpoints forever.
-    fn drop(&mut self) {
-        if let InitState::ReadPage1 { pager: Some(pager) } = self {
-            pager.end_read_tx();
-        }
-    }
+    ReadPage1 { pager: Box<Pager> },
 }
 
 /// Sub state machine for [`Database::header_validation`], driven from
@@ -559,6 +548,18 @@ pub struct ConnectAsyncState {
 impl ConnectAsyncState {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Drop for ConnectAsyncState {
+    /// A caller that gives up on the connect while page 1 is being read must
+    /// not keep the read transaction open, or it blocks checkpoints forever.
+    fn drop(&mut self) {
+        if let InitState::ReadPage1 { pager } = &self.init {
+            if pager.holds_read_lock() {
+                pager.end_read_tx();
+            }
+        }
     }
 }
 
@@ -1999,16 +2000,14 @@ impl Database {
                     }
 
                     *st = InitState::ReadPage1 {
-                        pager: Some(Box::new(pager)),
+                        pager: Box::new(pager),
                     };
                 }
-                InitState::ReadPage1 { pager: slot } => {
-                    let pager = slot.as_ref().expect("pager is set until init finishes");
+                InitState::ReadPage1 { pager } => {
                     // Read page 1 within the read transaction to determine the
                     // autovacuum mode. The read tx stays open across an IO
                     // yield here (re-entry resumes the read); we only end it
-                    // once the read completes or errors. Resetting `st` drops
-                    // the `ReadPage1` state, which ends the read tx.
+                    // once the read completes or errors.
                     let mode = match HeaderRef::from_pager(pager) {
                         Ok(IOResult::Done(header_ref)) => {
                             let header = header_ref.borrow();
@@ -2051,7 +2050,7 @@ impl Database {
                                 Ok(())
                             };
                             if let Err(err) = validate_codec_header() {
-                                *st = InitState::Start;
+                                pager.end_read_tx();
                                 return Err(err.into());
                             }
                             if header.vacuum_mode_largest_root_page.get() > 0 {
@@ -2066,15 +2065,17 @@ impl Database {
                         }
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Err(err) => {
-                            *st = InitState::Start;
+                            pager.end_read_tx();
                             return Err(err);
                         }
                     };
 
-                    let pager = slot.take().expect("pager is set until init finishes");
-                    *st = InitState::Start;
                     pager.end_read_tx();
                     pager.set_auto_vacuum_mode(mode);
+
+                    let InitState::ReadPage1 { pager } = std::mem::take(st) else {
+                        unreachable!("state is ReadPage1");
+                    };
                     return Ok(IOResult::Done(*pager));
                 }
             }
