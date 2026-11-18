@@ -1077,31 +1077,17 @@ impl Value {
             return Ok(Value::Null);
         }
 
-        let source = source.exec_cast("TEXT")?;
-        let pattern = pattern.exec_cast("TEXT")?;
-
-        // If any of the casts failed, panic as text casting is not expected to fail.
-        match (&source, &pattern) {
-            (Value::Text(source), Value::Text(pattern)) => {
-                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
-                    return Ok(Value::Text(source.clone()));
-                }
-
-                if matches!(replacement, Value::Null) {
-                    return Ok(Value::Null);
-                }
-                let replacement = replacement.exec_cast("TEXT")?;
-                let Value::Text(replacement) = replacement else {
-                    unreachable!("text cast should never fail");
-                };
-
-                let result = source
-                    .as_str()
-                    .replace(pattern.as_str(), replacement.as_str());
-                Ok(Value::build_text(result))
-            }
-            _ => unreachable!("text cast should never fail"),
+        let source = text_of_cast(source);
+        let pattern = text_of_cast(pattern);
+        if pattern.is_empty() || pattern.starts_with('\0') {
+            return Ok(Value::build_text(source.into_owned()));
         }
+
+        if matches!(replacement, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let replacement = text_of_cast(replacement);
+        Ok(Value::build_text(source.replace(&*pattern, &replacement)))
     }
 
     pub fn exec_math_unary(&self, function: &MathFunc) -> Value {
@@ -1582,6 +1568,15 @@ impl Value {
             })
             .collect();
         Value::build_text(result)
+    }
+}
+
+/// The text of `CAST(value AS TEXT)`, which is the text of `value.to_string()`.
+/// A TEXT value is borrowed, not copied.
+fn text_of_cast(value: &Value) -> std::borrow::Cow<'_, str> {
+    match value {
+        Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
+        value => std::borrow::Cow::Owned(value.to_string()),
     }
 }
 
