@@ -684,7 +684,7 @@ fn gap_e_77_ddl_in_a_schema_right_after_create_schema_mvcc(db: TempDatabase) {
 }
 
 // E-78 (S2): CREATE MATERIALIZED VIEW then select (MVCC)
-// tursopg: CREATE MATERIALIZED VIEW is rejected in MVCC mode.
+// tursopg: CREATE MATERIALIZED VIEW fails with a syntax error (42601) in MVCC mode.
 // PostgreSQL: 1
 #[turso_macros::test(views)]
 fn gap_e_78_tursopg_returns_wrong_result_create_materialized_view_then_select_mvcc(
