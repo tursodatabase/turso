@@ -313,7 +313,7 @@ pub struct RelationName {
 }
 
 /// What a statement's bytecode did to the dialect's tables. The dialect
-/// puts one in [`Insn::CatalogApply`](crate::Insn::CatalogApply) after the
+/// puts one in [`Insn::CatalogApply`] after the
 /// instructions that write the rows.
 pub trait CatalogApply: std::fmt::Debug + Send + Sync {
     /// Makes the same change to the dialect's state in `schema`. `values`
