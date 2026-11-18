@@ -567,6 +567,13 @@ fn test_errors_on_zero_divisor_dialect() {
         fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
             Arc::new(SqliteDialect)
         }
+
+        fn schema_builder(
+            &self,
+            enable_custom_types: bool,
+        ) -> turso_core::Result<turso_core::schema::SchemaBuilder> {
+            turso_sqlite::schema_builder(self, enable_custom_types)
+        }
         fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             SqliteDialect.parse(sql)
         }

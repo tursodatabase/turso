@@ -30,4 +30,11 @@ impl super::Dialect for EngineDialect {
     fn get_internal_dialect(&self) -> Arc<dyn super::Dialect> {
         Arc::new(EngineDialect)
     }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> crate::Result<crate::schema::SchemaBuilder> {
+        crate::schema::builtin::schema_builder(self, enable_custom_types)
+    }
 }

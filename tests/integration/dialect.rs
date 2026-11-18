@@ -72,6 +72,13 @@ impl Dialect for TestDialect {
         Arc::new(SqliteDialect)
     }
 
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> turso_core::Result<turso_core::schema::SchemaBuilder> {
+        turso_sqlite::schema_builder(self, enable_custom_types)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(sql) = sql.strip_prefix("test: ") {
@@ -170,6 +177,13 @@ impl Dialect for StrictTestDialect {
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> turso_core::Result<turso_core::schema::SchemaBuilder> {
+        turso_sqlite::schema_builder(self, enable_custom_types)
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
@@ -555,6 +569,13 @@ impl Dialect for NoFunctionsDialect {
         Arc::new(SqliteDialect)
     }
 
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> turso_core::Result<turso_core::schema::SchemaBuilder> {
+        turso_sqlite::schema_builder(self, enable_custom_types)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         SqliteDialect.parse_internal(sql)
     }
@@ -615,6 +636,13 @@ impl Dialect for ShoutingUpperDialect {
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
+    }
+
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> turso_core::Result<turso_core::schema::SchemaBuilder> {
+        turso_sqlite::schema_builder(self, enable_custom_types)
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {

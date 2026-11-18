@@ -192,7 +192,8 @@ struct SequenceMetadata {
 use crate::util::quote_identifier as quote_ident;
 
 pub mod alter_table;
-pub mod builtin;
+#[cfg(test)]
+pub(crate) mod builtin;
 pub mod view;
 
 /// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.

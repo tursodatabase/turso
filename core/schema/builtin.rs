@@ -1,12 +1,12 @@
-//! The catalog tables and types that the schema of every database has,
-//! whatever its dialect.
+//! The types and catalog tables that the databases of core's unit tests
+//! start with. It is a copy of `turso_sqlite::schema_builder`, which core
+//! cannot call because `turso_sqlite` depends on core.
 
 use super::{RangeOffsets, SchemaBuilder};
 use crate::vtab::VirtualTable;
 
 /// Starts the schema of a database: the built-in catalog tables and, if
-/// `enable_custom_types`, the built-in types. A dialect adds its own tables
-/// and types to the builder.
+/// `enable_custom_types`, the built-in types.
 pub fn schema_builder(
     dialect: &(impl crate::dialect::Dialect + ?Sized),
     enable_custom_types: bool,

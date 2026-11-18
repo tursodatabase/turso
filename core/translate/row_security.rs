@@ -983,6 +983,13 @@ mod tests {
             Arc::new(EngineDialect)
         }
 
+        fn schema_builder(
+            &self,
+            enable_custom_types: bool,
+        ) -> crate::Result<crate::schema::SchemaBuilder> {
+            crate::schema::builtin::schema_builder(self, enable_custom_types)
+        }
+
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
             EngineDialect.parse_table_sql(sql, root_page)
         }
