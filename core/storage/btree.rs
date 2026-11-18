@@ -10915,8 +10915,8 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, ConnectOpts, Connection, IOContext, StepResult, Wal,
-        WalAutoActions, WalFile, WalFileShared,
+        BufferPool, CheckpointMode, Completion, ConnectOpts, Connection, IOContext, StepResult,
+        SyncMode, Wal, WalAutoActions, WalFile, WalFileShared,
     };
     use std::{
         mem::transmute,
@@ -11685,6 +11685,22 @@ mod tests {
         (pager, page2.get().id() as i64)
     }
 
+    /// An empty table b-tree in a database whose page 1 was allocated by its first write transaction.
+    fn empty_btree_after_first_write_tx() -> (Arc<Pager>, i64) {
+        let pager = empty_pager(4096, PageCache::default());
+        pager.begin_read_tx().unwrap();
+        run_until_done(
+            || pager.begin_write_tx(WalAutoActions::all_enabled()),
+            &pager,
+        )
+        .unwrap();
+        commit_tx(&pager);
+
+        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
+        (pager, page2.get().id() as i64)
+    }
+
     /// A pager whose database holds only page 1.
     fn pager_of_new_database() -> Arc<Pager> {
         let pager = empty_pager(4096, PageCache::default());
@@ -11722,35 +11738,6 @@ mod tests {
             .set_initial_page_size(PageSize::new(page_size).unwrap())
             .unwrap();
         pager
-    }
-
-    fn empty_btree_in_database() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let pager = conn.pager.load().clone();
-
-        // FIXME: handle page cache is full
-
-        // force allocate page1 with a transaction
-        pager.begin_read_tx().unwrap();
-        run_until_done(
-            || pager.begin_write_tx(WalAutoActions::all_enabled()),
-            &pager,
-        )
-        .unwrap();
-        run_until_done(
-            || pager.commit_tx(&conn, conn.get_sync_mode(), true),
-            &pager,
-        )
-        .unwrap();
-
-        let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
-        btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
-        (pager, page2.get().id() as i64, db, conn)
     }
 
     #[test]
@@ -12138,7 +12125,7 @@ mod tests {
         let num_columns = 5;
 
         for _ in 0..attempts {
-            let (pager, root_page, _db, conn) = empty_btree_in_database();
+            let (pager, root_page) = empty_btree_after_first_write_tx();
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
@@ -12192,10 +12179,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                pager
-                    .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                    .unwrap();
+                commit_tx(&pager);
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
@@ -12264,7 +12248,7 @@ mod tests {
         let mut seen = crate::HashSet::default();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
-            let (pager, _, _db, conn) = empty_btree_in_database();
+            let (pager, _) = empty_btree_after_first_write_tx();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12335,10 +12319,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager
-                    .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                    .unwrap();
+                commit_tx(&pager);
             }
 
             // Check that all keys can be found by seeking
@@ -12441,7 +12422,7 @@ mod tests {
         tracing::info!("super seed: {}", seed);
 
         for _ in 0..attempts {
-            let (pager, _, _db, conn) = empty_btree_in_database();
+            let (pager, _) = empty_btree_after_first_write_tx();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12571,10 +12552,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager
-                    .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                    .unwrap();
+                commit_tx(&pager);
             }
 
             // Final validation
@@ -12846,7 +12824,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         tracing::info!("seed: {seed}");
         for attempt in 0..8 {
-            let (pager, _, _db, conn) = empty_btree_in_database();
+            let (pager, _) = empty_btree_after_first_write_tx();
             let index_root_page = pager
                 .io
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
@@ -12951,10 +12929,7 @@ mod tests {
             if let Some(c) = c {
                 pager.io.wait_for_completion(c).unwrap();
             }
-            pager
-                .io
-                .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
-                .unwrap();
+            commit_tx(&pager);
 
             // Full scan: every key must appear exactly once.
             pager.begin_read_tx().unwrap();
@@ -13039,6 +13014,39 @@ mod tests {
     #[ignore]
     pub fn fuzz_long_btree_insert_fuzz_run_overflow() {
         btree_insert_fuzz_run(2, 5_000, |rng| (rng.next_u32() % 32 * 1024) as usize);
+    }
+
+    /// Commits the write transaction of `pager`, ends its read transaction, and checkpoints
+    /// when the WAL is over the auto-checkpoint threshold, like `Pager::commit_tx` on a
+    /// connection with default settings.
+    fn commit_tx(pager: &Pager) {
+        const WAL_AUTOCHECKPOINT: u32 = 1000;
+        let wal = pager.wal().unwrap();
+        pager
+            .io
+            .block(|| {
+                pager.commit_wal(
+                    WalAutoActions::all_enabled(),
+                    WAL_AUTOCHECKPOINT,
+                    SyncMode::Full,
+                    false,
+                )
+            })
+            .unwrap();
+        let needs_checkpoint = wal.should_checkpoint(WAL_AUTOCHECKPOINT);
+        wal.end_write_tx();
+        wal.end_read_tx();
+        if needs_checkpoint {
+            let mode = CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            };
+            pager
+                .io
+                .block(|| pager.checkpoint(mode, SyncMode::Full, false))
+                .unwrap();
+        }
+        pager.commit_wal_end();
+        pager.clear_savepoints().unwrap();
     }
 
     fn setup_test_env(database_size: u32) -> Arc<Pager> {
