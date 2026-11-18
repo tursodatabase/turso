@@ -79,7 +79,7 @@ impl FunctionTypeUse {
 
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
-    pg_query::parse(sql).map_err(parse_error)
+    pg_query::parse(sql, pg_query::ParserOptions::DEFAULT).map_err(parse_error)
 }
 
 /// The error for SQL that pg_query refuses. pg_query gives only the message
@@ -109,10 +109,22 @@ fn is_reserved_role_name_error(message: &str) -> bool {
 pub fn returns_rows(parsed: &ParseResult) -> bool {
     match first_statement(parsed) {
         Some(NodeEnum::SelectStmt(select)) => select.into_clause.is_none(),
-        Some(NodeEnum::InsertStmt(insert)) => !insert.returning_list.is_empty(),
-        Some(NodeEnum::UpdateStmt(update)) => !update.returning_list.is_empty(),
-        Some(NodeEnum::DeleteStmt(delete)) => !delete.returning_list.is_empty(),
-        Some(NodeEnum::MergeStmt(merge)) => !merge.returning_list.is_empty(),
+        Some(NodeEnum::InsertStmt(insert)) => insert
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::UpdateStmt(update)) => update
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::DeleteStmt(delete)) => delete
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
+        Some(NodeEnum::MergeStmt(merge)) => merge
+            .returning_clause
+            .as_ref()
+            .is_some_and(|clause| !clause.exprs.is_empty()),
         Some(NodeEnum::ExplainStmt(_) | NodeEnum::VariableShowStmt(_)) => true,
         _ => false,
     }
@@ -151,9 +163,13 @@ pub fn normalize(sql: &str) -> Result<String, ParseError> {
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
-    pg_query::fingerprint(sql)
-        .map(|fp| fp.hex)
-        .map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::fingerprint(
+        sql,
+        pg_query::ParserOptions::DEFAULT,
+        pg_query::FingerprintOptions::DEFAULT,
+    )
+    .map(|fp| fp.hex)
+    .map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()

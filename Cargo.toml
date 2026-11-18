@@ -162,7 +162,7 @@ phf = { version = "0.11", features = ["macros"] }
 fallible-iterator = "0.3.0"
 allocator-api2 = "0.4"
 getrandom = "0.4.2"
-pg_query = "6.1"
+pg_query = "18.1"
 
 criterion = "0.5.0"
 codspeed-criterion-compat = "4.2.1"

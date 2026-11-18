@@ -992,6 +992,9 @@ impl PostgreSQLTranslator {
             .raw_expr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("GENERATED column missing expression".into()))?;
+        if constraint.generated_kind == "v" {
+            return Err(ParseError::not_supported("a virtual generated column"));
+        }
         self.generation_expression_table
             .replace(Some(bare_table_name(tbl_name.name.as_str()).to_string()));
         let expr = self.translate_expr(raw_expr);
@@ -2028,7 +2031,11 @@ impl PostgreSQLTranslator {
                 tbl_name,
                 columns,
                 body: ast::InsertBody::DefaultValues,
-                returning: self.translate_returning(&insert.returning_list, relation, true)?,
+                returning: self.translate_returning(
+                    insert.returning_clause.as_ref(),
+                    relation,
+                    true,
+                )?,
             });
         };
 
@@ -2094,7 +2101,8 @@ impl PostgreSQLTranslator {
             (ast::InsertBody::Select(select, upsert), columns)
         };
 
-        let returning = self.translate_returning(&insert.returning_list, relation, true)?;
+        let returning =
+            self.translate_returning(insert.returning_clause.as_ref(), relation, true)?;
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
@@ -2245,11 +2253,16 @@ impl PostgreSQLTranslator {
             None
         };
 
-        if !update.from_clause.is_empty() && update.returning_list.iter().any(is_bare_star) {
+        if !update.from_clause.is_empty()
+            && update
+                .returning_clause
+                .as_ref()
+                .is_some_and(|clause| clause.exprs.iter().any(is_bare_star))
+        {
             return Err(ParseError::not_supported("RETURNING * on UPDATE ... FROM"));
         }
         let returning = self.translate_returning(
-            &update.returning_list,
+            update.returning_clause.as_ref(),
             relation,
             update.from_clause.is_empty(),
         )?;
@@ -2289,7 +2302,8 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&delete.returning_list, relation, true)?;
+        let returning =
+            self.translate_returning(delete.returning_clause.as_ref(), relation, true)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
 
         Ok(ast::Stmt::Delete {
@@ -5124,10 +5138,19 @@ impl PostgreSQLTranslator {
     /// tables that RETURNING can name.
     fn translate_returning(
         &self,
-        returning_list: &[pg_query::protobuf::Node],
+        returning_clause: Option<&pg_query::protobuf::ReturningClause>,
         target: &pg_query::protobuf::RangeVar,
         only_target_in_scope: bool,
     ) -> Result<Vec<ast::ResultColumn>, ParseError> {
+        let Some(returning_clause) = returning_clause else {
+            return Ok(vec![]);
+        };
+        if !returning_clause.options.is_empty() {
+            return Err(ParseError::not_supported(
+                "RETURNING with OLD or NEW aliases",
+            ));
+        }
+        let returning_list = &returning_clause.exprs;
         if returning_list.is_empty() {
             return Ok(vec![]);
         }
@@ -5138,6 +5161,11 @@ impl PostgreSQLTranslator {
         };
         let mut columns = Vec::with_capacity(returning_list.len());
         for node in returning_list {
+            if names_old_or_new_row(node, target_qualifiers) {
+                return Err(ParseError::not_supported(
+                    "old or new as a row name in RETURNING",
+                ));
+            }
             if is_star_qualified_by(node, target_qualifiers) {
                 columns.push(ast::ResultColumn::Star);
                 continue;
@@ -6740,6 +6768,19 @@ fn range_names<'a>(node: &pg_query::NodeRef<'a>) -> Vec<&'a str> {
         NodeRef::CommonTableExpr(cte) => vec![cte.ctename.as_str()],
         _ => Vec::new(),
     }
+}
+
+/// Whether `node` has a column reference `old.x` or `new.x` that PostgreSQL 18
+/// reads as the old or new row, which is when the target is not itself named
+/// `old` or `new`.
+fn names_old_or_new_row(node: &pg_query::protobuf::Node, target_qualifiers: &[&str]) -> bool {
+    let Some(node) = node.node.as_ref() else {
+        return false;
+    };
+    node.nodes().iter().any(|(node, ..)| {
+        matches!(column_qualifier(node), Some(qualifier @ ("old" | "new"))
+            if !target_qualifiers.contains(&qualifier))
+    })
 }
 
 /// The table name of a column reference `table.column`.
@@ -8712,7 +8753,7 @@ fn create_schema_elements(
                 }
             }
             let sql = element
-                .deparse()
+                .deparse(pg_query::DeparseOptions::default())
                 .map_err(|e| ParseError::ParseError(e.to_string()))?;
             Ok((order, sql))
         })
@@ -9705,8 +9746,19 @@ fn reject_constraint_attributes(
     if constraint.is_no_inherit {
         return Err(ParseError::not_supported("a NO INHERIT constraint"));
     }
+    if !constraint.is_enforced
+        && matches!(contype, ConstrType::ConstrCheck | ConstrType::ConstrForeign)
+    {
+        return Err(ParseError::not_supported("a NOT ENFORCED constraint"));
+    }
     if constraint.skip_validation {
         return Err(ParseError::not_supported("a NOT VALID constraint"));
+    }
+    if constraint.without_overlaps {
+        return Err(ParseError::not_supported("WITHOUT OVERLAPS"));
+    }
+    if constraint.pk_with_period || constraint.fk_with_period {
+        return Err(ParseError::not_supported("PERIOD in a key"));
     }
     Ok(())
 }
