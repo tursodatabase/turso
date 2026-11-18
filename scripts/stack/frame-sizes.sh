@@ -72,10 +72,14 @@ frame_sizes() {
       }
       return v
     }
+    # The number after the first match of prefix, e.g. 0x88 in "sub $0x88,%rsp".
+    # It is read from the end of the match: prefix is a regex, so its length
+    # is not always the length of the text it matches ("\\$" matches "$").
     function imm(line, prefix,   m) {
       if (!match(line, prefix "(0x[0-9a-fA-F]+|[0-9]+)")) return 0
-      m = substr(line, RSTART + length(prefix), RLENGTH - length(prefix))
-      return num(m)
+      m = substr(line, RSTART, RLENGTH)
+      match(m, /(0x[0-9a-fA-F]+|[0-9]+)$/)
+      return num(substr(m, RSTART, RLENGTH))
     }
     function shifted(line, v) {
       return line ~ /lsl #12/ ? v * 4096 : v
