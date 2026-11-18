@@ -16,6 +16,7 @@ mod schema_state;
 mod session;
 mod settings;
 mod statement;
+mod text;
 mod unique_index;
 mod unnest;
 
@@ -29,6 +30,7 @@ pub use session::{
     PgQueryRunner, TransactionState,
 };
 pub use statement::{Statement, StatementResultKind};
+pub use text::{value_text, TextType};
 pub use turso_core::{
     types, Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, StepResult,
 };
