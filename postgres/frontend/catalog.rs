@@ -258,6 +258,10 @@ impl Dialect for PostgresDialect {
         crate::schema_state::build_schema_state(schema, results)
     }
 
+    fn catalog(&self) -> &dyn turso_core::Catalog {
+        &crate::classes::PostgresCatalog
+    }
+
     fn translate_relation_changes(
         &self,
         program: &mut turso_core::ProgramBuilder,
