@@ -1,0 +1,30 @@
+@database :memory:
+
+test old-row-text-numeric-defaults {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT .5;
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT 1e3;
+    ALTER TABLE t ADD COLUMN d TEXT DEFAULT -.5;
+    ALTER TABLE t ADD COLUMN e TEXT DEFAULT +0.50;
+    ALTER TABLE t ADD COLUMN f TEXT DEFAULT 00012;
+    ALTER TABLE t ADD COLUMN g TEXT DEFAULT 0x10;
+    ALTER TABLE t ADD COLUMN h TEXT DEFAULT 9223372036854775808;
+    INSERT INTO t(a) VALUES (2);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|.5|1e3|-.5|0.50|12|16|9223372036854775808
+    2|0.5|1000.0|-0.5|0.5|12|16|9.22337203685478e+18
+}
+
+test old-row-numeric-affinity-controls {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 1e3;
+    ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 0.0;
+    SELECT b, typeof(b), c, typeof(c) FROM t;
+}
+expect {
+    1000|integer|0|integer
+}

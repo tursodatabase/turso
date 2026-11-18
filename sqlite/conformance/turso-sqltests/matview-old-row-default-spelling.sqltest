@@ -1,0 +1,18 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+test matview-old-row-default-spelling {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT .5;
+    CREATE MATERIALIZED VIEW v AS SELECT a,b FROM t;
+    SELECT a,b FROM v;
+    UPDATE t SET a=2 WHERE a=1;
+    SELECT a,b FROM v;
+}
+expect {
+    1|.5
+    2|.5
+}
