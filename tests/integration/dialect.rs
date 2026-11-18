@@ -68,6 +68,10 @@ impl Dialect for TestDialect {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(sql) = sql.strip_prefix("test: ") {
@@ -162,6 +166,10 @@ impl Dialect for StrictTestDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
@@ -543,6 +551,10 @@ impl Dialect for NoFunctionsDialect {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         SqliteDialect.parse_internal(sql)
     }
@@ -599,6 +611,10 @@ impl Dialect for ShoutingUpperDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
@@ -1118,6 +1134,10 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
         sql: &str,
     ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {

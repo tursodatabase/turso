@@ -886,6 +886,10 @@ impl Dialect for SecretTableDialect {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
     fn role_has_privilege(
         &self,
         _schema: &Schema,
