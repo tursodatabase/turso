@@ -426,6 +426,7 @@ impl CrossDbCheckCtx<'_> {
     }
 }
 
+#[turso_macros::grow_stack_when_low]
 fn check_select_table_refs(
     select: &ast::Select,
     check_qname: &dyn Fn(&QualifiedName) -> Result<()>,
@@ -502,6 +503,7 @@ fn check_one_select_refs(
     Ok(())
 }
 
+#[turso_macros::grow_stack_when_low]
 fn check_from_clause_refs(
     from: &ast::FromClause,
     check_qname: &dyn Fn(&QualifiedName) -> Result<()>,

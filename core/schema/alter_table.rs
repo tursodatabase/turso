@@ -305,6 +305,7 @@ mod rename_column_view {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn rewrite_view_select_for_column_rename(
         select: &mut ast::Select,
         ctx: &ViewRewriteCtx,
@@ -520,6 +521,7 @@ mod rename_column_view {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn rewrite_from_clause_for_column_rename(
         from_clause: &mut ast::FromClause,
         ctx: &ViewRewriteCtx,
@@ -1449,6 +1451,7 @@ impl<'a> TableRenameScope<'a> {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn qualifier_target_in_from_clause(&self, from: &ast::FromClause) -> Option<bool> {
         std::iter::once(from.select.as_ref())
             .chain(from.joins.iter().map(|join| join.table.as_ref()))
@@ -1502,6 +1505,7 @@ impl<'a> TableRenameScope<'a> {
     }
 }
 
+#[turso_macros::grow_stack_when_low]
 fn rewrite_select_in_scope(select: &mut ast::Select, scope: TableRenameScope) {
     let scope = select
         .with
@@ -1589,6 +1593,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
     }
 }
 
+#[turso_macros::grow_stack_when_low]
 fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, scope: TableRenameScope) {
     let from_scope = scope.inside_from_clause(from);
     rewrite_select_table_entry_table_refs(&mut from.select, scope, from_scope);

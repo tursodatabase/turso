@@ -1135,6 +1135,7 @@ fn rewrite_expressions_in_select_for_when_clause(
 
 /// Rewrite all expressions in a SELECT tree, including CTEs, compounds, ORDER BY,
 /// LIMIT/OFFSET, FROM/JOIN subqueries, and window clauses.
+#[turso_macros::grow_stack_when_low]
 pub(crate) fn rewrite_select_expressions<F>(
     select: &mut ast::Select,
     rewrite_expr: &mut F,
@@ -1227,6 +1228,7 @@ where
     Ok(())
 }
 
+#[turso_macros::grow_stack_when_low]
 fn rewrite_from_clause_expressions<F>(
     from_clause: &mut ast::FromClause,
     rewrite_expr: &mut F,

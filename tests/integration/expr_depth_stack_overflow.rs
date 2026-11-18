@@ -287,6 +287,53 @@ fn compound_select_with_many_terms_does_not_overflow_the_stack() {
     assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]; terms]);
 }
 
+#[test]
+fn alter_table_with_a_view_over_nested_subqueries_does_not_overflow_the_stack() {
+    let depth = 500;
+    let create_view = format!(
+        "CREATE VIEW v AS SELECT x FROM {}src{}",
+        "(SELECT * FROM ".repeat(depth),
+        ")".repeat(depth)
+    );
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| {
+        conn.execute("CREATE TABLE src (x, y)").unwrap();
+        conn.execute(&create_view).unwrap();
+        conn.execute("ALTER TABLE src RENAME TO dst").unwrap();
+        conn.execute("ALTER TABLE dst RENAME COLUMN x TO z")
+            .unwrap();
+        conn.execute("ALTER TABLE dst DROP COLUMN y").unwrap();
+        limbo_exec_rows(
+            conn,
+            "SELECT sql LIKE '%(SELECT * FROM dst)%' AND sql LIKE 'CREATE VIEW v AS SELECT z FROM%' \
+             FROM sqlite_schema WHERE name = 'v'",
+        )
+    });
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+}
+
+#[test]
+fn trigger_with_nested_subqueries_does_not_overflow_the_stack() {
+    let depth = 300;
+    let create_trigger = format!(
+        "CREATE TRIGGER tr AFTER INSERT ON a BEGIN \
+         INSERT INTO b SELECT * FROM {}(SELECT NEW.x){}; END",
+        "(SELECT * FROM ".repeat(depth),
+        ")".repeat(depth)
+    );
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| {
+        conn.execute("CREATE TABLE a (x)").unwrap();
+        conn.execute("CREATE TABLE b (x)").unwrap();
+        conn.execute(&create_trigger).unwrap();
+        conn.execute("INSERT INTO a VALUES (7)").unwrap();
+        limbo_exec_rows(conn, "SELECT x FROM b")
+    });
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(7)]]);
+}
+
 fn on_thread_with_stack<T: Send + 'static>(
     stack_size: usize,
     work: impl FnOnce(&Arc<Connection>) -> T + Send + 'static,

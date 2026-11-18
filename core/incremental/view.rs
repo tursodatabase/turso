@@ -755,6 +755,7 @@ impl IncrementalView {
     pub(crate) fn referenced_tables(
         select: &ast::Select,
     ) -> std::vec::Vec<(Option<String>, String)> {
+        #[turso_macros::grow_stack_when_low]
         fn collect_source(
             source: &ast::SelectTable,
             cte_names: &HashSet<String>,
@@ -844,6 +845,7 @@ impl IncrementalView {
             }
         }
 
+        #[turso_macros::grow_stack_when_low]
         fn collect_select(
             select: &ast::Select,
             inherited_ctes: &HashSet<String>,

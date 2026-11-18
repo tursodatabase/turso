@@ -4152,6 +4152,7 @@ fn apply_upsert_for_column_rename(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::grow_stack_when_low]
 fn apply_select_for_column_rename(
     mode: ColumnRenameMode<'_>,
     select: &mut ast::Select,
@@ -4431,6 +4432,7 @@ fn apply_one_select_for_column_rename(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::grow_stack_when_low]
 fn apply_from_clause_for_column_rename(
     mode: ColumnRenameMode<'_>,
     from_clause: &mut ast::FromClause,
@@ -5362,6 +5364,7 @@ fn validate_expr_column_refs_after_drop(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::grow_stack_when_low]
 fn validate_select_column_refs_after_drop(
     select: &ast::Select,
     outer_visible_columns: &[String],
@@ -5670,6 +5673,7 @@ fn validate_one_select_column_refs_after_drop(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::grow_stack_when_low]
 fn validate_from_clause_column_refs_after_drop(
     from_clause: &ast::FromClause,
     outer_visible_columns: &[String],
@@ -5918,6 +5922,7 @@ fn collect_select_output_columns(select: &ast::Select) -> Vec<String> {
     collect_one_select_output_columns(&select.body.select)
 }
 
+#[turso_macros::grow_stack_when_low]
 fn collect_from_clause_output_columns(from_clause: &ast::FromClause) -> Vec<String> {
     collect_select_table_visible_columns_from_output(&from_clause.select)
 }

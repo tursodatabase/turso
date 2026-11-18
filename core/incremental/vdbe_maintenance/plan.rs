@@ -162,6 +162,7 @@ fn build_dag_from_plan(plan: &Plan, resolver: &Resolver) -> Result<dag::Maintena
     builder.finish(root)
 }
 
+#[turso_macros::grow_stack_when_low]
 fn build_plan_dag_node(
     builder: &mut dag::DagBuilder,
     plan: &Plan,
@@ -1027,6 +1028,7 @@ pub(crate) fn plan_view(
 /// view's plan is rebuilt whenever the schema changes, so the choice must not
 /// depend on cost: a new index could otherwise make an accepted view
 /// impossible to maintain.
+#[turso_macros::grow_stack_when_low]
 fn unnest_correlated_subqueries(plan: &mut Plan, resolver: &Resolver) -> Result<()> {
     match plan {
         Plan::Select(select) => unnest_select_subqueries(select, resolver),
