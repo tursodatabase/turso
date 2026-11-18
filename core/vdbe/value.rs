@@ -648,25 +648,10 @@ impl Value {
             return Value::from_i64(result as i64);
         }
 
-        let reg_str;
-        let reg = match self {
-            Value::Text(s) => s.as_str(),
-            _ => {
-                reg_str = self.to_string();
-                reg_str.as_str()
-            }
-        };
+        let reg = self.cast_text_ref().expect("a NULL value returns above");
+        let pattern = pattern.cast_text_ref().expect("a NULL value returns above");
 
-        let pattern_str;
-        let pattern = match pattern {
-            Value::Text(s) => s.as_str(),
-            _ => {
-                pattern_str = pattern.to_string();
-                pattern_str.as_str()
-            }
-        };
-
-        match reg.find(pattern) {
+        match find_text(&reg, &pattern) {
             Some(byte_pos) => {
                 // Convert byte position to character position (1-indexed)
                 let char_pos = reg[..byte_pos].chars().count() + 1;
@@ -1686,6 +1671,23 @@ fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
     result
 }
 
+/// The byte offset of the first `needle` in `haystack`, as `haystack.find(needle)`
+/// gives it. In a text of at most 64 bytes, the needle is compared at each
+/// byte, which costs less than the setup of the general search. A UTF-8
+/// needle can only match at the start of a character, so the offset is the
+/// same.
+fn find_text(haystack: &str, needle: &str) -> Option<usize> {
+    const SHORT_TEXT_BYTES: usize = 64;
+    let needle_bytes = needle.as_bytes();
+    match needle_bytes {
+        [first, ..] if haystack.len() <= SHORT_TEXT_BYTES => haystack
+            .as_bytes()
+            .windows(needle_bytes.len())
+            .position(|window| window[0] == *first && window == needle_bytes),
+        _ => haystack.find(needle),
+    }
+}
+
 /// `lhs` followed by `rhs`, as a TEXT value.
 #[inline]
 fn join_text(lhs: &str, rhs: &str) -> Result<Value> {
@@ -2057,6 +2059,39 @@ mod tests {
         let rhs = blob(&[3, 4]);
 
         assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn find_text_finds_what_str_find_finds() {
+        fn texts(max_chars: usize) -> Vec<String> {
+            let mut all = vec![String::new()];
+            let mut last = vec![String::new()];
+            for _ in 0..max_chars {
+                let mut next = Vec::new();
+                for text in &last {
+                    for c in ['a', 'b', '\u{e9}'] {
+                        let mut longer = text.clone();
+                        longer.push(c);
+                        next.push(longer);
+                    }
+                }
+                all.extend(next.iter().cloned());
+                last = next;
+            }
+            all
+        }
+        let needles = texts(3);
+        // The long texts take the general search.
+        let long = ["ab".repeat(40), format!("{}\u{e9}a", "a".repeat(70))];
+        for haystack in texts(6).into_iter().chain(long) {
+            for needle in &needles {
+                assert_eq!(
+                    super::find_text(&haystack, needle),
+                    haystack.find(needle.as_str()),
+                    "{haystack:?} {needle:?}"
+                );
+            }
+        }
     }
 
     #[test]
