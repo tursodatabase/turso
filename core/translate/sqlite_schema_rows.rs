@@ -361,6 +361,84 @@ pub(crate) fn emit_delete_temp_triggers_on_table(
     Ok(())
 }
 
+/// Deletes the row of a view or materialized view. Returns the register
+/// with the rowid of the deleted row.
+pub(crate) fn emit_drop_view_row(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    view_name: &str,
+    sqlite_schema_cursor_id: usize,
+) -> Result<usize> {
+    let view_name_reg = program.alloc_register();
+    let type_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    program.emit_insn(Insn::String8 {
+        dest: view_name_reg,
+        value: resolver.mangle_name(namespace, view_name),
+    });
+    program.emit_insn(Insn::String8 {
+        dest: type_reg,
+        value: "view".to_string(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Column 0 is type, column 1 is name.
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: type_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col1_reg,
+        rhs: view_name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_delete_label);
+
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+
+    Ok(rowid_reg)
+}
+
 /// Creates one of the engine's own tables in the main database the first
 /// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
 /// in the in-memory schema. Returns the table and the root page that the new
