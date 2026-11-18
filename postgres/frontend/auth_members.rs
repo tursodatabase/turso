@@ -100,6 +100,14 @@ pub(crate) struct Membership {
     pub(crate) set_option: bool,
 }
 
+impl Membership {
+    /// Whether the membership names role `role` as the role, the member or
+    /// the grantor.
+    pub(crate) fn names(&self, role: RoleId) -> bool {
+        self.role == role || self.member == role || self.grantor == role
+    }
+}
+
 /// The memberships of a database, in memory.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Memberships {
@@ -226,42 +234,13 @@ pub(crate) fn translate_grant_role(
     grantees: &[ast::Grantee],
 ) -> turso_core::Result<()> {
     let roles = schema_roles(schema);
-    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
-        return Err(LimboError::ParseError(
-            "the database has no role membership table".to_string(),
-        ));
-    };
     let statement = if revoke { "revoke" } else { "grant" };
     let grantees = grantees
         .iter()
         .map(|grantee| resolve_grantee(roles, connection, grantee))
         .collect::<turso_core::Result<Vec<_>>>()?;
 
-    let role_member_index = schema
-        .get_indices(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
-        .find(|index| index.name == AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME)
-        .cloned()
-        .ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "{AUTH_MEMBERS_TABLE_NAME} has no role and member index"
-            ))
-        })?;
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: table_cursor_id,
-        root_page: RegisterOrLiteral::Literal(table.root_page),
-        db: MAIN_DB_ID,
-    });
-    let index_cursor_id = program.alloc_cursor_index(None, &role_member_index)?;
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(role_member_index.root_page),
-        db: MAIN_DB_ID,
-    });
-    let cursors = Cursors {
-        table: table_cursor_id,
-        role_member_index: index_cursor_id,
-    };
+    let cursors = open_cursors(program, schema)?;
     // The memberships as the statement leaves them so far, so that a later
     // pair of the same statement sees what an earlier pair granted.
     let mut memberships = roles.memberships().clone();
@@ -383,10 +362,62 @@ fn role_does_not_exist(name: &str) -> LimboError {
     )
 }
 
-/// The cursors that GRANT and REVOKE write the membership table through.
+/// Deletes `memberships` from the membership table and from the in-memory
+/// catalog, as DROP ROLE does for the memberships of the roles it drops.
+pub(crate) fn emit_memberships_delete(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    memberships: &[Membership],
+) -> turso_core::Result<()> {
+    if memberships.is_empty() {
+        return Ok(());
+    }
+    let cursors = open_cursors(program, schema)?;
+    for membership in memberships {
+        emit_membership_delete(program, &cursors, membership);
+    }
+    Ok(())
+}
+
+/// The cursors that GRANT, REVOKE and DROP ROLE write the membership table
+/// through.
 struct Cursors {
     table: usize,
     role_member_index: usize,
+}
+
+/// Opens [`Cursors`] for writing the membership table of `schema`.
+fn open_cursors(program: &mut ProgramBuilder, schema: &Schema) -> turso_core::Result<Cursors> {
+    let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME) else {
+        return Err(LimboError::ParseError(
+            "the database has no role membership table".to_string(),
+        ));
+    };
+    let role_member_index = schema
+        .get_indices(NamespaceId::ROOT, AUTH_MEMBERS_TABLE_NAME)
+        .find(|index| index.name == AUTH_MEMBERS_ROLE_MEMBER_INDEX_NAME)
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "{AUTH_MEMBERS_TABLE_NAME} has no role and member index"
+            ))
+        })?;
+    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: table_cursor_id,
+        root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: MAIN_DB_ID,
+    });
+    let index_cursor_id = program.alloc_cursor_index(None, &role_member_index)?;
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(role_member_index.root_page),
+        db: MAIN_DB_ID,
+    });
+    Ok(Cursors {
+        table: table_cursor_id,
+        role_member_index: index_cursor_id,
+    })
 }
 
 /// Inserts `membership` under a new rowid and tells the engine to add it to
