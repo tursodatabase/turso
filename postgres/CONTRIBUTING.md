@@ -37,6 +37,29 @@ If Turso intentionally diverges from PostgreSQL, document that in
 are silently ignored: the parser accepts the full PostgreSQL grammar, so a
 feature the translator drops produces wrong results, not an error.
 
+## Known gaps
+
+A known gap is a case where tursopg gives a different result than PostgreSQL. Each gap is a test with an ID, for example `E-19`.
+
+- Gap tests are in [`conformance/pg-sqltests/gaps/`](conformance/pg-sqltests/gaps/), one file per category: `params-casts` (A), `operators-functions` (B), `output-formats` (C), `errors` (D), `ddl-catalog` (E).
+- A test name is `gap-<id>-<short-title>`, in lower case. The comment line above it gives the gap ID, the severity, and the title.
+- The default `expect` block is the PostgreSQL result. `make -C postgres/conformance run-postgres` checks it.
+- An `expect @tursopg` block records the current wrong tursopg result. `make -C postgres/conformance run` checks it.
+- For errors, compare the SQLSTATE with `@sqlstate <code>` and `expect error {}`, not the message text.
+- When you fix a gap, its `@tursopg` block fails. Delete the block in the same change.
+- Use `@skip "<gap id>: reason"` only when the tursopg result is not stable, for example a crash.
+- A test without an `@tursopg` block matches PostgreSQL. It is a regression test.
+- Cases that need bound parameters, a database reopen, two commands in one prepared statement, MVCC, or a query after a failed statement are in [`tests/integration/postgres/gaps.rs`](tests/integration/postgres/gaps.rs), named `gap_<id>_<short_title>`. Each test asserts the PostgreSQL result, and a test of an open gap has `#[ignore = "<gap id>: <reason>"]`. Run the open gaps with `cargo test -p turso_pg_tests --test integration_tests gaps:: -- --ignored`. When you fix the gap, remove its `#[ignore]`.
+
+Severity:
+
+| Severity | Meaning |
+|----------|---------|
+| S1 | Wrong result or wrong data, with no error |
+| S2 | Error where PostgreSQL succeeds |
+| S3 | Wrong error code or message |
+| S4 | Catalog or metadata gap |
+
 ## Running the upstream regression suite
 
 The upstream regression suite is the day-to-day test loop. Run it with:
