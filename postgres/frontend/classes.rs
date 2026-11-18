@@ -31,7 +31,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use turso_core::dialect::catalog::{CreateSequence, DropSequence, DropTable};
+use turso_core::dialect::catalog::DropTable;
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
     is_user_relation_name, BTreeTable, RelationKind, Schema, SQLITE_SEQUENCE_TABLE_NAME,
@@ -41,9 +41,9 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
-    CreateIndex, CursorType, DropIndex, DropView, InsertFlags, Insn, LimboError, LoadQuery,
-    LoadStep, NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName,
-    RenameTable, Row, SchemaLoad, SqliteCatalog, Value, WriteContext, WriteOrigin,
+    CreateTable, CursorType, InsertFlags, Insn, LimboError, LoadQuery, LoadStep, NewOwner, Numeric,
+    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, RenameTable, Row, SchemaLoad,
+    SqliteCatalog, Value, WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -488,92 +488,160 @@ impl Catalog for PostgresCatalog {
         ctx: &WriteContext<'_>,
         change: &CatalogWrite<'_>,
     ) -> turso_core::Result<AfterWrites> {
-        if let CatalogWrite::DropIndex(index) = change {
-            delete_index_class_row(program, ctx, index)?;
-            return SqliteCatalog.write(program, ctx, change);
-        }
-        if let CatalogWrite::DropView(view) = change {
-            return write_drop_view(program, ctx, view);
-        }
-        let after_writes = SqliteCatalog.write(program, ctx, change)?;
-        // A virtual table has no class row, in any database.
-        if matches!(change, CatalogWrite::DropTable(table) if table.is_virtual) {
-            return Ok(after_writes);
-        }
-        if !changes_class_rows(change) {
-            return Ok(after_writes);
-        }
-        if !writes_class_rows(ctx)? {
-            return Ok(after_writes);
-        }
         match change {
             CatalogWrite::CreateTable(table) => {
-                let mut changes = vec![RelationChange::Created {
-                    namespace: table.namespace,
-                    name: table.name,
-                    kind: RelationKind::Table,
-                    table: None,
-                }];
-                for index in table.automatic_indexes {
-                    changes.push(RelationChange::Created {
-                        namespace: table.namespace,
-                        name: &index.name,
-                        kind: RelationKind::Index,
-                        table: Some(table.name),
-                    });
-                }
-                translate_relation_changes(program, ctx.schema, ctx.connection, &changes)?;
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                change_class_rows(program, ctx, &class_rows_of_new_table(table))?;
+                Ok(after_writes)
             }
-            CatalogWrite::CreateIndex(index) => write_index_class_row(program, ctx, index)?,
-            CatalogWrite::DropIndex(_) => unreachable!("DROP INDEX returned above"),
+            CatalogWrite::CreateIndex(index) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Created {
+                        namespace: index.namespace,
+                        name: index.name,
+                        kind: RelationKind::Index,
+                        table: Some(index.table),
+                    }],
+                )?;
+                Ok(after_writes)
+            }
+            CatalogWrite::DropIndex(index) => {
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Dropped {
+                        namespace: index.namespace,
+                        name: index.name,
+                    }],
+                )?;
+                SqliteCatalog.write(program, ctx, change)
+            }
             CatalogWrite::CreateSequence(sequence) => {
-                emit_create_sequence_class_row(program, ctx, sequence)?
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Created {
+                        namespace: sequence.namespace,
+                        name: sequence.name,
+                        kind: RelationKind::Sequence,
+                        table: None,
+                    }],
+                )?;
+                Ok(after_writes)
             }
             CatalogWrite::DropSequence(sequence) => {
-                emit_drop_sequence_class_row(program, ctx, sequence)?
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Dropped {
+                        namespace: sequence.namespace,
+                        name: sequence.name,
+                    }],
+                )?;
+                Ok(after_writes)
             }
-            CatalogWrite::DropTable(table) => emit_drop_table_class_rows(program, ctx, table)?,
-            CatalogWrite::CreateView(view) => write_created_view_class_row(
-                program,
-                ctx,
-                view.namespace,
-                view.name,
-                RelationKind::View,
-            )?,
-            CatalogWrite::CreateMaterializedView(view) => write_created_view_class_row(
-                program,
-                ctx,
-                view.namespace,
-                view.name,
-                RelationKind::MaterializedView,
-            )?,
-            CatalogWrite::DropView(_) => unreachable!("DROP VIEW returned above"),
-            CatalogWrite::RenameTable(table) => rename_class_rows_of_table(program, ctx, table)?,
-            CatalogWrite::RenameColumn(column) => translate_relation_changes(
-                program,
-                ctx.schema,
-                ctx.connection,
-                &[RelationChange::ColumnRenamed {
-                    namespace: column.namespace,
-                    table: column.table,
-                    old_name: column.old_name,
-                    new_name: column.new_name.as_str(),
-                }],
-            )?,
-            CatalogWrite::AlterColumn(column) => translate_relation_changes(
-                program,
-                ctx.schema,
-                ctx.connection,
-                &[RelationChange::ColumnRenamed {
-                    namespace: column.namespace,
-                    table: column.table,
-                    old_name: column.old_name,
-                    new_name: column.definition.col_name.as_str(),
-                }],
-            )?,
-            CatalogWrite::AddColumn(_) | CatalogWrite::DropColumn(_) => {}
+            CatalogWrite::DropTable(table) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                // A virtual table has no class row, in any database.
+                if !table.is_virtual {
+                    change_class_rows(program, ctx, &class_rows_of_dropped_table(table))?;
+                }
+                Ok(after_writes)
+            }
+            CatalogWrite::CreateView(view) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Created {
+                        namespace: view.namespace,
+                        name: view.name,
+                        kind: RelationKind::View,
+                        table: None,
+                    }],
+                )?;
+                Ok(after_writes)
+            }
+            CatalogWrite::CreateMaterializedView(view) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Created {
+                        namespace: view.namespace,
+                        name: view.name,
+                        kind: RelationKind::MaterializedView,
+                        table: None,
+                    }],
+                )?;
+                Ok(after_writes)
+            }
+            CatalogWrite::DropView(view) => {
+                change_class_rows(
+                    program,
+                    ctx,
+                    &[RelationChange::Dropped {
+                        namespace: view.namespace,
+                        name: view.name,
+                    }],
+                )?;
+                SqliteCatalog.write(program, ctx, change)
+            }
+            CatalogWrite::RenameTable(table) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                // A virtual table has no class row, in any database.
+                if !table.is_virtual {
+                    change_class_rows(program, ctx, &class_rows_of_renamed_table(table))?;
+                }
+                Ok(after_writes)
+            }
+            CatalogWrite::RenameColumn(column) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                // A column that keeps its name owns the same sequences as
+                // before.
+                if column.old_name != column.new_name.as_str() {
+                    change_class_rows(
+                        program,
+                        ctx,
+                        &[RelationChange::ColumnRenamed {
+                            namespace: column.namespace,
+                            table: column.table,
+                            old_name: column.old_name,
+                            new_name: column.new_name.as_str(),
+                        }],
+                    )?;
+                }
+                Ok(after_writes)
+            }
+            CatalogWrite::AlterColumn(column) => {
+                let after_writes = SqliteCatalog.write(program, ctx, change)?;
+                // A column that keeps its name owns the same sequences as
+                // before.
+                if column.old_name != column.definition.col_name.as_str() {
+                    change_class_rows(
+                        program,
+                        ctx,
+                        &[RelationChange::ColumnRenamed {
+                            namespace: column.namespace,
+                            table: column.table,
+                            old_name: column.old_name,
+                            new_name: column.definition.col_name.as_str(),
+                        }],
+                    )?;
+                }
+                Ok(after_writes)
+            }
+            // A new column owns no sequence, so no class row changes.
+            CatalogWrite::AddColumn(_) => SqliteCatalog.write(program, ctx, change),
+            // The statement drops the sequences that the column owns
+            // itself, each with its class row.
+            CatalogWrite::DropColumn(_) => SqliteCatalog.write(program, ctx, change),
         }
-        Ok(after_writes)
     }
 
     fn write_access(
@@ -612,6 +680,19 @@ impl Catalog for PostgresCatalog {
     }
 }
 
+/// Changes the class rows as `changes` say, if the relations of the
+/// statement have class rows.
+fn change_class_rows(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    changes: &[RelationChange<'_>],
+) -> turso_core::Result<()> {
+    if !writes_class_rows(ctx)? {
+        return Ok(());
+    }
+    translate_relation_changes(program, ctx.schema, ctx.connection, changes)
+}
+
 /// Whether the relations of the statement get class rows. Only the
 /// relations a user creates in the main database do. A statement of the
 /// engine copies or replays a database whose class rows are stored as data
@@ -632,164 +713,44 @@ fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
     Ok(ctx.database_id == MAIN_DB_ID)
 }
 
-/// Writes the class row of a new index.
-fn write_index_class_row(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    index: &CreateIndex<'_>,
-) -> turso_core::Result<()> {
-    translate_relation_changes(
-        program,
-        ctx.schema,
-        ctx.connection,
-        &[RelationChange::Created {
-            namespace: index.namespace,
-            name: index.name,
+/// The class rows of a new table and of its automatic indexes.
+fn class_rows_of_new_table<'a>(table: &CreateTable<'a>) -> Vec<RelationChange<'a>> {
+    let mut changes = vec![RelationChange::Created {
+        namespace: table.namespace,
+        name: table.name,
+        kind: RelationKind::Table,
+        table: None,
+    }];
+    for index in table.automatic_indexes {
+        changes.push(RelationChange::Created {
+            namespace: table.namespace,
+            name: &index.name,
             kind: RelationKind::Index,
-            table: Some(index.table),
-        }],
-    )
-}
-
-/// Deletes the class row of an index, if the index has one. DROP INDEX
-/// deletes it before the engine's `sqlite_schema` row.
-fn delete_index_class_row(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    index: &DropIndex<'_>,
-) -> turso_core::Result<()> {
-    if !writes_class_rows(ctx)? {
-        return Ok(());
+            table: Some(table.name),
+        });
     }
-    translate_relation_changes(
-        program,
-        ctx.schema,
-        ctx.connection,
-        &[RelationChange::Dropped {
-            namespace: index.namespace,
-            name: index.name,
-        }],
-    )
+    changes
 }
 
-fn emit_create_sequence_class_row(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    sequence: &CreateSequence<'_>,
-) -> turso_core::Result<()> {
-    translate_relation_changes(
-        program,
-        ctx.schema,
-        ctx.connection,
-        &[RelationChange::Created {
-            namespace: sequence.namespace,
-            name: sequence.name,
-            kind: RelationKind::Sequence,
-            table: None,
-        }],
-    )
-}
-
-fn emit_drop_sequence_class_row(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    sequence: &DropSequence<'_>,
-) -> turso_core::Result<()> {
-    translate_relation_changes(
-        program,
-        ctx.schema,
-        ctx.connection,
-        &[RelationChange::Dropped {
-            namespace: sequence.namespace,
-            name: sequence.name,
-        }],
-    )
-}
-
-/// Deletes the class rows of the sequences that the table's columns own, of
-/// the table and of its indexes.
-fn emit_drop_table_class_rows(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    table: &DropTable<'_>,
-) -> turso_core::Result<()> {
+/// The class rows that go away with a table: those of the sequences that
+/// its columns own, its own and those of its indexes.
+fn class_rows_of_dropped_table<'a>(table: &DropTable<'a>) -> Vec<RelationChange<'a>> {
     let dropped = |name| RelationChange::Dropped {
         namespace: table.namespace,
         name,
     };
-    let changes: Vec<_> = table
+    table
         .owned_sequences
         .iter()
         .map(|sequence| dropped(sequence.as_str()))
         .chain([dropped(table.name)])
         .chain(table.indexes.iter().map(|index| dropped(index)))
-        .collect();
-    translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
+        .collect()
 }
 
-/// Deletes the class row of a dropped view or materialized view, and then
-/// the engine's row.
-fn write_drop_view(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    view: &DropView<'_>,
-) -> turso_core::Result<AfterWrites> {
-    if writes_class_rows(ctx)? {
-        translate_relation_changes(
-            program,
-            ctx.schema,
-            ctx.connection,
-            &[RelationChange::Dropped {
-                namespace: view.namespace,
-                name: view.name,
-            }],
-        )?;
-    }
-    SqliteCatalog.write(program, ctx, &CatalogWrite::DropView(*view))
-}
-
-/// Writes the class row of a new view or materialized view.
-fn write_created_view_class_row(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    namespace: NamespaceId,
-    name: &str,
-    kind: RelationKind,
-) -> turso_core::Result<()> {
-    translate_relation_changes(
-        program,
-        ctx.schema,
-        ctx.connection,
-        &[RelationChange::Created {
-            namespace,
-            name,
-            kind,
-            table: None,
-        }],
-    )
-}
-
-/// Whether the class table stores anything that `change` changes. A
-/// virtual table has no class row, a column that keeps its name owns the
-/// same sequences as before, and a new column owns none. The sequences of
-/// a dropped column are dropped by the statement, each with its class row.
-fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
-    match change {
-        CatalogWrite::RenameTable(table) => !table.is_virtual,
-        CatalogWrite::RenameColumn(column) => column.old_name != column.new_name.as_str(),
-        CatalogWrite::AlterColumn(column) => column.old_name != column.definition.col_name.as_str(),
-        CatalogWrite::AddColumn(_) | CatalogWrite::DropColumn(_) => false,
-        _ => true,
-    }
-}
-
-/// Gives the class rows of a renamed table and of its automatic indexes
-/// their new names.
-fn rename_class_rows_of_table(
-    program: &mut ProgramBuilder,
-    ctx: &WriteContext<'_>,
-    table: &RenameTable<'_>,
-) -> turso_core::Result<()> {
+/// The class rows of a renamed table and of its automatic indexes, which
+/// get their new names.
+fn class_rows_of_renamed_table<'a>(table: &RenameTable<'a>) -> Vec<RelationChange<'a>> {
     let mut changes = vec![RelationChange::Renamed {
         namespace: table.namespace,
         old_name: table.old_name,
@@ -804,7 +765,7 @@ fn rename_class_rows_of_table(
                 new_name: Cow::Owned(new_name),
             }),
     );
-    translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
+    changes
 }
 
 /// A relation that a statement created, dropped or renamed, or a column of
