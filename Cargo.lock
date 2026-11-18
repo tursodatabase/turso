@@ -7307,6 +7307,7 @@ version = "0.9.0-pre.5"
 dependencies = [
  "proc-macro2",
  "quote",
+ "stacker",
  "syn 2.0.100",
 ]
 

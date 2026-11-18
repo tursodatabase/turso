@@ -67,6 +67,12 @@ This project depends on tantivy-common, distributed by the Tantivy project autho
 * License: licenses/core/tantivy-common-mit-license.md (MIT License)
 * Homepage: https://github.com/quickwit-oss/tantivy
 
+This project depends on stacker, distributed by the rust-lang project:
+
+* License: licenses/core/stacker-apache-license.md (Apache License v2.0)
+* License: licenses/core/stacker-mit-license.md (MIT License)
+* Homepage: https://github.com/rust-lang/stacker
+
 This project depends on windows-sys, distributed by the Microsoft:
 
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)

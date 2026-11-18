@@ -88,6 +88,7 @@ mod test;
 
 // Import assertion proc macro implementations
 mod assert;
+mod grow_stack;
 #[path = "trace_stack.rs"]
 mod trace_stack_impl;
 
@@ -719,6 +720,37 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
     trace_stack_impl::trace_stack_attribute(attr, input)
+}
+
+/// Prevent a stack overflow in a function that recurses as deep as the SQL is
+/// nested.
+///
+/// At each call, the function reads how much stack the thread has left. If less
+/// than 128 KiB is left (1 MiB in debug builds, because their stack frames are
+/// much larger), the function calls itself again with the same arguments on a
+/// new stack of 2 MiB (8 MiB in debug builds). `stacker` allocates the new stack
+/// on the heap. The function body stays as it is, thus the usual path only adds
+/// the check.
+///
+/// Put the attribute on at least one function of each cycle of calls whose depth
+/// the SQL or the schema controls, for example the parse of nested subqueries or
+/// the execution of a chain of triggers. The depth is then limited by memory, not
+/// by the stack of the thread.
+///
+/// If `stacker` cannot find the stack limit of the thread, the function runs on
+/// the current stack. This is the case on Android, iOS and wasm.
+///
+/// Each argument must be a plain name. `Drop::drop` cannot have the attribute,
+/// because Rust does not let code call `drop` directly: put it on a function that
+/// `drop` calls. A crate that uses the attribute must depend on `stacker`.
+///
+/// ```ignore
+/// #[turso_macros::grow_stack_when_low]
+/// fn parse_select(&mut self) -> Result<Select> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn grow_stack_when_low(attr: TokenStream, input: TokenStream) -> TokenStream {
+    grow_stack::grow_stack_when_low_attribute(attr, input)
 }
 
 /// Wrap a function body in an allocation-site scope.
