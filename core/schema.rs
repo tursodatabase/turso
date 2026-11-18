@@ -122,7 +122,8 @@ use crate::translate::collate::{
     check_compared_with_own_type, key_collation, CollationSeq, TextCollation,
 };
 use crate::translate::expr::expr_type::{
-    column_type, primitive_value_type, stored_value_type, value_type, BuiltinType, ExprType,
+    column_type, primitive_value_type, stored_value_type, value_type, BuiltinType,
+    ColumnCustomType, ExprType,
 };
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
@@ -562,7 +563,8 @@ pub struct TypeDef {
     /// values, so an index on a column of the type can serve a range or ORDER
     /// BY even though the type has no ordering of its own. True only for the
     /// built-in date and time types, which store one text form with a 4-digit
-    /// year. False for a domain, whose index then serves only `=`.
+    /// year or, for timestamp and timestamptz, an integer. False for a domain,
+    /// whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
     /// Whether values of the type can only be stored, read back, sorted,
     /// grouped, indexed, compared with `=`, `<`, BETWEEN or IN, tested with IS
@@ -4794,6 +4796,8 @@ impl Schema {
         let mut parent_collations: Vec<CollationSeq> =
             Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut parent_key_types: Vec<Option<ast::Type>> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
             let (p, collation, parent_affinity, parent_type) = match parent_tbl.get_column(pc) {
                 Some((i, column)) => (
@@ -4814,6 +4818,25 @@ impl Schema {
                 ),
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            parent_key_types
+                .push_within_capacity(match &parent_type {
+                    ExprType::Custom { type_def, params } => Some(
+                        ColumnCustomType {
+                            type_def: type_def.clone(),
+                            params: params.clone(),
+                        }
+                        .type_name(),
+                    ),
+                    ExprType::Builtin(_) | ExprType::Array { .. } => None,
+                    ExprType::Untyped
+                    | ExprType::Null
+                    | ExprType::Unknown
+                    | ExprType::NotKnownYet
+                    | ExprType::RowValue => {
+                        unreachable!("a column's type is a custom, builtin or array type")
+                    }
+                })
+                .expect("FK key type vector was preallocated to parent_cols.len()");
             // A foreign key compares the child's key with the parent's.
             let child_type = column_type(&child.columns[cpos], child.is_strict, self);
             check_compared_with_own_type(&[child_type, parent_type], self)?;
@@ -4880,6 +4903,7 @@ impl Schema {
             parent_pos: parent_pos.into_boxed_slice(),
             parent_collations: parent_collations.into_boxed_slice(),
             key_affinities: key_affinities.into_boxed_slice(),
+            parent_key_types: parent_key_types.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -8031,6 +8055,10 @@ pub struct ResolvedFkRef {
     /// The affinity applied when a child key is compared with a parent key,
     /// as SQLite compares `parent_col = child_col`.
     pub key_affinities: BoxedSlice<Affinity>,
+    /// The custom type of each parent key column, written the way a CAST
+    /// names it, or None for a column without one and for the rowid. An
+    /// action's subprogram gives its parent key parameters these types.
+    pub parent_key_types: BoxedSlice<Option<ast::Type>>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,
