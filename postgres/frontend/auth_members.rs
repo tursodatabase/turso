@@ -16,14 +16,15 @@
 //! change.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
-    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID, SQLITE_ERROR,
+    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, LoadQuery,
+    LoadStep, Numeric, ProgramBuilder, RegisterOrLiteral, Row, SchemaLoad, Value, MAIN_DB_ID,
+    SQLITE_ERROR,
 };
 use turso_parser::ast;
 use turso_pg_parser::sqlstate::{
@@ -35,7 +36,7 @@ use crate::catalog::{pg_role_by_name, PgRole, PG_DATABASE_OWNER_NAME};
 use crate::error::sqlstate_error;
 use crate::functions::role_name_in;
 use crate::roles::{schema_roles, RoleCatalog};
-use crate::schema_state::{change_schema_state, emit_catalog_apply};
+use crate::schema_state::{change_schema_state, emit_catalog_apply, SchemaStateRead};
 use crate::unique_index::emit_unique_index_insert;
 
 /// The table that stores the memberships that `GRANT role TO role` makes.
@@ -67,6 +68,51 @@ pub(crate) const CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL: &str =
 
 /// The number of columns of [`AUTH_MEMBERS_TABLE_NAME`].
 const AUTH_MEMBERS_COLUMN_COUNT: usize = 7;
+
+/// Reads the memberships from [`AUTH_MEMBERS_TABLE_NAME`] into the roles
+/// that [`crate::roles::RoleRows`] read. They are read only with the roles
+/// table, which is created before the membership table.
+pub(crate) struct MembershipRows {
+    read: Arc<Mutex<SchemaStateRead>>,
+    queried: bool,
+    rows: Vec<Vec<Value>>,
+}
+
+impl MembershipRows {
+    pub(crate) fn new(read: Arc<Mutex<SchemaStateRead>>) -> Self {
+        Self {
+            read,
+            queried: false,
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl LoadStep for MembershipRows {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> turso_core::Result<Option<LoadQuery>> {
+        if self.queried || self.read.lock().unwrap().roles.is_none() {
+            return Ok(None);
+        }
+        self.queried = true;
+        Ok(schema_state_query(load.schema()).map(LoadQuery::engine_metadata_read))
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> turso_core::Result<()> {
+        self.rows.push(row.get_values().cloned().collect());
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, _load: &mut SchemaLoad) -> turso_core::Result<()> {
+        let memberships = Memberships::new(&self.rows)?;
+        let mut read = self.read.lock().unwrap();
+        let roles = read
+            .roles
+            .as_mut()
+            .expect("memberships are read after roles");
+        roles.set_memberships(memberships)?;
+        Ok(())
+    }
+}
 
 /// The query that reads the memberships for the frontend's schema state, or
 /// None when the database has no membership table, as one that an earlier
