@@ -949,9 +949,9 @@ impl Value {
                 }
             }
             None => match trim_type {
-                TrimType::All => text_cow.trim_matches(' '),
-                TrimType::Left => text_cow.trim_start_matches(' '),
-                TrimType::Right => text_cow.trim_end_matches(' '),
+                TrimType::All => trim_spaces(&text_cow, true, true),
+                TrimType::Left => trim_spaces(&text_cow, true, false),
+                TrimType::Right => trim_spaces(&text_cow, false, true),
             },
         };
         Value::build_text(trimmed.to_string())
@@ -1633,6 +1633,28 @@ fn push_hex_upper(out: &mut String, bytes: &[u8]) {
     }
 }
 
+/// `text` without the spaces at its start when `left` is true and at its end
+/// when `right` is true, as `trim_start_matches(' ')` and
+/// `trim_end_matches(' ')` give it. A space is one byte, so the bytes are
+/// compared directly, and the cuts are at character boundaries.
+fn trim_spaces(text: &str, left: bool, right: bool) -> &str {
+    let bytes = text.as_bytes();
+    let start = if left {
+        bytes.iter().position(|&b| b != b' ').unwrap_or(bytes.len())
+    } else {
+        0
+    };
+    let end = if right {
+        bytes[start..]
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(start, |i| start + i + 1)
+    } else {
+        bytes.len()
+    };
+    &text[start..end]
+}
+
 /// Text of at most `N` bytes in a stack buffer, written with `write!`.
 struct StackText<const N: usize> {
     buf: [u8; N],
@@ -2081,6 +2103,32 @@ mod tests {
         let rhs = blob(&[3, 4]);
 
         assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn trim_spaces_gives_the_result_of_trim_matches() {
+        for text in [
+            "",
+            " ",
+            "   ",
+            "a",
+            " a ",
+            "  hello world  ",
+            "\u{e9} ",
+            " \u{e9}",
+            "\t a \t",
+            "a  b",
+        ] {
+            assert_eq!(super::trim_spaces(text, true, true), text.trim_matches(' '));
+            assert_eq!(
+                super::trim_spaces(text, true, false),
+                text.trim_start_matches(' ')
+            );
+            assert_eq!(
+                super::trim_spaces(text, false, true),
+                text.trim_end_matches(' ')
+            );
+        }
     }
 
     #[test]
