@@ -60,7 +60,7 @@ fn gap_a_12_invalid_int_param_cast(db: TempDatabase) {
     assert_eq!(out, "ERROR 22P02");
 }
 
-// A-15 (OK): int param text -> int arithmetic
+// A-15: int param text -> int arithmetic
 #[turso_macros::test(views)]
 fn gap_a_15_int_param_text_int_arithmetic(db: TempDatabase) {
     let out = GapCase {
@@ -98,7 +98,7 @@ fn gap_a_29_numeric_n_param(db: TempDatabase) {
     assert_eq!(out, "12.35");
 }
 
-// A-33 (S1): timestamptz $n param with offset
+// A-33: timestamptz $n param with offset
 #[turso_macros::test(views)]
 fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
     let out = GapCase {
@@ -110,7 +110,7 @@ fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
     assert_eq!(out, "2026-10-08 12:00:00");
 }
 
-// A-41 (OK): date $n param
+// A-41 (S2): date $n param
 #[turso_macros::test(views)]
 #[ignore = "A-41: a date cast of a param is not supported"]
 fn gap_a_41_date_n_param(db: TempDatabase) {
@@ -136,7 +136,7 @@ fn gap_a_49_invalid_jsonb_param(db: TempDatabase) {
     assert_eq!(out, "ERROR 22P02");
 }
 
-// A-53 (OK): = ANY($1::bigint[]) text param
+// A-53: = ANY($1::bigint[]) text param
 #[turso_macros::test(views)]
 fn gap_a_53_any_1_bigint_text_param(db: TempDatabase) {
     let out = GapCase {
@@ -152,7 +152,7 @@ fn gap_a_53_any_1_bigint_text_param(db: TempDatabase) {
     assert_eq!(out, "1 ; 3");
 }
 
-// A-54 (OK): = ANY($1::text[]) text param
+// A-54: = ANY($1::text[]) text param
 #[turso_macros::test(views)]
 fn gap_a_54_any_1_text_text_param(db: TempDatabase) {
     let out = GapCase {
@@ -168,7 +168,7 @@ fn gap_a_54_any_1_text_text_param(db: TempDatabase) {
     assert_eq!(out, "a ; c");
 }
 
-// A-55 (OK): <> ALL($1::int[])
+// A-55: <> ALL($1::int[])
 #[turso_macros::test(views)]
 fn gap_a_55_all_1_int(db: TempDatabase) {
     let out = GapCase {
@@ -184,7 +184,7 @@ fn gap_a_55_all_1_int(db: TempDatabase) {
     assert_eq!(out, "2");
 }
 
-// A-56 (OK): = ANY($1::uuid[])
+// A-56: = ANY($1::uuid[])
 #[turso_macros::test(views)]
 fn gap_a_56_any_1_uuid(db: TempDatabase) {
     let out = GapCase {
@@ -199,7 +199,7 @@ fn gap_a_56_any_1_uuid(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// A-57 (OK): text[] param with quotes/commas
+// A-57: text[] param with quotes/commas
 #[turso_macros::test(views)]
 fn gap_a_57_text_param_with_quotes_commas(db: TempDatabase) {
     let out = GapCase {
@@ -211,7 +211,7 @@ fn gap_a_57_text_param_with_quotes_commas(db: TempDatabase) {
     assert_eq!(out, "b,c");
 }
 
-// A-67 (OK): untyped $1 text '42' into int column
+// A-67: untyped $1 text '42' into int column
 #[turso_macros::test(views)]
 fn gap_a_67_untyped_1_text_42_into_int_column(db: TempDatabase) {
     let out = GapCase {
@@ -224,7 +224,7 @@ fn gap_a_67_untyped_1_text_42_into_int_column(db: TempDatabase) {
     assert_eq!(out, "42");
 }
 
-// A-68 (OK): untyped $1 text 'true' into bool column
+// A-68: untyped $1 text 'true' into bool column
 #[turso_macros::test(views)]
 fn gap_a_68_untyped_1_text_true_into_bool_column(db: TempDatabase) {
     let out = GapCase {
@@ -237,7 +237,7 @@ fn gap_a_68_untyped_1_text_true_into_bool_column(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// A-69 (S2): untyped $1 '2026-10-08 14:00+02' into timestamptz column
+// A-69: untyped $1 '2026-10-08 14:00+02' into timestamptz column
 #[turso_macros::test(views)]
 fn gap_a_69_untyped_1_2026_10_08_14_00_02_into_timestamptz_c(db: TempDatabase) {
     let out = GapCase {
@@ -264,7 +264,7 @@ fn gap_a_70_insert_jsonb_text_param_into_jsonb_column(db: TempDatabase) {
     assert_eq!(out, r#"{"a": 2, "b": 1}"#);
 }
 
-// A-71 (OK): where bool col = $1 text 'true'
+// A-71: where bool col = $1 text 'true'
 #[turso_macros::test(views)]
 fn gap_a_71_where_bool_col_1_text_true(db: TempDatabase) {
     let out = GapCase {
@@ -280,7 +280,7 @@ fn gap_a_71_where_bool_col_1_text_true(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// A-72 (OK): where bool col = $1::boolean text 'false'
+// A-72: where bool col = $1::boolean text 'false'
 #[turso_macros::test(views)]
 fn gap_a_72_where_bool_col_1_boolean_text_false(db: TempDatabase) {
     let out = GapCase {
@@ -296,7 +296,7 @@ fn gap_a_72_where_bool_col_1_boolean_text_false(db: TempDatabase) {
     assert_eq!(out, "2");
 }
 
-// A-73 (OK): where int col = $1 text param
+// A-73: where int col = $1 text param
 #[turso_macros::test(views)]
 fn gap_a_73_where_int_col_1_text_param(db: TempDatabase) {
     let out = GapCase {
@@ -309,7 +309,7 @@ fn gap_a_73_where_int_col_1_text_param(db: TempDatabase) {
     assert_eq!(out, "2");
 }
 
-// A-74 (OK): where uuid col = $1 uppercase
+// A-74: where uuid col = $1 uppercase
 #[turso_macros::test(views)]
 fn gap_a_74_where_uuid_col_1_uppercase(db: TempDatabase) {
     let out = GapCase {
@@ -325,7 +325,7 @@ fn gap_a_74_where_uuid_col_1_uppercase(db: TempDatabase) {
     assert_eq!(out, "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
 }
 
-// A-75 (S2): where tstz col > $1 with offset
+// A-75: where tstz col > $1 with offset
 #[turso_macros::test(views)]
 fn gap_a_75_where_tstz_col_1_with_offset(db: TempDatabase) {
     let out = GapCase {
@@ -341,7 +341,7 @@ fn gap_a_75_where_tstz_col_1_with_offset(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// A-76 (OK): untyped $1 param result type
+// A-76: untyped $1 param result type
 #[turso_macros::test(views)]
 fn gap_a_76_untyped_1_param_result_type(db: TempDatabase) {
     let out = GapCase {
@@ -353,7 +353,7 @@ fn gap_a_76_untyped_1_param_result_type(db: TempDatabase) {
     assert_eq!(out, "x");
 }
 
-// A-77 (OK): insert int param bound as int into text column
+// A-77: insert int param bound as int into text column
 #[turso_macros::test(views)]
 fn gap_a_77_insert_int_param_bound_as_int_into_text_column(db: TempDatabase) {
     let out = GapCase {
@@ -366,7 +366,7 @@ fn gap_a_77_insert_int_param_bound_as_int_into_text_column(db: TempDatabase) {
     assert_eq!(out, "5");
 }
 
-// A-78 (OK): NULL param
+// A-78: NULL param
 #[turso_macros::test(views)]
 fn gap_a_78_null_param(db: TempDatabase) {
     let out = GapCase {
@@ -378,7 +378,7 @@ fn gap_a_78_null_param(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// B-13 (OK): LIKE with $1 param
+// B-13: LIKE with $1 param
 #[turso_macros::test(views)]
 fn gap_b_13_like_with_1_param(db: TempDatabase) {
     let out = GapCase {
@@ -394,7 +394,7 @@ fn gap_b_13_like_with_1_param(db: TempDatabase) {
     assert_eq!(out, "1 ; 3 ; 4");
 }
 
-// B-24 (OK): IN list with params
+// B-24: IN list with params
 #[turso_macros::test(views)]
 fn gap_b_24_in_list_with_params(db: TempDatabase) {
     let out = GapCase {
@@ -427,7 +427,7 @@ fn gap_b_27_col_any_1_int(db: TempDatabase) {
     assert_eq!(out, "3");
 }
 
-// B-32 (OK): int[] @> $1::int[]
+// B-32: int[] @> $1::int[]
 #[turso_macros::test(views)]
 fn gap_b_32_int_1_int(db: TempDatabase) {
     let out = GapCase {
@@ -460,7 +460,7 @@ fn gap_b_44_jsonb_1_jsonb_param(db: TempDatabase) {
     assert_eq!(out, "2");
 }
 
-// B-54 (OK): jsonb ->  param key
+// B-54: jsonb ->  param key
 #[turso_macros::test(views)]
 fn gap_b_54_jsonb_param_key(db: TempDatabase) {
     let out = GapCase {
@@ -476,7 +476,7 @@ fn gap_b_54_jsonb_param_key(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// B-89 (OK): LIMIT/OFFSET with text params
+// B-89: LIMIT/OFFSET with text params
 #[turso_macros::test(views)]
 fn gap_b_89_limit_offset_with_text_params(db: TempDatabase) {
     let out = GapCase {
@@ -506,7 +506,7 @@ fn gap_b_118_json_populate_recordset(db: TempDatabase) {
     assert_eq!(out, "1|a");
 }
 
-// B-119 (OK): json_to_recordset with column defs
+// B-119: json_to_recordset with column defs
 #[turso_macros::test(views)]
 fn gap_b_119_json_to_recordset_with_column_defs(db: TempDatabase) {
     let out = GapCase {
@@ -518,7 +518,7 @@ fn gap_b_119_json_to_recordset_with_column_defs(db: TempDatabase) {
     assert_eq!(out, "1|a");
 }
 
-// B-125 (OK): bound LIMIT in a correlated subquery
+// B-125: bound LIMIT in a correlated subquery
 #[turso_macros::test(views)]
 fn gap_b_125_bound_limit_in_a_correlated_subquery(db: TempDatabase) {
     let out = GapCase {
@@ -536,7 +536,7 @@ fn gap_b_125_bound_limit_in_a_correlated_subquery(db: TempDatabase) {
     assert_eq!(out, "1|1 ; 2|1 ; 3|1");
 }
 
-// D-43 (OK): statement after error in tx (25P02)
+// D-43: statement after error in tx (25P02)
 #[turso_macros::test(views)]
 fn gap_d_43_statement_after_error_in_tx_25p02(db: TempDatabase) {
     let out = GapCase {
@@ -566,7 +566,7 @@ fn gap_d_50_prepared_statement_with_two_commands(db: TempDatabase) {
     assert_eq!(out, "ERROR 42601");
 }
 
-// E-36 (OK): schema survives reopen
+// E-36: schema survives reopen
 #[turso_macros::test(views)]
 fn gap_e_36_schema_survives_reopen(db: TempDatabase) {
     let out = GapCase {
@@ -583,7 +583,7 @@ fn gap_e_36_schema_survives_reopen(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// E-71 (OK): ALTER TABLE RENAME TO survives reopen
+// E-71: ALTER TABLE RENAME TO survives reopen
 #[turso_macros::test(views)]
 fn gap_e_71_alter_table_rename_to_survives_reopen(db: TempDatabase) {
     let out = GapCase {
@@ -600,7 +600,7 @@ fn gap_e_71_alter_table_rename_to_survives_reopen(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// E-72 (OK): ALTER TABLE RENAME COLUMN survives reopen
+// E-72: ALTER TABLE RENAME COLUMN survives reopen
 #[turso_macros::test(views)]
 fn gap_e_72_alter_table_rename_column_survives_reopen(db: TempDatabase) {
     let out = GapCase {
@@ -617,7 +617,7 @@ fn gap_e_72_alter_table_rename_column_survives_reopen(db: TempDatabase) {
     assert_eq!(out, "a");
 }
 
-// E-75 (OK): in-memory schema stays in memory
+// E-75: in-memory schema stays in memory
 #[turso_macros::test(views)]
 fn gap_e_75_in_memory_schema_stays_in_memory(db: TempDatabase) {
     let out = GapCase {
@@ -637,7 +637,7 @@ fn gap_e_75_in_memory_schema_stays_in_memory(db: TempDatabase) {
     assert_eq!(out, "ERROR 42P01");
 }
 
-// E-76 (OK): ADD COLUMN on a table with a function default survives reopen
+// E-76: ADD COLUMN on a table with a function default survives reopen
 #[turso_macros::test(views)]
 fn gap_e_76_add_column_on_a_table_with_a_function_default_su(db: TempDatabase) {
     let out = GapCase {
@@ -653,7 +653,7 @@ fn gap_e_76_add_column_on_a_table_with_a_function_default_su(db: TempDatabase) {
     assert_eq!(out, "0");
 }
 
-// E-77 (OK): DDL in a schema right after CREATE SCHEMA (MVCC)
+// E-77: DDL in a schema right after CREATE SCHEMA (MVCC)
 #[turso_macros::test(views)]
 fn gap_e_77_ddl_in_a_schema_right_after_create_schema_mvcc(db: TempDatabase) {
     let out = GapCase {
@@ -685,7 +685,7 @@ fn gap_e_78_create_materialized_view_then_select_mvcc(db: TempDatabase) {
     assert_eq!(out, "1");
 }
 
-// E-83 (OK): enum column rejects an unknown label after reopen
+// E-83: enum column rejects an unknown label after reopen
 #[turso_macros::test(views)]
 fn gap_e_83_enum_column_rejects_an_unknown_label_after_reope(db: TempDatabase) {
     let out = GapCase {
@@ -701,7 +701,7 @@ fn gap_e_83_enum_column_rejects_an_unknown_label_after_reope(db: TempDatabase) {
     assert_eq!(out, "ERROR 22P02");
 }
 
-// E-84 (OK): enum type survives reopen
+// E-84: enum type survives reopen
 #[turso_macros::test(views)]
 fn gap_e_84_enum_type_survives_reopen(db: TempDatabase) {
     let out = GapCase {
@@ -714,7 +714,7 @@ fn gap_e_84_enum_type_survives_reopen(db: TempDatabase) {
     assert_eq!(out, "");
 }
 
-// E-88 (OK): DEFAULT auth.uid() / auth.email() fill the claims after reopen
+// E-88: DEFAULT auth.uid() / auth.email() fill the claims after reopen
 // PostgreSQL first creates the auth functions that tursopg has built in.
 #[turso_macros::test(views)]
 fn gap_e_88_default_auth_uid_auth_email_fill_the_claims_afte(db: TempDatabase) {

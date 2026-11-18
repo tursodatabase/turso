@@ -8,6 +8,11 @@
 
 @database :memory:
 
+setup t_b_n_ts_j_jb_arr_u_with_rows {
+    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
+    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+
 # C-01 (S1): boolean true: raw value, inside json_build_object
 test gap-c-01-boolean-true-raw-value-inside-json-build-object {
     CREATE TABLE t (v boolean);
@@ -20,7 +25,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-02 (OK): smallint 12: raw value, inside json_build_object
+# C-02 (S2): smallint 12: raw value, inside json_build_object
 test gap-c-02-smallint-12-raw-value-inside-json-build-object {
     CREATE TABLE t (v smallint);
     INSERT INTO t VALUES (12);
@@ -32,7 +37,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-03 (OK): integer 123: raw value, inside json_build_object
+# C-03 (S2): integer 123: raw value, inside json_build_object
 test gap-c-03-integer-123-raw-value-inside-json-build-object {
     CREATE TABLE t (v integer);
     INSERT INTO t VALUES (123);
@@ -44,7 +49,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-04 (OK): bigint 9007199254740993: raw value, inside json_build_object
+# C-04 (S2): bigint 9007199254740993: raw value, inside json_build_object
 test gap-c-04-bigint-9007199254740993-raw-value-inside-json-bu {
     CREATE TABLE t (v bigint);
     INSERT INTO t VALUES (9007199254740993);
@@ -92,7 +97,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-08 (OK): real 1.1: raw value, inside json_build_object
+# C-08 (S2): real 1.1: raw value, inside json_build_object
 test gap-c-08-real-1-1-raw-value-inside-json-build-object {
     CREATE TABLE t (v real);
     INSERT INTO t VALUES (1.1);
@@ -104,7 +109,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-09 (OK): double precision 0.1: raw value, inside json_build_object
+# C-09 (S2): double precision 0.1: raw value, inside json_build_object
 test gap-c-09-double-precision-0-1-raw-value-inside-json-build {
     CREATE TABLE t (v double precision);
     INSERT INTO t VALUES (0.1);
@@ -116,7 +121,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-10 (OK): text 'héllo "q"': raw value, inside json_build_object
+# C-10 (S2): text 'héllo "q"': raw value, inside json_build_object
 test gap-c-10-text-h-llo-q-raw-value-inside-json-build-object {
     CREATE TABLE t (v text);
     INSERT INTO t VALUES ('héllo "q"');
@@ -128,7 +133,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-11 (OK): uuid 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11': raw value, inside json_build_object
+# C-11 (S2): uuid 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11': raw value, inside json_build_object
 test gap-c-11-uuid-a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-raw-va {
     CREATE TABLE t (v uuid);
     INSERT INTO t VALUES ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
@@ -140,7 +145,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-12 (OK): date '2026-10-08': raw value, inside json_build_object
+# C-12 (S2): date '2026-10-08': raw value, inside json_build_object
 test gap-c-12-date-2026-10-08-raw-value-inside-json-build-obje {
     CREATE TABLE t (v date);
     INSERT INTO t VALUES ('2026-10-08');
@@ -152,7 +157,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# C-13 (OK): time '12:34:56.789': raw value, inside json_build_object
+# C-13 (S2): time '12:34:56.789': raw value, inside json_build_object
 test gap-c-13-time-12-34-56-789-raw-value-inside-json-build-ob {
     CREATE TABLE t (v time);
     INSERT INTO t VALUES ('12:34:56.789');
@@ -308,7 +313,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-26 (OK): mood 'happy': raw value, inside json_build_object
+# C-26 (S2): mood 'happy': raw value, inside json_build_object
 test gap-c-26-mood-happy-raw-value-inside-json-build-object {
     CREATE TYPE mood AS ENUM ('happy', 'sad');
     CREATE TABLE t (v mood);
@@ -321,7 +326,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-27 (OK): posint 5: raw value, inside json_build_object
+# C-27 (S2): posint 5: raw value, inside json_build_object
 test gap-c-27-posint-5-raw-value-inside-json-build-object {
     CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
     CREATE TABLE t (v posint);
@@ -334,7 +339,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# C-28 (OK): varchar(5) 'ab': raw value, inside json_build_object
+# C-28 (S2): varchar(5) 'ab': raw value, inside json_build_object
 test gap-c-28-varchar-5-ab-raw-value-inside-json-build-object {
     CREATE TABLE t (v varchar(5));
     INSERT INTO t VALUES ('ab');
@@ -395,9 +400,8 @@ expect {
 expect @tursopg error {}
 
 # C-40 (S1): json_agg of mixed-type row
+@setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-40-json-agg-of-mixed-type-row {
-    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
-    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
     SELECT json_agg(json_build_object('b', b, 'n', n, 'ts', ts, 'j', j, 'jb', jb, 'u', u)) FROM t;
 }
 expect {
@@ -407,9 +411,8 @@ expect {
 expect @tursopg error {}
 
 # C-41 (S2): text[] inside json object
+@setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-41-text-inside-json-object {
-    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
-    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
     SELECT json_build_object('arr', arr) FROM t;
 }
 expect {
@@ -419,9 +422,8 @@ expect {
 expect @tursopg error {}
 
 # C-42 (S1): ::text cast of each type
+@setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-42-text-cast-of-each-type {
-    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
-    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
     SELECT b::text, n::text, ts::text, jb::text, arr::text, u::text FROM t;
 }
 expect {
@@ -432,9 +434,8 @@ expect @tursopg {
 }
 
 # C-43 (S2): result column type of bool comparison via pg_typeof
+@setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-43-result-column-type-of-bool-comparison-via-pg-typ {
-    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
-    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
     SELECT pg_typeof(b), pg_typeof(n), pg_typeof(ts), pg_typeof(jb), pg_typeof(arr) FROM t;
 }
 expect {
@@ -444,9 +445,8 @@ expect {
 expect @tursopg error {}
 
 # C-44 (S2): row_to_json of whole row
+@setup t_b_n_ts_j_jb_arr_u_with_rows
 test gap-c-44-row-to-json-of-whole-row {
-    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
-    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
     SELECT row_to_json(t) FROM t;
 }
 expect {

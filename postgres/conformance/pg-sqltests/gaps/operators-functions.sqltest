@@ -8,26 +8,34 @@
 
 @database :memory:
 
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
+setup v_x_with_rows {
+    CREATE TABLE v (x int);
+    INSERT INTO v VALUES (1), (NULL), (2);
+}
+
 @backend postgres
-setup pg_setup_b_126 {
+setup auth_uid_from_claims_on_postgres {
     CREATE SCHEMA auth;
     CREATE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS $$ SELECT coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'))::text $$;
 }
 
-# B-01 (OK): = NULL yields no rows; IS NULL
+# B-01: = NULL yields no rows; IS NULL
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-01-null-yields-no-rows-is-null {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE n = NULL OR (id = 2 AND n IS NULL) ORDER BY id;
 }
 expect {
     2
 }
 
-# B-02 (OK): IS DISTINCT FROM
+# B-02: IS DISTINCT FROM
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-02-is-distinct-from {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE n IS DISTINCT FROM 10 ORDER BY id;
 }
 expect {
@@ -36,20 +44,18 @@ expect {
     4
 }
 
-# B-03 (OK): IS NOT DISTINCT FROM NULL
+# B-03: IS NOT DISTINCT FROM NULL
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-03-is-not-distinct-from-null {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE n IS NOT DISTINCT FROM NULL;
 }
 expect {
     2
 }
 
-# B-04 (OK): IS TRUE / IS NOT TRUE on bool col
+# B-04 (S1): IS TRUE / IS NOT TRUE on bool col
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-04-is-true-is-not-true-on-bool-col {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
 }
 expect {
@@ -65,10 +71,9 @@ expect @tursopg {
     4|0|1
 }
 
-# B-05 (OK): IS UNKNOWN
+# B-05: IS UNKNOWN
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-05-is-unknown {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE ok IS UNKNOWN ORDER BY id;
 }
 expect {
@@ -76,17 +81,16 @@ expect {
     4
 }
 
-# B-06 (OK): LIKE is case-sensitive
+# B-06: LIKE is case-sensitive
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-06-like-is-case-sensitive {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s LIKE 'Ab%' ORDER BY id;
 }
 expect {
     2
 }
 
-# B-07 (OK): LIKE case-sensitive literal
+# B-07 (S1): LIKE case-sensitive literal
 test gap-b-07-like-case-sensitive-literal {
     SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
 }
@@ -97,40 +101,36 @@ expect @tursopg {
     0|1|0
 }
 
-# B-08 (OK): LIKE default escape \_
+# B-08: LIKE default escape \_
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-08-like-default-escape {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s LIKE 'a\_c' ORDER BY id;
 }
 expect {
     3
 }
 
-# B-09 (OK): LIKE default escape \%
+# B-09: LIKE default escape \%
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-09-like-default-escape {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s LIKE 'a\%c' ORDER BY id;
 }
 expect {
     4
 }
 
-# B-10 (OK): LIKE ... ESCAPE '!'
+# B-10: LIKE ... ESCAPE '!'
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-10-like-escape {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s LIKE 'a!_c' ESCAPE '!' ORDER BY id;
 }
 expect {
     3
 }
 
-# B-11 (OK): ILIKE
+# B-11: ILIKE
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-11-ilike {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s ILIKE 'AB%' ORDER BY id;
 }
 expect {
@@ -138,7 +138,7 @@ expect {
     2
 }
 
-# B-12 (OK): ILIKE non-ASCII
+# B-12 (S1): ILIKE non-ASCII
 test gap-b-12-ilike-non-ascii {
     SELECT 'Ärger' ILIKE 'ä%';
 }
@@ -149,10 +149,9 @@ expect @tursopg {
     0
 }
 
-# B-14 (OK): NOT LIKE / NOT ILIKE
+# B-14: NOT LIKE / NOT ILIKE
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-14-not-like-not-ilike {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s NOT ILIKE 'ab%' ORDER BY id;
 }
 expect {
@@ -161,9 +160,8 @@ expect {
 }
 
 # B-15 (S2): LIKE ANY(array)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-15-like-any-array {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s LIKE ANY (ARRAY['ab%','a_c']) ORDER BY id;
 }
 expect {
@@ -175,9 +173,8 @@ expect {
 expect @tursopg error {}
 
 # B-16 (S2): ILIKE ALL(array)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-16-ilike-all-array {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s ILIKE ALL (ARRAY['a%','%c']) ORDER BY id;
 }
 expect {
@@ -188,10 +185,9 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-17 (OK): ~ regex is case-sensitive
+# B-17: ~ regex is case-sensitive
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-17-regex-is-case-sensitive {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s ~ '^a' ORDER BY id;
 }
 expect {
@@ -200,10 +196,9 @@ expect {
     4
 }
 
-# B-18 (OK): ~* regex is case-insensitive
+# B-18: ~* regex is case-insensitive
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-18-regex-is-case-insensitive {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s ~* '^ab' ORDER BY id;
 }
 expect {
@@ -211,20 +206,18 @@ expect {
     2
 }
 
-# B-19 (OK): !~ regex
+# B-19: !~ regex
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-19-regex {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s !~ '^a' ORDER BY id;
 }
 expect {
     2
 }
 
-# B-20 (OK): !~* regex
+# B-20: !~* regex
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-20-regex {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE s !~* '^ab' ORDER BY id;
 }
 expect {
@@ -232,7 +225,7 @@ expect {
     4
 }
 
-# B-21 (OK): regex classes \d and escapes
+# B-21 (S1): regex classes \d and escapes
 test gap-b-21-regex-classes-d-and-escapes {
     SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
 }
@@ -243,7 +236,7 @@ expect @tursopg {
     1|1|0
 }
 
-# B-22 (OK): SIMILAR TO
+# B-22 (S1): SIMILAR TO
 test gap-b-22-similar-to {
     SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
 }
@@ -254,7 +247,7 @@ expect @tursopg {
     1|0
 }
 
-# B-23 (OK): IN with NULL (three-valued)
+# B-23 (S1): IN with NULL (three-valued)
 test gap-b-23-in-with-null-three-valued {
     SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
 }
@@ -265,7 +258,7 @@ expect @tursopg {
     1||
 }
 
-# B-25 (OK): = ANY('{..}'::int[])
+# B-25 (S1): = ANY('{..}'::int[])
 test gap-b-25-any-int {
     SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
 }
@@ -286,27 +279,25 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-28 (OK): = ANY(array) with NULL element
+# B-28: = ANY(array) with NULL element
 test gap-b-28-any-array-with-null-element {
     SELECT 3 = ANY(ARRAY[1,NULL]);
 }
 expect {
 }
 
-# B-29 (OK): text[] @> literal
+# B-29: text[] @> literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-29-text-literal {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE arr @> '{a}' ORDER BY id;
 }
 expect {
     1
 }
 
-# B-30 (OK): text[] <@ literal
+# B-30: text[] <@ literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-30-text-literal {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE arr <@ '{a,b,c}' ORDER BY id;
 }
 expect {
@@ -315,10 +306,9 @@ expect {
     3
 }
 
-# B-31 (OK): text[] && literal
+# B-31: text[] && literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-31-text-literal {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE arr && '{b,c}' ORDER BY id;
 }
 expect {
@@ -326,10 +316,9 @@ expect {
     2
 }
 
-# B-33 (OK): int[] && literal
+# B-33: int[] && literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-33-int-literal {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE ia && '{2,3}'::int[] ORDER BY id;
 }
 expect {
@@ -337,17 +326,16 @@ expect {
     2
 }
 
-# B-34 (OK): array equality col = literal
+# B-34: array equality col = literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-34-array-equality-col-literal {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE ia = '{1,2}' ORDER BY id;
 }
 expect {
     1
 }
 
-# B-35 (OK): ARRAY @> ARRAY literal
+# B-35 (S1): ARRAY @> ARRAY literal
 test gap-b-35-array-array-literal {
     SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
 }
@@ -358,10 +346,9 @@ expect @tursopg {
     1|1|0
 }
 
-# B-36 (OK): array subscript 1-based + out of range
+# B-36: array subscript 1-based + out of range
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-36-array-subscript-1-based-out-of-range {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT arr[1], arr[5], ia[2] FROM t WHERE id = 1;
 }
 expect {
@@ -369,9 +356,8 @@ expect {
 }
 
 # B-37 (S2): array_length / cardinality
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-37-array-length-cardinality {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT array_length(arr, 1), cardinality(arr) FROM t WHERE id = 1;
 }
 expect {
@@ -381,9 +367,8 @@ expect {
 expect @tursopg error {}
 
 # B-38 (S2): unnest
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-38-unnest {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT unnest(arr) FROM t WHERE id = 1;
 }
 expect {
@@ -393,10 +378,9 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-39 (OK): jsonb -> key output
+# B-39 (S1): jsonb -> key output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-39-jsonb-key-output {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j -> 'a' FROM t WHERE id = 1;
 }
 expect {
@@ -406,10 +390,9 @@ expect @tursopg {
     {"b":1}
 }
 
-# B-40 (OK): jsonb ->> key output
+# B-40 (S1): jsonb ->> key output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-40-jsonb-key-output {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j ->> 'a', j ->> 'n' FROM t WHERE id = 1;
 }
 expect {
@@ -419,10 +402,9 @@ expect @tursopg {
     {"b":1}|1
 }
 
-# B-41 (OK): jsonb -> int index
+# B-41: jsonb -> int index
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-41-jsonb-int-index {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j -> 0, j ->> 1 FROM t WHERE id = 4;
 }
 expect {
@@ -430,9 +412,8 @@ expect {
 }
 
 # B-42 (S2): jsonb #> / #>> path
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-42-jsonb-path {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j #> '{a,b}', j #>> '{a,b}', j #>> '{tags,1}' FROM t WHERE id = 1;
 }
 expect {
@@ -442,9 +423,8 @@ expect {
 expect @tursopg error {}
 
 # B-43 (S1): jsonb @> filter
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-43-jsonb-filter {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j @> '{"n":1}' ORDER BY id;
 }
 expect {
@@ -454,9 +434,8 @@ expect @tursopg {
 }
 
 # B-45 (S1): jsonb <@
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-45-jsonb {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j <@ '{"a":2,"n":2,"z":0}' ORDER BY id;
 }
 expect {
@@ -466,9 +445,8 @@ expect @tursopg {
 }
 
 # B-46 (S2): jsonb ? key
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-46-jsonb-key {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j ? 'tags' ORDER BY id;
 }
 expect {
@@ -478,9 +456,8 @@ expect {
 expect @tursopg error {}
 
 # B-47 (S2): jsonb ?| array
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-47-jsonb-array {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j ?| array['tags','zzz'] ORDER BY id;
 }
 expect {
@@ -490,9 +467,8 @@ expect {
 expect @tursopg error {}
 
 # B-48 (S2): jsonb ?& array
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-48-jsonb-array {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j ?& array['a','n'] ORDER BY id;
 }
 expect {
@@ -503,9 +479,8 @@ expect {
 expect @tursopg error {}
 
 # B-49 (S1): jsonb ->> compared to text
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-49-jsonb-compared-to-text {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j ->> 'n' = '2';
 }
 expect {
@@ -514,10 +489,9 @@ expect {
 expect @tursopg {
 }
 
-# B-50 (OK): (jsonb ->> )::int comparison
+# B-50: (jsonb ->> )::int comparison
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-50-jsonb-int-comparison {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE (j ->> 'n')::int >= 1 ORDER BY id;
 }
 expect {
@@ -525,20 +499,18 @@ expect {
     2
 }
 
-# B-51 (OK): jsonb -> on missing key / non-object
+# B-51: jsonb -> on missing key / non-object
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-51-jsonb-on-missing-key-non-object {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j -> 'missing', j -> 'a' -> 'b' -> 'c' FROM t WHERE id = 1;
 }
 expect {
     |
 }
 
-# B-52 (OK): jsonb ->> object returns PG-formatted text
+# B-52 (S1): jsonb ->> object returns PG-formatted text
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-52-jsonb-object-returns-pg-formatted-text {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j ->> 'a' FROM t WHERE id = 1;
 }
 expect {
@@ -548,10 +520,9 @@ expect @tursopg {
     {"b":1}
 }
 
-# B-53 (OK): jsonb -> array element ->> of string
+# B-53: jsonb -> array element ->> of string
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-53-jsonb-array-element-of-string {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT j -> 'tags' ->> 0 FROM t WHERE id = 1;
 }
 expect {
@@ -589,9 +560,8 @@ expect {
 expect @tursopg error {}
 
 # B-58 (S2): text col @@ to_tsquery
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-58-text-col-to-tsquery {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE to_tsvector(s) @@ to_tsquery('abc');
 }
 expect {
@@ -641,9 +611,8 @@ expect {
 expect @tursopg error {}
 
 # B-63 (S2): json_build_object
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-63-json-build-object {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT json_build_object('id', id, 's', s) FROM t WHERE id = 1;
 }
 expect {
@@ -653,9 +622,8 @@ expect {
 expect @tursopg error {}
 
 # B-64 (S2): jsonb_build_object
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-64-jsonb-build-object {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT jsonb_build_object('id', id, 's', s) FROM t WHERE id = 1;
 }
 expect {
@@ -665,9 +633,8 @@ expect {
 expect @tursopg error {}
 
 # B-65 (S2): json_agg
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-65-json-agg {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT json_agg(id ORDER BY id) FROM t;
 }
 expect {
@@ -677,9 +644,8 @@ expect {
 expect @tursopg error {}
 
 # B-66 (S2): jsonb_agg
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-66-jsonb-agg {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT jsonb_agg(id ORDER BY id) FROM t;
 }
 expect {
@@ -689,9 +655,8 @@ expect {
 expect @tursopg error {}
 
 # B-67 (S2): to_json(scalar)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-67-to-json-scalar {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;
 }
 expect {
@@ -701,9 +666,8 @@ expect {
 expect @tursopg error {}
 
 # B-68 (S2): row_to_json / to_json(row)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-68-row-to-json-to-json-row {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT row_to_json(t) FROM t WHERE id = 2;
 }
 expect {
@@ -713,9 +677,8 @@ expect {
 expect @tursopg error {}
 
 # B-69 (S2): to_json(t.*) of table alias
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-69-to-json-t-of-table-alias {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT to_json(x.*) FROM t x WHERE id = 2;
 }
 expect {
@@ -724,10 +687,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-70 (S2): array_to_json
+# B-70: array_to_json
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-70-array-to-json {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT array_to_json(arr) FROM t WHERE id = 1;
 }
 expect {
@@ -735,9 +697,8 @@ expect {
 }
 
 # B-71 (S2): json_object_agg
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-71-json-object-agg {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT json_object_agg(s, n ORDER BY id) FROM t WHERE id < 3;
 }
 expect {
@@ -747,9 +708,8 @@ expect {
 expect @tursopg error {}
 
 # B-72 (S2): coalesce(json_agg(...), '[]')
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-72-coalesce-json-agg {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT coalesce(json_agg(id), '[]') FROM t WHERE id > 99;
 }
 expect {
@@ -758,10 +718,9 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-73 (OK): count(*) OVER ()
+# B-73: count(*) OVER ()
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-73-count-over {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id, count(*) OVER () FROM t ORDER BY id LIMIT 2;
 }
 expect {
@@ -769,10 +728,9 @@ expect {
     2|4
 }
 
-# B-74 (OK): string_agg ORDER BY
+# B-74 (S1): string_agg ORDER BY
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-74-string-agg-order-by {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT string_agg(s, ',' ORDER BY s DESC) FROM t;
 }
 expect {
@@ -782,10 +740,9 @@ expect @tursopg {
     abc,a_c,a%c,Abd
 }
 
-# B-75 (OK): array_agg ORDER BY
+# B-75: array_agg ORDER BY
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-75-array-agg-order-by {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT array_agg(id ORDER BY id DESC) FROM t;
 }
 expect {
@@ -793,9 +750,8 @@ expect {
 }
 
 # B-76 (S2): ctid
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-76-ctid {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT ctid FROM t WHERE id = 1;
 }
 expect {
@@ -815,7 +771,7 @@ expect @tursopg {
     0
 }
 
-# B-78 (OK): gen_random_uuid() format
+# B-78 (S1): gen_random_uuid() format
 test gap-b-78-gen-random-uuid-format {
     SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 }
@@ -826,7 +782,7 @@ expect @tursopg {
     1
 }
 
-# B-79 (OK): set_config + current_setting
+# B-79: set_config + current_setting
 test gap-b-79-set-config-current-setting {
     SELECT set_config('request.jwt.claims', '{"sub":"u1"}', true);
 }
@@ -834,7 +790,7 @@ expect {
     {"sub":"u1"}
 }
 
-# B-80 (OK): current_setting missing_ok
+# B-80: current_setting missing_ok
 test gap-b-80-current-setting-missing-ok {
     SELECT current_setting('request.jwt.claim.sub', true);
 }
@@ -872,7 +828,7 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-84 (OK): || with NULL and int
+# B-84: || with NULL and int
 test gap-b-84-with-null-and-int {
     SELECT 'a' || NULL, 'a' || 1;
 }
@@ -891,10 +847,9 @@ expect @tursopg {
     0.30000000000000004|0.3333333333333333|1e301
 }
 
-# B-86 (OK): default NULL ordering ASC (nulls last)
+# B-86: default NULL ordering ASC (nulls last)
+@setup v_x_with_rows
 test gap-b-86-default-null-ordering-asc-nulls-last {
-    CREATE TABLE v (x int);
-    INSERT INTO v VALUES (1), (NULL), (2);
     SELECT x FROM v ORDER BY x;
 }
 expect raw {
@@ -903,10 +858,9 @@ expect raw {
 
 }
 
-# B-87 (OK): default NULL ordering DESC (nulls first)
+# B-87: default NULL ordering DESC (nulls first)
+@setup v_x_with_rows
 test gap-b-87-default-null-ordering-desc-nulls-first {
-    CREATE TABLE v (x int);
-    INSERT INTO v VALUES (1), (NULL), (2);
     SELECT x FROM v ORDER BY x DESC;
 }
 expect {
@@ -929,9 +883,8 @@ expect {
 expect @tursopg error {}
 
 # B-90 (S1): count/sum/avg output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-90-count-sum-avg-output {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT count(*), sum(n), avg(n) FROM t;
 }
 expect {
@@ -964,7 +917,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-93 (OK): nullif / greatest / least
+# B-93: nullif / greatest / least
 test gap-b-93-nullif-greatest-least {
     SELECT nullif(1, 1), greatest(1, 3, 2), least('b', 'a');
 }
@@ -972,7 +925,7 @@ expect {
     |3|a
 }
 
-# B-94 (OK): lower/upper non-ASCII
+# B-94 (S1): lower/upper non-ASCII
 test gap-b-94-lower-upper-non-ascii {
     SELECT upper('äb'), lower('ÄB');
 }
@@ -983,7 +936,7 @@ expect @tursopg {
     äB|Äb
 }
 
-# B-95 (OK): string comparison order
+# B-95 (S1): string comparison order
 test gap-b-95-string-comparison-order {
     SELECT 'a' < 'B', 'B' < 'a';
 }
@@ -994,7 +947,7 @@ expect @tursopg {
     0|1
 }
 
-# B-96 (OK): length / char_length bytes vs chars
+# B-96: length / char_length bytes vs chars
 test gap-b-96-length-char-length-bytes-vs-chars {
     SELECT length('é'), octet_length('é');
 }
@@ -1002,7 +955,7 @@ expect {
     1|2
 }
 
-# B-97 (OK): current_user / current_role
+# B-97 (S1): current_user / current_role
 test gap-b-97-current-user-current-role {
     SELECT current_user = current_role;
 }
@@ -1013,7 +966,7 @@ expect @tursopg {
     1
 }
 
-# B-98 (OK): pg_catalog.-qualified function
+# B-98: pg_catalog.-qualified function
 test gap-b-98-pg-catalog-qualified-function {
     SELECT pg_catalog.lower('A');
 }
@@ -1022,9 +975,8 @@ expect {
 }
 
 # B-99 (S2): DELETE ... USING
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-99-delete-using {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     DELETE FROM t USING t AS t2 WHERE t.id = t2.id AND t2.id = 1 RETURNING t.id;
 }
 expect {
@@ -1048,20 +1000,18 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-101 (OK): UPDATE ... FROM
+# B-101: UPDATE ... FROM
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-101-update-from {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     UPDATE t SET n = t2.n + 1 FROM t AS t2 WHERE t2.id = 3 AND t.id = 1 RETURNING t.id, t.n;
 }
 expect {
     1|31
 }
 
-# B-102 (OK): INSERT ON CONFLICT DO UPDATE with EXCLUDED + WHERE
+# B-102: INSERT ON CONFLICT DO UPDATE with EXCLUDED + WHERE
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-102-insert-on-conflict-do-update-with-excluded-where {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     INSERT INTO t (id, s) VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET s = EXCLUDED.s WHERE t.n = 10 RETURNING id, s;
 }
 expect {
@@ -1079,7 +1029,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# B-104 (S2): INSERT DEFAULT VALUES
+# B-104: INSERT DEFAULT VALUES
 test gap-b-104-insert-default-values {
     CREATE TABLE u (id serial PRIMARY KEY, s text DEFAULT 'x');
     INSERT INTO u DEFAULT VALUES RETURNING id, s;
@@ -1088,20 +1038,18 @@ expect {
     1|x
 }
 
-# B-105 (OK): UPDATE multi-column SET (a,b) = (..)
+# B-105: UPDATE multi-column SET (a,b) = (..)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-105-update-multi-column-set-a-b {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     UPDATE t SET (s, n) = ('z', 0) WHERE id = 1 RETURNING s, n;
 }
 expect {
     z|0
 }
 
-# B-106 (OK): boolean comparison output
+# B-106 (S1): boolean comparison output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-106-boolean-comparison-output {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id < 2, n IS NULL FROM t WHERE id = 1;
 }
 expect {
@@ -1111,10 +1059,9 @@ expect @tursopg {
     1|0
 }
 
-# B-107 (OK): EXISTS subquery output
+# B-107 (S1): EXISTS subquery output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-107-exists-subquery-output {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
 }
 expect {
@@ -1124,7 +1071,7 @@ expect @tursopg {
     1
 }
 
-# B-117 (OK): VALUES list with column aliases v(x)
+# B-117: VALUES list with column aliases v(x)
 test gap-b-117-values-list-with-column-aliases-v-x {
     SELECT x FROM (VALUES (1), (2)) v(x) ORDER BY x;
 }
@@ -1174,7 +1121,7 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# B-108 (OK): generate_series column alias
+# B-108: generate_series column alias
 test gap-b-108-generate-series-column-alias {
     SELECT g.x FROM generate_series(1, 2) AS g(x);
 }
@@ -1184,9 +1131,8 @@ expect {
 }
 
 # B-109 (S2): WITH ... INSERT ... RETURNING (data-modifying CTE)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-109-with-insert-returning-data-modifying-cte {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     WITH ins AS (INSERT INTO t (id, s) VALUES (9, 'z') RETURNING id) SELECT id FROM ins;
 }
 expect {
@@ -1195,10 +1141,9 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# B-110 (OK): row comparison (a,b) > (x,y) (keyset pagination)
+# B-110: row comparison (a,b) > (x,y) (keyset pagination)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-110-row-comparison-a-b-x-y-keyset-pagination {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE (id, s) > (2, 'Abd') ORDER BY id;
 }
 expect {
@@ -1206,7 +1151,7 @@ expect {
     4
 }
 
-# B-111 (OK): CASE returning bool
+# B-111: CASE returning bool
 test gap-b-111-case-returning-bool {
     SELECT CASE WHEN true THEN true ELSE false END;
 }
@@ -1215,9 +1160,8 @@ expect {
 }
 
 # B-112 (S2): json_agg of row subquery
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-112-json-agg-of-row-subquery {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT coalesce(json_agg(_s), '[]') FROM (SELECT id, s FROM t WHERE id < 3 ORDER BY id) _s;
 }
 expect raw {
@@ -1227,20 +1171,18 @@ expect raw {
 @sqlstate 42703
 expect @tursopg error {}
 
-# B-113 (OK): RETURNING with expressions
+# B-113: RETURNING with expressions
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-113-returning-with-expressions {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     UPDATE t SET n = n + 1 WHERE id = 1 RETURNING id, n * 2 AS dbl;
 }
 expect {
     1|22
 }
 
-# B-114 (OK): ORDER BY jsonb ->> key
+# B-114: ORDER BY jsonb ->> key
+@setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-114-order-by-jsonb-key {
-    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
-    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
     SELECT id FROM t WHERE j IS NOT NULL ORDER BY j ->> 'n' DESC NULLS LAST, id;
 }
 expect {
@@ -1249,7 +1191,7 @@ expect {
     4
 }
 
-# B-115 (OK): text concat with typed values
+# B-115 (S2): text concat with typed values
 test gap-b-115-text-concat-with-typed-values {
     SELECT 'id=' || 1::int || ' at ' || '2026-10-08'::date;
 }
@@ -1280,7 +1222,7 @@ expect {
 expect @tursopg error {}
 
 # B-126 (S2): auth.role() reads the role claim
-@setup pg_setup_b_126
+@setup auth_uid_from_claims_on_postgres
 test gap-b-126-auth-role-reads-the-role-claim {
     SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}', false);
     SELECT auth.role();

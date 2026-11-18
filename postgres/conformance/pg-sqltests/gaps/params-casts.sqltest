@@ -8,6 +8,14 @@
 
 @database :memory:
 
+setup t_id {
+    CREATE TABLE t (id int);
+}
+
+setup t_b {
+    CREATE TABLE t (b boolean);
+}
+
 # A-01 (S1): bool literal casts, true forms
 test gap-a-01-bool-literal-casts-true-forms {
     SELECT 't'::boolean, 'true'::boolean, 'yes'::boolean, 'on'::boolean, '1'::boolean, 'TRUE'::boolean, 'y'::boolean;
@@ -19,7 +27,7 @@ expect @tursopg {
     0|0|0|0|1|0|0
 }
 
-# A-02 (OK): bool literal casts, false forms
+# A-02 (S1): bool literal casts, false forms
 test gap-a-02-bool-literal-casts-false-forms {
     SELECT 'f'::boolean, 'false'::boolean, 'no'::boolean, 'off'::boolean, '0'::boolean;
 }
@@ -122,7 +130,7 @@ expect @tursopg {
     1|2|-2
 }
 
-# A-16 (OK): int with surrounding spaces
+# A-16: int with surrounding spaces
 test gap-a-16-int-with-surrounding-spaces {
     SELECT ' 42 '::integer;
 }
@@ -245,7 +253,7 @@ expect @tursopg {
     1000.0|1.5
 }
 
-# A-30 (S2): timestamptz literal with +02 offset
+# A-30: timestamptz literal with +02 offset
 test gap-a-30-timestamptz-literal-with-02-offset {
     SELECT '2026-10-08 14:00:00+02'::timestamptz;
 }
@@ -253,7 +261,7 @@ expect {
     2026-10-08 12:00:00+00
 }
 
-# A-31 (S1): timestamptz literal with Z
+# A-31: timestamptz literal with Z
 test gap-a-31-timestamptz-literal-with-z {
     SELECT '2026-10-08T12:00:00Z'::timestamptz;
 }
@@ -261,7 +269,7 @@ expect {
     2026-10-08 12:00:00+00
 }
 
-# A-32 (S1): timestamptz with +05:30 and micros
+# A-32: timestamptz with +05:30 and micros
 test gap-a-32-timestamptz-with-05-30-and-micros {
     SELECT '2026-10-08T12:00:00.123456+05:30'::timestamptz;
 }
@@ -269,7 +277,7 @@ expect {
     2026-10-08 06:30:00.123456+00
 }
 
-# A-34 (S1): timestamptz from date-only
+# A-34: timestamptz from date-only
 test gap-a-34-timestamptz-from-date-only {
     SELECT '2026-10-08'::timestamptz;
 }
@@ -277,7 +285,7 @@ expect {
     2026-10-08 00:00:00+00
 }
 
-# A-35 (OK): invalid timestamptz
+# A-35: invalid timestamptz
 test gap-a-35-invalid-timestamptz {
     SELECT 'nope'::timestamptz;
 }
@@ -295,7 +303,7 @@ expect @tursopg {
     1
 }
 
-# A-37 (S2): timestamp drops offset
+# A-37: timestamp drops offset
 test gap-a-37-timestamp-drops-offset {
     SELECT '2026-10-08 14:00:00+02'::timestamp;
 }
@@ -322,7 +330,7 @@ expect error {}
 @sqlstate 0A000
 expect @tursopg error {}
 
-# A-40 (OK): date + int, date - date
+# A-40 (S2): date + int, date - date
 test gap-a-40-date-int-date-date {
     SELECT '2026-10-08'::date + 1, '2026-10-08'::date - '2026-10-01'::date;
 }
@@ -384,7 +392,7 @@ expect @tursopg {
     {"a":1,"a":2}
 }
 
-# A-47 (OK): json literal preserved verbatim
+# A-47: json literal preserved verbatim
 test gap-a-47-json-literal-preserved-verbatim {
     SELECT '{"b": 2,  "a":1}'::json;
 }
@@ -402,7 +410,7 @@ expect @tursopg {
     not json
 }
 
-# A-50 (OK): jsonb number precision
+# A-50: jsonb number precision
 test gap-a-50-jsonb-number-precision {
     SELECT '1.50'::jsonb, '12345678901234567890'::jsonb;
 }
@@ -410,7 +418,7 @@ expect {
     1.50|12345678901234567890
 }
 
-# A-51 (OK): int[] literal cast output
+# A-51: int[] literal cast output
 test gap-a-51-int-literal-cast-output {
     SELECT '{1,2,3}'::int[];
 }
@@ -427,7 +435,7 @@ expect error {}
 @sqlstate 23000
 expect @tursopg error {}
 
-# A-58 (OK): ARRAY[] constructor output
+# A-58: ARRAY[] constructor output
 test gap-a-58-array-constructor-output {
     SELECT ARRAY[1,2], ARRAY['a','b'];
 }
@@ -435,7 +443,7 @@ expect {
     {1,2}|{a,b}
 }
 
-# A-59 (OK): int + unknown literal
+# A-59: int + unknown literal
 test gap-a-59-int-unknown-literal {
     SELECT 1 + '2';
 }
@@ -443,7 +451,7 @@ expect {
     3
 }
 
-# A-60 (OK): int column = text literal
+# A-60: int column = text literal
 test gap-a-60-int-column-text-literal {
     CREATE TABLE t (id int);
     INSERT INTO t VALUES (1);
@@ -465,9 +473,9 @@ expect @tursopg {
     1
 }
 
-# A-62 (OK): insert '42' text literal into int column
+# A-62: insert '42' text literal into int column
+@setup t_id
 test gap-a-62-insert-42-text-literal-into-int-column {
-    CREATE TABLE t (id int);
     INSERT INTO t VALUES ('42') RETURNING id;
 }
 expect {
@@ -475,8 +483,8 @@ expect {
 }
 
 # A-63 (S3): insert 'abc' into int column
+@setup t_id
 test gap-a-63-insert-abc-into-int-column {
-    CREATE TABLE t (id int);
     INSERT INTO t VALUES ('abc') RETURNING id;
 }
 @sqlstate 22P02
@@ -485,8 +493,8 @@ expect error {}
 expect @tursopg error {}
 
 # A-64 (S2): insert 1.7 numeric into int column
+@setup t_id
 test gap-a-64-insert-1-7-numeric-into-int-column {
-    CREATE TABLE t (id int);
     INSERT INTO t VALUES (1.7) RETURNING id;
 }
 expect {
@@ -495,9 +503,9 @@ expect {
 @sqlstate 23000
 expect @tursopg error {}
 
-# A-65 (OK): insert 'true' into bool column
+# A-65: insert 'true' into bool column
+@setup t_b
 test gap-a-65-insert-true-into-bool-column {
-    CREATE TABLE t (b boolean);
     INSERT INTO t VALUES ('true') RETURNING b;
 }
 expect {
@@ -505,8 +513,8 @@ expect {
 }
 
 # A-66 (S3): insert integer 1 into bool column
+@setup t_b
 test gap-a-66-insert-integer-1-into-bool-column {
-    CREATE TABLE t (b boolean);
     INSERT INTO t VALUES (1) RETURNING b;
 }
 @sqlstate 42804
@@ -515,7 +523,7 @@ expect @tursopg {
     t
 }
 
-# A-79 (S2): insert literal with short +00 offset into timestamptz column
+# A-79: insert literal with short +00 offset into timestamptz column
 test gap-a-79-insert-literal-with-short-00-offset-into-timesta {
     CREATE TABLE t (ts timestamptz);
     INSERT INTO t VALUES ('2026-10-08 12:00:00+00') RETURNING ts;
@@ -524,7 +532,7 @@ expect {
     2026-10-08 12:00:00+00
 }
 
-# A-80 (OK): timestamptz column ORDER BY across offsets
+# A-80: timestamptz column ORDER BY across offsets
 test gap-a-80-timestamptz-column-order-by-across-offsets {
     CREATE TABLE t (id int, ts timestamptz);
     INSERT INTO t VALUES (1, '2026-10-08T12:00:00Z'), (2, '2026-10-08T13:00:00+02:00');

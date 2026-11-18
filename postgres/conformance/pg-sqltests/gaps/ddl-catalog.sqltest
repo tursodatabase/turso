@@ -8,25 +8,51 @@
 
 @database :memory:
 
+setup t_id_s_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    INSERT INTO t VALUES (1, 'a');
+}
+
+setup t_id {
+    CREATE TABLE t (id int);
+}
+
+setup t_id_view_v {
+    CREATE TABLE t (id int);
+    CREATE VIEW v AS SELECT id FROM t;
+}
+
+setup type_mood {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+}
+
+setup t_id_serial {
+    CREATE TABLE t (id serial PRIMARY KEY);
+}
+
+setup schema_api_api_items_id {
+    CREATE SCHEMA api;
+    CREATE TABLE api.items (id int PRIMARY KEY);
+}
+
 @backend postgres
-setup pg_setup_e_67 {
+setup auth_uid_on_postgres {
     CREATE SCHEMA auth;
     CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
 }
 
 @backend postgres
-setup pg_setup_e_86 {
+setup auth_uid_from_claims_on_postgres {
     CREATE SCHEMA auth;
     CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT coalesce(nullif(current_setting('request.jwt.claim.sub', true), ''), (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))::uuid $$;
 }
 
-@backend postgres
-setup pg_setup_e_87 {
-    CREATE SCHEMA auth;
-    CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT coalesce(nullif(current_setting('request.jwt.claim.sub', true), ''), (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub'))::uuid $$;
+setup t_id_s_policy_p {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE POLICY p ON t USING (true);
 }
 
-# E-01 (OK): ALTER TABLE ADD COLUMN with DEFAULT backfills
+# E-01: ALTER TABLE ADD COLUMN with DEFAULT backfills
 test gap-e-01-alter-table-add-column-with-default-backfills {
     CREATE TABLE t (id int PRIMARY KEY, s text);
     INSERT INTO t VALUES (1, 'a');
@@ -37,28 +63,25 @@ expect {
     7
 }
 
-# E-02 (OK): ALTER TABLE DROP COLUMN
+# E-02: ALTER TABLE DROP COLUMN
+@setup t_id_s_with_rows
 test gap-e-02-alter-table-drop-column {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t DROP COLUMN s;
 }
 expect {
 }
 
-# E-03 (OK): ALTER TABLE RENAME COLUMN
+# E-03: ALTER TABLE RENAME COLUMN
+@setup t_id_s_with_rows
 test gap-e-03-alter-table-rename-column {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t RENAME COLUMN s TO s2;
 }
 expect {
 }
 
 # E-04 (S2): ALTER COLUMN SET DEFAULT
+@setup t_id_s_with_rows
 test gap-e-04-alter-column-set-default {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ALTER COLUMN s SET DEFAULT 'x';
 }
 expect {
@@ -67,9 +90,8 @@ expect {
 expect @tursopg error {}
 
 # E-05 (S2): ALTER COLUMN DROP DEFAULT
+@setup t_id_s_with_rows
 test gap-e-05-alter-column-drop-default {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ALTER COLUMN s DROP DEFAULT;
 }
 expect {
@@ -78,9 +100,8 @@ expect {
 expect @tursopg error {}
 
 # E-06 (S2): ALTER COLUMN SET NOT NULL
+@setup t_id_s_with_rows
 test gap-e-06-alter-column-set-not-null {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ALTER COLUMN s SET NOT NULL;
 }
 expect {
@@ -99,9 +120,8 @@ expect {
 expect @tursopg error {}
 
 # E-08 (S2): ALTER COLUMN TYPE
+@setup t_id_s_with_rows
 test gap-e-08-alter-column-type {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ALTER COLUMN s TYPE varchar(10);
 }
 expect {
@@ -110,9 +130,8 @@ expect {
 expect @tursopg error {}
 
 # E-09 (S2): ADD CONSTRAINT UNIQUE
+@setup t_id_s_with_rows
 test gap-e-09-add-constraint-unique {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ADD CONSTRAINT t_s_key UNIQUE (s);
 }
 expect {
@@ -132,9 +151,8 @@ expect {
 expect @tursopg error {}
 
 # E-11 (S2): ADD CONSTRAINT CHECK
+@setup t_id_s_with_rows
 test gap-e-11-add-constraint-check {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ADD CONSTRAINT t_s_check CHECK (s <> '');
 }
 expect {
@@ -152,16 +170,15 @@ expect {
 @sqlstate 42601
 expect @tursopg error {}
 
-# E-13 (OK): ALTER TABLE RENAME TO
+# E-13: ALTER TABLE RENAME TO
+@setup t_id_s_with_rows
 test gap-e-13-alter-table-rename-to {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t RENAME TO t2;
 }
 expect {
 }
 
-# E-14 (S2): generated STORED column value
+# E-14: generated STORED column value
 test gap-e-14-generated-stored-column-value {
     CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
     INSERT INTO t (a) VALUES (3);
@@ -171,7 +188,7 @@ expect {
     3|6
 }
 
-# E-15 (S2): identity ALWAYS column assigns ids
+# E-15: identity ALWAYS column assigns ids
 test gap-e-15-identity-always-column-assigns-ids {
     CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, s text);
     INSERT INTO t (s) VALUES ('a'), ('b');
@@ -182,7 +199,7 @@ expect {
     2|b
 }
 
-# E-16 (S2): identity BY DEFAULT accepts explicit
+# E-16: identity BY DEFAULT accepts explicit
 test gap-e-16-identity-by-default-accepts-explicit {
     CREATE TABLE t (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, s text);
     INSERT INTO t (id, s) VALUES (10, 'a');
@@ -194,7 +211,7 @@ expect {
     10
 }
 
-# E-17 (S2): identity in pg_attribute.attidentity
+# E-17: identity in pg_attribute.attidentity
 test gap-e-17-identity-in-pg-attribute-attidentity {
     CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, s text);
     SELECT attname, attidentity FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
@@ -204,7 +221,7 @@ expect {
     s|
 }
 
-# E-18 (S2): generated column in pg_attribute.attgenerated
+# E-18: generated column in pg_attribute.attgenerated
 test gap-e-18-generated-column-in-pg-attribute-attgenerated {
     CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
     SELECT attname, attgenerated FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
@@ -215,8 +232,8 @@ expect {
 }
 
 # E-19 (S4): 't'::regclass resolves
+@setup t_id
 test gap-e-19-t-regclass-resolves {
-    CREATE TABLE t (id int);
     SELECT 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
@@ -227,9 +244,8 @@ expect @tursopg {
 }
 
 # E-20 (S4): view in pg_class relkind v
+@setup t_id_view_v
 test gap-e-20-view-in-pg-class-relkind-v {
-    CREATE TABLE t (id int);
-    CREATE VIEW v AS SELECT id FROM t;
     SELECT relname, relkind FROM pg_class WHERE relname IN ('t', 'v') ORDER BY relname;
 }
 expect {
@@ -241,9 +257,8 @@ expect @tursopg {
 }
 
 # E-21 (S4): pg_views
+@setup t_id_view_v
 test gap-e-21-pg-views {
-    CREATE TABLE t (id int);
-    CREATE VIEW v AS SELECT id FROM t;
     SELECT schemaname, viewname FROM pg_views WHERE schemaname = 'public';
 }
 expect {
@@ -253,9 +268,8 @@ expect {
 expect @tursopg error {}
 
 # E-22 (S4): view columns in pg_attribute
+@setup t_id_view_v
 test gap-e-22-view-columns-in-pg-attribute {
-    CREATE TABLE t (id int);
-    CREATE VIEW v AS SELECT id FROM t;
     SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'v' AND a.attnum > 0;
 }
 expect {
@@ -265,8 +279,8 @@ expect @tursopg {
 }
 
 # E-23 (S4): pg_enum
+@setup type_mood
 test gap-e-23-pg-enum {
-    CREATE TYPE mood AS ENUM ('happy', 'sad');
     SELECT enumlabel FROM pg_enum ORDER BY enumsortorder;
 }
 expect {
@@ -276,9 +290,9 @@ expect {
 @sqlstate 42P01
 expect @tursopg error {}
 
-# E-24 (OK): enum in pg_type typtype e
+# E-24: enum in pg_type typtype e
+@setup type_mood
 test gap-e-24-enum-in-pg-type-typtype-e {
-    CREATE TYPE mood AS ENUM ('happy', 'sad');
     SELECT typname, typtype FROM pg_type WHERE typname = 'mood';
 }
 expect {
@@ -298,7 +312,7 @@ expect @tursopg {
     unknown
 }
 
-# E-26 (OK): domain in pg_type typtype d
+# E-26: domain in pg_type typtype d
 test gap-e-26-domain-in-pg-type-typtype-d {
     CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
     SELECT typname, typtype, format_type(typbasetype, NULL) FROM pg_type WHERE typname = 'posint';
@@ -321,8 +335,8 @@ expect @tursopg {
 }
 
 # E-28 (S4): serial column default in pg_attrdef
+@setup t_id_serial
 test gap-e-28-serial-column-default-in-pg-attrdef {
-    CREATE TABLE t (id serial PRIMARY KEY);
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
@@ -333,8 +347,8 @@ expect @tursopg {
 }
 
 # E-29 (S4): serial internal tables visible
+@setup t_id_serial
 test gap-e-29-serial-internal-tables-visible {
-    CREATE TABLE t (id serial PRIMARY KEY);
     SELECT relname, relkind FROM pg_class WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') ORDER BY relname;
 }
 expect {
@@ -371,8 +385,8 @@ expect @tursopg {
 }
 
 # E-31 (S4): information_schema.columns
+@setup t_id
 test gap-e-31-information-schema-columns {
-    CREATE TABLE t (id int);
     SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't';
 }
 expect {
@@ -382,8 +396,8 @@ expect {
 expect @tursopg error {}
 
 # E-32 (S4): information_schema.tables
+@setup t_id
 test gap-e-32-information-schema-tables {
-    CREATE TABLE t (id int);
     SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public';
 }
 expect {
@@ -392,17 +406,16 @@ expect {
 @sqlstate 42P01
 expect @tursopg error {}
 
-# E-33 (OK): pg_class rows for non-public schema
+# E-33: pg_class rows for non-public schema
+@setup schema_api_api_items_id
 test gap-e-33-pg-class-rows-for-non-public-schema {
-    CREATE SCHEMA api;
-    CREATE TABLE api.items (id int PRIMARY KEY);
     SELECT c.relname, n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'api' AND c.relkind = 'r';
 }
 expect {
     items|api
 }
 
-# E-34 (OK): pg_attribute rows for non-public schema
+# E-34: pg_attribute rows for non-public schema
 test gap-e-34-pg-attribute-rows-for-non-public-schema {
     CREATE SCHEMA api;
     CREATE TABLE api.items (id int PRIMARY KEY, s text);
@@ -414,9 +427,8 @@ expect {
 }
 
 # E-35 (S4): pg_constraint rows for non-public schema
+@setup schema_api_api_items_id
 test gap-e-35-pg-constraint-rows-for-non-public-schema {
-    CREATE SCHEMA api;
-    CREATE TABLE api.items (id int PRIMARY KEY);
     SELECT conname, contype FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = 'api';
 }
 expect {
@@ -426,7 +438,7 @@ expect {
 expect @tursopg {
 }
 
-# E-37 (OK): cross-schema FK (public -> auth)
+# E-37: cross-schema FK (public -> auth)
 test gap-e-37-cross-schema-fk-public-auth {
     CREATE SCHEMA IF NOT EXISTS auth;
     CREATE TABLE auth.users (id uuid PRIMARY KEY);
@@ -438,7 +450,8 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
-# E-38 (OK): cross-schema FK rejects orphan
+# E-38 (S1): cross-schema FK rejects orphan
+# Fails while foreign keys are off, see D-01.
 test gap-e-38-cross-schema-fk-rejects-orphan {
     CREATE SCHEMA IF NOT EXISTS auth;
     CREATE TABLE auth.users (id uuid PRIMARY KEY);
@@ -487,7 +500,7 @@ expect {
 expect @tursopg {
 }
 
-# E-42 (OK): SHOW search_path
+# E-42: SHOW search_path
 test gap-e-42-show-search-path {
     SHOW search_path;
 }
@@ -495,7 +508,7 @@ expect {
     "$user", public
 }
 
-# E-43 (OK): SET search_path then unqualified
+# E-43: SET search_path then unqualified
 test gap-e-43-set-search-path-then-unqualified {
     CREATE SCHEMA api;
     CREATE TABLE api.items (id int);
@@ -507,19 +520,17 @@ expect {
     1
 }
 
-# E-44 (OK): CREATE POLICY
+# E-44: CREATE POLICY
+@setup t_id_s_with_rows
 test gap-e-44-create-policy {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     CREATE POLICY p ON t FOR SELECT USING (true);
 }
 expect {
 }
 
-# E-45 (OK): ENABLE ROW LEVEL SECURITY
+# E-45: ENABLE ROW LEVEL SECURITY
+@setup t_id_s_with_rows
 test gap-e-45-enable-row-level-security {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     ALTER TABLE t ENABLE ROW LEVEL SECURITY;
 }
 expect {
@@ -535,8 +546,8 @@ expect {
 expect @tursopg error {}
 
 # E-47 (S2): CREATE TRIGGER
+@setup t_id
 test gap-e-47-create-trigger {
-    CREATE TABLE t (id int);
     CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
 }
 expect {
@@ -544,10 +555,9 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-48 (OK): GRANT
+# E-48: GRANT
+@setup t_id_s_with_rows
 test gap-e-48-grant {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     GRANT SELECT ON t TO PUBLIC;
 }
 expect {
@@ -563,10 +573,9 @@ expect error {}
 @sqlstate 42704
 expect @tursopg error {}
 
-# E-50 (OK): pg_index indkey for PK
+# E-50: pg_index indkey for PK
+@setup t_id_s_with_rows
 test gap-e-50-pg-index-indkey-for-pk {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     SELECT indisprimary, indkey::text FROM pg_index WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 't');
 }
 expect {
@@ -586,7 +595,7 @@ expect @tursopg {
     CREATE UNIQUE INDEX t_s_idx ON public.t USING btree (s) WHERE id > 0
 }
 
-# E-52 (OK): pg_get_constraintdef FK
+# E-52: pg_get_constraintdef FK
 test gap-e-52-pg-get-constraintdef-fk {
     CREATE TABLE p (id int PRIMARY KEY);
     CREATE TABLE c (pid int CONSTRAINT c_pid_fkey REFERENCES p(id) ON DELETE CASCADE);
@@ -610,9 +619,8 @@ expect {
 expect @tursopg error {}
 
 # E-54 (S1): DROP TABLE without CASCADE blocked by view
+@setup t_id_view_v
 test gap-e-54-drop-table-without-cascade-blocked-by-view {
-    CREATE TABLE t (id int);
-    CREATE VIEW v AS SELECT id FROM t;
     DROP TABLE t;
 }
 @sqlstate 2BP01
@@ -620,7 +628,7 @@ expect error {}
 expect @tursopg {
 }
 
-# E-55 (OK): SAVEPOINT / ROLLBACK TO
+# E-55: SAVEPOINT / ROLLBACK TO
 test gap-e-55-savepoint-rollback-to {
     CREATE TABLE t (id int);
     BEGIN;
@@ -634,7 +642,7 @@ expect {
     1
 }
 
-# E-56 (OK): CREATE TABLE IF NOT EXISTS in non-public schema twice
+# E-56: CREATE TABLE IF NOT EXISTS in non-public schema twice
 test gap-e-56-create-table-if-not-exists-in-non-public-schema {
     CREATE SCHEMA api;
     CREATE TABLE IF NOT EXISTS api.t (id int);
@@ -643,7 +651,7 @@ test gap-e-56-create-table-if-not-exists-in-non-public-schema {
 expect {
 }
 
-# E-57 (OK): pg_namespace after DROP SCHEMA
+# E-57: pg_namespace after DROP SCHEMA
 test gap-e-57-pg-namespace-after-drop-schema {
     CREATE SCHEMA api;
     DROP SCHEMA api;
@@ -665,7 +673,7 @@ expect @tursopg {
     now ()
 }
 
-# E-59 (OK): pg_attribute attnotnull / atthasdef
+# E-59: pg_attribute attnotnull / atthasdef
 test gap-e-59-pg-attribute-attnotnull-atthasdef {
     CREATE TABLE t (id int PRIMARY KEY, s text NOT NULL DEFAULT 'x', n int);
     SELECT attname, attnotnull, atthasdef FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't') AND attnum > 0 ORDER BY attnum;
@@ -737,7 +745,7 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
-# E-66 (OK): CHECK constraint on smallint column
+# E-66: CHECK constraint on smallint column
 test gap-e-66-check-constraint-on-smallint-column {
     CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
     INSERT INTO t VALUES (1) RETURNING n;
@@ -746,8 +754,8 @@ expect {
     1
 }
 
-# E-67 (OK): DEFAULT auth.uid() column read back
-@setup pg_setup_e_67
+# E-67: DEFAULT auth.uid() column read back
+@setup auth_uid_on_postgres
 test gap-e-67-default-auth-uid-column-read-back {
     CREATE TABLE t (id int, owner uuid DEFAULT auth.uid());
     INSERT INTO t (id, owner) VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
@@ -757,7 +765,7 @@ expect {
     1
 }
 
-# E-68 (OK): empty search_path still finds pg_catalog
+# E-68: empty search_path still finds pg_catalog
 test gap-e-68-empty-search-path-still-finds-pg-catalog {
     CREATE TABLE t (id int);
     SET search_path TO '';
@@ -767,7 +775,7 @@ expect {
     t
 }
 
-# E-69 (S2): identity BY DEFAULT assigns ids
+# E-69: identity BY DEFAULT assigns ids
 test gap-e-69-identity-by-default-assigns-ids {
     CREATE TABLE t (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, s text);
     INSERT INTO t (s) VALUES ('a') RETURNING id;
@@ -776,7 +784,7 @@ expect {
     1
 }
 
-# E-70 (OK): schema-qualified public table outside search_path
+# E-70: schema-qualified public table outside search_path
 test gap-e-70-schema-qualified-public-table-outside-search-pat {
     CREATE TABLE t (id int);
     INSERT INTO t VALUES (1);
@@ -787,7 +795,7 @@ expect {
     1
 }
 
-# E-73 (OK): omitted nullable uuid column stays NULL
+# E-73 (S1): omitted nullable uuid column stays NULL
 test gap-e-73-omitted-nullable-uuid-column-stays-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
@@ -800,7 +808,7 @@ expect @tursopg {
     1|1
 }
 
-# E-74 (OK): quoted identifier keeps its case in pg_class
+# E-74: quoted identifier keeps its case in pg_class
 test gap-e-74-quoted-identifier-keeps-its-case-in-pg-class {
     CREATE TABLE "Todos" (id int);
     SELECT relname FROM pg_class WHERE relname IN ('Todos', 'todos') ORDER BY relname;
@@ -868,7 +876,7 @@ expect {
 expect @tursopg error {}
 
 # E-86 (S4): DEFAULT auth.uid() in pg_attrdef
-@setup pg_setup_e_86
+@setup auth_uid_from_claims_on_postgres
 test gap-e-86-default-auth-uid-in-pg-attrdef {
     CREATE TABLE t (owner uuid DEFAULT auth.uid());
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't');
@@ -880,8 +888,8 @@ expect @tursopg {
     "auth.uid" ()
 }
 
-# E-87 (OK): CHECK calling auth.uid()
-@setup pg_setup_e_87
+# E-87: CHECK calling auth.uid()
+@setup auth_uid_from_claims_on_postgres
 test gap-e-87-check-calling-auth-uid {
     CREATE TABLE t (owner uuid CHECK (owner = auth.uid()));
 }
@@ -918,9 +926,8 @@ expect {
 expect @tursopg error {}
 
 # E-92 (S2): ALTER POLICY
+@setup t_id_s_policy_p
 test gap-e-92-alter-policy {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    CREATE POLICY p ON t USING (true);
     ALTER POLICY p ON t USING (false);
 }
 expect {
@@ -947,19 +954,17 @@ expect {
 @sqlstate 42704
 expect @tursopg error {}
 
-# E-95 (S2): REVOKE
+# E-95: REVOKE
+@setup t_id_s_with_rows
 test gap-e-95-revoke {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     REVOKE SELECT ON t FROM PUBLIC;
 }
 expect {
 }
 
 # E-96 (S2): GRANT column privileges
+@setup t_id_s_with_rows
 test gap-e-96-grant-column-privileges {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    INSERT INTO t VALUES (1, 'a');
     GRANT SELECT (id) ON t TO PUBLIC;
 }
 expect {
@@ -976,10 +981,9 @@ expect error {}
 expect @tursopg {
 }
 
-# E-98 (S4): pg_policies
+# E-98: pg_policies
+@setup t_id_s_policy_p
 test gap-e-98-pg-policies {
-    CREATE TABLE t (id int PRIMARY KEY, s text);
-    CREATE POLICY p ON t USING (true);
     SELECT policyname FROM pg_policies WHERE tablename = 't';
 }
 expect {
