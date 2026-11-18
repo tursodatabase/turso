@@ -1299,6 +1299,226 @@ expect {
     2|-1
 }
 
+test unnest-several-arrays-pads-the-shorter-ones-with-null {
+    SELECT * FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b']) AS t(a, b);
+    SELECT * FROM unnest(ARRAY['a', 'b'], ARRAY[1, 2, 3]) AS t(a, b);
+    SELECT * FROM unnest(ARRAY[1.5, 2], ARRAY['x', 'y', 'z'], ARRAY[10, 20, 30, 40]) AS t(a, b, c);
+}
+expect {
+    1|a
+    2|b
+    3|
+    a|1
+    b|2
+    |3
+    1.5|x|10
+    2|y|20
+    |z|30
+    ||40
+}
+
+test unnest-several-arrays-keeps-null-elements {
+    SELECT * FROM unnest(ARRAY[1, NULL, 3], ARRAY[NULL, 'x']) AS t(a, b);
+}
+expect {
+    1|
+    |x
+    3|
+}
+
+test unnest-several-arrays-reads-arrays-of-more-dimensions-element-by-element {
+    SELECT * FROM unnest(ARRAY[[1, 2], [3, 4]], ARRAY['a', 'b', 'c', 'd', 'e']) AS t(a, b);
+    SELECT * FROM unnest(ARRAY[[[1], [2]], [[3], [4]]], ARRAY[[10, 20], [30, 40]], ARRAY[100]) AS t(a, b, c);
+    SELECT * FROM unnest(ARRAY[ARRAY[1, 2]], ARRAY[10]) AS t(a, b);
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    |e
+    1|10|100
+    2|20|
+    3|30|
+    4|40|
+    1|10
+    2|
+}
+
+test unnest-several-arrays-null-and-empty-arrays-have-no-elements {
+    SELECT * FROM unnest(ARRAY[1, 2], NULL::int[], '{}'::text[]) AS t(a, b, c);
+    SELECT count(*) FROM unnest(NULL::int[], NULL::int[]) AS t(a, b);
+    SELECT count(*) FROM unnest('{}'::int[], '{}'::int[]) AS t(a, b);
+    SELECT v.k, u.* FROM (VALUES (1)) v(k) LEFT JOIN unnest(NULL::int[], NULL::int[]) AS u(x, y) ON true;
+}
+expect {
+    1||
+    2||
+    0
+    0
+    1||
+}
+
+test unnest-several-arrays-with-ordinality {
+    SELECT * FROM unnest(ARRAY[1, 2, 3], ARRAY['a', 'b']) WITH ORDINALITY AS t(a, b, n);
+    SELECT * FROM unnest(ARRAY[1, 2], ARRAY['a']) WITH ORDINALITY AS t(a, b);
+}
+expect {
+    1|a|1
+    2|b|2
+    3||3
+    1|a|1
+    2||2
+}
+
+test unnest-several-arrays-column-names {
+    SELECT x, unnest FROM unnest(ARRAY[1, 2], ARRAY['a']) AS t(x);
+    SELECT t.b, t.a FROM unnest(ARRAY[1, 2], ARRAY['a']) AS t(a, b) WHERE b IS NULL;
+    SELECT * FROM unnest(ARRAY['x'], ARRAY['y']) AS unnest(a);
+    SELECT * FROM ROWS FROM (unnest(ARRAY[1, 2], ARRAY[3])) AS t(a, b);
+}
+expect {
+    1|a
+    2|
+    |2
+    x|y
+    1|3
+    2|
+}
+
+test unnest-several-arrays-of-table-columns {
+    CREATE TABLE unnest_several (id int, a int[], b text[], c int[][]);
+    INSERT INTO unnest_several VALUES
+        (1, ARRAY[1, 2, 3], ARRAY['x', 'y'], ARRAY[[1, 2], [3, 4]]),
+        (2, NULL, ARRAY['only'], NULL),
+        (3, '{}', '{}', ARRAY[[9]]),
+        (4, ARRAY[7], NULL, ARRAY[[5, 6]]);
+    SELECT id, u.* FROM unnest_several, unnest(a, b) AS u(x, y) ORDER BY id, x, y;
+    SELECT id, u.* FROM unnest_several LEFT JOIN LATERAL unnest(a, b, c) AS u(x, y, z) ON true ORDER BY id, x, y, z;
+    SELECT id, count(u.x), count(u.y) FROM unnest_several LEFT JOIN unnest(a, b) AS u(x, y) ON true GROUP BY id ORDER BY id;
+}
+expect {
+    1|1|x
+    1|2|y
+    1|3|
+    2||only
+    4|7|
+    1|1|x|1
+    1|2|y|2
+    1|3||3
+    1|||4
+    2||only|
+    3|||9
+    4|7||5
+    4|||6
+    1|3|2
+    2|0|1
+    3|0|0
+    4|1|0
+}
+
+test unnest-several-arrays-in-a-view {
+    CREATE TABLE unnest_view_source (id int, a int[], b text[]);
+    INSERT INTO unnest_view_source VALUES (1, ARRAY[1, 2], ARRAY['x']), (2, ARRAY[3], ARRAY['y', 'z']);
+    CREATE VIEW unnest_view AS SELECT id, x, y FROM unnest_view_source, unnest(a, b) AS u(x, y);
+    SELECT * FROM unnest_view ORDER BY id, x, y;
+}
+expect {
+    1|1|x
+    1|2|
+    2|3|y
+    2||z
+}
+
+test unnest-several-arrays-joined-to-each-other {
+    SELECT * FROM unnest(ARRAY[1, 2], ARRAY[3, 4]) AS x(a, b) JOIN unnest(ARRAY[2, 1], ARRAY['two', 'one']) AS y(a, n) USING (a) ORDER BY a;
+    SELECT a, b FROM unnest(ARRAY[3, 1, 2], ARRAY['c', 'a', 'b']) AS t(a, b) ORDER BY b DESC LIMIT 2;
+}
+expect {
+    1|3|one
+    2|4|two
+    3|c
+    2|b
+}
+
+test unnest-column-alias-list-longer-than-the-arrays-errors {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS t(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+    table "t" has 2 columns available but 3 columns specified
+}
+
+test unnest-column-definition-list-errors {
+    SELECT * FROM unnest(ARRAY[1,2]) AS t(x int);
+}
+@sqlstate 42601
+expect error {
+    a column definition list is only allowed for functions returning "record"
+}
+
+test unnest-several-arrays-column-definition-list-errors {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS t(x int, y int);
+}
+@sqlstate 42601
+expect error {
+    UNNEST\(\) with multiple arguments cannot have a column definition list
+}
+
+test generate-series-column-definition-list-errors {
+    SELECT * FROM generate_series(1, 3) AS t(x int);
+}
+@sqlstate 42601
+expect error {
+    a column definition list is only allowed for functions returning "record"
+}
+
+test generate-series-with-one-argument-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM generate_series(1) AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-with-four-arguments-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM generate_series(1, 2, 3, 4) AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test unnest-without-an-array-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM unnest() AS t(x int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test schema-qualified-unnest-with-several-arrays-and-a-column-definition-list-reports-the-function {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1], ARRAY[2]) AS t(x int, y int);
+}
+@sqlstate 42883
+expect error {
+}
+
+test unnest-without-an-array-errors {
+    SELECT * FROM unnest();
+}
+@sqlstate 42883
+expect error {
+    function unnest\(\) does not exist
+}
+
+# PostgreSQL returns two columns named unnest.
+@skip-if postgres "tursopg cannot return two columns of a function with the same name"
+test unnest-several-arrays-without-distinct-column-names-is-not-supported {
+    SELECT * FROM unnest(ARRAY[1], ARRAY[2]);
+}
+@sqlstate 0A000
+expect error {
+    two columns with the same name in a function in FROM is not supported
+}
+
 test json-to-recordset-column-list {
     SELECT (id + 10) || ':' || v FROM json_to_recordset('[{"id":1,"v":"a"},{"id":2,"v":"b"}]') AS _("id" integer, "v" text) ORDER BY id;
     SELECT (id + 10) || ':' || v FROM jsonb_to_recordset('[{"id":3,"v":"c"},{"id":4,"v":"d"}]'::jsonb) AS _("id" integer, "v" text) ORDER BY id;
@@ -1386,6 +1606,108 @@ test json-to-record-requires-column-list {
 @sqlstate 42601
 expect error {
     a column definition list is required for functions returning "record"
+}
+
+test schema-qualified-unnest-with-several-arrays-errors {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1, 2], ARRAY[3]) AS u(a, b);
+}
+@sqlstate 42883
+expect error {
+}
+
+test schema-qualified-unnest-with-one-array {
+    SELECT * FROM pg_catalog.unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(a, n);
+}
+expect {
+    1|1
+    2|2
+}
+
+test generate-series-with-one-argument-errors {
+    SELECT * FROM generate_series(1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-with-four-arguments-errors {
+    SELECT * FROM generate_series(1, 2, 1, 1);
+}
+@sqlstate 42883
+expect error {
+}
+
+test generate-series-argument-cannot-name-the-column-of-the-function {
+    SELECT * FROM generate_series(1, generate_series);
+}
+@sqlstate 42703
+expect error {
+    generate_series
+}
+
+test unnest-argument-cannot-name-the-column-of-the-function {
+    SELECT * FROM unnest(unnest);
+}
+@sqlstate 42703
+expect error {
+    unnest
+}
+
+test generate-series-argument-cannot-name-the-function-itself {
+    SELECT * FROM generate_series(1, generate_series.generate_series);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-column-the-function-does-not-have {
+    SELECT * FROM generate_series(1, generate_series.value);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test unnest-argument-cannot-name-the-function-itself {
+    SELECT * FROM unnest(unnest.unnest);
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE series_later (n int);
+    SELECT * FROM generate_series(1, series_later.n), series_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-cannot-name-a-column-of-a-table-listed-after-it {
+    CREATE TABLE series_later_column (n int);
+    SELECT * FROM generate_series(1, n), series_later_column;
+}
+@sqlstate 42703
+expect error {
+    n
+}
+
+test unnest-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE unnest_later (a int[]);
+    SELECT * FROM unnest(unnest_later.a), unnest_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test generate-series-argument-named-like-a-column-of-the-function {
+    CREATE TABLE series_args (start int, stop int, step int, value text);
+    INSERT INTO series_args VALUES (1, 7, 3, 'a');
+    SELECT series_args.value, generate_series.generate_series FROM series_args, generate_series(start, stop, step);
+}
+expect {
+    a|1
+    a|4
+    a|7
 }
 
 test json-to-record-argument-named-like-json-each-column {
@@ -2080,4 +2402,206 @@ test array-to-json-result-is-json {
 }
 expect {
     [[1,2]]|2
+}
+
+test table-function-argument-cannot-name-a-table-listed-after-it {
+    CREATE TABLE json_each_later (j json);
+    SELECT * FROM json_each(json_each_later.j), json_each_later;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test table-function-argument-cannot-name-a-column-of-a-table-listed-after-it {
+    CREATE TABLE json_each_later_column (j json);
+    SELECT * FROM json_each(j), json_each_later_column;
+}
+@sqlstate 42703
+expect error {
+    j
+}
+
+test table-function-argument-named-like-a-column-of-the-function {
+    CREATE TABLE json_each_value (value json);
+    INSERT INTO json_each_value VALUES ('{"a": 1, "b": 2}');
+    SELECT count(*) FROM json_each_value, json_each(value) AS e;
+}
+expect {
+    2
+}
+
+test table-function-argument-names-the-column-of-the-function-before-it {
+    CREATE TABLE json_each_nested (j json);
+    INSERT INTO json_each_nested VALUES ('{"a": {"x": 1, "y": 2}, "b": {"z": 3}}');
+    SELECT count(*) FROM json_each_nested, json_each(j) AS outer_each, json_each(value) AS inner_each;
+}
+expect {
+    3
+}
+
+test json-each-returns-the-key-and-the-value-of-each-member {
+    SELECT * FROM json_each('{"a":1,"b":"x","c":[1,2],"d":null,"e":true,"f":false,"g":{"h":1},"i":2.5}');
+}
+expect {
+    a|1
+    b|"x"
+    c|[1,2]
+    d|null
+    e|true
+    f|false
+    g|{"h":1}
+    i|2.5
+}
+
+test json-each-has-only-the-columns-key-and-value {
+    SELECT * FROM json_each('{"a":1}') AS j WHERE j.key = 'a' AND j.value::text = '1';
+}
+expect {
+    a|1
+}
+
+test json-each-key-is-text-and-value-is-json {
+    SELECT key || '!', value -> 'h' FROM json_each('{"a":{"h":5}}');
+}
+expect {
+    a!|5
+}
+
+test json-each-keeps-the-order-and-the-repeated-keys {
+    SELECT * FROM json_each('{"b":1,"a":2,"b":3}');
+}
+expect {
+    b|1
+    a|2
+    b|3
+}
+
+test json-each-of-an-empty-object-has-no-rows {
+    SELECT count(*) FROM json_each('{}');
+}
+expect {
+    0
+}
+
+test json-each-of-null-has-no-rows {
+    SELECT count(*) FROM json_each(NULL::json);
+}
+expect {
+    0
+}
+
+test json-each-of-an-array-errors {
+    SELECT * FROM json_each('[1]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-an-empty-array-errors {
+    SELECT * FROM json_each('[]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-a-scalar-errors {
+    SELECT * FROM json_each('1');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct a scalar
+}
+
+test json-each-of-json-null-errors {
+    SELECT * FROM json_each('null');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct a scalar
+}
+
+test json-each-with-ordinality {
+    SELECT * FROM json_each('{"a":10,"b":20}') WITH ORDINALITY;
+}
+expect {
+    a|10|1
+    b|20|2
+}
+
+test json-each-with-column-aliases {
+    SELECT k, v FROM json_each('{"a":1}') AS j(k, v);
+}
+expect {
+    a|1
+}
+
+test json-each-with-ordinality-and-column-aliases {
+    SELECT k, v, n FROM json_each('{"a":1,"b":2}') WITH ORDINALITY AS j(k, v, n);
+}
+expect {
+    a|1|1
+    b|2|2
+}
+
+test json-each-reads-a-column-of-an-earlier-table {
+    CREATE TABLE json_each_docs (id int, doc json);
+    INSERT INTO json_each_docs VALUES (1, '{"a":1,"b":2}'), (2, '{"c":3}');
+    SELECT id, key, value FROM json_each_docs, json_each(doc) ORDER BY id, key;
+}
+expect {
+    1|a|1
+    1|b|2
+    2|c|3
+}
+
+test json-each-restarts-the-ordinality-for-each-row {
+    CREATE TABLE json_each_ordinality_docs (id int, doc json);
+    INSERT INTO json_each_ordinality_docs VALUES (1, '{"a":1,"b":2}'), (2, '{"c":3}');
+    SELECT id, key, ordinality FROM json_each_ordinality_docs, json_each(doc) WITH ORDINALITY ORDER BY id, ordinality;
+}
+expect {
+    1|a|1
+    1|b|2
+    2|c|1
+}
+
+test json-each-with-the-schema-name {
+    SELECT * FROM pg_catalog.json_each('{"a":1}');
+}
+expect {
+    a|1
+}
+
+test json-each-without-an-argument-errors {
+    SELECT * FROM json_each();
+}
+@sqlstate 42883
+expect error {
+}
+
+test json-each-with-two-arguments-errors {
+    SELECT * FROM json_each('{"a":1}', '{"b":2}');
+}
+@sqlstate 42883
+expect error {
+}
+
+test json-each-with-a-column-definition-list-errors {
+    SELECT * FROM json_each('{"a":1}') AS j(k text, v json);
+}
+@sqlstate 42601
+expect error {
+}
+
+test json-tree-is-not-a-function-of-postgresql {
+    SELECT * FROM json_tree('{"a":1}');
+}
+@sqlstate 42883
+expect error {
+}
+@sqlstate 0A000
+expect @tursopg error {
+    json_tree as a function in FROM is not supported
 }

@@ -243,6 +243,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn table_function_arguments_read_only_earlier_tables(&self) -> bool {
+        true
+    }
+
     fn binds_names_at_create(&self) -> bool {
         true
     }

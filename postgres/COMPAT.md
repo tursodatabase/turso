@@ -247,11 +247,11 @@ return date, time, timetz or interval, such as `age` and `make_date`.
 | SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
-| unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
+| unnest/array_agg | 🟡 Partial | array_agg works; unnest works in FROM with up to 100 arrays, and not in the select list. `unnest(a, b)` needs a column alias list that gives its columns different names, because two columns named `unnest` are rejected |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
-| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(), unnest(), current_schema(), current_database(), version(), and on json_to_record / json_to_recordset and their jsonb_ variants in `ROWS FROM (f(...) AS (...))`; rejected on other functions and on ROWS FROM with several functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
+| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(), unnest(), json_each(), current_schema(), current_database(), version(), and on json_to_record / json_to_recordset and their jsonb_ variants in `ROWS FROM (f(...) AS (...))`; rejected on other functions and on ROWS FROM with several functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
@@ -345,6 +345,8 @@ return date, time, timetz or interval, such as `age` and `make_date`.
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
 | array_to_json | ✅ Supported | |
 | json_strip_nulls | 🟡 Partial | Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json; `jsonb_strip_nulls` is not supported |
+| json_each | 🟡 Partial | Returns `key` (text) and `value` (json), accepts WITH ORDINALITY and column aliases, and fails on an array or a scalar like PostgreSQL. A member that is a number is written from its SQL value, so `12345678901234567890` comes back as `1.23456789012346e+19`, `1e2` as `100.0` and `1.50` as `1.5`, where PostgreSQL returns the text of the input (`->` keeps the spelling of a number). An object or an array comes back without the whitespace of the input (`[1, 2]` as `[1,2]`). A text or jsonb argument is accepted, where PostgreSQL only takes json. `jsonb_each`, `json_each_text`, `jsonb_each_text` and the other functions that return members are not supported |
+| Table functions of SQLite (json_tree, completion, ...) | ❌ Not supported | Refused with `0A000` as a function in FROM; PostgreSQL has no such function and reports `42883`. The `pragma_*` functions work and check the privilege of the PRAGMA |
 | json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list, after the alias or inside ROWS FROM (); WITH ORDINALITY works on the ROWS FROM form; ROWS FROM with several functions is not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |

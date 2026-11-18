@@ -2829,7 +2829,10 @@ impl PostgreSQLTranslator {
             func_name,
             "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
         );
-        if !returns_record && !column_definitions.is_empty() {
+        if !returns_record
+            && rewritten_function(func_name).is_none()
+            && !column_definitions.is_empty()
+        {
             return Err(ParseError::not_supported(format!(
                 "a column definition list on {func_name}()"
             )));
@@ -2914,36 +2917,20 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let name = exact_name(func_name);
-        let qualified_name = if function_uses_main_schema(func_name) {
-            ast::QualifiedName::fullname(exact_name("main"), name)
-        } else {
-            ast::QualifiedName::single(name)
-        };
-        if func_name == "unnest" {
-            if args.len() != 1 {
-                return Err(ParseError::ParseError(
-                    "unnest currently requires exactly one array".into(),
-                ));
-            }
-            let element_name = range_func
-                .alias
-                .as_ref()
-                .map_or(func_name, |range_alias| range_alias.aliasname.as_str());
-            let names = range_function_column_names(range_func, vec![element_name.to_string()])?;
-            let column = |name: &str| ast::Expr::Id(exact_name(name));
-            return Ok(ast::SelectTable::Select {
-                select: function_select(
-                    qualified_name,
-                    args,
-                    [column("unnest"), bigint(column("ordinality"))]
-                        .into_iter()
-                        .zip(names)
-                        .collect(),
-                ),
+        let qualified_name = function_qualified_name(func_name);
+        if let Some(function) = rewritten_function(func_name) {
+            return translate_rewritten_function(
+                function,
+                range_func,
+                qualified_name,
+                args,
                 alias,
-                lateral: true,
-            });
+                CallShape {
+                    arg_count: func_call.args.len(),
+                    schema_qualified: func_call.funcname.len() > 1,
+                    has_column_definition_list: !column_definitions.is_empty(),
+                },
+            );
         }
         if returns_record {
             return self.translate_json_to_record(
@@ -2954,41 +2941,17 @@ impl PostgreSQLTranslator {
                 alias,
             );
         }
-        if func_name == "generate_series" {
-            let value_name = range_func
-                .alias
-                .as_ref()
-                .map_or(func_name, |range_alias| range_alias.aliasname.as_str());
-            let names = range_function_column_names(range_func, vec![value_name.to_string()])?;
-            let column = |name: &str| ast::Expr::Id(exact_name(name));
-            let ordinality = bigint(function_call(
-                "pg_generate_series_ordinality",
-                vec![column("value"), column("start"), column("step")],
-            ));
-            let alias = alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)));
-            return Ok(ast::SelectTable::Select {
-                select: function_select(
-                    qualified_name,
-                    args,
-                    [column("value"), ordinality]
-                        .into_iter()
-                        .zip(names)
-                        .collect(),
-                ),
-                alias: Some(alias),
-                lateral: true,
-            });
-        }
         if range_func.ordinality {
             return Err(ParseError::not_supported(format!(
                 "WITH ORDINALITY on {func_name}()"
             )));
         }
-        reject_column_aliases(&range_func.alias, "a function")?;
-
-        fn function_uses_main_schema(name: &str) -> bool {
-            is_catalog_table_name(name) || name == "generate_series"
+        if !POSTGRES_TABLE_FUNCTIONS.contains(&func_name) && !func_name.starts_with("pragma_") {
+            return Err(ParseError::not_supported(format!(
+                "{func_name} as a function in FROM"
+            )));
         }
+        reject_column_aliases(&range_func.alias, "a function")?;
 
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
@@ -3060,17 +3023,6 @@ impl PostgreSQLTranslator {
                 vec![("array", "cannot call populate_composite on an array".into())],
                 "cannot call populate_composite on a scalar".into(),
             ),
-        };
-        let json_type = |args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
-            name: exact_name("json_type"),
-            distinctness: None,
-            args,
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
         };
         let checked_arg = json_type_or_raise(
             json_type(vec![arg.clone()]),
@@ -3187,22 +3139,9 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
         if range_func.ordinality {
-            let one = ast::Expr::Literal(ast::Literal::Numeric("1".into()));
-            let ordinality = if is_recordset {
-                ast::Expr::Binary(
-                    Box::new(ast::Expr::Qualified(
-                        exact_name("element"),
-                        exact_name("key"),
-                    )),
-                    ast::Operator::Add,
-                    Box::new(one),
-                )
-            } else {
-                one
-            };
             let name = names.last().expect("WITH ORDINALITY adds a column name");
             columns.push(ast::ResultColumn::Expr(
-                Box::new(bigint(ordinality)),
+                Box::new(row_number()),
                 Some(ast::As::Elided(exact_name(name.clone()))),
             ));
         }
@@ -5656,42 +5595,257 @@ impl PostgreSQLTranslator {
     }
 }
 
+/// What a call of a function in FROM looks like, before its arguments are translated.
+#[derive(Clone, Copy)]
+struct CallShape {
+    arg_count: usize,
+    schema_qualified: bool,
+    has_column_definition_list: bool,
+}
+
+/// A table function that PostgreSQL has in FROM and that is a call of a table function of
+/// the engine here. The call is a SELECT over the engine's table function.
+struct RewrittenFunction {
+    name: &'static str,
+    in_main_schema: bool,
+    /// Refuses a call that PostgreSQL refuses for this function.
+    check_call: fn(CallShape) -> Result<(), ParseError>,
+    /// The arguments to pass to the engine's table function, given the arguments of the call.
+    #[allow(clippy::vec_box)]
+    prepare_arguments: fn(Vec<Box<ast::Expr>>) -> Vec<Box<ast::Expr>>,
+    /// The column of the engine's table function that holds each column of the result,
+    /// and the name PostgreSQL gives that column, for a call with this many arguments.
+    columns: fn(usize) -> Vec<(ast::Expr, String)>,
+}
+
+/// The most arrays one call of unnest() in FROM can take.
+pub const MAX_UNNEST_ARRAYS: usize = 100;
+
+/// The column of the unnest table function with the elements of its `array`th argument,
+/// counted from 1.
+pub fn unnest_column_name(array: usize) -> String {
+    if array == 1 {
+        "unnest".to_string()
+    } else {
+        format!("unnest{array}")
+    }
+}
+
+fn rewritten_function(name: &str) -> Option<&'static RewrittenFunction> {
+    REWRITTEN_FUNCTIONS
+        .iter()
+        .find(|function| function.name == name)
+}
+
+/// Table functions of the engine that go to a function in FROM unchanged, besides the
+/// `pragma_*` functions. Any other function in FROM is refused, so a table function of
+/// SQLite is not offered under a name PostgreSQL has.
+const POSTGRES_TABLE_FUNCTIONS: [&str; 3] = [
+    "pg_options_to_table",
+    "pg_input_error_info",
+    "pg_get_tabledef",
+];
+
+const REWRITTEN_FUNCTIONS: [RewrittenFunction; 3] = [
+    RewrittenFunction {
+        name: "unnest",
+        in_main_schema: true,
+        check_call: |call| {
+            let count = call.arg_count;
+            if count == 0 || (call.schema_qualified && count > 1) {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+                    message: if count == 0 {
+                        "function unnest() does not exist".into()
+                    } else {
+                        format!("function unnest with {count} arguments does not exist")
+                    },
+                });
+            }
+            if count > MAX_UNNEST_ARRAYS {
+                return Err(ParseError::not_supported(format!(
+                    "unnest() with more than {MAX_UNNEST_ARRAYS} arrays"
+                )));
+            }
+            if count > 1 && call.has_column_definition_list {
+                return Err(ParseError::ParseError(
+                    "UNNEST() with multiple arguments cannot have a column definition list".into(),
+                ));
+            }
+            Ok(())
+        },
+        prepare_arguments: |arguments| arguments,
+        columns: |count| {
+            (1..=count)
+                .map(|array| {
+                    (
+                        ast::Expr::Id(exact_name(unnest_column_name(array))),
+                        "unnest".to_string(),
+                    )
+                })
+                .collect()
+        },
+    },
+    RewrittenFunction {
+        name: "generate_series",
+        in_main_schema: true,
+        check_call: |call| {
+            if !(2..=3).contains(&call.arg_count) {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+                    message: format!(
+                        "function generate_series with {} arguments does not exist",
+                        call.arg_count
+                    ),
+                });
+            }
+            Ok(())
+        },
+        prepare_arguments: |arguments| arguments,
+        columns: |_| vec![(ast::Expr::Id(exact_name("value")), "generate_series".into())],
+    },
+    RewrittenFunction {
+        name: "json_each",
+        in_main_schema: false,
+        check_call: |call| {
+            if call.arg_count != 1 {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+                    message: format!(
+                        "function json_each with {} arguments does not exist",
+                        call.arg_count
+                    ),
+                });
+            }
+            Ok(())
+        },
+        prepare_arguments: |arguments| {
+            arguments
+                .into_iter()
+                .map(|argument| {
+                    Box::new(json_type_or_raise(
+                        json_type(vec![argument.clone()]),
+                        *argument,
+                        "object",
+                        &[(
+                            "array",
+                            "cannot deconstruct an array as an object".to_string(),
+                        )],
+                        "cannot deconstruct a scalar",
+                    ))
+                })
+                .collect()
+        },
+        columns: |_| {
+            let column = |name: &str| ast::Expr::Id(exact_name(name));
+            let text = |text: &str| {
+                Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'{text}'"
+                ))))
+            };
+            let json_text = ast::Expr::Case {
+                base: Some(Box::new(column("type"))),
+                when_then_pairs: vec![
+                    (text("object"), Box::new(column("value"))),
+                    (text("array"), Box::new(column("value"))),
+                    (text("true"), text("true")),
+                    (text("false"), text("false")),
+                ],
+                else_expr: Some(Box::new(ast::Expr::FunctionCall {
+                    name: exact_name("json_quote"),
+                    distinctness: None,
+                    args: vec![Box::new(column("value"))],
+                    order_by: vec![],
+                    within_group: vec![],
+                    filter_over: ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                })),
+            };
+            let cast = |expr: ast::Expr, type_name: &str| ast::Expr::Cast {
+                expr: Box::new(expr),
+                type_name: Some(ast::Type {
+                    name: type_name.to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+            vec![
+                (cast(column("key"), "TEXT"), "key".to_string()),
+                (cast(json_text, "JSON"), "value".to_string()),
+            ]
+        },
+    },
+];
+
+fn function_qualified_name(func_name: &str) -> ast::QualifiedName {
+    let in_main_schema = is_catalog_table_name(func_name)
+        || rewritten_function(func_name).is_some_and(|function| function.in_main_schema);
+    let name = exact_name(func_name);
+    if in_main_schema {
+        ast::QualifiedName::fullname(exact_name("main"), name)
+    } else {
+        ast::QualifiedName::single(name)
+    }
+}
+
+#[allow(clippy::vec_box)]
+fn translate_rewritten_function(
+    function: &RewrittenFunction,
+    range_func: &pg_query::protobuf::RangeFunction,
+    qualified_name: ast::QualifiedName,
+    args: Vec<Box<ast::Expr>>,
+    alias: Option<ast::As>,
+    call: CallShape,
+) -> Result<ast::SelectTable, ParseError> {
+    (function.check_call)(call)?;
+    if call.has_column_definition_list {
+        return Err(ParseError::ParseError(
+            "a column definition list is only allowed for functions returning \"record\"".into(),
+        ));
+    }
+    let args = (function.prepare_arguments)(args);
+    let (mut sources, mut default_names): (Vec<_>, Vec<_>) =
+        (function.columns)(args.len()).into_iter().unzip();
+    if let ([name], Some(table_alias)) = (default_names.as_mut_slice(), &range_func.alias) {
+        name.clone_from(&table_alias.aliasname);
+    }
+    let names = range_function_column_names(range_func, default_names)?;
+    if range_func.ordinality {
+        sources.push(row_number());
+    }
+    let columns = sources
+        .into_iter()
+        .zip(names)
+        .map(|(source, name)| {
+            ast::ResultColumn::Expr(Box::new(source), Some(ast::As::Elided(exact_name(name))))
+        })
+        .collect();
+    Ok(ast::SelectTable::Select {
+        select: function_select(qualified_name, args, columns),
+        alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(function.name)))),
+        lateral: true,
+    })
+}
+
 /// A SELECT of `columns` from a call of the table function `function`.
-///
-/// The arguments are evaluated in their own VALUES row, so that a name in them
-/// such as `value` or `input` is a column of the query and not one of the
-/// function's own columns. VALUES, unlike a SELECT, still rejects aggregate
-/// and window functions.
 #[allow(clippy::vec_box)]
 fn function_select(
     function: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
-    columns: Vec<(ast::Expr, String)>,
+    columns: Vec<ast::ResultColumn>,
 ) -> ast::Select {
-    let (arguments, args) = function_arguments_subquery(args);
-    let from = ast::FromClause {
-        select: Box::new(arguments),
-        joins: vec![ast::JoinedSelectTable {
-            operator: ast::JoinOperator::Comma,
-            table: Box::new(ast::SelectTable::TableCall(function, args, None)),
-            constraint: None,
-        }],
-    };
     ast::Select {
         with: None,
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
                 distinctness: None,
-                columns: columns
-                    .into_iter()
-                    .map(|(expr, name)| {
-                        ast::ResultColumn::Expr(
-                            Box::new(expr),
-                            Some(ast::As::Elided(exact_name(name))),
-                        )
-                    })
-                    .collect(),
-                from: Some(from),
+                columns,
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::TableCall(function, args, None)),
+                    joins: vec![],
+                }),
                 where_clause: None,
                 group_by: None,
                 window_clause: vec![],
@@ -5703,34 +5857,6 @@ fn function_select(
     }
 }
 
-#[allow(clippy::vec_box)]
-fn function_arguments_subquery(
-    args: Vec<Box<ast::Expr>>,
-) -> (ast::SelectTable, Vec<Box<ast::Expr>>) {
-    let arg_refs = (1..=args.len())
-        .map(|i| {
-            Box::new(ast::Expr::Qualified(
-                exact_name("arg"),
-                exact_name(format!("column{i}")),
-            ))
-        })
-        .collect();
-    let subquery = ast::SelectTable::Select {
-        select: ast::Select {
-            with: None,
-            body: ast::SelectBody {
-                select: ast::OneSelect::Values(vec![args]),
-                compounds: vec![],
-            },
-            order_by: vec![],
-            limit: None,
-        },
-        alias: Some(ast::As::Elided(exact_name("arg"))),
-        lateral: false,
-    };
-    (subquery, arg_refs)
-}
-
 fn bigint(expr: ast::Expr) -> ast::Expr {
     ast::Expr::Cast {
         expr: Box::new(expr),
@@ -5740,6 +5866,26 @@ fn bigint(expr: ast::Expr) -> ast::Expr {
             array_dimensions: 0,
         }),
     }
+}
+
+/// The number of a row of a function in FROM, counted from 1 for each call of the function.
+fn row_number() -> ast::Expr {
+    bigint(ast::Expr::FunctionCall {
+        name: exact_name("row_number"),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: Some(Box::new(ast::Over::Window(ast::Window {
+                base: None,
+                partition_by: vec![],
+                order_by: vec![],
+                frame_clause: None,
+            }))),
+        },
+    })
 }
 
 /// The names of the columns of a function in FROM. `function_columns` are the
@@ -7115,6 +7261,21 @@ fn translate_create_enum(
             default: None,
         },
     })
+}
+
+#[allow(clippy::vec_box)]
+fn json_type(args: Vec<Box<ast::Expr>>) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: exact_name("json_type"),
+        distinctness: None,
+        args,
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
 }
 
 fn json_type_or_raise(
@@ -9957,15 +10118,15 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM main.generate_series (1, 3)) g",
             ),
             (
                 "SELECT g FROM generate_series(1, 3) g",
-                "SELECT g FROM LATERAL (SELECT value g FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+                "SELECT g FROM LATERAL (SELECT value g FROM main.generate_series (1, 3)) g",
             ),
             (
                 "SELECT * FROM generate_series(1, 3)",
-                "SELECT * FROM LATERAL (SELECT value generate_series FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) generate_series",
+                "SELECT * FROM LATERAL (SELECT value generate_series FROM main.generate_series (1, 3)) generate_series",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
@@ -12790,6 +12951,18 @@ mod tests {
         );
     }
 
+    fn assert_rejected(sql: &str, needle: &str) {
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains(needle),
+            "{sql}: expected an error mentioning {needle:?}, got: {err}"
+        );
+    }
+
     fn assert_translates(sql: &str) {
         let parsed = crate::parse(sql).unwrap();
         if let Err(err) = PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
@@ -13615,14 +13788,15 @@ mod tests {
             "column alias list on a table",
         );
         assert_not_supported(
-            "SELECT * FROM json_each('[]') AS j(k, v)",
+            "SELECT * FROM pg_options_to_table(ARRAY['a=1']) AS o(k, v)",
             "column alias list on a function",
         );
         assert_not_supported(
-            "SELECT * FROM json_each('[1]') AS s(x)",
+            "SELECT * FROM pg_options_to_table(ARRAY['a=1']) AS s(x)",
             "column alias list on a function",
         );
         assert_translates("SELECT * FROM current_schema() AS s(x)");
+        assert_translates("SELECT * FROM json_each('{}') AS j(k, v)");
         assert_translates("SELECT * FROM version() WITH ORDINALITY AS v(a, b)");
         assert_translates("SELECT u.x FROM unnest(ARRAY[1, 2]) AS u(x)");
         assert_translates("SELECT x.a FROM t AS x");
@@ -13646,8 +13820,8 @@ mod tests {
             "several functions",
         );
         assert_not_supported(
-            "SELECT * FROM json_each('[1]') WITH ORDINALITY",
-            "WITH ORDINALITY on json_each()",
+            "SELECT * FROM pg_options_to_table(ARRAY['a=1']) WITH ORDINALITY",
+            "WITH ORDINALITY on pg_options_to_table()",
         );
         assert_not_supported(
             "SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS ordinality",
@@ -13662,9 +13836,17 @@ mod tests {
             "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
             "column definition list on f()",
         );
-        assert_not_supported(
+        assert_rejected(
             "SELECT * FROM unnest(ARRAY[1]) AS u(a int)",
-            "column definition list on unnest()",
+            "only allowed for functions returning",
+        );
+        assert_rejected(
+            "SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS u(a int, b int)",
+            "UNNEST() with multiple arguments",
+        );
+        assert_rejected(
+            "SELECT * FROM generate_series(1, 3) AS g(a int)",
+            "only allowed for functions returning",
         );
         assert_translates("SELECT * FROM ROWS FROM (json_to_record('{}') AS (a int)) AS r(x)");
         assert_not_supported(

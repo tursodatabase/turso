@@ -1586,20 +1586,32 @@ pub fn resolve_unqualified_column(
     tables: &[JoinedTable],
     column_name: &str,
 ) -> Result<Option<ResolvedColumn>> {
+    resolve_unqualified_column_except(tables, column_name, &[])
+}
+
+/// Like [resolve_unqualified_column], but the tables in `excluded` have no columns.
+pub fn resolve_unqualified_column_except(
+    tables: &[JoinedTable],
+    column_name: &str,
+    excluded: &[TableInternalId],
+) -> Result<Option<ResolvedColumn>> {
+    let lookup = |table: &JoinedTable, include_rowid_names: bool| {
+        if excluded.contains(&table.internal_id) {
+            return ColumnLookup::Missing;
+        }
+        lookup_unqualified_column(&table.table, column_name, include_rowid_names)
+    };
     let has_declared_column = crate::translate::planner::ROWID_STRS
         .iter()
         .any(|name| name.eq_ignore_ascii_case(column_name))
-        && tables.iter().any(|table| {
-            !matches!(
-                lookup_unqualified_column(&table.table, column_name, false),
-                ColumnLookup::Missing
-            )
-        });
+        && tables
+            .iter()
+            .any(|table| !matches!(lookup(table, false), ColumnLookup::Missing));
     let found = unqualified_column_sources(
         tables,
         column_name,
         |table| table.join_info.as_ref(),
-        |table| lookup_unqualified_column(&table.table, column_name, !has_declared_column),
+        |table| lookup(table, !has_declared_column),
     );
     if found.ambiguous {
         crate::bail_parse_error!("ambiguous column name: {}", column_name);

@@ -815,8 +815,11 @@ pub fn find_best_access_method_for_join_order<'a>(
             multi_index_work,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
+            rhs_table,
             vtab,
             &rhs_constraints.constraints,
+            where_clause,
+            lhs_mask,
             join_order,
             input_cardinality,
             base_row_count,
@@ -1165,14 +1168,62 @@ fn has_two_local_constraint_terms(
     false
 }
 
+/// Whether an argument of this table function reads a table that is not joined before it.
+fn table_function_argument_reads_a_later_table(
+    table_function: &JoinedTable,
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    lhs_mask: &TableMask,
+    join_order: &[JoinOrderMember],
+) -> bool {
+    let own_index = join_order
+        .iter()
+        .find(|member| member.table_id == table_function.internal_id)
+        .map(|member| member.original_idx);
+    constraints.iter().any(|constraint| {
+        let term = &where_clause[constraint.where_clause_pos.0];
+        if term.origin.table_function_table() != Some(table_function.internal_id) {
+            return false;
+        }
+        let mut read = constraint.lhs_mask.clone();
+        if let Some(own_index) = own_index {
+            read.clear(own_index);
+        }
+        !lhs_mask.contains_all_set_bits_of(&read)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn find_best_access_method_for_vtab(
+    table: &JoinedTable,
     vtab: &VirtualTable,
     constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
+    debug_assert!(
+        where_clause
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| term.origin.table_function_table() == Some(table.internal_id))
+            .all(|(pos, _)| constraints
+                .iter()
+                .any(|constraint| constraint.where_clause_pos.0 == pos)),
+        "every argument of a table function must be one of its constraints"
+    );
+    if table_function_argument_reads_a_later_table(
+        table,
+        constraints,
+        where_clause,
+        lhs_mask,
+        join_order,
+    ) {
+        return Ok(None);
+    }
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
 
     // TODO: get proper order_by information to pass to the vtab.
