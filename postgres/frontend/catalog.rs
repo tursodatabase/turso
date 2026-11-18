@@ -255,26 +255,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        false
-    }
-
     fn supports_capture_data_changes(&self) -> bool {
         false
     }
 
     fn catalog(&self) -> &dyn turso_core::Catalog {
         &crate::classes::PostgresCatalog
-    }
-
-    fn translate_relation_changes(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[turso_core::RelationChange<'_>],
-    ) -> turso_core::Result<()> {
-        crate::classes::translate_relation_changes(program, schema, connection, changes)
     }
 
     /// The built-in superuser is found by its name, `postgres`, too.

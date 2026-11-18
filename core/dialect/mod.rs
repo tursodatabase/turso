@@ -44,7 +44,7 @@ use crate::{
     namespace::NamespaceId,
     schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
-    vdbe::{builder::ProgramBuilder, Register},
+    vdbe::Register,
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::sync::Arc;
@@ -309,31 +309,6 @@ pub trait Dialect: Send + Sync + 'static {
     /// stores them as rows of `sqlite_schema`.
     fn catalog(&self) -> &dyn Catalog {
         &SqliteCatalog
-    }
-
-    /// Translates `changes`, which the statement being compiled makes to
-    /// relations, into the bytecode that records them in the dialect's own
-    /// schema state, in the same transaction as the statement's
-    /// `sqlite_schema` rows. Does nothing for a dialect without schema state
-    /// of its own. `CREATE TABLE` does not call this: it stores the table
-    /// through [`Dialect::catalog`].
-    fn translate_relation_changes(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[RelationChange<'_>],
-    ) -> Result<()> {
-        let _ = (program, schema, connection, changes);
-        Ok(())
-    }
-
-    /// Whether relations can be created, renamed or dropped in an attached
-    /// database. The PostgreSQL frontend refuses it: its relation catalog
-    /// covers only the main database, so a database file with relations
-    /// made while it was attached could not be opened later.
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        true
     }
 
     /// The id of the role named `name`, case-sensitively, when the dialect
