@@ -1,0 +1,463 @@
+# Known tursopg gaps against PostgreSQL: D. Errors
+#
+# The default `expect` block is the PostgreSQL result. An `expect @tursopg`
+# block is the current wrong tursopg result. When you fix a gap, delete its
+# `@tursopg` block in the same change. See postgres/CONTRIBUTING.md.
+# A test without an `@tursopg` block matches PostgreSQL and guards against
+# regressions.
+
+@database :memory:
+
+# D-01 (S1): FK not enforced by default
+test gap-d-01-fk-not-enforced-by-default {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int CONSTRAINT child_pid_fkey REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 99);
+}
+@sqlstate 23503
+expect error {}
+expect @tursopg {
+}
+
+# D-02 (OK): FK violation on insert
+test gap-d-02-fk-violation-on-insert {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int CONSTRAINT child_pid_fkey REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 99);
+}
+@sqlstate 23503
+expect error {}
+expect @tursopg {
+}
+
+# D-03 (OK): FK violation on update child
+test gap-d-03-fk-violation-on-update-child {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int CONSTRAINT child_pid_fkey REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    UPDATE child SET pid = 99 WHERE id = 1;
+}
+@sqlstate 23503
+expect error {}
+expect @tursopg {
+}
+
+# D-04 (OK): FK violation on delete parent
+test gap-d-04-fk-violation-on-delete-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int CONSTRAINT child_pid_fkey REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    DELETE FROM parent WHERE id = 1;
+}
+@sqlstate 23503
+expect error {}
+expect @tursopg {
+}
+
+# D-05 (OK): ON DELETE CASCADE
+test gap-d-05-on-delete-cascade {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    DELETE FROM parent WHERE id = 1;
+    SELECT count(*) FROM child;
+}
+expect {
+    0
+}
+expect @tursopg {
+    1
+}
+
+# D-06 (OK): ON DELETE SET NULL
+test gap-d-06-on-delete-set-null {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    DELETE FROM parent WHERE id = 1;
+    SELECT id, pid FROM child;
+}
+expect {
+    1|
+}
+expect @tursopg {
+    1|1
+}
+
+# D-07 (OK): ON UPDATE CASCADE
+test gap-d-07-on-update-cascade {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    UPDATE parent SET id = 2;
+    SELECT pid FROM child;
+}
+expect {
+    2
+}
+expect @tursopg {
+    1
+}
+
+# D-08 (OK): FK to non-PK unique column
+test gap-d-08-fk-to-non-pk-unique-column {
+    CREATE TABLE parent (id int PRIMARY KEY, code text UNIQUE);
+    CREATE TABLE child (id int PRIMARY KEY, code text REFERENCES parent(code));
+    INSERT INTO parent VALUES (1, 'x');
+    INSERT INTO child VALUES (1, 'nope');
+}
+@sqlstate 23503
+expect error {}
+expect @tursopg {
+}
+
+# D-09 (OK): PK duplicate
+test gap-d-09-pk-duplicate {
+    CREATE TABLE t (id int PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 23505
+expect error {}
+
+# D-10 (OK): named UNIQUE constraint duplicate
+test gap-d-10-named-unique-constraint-duplicate {
+    CREATE TABLE t (id int, code text, CONSTRAINT t_code_uq UNIQUE (code));
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (2, 'a');
+}
+@sqlstate 23505
+expect error {}
+
+# D-11 (OK): unique index duplicate
+test gap-d-11-unique-index-duplicate {
+    CREATE TABLE t (id int, email text);
+    CREATE UNIQUE INDEX t_email_idx ON t (email);
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (2, 'a');
+}
+@sqlstate 23505
+expect error {}
+
+# D-12 (OK): expression unique index duplicate
+test gap-d-12-expression-unique-index-duplicate {
+    CREATE TABLE t (id int, email text);
+    CREATE UNIQUE INDEX t_lower_email_idx ON t (lower(email));
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (2, 'A');
+}
+@sqlstate 23505
+expect error {}
+
+# D-13 (OK): composite UNIQUE duplicate
+test gap-d-13-composite-unique-duplicate {
+    CREATE TABLE t (a int, b int, UNIQUE (a, b));
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1);
+}
+@sqlstate 23505
+expect error {}
+
+# D-14 (OK): NOT NULL on insert
+test gap-d-14-not-null-on-insert {
+    CREATE TABLE t (id int, s text NOT NULL);
+    INSERT INTO t VALUES (1, NULL);
+}
+@sqlstate 23502
+expect error {}
+
+# D-15 (OK): NOT NULL on update
+test gap-d-15-not-null-on-update {
+    CREATE TABLE t (id int, s text NOT NULL);
+    INSERT INTO t VALUES (1, 'a');
+    UPDATE t SET s = NULL;
+}
+@sqlstate 23502
+expect error {}
+
+# D-16 (OK): CHECK unnamed (column)
+test gap-d-16-check-unnamed-column {
+    CREATE TABLE t (qty int CHECK (qty > 0));
+    INSERT INTO t VALUES (-1);
+}
+@sqlstate 23514
+expect error {}
+
+# D-17 (OK): CHECK named
+test gap-d-17-check-named {
+    CREATE TABLE t (qty int, CONSTRAINT qty_positive CHECK (qty > 0));
+    INSERT INTO t VALUES (-1);
+}
+@sqlstate 23514
+expect error {}
+
+# D-18 (OK): CHECK unnamed (table)
+test gap-d-18-check-unnamed-table {
+    CREATE TABLE t (a int, b int, CHECK (a < b));
+    INSERT INTO t VALUES (2, 1);
+}
+@sqlstate 23514
+expect error {}
+
+# D-19 (OK): enum invalid value
+test gap-d-19-enum-invalid-value {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+    CREATE TABLE t (m mood);
+    INSERT INTO t VALUES ('angry');
+}
+@sqlstate 22P02
+expect error {}
+
+# D-20 (OK): enum invalid literal cast
+test gap-d-20-enum-invalid-literal-cast {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+    SELECT 'angry'::mood;
+}
+@sqlstate 22P02
+expect error {}
+
+# D-21 (OK): domain CHECK violation
+test gap-d-21-domain-check-violation {
+    CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+    CREATE TABLE t (n posint);
+    INSERT INTO t VALUES (-1);
+}
+@sqlstate 23514
+expect error {}
+
+# D-22 (S3): invalid int into int column
+test gap-d-22-invalid-int-into-int-column {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES ('abc');
+}
+@sqlstate 22P02
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+# D-23 (S3): invalid uuid into uuid column
+test gap-d-23-invalid-uuid-into-uuid-column {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('nope');
+}
+@sqlstate 22P02
+expect error {}
+@sqlstate P0001
+expect @tursopg error {}
+
+# D-24 (OK): invalid timestamptz into column
+test gap-d-24-invalid-timestamptz-into-column {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('nope');
+}
+@sqlstate 22007
+expect error {}
+
+# D-25 (OK): invalid json into jsonb column
+test gap-d-25-invalid-json-into-jsonb-column {
+    CREATE TABLE t (j jsonb);
+    INSERT INTO t VALUES ('\{bad');
+}
+@sqlstate 22P02
+expect error {}
+
+# D-26 (S3): invalid bool into bool column
+test gap-d-26-invalid-bool-into-bool-column {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('maybe');
+}
+@sqlstate 22P02
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+# D-27 (OK): integer division by zero
+test gap-d-27-integer-division-by-zero {
+    SELECT 1 / 0;
+}
+@sqlstate 22012
+expect error {}
+
+# D-28 (OK): numeric division by zero
+test gap-d-28-numeric-division-by-zero {
+    SELECT 1.0 / 0;
+}
+@sqlstate 22012
+expect error {}
+
+# D-29 (OK): modulo by zero
+test gap-d-29-modulo-by-zero {
+    SELECT 1 % 0;
+}
+@sqlstate 22012
+expect error {}
+
+# D-30 (S3): varchar(n) too long
+test gap-d-30-varchar-n-too-long {
+    CREATE TABLE t (s varchar(3));
+    INSERT INTO t VALUES ('abcd');
+}
+@sqlstate 22001
+expect error {}
+
+# D-31 (S2): char(n) too long
+test gap-d-31-char-n-too-long {
+    CREATE TABLE t (s char(3));
+    INSERT INTO t VALUES ('abcd');
+}
+@sqlstate 22001
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# D-32 (S3): numeric(p,s) overflow
+test gap-d-32-numeric-p-s-overflow {
+    CREATE TABLE t (n numeric(5,2));
+    INSERT INTO t VALUES (12345.678);
+}
+@sqlstate 22003
+expect error {}
+@sqlstate 23000
+expect @tursopg error {}
+
+# D-33 (S1): int4 column overflow
+test gap-d-33-int4-column-overflow {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {}
+expect @tursopg {
+}
+
+# D-34 (S3): smallint column overflow
+test gap-d-34-smallint-column-overflow {
+    CREATE TABLE t (n smallint);
+    INSERT INTO t VALUES (40000);
+}
+@sqlstate 22003
+expect error {}
+
+# D-35 (OK): undefined table
+test gap-d-35-undefined-table {
+    SELECT * FROM nope;
+}
+@sqlstate 42P01
+expect error {}
+
+# D-36 (OK): undefined column
+test gap-d-36-undefined-column {
+    CREATE TABLE t (id int);
+    SELECT nope FROM t;
+}
+@sqlstate 42703
+expect error {}
+
+# D-37 (OK): undefined function
+test gap-d-37-undefined-function {
+    SELECT nope();
+}
+@sqlstate 42883
+expect error {}
+
+# D-38 (OK): syntax error
+test gap-d-38-syntax-error {
+    SELEC 1;
+}
+@sqlstate 42601
+expect error {}
+
+# D-39 (OK): duplicate table
+test gap-d-39-duplicate-table {
+    CREATE TABLE t (id int);
+    CREATE TABLE t (id int);
+}
+@sqlstate 42P07
+expect error {}
+
+# D-40 (S2): insert into identity ALWAYS column
+test gap-d-40-insert-into-identity-always-column {
+    CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, s text);
+    INSERT INTO t (id, s) VALUES (5, 'x');
+}
+@sqlstate 428C9
+expect error {}
+
+# D-41 (S2): insert into generated column
+test gap-d-41-insert-into-generated-column {
+    CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t (a, b) VALUES (1, 5);
+}
+@sqlstate 428C9
+expect error {}
+
+# D-42 (OK): write in READ ONLY transaction
+test gap-d-42-write-in-read-only-transaction {
+    CREATE TABLE t (id int);
+    BEGIN READ ONLY;
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 25006
+expect error {}
+
+# D-44 (S3): unknown type in cast
+test gap-d-44-unknown-type-in-cast {
+    SELECT 1::nosuchtype;
+}
+@sqlstate 42704
+expect error {}
+expect @tursopg {
+    1
+}
+
+# D-45 (S3): wrong arg type to function
+test gap-d-45-wrong-arg-type-to-function {
+    SELECT lower(1, 2);
+}
+@sqlstate 42883
+expect error {}
+@sqlstate 42601
+expect @tursopg error {}
+
+# D-46 (OK): column count mismatch on insert
+test gap-d-46-column-count-mismatch-on-insert {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1, 2);
+}
+@sqlstate 42601
+expect error {}
+
+# D-47 (OK): ambiguous column
+test gap-d-47-ambiguous-column {
+    CREATE TABLE a (id int);
+    CREATE TABLE b (id int);
+    SELECT id FROM a, b;
+}
+@sqlstate 42702
+expect error {}
+
+# D-49 (OK): CHECK named, column-level
+test gap-d-49-check-named-column-level {
+    CREATE TABLE t (qty int CONSTRAINT qty_positive CHECK (qty > 0));
+    INSERT INTO t VALUES (-1);
+}
+@sqlstate 23514
+expect error {}
+
+# D-48 (S1): RAISE-style error via invalid regex
+test gap-d-48-raise-style-error-via-invalid-regex {
+    SELECT 'a' ~ '(';
+}
+@sqlstate 2201B
+expect error {}
+expect @tursopg {
+}
