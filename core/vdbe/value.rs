@@ -7,6 +7,8 @@ use crate::{
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
 };
+use smallvec::SmallVec;
+use std::borrow::Cow;
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
@@ -1515,8 +1517,19 @@ impl Value {
         Ok(())
     }
 
-    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
-        let mut result = String::new();
+    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self> + Clone>(registers: T) -> Self {
+        // Reserve the length of the result first, so that the `String` does not
+        // grow while the parts are appended. A number has at most 22 characters.
+        let capacity = registers
+            .clone()
+            .map(|val| match val {
+                Value::Null => 0,
+                Value::Text(s) => s.as_str().len(),
+                Value::Blob(b) => b.len(),
+                Value::Numeric(_) => 22,
+            })
+            .sum();
+        let mut result = String::with_capacity(capacity);
         for val in registers {
             match val {
                 Value::Null => continue,
@@ -1544,10 +1557,9 @@ impl Value {
             return Value::Null;
         };
 
-        let parts = registers.filter_map(Value::cast_text_ref);
-
-        let result = parts.collect::<Vec<_>>().join(&separator);
-        Value::build_text(result)
+        let parts: SmallVec<[Cow<'_, str>; 8]> =
+            registers.filter_map(Value::cast_text_ref).collect();
+        Value::build_text(parts.join(&separator))
     }
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
@@ -1598,10 +1610,10 @@ fn push_hex_upper(out: &mut String, bytes: &[u8]) {
 
 /// The text of `CAST(value AS TEXT)`, which is the text of `value.to_string()`.
 /// A TEXT value is borrowed, not copied.
-fn text_of_cast(value: &Value) -> std::borrow::Cow<'_, str> {
+fn text_of_cast(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
-        value => std::borrow::Cow::Owned(value.to_string()),
+        Value::Text(text) => Cow::Borrowed(text.as_str()),
+        value => Cow::Owned(value.to_string()),
     }
 }
 
