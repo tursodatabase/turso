@@ -844,15 +844,8 @@ pub(crate) fn translate_access_statement(
             };
             emit_class_row_set_policies(program, &cursors, *namespace, name, stored);
         }
-        AccessStatement::CreateRole { .. } => {
-            return Err(LimboError::InternalError(
-                "CREATE ROLE reached the relation catalog".to_string(),
-            ));
-        }
-        AccessStatement::GrantRole { .. } => {
-            return Err(LimboError::InternalError(
-                "GRANT of role membership reached the relation catalog".to_string(),
-            ));
+        AccessStatement::CreateRole { .. } | AccessStatement::GrantRole { .. } => {
+            unreachable!("statements about roles do not change a class row")
         }
     }
     Ok(())
