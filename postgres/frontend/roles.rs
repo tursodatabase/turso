@@ -428,6 +428,31 @@ mod tests {
     }
 
     #[test]
+    fn role_created_adds_the_role_under_the_id_it_reads_back() {
+        let mut catalog = RoleCatalog::new(&[], &[]).unwrap();
+        let created = RoleCreated {
+            name: "alice".to_string(),
+            options: RoleOptions {
+                inherit: false,
+                bypassrls: true,
+            },
+        };
+
+        created
+            .apply_to(&mut catalog, &[Value::from_i64(5)])
+            .unwrap();
+
+        let alice = catalog.get_by_name("alice").unwrap();
+        assert_eq!(alice.id, RoleId::from_stored(5));
+        assert!(!alice.superuser);
+        assert!(!alice.inherit);
+        assert!(alice.bypassrls);
+
+        let no_id = created.apply_to(&mut catalog, &[]);
+        assert!(matches!(no_id, Err(LimboError::InternalError(_))));
+    }
+
+    #[test]
     fn new_reads_the_stored_roles() {
         let catalog =
             RoleCatalog::new(&[role_row(1, "alice", 0), role_row(2, "Alice", 1)], &[]).unwrap();

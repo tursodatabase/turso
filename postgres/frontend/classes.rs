@@ -2060,3 +2060,251 @@ pub(crate) fn initialize_schema(
     }
     Ok(statements)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TABLE_OID: i64 = FIRST_NORMAL_OBJECT_ID;
+    const SEQUENCE_OID: i64 = FIRST_NORMAL_OBJECT_ID + 1;
+    const ALICE: i64 = 7;
+    const BOB: i64 = 8;
+
+    #[test]
+    fn class_created_adds_a_row_with_the_oid_and_owner_it_reads_back() {
+        let classes = table_and_sequence();
+
+        let table = classes.get_by_name(NamespaceId::ROOT, "t").unwrap();
+        assert_eq!(table.oid, TABLE_OID);
+        assert_eq!(table.relkind, RelationKind::Table);
+        assert_eq!(table.relowner, RoleId::from_stored(ALICE));
+        assert_eq!(table.relownedby, 0);
+        assert_eq!(table.relacl, None);
+        assert!(!table.relrowsecurity);
+    }
+
+    #[test]
+    fn class_created_refuses_values_that_are_not_an_oid_and_an_owner() {
+        let created = ClassCreated {
+            namespace: NamespaceId::ROOT,
+            name: "t".to_string(),
+            kind: RelationKind::Table,
+        };
+        let mut classes = ClassCatalog::default();
+
+        let missing_owner = created.apply_to(&mut classes, &[Value::from_i64(TABLE_OID)]);
+        let text_oid = created.apply_to(
+            &mut classes,
+            &[Value::build_text("t"), Value::from_i64(ALICE)],
+        );
+
+        assert!(matches!(missing_owner, Err(LimboError::InternalError(_))));
+        assert!(matches!(text_oid, Err(LimboError::InternalError(_))));
+        assert_eq!(classes.classes().count(), 0);
+    }
+
+    #[test]
+    fn class_renamed_keeps_the_oid_under_the_new_name() {
+        let mut classes = table_and_sequence();
+
+        ClassRenamed {
+            namespace: NamespaceId::ROOT,
+            old_name: "t".to_string(),
+            new_name: "u".to_string(),
+        }
+        .apply_to(&mut classes, &[])
+        .unwrap();
+
+        assert!(classes.get_by_name(NamespaceId::ROOT, "t").is_none());
+        let renamed = classes.get_by_name(NamespaceId::ROOT, "u").unwrap();
+        assert_eq!(renamed.oid, TABLE_OID);
+        assert_eq!(renamed.relname, "u");
+    }
+
+    #[test]
+    fn class_dropped_removes_the_row() {
+        let mut classes = table_and_sequence();
+
+        ClassDropped {
+            namespace: NamespaceId::ROOT,
+            name: "t".to_string(),
+        }
+        .apply_to(&mut classes, &[])
+        .unwrap();
+
+        assert!(classes.get_by_name(NamespaceId::ROOT, "t").is_none());
+        assert!(classes.get_by_name(NamespaceId::ROOT, "s").is_some());
+    }
+
+    #[test]
+    fn owner_column_changes_follow_the_table_and_the_column_name() {
+        let mut classes = table_and_sequence();
+        let owned_by = |owner| OwnerColumnSet {
+            namespace: NamespaceId::ROOT,
+            name: "s".to_string(),
+            owner,
+        };
+
+        owned_by(Some(OwnerColumn {
+            table: "t".to_string(),
+            column: "a".to_string(),
+        }))
+        .apply_to(&mut classes, &[])
+        .unwrap();
+        let sequence = classes.get_by_name(NamespaceId::ROOT, "s").unwrap();
+        assert_eq!(sequence.relownedby, TABLE_OID);
+        assert_eq!(sequence.relownedbycolumn.as_deref(), Some("a"));
+
+        OwnerColumnRenamed {
+            namespace: NamespaceId::ROOT,
+            table: "t".to_string(),
+            old_name: "a".to_string(),
+            new_name: "b".to_string(),
+        }
+        .apply_to(&mut classes, &[])
+        .unwrap();
+        let sequence = classes.get_by_name(NamespaceId::ROOT, "s").unwrap();
+        assert_eq!(sequence.relownedby, TABLE_OID);
+        assert_eq!(sequence.relownedbycolumn.as_deref(), Some("b"));
+
+        owned_by(None).apply_to(&mut classes, &[]).unwrap();
+        let sequence = classes.get_by_name(NamespaceId::ROOT, "s").unwrap();
+        assert_eq!(sequence.relownedby, 0);
+        assert_eq!(sequence.relownedbycolumn, None);
+    }
+
+    #[test]
+    fn owner_set_reads_back_the_owner_and_the_access_control_list() {
+        let mut classes = table_and_sequence();
+        let acl = Acl::default_for(RelationKind::Table, role_oid(RoleId::from_stored(BOB)));
+        let owner_set = OwnerSet {
+            namespace: NamespaceId::ROOT,
+            name: "t".to_string(),
+        };
+
+        owner_set
+            .apply_to(
+                &mut classes,
+                &[Value::from_i64(BOB), Value::build_text(acl.stored_text())],
+            )
+            .unwrap();
+        let table = classes.get_by_name(NamespaceId::ROOT, "t").unwrap();
+        assert_eq!(table.relowner, RoleId::from_stored(BOB));
+        assert_eq!(table.relacl.as_ref(), Some(&acl));
+
+        owner_set
+            .apply_to(&mut classes, &[Value::from_i64(ALICE), Value::Null])
+            .unwrap();
+        let table = classes.get_by_name(NamespaceId::ROOT, "t").unwrap();
+        assert_eq!(table.relowner, RoleId::from_stored(ALICE));
+        assert_eq!(table.relacl, None);
+
+        let only_owner = owner_set.apply_to(&mut classes, &[Value::from_i64(BOB)]);
+        assert!(matches!(only_owner, Err(LimboError::InternalError(_))));
+    }
+
+    #[test]
+    fn acl_set_reads_back_the_access_control_list() {
+        let mut classes = table_and_sequence();
+        let acl = Acl::default_for(RelationKind::Table, role_oid(RoleId::from_stored(ALICE)));
+        let acl_set = AclSet {
+            namespace: NamespaceId::ROOT,
+            name: "t".to_string(),
+        };
+
+        acl_set
+            .apply_to(&mut classes, &[Value::build_text(acl.stored_text())])
+            .unwrap();
+        let table = classes.get_by_name(NamespaceId::ROOT, "t").unwrap();
+        assert_eq!(table.relacl.as_ref(), Some(&acl));
+
+        let not_a_list = acl_set.apply_to(&mut classes, &[Value::from_i64(1)]);
+        assert!(matches!(not_a_list, Err(LimboError::InternalError(_))));
+    }
+
+    #[test]
+    fn row_security_set_changes_only_the_named_table() {
+        let mut classes = table_and_sequence();
+
+        RowSecuritySet {
+            namespace: NamespaceId::ROOT,
+            name: "t".to_string(),
+            enabled: true,
+        }
+        .apply_to(&mut classes, &[])
+        .unwrap();
+
+        assert!(
+            classes
+                .get_by_name(NamespaceId::ROOT, "t")
+                .unwrap()
+                .relrowsecurity
+        );
+        assert!(
+            !classes
+                .get_by_name(NamespaceId::ROOT, "s")
+                .unwrap()
+                .relrowsecurity
+        );
+    }
+
+    #[test]
+    fn policies_set_reads_back_the_policies() {
+        let mut classes = table_and_sequence();
+        let policies_set = PoliciesSet {
+            namespace: NamespaceId::ROOT,
+            name: "t".to_string(),
+        };
+
+        policies_set.apply_to(&mut classes, &[Value::Null]).unwrap();
+        let table = classes.get_by_name(NamespaceId::ROOT, "t").unwrap();
+        assert!(table.relpolicies.is_empty());
+
+        let not_policies = policies_set.apply_to(&mut classes, &[Value::build_text("?")]);
+        let no_value = policies_set.apply_to(&mut classes, &[]);
+        assert!(matches!(not_policies, Err(LimboError::InternalError(_))));
+        assert!(matches!(no_value, Err(LimboError::InternalError(_))));
+    }
+
+    #[test]
+    fn a_change_to_a_relation_without_a_row_does_nothing() {
+        let mut classes = table_and_sequence();
+
+        RowSecuritySet {
+            namespace: NamespaceId::ROOT,
+            name: "missing".to_string(),
+            enabled: true,
+        }
+        .apply_to(&mut classes, &[])
+        .unwrap();
+        AclSet {
+            namespace: NamespaceId::ROOT,
+            name: "missing".to_string(),
+        }
+        .apply_to(&mut classes, &[Value::Null])
+        .unwrap();
+
+        assert_eq!(classes.classes().count(), 2);
+    }
+
+    /// Table `t` and sequence `s`, both owned by `ALICE`.
+    fn table_and_sequence() -> ClassCatalog {
+        let mut classes = ClassCatalog::default();
+        for (name, kind, oid) in [
+            ("t", RelationKind::Table, TABLE_OID),
+            ("s", RelationKind::Sequence, SEQUENCE_OID),
+        ] {
+            ClassCreated {
+                namespace: NamespaceId::ROOT,
+                name: name.to_string(),
+                kind,
+            }
+            .apply_to(
+                &mut classes,
+                &[Value::from_i64(oid), Value::from_i64(ALICE)],
+            )
+            .unwrap();
+        }
+        classes
+    }
+}
