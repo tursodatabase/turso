@@ -53,12 +53,18 @@ impl From<LimboError> for Error {
 }
 
 /// An engine error with the message `message`, which reports SQLSTATE
-/// `sqlstate` to the client. Use it for errors that the PostgreSQL frontend
-/// raises itself, also in the PostgreSQL functions that the engine runs.
-pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
+/// `sqlstate` to the client, with the DETAIL `detail` if there is one. Use
+/// it for errors that the PostgreSQL frontend raises itself, also in the
+/// PostgreSQL functions that the engine runs.
+pub fn sqlstate_error(
+    sqlstate: &'static str,
+    message: impl Into<String>,
+    detail: Option<String>,
+) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
         code: sqlstate,
         message: message.into(),
+        detail,
     }))
 }
 
@@ -67,7 +73,7 @@ pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> Lim
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
         turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
-            sqlstate_error(sqlstate, message)
+            sqlstate_error(sqlstate, message, None)
         }
         other => LimboError::ParseError(other.to_string()),
     }
@@ -80,6 +86,7 @@ pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
     sqlstate_error(
         turso_pg_parser::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
         "current transaction is aborted, commands ignored until end of transaction block",
+        None,
     )
 }
 
@@ -119,6 +126,9 @@ impl From<&LimboError> for ErrorReport {
         }
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
+        }
+        if let LimboError::Dialect(error) = error {
+            report.detail.clone_from(&error.detail);
         }
         report
     }

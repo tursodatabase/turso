@@ -66,6 +66,9 @@ impl ConstraintViolation {
 pub struct DialectError {
     pub code: &'static str,
     pub message: String,
+    /// More about the error, which a dialect may report apart from the
+    /// message, such as the objects that keep it from dropping something.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]

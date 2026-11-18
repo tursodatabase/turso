@@ -493,7 +493,7 @@ fn binary_not_supported(what: &str, pg_type: &Type) -> PgWireError {
 }
 
 fn wire_error(sqlstate: &'static str, message: String) -> PgWireError {
-    pg_error(sqlstate_error(sqlstate, message).into())
+    pg_error(sqlstate_error(sqlstate, message, None).into())
 }
 
 /// How tursopg reads or writes a value of a type in binary format.
@@ -934,7 +934,7 @@ fn binary_value_not_supported(pg_type: &Type) -> turso_core::LimboError {
         "cannot send this value in binary format as type {}; use text format",
         pg_type.name()
     );
-    sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message)
+    sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, message, None)
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {

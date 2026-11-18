@@ -133,6 +133,7 @@ pub(crate) fn append_options(input: &Value, rows: &mut Vec<[Value; 2]>) -> Resul
             return Err(sqlstate_error(
                 SQLSTATE_NULL_VALUE_NOT_ALLOWED,
                 "null array element not allowed in this context",
+                None,
             ));
         }
         let option = value.to_string();

@@ -268,6 +268,7 @@ pub(crate) fn translate_create_role(
         return Err(sqlstate_error(
             SQLSTATE_DUPLICATE_OBJECT,
             format!("role \"{name}\" already exists"),
+            None,
         ));
     }
     let Some(table) = schema.get_btree_table(NamespaceId::ROOT, AUTHID_TABLE_NAME) else {

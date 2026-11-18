@@ -275,12 +275,14 @@ pub(crate) fn translate_grant_role(
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!("role \"{PG_DATABASE_OWNER_NAME}\" cannot have explicit members"),
+                None,
             ));
         }
         if !roles.is_superuser(connection.current_role()) {
             return Err(sqlstate_error(
                 SQLSTATE_INSUFFICIENT_PRIVILEGE,
                 format!("permission denied to {statement} role \"{}\"", role.name),
+                None,
             ));
         }
         // pg_database_owner has no stored members to revoke.
@@ -304,6 +306,7 @@ pub(crate) fn translate_grant_role(
                 return Err(sqlstate_error(
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
                     format!("role \"{PG_DATABASE_OWNER_NAME}\" cannot be a member of any role"),
+                    None,
                 ));
             };
             // A role that `role` already reaches cannot become its member:
@@ -318,6 +321,7 @@ pub(crate) fn translate_grant_role(
                         "role \"{}\" is a member of role \"{}\"",
                         role.name, grantee.name
                     ),
+                    None,
                 ));
             }
             if memberships.get(role_id, member_id).is_some() {
@@ -375,6 +379,7 @@ fn role_does_not_exist(name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_OBJECT,
         format!("role \"{name}\" does not exist"),
+        None,
     )
 }
 
