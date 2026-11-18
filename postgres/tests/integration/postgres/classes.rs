@@ -52,6 +52,31 @@ fn postgres_async_open_initializes_the_postgres_catalog() {
     assert_ne!(rows[0].0, rows[1].0);
 }
 
+#[test]
+fn portable_catalog_initialization_keeps_later_log_writes_append_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("portable.db");
+    let db = open_like_server_with_opts(
+        path.to_str().unwrap(),
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        turso_core::ConnectOpts::new(SessionRole::Superuser)
+            .with_portable_logical_changes_enabled(true),
+    );
+    let log_path = path.with_extension("db-log");
+    let after_open = std::fs::read(&log_path).unwrap();
+    assert_eq!(&after_open[..5], b"2LML\x03");
+
+    let pg = turso_pg::PgConnection::connect(&db).unwrap();
+    pg.inner().set_portable_logical_changes_enabled(true);
+    pg.execute("CREATE TABLE t (id integer PRIMARY KEY)")
+        .unwrap();
+    pg.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let after_writes = std::fs::read(&log_path).unwrap();
+    assert!(after_writes.len() > after_open.len());
+    assert_eq!(&after_writes[..after_open.len()], &after_open[..]);
+}
+
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn postgres_async_open_initializes_catalog_across_io_yields() {
@@ -158,6 +183,18 @@ fn open_like_server(path: &str) -> Arc<turso_core::Database> {
 }
 
 fn open_like_server_with_io(path: &str, io: Arc<dyn turso_core::IO>) -> Arc<turso_core::Database> {
+    open_like_server_with_opts(
+        path,
+        io,
+        turso_core::ConnectOpts::new(SessionRole::Superuser),
+    )
+}
+
+fn open_like_server_with_opts(
+    path: &str,
+    io: Arc<dyn turso_core::IO>,
+    connect_opts: turso_core::ConnectOpts,
+) -> Arc<turso_core::Database> {
     let file = io
         .open_file(path, turso_core::OpenFlags::default(), true)
         .unwrap();
@@ -173,7 +210,7 @@ fn open_like_server_with_io(path: &str, io: Arc<dyn turso_core::IO>) -> Arc<turs
             io.clone(),
             path,
             &options,
-            turso_core::ConnectOpts::new(SessionRole::Superuser),
+            connect_opts.clone(),
         )
         .unwrap()
         {
