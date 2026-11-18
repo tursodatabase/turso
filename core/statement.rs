@@ -842,6 +842,7 @@ impl Statement {
         self.state.query_deadline = deadline;
     }
 
+    #[turso_macros::grow_stack_when_low]
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self
             .program
@@ -1776,15 +1777,22 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        // Keep helper statements nested while drop-time reset/abort cleanup runs.
-        // That cleanup consults `is_nested_stmt()` to decide whether top-level
-        // transaction/savepoint finalization belongs to this statement or to its
-        // parent, so we release the nested guard only after reset completes.
-        self.reset_best_effort();
-        if self.nested_guard_active {
-            self.connection.end_nested();
-            self.nested_guard_active = false;
-        }
+        clean_up_before_drop(self);
+    }
+}
+
+/// The reset drops the cached statements of the triggers that the statement
+/// ran, so the drop of a chain of triggers recurses once for each trigger.
+#[turso_macros::grow_stack_when_low]
+fn clean_up_before_drop(statement: &mut Statement) {
+    // Keep helper statements nested while drop-time reset/abort cleanup runs.
+    // That cleanup consults `is_nested_stmt()` to decide whether top-level
+    // transaction/savepoint finalization belongs to this statement or to its
+    // parent, so we release the nested guard only after reset completes.
+    statement.reset_best_effort();
+    if statement.nested_guard_active {
+        statement.connection.end_nested();
+        statement.nested_guard_active = false;
     }
 }
 

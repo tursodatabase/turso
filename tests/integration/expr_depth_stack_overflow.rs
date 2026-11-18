@@ -334,6 +334,51 @@ fn trigger_with_nested_subqueries_does_not_overflow_the_stack() {
     assert_eq!(rows, vec![vec![SqliteValue::Integer(7)]]);
 }
 
+#[test]
+fn trigger_chain_does_not_overflow_the_stack() {
+    let depth = 200;
+    let mut schema = String::new();
+    for level in 0..=depth {
+        schema.push_str(&format!("CREATE TABLE t{level}(x);"));
+    }
+    for level in 0..depth {
+        let next = level + 1;
+        schema.push_str(&format!(
+            "CREATE TRIGGER tr{level} AFTER INSERT ON t{level} BEGIN INSERT INTO t{next} VALUES (NEW.x); END;"
+        ));
+    }
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| {
+        conn.execute(&schema).unwrap();
+        conn.execute("INSERT INTO t0 VALUES (7)").unwrap();
+        limbo_exec_rows(conn, &format!("SELECT x FROM t{depth}"))
+    });
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(7)]]);
+}
+
+#[test]
+fn cascading_delete_through_a_chain_of_rows_does_not_overflow_the_stack() {
+    let rows = on_thread_with_stack(SMALL_STACK, |conn| {
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute(
+            "CREATE TABLE node (id INTEGER PRIMARY KEY, \
+             parent INTEGER REFERENCES node(id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO node VALUES (0, NULL)").unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM n WHERE id < 500) \
+             INSERT INTO node SELECT id, id - 1 FROM n",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM node WHERE id = 0").unwrap();
+        limbo_exec_rows(conn, "SELECT count(*) FROM node")
+    });
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+}
+
 fn on_thread_with_stack<T: Send + 'static>(
     stack_size: usize,
     work: impl FnOnce(&Arc<Connection>) -> T + Send + 'static,

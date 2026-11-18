@@ -1722,6 +1722,7 @@ impl ProgramState {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
@@ -1730,6 +1731,7 @@ impl ProgramState {
         metrics
     }
 
+    #[turso_macros::grow_stack_when_low]
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
@@ -1737,6 +1739,7 @@ impl ProgramState {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
         match counter {
             crate::statement::StatementStatusCounter::FullscanStep => {
@@ -2200,6 +2203,19 @@ pub struct PreparedProgram {
     /// Whether the program frees a b-tree (`Insn::Destroy`) or the storage of an
     /// index method (`Insn::IndexMethodDestroy`), as DROP TABLE and DROP INDEX do.
     pub destroys_btree: bool,
+}
+
+impl Drop for PreparedProgram {
+    fn drop(&mut self) {
+        drop_instructions(std::mem::take(&mut self.insns));
+    }
+}
+
+/// The instructions of a program can hold the programs of triggers, so the drop
+/// of a chain of triggers recurses once for each trigger.
+#[turso_macros::grow_stack_when_low]
+fn drop_instructions(insns: Vec<(Insn, usize)>) {
+    drop(insns);
 }
 
 #[derive(Clone)]
