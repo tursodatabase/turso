@@ -1,7 +1,7 @@
 //! Bytecode that rewrites stored rows for `ALTER TABLE`: the rows of
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
-use crate::dialect::catalog::{
+use crate::dialect::{
     AddColumn, AfterWrites, AlterColumn, DropColumn, RenameColumn, RenameTable, WriteContext,
 };
 use crate::function::{AlterTableFunc, Func, FuncCtx};

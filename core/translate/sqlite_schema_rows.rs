@@ -1,8 +1,8 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
-use crate::dialect::catalog::{
+use crate::dialect::{
     AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateMaterializedView, CreateTable,
-    CreateView, DropIndex, DropView, TableText, WriteContext,
+    CreateView, DropIndex, DropTable, DropView, TableText, WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -350,7 +350,7 @@ pub(crate) fn emit_open_sqlite_schema_cursor(
 fn emit_drop_table_rows(
     program: &mut ProgramBuilder,
     ctx: &WriteContext<'_>,
-    table: &crate::dialect::catalog::DropTable<'_>,
+    table: &DropTable<'_>,
 ) -> Result<AfterWrites> {
     emit_delete_rows_of_table(program, ctx, table)?;
     emit_delete_temp_triggers_on_table(program, ctx, table)?;
@@ -362,7 +362,7 @@ fn emit_drop_table_rows(
 fn emit_delete_rows_of_table(
     program: &mut ProgramBuilder,
     ctx: &WriteContext<'_>,
-    table: &crate::dialect::catalog::DropTable<'_>,
+    table: &DropTable<'_>,
 ) -> Result<()> {
     let resolver = ctx.resolver;
     let database_id = ctx.database_id;
@@ -483,7 +483,7 @@ fn emit_delete_rows_of_table(
 fn emit_delete_temp_triggers_on_table(
     program: &mut ProgramBuilder,
     ctx: &WriteContext<'_>,
-    table: &crate::dialect::catalog::DropTable<'_>,
+    table: &DropTable<'_>,
 ) -> Result<()> {
     // SQLite removes temp triggers targeting the dropped table.
     // Enumerate the temp schema triggers at translate time (which is

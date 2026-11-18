@@ -17,16 +17,13 @@ pub mod catalog;
 pub mod engine;
 
 pub use crate::translate::sqlite_schema_rows::SqliteCatalog;
-pub use catalog::AddColumn;
-pub use catalog::AlterColumn;
-pub use catalog::DropColumn;
 pub use catalog::{
-    AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
-    CreateMaterializedView, CreateTable, CreateView, DropIndex, DropView, NewOwner, OwnerColumn,
-    RelationName, TableText, WriteContext, WriteOrigin,
+    AccessStatement, AddColumn, AfterWrites, AlterColumn, AutomaticIndex, Catalog, CatalogApply,
+    CatalogWrite, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView,
+    DropColumn, DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, RenamedIndex, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable, WriteContext, WriteOrigin,
 };
-pub use catalog::{RenameColumn, RewrittenTrigger, RewrittenView};
-pub use catalog::{RenameTable, RenamedIndex, TempTriggerOfRenamedTable};
 pub(crate) use engine::EngineDialect;
 
 use crate::{
