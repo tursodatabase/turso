@@ -15,7 +15,9 @@ use crate::translate::emitter::{
 };
 use crate::translate::index::canonical_create_index_sql;
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
-use crate::translate::sqlite_schema_alter_rows::{emit_rename_column_rows, emit_rename_table_rows};
+use crate::translate::sqlite_schema_alter_rows::{
+    emit_alter_column_rows, emit_rename_column_rows, emit_rename_table_rows,
+};
 use crate::translate::ProgramBuilder;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
@@ -53,6 +55,7 @@ impl Catalog for SqliteCatalog {
             CatalogWrite::DropView(view) => emit_drop_view_row(program, ctx, view),
             CatalogWrite::RenameTable(table) => emit_rename_table_rows(program, ctx, table),
             CatalogWrite::RenameColumn(column) => emit_rename_column_rows(program, ctx, column),
+            CatalogWrite::AlterColumn(column) => emit_alter_column_rows(program, ctx, column),
         }
     }
 }
