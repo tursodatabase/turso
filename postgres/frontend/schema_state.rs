@@ -4,15 +4,17 @@
 //! with their memberships of [`crate::auth_members`], each loaded from its
 //! own table.
 
-use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use turso_core::schema::Schema;
-use turso_core::{CatalogApply, Insn, LimboError, ProgramBuilder, Value, MAIN_DB_ID};
+use turso_core::{
+    CatalogApply, Insn, LimboError, LoadQuery, LoadStep, ProgramBuilder, Row, SchemaLoad,
+    MAIN_DB_ID,
+};
 
-use crate::auth_members;
-use crate::classes::{self, ClassCatalog};
-use crate::roles::{self, RoleCatalog};
+use crate::auth_members::MembershipRows;
+use crate::classes::{ClassCatalog, ClassRows};
+use crate::roles::{RoleCatalog, RoleRows};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchemaState {
@@ -26,46 +28,54 @@ pub(crate) fn schema_state(schema: &Schema) -> Option<&SchemaState> {
     schema.dialect_schema.as_ref()?.downcast_ref()
 }
 
-/// [`turso_core::Dialect::schema_state_queries`] for the PostgreSQL
-/// frontend: the relation catalog, then the roles, then the memberships. A
-/// database without the relation catalog has no schema state. The
-/// membership table is read only with the roles table, which is created
-/// before it.
-pub(crate) fn schema_state_queries(schema: &Schema) -> Vec<String> {
-    let Some(classes_query) = classes::schema_state_query(schema) else {
-        return Vec::new();
-    };
-    let mut queries = vec![classes_query];
-    if let Some(roles_query) = roles::schema_state_query(schema) {
-        queries.push(roles_query);
-        queries.extend(auth_members::schema_state_query(schema));
-    }
-    queries
+/// The steps that load the frontend's schema state, in the order they run:
+/// the relation catalog, then the roles, then the memberships, each from
+/// its own table. The last step stores what they read in the schema.
+pub(crate) fn load_steps() -> Vec<Box<dyn LoadStep>> {
+    let read = Arc::new(Mutex::new(SchemaStateRead::default()));
+    vec![
+        Box::new(ClassRows::new(read.clone())),
+        Box::new(RoleRows::new(read.clone())),
+        Box::new(MembershipRows::new(read.clone())),
+        Box::new(StoresSchemaState { read }),
+    ]
 }
 
-/// [`turso_core::Dialect::build_schema_state`] for the PostgreSQL frontend.
-/// A database without the roles table has no roles, and one without the
-/// membership table has no memberships.
-pub(crate) fn build_schema_state(
-    schema: &Schema,
-    results: &[Vec<Vec<Value>>],
-) -> turso_core::Result<Arc<dyn Any + Send + Sync>> {
-    let (class_rows, role_rows, membership_rows): (_, &[_], &[_]) = match results {
-        [class_rows] => (class_rows, &[], &[]),
-        [class_rows, role_rows] => (class_rows, role_rows, &[]),
-        [class_rows, role_rows, membership_rows] => (class_rows, role_rows, membership_rows),
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "expected the rows of up to three schema state queries, got {}",
-                results.len()
-            )))
-        }
-    };
-    let roles = RoleCatalog::new(role_rows, membership_rows)?;
-    Ok(Arc::new(SchemaState {
-        classes: Arc::new(ClassCatalog::build(schema, class_rows)?),
-        roles: Arc::new(roles),
-    }))
+/// What the steps of [`load_steps`] have read so far. It stays out of the
+/// schema until all of it is read, so that no statement is compiled against
+/// a relation catalog without its roles.
+#[derive(Default)]
+pub(crate) struct SchemaStateRead {
+    /// None when the database has no relation catalog. Such a database has
+    /// no schema state, and its roles and memberships are not read.
+    pub(crate) classes: Option<ClassCatalog>,
+    /// None when the roles were not read. A database without the roles
+    /// table has no roles, and its memberships are not read.
+    pub(crate) roles: Option<RoleCatalog>,
+}
+
+/// Stores what the steps before it read as the schema state of the schema
+/// being read. It has no statement of its own.
+struct StoresSchemaState {
+    read: Arc<Mutex<SchemaStateRead>>,
+}
+
+impl LoadStep for StoresSchemaState {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> turso_core::Result<Option<LoadQuery>> {
+        let read = std::mem::take(&mut *self.read.lock().unwrap());
+        let Some(classes) = read.classes else {
+            return Ok(None);
+        };
+        load.schema_mut()?.dialect_schema = Some(Arc::new(SchemaState {
+            classes: Arc::new(classes),
+            roles: Arc::new(read.roles.unwrap_or_default()),
+        }));
+        Ok(None)
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> turso_core::Result<()> {
+        unreachable!("storing the schema state has no statement")
+    }
 }
 
 /// Changes the frontend's schema state in `schema` with `change`, so that
