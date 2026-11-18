@@ -4439,6 +4439,12 @@ fn check_condition_text(condition: &ast::Expr, table: &BTreeTable) -> String {
 fn render_expr(expr: &ast::Expr) -> String {
     let mut expr = expr.clone();
     walk_expr_mut(&mut expr, &mut |expr| {
+        // The translator compiles PostgreSQL's binary collations to BINARY.
+        if let ast::Expr::Collate(_, collation) = expr {
+            if collation.as_str().eq_ignore_ascii_case("binary") {
+                *collation = ast::Name::from_string("\"C\"");
+            }
+        }
         if let ast::Expr::FunctionCall { name, args, .. } = expr {
             if args.is_empty() {
                 if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
@@ -4457,7 +4463,7 @@ fn render_expr(expr: &ast::Expr) -> String {
         }
         Ok(WalkControl::Continue)
     })
-    .expect("rewriting role functions does not fail");
+    .expect("rewriting role functions and collations does not fail");
     expr.to_string()
 }
 

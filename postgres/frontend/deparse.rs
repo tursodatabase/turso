@@ -245,7 +245,7 @@ impl Printer<'_> {
                 ))
             }
             ast::Expr::Unary(ast::UnaryOperator::Negative, operand) => match operand.as_ref() {
-                ast::Expr::Literal(ast::Literal::Numeric(value)) => negative_number_text(value),
+                ast::Expr::Literal(ast::Literal::Numeric(value)) => signed_number_text(true, value),
                 _ => {
                     let operand = self.expr(operand)?;
                     if !operand.ty.is_integer() && operand.ty != PgType::Numeric {
@@ -287,8 +287,29 @@ impl Printer<'_> {
                 self.function_call(name.as_str(), args)
             }
             ast::Expr::Subquery(select) => self.scalar_subquery(select),
+            ast::Expr::Collate(operand, collation) => self.collate(operand, collation),
             _ => None,
         }
+    }
+
+    /// The translator compiles PostgreSQL's binary collations to `BINARY`,
+    /// which PostgreSQL calls `"C"`. PostgreSQL makes the operand `text`
+    /// before applying the collation: a quoted literal is printed as
+    /// `'a'::text`, and a `varchar` column as `(code)::text`.
+    fn collate(&self, operand: &ast::Expr, collation: &ast::Name) -> Option<Printed> {
+        if !collation.as_str().eq_ignore_ascii_case("binary") {
+            return None;
+        }
+        let operand = self.expr(operand)?;
+        let text = match operand.ty {
+            PgType::UnknownLiteral | PgType::Varchar => operand.typed_text(Some(PgType::Text)),
+            PgType::Text => operand.text,
+            _ => return None,
+        };
+        Some(Printed::new(
+            format!("({text} COLLATE \"C\")"),
+            PgType::Text,
+        ))
     }
 
     fn column(&self, name: &ast::Name) -> Option<Printed> {
@@ -587,8 +608,8 @@ fn coalesce(args: &[Printed]) -> Option<Printed> {
 fn literal_text(literal: &ast::Literal) -> Option<Printed> {
     match literal {
         ast::Literal::Numeric(value) => match value.strip_prefix('-') {
-            Some(positive) => negative_number_text(positive),
-            None => number_text(value),
+            Some(positive) => signed_number_text(true, positive),
+            None => signed_number_text(false, value),
         },
         ast::Literal::String(quoted) => Some(Printed::constant(
             quote_literal(&unquote(quoted)?),
@@ -600,50 +621,61 @@ fn literal_text(literal: &ast::Literal) -> Option<Printed> {
     }
 }
 
-/// A number as PostgreSQL prints a constant: an `integer` as it is, a
-/// `bigint` quoted with its type, and a decimal number as it is.
-fn number_text(value: &str) -> Option<Printed> {
-    if let Ok(number) = value.parse::<i64>() {
-        return Some(if i32::try_from(number).is_ok() {
-            Printed::constant(number.to_string(), PgType::Integer)
-        } else {
-            Printed::constant(format!("'{number}'::bigint"), PgType::Bigint)
-        });
-    }
-    let is_decimal = value.chars().all(|c| c.is_ascii_digit() || c == '.')
-        && value.chars().filter(|c| *c == '.').count() == 1
-        && value.chars().next().is_some_and(|c| c.is_ascii_digit());
-    is_decimal.then(|| Printed::constant(value, PgType::Numeric))
-}
-
-/// The negation of the number `positive`, which PostgreSQL prints quoted
-/// with its type, such as `'-1'::integer`. The type is the one the negative
-/// number fits in: `-2147483648` is an `integer`, though `2147483648` is a
-/// `bigint`. `-0` is printed as `0`, and `-0.0` as `0.0`.
-fn negative_number_text(positive: &str) -> Option<Printed> {
-    if let Ok(number) = format!("-{positive}").parse::<i64>() {
-        if number == 0 {
-            return Some(Printed::constant("0", PgType::Integer));
-        }
-        let (type_name, ty) = if i32::try_from(number).is_ok() {
-            ("integer", PgType::Integer)
-        } else {
-            ("bigint", PgType::Bigint)
-        };
-        return Some(Printed::constant(format!("'{number}'::{type_name}"), ty));
-    }
-    let positive = number_text(positive)?;
-    if positive.ty != PgType::Numeric {
+/// The constant `value`, negated when `negative`, as PostgreSQL types and
+/// prints it: the narrowest of `integer` and `bigint` that holds a whole
+/// number, otherwise `numeric`. An `integer` that is not negative is
+/// printed as it is, and a `numeric` as it is when its text has a decimal
+/// point; anything else is quoted with its type, such as `'-1'::integer`
+/// and `'5'::numeric`.
+fn signed_number_text(negative: bool, value: &str) -> Option<Printed> {
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (value, None),
+    };
+    if !whole
+        .chars()
+        .chain(fraction.unwrap_or("").chars())
+        .all(|c| c.is_ascii_digit())
+        || (whole.is_empty() && fraction.is_none_or(str::is_empty))
+    {
         return None;
     }
-    let is_zero = positive.text.chars().all(|c| c == '0' || c == '.');
-    if is_zero {
-        return Some(positive);
+    let is_zero = !whole
+        .chars()
+        .chain(fraction.unwrap_or("").chars())
+        .any(|c| c != '0');
+    let sign = if negative && !is_zero { "-" } else { "" };
+    let whole = match whole.trim_start_matches('0') {
+        "" => "0",
+        digits => digits,
+    };
+    if fraction.is_none() {
+        let number = format!("{sign}{whole}");
+        if let Ok(integer) = number.parse::<i32>() {
+            return Some(if integer < 0 {
+                Printed::constant(format!("'{integer}'::integer"), PgType::Integer)
+            } else {
+                Printed::constant(number, PgType::Integer)
+            });
+        }
+        if number.parse::<i64>().is_ok() {
+            return Some(Printed::constant(
+                format!("'{number}'::bigint"),
+                PgType::Bigint,
+            ));
+        }
     }
-    Some(Printed::constant(
-        format!("'-{}'::numeric", positive.text),
-        PgType::Numeric,
-    ))
+    // numeric_out keeps the digits after the point, and drops the point when
+    // there are none: `5.` is printed as `5`.
+    let number = match fraction {
+        Some(fraction) if !fraction.is_empty() => format!("{sign}{whole}.{fraction}"),
+        _ => format!("{sign}{whole}"),
+    };
+    Some(if sign.is_empty() && number.contains('.') {
+        Printed::constant(number, PgType::Numeric)
+    } else {
+        Printed::constant(format!("'{number}'::numeric"), PgType::Numeric)
+    })
 }
 
 /// The text of an engine string literal, which keeps its quotes.

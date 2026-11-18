@@ -8,6 +8,7 @@ use crate::names::{
     extract_key_columns, is_default_schema, is_pg_catalog, object_name, schema_qualifier,
     unqualified_name,
 };
+use crate::policy_condition::written_condition;
 use crate::sqlstate::{
     SQLSTATE_DUPLICATE_OBJECT, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_GROUPING_ERROR,
     SQLSTATE_INVALID_COLUMN_REFERENCE, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
@@ -1142,8 +1143,12 @@ impl PostgreSQLTranslator {
             .as_ref()
             .map(|expr| self.translate_expr(expr).map(Box::new))
             .transpose()?;
-        let using_sql = policy.qual.as_deref().map(deparse_expr).transpose()?;
-        let check_sql = policy.with_check.as_deref().map(deparse_expr).transpose()?;
+        let using_sql = policy.qual.as_deref().map(written_condition).transpose()?;
+        let check_sql = policy
+            .with_check
+            .as_deref()
+            .map(written_condition)
+            .transpose()?;
         Ok(ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
             policy_name: ast::Name::exact(policy.policy_name.clone()),
             tbl_name: self.qualified_name_from_range_var(table)?,
@@ -3517,13 +3522,18 @@ impl PostgreSQLTranslator {
                         "a non-binary COLLATE in an expression",
                     ));
                 }
-                if let Some(arg) = &collate.arg {
-                    self.translate_expr(arg)
-                } else {
-                    Err(ParseError::ParseError(
-                        "COLLATE clause missing inner expression".to_string(),
-                    ))
+                let arg = collate.arg.as_ref().ok_or_else(|| {
+                    ParseError::ParseError("COLLATE clause missing inner expression".to_string())
+                })?;
+                let arg = self.translate_expr(arg)?;
+                if is_default_collation(&collate.collname) {
+                    return Ok(arg);
                 }
+                // The catalogs print COLLATE BINARY as COLLATE "C".
+                Ok(ast::Expr::Collate(
+                    Box::new(arg),
+                    ast::Name::from_string("BINARY"),
+                ))
             }
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
@@ -7023,32 +7033,6 @@ fn role_list(
         .collect()
 }
 
-/// `expr` as PostgreSQL SQL, as pg_query prints it in `SELECT expr`.
-fn deparse_expr(expr: &pg_query::protobuf::Node) -> Result<String, ParseError> {
-    use pg_query::protobuf::node::Node;
-    use pg_query::protobuf::{LimitOption, ResTarget, SelectStmt, SetOperation};
-
-    let select = Node::SelectStmt(Box::new(SelectStmt {
-        target_list: vec![pg_query::protobuf::Node {
-            node: Some(Node::ResTarget(Box::new(ResTarget {
-                val: Some(Box::new(expr.clone())),
-                ..Default::default()
-            }))),
-        }],
-        op: SetOperation::SetopNone as i32,
-        limit_option: LimitOption::Default as i32,
-        ..Default::default()
-    }));
-    let sql = select
-        .deparse()
-        .map_err(|e| ParseError::ParseError(e.to_string()))?;
-    sql.strip_prefix("SELECT ")
-        .map(str::to_string)
-        .ok_or_else(|| {
-            ParseError::ParseError(format!("unexpected deparse of an expression: {sql}"))
-        })
-}
-
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
 /// an ENCODE expression that validates values against the enum labels.
 fn translate_create_enum(
@@ -9844,6 +9828,15 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
             "c" | "posix" | "default" | "ucs_basic"
         )
     })
+}
+
+/// Whether `collname` names the default collation, which leaves an
+/// expression's collation as it is.
+fn is_default_collation(collname: &[pg_query::protobuf::Node]) -> bool {
+    let Ok(names) = extract_key_columns(collname) else {
+        return false;
+    };
+    unqualified_name(&names, is_pg_catalog).is_some_and(|name| name.eq_ignore_ascii_case("default"))
 }
 
 #[cfg(test)]
