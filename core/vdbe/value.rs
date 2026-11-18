@@ -209,6 +209,10 @@ impl Value {
             Value::Text(t) => {
                 Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
             }
+            // The decimal text of an integer is ASCII, so it has one character for each byte.
+            Value::Numeric(Numeric::Integer(i)) => {
+                Value::from_i64(IntegerText::new(*i).as_str().len() as i64)
+            }
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
                 Value::from_i64(self.to_string().chars().count() as i64)
@@ -222,6 +226,9 @@ impl Value {
         match self {
             Value::Text(s) => Value::from_i64(s.as_str().len() as i64),
             Value::Blob(blob) => Value::from_i64(blob.len() as i64),
+            Value::Numeric(Numeric::Integer(i)) => {
+                Value::from_i64(IntegerText::new(*i).as_str().len() as i64)
+            }
             Value::Numeric(_) => Value::from_i64(self.to_string().len() as i64),
             _ => self.to_owned(),
         }
