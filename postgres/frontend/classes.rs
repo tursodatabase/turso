@@ -564,7 +564,7 @@ pub(crate) fn translate_access_statement(
                 owner: NewOwner::Column(_),
                 ..
             } => Ok(()),
-            AccessStatement::Grant { relations, .. } if relations.is_empty() => Ok(()),
+            AccessStatement::Grant { relations: [], .. } => Ok(()),
             _ => Err(LimboError::ParseError(
                 "the database has no relation catalog".to_string(),
             )),
