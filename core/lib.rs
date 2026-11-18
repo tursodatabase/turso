@@ -165,7 +165,7 @@ pub use dialect::DropColumn;
 pub use dialect::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
     CreateMaterializedView, CreateTable, CreateView, Dialect, DropIndex, DropView, NewOwner,
-    OwnerColumn, RelationChange, RelationName, SqliteCatalog, TableText, WriteContext, WriteOrigin,
+    OwnerColumn, RelationName, SqliteCatalog, TableText, WriteContext, WriteOrigin,
 };
 pub use dialect::{RenameColumn, RewrittenTrigger, RewrittenView};
 pub use dialect::{RenameTable, TempTriggerOfRenamedTable};
