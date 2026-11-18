@@ -19,8 +19,8 @@ pub mod engine;
 pub use crate::translate::sqlite_schema_rows::SqliteCatalog;
 pub use catalog::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
-    CreateTable, DropIndex, NewOwner, OwnerColumn, RelationChange, RelationName, TableText,
-    WriteContext, WriteOrigin,
+    CreateTable, CreateView, DropIndex, NewOwner, OwnerColumn, RelationChange, RelationName,
+    TableText, WriteContext, WriteOrigin,
 };
 pub(crate) use engine::EngineDialect;
 

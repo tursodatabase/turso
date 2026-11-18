@@ -488,6 +488,13 @@ impl Catalog for PostgresCatalog {
                 emit_drop_sequence_class_row(program, ctx, sequence)?
             }
             CatalogWrite::DropTable(table) => emit_drop_table_class_rows(program, ctx, table)?,
+            CatalogWrite::CreateView(view) => write_created_view_class_row(
+                program,
+                ctx,
+                view.namespace,
+                view.name,
+                RelationKind::View,
+            )?,
         }
         Ok(after_writes)
     }
@@ -606,6 +613,27 @@ fn emit_drop_table_class_rows(
         .chain(table.indexes.iter().map(|index| dropped(index)))
         .collect();
     translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
+}
+
+/// Writes the class row of a new view or materialized view.
+fn write_created_view_class_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    namespace: NamespaceId,
+    name: &str,
+    kind: RelationKind,
+) -> turso_core::Result<()> {
+    translate_relation_changes(
+        program,
+        ctx.schema,
+        ctx.connection,
+        &[RelationChange::Created {
+            namespace,
+            name,
+            kind,
+            table: None,
+        }],
+    )
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
