@@ -6175,6 +6175,7 @@ dependencies = [
  "tokio",
  "turso",
  "turso_parser",
+ "turso_pg",
  "turso_pg_client",
 ]
 
