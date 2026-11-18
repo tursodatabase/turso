@@ -1960,6 +1960,7 @@ where
 
 /// Walk a SELECT: the tables it reads and all of its expressions, including
 /// subqueries.
+#[turso_macros::grow_stack_when_low]
 pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
     visit_with(select.with.as_ref(), visitor)?;
 
@@ -2035,6 +2036,7 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
     Ok(())
 }
 
+#[turso_macros::grow_stack_when_low]
 fn visit_from_clause<V: AstVisitor>(from_clause: &ast::FromClause, visitor: &mut V) -> Result<()> {
     visit_select_table(&from_clause.select, visitor)?;
 

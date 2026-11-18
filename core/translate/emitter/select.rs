@@ -81,6 +81,7 @@ fn emit_program_for_select_with_inputs(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
+#[turso_macros::grow_stack_when_low]
 pub fn emit_query<'a>(
     program: &mut ProgramBuilder,
     plan: &'a mut SelectPlan,

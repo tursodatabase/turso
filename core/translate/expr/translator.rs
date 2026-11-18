@@ -95,6 +95,7 @@ pub fn resolve_expr(
 
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
+#[turso_macros::grow_stack_when_low]
 pub fn translate_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,

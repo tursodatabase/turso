@@ -61,7 +61,7 @@ nanosecond-bench = ["bench"]
 fts = ["dep:tantivy", "dep:tantivy-common", "dep:serde", "dep:serde_json", "dep:crc32fast"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
-stacker = ["dep:stacker"]
+stacker = []
 percentile = []
 simd = ["dep:simsimd"]
 
@@ -151,7 +151,7 @@ crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
-stacker = { version = "0.1", optional = true }
+stacker = { workspace = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 simsimd = { version = "6.5.3", optional = true }

@@ -100,6 +100,7 @@ fn append_view_column_schema(
         .collect()
 }
 
+#[turso_macros::grow_stack_when_low]
 fn view_source_from_select_table(
     namespace: NamespaceId,
     select_table: &ast::SelectTable,
@@ -282,6 +283,7 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
 /// Collect view sources and validate their NATURAL and USING clauses.
 ///
 /// Stored view metadata must use the same join-column rules as normal name binding.
+#[turso_macros::grow_stack_when_low]
 fn view_sources_from_clause(
     namespace: NamespaceId,
     from: &ast::FromClause,
@@ -506,6 +508,7 @@ fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<St
     *count += 1;
 }
 
+#[turso_macros::grow_stack_when_low]
 fn extract_view_columns_inner(
     namespace: NamespaceId,
     select_stmt: &ast::Select,

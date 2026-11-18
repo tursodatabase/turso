@@ -102,27 +102,19 @@ const GEN_EXPRS: &[GenExpr] = &[
     },
 ];
 
-const WORKER_STACK: usize = 64 << 20;
+const SMALL_STACK: usize = 1 << 20;
 
-fn run_on_big_stack(sql: String) -> turso_core::Result<()> {
-    run_with_stack(WORKER_STACK, vec![sql])
+fn run_on_small_stack(sql: String) -> turso_core::Result<()> {
+    run_with_stack(SMALL_STACK, vec![sql])
 }
 
 fn run_with_stack(stack_size: usize, statements: Vec<String>) -> turso_core::Result<()> {
-    std::thread::Builder::new()
-        .stack_size(stack_size)
-        .spawn(move || -> turso_core::Result<()> {
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-            for sql in &statements {
-                conn.execute(sql)?;
-            }
-            Ok(())
-        })
-        .expect("failed to spawn worker thread")
-        .join()
-        .expect("worker thread panicked while executing expression depth test")
+    on_thread_with_stack(stack_size, move |conn| {
+        for sql in &statements {
+            conn.execute(sql)?;
+        }
+        Ok(())
+    })
 }
 
 #[test]
@@ -130,10 +122,10 @@ fn over_limit_is_a_graceful_depth_error() {
     let expected = format!("Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})");
 
     for gen_expr in GEN_EXPRS {
-        let err = run_on_big_stack((gen_expr.build)(MAX_EXPR_DEPTH)).expect_err(gen_expr.name);
+        let err = run_on_small_stack((gen_expr.build)(MAX_EXPR_DEPTH)).expect_err(gen_expr.name);
         assert_eq!(err.to_string(), expected, "{}: {err:?}", gen_expr.name);
 
-        run_on_big_stack((gen_expr.build)(MAX_EXPR_DEPTH - 1))
+        run_on_small_stack((gen_expr.build)(MAX_EXPR_DEPTH - 1))
             .unwrap_or_else(|err| panic!("{}: under-limit query failed: {err:?}", gen_expr.name));
     }
 }
@@ -192,8 +184,6 @@ fn upsert_with_a_change_check_per_column_runs_on_a_1_mib_stack() {
     run_with_stack(1 << 20, vec![create, upsert.clone(), upsert]).unwrap();
 }
 
-const SMALL_STACK: usize = 1 << 20;
-
 #[test]
 fn long_unary_operator_chains_do_not_overflow_the_stack() {
     let plus_chain = format!("SELECT {}1", "+".repeat(MAX_EXPR_DEPTH - 1));
@@ -212,6 +202,89 @@ fn long_unary_operator_chains_do_not_overflow_the_stack() {
             vec![SqliteValue::Integer(-1)]
         ]
     );
+}
+
+#[test]
+fn nested_subqueries_do_not_overflow_the_stack() {
+    let depth = 500;
+    let query = format!(
+        "SELECT * FROM {}(SELECT 1){}",
+        "(SELECT * FROM ".repeat(depth),
+        ")".repeat(depth)
+    );
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| limbo_exec_rows(conn, &query));
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+}
+
+#[test]
+fn nested_ctes_do_not_overflow_the_stack() {
+    let query = (0..100).fold("SELECT 1".to_string(), |inner, level| {
+        format!("WITH n{level} AS ({inner}) SELECT * FROM n{level}")
+    });
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| limbo_exec_rows(conn, &query));
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+}
+
+#[test]
+fn chain_of_ctes_in_one_with_clause_does_not_overflow_the_stack() {
+    let ctes = (1..300)
+        .map(|level| format!("c{level} AS (SELECT x FROM c{})", level - 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("WITH c0 AS (SELECT 1 AS x), {ctes} SELECT x FROM c299");
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| limbo_exec_rows(conn, &query));
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+}
+
+#[test]
+fn view_over_nested_subqueries_does_not_overflow_the_stack() {
+    let depth = 300;
+    let create_view = format!(
+        "CREATE VIEW v AS SELECT * FROM {}(SELECT 1 AS x){}",
+        "(SELECT * FROM ".repeat(depth),
+        ")".repeat(depth)
+    );
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| {
+        conn.execute(&create_view).unwrap();
+        limbo_exec_rows(conn, "SELECT x FROM v")
+    });
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+}
+
+#[test]
+fn many_different_windows_do_not_overflow_the_stack() {
+    let windows = 200;
+    let columns = (0..windows)
+        .map(|i| format!("sum(x) OVER (ORDER BY x + {i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT count(*) FROM (SELECT {columns} FROM t)");
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| {
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        limbo_exec_rows(conn, &query)
+    });
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+}
+
+#[test]
+fn compound_select_with_many_terms_does_not_overflow_the_stack() {
+    let terms = 1000;
+    let query = vec!["SELECT 1"; terms].join(" UNION ALL ");
+
+    let rows = on_thread_with_stack(SMALL_STACK, move |conn| limbo_exec_rows(conn, &query));
+
+    assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]; terms]);
 }
 
 fn on_thread_with_stack<T: Send + 'static>(

@@ -125,6 +125,7 @@ fn collect_cte_definitions(
 
 /// Collect the table names that a SELECT, its subqueries, and its nested WITH
 /// clauses read in a FROM clause. Used to find the CTEs that a query reads.
+#[turso_macros::grow_stack_when_low]
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     if let Some(with) = &select.with {
         for cte in &with.ctes {
@@ -200,6 +201,7 @@ impl RecursiveRefCounter<'_> {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn count_select(&self, select: &Select, scope: &mut RecursiveRefScope) -> usize {
         let scope_base = scope.len();
         self.push_nested_ctes(select.with.as_ref(), scope);
@@ -269,6 +271,7 @@ impl RecursiveRefCounter<'_> {
         }
     }
 
+    #[turso_macros::grow_stack_when_low]
     fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
         match table {
             ast::SelectTable::Table(name, _, _) => {
@@ -347,6 +350,7 @@ impl RecursiveRefCounter<'_> {
     /// recursive CTE body: direct references to the recursive table in the
     /// arm's FROM clause, and all references reachable from the arm.
     fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
+        #[turso_macros::grow_stack_when_low]
         fn count_direct_in_from_table(
             counter: &RecursiveRefCounter,
             table: &ast::SelectTable,
@@ -395,6 +399,7 @@ impl RecursiveRefCounter<'_> {
     }
 }
 
+#[turso_macros::grow_stack_when_low]
 fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _) => {
@@ -1218,6 +1223,7 @@ fn build_ordered_set_aggregate(
 ///
 /// Each use gets separate table and cursor IDs unless it shares materialized rows.
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::grow_stack_when_low]
 fn plan_cte(
     cte_definition_index: usize,
     cte_definitions: &[CteDefinition],
@@ -1594,6 +1600,7 @@ pub fn plan_ctes_as_outer_refs(
     )
 }
 
+#[turso_macros::grow_stack_when_low]
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,

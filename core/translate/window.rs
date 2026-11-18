@@ -122,6 +122,7 @@ pub fn plan_windows(
     prepare_window_subquery(program, plan, resolver, connection, windows, 0)
 }
 
+#[turso_macros::grow_stack_when_low]
 fn prepare_window_subquery(
     program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,

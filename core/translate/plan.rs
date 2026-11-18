@@ -629,6 +629,7 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
+    #[turso_macros::grow_stack_when_low]
     fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         match self {
             Plan::Select(select_plan) => select_plan.reads_table(namespace, table_name),
@@ -4576,6 +4577,7 @@ impl NonFromClauseSubquery {
 }
 
 /// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
+#[turso_macros::grow_stack_when_low]
 fn eval_at_for_plan(
     plan: &Plan,
     join_order: &[JoinOrderMember],
@@ -4615,6 +4617,7 @@ fn eval_at_for_plan(
 }
 
 /// Returns true if a plan (including compound SELECTs) references outer-scope tables.
+#[turso_macros::grow_stack_when_low]
 pub fn plan_is_correlated(plan: &Plan) -> bool {
     match plan {
         Plan::Select(select_plan) => select_plan.is_correlated(),
@@ -4681,6 +4684,7 @@ fn select_plan_has_outer_scope_dependency_with_tables(
     has_outer_scope_dependency
 }
 
+#[turso_macros::grow_stack_when_low]
 fn plan_has_outer_scope_dependency_with_tables(
     plan: &Plan,
     accessible_table_ids: &mut Vec<TableInternalId>,

@@ -122,6 +122,7 @@ pub fn emit_select_plan(
     Ok(num_result_cols)
 }
 
+#[turso_macros::grow_stack_when_low]
 fn plan_first_virtual_table_name(plan: &Plan) -> Option<String> {
     match plan {
         Plan::Select(select_plan) => select_plan_first_virtual_table_name(select_plan),
@@ -165,6 +166,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+#[turso_macros::grow_stack_when_low]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -1142,6 +1144,7 @@ fn reject_outer_query_refs_in_group_by_expr(
     Ok(())
 }
 
+#[turso_macros::grow_stack_when_low]
 fn reject_outer_scope_refs_inside_plan_tree(
     plan: &Plan,
     current_scope_table_refs: &TableReferences,
@@ -1467,6 +1470,7 @@ fn ordinal(n: usize) -> String {
 }
 
 /// Counts cursors needed to emit a query plan.
+#[turso_macros::grow_stack_when_low]
 fn count_required_cursors_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => count_required_cursors_for_simple_select(select_plan),
@@ -1525,6 +1529,7 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
 }
 
 /// Estimates bytecode instructions needed to emit a query plan.
+#[turso_macros::grow_stack_when_low]
 fn estimate_num_instructions_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_instructions_for_simple_select(select_plan),
@@ -1612,6 +1617,7 @@ fn collect_table_refs_outside_from(
 }
 
 /// Estimates jump labels needed to emit a query plan.
+#[turso_macros::grow_stack_when_low]
 fn estimate_num_labels_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_labels_for_simple_select(select_plan),

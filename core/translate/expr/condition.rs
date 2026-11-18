@@ -266,6 +266,7 @@ pub(super) fn translate_in_list(
 }
 
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
+#[turso_macros::grow_stack_when_low]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
