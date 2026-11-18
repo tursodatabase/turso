@@ -1,7 +1,7 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::catalog::{
-    AfterWrites, Catalog, CatalogWrite, CreateTable, TableText, WriteContext,
+    AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateTable, TableText, WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -12,6 +12,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
+use crate::translate::index::canonical_create_index_sql;
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::util::escape_sql_string_literal;
@@ -34,6 +35,7 @@ impl Catalog for SqliteCatalog {
     ) -> Result<AfterWrites> {
         match change {
             CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
+            CatalogWrite::CreateIndex(index) => emit_create_index_row(program, ctx, index),
         }
     }
 }
@@ -117,6 +119,49 @@ fn table_sql(
         }),
         TableText::Statement(input) => dialect.format_table_sql(input, &name_in_sql, table.body),
     }
+}
+
+/// Writes the row of a new index.
+fn emit_create_index_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    index: &CreateIndex<'_>,
+) -> Result<AfterWrites> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: index.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, index.name);
+    let sql = canonical_create_index_sql(
+        index.statement,
+        resolver.name_in_sql(namespace, index.written_name),
+        resolver.name_in_sql(namespace, index.written_table),
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.map(|x| x.0),
+        SchemaEntryType::Index,
+        &stored_name,
+        &resolver.mangle_name(namespace, index.table),
+        index.root_reg,
+        Some(sql),
+    )?;
+
+    Ok(AfterWrites::parse_sqlite_schema_rows(format!(
+        "name = '{}' AND type = 'index'",
+        escape_sql_string_literal(&stored_name)
+    )))
 }
 
 /// Deletes the row of an index.
@@ -239,6 +284,33 @@ pub(crate) fn emit_delete_index_row(
     }
 
     Ok(())
+}
+
+/// Gives a cursor for writing `sqlite_schema` of the given database its
+/// number, without opening it.
+pub(crate) fn alloc_sqlite_schema_cursor(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+) -> usize {
+    let sqlite_schema = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .expect("every database has sqlite_schema")
+    });
+    program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema))
+}
+
+/// Opens a cursor that [`alloc_sqlite_schema_cursor`] gave a number.
+pub(crate) fn emit_open_sqlite_schema_cursor(
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    database_id: usize,
+) {
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(SQLITE_SCHEMA_ROOT_PAGE),
+        db: database_id,
+    });
 }
 
 /// Deletes every row whose `tbl_name` is the table: its own row and the
