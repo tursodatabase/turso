@@ -7,13 +7,48 @@ expect {
     -2000
 }
 
-# 200 is minimum cache size value, so we test for this
+# The page cache can enforce an internal minimum while retaining the PRAGMA value.
 test pragma-set-cache-size {
     PRAGMA cache_size = 200;
     PRAGMA cache_size
 }
 expect {
     200
+}
+
+test pragma-cache-size-small-positive {
+    PRAGMA cache_size = 5;
+    PRAGMA cache_size;
+}
+expect {
+    5
+}
+
+test pragma-cache-size-small-negative {
+    PRAGMA cache_size = -5;
+    PRAGMA cache_size;
+}
+expect {
+    -5
+}
+
+test pragma-cache-size-zero {
+    PRAGMA cache_size = 0;
+    PRAGMA cache_size;
+}
+expect {
+    0
+}
+
+test pragma-cache-size-large-and-overflow {
+    PRAGMA cache_size = 2147483647;
+    PRAGMA cache_size;
+    PRAGMA cache_size = 2147483648;
+    PRAGMA cache_size;
+}
+expect {
+    2147483647
+    0
 }
 
 # Even though the cache size was set to 100 in previous test, a new connection defaults back to -2000.
@@ -339,6 +374,88 @@ test pragma-max-page-count-set-zero-ignored {
 expect {
     4294967294
     4294967294
+}
+
+test pragma-max-page-count-clamps-overflow {
+    PRAGMA max_page_count = 4294967297;
+    PRAGMA max_page_count;
+}
+expect {
+    4294967294
+    4294967294
+}
+
+test pragma-max-page-count-negative-ignored {
+    PRAGMA max_page_count = 1000;
+    PRAGMA max_page_count = -1;
+    PRAGMA max_page_count;
+}
+expect {
+    1000
+    1000
+    1000
+}
+
+test pragma-max-page-count-float-ignored {
+    PRAGMA max_page_count = 1000;
+    PRAGMA max_page_count = 1.5;
+    PRAGMA max_page_count;
+}
+expect {
+    1000
+    1000
+    1000
+}
+
+test pragma-max-page-count-string-ignored {
+    PRAGMA max_page_count = 1000;
+    PRAGMA max_page_count = 'abc';
+    PRAGMA max_page_count;
+}
+expect {
+    1000
+    1000
+    1000
+}
+
+test pragma-max-page-count-quoted-hex {
+    PRAGMA max_page_count = '0x10';
+    PRAGMA max_page_count;
+}
+expect {
+    16
+    16
+}
+
+test pragma-max-page-count-decimal-too-large-ignored {
+    PRAGMA max_page_count = 1000;
+    PRAGMA max_page_count = 999999999999999999999999;
+    PRAGMA max_page_count;
+}
+expect {
+    1000
+    1000
+    1000
+}
+
+test pragma-max-page-count-quoted-whitespace {
+    PRAGMA max_page_count = ' 12 ';
+    PRAGMA max_page_count;
+}
+expect {
+    12
+    12
+}
+
+test pragma-max-page-count-signed-hex-ignored {
+    PRAGMA max_page_count = 1000;
+    PRAGMA max_page_count = 0xffffffffffffffff;
+    PRAGMA max_page_count;
+}
+expect {
+    1000
+    1000
+    1000
 }
 
 test pragma-integrity-check-empty {
