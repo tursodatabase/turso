@@ -1,4 +1,6 @@
-use crate::dialect::RelationChange;
+use crate::dialect::{
+    AutomaticIndex, CatalogWrite, CreateTable, RelationChange, TableText, WriteContext,
+};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -1182,11 +1184,6 @@ pub fn translate_create_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
-    let tbl_name_in_sql = ast::QualifiedName {
-        namespace: None,
-        name: resolver.name_in_sql(namespace, &tbl_name.name),
-        alias: None,
-    };
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1367,32 +1364,6 @@ pub fn translate_create_table(
         false
     };
 
-    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, let
-    // the schema dialect format the SQL to store (the SQLite dialect renders
-    // canonical text from the AST, a frontend dialect preserves its own
-    // input text).
-    // The resolver's dialect is the one the statement was parsed with: the
-    // engine's own for an engine schema statement, which stores plain SQLite
-    // text, the connection's otherwise.
-    let sql = if let Some(ref info) = ctas_info {
-        info.schema_sql.clone()
-    } else if bound_sequence_names {
-        resolver
-            .catalog
-            .dialect
-            .format_rewritten_table_sql(&ast::Stmt::CreateTable {
-                temporary,
-                if_not_exists,
-                tbl_name: tbl_name_in_sql,
-                body: body.clone(),
-            })?
-    } else {
-        resolver
-            .catalog
-            .dialect
-            .format_table_sql(input, &tbl_name_in_sql, &body)?
-    };
-
     let parse_schema_label = program.allocate_label();
 
     let table_root_reg = program.alloc_register();
@@ -1445,49 +1416,42 @@ pub fn translate_create_table(
         }
     }
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
-    )?;
-
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        cdc_table.as_ref().map(|x| x.0),
-        SchemaEntryType::Table,
-        &mangled_tbl_name,
-        &mangled_tbl_name,
-        table_root_reg,
-        Some(sql),
-    )?;
-
-    let mut autoindex_names = vec![];
-    if let Some(index_regs) = index_regs {
-        for (idx, index_reg) in index_regs.into_iter().enumerate() {
-            let index_name = format!(
+    let automatic_indexes: Vec<AutomaticIndex> = index_regs
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(idx, root_reg)| AutomaticIndex {
+            name: format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
                 mangled_tbl_name,
                 idx + 1
-            );
-            emit_schema_entry(
-                program,
-                resolver,
-                sqlite_schema_cursor_id,
-                None,
-                SchemaEntryType::Index,
-                &index_name,
-                &mangled_tbl_name,
-                index_reg,
-                None,
-            )?;
-            autoindex_names.push(index_name);
-        }
-    }
+            ),
+            root_reg,
+        })
+        .collect();
+    let text = if let Some(ref info) = ctas_info {
+        TableText::FromSelect(&info.schema_sql)
+    } else if bound_sequence_names {
+        TableText::Rewritten
+    } else {
+        TableText::Statement(input)
+    };
+    let write_context = WriteContext::new(connection, resolver, database_id);
+    let after_writes = resolver.catalog.dialect.catalog().write(
+        program,
+        &write_context,
+        &CatalogWrite::CreateTable(CreateTable {
+            namespace: namespace.id,
+            name: &normalized_tbl_name,
+            written_name: &tbl_name.name,
+            temporary,
+            if_not_exists,
+            body: &body,
+            text,
+            root_reg: table_root_reg,
+            automatic_indexes: &automatic_indexes,
+        }),
+    )?;
 
     if dialect_relation_hooks_apply(connection, database_id)? {
         let mut changes = vec![RelationChange::Created {
@@ -1496,10 +1460,10 @@ pub fn translate_create_table(
             kind: RelationKind::Table,
             table: None,
         }];
-        for index_name in &autoindex_names {
+        for index in &automatic_indexes {
             changes.push(RelationChange::Created {
                 namespace: namespace.id,
-                name: index_name,
+                name: &index.name,
                 kind: RelationKind::Index,
                 table: Some(&normalized_tbl_name),
             });
@@ -1526,6 +1490,7 @@ pub fn translate_create_table(
                 .is_some()
         });
         if !already_exists {
+            let sqlite_schema_cursor_id = write_context.sqlite_schema_cursor(program);
             crate::translate::sequence::emit_sequence_backing_table(
                 program,
                 resolver,
@@ -1550,28 +1515,11 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    let escaped_tbl_name = escape_sql_string_literal(&mangled_tbl_name);
-    let mut parse_schema_where_clause = String::with_capacity(
-        "tbl_name = '' AND type != 'trigger'".len()
-            + escaped_tbl_name.len()
-            + if created_sequence_table {
-                " OR tbl_name = 'sqlite_sequence'".len()
-            } else {
-                0
-            },
+    after_writes.emit(
+        program,
+        database_id,
+        created_sequence_table.then_some("tbl_name = 'sqlite_sequence'"),
     );
-    parse_schema_where_clause.push_str("tbl_name = '");
-    parse_schema_where_clause.push_str(&escaped_tbl_name);
-    parse_schema_where_clause.push_str("' AND type != 'trigger'");
-    if created_sequence_table {
-        parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
-    }
-
-    program.emit_insn(Insn::ParseSchema {
-        db: database_id,
-        where_clause: Some(parse_schema_where_clause),
-        trigger_target_database_id: None,
-    });
 
     // For CTAS, emit bytecode to populate the new table from the SELECT
     if let Some(info) = ctas_info {
