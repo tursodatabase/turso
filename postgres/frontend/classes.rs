@@ -477,6 +477,13 @@ impl Catalog for PostgresCatalog {
                 view.name,
                 RelationKind::View,
             )?,
+            CatalogWrite::CreateMaterializedView(view) => write_created_view_class_row(
+                program,
+                ctx,
+                view.namespace,
+                view.name,
+                RelationKind::MaterializedView,
+            )?,
         }
         Ok(after_writes)
     }
