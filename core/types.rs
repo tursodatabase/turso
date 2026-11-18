@@ -8,9 +8,9 @@ use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
-use crate::numeric::format_float;
 use crate::numeric::nonnan::NonNan;
 use crate::numeric::Numeric;
+use crate::numeric::{format_float, IntegerText};
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -45,6 +45,76 @@ pub enum ValueType {
     Text,
     Blob,
     Error,
+}
+
+/// What a STRICT column of a plain type stores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrictType {
+    /// INTEGER, INT, REAL, TEXT or BLOB: only values of this storage class.
+    Stores(StorageClass),
+    /// ANY: every value, unchanged.
+    Any,
+}
+
+impl StrictType {
+    /// The STRICT column type named `type_name`, which may be quoted as a
+    /// whole like `"INT"`. None for a name a STRICT table refuses, such as
+    /// FLOAT.
+    pub fn named(type_name: &str) -> Option<Self> {
+        let name = crate::util::strip_type_name_quotes(type_name).unwrap_or(type_name);
+        turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
+            b"INTEGER" | b"INT" => Some(Self::Stores(StorageClass::Integer)),
+            b"REAL" => Some(Self::Stores(StorageClass::Real)),
+            b"BLOB" => Some(Self::Stores(StorageClass::Blob)),
+            b"TEXT" => Some(Self::Stores(StorageClass::Text)),
+            b"ANY" => Some(Self::Any),
+            _ => None,
+        })
+    }
+
+    /// The type name a STRICT column of this type is declared with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stores(StorageClass::Integer) => "INTEGER",
+            Self::Stores(StorageClass::Real) => "REAL",
+            Self::Stores(StorageClass::Text) => "TEXT",
+            Self::Stores(StorageClass::Blob) => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
+}
+
+/// A storage class other than NULL: the kind of value a STRICT column of
+/// type INTEGER, REAL, TEXT or BLOB holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StorageClass {
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl StorageClass {
+    pub fn value_type(self) -> ValueType {
+        match self {
+            Self::Integer => ValueType::Integer,
+            Self::Real => ValueType::Float,
+            Self::Text => ValueType::Text,
+            Self::Blob => ValueType::Blob,
+        }
+    }
+
+    /// The affinity of a column of this type: what turns '5' into 5 for
+    /// INTEGER and 5 into 5.0 for REAL.
+    pub fn affinity(self) -> crate::vdbe::affinity::Affinity {
+        use crate::vdbe::affinity::Affinity;
+        match self {
+            Self::Integer => Affinity::Integer,
+            Self::Real => Affinity::Real,
+            Self::Text => Affinity::Text,
+            Self::Blob => Affinity::Blob,
+        }
+    }
 }
 
 impl Display for ValueType {
@@ -483,7 +553,7 @@ impl From<Text> for String {
 pub type ValueBlob = crate::alloc::Vec<u8>;
 
 #[inline]
-pub(crate) fn value_blob_from_slice(
+pub fn value_blob_from_slice(
     bytes: &[u8],
 ) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
     bytes.try_to_vec()
@@ -866,7 +936,7 @@ impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, ""),
-            Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            Self::Numeric(Numeric::Integer(i)) => f.write_str(IntegerText::new(*i).as_str()),
             Self::Numeric(Numeric::Float(fl)) => f.write_str(&format_float(f64::from(*fl))),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
@@ -885,7 +955,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+    pub fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
         match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
@@ -1450,54 +1520,30 @@ mod immutable_record {
         write_varint(out, value)
     }
 
-    /// Writes the bytes of `value` for `serial_type` at the start of `out`
-    /// and returns how many it wrote.
+    /// Appends the bytes of `value` for `serial_type` to `out`.
     #[inline(always)]
-    fn write_value(out: &mut [u8], value: ValueRef<'_>, serial_type: SerialType) -> usize {
-        let bytes: &[u8] = match value {
-            ValueRef::Null => return 0,
-            ValueRef::Numeric(Numeric::Integer(i)) => {
-                return match serial_type.kind() {
-                    SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => 0,
-                    SerialTypeKind::I8 => {
-                        out[0] = i as u8;
-                        1
-                    }
-                    SerialTypeKind::I16 => {
-                        out[..2].copy_from_slice(&(i as i16).to_be_bytes());
-                        2
-                    }
-                    // Without the most significant byte.
-                    SerialTypeKind::I24 => {
-                        out[..3].copy_from_slice(&(i as i32).to_be_bytes()[1..]);
-                        3
-                    }
-                    SerialTypeKind::I32 => {
-                        out[..4].copy_from_slice(&(i as i32).to_be_bytes());
-                        4
-                    }
-                    // Without the two most significant bytes.
-                    SerialTypeKind::I48 => {
-                        out[..6].copy_from_slice(&i.to_be_bytes()[2..]);
-                        6
-                    }
-                    SerialTypeKind::I64 => {
-                        out[..8].copy_from_slice(&i.to_be_bytes());
-                        8
-                    }
-                    other => panic!("Serial type is not an integer: {other:?}"),
-                };
-            }
+    fn append_value(out: &mut ValueBlob, value: ValueRef<'_>, serial_type: SerialType) {
+        match value {
+            ValueRef::Null => {}
+            ValueRef::Numeric(Numeric::Integer(i)) => match serial_type.kind() {
+                SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
+                SerialTypeKind::I8 => out.push(i as u8),
+                SerialTypeKind::I16 => out.extend_from_slice(&(i as i16).to_be_bytes()),
+                // Without the most significant byte.
+                SerialTypeKind::I24 => out.extend_from_slice(&(i as i32).to_be_bytes()[1..]),
+                SerialTypeKind::I32 => out.extend_from_slice(&(i as i32).to_be_bytes()),
+                // Without the two most significant bytes.
+                SerialTypeKind::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]),
+                SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
+                other => panic!("Serial type is not an integer: {other:?}"),
+            },
             ValueRef::Numeric(Numeric::Float(f)) => {
                 let fval: f64 = f.into();
-                out[..8].copy_from_slice(&fval.to_be_bytes());
-                return 8;
+                out.extend_from_slice(&fval.to_be_bytes());
             }
-            ValueRef::Text(t) => t.value.as_bytes(),
-            ValueRef::Blob(b) => b,
-        };
-        out[..bytes.len()].copy_from_slice(bytes);
-        bytes.len()
+            ValueRef::Text(t) => out.extend_from_slice(t.value.as_bytes()),
+            ValueRef::Blob(b) => out.extend_from_slice(b),
+        }
     }
 
     #[inline(always)]
@@ -1936,21 +1982,23 @@ mod immutable_record {
                 return Err(LimboError::TooBig);
             }
             buf.try_reserve_exact(total_size)?;
-            buf.resize(total_size, 0);
+            // Only the header is zeroed before the writing pass. The values
+            // are appended after it, so the bytes of a large text or blob are
+            // written once.
+            buf.resize(header_size, 0);
 
             // Writing pass: each serial type goes into the header and each
             // value after it, the varints straight into their place.
             let mut header_pos = write_short_varint(&mut buf[..header_size], header_size as u64);
-            let mut value_pos = header_size;
             for value in values {
                 let value = value.as_value_ref();
                 let serial_type = SerialType::from(value);
                 header_pos +=
                     write_short_varint(&mut buf[header_pos..header_size], serial_type.into());
-                value_pos += write_value(&mut buf[value_pos..], value, serial_type);
+                append_value(&mut buf, value, serial_type);
             }
             crate::turso_assert!(
-                header_pos == header_size && value_pos == total_size,
+                header_pos == header_size && buf.len() == total_size,
                 "record sizing pass and writing pass disagree"
             );
             Ok(Self {
@@ -1987,7 +2035,9 @@ mod immutable_record {
             &self.payload
         }
 
-        #[inline]
+        // The sorter and the MVCC cursors call this once per row. The
+        // compiler inlines it into Sorter::next only in some builds.
+        #[inline(always)]
         #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
             let blob = self.as_blob_mut();

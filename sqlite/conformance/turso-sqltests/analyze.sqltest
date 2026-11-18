@@ -146,7 +146,7 @@ test analyze-table-without-rowid-fails {
     ANALYZE tbl;
 }
 expect error {
-    Parse error: ANALYZE on tables without rowid is not supported
+    ANALYZE on tables without rowid is not supported
 }
 
 # This test will fail if a ColumnRange opcode incorrectly collapses Column opcodes where the nth consecutive Column

@@ -1630,7 +1630,7 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
@@ -1755,7 +1755,7 @@ struct PendingRead {
 /// Test-only deterministic spill-yield injector for `Pager::read_page`. When
 /// armed, the next matching call (after `skip` ignored matches) returns
 /// `IO(yield)` once, then disarms itself.
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 struct SpillYieldHook {
     /// `-1` = disarmed; otherwise the `page_idx` to fire on.
     target: std::sync::atomic::AtomicI64,
@@ -1763,7 +1763,7 @@ struct SpillYieldHook {
     skip: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 impl SpillYieldHook {
     const fn new() -> Self {
         Self {
@@ -1943,7 +1943,7 @@ impl Pager {
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             pages_dirtied_count: AtomicU64::new(0),
@@ -3296,6 +3296,16 @@ impl Pager {
         self.wal.as_ref().map(|wal| wal.backfill_frame())
     }
 
+    /// The write-ahead log of this pager, or `None` if there is no WAL.
+    pub fn wal(&self) -> Option<&Arc<dyn Wal>> {
+        self.wal.as_ref()
+    }
+
+    /// Number of the last frame in the WAL, or `None` if there is no WAL.
+    pub fn wal_max_frame(&self) -> Option<u64> {
+        self.wal.as_ref().map(|wal| wal.get_max_frame_in_wal())
+    }
+
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
@@ -3672,7 +3682,7 @@ impl Pager {
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
         }
@@ -3814,9 +3824,16 @@ impl Pager {
 
     /// Test-only: arm `read_page` to return `IO(yield)` once for `page_id`
     /// after `skip` matching calls have passed through.
-    #[cfg(test)]
-    pub(crate) fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn arm_spill_yield_on_read(&self, page_id: i64, skip: usize) {
         self.spill_yield.arm(page_id, skip);
+    }
+
+    /// Whether the page is in the page cache. Unlike `cache_get`, this never removes the page.
+    pub fn cache_contains(&self, page_idx: usize) -> bool {
+        self.page_cache
+            .read()
+            .contains_key(&PageCacheKey::new(page_idx))
     }
 
     // Get a page from the cache, if it exists.
@@ -5470,7 +5487,7 @@ impl Pager {
     /// Test-only: evict clean, unpinned pages WITHOUT invalidating cursors, so we
     /// can exercise what happens to a cursor that still holds a `PageRef` to an
     /// evicted (buffer-taken) page — the exact hazard normal LRU eviction creates.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn test_evict_all_unpinned_clean(&self) {
         self.page_cache.write().test_evict_all_unpinned_clean();
     }
@@ -5845,54 +5862,15 @@ impl Pager {
             tracing::debug!("allocate_page(state={:?})", state);
             match &mut *state {
                 AllocatePageState::Start => {
-                    let old_db_size = header.database_size.get();
-                    #[cfg(feature = "autovacuum")]
-                    let mut new_db_size = old_db_size;
-                    #[cfg(not(feature = "autovacuum"))]
-                    let new_db_size = old_db_size;
-
-                    tracing::debug!("allocate_page(database_size={})", new_db_size);
-                    #[cfg(feature = "autovacuum")]
-                    {
-                        //  If the following conditions are met, allocate a pointer map page, add to cache and increment the database size
-                        //  - autovacuum is enabled
-                        //  - the last page is a pointer map page
-                        if matches!(
-                            AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
-                            AutoVacuumMode::Full
-                        ) && is_ptrmap_page(new_db_size + 1, header.page_size.get() as usize)
-                        {
-                            // we will allocate a ptrmap page, so increment size
-                            new_db_size += 1;
-                            // Make the ptrmap allocation idempotent across
-                            // spill-yield re-entries: only allocate + insert
-                            // if the cache doesn't already contain it. The
-                            // read-then-write pattern is safe because
-                            // `allocate_page` holds the only writer for
-                            // `database_size`/`freelist_trunk_page`; no
-                            // concurrent caller can race in between.
-                            let page_key = PageCacheKey::new(new_db_size as usize);
-                            let already_present = {
-                                let cache = self.page_cache.read();
-                                cache.contains_key(&page_key)
-                            };
-                            if !already_present {
-                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
-                                self.add_dirty(&page)?;
-                                self.page_cache.write().force_insert_page(page_key, page)?;
-                            }
-                        }
-                    }
+                    let current_db_size = header.database_size.get();
+                    tracing::debug!("allocate_page(database_size={})", current_db_size);
 
                     let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
                     if first_freelist_trunk_page_id == 0 {
-                        *state = AllocatePageState::AllocateNewPage {
-                            current_db_size: new_db_size,
-                        };
+                        *state = AllocatePageState::AllocateNewPage { current_db_size };
                         continue;
                     }
-                    // Spill yield routes back through `Start`; the ptrmap
-                    // allocation above is idempotent and `trunk_page.pin()`
+                    // Spill yield routes back through `Start`; `trunk_page.pin()`
                     // happens only after `Done`, so no double-pin.
                     let (trunk_page, c) =
                         return_if_io!(self.read_page(first_freelist_trunk_page_id as i64));
@@ -6042,16 +6020,25 @@ impl Pager {
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
 
+                    // As in SQLite's allocateBtreePage, a pointer map page is only created
+                    // when the file grows: if the next page is a pointer map page, it is
+                    // allocated too and the page after it is returned.
+                    #[cfg(feature = "autovacuum")]
+                    let mut ptrmap_page_id = None;
+                    #[cfg(feature = "autovacuum")]
+                    if matches!(
+                        AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
+                        AutoVacuumMode::Full
+                    ) && is_ptrmap_page(new_db_size, header.page_size.get() as usize)
+                    {
+                        ptrmap_page_id = Some(new_db_size);
+                        new_db_size += 1;
+                    }
+
                     // if new_db_size reaches the pending page, we need to allocate a new one
-                    if Some(new_db_size) == self.pending_byte_page_id() {
-                        let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
-                        self.add_dirty(&richard_hipp_special_page)?;
-                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
-                        self.page_cache
-                            .write()
-                            .force_insert_page(page_key, richard_hipp_special_page)?;
-                        // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
+                    let pending_byte_page_id = self.pending_byte_page_id();
+                    let skips_pending_byte_page = Some(new_db_size) == pending_byte_page_id;
+                    if skips_pending_byte_page {
                         new_db_size += 1;
                     }
 
@@ -6059,6 +6046,25 @@ impl Pager {
                     let max_page_count = self.get_max_page_count();
                     if new_db_size > max_page_count {
                         return Err(LimboError::DatabaseFull.into());
+                    }
+
+                    #[cfg(feature = "autovacuum")]
+                    if let Some(ptrmap_page_id) = ptrmap_page_id {
+                        let page = allocate_new_page(ptrmap_page_id as i64, &self.buffer_pool);
+                        self.add_dirty(&page)?;
+                        let page_key = PageCacheKey::new(ptrmap_page_id as usize);
+                        self.page_cache.write().force_insert_page(page_key, page)?;
+                    }
+
+                    if skips_pending_byte_page {
+                        // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
+                        let richard_hipp_special_page =
+                            allocate_new_page((new_db_size - 1) as i64, &self.buffer_pool);
+                        self.add_dirty(&richard_hipp_special_page)?;
+                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
+                        self.page_cache
+                            .write()
+                            .force_insert_page(page_key, richard_hipp_special_page)?;
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
@@ -6581,6 +6587,7 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
+    use crate::security::roles::SessionRole;
     use crate::sync::Arc;
 
     use crate::sync::RwLock;
@@ -6601,8 +6608,10 @@ mod tests {
     fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
         let io = Arc::new(MemoryIO::new());
         let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
@@ -6820,137 +6829,6 @@ mod tests {
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id(), 1);
     }
-
-    #[test]
-    fn rollback_keeps_pages_the_transaction_did_not_change() {
-        let (db, conn) = open_memory_database("rollback-keeps-unchanged-pages.db");
-        conn.execute("CREATE TABLE changed(x)").unwrap();
-        conn.execute("CREATE TABLE unchanged(x)").unwrap();
-        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
-        conn.execute("INSERT INTO unchanged VALUES (1)").unwrap();
-        let changed_root = root_page(&conn, "changed");
-        let unchanged_root = root_page(&conn, "unchanged");
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
-        let pager = conn.pager.load();
-        let cached_unchanged_root = pager.cache_get(unchanged_root).unwrap().unwrap();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO changed VALUES (2)").unwrap();
-        conn.execute("ROLLBACK").unwrap();
-
-        assert!(!pager
-            .page_cache
-            .write()
-            .contains_key(&PageCacheKey::new(changed_root)));
-        let unchanged_root_after_rollback = pager.cache_get(unchanged_root).unwrap().unwrap();
-        assert!(Arc::ptr_eq(
-            &cached_unchanged_root,
-            &unchanged_root_after_rollback
-        ));
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM changed"), 1);
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unchanged"), 1);
-        drop(db);
-    }
-
-    #[test]
-    fn rollback_drops_pages_spilled_to_the_wal() {
-        let (db, conn) = open_memory_database("rollback-drops-spilled-pages.db");
-        conn.execute("PRAGMA cache_size = 200").unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 500)")
-            .unwrap();
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
-        let pager = conn.pager.load();
-        let wal = pager.wal.as_ref().unwrap();
-        let committed_max_frame = wal.get_max_frame();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("UPDATE t SET x = randomblob(1000)").unwrap();
-        conn.execute("INSERT INTO t SELECT randomblob(1000) FROM generate_series(1, 1000)")
-            .unwrap();
-        assert!(
-            wal.get_max_frame() > committed_max_frame,
-            "the transaction must spill pages to the WAL"
-        );
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 1500);
-        conn.execute("ROLLBACK").unwrap();
-
-        assert_eq!(wal.get_max_frame(), committed_max_frame);
-        let mut cache = pager.page_cache.write();
-        for key in cache.keys() {
-            let page = cache.peek(&key, false).unwrap();
-            assert!(!page.is_dirty());
-            assert!(!page.has_wal_tag() || page.wal_tag_pair().0 <= committed_max_frame);
-        }
-        drop(cache);
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM t"), 500);
-        let mut integrity_check = conn.prepare("PRAGMA integrity_check").unwrap();
-        assert_eq!(
-            integrity_check.run_collect_rows().unwrap(),
-            vec![vec![crate::Value::build_text("ok")]]
-        );
-        drop(db);
-    }
-
-    #[test]
-    fn rollback_drops_pinned_pages_that_are_not_loaded() {
-        let (db, conn) = open_memory_database("rollback-drops-pinned-unloaded-pages.db");
-        conn.execute("CREATE TABLE changed(x)").unwrap();
-        conn.execute("CREATE TABLE unloaded(x)").unwrap();
-        conn.execute("INSERT INTO unloaded VALUES (1)").unwrap();
-        let unloaded_root = root_page(&conn, "unloaded");
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
-        let pager = conn.pager.load();
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO changed VALUES (1)").unwrap();
-        let page = pager.cache_get(unloaded_root).unwrap().unwrap();
-        page.pin();
-        page.clear_loaded();
-        conn.execute("ROLLBACK").unwrap();
-
-        assert!(!pager
-            .page_cache
-            .write()
-            .contains_key(&PageCacheKey::new(unloaded_root)));
-        assert_eq!(query_i64(&conn, "SELECT count(*) FROM unloaded"), 1);
-        drop(db);
-    }
-
-    #[test]
-    #[should_panic(expected = "rollback must discard pages while holding the WAL write lock")]
-    fn rollback_without_the_write_lock_panics() {
-        let (_db, conn) = open_memory_database("rollback-without-write-lock.db");
-        conn.execute("CREATE TABLE t(x)").unwrap();
-
-        conn.pager.load().rollback(false, &conn, true);
-    }
-
-    fn open_memory_database(path: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = crate::Database::open_file(io, path, Arc::new(crate::SqliteDialect)).unwrap();
-        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
-        (db, conn)
-    }
-
-    fn root_page(conn: &Arc<crate::Connection>, table: &str) -> usize {
-        query_i64(
-            conn,
-            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{table}'"),
-        ) as usize
-    }
-
-    fn query_i64(conn: &Arc<crate::Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-        match rows.as_slice() {
-            [row] => match row.as_slice() {
-                [crate::Value::Numeric(crate::Numeric::Integer(value))] => *value,
-                other => panic!("expected one integer, got {other:?}"),
-            },
-            other => panic!("expected one row, got {other:?}"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -7138,6 +7016,53 @@ mod ptrmap_tests {
             .unwrap();
         assert_eq!(entry.entry_type, PtrmapType::RootPage);
         assert_eq!(entry.parent_page_no, 0);
+    }
+
+    #[test]
+    fn freelist_reuse_at_ptrmap_boundary_does_not_create_ptrmap_page() {
+        let page_size = 4096;
+        // Pages 1..=821: header, ptrmap page 2 and 819 root pages. Page 822 is the next ptrmap page.
+        let pager = test_pager_setup(page_size, 819);
+        assert!(is_ptrmap_page(822, page_size as usize));
+        run_until_done(|| pager.free_page(None, 50), &pager).unwrap();
+
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        assert_eq!(page.get().id(), 50);
+
+        let database_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size))
+            .unwrap()
+            .get();
+        assert_eq!(database_size, 821);
+        let max_dirty_page = pager.dirty_pages.read().max().unwrap();
+        assert!(
+            max_dirty_page <= database_size,
+            "dirty page {max_dirty_page} is beyond database_size {database_size}"
+        );
+
+        // When the file grows, the ptrmap page is created and the page after it is returned.
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        assert_eq!(page.get().id(), 823);
+        assert!(pager.dirty_pages.read().contains(822));
+        let database_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size))
+            .unwrap()
+            .get();
+        assert_eq!(database_size, 823);
+    }
+
+    #[test]
+    fn database_full_at_ptrmap_boundary_does_not_create_ptrmap_page() {
+        let page_size = 4096;
+        // Pages 1..=821: header, ptrmap page 2 and 819 root pages. Page 822 is the next ptrmap page.
+        let pager = test_pager_setup(page_size, 819);
+        run_until_done(|| pager.set_max_page_count(822), &pager).unwrap();
+
+        let result = run_until_done(|| pager.allocate_page(), &pager);
+        assert!(matches!(result, Err(LimboError::DatabaseFull)));
+        assert!(!pager.dirty_pages.read().contains(822));
     }
 
     #[test]
@@ -7355,13 +7280,14 @@ mod ptrmap_tests {
 mod checkpoint_phase_tests {
     use super::*;
     use crate::io::{PlatformIO, IO};
+    use crate::security::roles::SessionRole;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -7396,7 +7322,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         (db, dir)
@@ -7414,7 +7340,9 @@ mod checkpoint_phase_tests {
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();

@@ -1,5 +1,5 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -10,6 +10,7 @@ use turso_core::{
 };
 
 use crate::common::{rng_from_time, ExecRows, TempDatabase};
+use turso_core::SessionRole;
 
 // TODO: mvcc
 #[turso_macros::test()]
@@ -341,6 +342,55 @@ fn test_wal_insert_frame_without_session_does_not_overwrite_committed_frames() {
     assert!(matches!(insert, Err(LimboError::TxError(_))), "{insert:?}");
     let rows: Vec<(i64,)> = db.connect_limbo().exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows, [(3,)]);
+}
+
+#[test]
+fn wal_get_frame_returns_uncommitted_frame() {
+    let db = TempDatabase::new_empty();
+    let writer = db.connect_limbo();
+    let reader = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer.execute("PRAGMA cache_size = 100").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t SELECT randomblob(3000) FROM generate_series(1, 1000)")
+        .unwrap();
+    let _: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    let max_frame = reader.wal_state().unwrap().max_frame;
+    let mut frame = [0u8; 24 + 4096];
+    let read = reader.wal_get_frame(max_frame + 1, &mut frame);
+    assert!(
+        read.is_err(),
+        "max_frame={max_frame}, uncommitted frame {}: {read:?}",
+        max_frame + 1
+    );
+    assert!(reader.wal_get_frame(0, &mut frame).is_err());
+    reader.wal_get_frame(max_frame, &mut frame).unwrap();
+}
+
+#[test]
+fn wal_get_frame_after_wal_restart_does_not_return_uncommitted_frame() {
+    let db = TempDatabase::new_empty();
+    let writer = db.connect_limbo();
+    let reader = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer
+        .execute("INSERT INTO t SELECT randomblob(3000) FROM generate_series(1, 20)")
+        .unwrap();
+    let _: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    let max_frame = reader.wal_state().unwrap().max_frame;
+    assert!(max_frame > 0);
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("PRAGMA cache_size = 100").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t SELECT randomblob(3000) FROM generate_series(1, 1000)")
+        .unwrap();
+    let mut frame = [0u8; 24 + 4096];
+    for frame_no in 1..=max_frame {
+        let read = reader.wal_get_frame(frame_no, &mut frame);
+        assert!(read.is_err(), "uncommitted frame {frame_no}: {read:?}");
+    }
 }
 
 // TODO: mvcc
@@ -927,7 +977,9 @@ fn test_db_share_same_file() {
             .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
-    let conn1 = db1.connect(ConnectOpts::new()).unwrap();
+    let conn1 = db1
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn1.wal_auto_actions_disable();
 
     conn1.execute("create table a(x, y)").unwrap();
@@ -952,7 +1004,9 @@ fn test_db_share_same_file() {
             .wal_path(format!("{}-wal-copy", path.to_str().unwrap())),
     )
     .unwrap();
-    let conn2 = db2.connect(ConnectOpts::new()).unwrap();
+    let conn2 = db2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn2.wal_auto_actions_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();
@@ -1066,7 +1120,9 @@ fn wal_insert_end_syncs_committed_frames() {
         let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
         let db = turso_core::Database::open_file(io.clone(), "target.db", Arc::new(SqliteDialect))
             .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("PRAGMA synchronous = FULL").unwrap();
         let mut frame = [0u8; 24 + 4096];
         conn.wal_insert_begin().unwrap();
@@ -1076,7 +1132,7 @@ fn wal_insert_end_syncs_committed_frames() {
         }
         conn.wal_insert_end(force_commit).unwrap();
         let rows: Vec<(i64,)> = db
-            .connect(ConnectOpts::new())
+            .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
             .exec_rows("SELECT count(*) FROM t");
         assert_eq!(rows, [(1,)]);
@@ -1123,7 +1179,12 @@ fn wal_insert_end_drops_frames_of_concurrent_writer() {
     while !updates.is_finished() {
         if session.wal_insert_begin().is_ok() {
             let _: Vec<(i64,)> = session.exec_rows("SELECT count(*) FROM big WHERE length(x) > 0");
-            session.wal_insert_end(false).unwrap();
+            // The session is already over when `Busy` comes back: it is the
+            // read lock for the schema cookie check, which can lose to the writer.
+            match session.wal_insert_end(false) {
+                Ok(()) | Err(LimboError::Busy) => {}
+                Err(err) => panic!("wal_insert_end failed: {err:?}"),
+            }
         }
     }
     updates.join().unwrap();
@@ -1179,7 +1240,9 @@ fn wal_get_frame_does_not_write_into_buffer_after_it_returns_error() {
     });
     let db =
         turso_core::Database::open_file(io.clone(), "repro.db", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     let mut frame = [0u8; 24 + 4096];
     io.fail_next_step

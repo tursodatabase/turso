@@ -1,0 +1,139 @@
+# Date and time types that tursopg refuses.
+#
+# tursopg refuses date, time, timetz and interval, arrays of every date and
+# time type, and the keywords and functions that return a refused type. Each
+# test shows PostgreSQL's answer; remove a test's `expect @tursopg error`
+# block once tursopg supports that type.
+
+@database :memory:
+
+test date-column {
+    CREATE TABLE t (a date);
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT a FROM t;
+}
+expect {
+    2024-01-01
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+test interval-cast {
+    SELECT '1 day 2 hours'::interval;
+}
+expect {
+    1 day 02:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
+
+test timetz-typed-literal {
+    SELECT time with time zone '10:00:00+05';
+}
+expect {
+    10:00:00+05
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "timetz" is not supported
+}
+
+test domain-over-date {
+    CREATE DOMAIN d AS date;
+    SELECT '2024-01-01'::d;
+}
+expect {
+    2024-01-01
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+test localtime-returns-time {
+    SELECT localtime IS NOT NULL;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+test current-time-returns-timetz {
+    SELECT current_time IS NOT NULL;
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "timetz" is not supported
+}
+
+test current-timestamp-returns-timestamptz {
+    SELECT 'ok' WHERE CURRENT_TIMESTAMP IS NOT NULL;
+}
+expect {
+    ok
+}
+
+test localtimestamp-returns-timestamp {
+    SELECT 'ok' WHERE LOCALTIMESTAMP IS NOT NULL;
+}
+expect {
+    ok
+}
+
+test make-date-returns-date {
+    SELECT make_date(2024, 1, 1);
+}
+expect {
+    2024-01-01
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+test timestamp-array-column {
+    CREATE TABLE t (a timestamp[]);
+    INSERT INTO t VALUES ('{"2024-01-01 08:00:00"}');
+    SELECT a FROM t;
+}
+expect {
+    {"2024-01-01 08:00:00"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "timestamp\[\]" is not supported
+}
+
+test timestamptz-array-cast {
+    SELECT '{"2024-01-01 08:00:00+00"}'::timestamptz[];
+}
+expect {
+    {"2024-01-01 08:00:00+00"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "timestamptz\[\]" is not supported
+}
+
+test timestamptz-array-column-by-internal-name {
+    CREATE TABLE t (a _timestamptz);
+    INSERT INTO t VALUES ('{"2024-01-01 08:00:00+00"}');
+    SELECT a FROM t;
+}
+expect {
+    {"2024-01-01 08:00:00+00"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "_timestamptz" is not supported
+}

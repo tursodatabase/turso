@@ -1008,6 +1008,9 @@ impl<'a> Parser<'a> {
 
     fn parse_vtab_arg(&mut self) -> Result<String> {
         let start_idx = self.offset();
+        // Like SQLite, an argument ends at its last token, so whitespace and
+        // comments before the next comma or `)` are not part of it.
+        let mut end_idx = start_idx;
 
         loop {
             match self.peek_no_eof()?.token_type {
@@ -1034,12 +1037,7 @@ impl<'a> Parser<'a> {
                     self.eat_no_eof()?;
                 }
             }
-        }
-
-        // minus 1 because lexer already consumed TK_COMMA or TK_RP
-        let end_idx = self.offset();
-        if start_idx == end_idx {
-            return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
+            end_idx = self.offset();
         }
 
         Ok(from_bytes(&self.lexer.input[start_idx..end_idx]))
@@ -1058,18 +1056,13 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_LP);
                     let mut result = vec![];
                     loop {
-                        if self.peek_no_eof()?.token_type == TK_RP {
-                            break; // handle empty args case
-                        }
-
-                        result.push(self.parse_vtab_arg()?);
-                        let tok = peek_expect!(self, TK_COMMA, TK_RP);
-                        match tok.token_type {
+                        // Like SQLite, an argument with no tokens, as in `(a,,b)`, is skipped.
+                        match self.peek_no_eof()?.token_type {
                             TK_COMMA => {
                                 eat_assert!(self, TK_COMMA);
                             }
                             TK_RP => break,
-                            _ => unreachable!(),
+                            _ => result.push(self.parse_vtab_arg()?),
                         }
                     }
 
@@ -1290,13 +1283,15 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         let start = self.offset();
-        let first_word = match token_type.fallback_id_if_ok() {
+        let is_struct_or_union =
+            |word: &str| word.eq_ignore_ascii_case("STRUCT") || word.eq_ignore_ascii_case("UNION");
+        let first_word_is_struct_or_union = match token_type.fallback_id_if_ok() {
             TK_ID | TK_STRING => {
                 let tok = eat_assert!(self, TK_ID, TK_STRING);
-                from_bytes(tok.as_bytes())
+                is_struct_or_union(from_bytes_as_str(tok.as_bytes()))
             }
             TK_LBRACKET if !self.peeked_empty_brackets() => {
-                self.parse_bracket_quoted_name()?.as_str().to_owned()
+                is_struct_or_union(self.parse_bracket_quoted_name()?.as_str())
             }
             _ => return Ok(None),
         };
@@ -1305,9 +1300,7 @@ impl<'a> Parser<'a> {
         // Inline STRUCT/UNION types (e.g. `col STRUCT(x INT)`) are only valid
         // inside CREATE TYPE field lists (tracked by type_nesting_depth > 0).
         // In column definitions and CAST expressions, reject them.
-        let is_struct = first_word.eq_ignore_ascii_case("STRUCT");
-        let is_union = first_word.eq_ignore_ascii_case("UNION");
-        if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+        if first_word_is_struct_or_union && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
             if self.type_nesting_depth == 0 {
                 return Err(Error::ParseError(
                     "inline STRUCT/UNION column types are not supported; \
@@ -3665,6 +3658,8 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
+                    // Only the first option may be missing; a comma always needs an option after it.
+                    peek_expect!(self, TK_WITHOUT, TK_ID);
                     self.parse_table_option(&mut result)?;
                 }
                 _ => break,
@@ -3851,6 +3846,16 @@ impl<'a> Parser<'a> {
             }
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
+            }
+            // SQLite's pragma value grammar does not accept NULL
+            TK_NULL => {
+                let offset = self.offset();
+                let token = self.peek_no_eof()?;
+                Err(unexpected_token_error(
+                    token,
+                    offset,
+                    &[TK_ID, TK_STRING, TK_INTEGER, TK_FLOAT],
+                ))
             }
             tt if tt
                 .as_str()
@@ -4897,6 +4902,7 @@ impl<'a> Parser<'a> {
             indexed,
             where_clause,
             returning,
+            truncate: false,
         })
     }
 
@@ -5496,6 +5502,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Stmt::Insert {
+            overriding_system_value: false,
             with,
             or_conflict: resolve_type,
             tbl_name,
@@ -12861,6 +12868,46 @@ mod tests {
                     ],
                 }))],
             ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar(, a,, ,b,)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec!["a".to_owned(), "b".to_owned()],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar( alpha , 73 /* c */, f( x ) -- c\n)"
+                    .as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec!["alpha".to_owned(), "73".to_owned(), "f( x )".to_owned()],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE foo USING bar(,)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("bar".to_owned()),
+                    args: vec![],
+                }))],
+            ),
             // parse delete
             (
                 b"DELETE FROM foo".as_slice(),
@@ -12874,6 +12921,7 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
+                    truncate: false,
                 })],
             ),
             (
@@ -12921,6 +12969,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    truncate: false,
                 })],
             ),
             // parse drop index
@@ -13019,6 +13068,7 @@ mod tests {
             (
                 b"INSERT INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: None,
                     tbl_name: QualifiedName {
@@ -13047,6 +13097,7 @@ mod tests {
             (
                 b"REPLACE INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
@@ -13075,6 +13126,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) INSERT INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13123,6 +13175,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) REPLACE INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13395,6 +13448,17 @@ mod tests {
             b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
+    }
+
+    #[test]
+    fn test_pragma_value_rejects_null() {
+        for sql in [
+            b"PRAGMA foreign_keys = NULL".as_slice(),
+            b"PRAGMA foreign_keys(NULL)".as_slice(),
         ] {
             let result = Parser::new(sql).next().unwrap();
             assert!(result.is_err(), "expected parse error for {sql:?}");

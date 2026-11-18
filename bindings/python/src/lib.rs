@@ -19,7 +19,8 @@ mod _turso {
     // exception exports
     #[pymodule_export]
     use crate::turso::{
-        Busy, Constraint, Corrupt, DatabaseFull, Error, Interrupt, Misuse, NotAdb, Readonly,
+        Busy, BusySnapshot, Constraint, Corrupt, DatabaseFull, Error, Interrupt, IoError, Misuse,
+        NotAdb, Readonly,
     };
 
     // sync exports

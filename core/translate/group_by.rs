@@ -419,6 +419,7 @@ fn collect_non_aggregate_expressions<'a>(
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
     }
+    result_columns.extend(&group_by.columns_read_by_group_subqueries);
 
     for group_expr in &group_by.exprs {
         let expr_appears_in_result_columns = result_columns
@@ -480,8 +481,10 @@ fn collect_result_columns<'a>(
             ast::Expr::SubqueryResult {
                 subquery_id, lhs, ..
             } => {
+                // The subquery's value does not exist yet when the row is saved,
+                // but the left side of an IN still needs its columns saved.
                 if is_deferred_grouped_output_subquery(plan, *subquery_id) {
-                    return Ok(WalkControl::SkipChildren);
+                    return Ok(WalkControl::Continue);
                 }
                 if let Some(ref lhs) = lhs {
                     let mut lhs_contains_agg = false;

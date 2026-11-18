@@ -12,6 +12,21 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+# Turso accepts a FOREIGN KEY that names a column the table does not have
+# (SQLite refuses it), so databases with such tables exist. ALTER TABLE must
+# keep working on them.
+test alter-table-with-foreign-key-on-missing-column {
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE t (a INTEGER, FOREIGN KEY (zz) REFERENCES p (id));
+    ALTER TABLE t ADD COLUMN b INTEGER;
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    INSERT INTO t VALUES ('x', 1);
+    SELECT * FROM t;
+}
+expect {
+    x|1
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
@@ -335,10 +350,45 @@ expect {
 # Adding a stored generated column via ALTER TABLE should error
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
     ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {
     cannot add a STORED column
+}
+
+test alter-column-read-by-stored-column-error {
+    CREATE TABLE t(a INTEGER, s AS (a || '') STORED);
+    ALTER TABLE t ALTER COLUMN a TO a REAL;
+}
+expect error {
+    cannot alter a STORED column or a column that a STORED column uses
+}
+
+test alter-column-read-by-stored-column-through-virtual-error {
+    CREATE TABLE t(a INTEGER, v AS (a * 2) VIRTUAL, s AS (v || '') STORED);
+    ALTER TABLE t ALTER COLUMN a TO a TEXT COLLATE NOCASE;
+}
+expect error {
+    cannot alter a STORED column or a column that a STORED column uses
+}
+
+test alter-column-stored-column-error {
+    CREATE TABLE t(a, s AS (a * 2) STORED);
+    ALTER TABLE t ALTER COLUMN s TO s AS (a * 3);
+}
+expect error {
+    cannot alter a STORED column or a column that a STORED column uses
+}
+
+test alter-column-not-read-by-stored-column-with-rows {
+    CREATE TABLE t(a INTEGER, b INTEGER, s AS (a || '') STORED);
+    INSERT INTO t VALUES (5, 6);
+    ALTER TABLE t ALTER COLUMN b TO b REAL;
+    SELECT a, typeof(b), s FROM t;
+}
+expect {
+    5|real|5
 }
 
 test alter-column-only-to-generated-error {
@@ -346,7 +396,7 @@ test alter-column-only-to-generated-error {
     ALTER TABLE t ALTER COLUMN a TO b AS (123);
 }
 expect error {
-    Parse error: must have at least one non-generated column
+    must have at least one non-generated column
 }
 
 test alter-column-all-to-generated-error {
@@ -355,7 +405,7 @@ test alter-column-all-to-generated-error {
     ALTER TABLE t ALTER COLUMN b TO d AS (123);
 }
 expect error {
-    Parse error: must have at least one non-generated column
+    must have at least one non-generated column
 }
 
 test alter-column-to-generated-with-other-columns {
@@ -753,7 +803,7 @@ test alter-column-rejects-index-rewrite-mvcc {
     ALTER TABLE t ALTER COLUMN x TO y TEXT;
 }
 expect error {
-    Parse error: cannot ALTER COLUMN "x": rebuilding affected indexes is not supported in MVCC mode
+    cannot ALTER COLUMN "x": rebuilding affected indexes is not supported in MVCC mode
 }
 
 test alter-column-rejects-index-only-rewrite-mvcc {
@@ -764,7 +814,7 @@ test alter-column-rejects-index-only-rewrite-mvcc {
     ALTER TABLE t ALTER COLUMN g TO h TEXT GENERATED ALWAYS AS ('new:' || a) VIRTUAL;
 }
 expect error {
-    Parse error: cannot ALTER COLUMN "g": rebuilding affected indexes is not supported in MVCC mode
+    cannot ALTER COLUMN "g": rebuilding affected indexes is not supported in MVCC mode
 }
 
 test alter-column-text-to-integer-coerces-existing-rows {
@@ -972,4 +1022,201 @@ test alter-column-changes-the-collation-under-an-index-that-does-not-sort-by-it 
 }
 expect {
     ok
+}
+
+# ALTER COLUMN replaces the whole column definition, and the new definition cannot have
+# a PRIMARY KEY or UNIQUE. So a PRIMARY KEY or UNIQUE written in the old column would be
+# lost, and the statement is rejected.
+test fail-alter-column-removes-column-primary-key {
+    CREATE TABLE t (a text primary key, b text);
+    ALTER TABLE t ALTER COLUMN a TO integer;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-removes-column-unique {
+    CREATE TABLE t (a text unique, b text unique);
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    UNIQUE constraint cannot be altered
+}
+
+test fail-alter-column-removes-column-unique-primary-key {
+    CREATE TABLE t (a text unique primary key, b text);
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+@skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
+test fail-alter-column-removes-primary-key-of-without-rowid-table {
+    CREATE TABLE t (a text primary key, b text) WITHOUT ROWID;
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+# A table-level constraint stays in the stored CREATE TABLE, so its column can be redefined.
+@cross-check-integrity
+test alter-column-keeps-table-level-unique {
+    CREATE TABLE t (a text, b text unique, unique (a));
+    INSERT INTO t VALUES ('x', 'y');
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+    INSERT OR IGNORE INTO t VALUES ('x', 'z');
+    SELECT type, name, sql FROM sqlite_schema;
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    table|t|CREATE TABLE t (a2 text, b text UNIQUE, UNIQUE (a2))
+    index|sqlite_autoindex_t_1|
+    index|sqlite_autoindex_t_2|
+    1
+    ok
+}
+
+@cross-check-integrity
+test alter-column-renames-column-with-unique-also-declared-at-table-level {
+    CREATE TABLE t (a text unique, b text, unique (a));
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    INSERT INTO t VALUES ('x', 1);
+    INSERT OR IGNORE INTO t VALUES ('x', 2);
+    SELECT type, name, sql FROM sqlite_schema;
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    table|t|CREATE TABLE t (a2 text UNIQUE, b text, UNIQUE (a2))
+    index|sqlite_autoindex_t_1|
+    1
+    ok
+}
+
+# An INTEGER PRIMARY KEY is a PRIMARY KEY written in the column too, even though it has
+# no automatic index.
+test fail-alter-column-removes-integer-primary-key {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-changes-type-of-integer-primary-key {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, c text) STRICT;
+    INSERT INTO t VALUES (1, 'a');
+    ALTER TABLE t ALTER COLUMN id TO k text;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-removes-integer-primary-key-autoincrement {
+    CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b);
+    INSERT INTO t (b) VALUES ('x');
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+# With a table-level PRIMARY KEY, an INTEGER column stays the rowid while its type stays INTEGER.
+@cross-check-integrity
+test alter-column-keeps-rowid-alias-of-table-level-primary-key {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
+    INSERT INTO t VALUES (5, 1);
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER NOT NULL;
+    INSERT INTO t (b) VALUES (2);
+    SELECT rowid, a2, b FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    5|5|1
+    6|6|2
+    ok
+}
+
+# Changing whether a table-level PRIMARY KEY column is the rowid would need its automatic
+# index created or dropped.
+test fail-alter-column-turns-table-level-integer-primary-key-into-text {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-turns-table-level-text-primary-key-into-integer {
+    CREATE TABLE t (a TEXT, b, PRIMARY KEY (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+# The column put back by ALTER COLUMN is still part of the table-level PRIMARY KEY, so a
+# second ALTER COLUMN is checked the same way.
+test fail-second-alter-column-turns-table-level-text-primary-key-into-integer {
+    CREATE TABLE t (a TEXT, b, PRIMARY KEY (a));
+    INSERT INTO t VALUES ('5', 1);
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    ALTER TABLE t ALTER COLUMN a2 TO a3 INTEGER;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-second-alter-column-turns-table-level-integer-primary-key-into-text {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
+    INSERT INTO t VALUES (5, 1);
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
+    ALTER TABLE t ALTER COLUMN a2 TO a3 TEXT;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+# NOT NULL and CHECK of the new definition see the rowid value of a rowid alias column,
+# which is stored as NULL in the record.
+@cross-check-integrity
+test alter-column-checks-not-null-of-integer-primary-key {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
+    INSERT INTO t VALUES (5, 1);
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER NOT NULL CHECK (a2 > 0);
+    SELECT rowid, a2, b FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    5|5|1
+    ok
+}
+
+test fail-alter-column-checks-check-of-integer-primary-key {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
+    INSERT INTO t VALUES (5, 1);
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER CHECK (a2 < 0);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test fail-alter-column-makes-table-level-text-primary-key-generated {
+    CREATE TABLE t (a TEXT, b, PRIMARY KEY (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT AS (b || 'x');
+}
+expect error {
+    generated column "a2" cannot be part of the PRIMARY KEY
+}
+
+test fail-alter-column-makes-table-level-integer-primary-key-generated {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
+    INSERT INTO t VALUES (5, 1);
+    ALTER TABLE t ALTER COLUMN a TO a2 INTEGER AS (b + 1);
+}
+expect error {
+    generated column "a2" cannot be part of the PRIMARY KEY
 }

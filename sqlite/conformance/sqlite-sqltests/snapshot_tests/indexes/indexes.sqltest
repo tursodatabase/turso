@@ -140,6 +140,111 @@ snapshot-eqp primary-key-lookup {
     SELECT id, sku, name FROM products WHERE id = 42;
 }
 
+
+setup rowid_bounds {
+    CREATE TABLE r(x INTEGER PRIMARY KEY, y);
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-equality {
+    SELECT * FROM r WHERE x = 2;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-in-list {
+    SELECT * FROM r WHERE x IN (2, 5);
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-strict {
+    SELECT * FROM r WHERE x > 2;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-inclusive {
+    SELECT * FROM r WHERE x >= 2;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-upper-strict {
+    SELECT * FROM r WHERE x < 8;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-upper-inclusive {
+    SELECT * FROM r WHERE x <= 8;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-strict {
+    SELECT * FROM r WHERE x > 2 AND x < 8;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-inclusive {
+    SELECT * FROM r WHERE x >= 2 AND x <= 8;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-inclusive-upper-strict {
+    SELECT * FROM r WHERE x >= 2 AND x < 8;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-strict-upper-inclusive {
+    SELECT * FROM r WHERE x > 2 AND x <= 8;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-strict-desc {
+    SELECT * FROM r WHERE x > 2 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-inclusive-desc {
+    SELECT * FROM r WHERE x >= 2 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-upper-strict-desc {
+    SELECT * FROM r WHERE x < 8 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-upper-inclusive-desc {
+    SELECT * FROM r WHERE x <= 8 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-strict-desc {
+    SELECT * FROM r WHERE x > 2 AND x < 8 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-inclusive-desc {
+    SELECT * FROM r WHERE x >= 2 AND x <= 8 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-inclusive-upper-strict-desc {
+    SELECT * FROM r WHERE x >= 2 AND x < 8 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+snapshot-eqp rowid-bounds-lower-strict-upper-inclusive-desc {
+    SELECT * FROM r WHERE x > 2 AND x <= 8 ORDER BY x DESC;
+}
+
+@setup rowid_bounds
+@skip-if sqlite "SQLite does not support EXPLAIN QUERY PLAN FORMAT=JSON"
+test rowid-bounds-json-desc {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT * FROM r WHERE x > 2 AND x < 8 ORDER BY x DESC;
+}
+expect pattern {
+    "constraints":\["rowid>\?","rowid<\?"\]
+}
+
 # Simple index lookup with additional non-indexed filter
 @setup schema
 snapshot-eqp simple-index-with-filter {

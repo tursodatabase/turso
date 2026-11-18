@@ -53,11 +53,22 @@ type StepResult = vdbe::StepResult;
 /// already compiled into a parent statement and entered through `OP_Program`,
 /// such as trigger or foreign-key actions. This is not separately prepared SQL;
 /// it is embedded child bytecode execution inside the parent statement.
+///
+/// Use [`StatementOrigin::EngineMetadataRead`] when the engine reads its own
+/// tables, such as the roles table or `sqlite_stat1`, to load the schema.
+/// Such a statement is a top-level statement like a root statement, so it
+/// runs in its own read transaction, but its names are looked up like in a
+/// helper statement: in every database, whatever the search path says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementOrigin {
     Root,
     InternalHelper,
     Subprogram,
+    EngineMetadataRead,
+    /// A schema write of the engine's own, such as a frontend creating its
+    /// internal tables at open: engine SQL semantics like
+    /// [`StatementOrigin::EngineMetadataRead`], run as a top-level statement.
+    EngineSchemaWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +77,7 @@ pub enum StatementStatusCounter {
     Sort,
     VmStep,
     Reprepare,
+    Run,
     RowsRead,
     RowsWritten,
 }
@@ -73,6 +85,15 @@ pub enum StatementStatusCounter {
 impl StatementOrigin {
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
+    }
+
+    /// Whether the statement counts toward
+    /// `Connection::n_active_root_statements`.
+    pub(crate) const fn is_top_level(self) -> bool {
+        matches!(
+            self,
+            Self::Root | Self::EngineMetadataRead | Self::EngineSchemaWrite
+        )
     }
 }
 
@@ -94,7 +115,11 @@ impl StatementOrigin {
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. An expression whose
+/// type is a custom type (`CAST(x AS cents)`, `coalesce(cents_col, 0)`, a
+/// function declared to return one) is reported exactly like a column of
+/// that type: `declared_name` is the type's name, `base_type` the primitive
+/// it is stored as, and `kind` its kind. When none of these paths
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
 /// declared return affinity), `get_column_type_info` returns `Ok(None)`
@@ -170,6 +195,7 @@ pub enum ColumnTypeKind {
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
+    connection: Arc<Connection>,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
@@ -227,7 +253,7 @@ impl Statement {
     pub(crate) fn commit_index_methods(&mut self) {
         crate::vdbe::execute::index_method_on_transaction_committed_all(
             &mut self.state,
-            &self.program.connection,
+            &self.connection,
         );
     }
 
@@ -237,12 +263,14 @@ impl Statement {
 
     pub fn new(
         program: vdbe::Program,
+        connection: Arc<Connection>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
     ) -> Self {
         Self::new_with_origin(
             program,
+            connection,
             pager,
             query_mode,
             tail_offset,
@@ -254,6 +282,7 @@ impl Statement {
     #[turso_macros::trace_stack]
     pub(crate) fn new_with_origin(
         program: vdbe::Program,
+        connection: Arc<Connection>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
@@ -274,6 +303,7 @@ impl Statement {
         Self {
             program,
             state,
+            connection,
             pager,
             query_mode,
             busy: false,
@@ -317,6 +347,10 @@ impl Statement {
         &self.program
     }
 
+    pub fn get_connection(&self) -> &Arc<Connection> {
+        &self.connection
+    }
+
     pub fn get_pager(&self) -> &Arc<Pager> {
         &self.pager
     }
@@ -340,7 +374,7 @@ impl Statement {
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        self.program.connection.set_mv_tx(mv_tx);
+        self.connection.set_mv_tx(mv_tx);
     }
 
     pub fn interrupt(&mut self) {
@@ -377,6 +411,7 @@ impl Statement {
             StatementStatusCounter::Sort => metrics.sort_operations,
             StatementStatusCounter::VmStep => metrics.insn_executed,
             StatementStatusCounter::Reprepare => metrics.reprepares,
+            StatementStatusCounter::Run => metrics.runs,
             StatementStatusCounter::RowsRead => metrics.rows_read,
             StatementStatusCounter::RowsWritten => metrics.rows_written,
         }
@@ -387,7 +422,7 @@ impl Statement {
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
-        self.program.connection.mv_store()
+        self.connection.mv_store()
     }
 
     /// Take the pending IO completions from this statement.
@@ -395,6 +430,14 @@ impl Statement {
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
         self.state.io_completions.take()
+    }
+
+    /// Clone the pending completion handle without removing it from the statement.
+    pub fn io_completions(&self) -> Option<crate::types::IOCompletions> {
+        self.state
+            .io_completions
+            .as_ref()
+            .map(|io| crate::types::IOCompletions(io.0.clone()))
     }
 
     fn arm_query_timeout_if_needed(&mut self) {
@@ -405,7 +448,7 @@ impl Statement {
         }
         let timeout = match self.query_timeout_override {
             Some(timeout_override) => timeout_override,
-            None => match self.program.connection.get_query_timeout_ms() {
+            None => match self.connection.get_query_timeout_ms() {
                 0 => None,
                 millis => Some(Duration::from_millis(millis)),
             },
@@ -418,7 +461,7 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self, statement_failed: bool) {
         if self.counted_as_active_root {
-            let conn = &self.program.connection;
+            let conn = &self.connection;
             if let Some(hooks) = conn.hooks() {
                 hooks.root_statement_ended(conn, statement_failed);
             }
@@ -427,18 +470,17 @@ impl Statement {
             // than are really active (a stale-high read only causes a
             // spurious StatementsInProgress, never a missed one).
             if self.is_blob_handle {
-                self.program
-                    .connection
+                self.connection
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
+            self.state.stop_counting_as_reader(conn);
             let previous = self
-                .program
                 .connection
                 .n_active_root_statements
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
-                self.program.connection.clear_interrupt_if_idle();
+                self.connection.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
         }
@@ -465,10 +507,12 @@ impl Statement {
         }
         let res = match self.query_mode {
             QueryMode::Normal => {
-                match self
-                    .program
-                    .normal_step(&mut self.state, &self.pager, waker)
-                {
+                match self.program.normal_step(
+                    &mut self.state,
+                    &self.connection,
+                    &self.pager,
+                    waker,
+                ) {
                     ProgramStep::Row => {
                         self.state.pending_fresh_tx = None;
                         self.busy = true;
@@ -478,9 +522,13 @@ impl Statement {
                     step => step.into(),
                 }
             }
-            _ => self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
+            _ => self.program.step(
+                &mut self.state,
+                &self.connection,
+                &self.pager,
+                self.query_mode,
+                waker,
+            ),
         };
         self.finish_step(res, waker)
     }
@@ -492,7 +540,7 @@ impl Statement {
         let Some(refresh) = self.analyze_refresh.as_mut() else {
             return Ok(StepResult::Done);
         };
-        match refresh_analyze_stats_nonblock(&self.program.connection, refresh) {
+        match refresh_analyze_stats_nonblock(&self.connection, refresh) {
             Ok(crate::IOResult::IO(io)) => {
                 self.busy = true;
                 io.set_waker(waker);
@@ -518,14 +566,13 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
-            self.program.connection.start_root_statement()?;
+        if !self.counted_as_active_root && self.origin.is_top_level() {
+            self.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
             // can only read stale-high (see release_active_root_if_counted).
             if self.is_blob_handle {
-                self.program
-                    .connection
+                self.connection
                     .n_active_blob_statements
                     .fetch_add(1, Ordering::SeqCst);
             }
@@ -533,15 +580,15 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
-            if self.state.db_mv_store(&self.program.connection).is_some() {
+            if self.state.db_mv_store(&self.connection).is_some() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
-                self.program.connection.maybe_update_schema();
+                self.connection.maybe_update_schema();
             }
             if !self
                 .program
                 .prepare_context
-                .matches_connection(&self.program.connection)
+                .matches_connection(&self.connection)
             {
                 if let Err(err) = self.reprepare() {
                     self.release_active_root_if_counted(true);
@@ -588,9 +635,9 @@ impl Statement {
             // disk). Allow a few retries for the in-process case where reprepare
             // *can* resolve the issue, but bail early to avoid burning 50 attempts.
             if attempt >= 2
-                && !self.program.connection.get_auto_commit()
+                && !self.connection.get_auto_commit()
                 && matches!(
-                    self.program.connection.get_tx_state(),
+                    self.connection.get_tx_state(),
                     TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
                 )
             {
@@ -604,14 +651,18 @@ impl Statement {
                 self.release_active_root_if_counted(true);
                 return Err(err);
             }
-            res = self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker);
+            res = self.program.step(
+                &mut self.state,
+                &self.connection,
+                &self.pager,
+                self.query_mode,
+                waker,
+            );
         }
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let connection = &self.program.connection;
+            let connection = &self.connection;
             self.state
                 .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
@@ -639,7 +690,7 @@ impl Statement {
         // Handle busy result by invoking the busy handler
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.current_time_monotonic();
-            let handler = self.program.connection.get_busy_handler();
+            let handler = self.connection.get_busy_handler();
 
             // Initialize or get existing busy handler state
             let busy_state = self
@@ -705,12 +756,12 @@ impl Statement {
                 // already active" error at Insn::Transaction.
                 if self.state.is_active_write {
                     let prev = self
-                        .program
                         .connection
                         .n_active_writes
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
                 }
+                self.state.stop_counting_as_reader(&self.connection);
                 self.state.reset(None, None);
             }
         }
@@ -729,6 +780,14 @@ impl Statement {
         self._step(None).map_err(|error| self.format_error(error))
     }
 
+    /// Like [`Self::step`], but a constraint violation stays a
+    /// [`LimboError::ConstraintViolation`] that names its kind in every
+    /// dialect, so the caller can report its extended result code.
+    #[inline]
+    pub fn step_with_structured_errors(&mut self) -> Result<StepResult> {
+        self._step(None)
+    }
+
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
@@ -741,12 +800,18 @@ impl Statement {
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
-            .step(&mut self.state, &self.pager, self.query_mode, None)
+            .step(
+                &mut self.state,
+                &self.connection,
+                &self.pager,
+                self.query_mode,
+                None,
+            )
             .map_err(|err| *err)
     }
 
     fn format_error(&self, error: LimboError) -> LimboError {
-        self.program.connection.dialect().format_error(error)
+        self.connection.dialect().format_error(error)
     }
 
     /// Makes a trigger or foreign key action see the same current time as
@@ -755,8 +820,16 @@ impl Statement {
         self.state.current_time = Some(now);
     }
 
+    /// Makes a trigger or foreign key action stop at the deadline of the
+    /// statement that runs it.
+    pub(crate) fn set_query_deadline(&mut self, deadline: Option<crate::MonotonicInstant>) {
+        self.state.query_deadline = deadline;
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
-        let result = self.program.abort(&self.pager, err, &mut self.state, false);
+        let result = self
+            .program
+            .abort(&self.connection, &self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;
         result
     }
@@ -899,7 +972,7 @@ impl Statement {
     }
 
     fn rollback_autocommit_txn(&mut self) -> Result<()> {
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         let main_pager = conn.pager.load().clone();
 
         // SchemaUpdated bypasses the normal abort rollback path, so in
@@ -962,7 +1035,7 @@ impl Statement {
 
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
             conn.maybe_reparse_schema()?;
         }
@@ -1058,8 +1131,8 @@ impl Statement {
                     return Cow::Borrowed(alias);
                 }
 
-                let full = self.program.connection.get_full_column_names();
-                let short = self.program.connection.get_short_column_names();
+                let full = self.connection.get_full_column_names();
+                let short = self.connection.get_short_column_names();
 
                 // 2. For column references, apply full/short column name logic.
                 match &column.expr {
@@ -1220,7 +1293,7 @@ impl Statement {
     /// returned struct is `#[non_exhaustive]` so additional metadata can be
     /// added over time without breaking callers.
     pub fn get_column_type_info(&self, idx: usize) -> Result<Option<ColumnTypeInfo>> {
-        if !self.program.connection.experimental_custom_types_enabled() {
+        if !self.connection.experimental_custom_types_enabled() {
             return Err(LimboError::ParseError(
                 "get_column_type_info requires --experimental-custom-types".to_string(),
             ));
@@ -1377,7 +1450,7 @@ impl Statement {
         if self.has_returned_row {
             return;
         }
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         if let Some(mv_store) = conn.mv_store_for_db(db) {
             if let Some((tx_id, _)) = conn.get_mv_tx_for_db(db) {
                 mv_store.rollback_tx(tx_id, self.pager.clone(), &conn, db);
@@ -1391,7 +1464,7 @@ impl Statement {
         let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
             return;
         };
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
             return;
         };
@@ -1494,6 +1567,7 @@ impl Statement {
                     match vdbe::execute::halt(
                         &self.program,
                         &mut self.state,
+                        &self.connection,
                         &self.pager,
                         0,
                         "",
@@ -1527,7 +1601,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Interrupt) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(
@@ -1543,6 +1618,7 @@ impl Statement {
                 statement_failed = !halt_completed;
                 if !halt_completed {
                     if let Err(abort_err) = self.program.abort(
+                        &self.connection,
                         &self.pager,
                         reset_error.as_ref(),
                         &mut self.state,
@@ -1562,6 +1638,7 @@ impl Statement {
                 // partial DML or silently retrying after transient errors (Busy).
                 statement_failed = self.state.is_active_write;
                 if let Err(abort_err) = self.program.abort(
+                    &self.connection,
                     &self.pager,
                     None,
                     &mut self.state,
@@ -1577,6 +1654,7 @@ impl Statement {
         } else {
             // Statement not running (Done/Failed/Init) — cleanup only.
             if let Err(abort_err) = self.program.abort(
+                &self.connection,
                 &self.pager,
                 None,
                 &mut self.state,
@@ -1594,7 +1672,6 @@ impl Statement {
         // clears the flag.
         if self.state.is_active_write {
             let previous = self
-                .program
                 .connection
                 .n_active_writes
                 .fetch_sub(1, Ordering::SeqCst);
@@ -1607,6 +1684,7 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted(statement_failed);
         }
+        self.state.stop_counting_as_reader(&self.connection);
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
@@ -1630,6 +1708,11 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    /// True once [Self::step] has returned a [StepResult::Row] since the last reset.
+    pub fn has_returned_row(&self) -> bool {
+        self.has_returned_row
     }
 
     /// Internal method to get IO from a statement.
@@ -1684,7 +1767,7 @@ impl Drop for Statement {
         // parent, so we release the nested guard only after reset completes.
         self.reset_best_effort();
         if self.nested_guard_active {
-            self.program.connection.end_nested();
+            self.connection.end_nested();
             self.nested_guard_active = false;
         }
     }
@@ -1708,7 +1791,8 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteDialect;
+    use crate::security::roles::SessionRole;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     #[test]
@@ -1783,20 +1867,37 @@ mod tests {
                 .set_register(index, vdbe::Register::Value(Value::from_i64(99)));
         }
         let error = match &insn {
-            Insn::Halt { .. } => {
-                execute::op_halt(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
-                    .err()
-                    .expect("constraint error")
-            }
+            Insn::Halt { .. } => execute::op_halt(
+                &stmt.program,
+                &mut stmt.state,
+                &insn,
+                &stmt.connection,
+                &stmt.pager,
+            )
+            .err()
+            .expect("constraint error"),
             Insn::HaltIfNull { target_reg, .. } => {
                 stmt.state
                     .set_register(*target_reg, vdbe::Register::Value(Value::Null));
-                execute::op_halt_if_null(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
-                    .err()
-                    .expect("constraint error")
+                execute::op_halt_if_null(
+                    &stmt.program,
+                    &mut stmt.state,
+                    &insn,
+                    &stmt.connection,
+                    &stmt.pager,
+                )
+                .err()
+                .expect("constraint error")
             }
             Insn::FkCounter { .. } => {
-                execute::op_fk_counter(&stmt.program, &mut stmt.state, &insn, &stmt.pager).unwrap();
+                execute::op_fk_counter(
+                    &stmt.program,
+                    &mut stmt.state,
+                    &insn,
+                    &stmt.connection,
+                    &stmt.pager,
+                )
+                .unwrap();
                 Box::new(stmt.state.immediate_foreign_key_error())
             }
             _ => unreachable!(),
@@ -1812,11 +1913,11 @@ mod tests {
 
     #[test]
     fn internal_constraint_errors_are_structured() {
-        for (sql, kind, message, foreign_key) in constraint_error_cases() {
+        for (sql, kind, message, foreign_key, extended_code) in constraint_error_cases() {
             let conn = constraint_test_connection();
             let mut stmt = conn.prepare(sql).unwrap();
             let error = loop {
-                match stmt._step(None) {
+                match stmt.step_with_structured_errors() {
                     Err(error) => break error,
                     Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
                         stmt.pager.io.step().unwrap();
@@ -1831,12 +1932,13 @@ mod tests {
             assert_eq!(error.to_string(), message, "{sql}");
             assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
             assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
         }
     }
 
     #[test]
     fn public_constraint_errors_preserve_sqlite_variants() {
-        for (sql, _, message, foreign_key) in constraint_error_cases() {
+        for (sql, _, message, foreign_key, _) in constraint_error_cases() {
             for with_waker in [false, true] {
                 let conn = constraint_test_connection();
                 let mut stmt = conn.prepare(sql).unwrap();
@@ -1872,18 +1974,6 @@ mod tests {
     }
 
     #[test]
-    fn public_helper_statement_errors_preserve_sqlite_variants() {
-        let conn = constraint_test_connection();
-        let mut stmt = conn
-            .prepare_internal("INSERT INTO parent VALUES (1, 'b', 1)")
-            .unwrap();
-        let error = stmt.run_ignore_rows().unwrap_err();
-        assert!(matches!(error, LimboError::Constraint(_)), "{error:?}");
-        assert_eq!(error.to_string(), "UNIQUE constraint failed: parent.id");
-        assert_eq!(error.sqlite_result_code(), 19);
-    }
-
-    #[test]
     fn public_reset_preserves_sqlite_foreign_key_error() {
         let conn = constraint_test_connection();
         let mut stmt = conn
@@ -1907,57 +1997,131 @@ mod tests {
         assert_eq!(error.sqlite_result_code(), 19);
     }
 
-    fn constraint_error_cases() -> [(&'static str, crate::ConstraintKind, &'static str, bool); 8] {
+    fn constraint_error_cases(
+    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
         [
             (
                 "INSERT INTO parent VALUES (1, 'b', 1)",
                 crate::ConstraintKind::PrimaryKey,
                 "UNIQUE constraint failed: parent.id",
                 false,
+                1555,
             ),
             (
                 "INSERT INTO parent VALUES (2, 'a', 1)",
                 crate::ConstraintKind::Unique,
                 "UNIQUE constraint failed: parent.code",
                 false,
+                2067,
             ),
             (
                 "INSERT INTO parent VALUES (2, NULL, 1)",
                 crate::ConstraintKind::NotNull,
                 "NOT NULL constraint failed: parent.code",
                 false,
+                1299,
             ),
             (
                 "INSERT INTO parent VALUES (2, 'b', -1)",
                 crate::ConstraintKind::Check,
                 "CHECK constraint failed: positive",
                 false,
+                275,
             ),
             (
                 "INSERT INTO child VALUES (99)",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "DELETE FROM parent",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "INSERT INTO deferred_child VALUES (99)",
                 crate::ConstraintKind::ForeignKey,
                 "FOREIGN KEY constraint failed",
                 true,
+                787,
             ),
             (
                 "INSERT INTO trigger_source VALUES (1)",
                 crate::ConstraintKind::PrimaryKey,
                 "UNIQUE constraint failed: parent.id",
                 false,
+                1555,
+            ),
+            (
+                "INSERT INTO text_key VALUES ('k')",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: text_key.k",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO pair_key VALUES (1, 1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "UPDATE pair_key SET b = 1 WHERE b = 2",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO pair_key VALUES (1, 2) ON CONFLICT DO UPDATE SET b = 1",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: pair_key.a, pair_key.b",
+                false,
+                1555,
+            ),
+            (
+                "INSERT INTO strict_int VALUES ('x')",
+                crate::ConstraintKind::Datatype,
+                "cannot store TEXT value in INTEGER column strict_int.a",
+                false,
+                3091,
             ),
         ]
+    }
+
+    /// RAISE and a constraint's own ON CONFLICT clause halt with their own
+    /// resolve type, and the error still reports the halt's result code.
+    #[test]
+    fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
+        for (sql, message, extended_code) in [
+            ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
+            (
+                "INSERT INTO unique_rollback VALUES (1)",
+                "UNIQUE constraint failed: unique_rollback.a",
+                2067,
+            ),
+        ] {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                match stmt.step_with_structured_errors() {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt.pager.io.step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+        }
     }
 
     fn constraint_test_connection() -> Arc<crate::Connection> {
@@ -1971,6 +2135,15 @@ mod tests {
             "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
             "INSERT INTO parent VALUES (1, 'a', 1)",
             "INSERT INTO child VALUES (1)",
+            "CREATE TABLE text_key (k TEXT PRIMARY KEY)",
+            "INSERT INTO text_key VALUES ('k')",
+            "CREATE TABLE pair_key (a, b, PRIMARY KEY (a, b))",
+            "INSERT INTO pair_key VALUES (1, 1), (1, 2)",
+            "CREATE TABLE strict_int (a INTEGER) STRICT",
+            "CREATE TABLE raise_abort (a)",
+            "CREATE TRIGGER raise_abort_trigger BEFORE INSERT ON raise_abort BEGIN SELECT RAISE(ABORT, 'nope'); END",
+            "CREATE TABLE unique_rollback (a UNIQUE ON CONFLICT ROLLBACK)",
+            "INSERT INTO unique_rollback VALUES (1)",
         ] {
             conn.execute(sql).unwrap();
         }
@@ -1985,9 +2158,9 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
-        db.connect(ConnectOpts::new())
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
     }
 
     /// A hash join inside a correlated subquery is built once and probed once per
@@ -2033,246 +2206,6 @@ mod tests {
         assert!(
             metrics.grace_partitions_processed > 0,
             "no pass went through grace: {metrics:?}"
-        );
-    }
-
-    #[test]
-    fn test_expanded_sql() {
-        let conn = open_test_connection().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT ?1, :nm, ':nm' /* ? */, -- ?\n?")
-            .unwrap();
-
-        // Unbound parameters render as NULL; markers inside string
-        // literals and comments are untouched.
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL"
-        );
-
-        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(42))
-            .unwrap();
-        let nm = stmt.parameter_index(":nm").unwrap();
-        stmt.bind_at(nm, Value::build_text("it's")).unwrap();
-        stmt.bind_at(3.try_into().unwrap(), Value::from_slice(&[1, 2]).unwrap())
-            .unwrap();
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\nx'0102'"
-        );
-
-        // Bindings survive reset; clear_bindings reverts them to NULL.
-        stmt.reset().unwrap();
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT 42, 'it''s', ':nm' /* ? */, -- ?\nx'0102'"
-        );
-        stmt.clear_bindings();
-        assert_eq!(
-            stmt.expanded_sql(),
-            "SELECT NULL, NULL, ':nm' /* ? */, -- ?\nNULL"
-        );
-
-        // A marker can occur several times and renders its value at every
-        // occurrence; a bare ? after ?2 takes index 3.
-        let mut stmt = conn.prepare("SELECT ?2, :a, ?2, ?").unwrap();
-        stmt.bind_at(2.try_into().unwrap(), Value::from_i64(7))
-            .unwrap();
-        stmt.bind_at(3.try_into().unwrap(), Value::build_text("x"))
-            .unwrap();
-        stmt.bind_at(4.try_into().unwrap(), Value::from_i64(9))
-            .unwrap();
-        assert_eq!(stmt.expanded_sql(), "SELECT 7, 'x', 7, 9");
-    }
-
-    #[test]
-    fn test_tcl_style_parameter_names_bind_and_expand() {
-        // The TCL binding passes namespace-qualified variables ($::x,
-        // $ns::y) and array elements ($arr(k)) as parameter names. Each
-        // spelling is one parameter, found by its full text, and expanded
-        // SQL — which re-lexes the statement text — sees the same markers
-        // the parse did, so the bound values land in the right places.
-        let conn = open_test_connection().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT $::x, $ns::y, $arr(k), $::x, '$::x'")
-            .unwrap();
-        let x = stmt.parameter_index("$::x").unwrap();
-        let y = stmt.parameter_index("$ns::y").unwrap();
-        let k = stmt.parameter_index("$arr(k)").unwrap();
-        assert_eq!(stmt.parameters_count(), 3);
-        stmt.bind_at(x, Value::from_i64(1)).unwrap();
-        stmt.bind_at(y, Value::build_text("two")).unwrap();
-        stmt.bind_at(k, Value::from_i64(3)).unwrap();
-
-        assert_eq!(stmt.expanded_sql(), "SELECT 1, 'two', 3, 1, '$::x'");
-        let rows = stmt.run_collect_rows().unwrap();
-        assert_eq!(
-            rows,
-            vec![vec![
-                Value::from_i64(1),
-                Value::build_text("two"),
-                Value::from_i64(3),
-                Value::from_i64(1),
-                Value::build_text("$::x"),
-            ]]
-        );
-    }
-
-    #[test]
-    fn finish_seek_counts_a_deferred_table_seek() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")
-            .unwrap();
-        conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 1, 10), (2, 2, 20)")
-            .unwrap();
-
-        // The index finds the row, and FinishSeek moves the table cursor to it.
-        let mut stmt = conn.prepare("UPDATE t SET b = 5 WHERE a = 1").unwrap();
-        stmt.run_ignore_rows().unwrap();
-        assert_eq!(stmt.metrics().btree_deferred_seeks, 1);
-        assert_eq!(stmt.metrics().btree_table_seeks, 1);
-    }
-
-    #[test]
-    fn test_metrics_persist_across_reset() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.metrics.write().reset();
-
-        let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
-        stmt.run_ignore_rows().unwrap();
-        assert_eq!(stmt.metrics().rows_written, 1);
-
-        stmt.reset().unwrap();
-        assert_eq!(stmt.metrics().rows_written, 1);
-
-        stmt.run_ignore_rows().unwrap();
-        assert_eq!(stmt.metrics().rows_written, 2);
-
-        stmt.reset_metrics();
-        assert_eq!(stmt.metrics().rows_written, 0);
-    }
-
-    #[test]
-    fn test_seek_metrics_separate_index_and_table_work() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE t(a, b)").unwrap();
-        conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
-            .unwrap();
-
-        let mut stmt = conn.prepare("SELECT b FROM t WHERE a = 2").unwrap();
-        stmt.run_collect_rows().unwrap();
-        let metrics = stmt.metrics();
-
-        assert_eq!(metrics.btree_seeks, 2);
-        assert_eq!(metrics.btree_table_seeks, 1);
-        assert_eq!(metrics.btree_index_seeks, 1);
-        assert_eq!(metrics.btree_deferred_seeks, 1);
-    }
-
-    #[test]
-    fn test_correlated_subquery_runs_after_selective_join() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, allowed_id INTEGER)")
-            .unwrap();
-        conn.execute("CREATE TABLE allowed(id INTEGER PRIMARY KEY, enabled INTEGER)")
-            .unwrap();
-        conn.execute("CREATE TABLE inner_rows(outer_id INTEGER, value INTEGER)")
-            .unwrap();
-        conn.execute("CREATE INDEX inner_outer_id ON inner_rows(outer_id)")
-            .unwrap();
-        conn.execute("INSERT INTO allowed VALUES (1, 0), (2, 1)")
-            .unwrap();
-        conn.execute("INSERT INTO outer_rows VALUES (1, 1), (2, 1), (3, 2)")
-            .unwrap();
-        conn.execute(
-            "INSERT INTO inner_rows
-             SELECT id, CASE WHEN id = 3 THEN 0 ELSE id END FROM outer_rows",
-        )
-        .unwrap();
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT o.id
-                 FROM outer_rows o CROSS JOIN allowed a
-                 WHERE a.id = o.allowed_id
-                   AND a.enabled = 1
-                   AND EXISTS (
-                       SELECT 1 FROM inner_rows i
-                       WHERE i.outer_id = o.id AND i.value <> o.id
-                   )",
-            )
-            .unwrap();
-        let rows = stmt.run_collect_rows().unwrap();
-
-        assert_eq!(rows, vec![vec![Value::from_i64(3)]]);
-        assert_eq!(stmt.metrics().btree_index_seeks, 1);
-    }
-
-    #[test]
-    fn test_run_with_row_callback_nonblock_collects_all_rows() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
-            .unwrap();
-
-        let io = conn.db.io.clone();
-        let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
-
-        // Drive the non-blocking runner via the IOResult loop, exactly as a
-        // state-machine caller would: collect into an accumulator that persists
-        // across yields and wait on each yielded completion.
-        let mut collected: Vec<i64> = Vec::new();
-        loop {
-            let res = stmt
-                .run_with_row_callback_nonblock(|row| {
-                    collected.push(row.get::<i64>(0)?);
-                    Ok(())
-                })
-                .unwrap();
-            match res {
-                crate::IOResult::Done(()) => break,
-                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
-            }
-        }
-        assert_eq!(collected, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_run_ignore_rows_nonblock_completes() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-
-        let io = conn.db.io.clone();
-        let mut stmt = conn.prepare("INSERT INTO t VALUES (1), (2)").unwrap();
-        loop {
-            match stmt.run_ignore_rows_nonblock().unwrap() {
-                crate::IOResult::Done(()) => break,
-                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
-            }
-        }
-        assert_eq!(stmt.metrics().rows_written, 2);
-    }
-
-    #[test]
-    fn test_metrics_include_subprogram_writes() {
-        let conn = open_test_connection().unwrap();
-        conn.execute("CREATE TABLE src(x)").unwrap();
-        conn.execute("CREATE TABLE log(x)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER src_log AFTER INSERT ON src BEGIN INSERT INTO log VALUES (new.x); END",
-        )
-        .unwrap();
-
-        let mut stmt = conn.prepare("INSERT INTO src VALUES (1), (2)").unwrap();
-        stmt.run_ignore_rows().unwrap();
-
-        assert_eq!(
-            stmt.metrics().rows_written,
-            6,
-            "cumulative metrics should include root and trigger writes"
         );
     }
 }

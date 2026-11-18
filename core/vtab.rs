@@ -8,7 +8,7 @@ use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
-use turso_parser::{ast, parser::Parser};
+use turso_parser::ast;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
@@ -20,7 +20,7 @@ pub(crate) enum VirtualTableType {
 #[derive(Clone, Debug)]
 pub struct VirtualTable {
     pub(crate) name: String,
-    pub(crate) columns: Vec<Column>,
+    pub columns: Vec<Column>,
     pub(crate) kind: VTabKind,
     pub(crate) vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
@@ -29,7 +29,7 @@ pub struct VirtualTable {
     pub(crate) is_droppable: bool,
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
-    pub(crate) innocuous: bool,
+    pub innocuous: bool,
 }
 
 impl VirtualTable {
@@ -48,13 +48,17 @@ impl VirtualTable {
     /// `Schema`'s catalog. The table's `name()` becomes the catalog name and
     /// its `sql()` is parsed to derive the column metadata. Returns an error
     /// if the SQL string is not a valid `CREATE TABLE` statement.
-    pub(crate) fn wrap_internal_table<T>(table: T) -> crate::Result<Arc<VirtualTable>>
+    pub(crate) fn wrap_internal_table<T>(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        table: T,
+    ) -> crate::Result<Arc<VirtualTable>>
     where
         T: InternalVirtualTable + 'static,
     {
         let name = table.name();
         let sql = table.sql();
         Ok(Arc::new(Self::new_internal(
+            dialect,
             name,
             sql,
             VTabKind::TableValuedFunction,
@@ -67,8 +71,9 @@ impl VirtualTable {
     /// parsed to derive the column metadata. Schema dialects use this to
     /// construct catalog tables (e.g. a `pg_catalog` surface) with a
     /// non-table-valued-function kind and install them through
-    /// [`crate::dialect::Dialect::register_catalog`].
+    /// [`crate::dialect::Dialect::schema_builder`].
     pub fn new_internal(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
         name: String,
         sql: String,
         kind: VTabKind,
@@ -76,7 +81,7 @@ impl VirtualTable {
     ) -> crate::Result<Self> {
         Ok(VirtualTable {
             name,
-            columns: Self::resolve_columns(sql)?,
+            columns: Self::resolve_columns(dialect, sql)?,
             kind,
             vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
@@ -85,7 +90,11 @@ impl VirtualTable {
         })
     }
 
-    pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
+    pub(crate) fn function(
+        dialect: &dyn crate::dialect::Dialect,
+        name: &str,
+        syms: &SymbolTable,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
             crate::ext::create_virtual_table(
@@ -102,7 +111,7 @@ impl VirtualTable {
 
         let vtab = VirtualTable {
             name: name.to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns: Self::resolve_columns(dialect, schema)?,
             kind: VTabKind::TableValuedFunction,
             vtab_type,
             vtab_id: 0,
@@ -113,6 +122,7 @@ impl VirtualTable {
     }
 
     pub fn table(
+        dialect: &dyn crate::dialect::Dialect,
         tbl_name: Option<&str>,
         module_name: &str,
         args: Vec<Value>,
@@ -123,7 +133,7 @@ impl VirtualTable {
             crate::ext::create_virtual_table(module_name, module, args, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
-            columns: Self::resolve_columns(schema)?,
+            columns: Self::resolve_columns(dialect, schema)?,
             kind: VTabKind::VirtualTable,
             vtab_type,
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
@@ -133,10 +143,12 @@ impl VirtualTable {
         Ok(Arc::new(vtab))
     }
 
-    pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
-        let mut parser = Parser::new(schema.as_bytes());
+    pub(crate) fn resolve_columns(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        schema: String,
+    ) -> crate::Result<Vec<Column>> {
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
-            parser.next_cmd()?.ok_or_else(|| {
+            crate::dialect::parse_statement(dialect, &schema)?.ok_or_else(|| {
                 LimboError::ParseError(
                     "Failed to parse schema from virtual table module".to_string(),
                 )
@@ -160,7 +172,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
+    pub fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
         match &self.vtab_type {
             VirtualTableType::Pragma(table) => {
                 Ok(VirtualTableCursor::new_pragma(table.open(conn)?))
@@ -186,7 +198,7 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn destroy(&self) -> crate::Result<()> {
+    pub fn destroy(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
             VirtualTableType::External(table) => table.destroy(),
@@ -323,7 +335,7 @@ impl VirtualTableCursor {
         })
     }
 
-    pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
+    pub fn column(&mut self, column: usize) -> IOResultOr<Value> {
         if self.null_flag {
             return Ok(IOResult::Done(Value::Null));
         }
@@ -335,7 +347,7 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn filter(
+    pub fn filter(
         &mut self,
         idx_num: i32,
         idx_str: Option<String>,
@@ -631,6 +643,10 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
         order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode>;
     fn sql(&self) -> String;
+    /// Whether only a superuser may read the table. True for tables that
+    /// show the database file, because they show the rows row-level
+    /// security hides. There is no default, so a new table must say.
+    fn superuser_only(&self) -> bool;
 }
 
 pub trait InternalVirtualTableCursor: Send + Sync {
@@ -649,7 +665,8 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
-    use crate::SqliteDialect;
+    use crate::security::roles::SessionRole;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
@@ -666,6 +683,9 @@ mod tests {
         }
         fn sql(&self) -> String {
             format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+        }
+        fn superuser_only(&self) -> bool {
+            false
         }
         fn open(
             &self,
@@ -741,7 +761,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let name = db
@@ -751,7 +771,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "external_metadata");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM external_metadata")
             .unwrap();
@@ -785,7 +807,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let name = db
@@ -795,7 +817,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);

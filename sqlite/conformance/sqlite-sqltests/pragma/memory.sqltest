@@ -89,6 +89,49 @@ expect {
     value
 }
 
+test pragma-table-info-type-parameters {
+    CREATE TABLE t(
+        a VARCHAR(100),
+        b CHAR(50),
+        c DECIMAL(10,2),
+        d NUMERIC(5,3),
+        e FLOAT(24),
+        f NVARCHAR(200),
+        g TEXT,
+        h
+    );
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|VARCHAR(100)|0||0
+    1|b|CHAR(50)|0||0
+    2|c|DECIMAL(10,2)|0||0
+    3|d|NUMERIC(5,3)|0||0
+    4|e|FLOAT(24)|0||0
+    5|f|NVARCHAR(200)|0||0
+    6|g|TEXT|0||0
+    7|h||0||0
+}
+
+test pragma-table-xinfo-type-parameters {
+    CREATE TABLE t(a VARCHAR(100), b DECIMAL(10,2) AS (1.5));
+    PRAGMA table_xinfo(t);
+}
+expect {
+    0|a|VARCHAR(100)|0||0|0
+    1|b|DECIMAL(10,2)|0||0|2
+}
+
+test pragma-table-info-added-type-parameters {
+    CREATE TABLE t(a CHAR(50));
+    ALTER TABLE t ADD COLUMN b NUMERIC(5,3);
+    SELECT name, type FROM pragma_table_info('t') ORDER BY cid;
+}
+expect {
+    a|CHAR(50)
+    b|NUMERIC(5,3)
+}
+
 @skip-if mvcc "page_count not implemented for mvcc"
 @cross-check-integrity
 test pragma-page-count-table {
@@ -365,4 +408,47 @@ test pragma-wal-autocheckpoint-value-above-int-range-reads-back-as-zero {
 expect {
     0
     0
+}
+
+@cross-check-integrity
+test pragma-table-info-quoted-type-parameters {
+    CREATE TABLE t(a "varchar"(10), b 'x y'(3,4), c `decimal`(5,2));
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|varchar|0||0
+    1|b|x y|0||0
+    2|c|decimal|0||0
+}
+
+@cross-check-integrity
+test pragma-table-xinfo-quoted-type-parameters {
+    CREATE TABLE t(a "varchar"(10), b 'x y'(3,4) AS (a));
+    PRAGMA table_xinfo(t);
+}
+expect {
+    0|a|varchar|0||0|0
+    1|b|x y|0||0|2
+}
+
+@cross-check-integrity
+test pragma-alter-add-quoted-type-parameters {
+    CREATE TABLE t(a TEXT);
+    ALTER TABLE t ADD COLUMN b "varchar"(10);
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|TEXT|0||0
+    1|b|varchar|0||0
+}
+
+@cross-check-integrity
+test pragma-table-info-signed-type-parameters {
+    CREATE TABLE t(a VARCHAR(+10), b DECIMAL(-5), c NUMERIC(10,-2));
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|VARCHAR(+10)|0||0
+    1|b|DECIMAL(-5)|0||0
+    2|c|NUMERIC(10,-2)|0||0
 }

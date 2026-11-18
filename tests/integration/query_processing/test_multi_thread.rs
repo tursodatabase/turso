@@ -19,7 +19,7 @@ fn test_schema_reprepare(tmp_db: TempDatabase) {
         match stmt2.step() {
             Ok(StepResult::IO) => tmp_db.io.step().unwrap(),
             Err(err) => {
-                assert_eq!(err.to_string(), "Parse error: no such column: x");
+                assert_eq!(err.to_string(), "no such column: x");
                 break;
             }
             r => panic!("unexpected response: {r:?}"),

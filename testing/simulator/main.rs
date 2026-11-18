@@ -24,6 +24,7 @@ use crate::model::interactions::{
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
+use turso_core::SessionRole;
 
 mod common;
 mod generation;
@@ -134,6 +135,7 @@ fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Resul
     }
 
     let paths = env.paths.clone();
+    let page_size = env.opts.page_size;
 
     if cli_opts.differential {
         env.type_ = SimulationType::Differential;
@@ -143,8 +145,9 @@ fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Resul
 
     let result = run_simulator(bugbase.as_mut(), cli_opts, env, plans);
 
-    // Print the seed, the locations of the database and the plan file at the end again for easily accessing them.
+    // Print the seed, the page size, the locations of the database and the plan file at the end again for easily accessing them.
     println!("seed: {seed}");
+    println!("page size: {page_size}");
     println!("path: {}", paths.base.display());
 
     if !cli_opts.keep_files && result.is_ok() {
@@ -609,7 +612,7 @@ fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
             .db
             .as_ref()
             .expect("simulation database exists")
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         let mut statement = connection.prepare("PRAGMA integrity_check")?;
         statement.run_with_row_callback(|row| {
             result.push(row.get::<String>(0)?);
@@ -637,6 +640,8 @@ fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
 #[cfg(test)]
 mod integrity_tests {
     use super::*;
+    use turso_core::SessionRole;
+    use turso_sqlite::SqliteDialect;
 
     #[test]
     fn wal_integrity_check_uses_exported_database() -> anyhow::Result<()> {
@@ -653,7 +658,7 @@ mod integrity_tests {
             .db
             .as_ref()
             .unwrap()
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO checked VALUES (42)")?;
         env.io.persist_files()?;
@@ -679,7 +684,7 @@ mod integrity_tests {
             .db
             .as_ref()
             .unwrap()
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO checked VALUES (42)")?;
         connection.execute("CREATE SEQUENCE checked_seq START 10")?;
@@ -693,9 +698,9 @@ mod integrity_tests {
         let reopened = turso_core::Database::open_file(
             Arc::new(turso_core::PlatformIO::new()?),
             path.to_str().unwrap(),
-            Arc::new(turso_core::SqliteDialect),
+            Arc::new(SqliteDialect),
         )?
-        .connect(turso_core::ConnectOpts::new())?;
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))?;
         let rows = reopened
             .prepare("SELECT id FROM checked")?
             .run_collect_rows()?;

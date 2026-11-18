@@ -157,6 +157,7 @@ fn decode_ascii85(input: &str) -> Result<Vec<u8>, Box<dyn StdError>> {
         if digit == b'z' {
             if counter == 0 {
                 result.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
             } else {
                 return Err("Missaligned z in input".into());
             }
@@ -166,13 +167,13 @@ fn decode_ascii85(input: &str) -> Result<Vec<u8>, Box<dyn StdError>> {
             return Err("Input char is out of range for Ascii85".into());
         }
 
-        decode_digit(digit, &mut counter, &mut chunk, &mut result);
+        decode_digit(digit, &mut counter, &mut chunk, &mut result)?;
     }
 
     let mut to_remove = 0;
 
     while counter != 0 {
-        decode_digit(b'u', &mut counter, &mut chunk, &mut result);
+        decode_digit(b'u', &mut counter, &mut chunk, &mut result)?;
         to_remove += 1;
     }
 
@@ -181,10 +182,20 @@ fn decode_ascii85(input: &str) -> Result<Vec<u8>, Box<dyn StdError>> {
     Ok(result)
 }
 
-fn decode_digit(digit: u8, counter: &mut usize, chunk: &mut u32, result: &mut Vec<u8>) {
+fn decode_digit(
+    digit: u8,
+    counter: &mut usize,
+    chunk: &mut u32,
+    result: &mut Vec<u8>,
+) -> Result<(), Box<dyn StdError>> {
     let byte = digit - 33;
 
-    *chunk += byte as u32 * TABLE[*counter];
+    // A group of 5 digits can encode values up to 85^5 - 1, but only values that
+    // fit in 4 bytes are valid Ascii85.
+    *chunk = (byte as u32)
+        .checked_mul(TABLE[*counter])
+        .and_then(|value| chunk.checked_add(value))
+        .ok_or("Ascii85 group is larger than 4 bytes")?;
 
     if *counter == 4 {
         result.extend_from_slice(&chunk.to_be_bytes());
@@ -193,6 +204,8 @@ fn decode_digit(digit: u8, counter: &mut usize, chunk: &mut u32, result: &mut Ve
     } else {
         *counter += 1;
     }
+
+    Ok(())
 }
 
 fn encode_ascii85(input: &[u8]) -> String {
@@ -217,4 +230,36 @@ fn encode_ascii85(input: &[u8]) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_ascii85_rejects_groups_larger_than_4_bytes() {
+        // 'u' as the first digit overflows the multiplication; `s8W-"` is
+        // u32::MAX + 1 and overflows the addition; "uu" overflows once padded.
+        for input in ["uuuuuuuuuuuuuuuuuuuu", "uuuuu", "s8W-\"", "uu"] {
+            assert!(
+                decode_ascii85(input).is_err(),
+                "{input:?} should not decode"
+            );
+        }
+        assert_eq!(decode_ascii85("s8W-!").unwrap(), [0xff; 4]);
+    }
+
+    #[test]
+    fn decode_ascii85_expands_z_to_4_zero_bytes() {
+        assert_eq!(decode_ascii85("z").unwrap(), [0; 4]);
+        assert_eq!(decode_ascii85("zBOu!rDZ").unwrap(), b"\0\0\0\0hello");
+        assert!(decode_ascii85("Bz").is_err());
+    }
+
+    #[test]
+    fn ascii85_round_trips() {
+        for input in [&b"hello"[..], &[0xff; 7], &[0; 4], b"a"] {
+            assert_eq!(decode_ascii85(&encode_ascii85(input)).unwrap(), input);
+        }
+    }
 }

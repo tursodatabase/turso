@@ -926,7 +926,7 @@ test match-operator-non-fts-table-select-error {
     SELECT * FROM t WHERE a MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -936,7 +936,7 @@ test match-operator-non-fts-table-delete-error {
     DELETE FROM t WHERE a MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -946,7 +946,7 @@ test match-operator-non-fts-table-update-error {
     UPDATE t SET b = 'updated' WHERE a MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -968,7 +968,7 @@ test not-match-operator-non-fts-table-error {
     SELECT * FROM t WHERE a NOT MATCH 'hello';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli
@@ -983,7 +983,7 @@ test match-operator-multi-table-join-wrong-table-error {
     SELECT * FROM users, documents WHERE users.name MATCH 'alice';
 }
 expect error {
-    Parse error: unable to use function MATCH in the requested context
+    unable to use function MATCH in the requested context
 }
 
 @backend cli

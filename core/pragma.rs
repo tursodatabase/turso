@@ -147,6 +147,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
         ),
+        AutomaticIndex => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["automatic_index"],
+        ),
         BusyTimeout => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["busy_timeout"],
@@ -217,6 +221,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0,
             &["name", "builtin", "type", "enc", "narg", "flags"],
         ),
+        CollationList => Pragma::new(PragmaFlags::Result0, &["seq", "name"]),
         PragmaName::CacheSpill => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],
@@ -354,6 +359,11 @@ impl PragmaVirtualTable {
                 1 => arg1_idx = Some(i),
                 _ => unreachable!("Unexpected hidden column index: {}", hidden_idx),
             }
+        }
+
+        // Without the table argument, do not pass a schema value as that argument.
+        if self.has_pragma_arg && arg0_idx.is_none() {
+            arg1_idx = None;
         }
 
         let argv_arg0_idx = arg0_idx.map_or(0, |_| 1);
@@ -534,14 +544,17 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect};
+    use crate::security::roles::SessionRole;
+    use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
 
     #[test]
     fn filter_starts_each_pragma_scan_at_rowid_one() {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE scan_target(first, second)")
             .unwrap();
 

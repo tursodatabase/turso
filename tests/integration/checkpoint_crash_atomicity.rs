@@ -25,9 +25,11 @@
 
 use std::sync::Arc;
 
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_sqlite::SqliteDialect;
 
 use crate::unreliable_io::UnreliableIo;
+use turso_core::SessionRole;
 
 fn query_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(sql)?;
@@ -63,7 +65,7 @@ fn run_checkpoint_crash_scenario(sync_pragma: &str) -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     // S0: a multi-page table, fully checkpointed and durable.
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -115,7 +117,7 @@ fn run_checkpoint_crash_scenario(sync_pragma: &str) -> anyhow::Result<()> {
         db_path.to_str().unwrap(),
         Arc::new(SqliteDialect),
     )?;
-    let recovered = recovered_db.connect(ConnectOpts::new())?;
+    let recovered = recovered_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     let integrity = query_rows(&recovered, "PRAGMA integrity_check")?;
     assert_eq!(
@@ -161,35 +163,6 @@ fn checkpoint_backfill_crash_under_synchronous_full_control() -> anyhow::Result<
     run_checkpoint_crash_scenario("FULL")
 }
 
-/// Simulates a power loss at this exact moment (every unsynced write in every
-/// file is lost) and recovers the surviving image with a fresh database.
-/// Returns the tempdir alongside the connection to keep the files alive.
-fn crash_now_and_recover(
-    io: &UnreliableIo,
-    db_path_sim: &str,
-) -> anyhow::Result<(tempfile::TempDir, Arc<turso_core::Connection>)> {
-    let files = io.durable_files();
-    let dir = tempfile::TempDir::new()?;
-    let db_path = dir.path().join("recovered.db");
-    std::fs::write(
-        &db_path,
-        files
-            .get(db_path_sim)
-            .map(Vec::as_slice)
-            .unwrap_or_default(),
-    )?;
-    if let Some(wal) = files.get(&format!("{db_path_sim}-wal")) {
-        std::fs::write(dir.path().join("recovered.db-wal"), wal)?;
-    }
-    let recovered_db = Database::open_file(
-        Arc::new(turso_core::PlatformIO::new()?),
-        db_path.to_str().unwrap(),
-        Arc::new(SqliteDialect),
-    )?;
-    let recovered = recovered_db.connect(ConnectOpts::new())?;
-    Ok((dir, recovered))
-}
-
 /// Under `synchronous=FULL`, a commit that follows a WAL-resetting checkpoint
 /// must fsync the WAL before COMMIT returns. The checkpoint's own WAL fsync
 /// clears the WAL dirty flag, so a commit fsync gated on that flag alone is
@@ -207,7 +180,7 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous=FULL")?;
     conn.execute("CREATE TABLE t(x)")?;
     conn.execute("INSERT INTO t VALUES (1)")?;
@@ -216,7 +189,7 @@ fn full_commit_right_after_truncate_checkpoint_survives_power_loss() -> anyhow::
     // The commit under test: the first commit into the reset WAL.
     conn.execute("INSERT INTO t VALUES (2)")?;
 
-    let (_dir, recovered) = crash_now_and_recover(&io, db_path_sim)?;
+    let (_dir, recovered) = io.crash_now_and_recover(db_path_sim)?;
     let rows = query_rows(&recovered, "SELECT x FROM t ORDER BY x")?;
     assert_eq!(
         rows,
@@ -242,7 +215,7 @@ fn savepoint_spill_crash_image_matches_sqlite_recovery() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous=FULL")?;
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
     conn.execute("CREATE INDEX t_anchor_idx ON t(id, v)")?;
@@ -283,7 +256,7 @@ fn savepoint_spill_crash_image_matches_sqlite_recovery() -> anyhow::Result<()> {
     std::fs::write(&sqlite_db_path, durable_db)?;
     std::fs::write(sqlite_dir.path().join("recovered.db-wal"), durable_wal)?;
 
-    let (_turso_dir, turso_recovered) = crash_now_and_recover(&io, db_path_sim)?;
+    let (_turso_dir, turso_recovered) = io.crash_now_and_recover(db_path_sim)?;
     let table_sql = format!("SELECT COUNT(*) FROM t NOT INDEXED WHERE v = CAST('{new}' AS BLOB)");
     let index_sql =
         format!("SELECT COUNT(*) FROM t INDEXED BY t_anchor_idx WHERE v = CAST('{new}' AS BLOB)");
@@ -340,7 +313,7 @@ fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("PRAGMA synchronous=FULL")?;
     conn.execute("CREATE TABLE t(x)")?;
 

@@ -999,7 +999,12 @@ pub(crate) fn plan_view(
     // Lower the same optimized plan regular execution runs. Maintenance does
     // not depend on its access paths: no operator state depends on the order
     // in which a query would meet the rows.
-    optimize_plan(&mut planner_program, &mut relational_plan, resolver)?;
+    optimize_plan(
+        &mut planner_program,
+        &mut relational_plan,
+        resolver,
+        connection,
+    )?;
     let dag = build_dag_from_plan(&relational_plan, resolver)?;
     let operator_states = plan_operator_states(view_name, &dag, resolver)?;
     let output_arity = dag.root_schema().len();

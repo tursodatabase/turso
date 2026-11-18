@@ -228,6 +228,19 @@ expect {
     2|30
 }
 
+@cross-check-integrity
+test check_constraint_strict_table_with_collate {
+    CREATE TABLE names (
+        id INTEGER PRIMARY KEY,
+        name TEXT CHECK (name COLLATE NOCASE <> 'admin')
+    ) STRICT;
+    INSERT INTO names VALUES (1, 'alice');
+    INSERT INTO names VALUES (2, 'ADMIN');
+}
+expect error {
+    CHECK constraint failed
+}
+
 @requires strict "uses STRICT tables"  
 @cross-check-integrity
 test check_constraint_strict_type_violation {
@@ -264,6 +277,28 @@ test check_constraint_strict_check_violation_after_coercion {
     INSERT INTO employees VALUES (1, '17');
 }
 expect error {
+}
+
+@cross-check-integrity
+test check_constraint_strict_substr_of_integer_is_text {
+    -- substr() of a number returns text.
+    CREATE TABLE a (t TEXT, i INTEGER, CHECK (t = substr(i, 1))) STRICT;
+    INSERT INTO a VALUES ('12', 12);
+    SELECT * FROM a;
+}
+expect {
+    12|12
+}
+
+@cross-check-integrity
+test check_constraint_strict_ceil_of_text_is_a_number {
+    -- ceil() converts a text argument to a number.
+    CREATE TABLE a (x INTEGER, s TEXT, CHECK (x = ceil(s))) STRICT;
+    INSERT INTO a VALUES (12, '12');
+    SELECT * FROM a;
+}
+expect {
+    12|12
 }
 
 # Regular (non-STRICT) tables with type affinity

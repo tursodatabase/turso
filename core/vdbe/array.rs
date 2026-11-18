@@ -37,7 +37,7 @@ pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
 
 /// [parse_text_array] for an array whose elements are texts, such as a
 /// `text[]`: an unquoted `1.0` stays the text `1.0`.
-pub(crate) fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
+pub fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
     parse_text_array_as(text, UnquotedElements::Texts)
 }
 
@@ -189,6 +189,20 @@ pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
     }
     result.push('}');
     Ok(result)
+}
+
+/// Formats texts as an array literal in the same format, such as
+/// `{a,"b c"}`.
+pub fn text_array_literal<'a>(elements: impl IntoIterator<Item = &'a str>) -> String {
+    let mut result = String::from("{");
+    for (i, element) in elements.into_iter().enumerate() {
+        if i > 0 {
+            result.push(',');
+        }
+        write_pg_text_element(&mut result, element);
+    }
+    result.push('}');
+    result
 }
 
 fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {

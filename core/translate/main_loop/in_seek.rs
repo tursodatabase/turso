@@ -35,6 +35,7 @@ pub(super) fn emit_in_seek_start(
         table_references,
         resolver,
         index,
+        source,
         source_cursor_id,
         next_value,
     )?;
@@ -78,11 +79,14 @@ pub(super) fn emit_in_seek_start(
 /// Read the current `IN` value into a new register and return it as a seek
 /// key. A NULL value matches nothing, so it jumps to `next_value`. An index
 /// holds encoded values, so the key is encoded as for any other index seek.
+/// Values of a literal list are encoded when they are inserted into the
+/// ephemeral index, so they are not encoded again here.
 pub(super) fn emit_in_seek_key(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
     index: Option<&Arc<Index>>,
+    source: &InSeekSource,
     source_cursor_id: CursorID,
     next_value: BranchOffset,
 ) -> Result<usize> {
@@ -97,14 +101,15 @@ pub(super) fn emit_in_seek_key(
         reg: seek_reg,
         target_pc: next_value,
     });
-    if let Some(index) = index {
+    if let (Some(index), InSeekSource::Subquery { .. }) = (index, source) {
         encode_seek_keys_for_custom_types(
             program,
             table_references,
             index,
             seek_reg,
-            1,
+            [None],
             0,
+            None,
             resolver,
         )?;
     }
@@ -115,8 +120,12 @@ pub(super) fn emit_in_seek_key(
 ///
 /// Literal lists are materialized once into a unique ephemeral index so both
 /// ordinary `Search::InSeek` and multi-index OR branches can drive repeated
-/// equality seeks from the same bytecode pattern. IN-subqueries already have an
-/// ephemeral cursor from subquery translation, so they are reused directly.
+/// equality seeks from the same bytecode pattern. Each literal gets the
+/// comparison affinity and, when the seek uses an index, is then encoded
+/// before it is inserted, so two spellings of one value (`'12:00'` and
+/// `'12:00:00'` for a time) become one entry and the matching rows are read
+/// once. IN-subqueries already have an ephemeral cursor from subquery
+/// translation, so they are reused directly.
 pub(super) fn open_in_seek_source_cursor(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -178,12 +187,24 @@ pub(super) fn open_in_seek_source_cursor(
                     resolver,
                     NoConstantOptReason::InListEphemeral,
                 )?;
+                if let Some(index) = index {
+                    encode_seek_keys_for_custom_types(
+                        program,
+                        table_references,
+                        index,
+                        val_reg,
+                        [Some(value)],
+                        0,
+                        Some(&affinity_str),
+                        resolver,
+                    )?;
+                }
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u32(val_reg),
                     count: 1,
                     dest_reg: to_u32(record_reg),
                     index_name: None,
-                    affinity_str: Some(affinity_str.clone()),
+                    affinity_str: index.is_none().then(|| affinity_str.clone()),
                 });
                 program.emit_insn(Insn::IdxInsert {
                     cursor_id: eph_cursor,

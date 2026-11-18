@@ -1,0 +1,54 @@
+@database :memory:
+@skip-file-if sqlite "SQLite has no WITHIN GROUP syntax for percentile_disc and percentile_cont"
+
+# The fraction of percentile_disc and percentile_cont is read once, before the
+# rows of the FROM clause are read, so it must not read a column or the rowid
+# of those rows. A rowid of an outer query is the same for all those rows.
+
+test percentile-disc-fraction-reads-rowid {
+    CREATE TABLE t(a INT);
+    INSERT INTO t VALUES(1);
+    SELECT percentile_disc(rowid) WITHIN GROUP (ORDER BY a) FROM t;
+}
+expect error {
+    must be a constant expression that does not depend on the aggregated rows
+}
+
+test percentile-cont-fraction-reads-rowid {
+    CREATE TABLE t(a INT);
+    INSERT INTO t VALUES(1);
+    SELECT percentile_cont(rowid) WITHIN GROUP (ORDER BY a) FROM t;
+}
+expect error {
+    must be a constant expression that does not depend on the aggregated rows
+}
+
+test percentile-disc-fraction-reads-qualified-rowid-of-empty-table {
+    CREATE TABLE t(a INT);
+    SELECT percentile_disc(t.rowid) WITHIN GROUP (ORDER BY a) FROM t;
+}
+expect error {
+    must be a constant expression that does not depend on the aggregated rows
+}
+
+test percentile-disc-fraction-reads-rowid-in-insert-select {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(x REAL);
+    INSERT INTO t VALUES(1);
+    INSERT INTO u SELECT percentile_disc(oid = 1) WITHIN GROUP (ORDER BY a) FROM t;
+}
+expect error {
+    must be a constant expression that does not depend on the aggregated rows
+}
+
+test percentile-disc-fraction-reads-outer-rowid {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(x INT);
+    INSERT INTO t VALUES(1), (2);
+    INSERT INTO u VALUES(10), (20);
+    SELECT (SELECT percentile_disc(t.rowid * 0.5) WITHIN GROUP (ORDER BY u.x) FROM u) FROM t ORDER BY t.a;
+}
+expect {
+    10
+    20
+}

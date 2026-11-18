@@ -16,6 +16,7 @@ void test_sqlite3_last_insert_rowid();
 void test_sqlite3_bind_text();
 void test_sqlite3_bind_text2();
 void test_sqlite3_bind_blob();
+void test_sqlite3_result_text_and_blob();
 void test_sqlite3_column_type();
 void test_sqlite3_column_decltype();
 void test_sqlite3_next_stmt();
@@ -30,6 +31,7 @@ void test_sqlite3_exec_null_values();
 void test_sqlite3_prepare_no_statements();
 void test_sqlite3_close_with_unfinalized_stmt();
 void test_sqlite3_open_v2_flags();
+void test_sqlite3_db_readonly();
 
 int allocated = 0;
 
@@ -45,6 +47,7 @@ int main(void)
     test_sqlite3_bind_text();
     test_sqlite3_bind_text2();
     test_sqlite3_bind_blob();
+    test_sqlite3_result_text_and_blob();
     test_sqlite3_column_type();
     test_sqlite3_column_decltype();
     test_sqlite3_next_stmt();
@@ -59,6 +62,7 @@ int main(void)
     test_sqlite3_prepare_no_statements();
     test_sqlite3_close_with_unfinalized_stmt();
     test_sqlite3_open_v2_flags();
+    test_sqlite3_db_readonly();
     return 0;
 }
 
@@ -599,6 +603,89 @@ void test_sqlite3_bind_blob()
 
     sqlite3_finalize(stmt);
     sqlite3_close(db);
+}
+
+static void result_malloc_text(void *ctx, int argc, void **argv)
+{
+    (void)argc;
+    (void)argv;
+    char *text = malloc(6);
+    memcpy(text, "hello", 6);
+    allocated++;
+    sqlite3_result_text(ctx, text, -1, custom_destructor);
+}
+
+static void result_malloc_blob(void *ctx, int argc, void **argv)
+{
+    (void)argc;
+    (void)argv;
+    char *blob = malloc(3);
+    memcpy(blob, "abc", 3);
+    allocated++;
+    sqlite3_result_blob(ctx, blob, 3, custom_destructor);
+}
+
+static void result_null_text(void *ctx, int argc, void **argv)
+{
+    (void)argc;
+    (void)argv;
+    sqlite3_result_int(ctx, 1);
+    sqlite3_result_text(ctx, NULL, 0, SQLITE_TRANSIENT);
+}
+
+static void result_null_blob(void *ctx, int argc, void **argv)
+{
+    (void)argc;
+    (void)argv;
+    sqlite3_result_int(ctx, 1);
+    sqlite3_result_blob(ctx, NULL, 0, SQLITE_TRANSIENT);
+}
+
+static void check_single_value(sqlite3 *db, const char *sql, int type, const char *expected, int len)
+{
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+    assert(sqlite3_column_type(stmt, 0) == type);
+    if (expected != NULL) {
+        assert(sqlite3_column_bytes(stmt, 0) == len);
+        assert(memcmp(sqlite3_column_blob(stmt, 0), expected, len) == 0);
+    }
+    sqlite3_finalize(stmt);
+}
+
+void test_sqlite3_result_text_and_blob()
+{
+    sqlite3 *db;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_create_function_v2(db, "malloc_text", 0, SQLITE_UTF8, NULL, (void (*)(void))result_malloc_text, NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_create_function_v2(db, "malloc_blob", 0, SQLITE_UTF8, NULL, (void (*)(void))result_malloc_blob, NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_create_function_v2(db, "null_text", 0, SQLITE_UTF8, NULL, (void (*)(void))result_null_text, NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_create_function_v2(db, "null_blob", 0, SQLITE_UTF8, NULL, (void (*)(void))result_null_blob, NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+
+    // A custom destructor releases the buffer once, and the result keeps its value.
+    check_single_value(db, "SELECT malloc_text()", SQLITE_TEXT, "hello", 5);
+    assert(allocated == 0);
+    check_single_value(db, "SELECT malloc_blob()", SQLITE_BLOB, "abc", 3);
+    assert(allocated == 0);
+
+    // A NULL pointer replaces any earlier result with SQL NULL.
+    check_single_value(db, "SELECT null_text()", SQLITE_NULL, NULL, 0);
+    check_single_value(db, "SELECT null_blob()", SQLITE_NULL, NULL, 0);
+
+    sqlite3_close(db);
+
+    printf("Test passed: result_text and result_blob call custom destructors\n");
 }
 
 void test_sqlite3_column_type()
@@ -1296,4 +1383,27 @@ void test_sqlite3_open_v2_flags()
     sqlite3_close(db);
 
     printf("test_sqlite3_open_v2_flags test passed\n");
+}
+
+void test_sqlite3_db_readonly()
+{
+    sqlite3 *db;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    assert(sqlite3_db_readonly(db, "missing_schema") == -1);
+    assert(sqlite3_db_readonly(db, "main") == 0);
+    assert(sqlite3_db_readonly(db, "MAIN") == 0);
+    assert(sqlite3_db_readonly(db, NULL) == 0);
+
+    /* temp is not a database until a temp object creates it. */
+    assert(sqlite3_db_readonly(db, "temp") == -1);
+    rc = sqlite3_exec(db, "CREATE TEMP TABLE tt(x);", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_db_readonly(db, "temp") == 0);
+
+    sqlite3_close(db);
+    printf("test_sqlite3_db_readonly test passed\n");
 }

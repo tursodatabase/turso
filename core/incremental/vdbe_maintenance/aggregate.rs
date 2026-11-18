@@ -15,6 +15,7 @@ use crate::function::AggFunc;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
@@ -179,8 +180,9 @@ fn emit_group_aggregate_rows(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
     );
 
     turso_assert!(

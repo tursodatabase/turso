@@ -23,6 +23,7 @@ name = "plan_to_test"
 path = "plan_to_test.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 turso_core = { workspace = true, features = [
     "simulator",
     "io_uring",

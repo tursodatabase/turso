@@ -20,14 +20,36 @@ pub(crate) fn custom_operator_call(
     expr: &ast::Expr,
     env: &TypeEnv,
 ) -> Result<Option<OperatorCall>> {
-    let Some((_, operands)) = decided_operator(expr, env) else {
+    let Some(types) = operand_types(expr, env) else {
         return Ok(None);
     };
-    let types: Vec<ExprType> = operands
-        .iter()
-        .map(|operand| type_of(operand, env))
-        .collect();
     find_operator_call(expr, &types, env)
+}
+
+/// Fails when no function runs the operator expression `expr`, as in
+/// `date * 2`, for an expression that is bound but not yet compiled. An
+/// operand whose type is not known yet, such as a subquery that is not planned
+/// yet, leaves the decision to a check once it is known.
+pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
+    let Some(types) = operand_types(expr, env) else {
+        return Ok(());
+    };
+    if types.iter().any(|ty| matches!(ty, ExprType::NotKnownYet)) {
+        return Ok(());
+    }
+    find_operator_call(expr, &types, env).map(|_| ())
+}
+
+/// The types of the operands of `expr`, in order, when it is an operator that
+/// custom types decide (see [decided_operator]).
+fn operand_types(expr: &ast::Expr, env: &TypeEnv) -> Option<Vec<ExprType>> {
+    let (_, operands) = decided_operator(expr, env)?;
+    Some(
+        operands
+            .iter()
+            .map(|operand| type_of(operand, env))
+            .collect(),
+    )
 }
 
 /// The function that runs the operator expression `expr` when an operand is a
@@ -180,10 +202,10 @@ impl<'a> Operand<'a> {
             }
             _ => None,
         };
-        let sqlite_type = sqlite_operand_type(expr_type.clone(), env.schema());
+        let sqlite_type = sqlite_operand_type(expr_type.clone());
         let may_be_integer = matches!(
             sqlite_type,
-            ExprType::Builtin(BuiltinType::Integer | BuiltinType::Any)
+            ExprType::Builtin(BuiltinType::Integer | BuiltinType::Numeric | BuiltinType::Any)
         );
         let is_real = matches!(sqlite_type, ExprType::Builtin(BuiltinType::Real))
             && !matches!(expr_type, ExprType::Builtin(BuiltinType::Decimal));
@@ -202,13 +224,13 @@ impl<'a> Operand<'a> {
     fn type_name(&self) -> String {
         match (&self.value_type, self.expr_type) {
             (Some(ty), _) => ty.type_def.name.clone(),
-            (None, ExprType::Builtin(BuiltinType::Any)) => "value".to_string(),
-            (None, ExprType::Builtin(BuiltinType::Decimal)) => "numeric".to_string(),
-            (None, ExprType::Builtin(builtin)) => format!("{builtin:?}").to_lowercase(),
-            (None, ExprType::Custom { type_def, .. }) => type_def.name.clone(),
-            (None, ExprType::Untyped) => "text".to_string(),
-            (None, ExprType::Null) => "null".to_string(),
-            (None, _) => "value".to_string(),
+            // A value whose type is only known when the statement runs, such as
+            // the result of json_extract().
+            (
+                None,
+                ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown | ExprType::NotKnownYet,
+            ) => "value".to_string(),
+            (None, ty) => ty.to_string(),
         }
     }
 }
@@ -234,9 +256,9 @@ fn accepts_operand(
         OperatorArg::Value => is_this_type(operand.value_type.as_ref()),
         OperatorArg::EncodableLiteral => {
             operand.value_type.is_none()
-                && operand.literal_kind.is_some_and(|kind| {
-                    literal_compatible_with_value_type(kind, ty.type_def.value_input_type())
-                })
+                && operand
+                    .literal_kind
+                    .is_some_and(|kind| takes_input_of_type(&ty.type_def, kind))
         }
         OperatorArg::PlainValue => is_plain_value(signature, operand),
         OperatorArg::Integer => is_plain_value(signature, operand) && operand.may_be_integer,
@@ -413,13 +435,31 @@ fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: u
 /// with 3.50.
 fn emit_encode(
     program: &mut ProgramBuilder,
-    to: &TypeDef,
+    to: &Arc<TypeDef>,
     value_reg: usize,
     dest_reg: usize,
     resolver: &Resolver,
-) -> Result<usize> {
-    let encode = to
-        .encode()
-        .ok_or_else(|| LimboError::InternalError(format!("type {} has no ENCODE", to.name)))?;
-    emit_type_expr(program, encode, value_reg, dest_reg, resolver)
+) -> Result<()> {
+    if to.encode().is_none() {
+        return Err(LimboError::InternalError(format!(
+            "type {} has no ENCODE",
+            to.name
+        )));
+    }
+    let resolved = resolver
+        .schema()
+        .resolve_type_unchecked(&to.name)?
+        .ok_or_else(|| LimboError::InternalError(format!("type {} does not resolve", to.name)))?;
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: dest_reg,
+        extra_amount: 0,
+    });
+    emit_encode_for_comparison(
+        program,
+        std::slice::from_ref(to),
+        resolved.storage_class()?,
+        dest_reg,
+        resolver,
+    )
 }

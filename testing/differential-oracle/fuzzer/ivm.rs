@@ -1521,7 +1521,8 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use sql_gen::SchemaBuilder;
-    use turso_core::{ConnectOpts, Database, SqliteDialect};
+    use turso_core::{ConnectOpts, Database, SessionRole};
+    use turso_sqlite::SqliteDialect;
 
     fn test_schema() -> Schema {
         SchemaBuilder::new()
@@ -1554,7 +1555,8 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap()
     }
 
     #[test]

@@ -10,7 +10,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH items USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH items USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
 
 BYTECODE
 addr  opcode          p1  p2  p3  p4        p5  comment

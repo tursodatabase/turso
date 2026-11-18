@@ -22,7 +22,10 @@ pub(crate) use vtab::{
     create_virtual_table, ExtensionCursor, ExtensionTable, ModuleImplementation,
 };
 
-use crate::{function::ExternalFunc, Connection, Database};
+use crate::{
+    function::{ExternalFunc, ReturnType},
+    Connection, Database,
+};
 use crate::{vtab::VirtualTable, SymbolTable};
 #[cfg(feature = "fs")]
 use crate::{LimboError, IO};
@@ -48,6 +51,9 @@ pub struct ExtensionCtx {
     /// We must bump the prepare context generation so prepared statements
     /// know they need to be reprepared after extension registration.
     prepare_context_generation: *const AtomicU64,
+    /// The dialect of the database, which parses the schema that a
+    /// table-valued function module declares.
+    dialect: Arc<dyn crate::dialect::Dialect>,
 }
 
 pub(crate) unsafe extern "C" fn register_vtab_module(
@@ -81,7 +87,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
         }
 
         if kind == VTabKind::TableValuedFunction {
-            if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
+            if let Ok(vtab) = VirtualTable::function(ext_ctx.dialect.as_ref(), &name_str, syms) {
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
                 let mut guard = mutex.lock();
@@ -100,15 +106,20 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub(crate) implementation: ModuleImplementation,
+    pub implementation: ModuleImplementation,
 }
 
+/// Registers a function that core implements through the extension API.
+/// Unlike a loaded extension's function, it states the type it returns, so
+/// expressions that call it have a known type. `None` means the type depends
+/// on the arguments: `time_get(t, 'second')` is a REAL, other fields INTEGERs.
 pub(crate) unsafe fn register_scalar_function(
     ctx: *mut c_void,
     name: *const c_char,
     func: ScalarFunction,
+    return_type: Option<ReturnType>,
 ) -> ResultCode {
-    unsafe { register_scalar_function_with_options(ctx, name, -1, false, 0, func, None, None) }
+    unsafe { add_scalar_function(ctx, name, -1, false, 0, func, None, None, return_type) }
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
@@ -120,6 +131,33 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
     callback: ScalarFunction,
     context_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
+) -> ResultCode {
+    unsafe {
+        add_scalar_function(
+            ctx,
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            None,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn add_scalar_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: ScalarFunction,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+    return_type: Option<ReturnType>,
 ) -> ResultCode {
     if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
@@ -137,6 +175,7 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
         callback,
         context_destructor,
         value_destructor,
+        return_type,
     ) {
         Ok(function) => function,
         Err(_) => return ResultCode::InvalidArgs,
@@ -278,6 +317,7 @@ impl Database {
             syms,
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: std::ptr::null(),
+            dialect: self.dialect(),
         }));
         #[allow(unused)]
         let mut ext_api = ExtensionApi {
@@ -353,6 +393,7 @@ impl Connection {
             syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: &self.prepare_context_generation as *const _,
+            dialect: self.dialect(),
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;
         ExtensionApi {

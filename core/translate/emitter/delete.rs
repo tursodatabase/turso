@@ -1,4 +1,4 @@
-use super::{Resolver, Result, TranslateCtx};
+use super::{emit_columns_and_dependencies, Resolver, Result, TranslateCtx};
 use crate::namespace::NamespaceRef;
 use crate::{
     emit_explain,
@@ -8,8 +8,8 @@ use crate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_partial_index_where_old_image,
-            emit_program_for_select, get_triggers_including_temp, has_triggers_including_temp,
-            OperationMode, TriggerTime,
+            emit_program_for_select, gencol::emit_row_from_cursor, get_triggers_including_temp,
+            has_triggers_including_temp, OperationMode, TriggerTime,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
@@ -30,7 +30,7 @@ use crate::{
         trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, DmlRowForm, ProgramBuilder},
         insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
@@ -379,24 +379,26 @@ pub fn emit_fk_child_decrement_on_delete(
         if !fk_ref.fk.deferred {
             continue;
         }
+        let child_positions: Vec<usize> = fk_ref
+            .fk
+            .child_columns
+            .iter()
+            .map(|cname| child_tbl.get_column(cname).unwrap().0)
+            .collect();
+        let child_key = emit_columns_and_dependencies(
+            program,
+            child_tbl,
+            child_cursor_id,
+            child_rowid_reg,
+            child_positions.iter().copied(),
+            resolver,
+        )?;
+
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
-        for cname in &fk_ref.fk.child_columns {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
+        for &pos in &child_positions {
             program.emit_insn(Insn::IsNull {
-                reg: src,
+                reg: child_key.to_column_reg(pos),
                 target_pc: null_skip,
             });
         }
@@ -410,33 +412,20 @@ pub fn emit_fk_child_decrement_on_delete(
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
-            let val = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
             let tmpi = program.alloc_register();
             program.emit_insn(Insn::Copy {
-                src_reg: val,
+                src_reg: child_key.to_column_reg(child_positions[0]),
                 dst_reg: tmpi,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt {
-                reg: tmpi,
-                target_pc: None,
-            });
-
-            // NotExists jumps when the parent key is missing, so we decrement there
+            // A key that is not an integer cannot match a parent rowid, so the
+            // parent is missing, and NotExists jumps there too
             let missing = program.allocate_label();
             let done = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmpi,
+                target_pc: Some(missing),
+            });
 
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
@@ -466,22 +455,9 @@ pub fn emit_fk_child_decrement_on_delete(
             // Build probe from current child row
             let n = fk_ref.fk.child_columns.len();
             let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
-                let src = if col.is_rowid_alias() {
-                    child_rowid_reg
-                } else {
-                    let r = program.alloc_register();
-                    program.emit_insn(Insn::Column {
-                        cursor_id: child_cursor_id,
-                        column: pos,
-                        dest: r,
-                        default: None,
-                    });
-                    r
-                };
+            for (i, &pos) in child_positions.iter().enumerate() {
                 program.emit_insn(Insn::Copy {
-                    src_reg: src,
+                    src_reg: child_key.to_column_reg(pos),
                     dst_reg: probe + i,
                     extra_amount: 0,
                 });
@@ -567,6 +543,7 @@ fn emit_delete_insns<'a>(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -603,18 +580,14 @@ fn emit_delete_insns<'a>(
             let columns_start_reg = program.alloc_registers(cols_len);
 
             // Read all column values from the row to be deleted
-            for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-                emit_table_column(
-                    program,
-                    main_table_cursor_id,
-                    internal_id,
-                    table_references,
-                    column,
-                    i,
-                    columns_start_reg + i,
-                    resolver,
-                )?;
-            }
+            emit_deleted_row(
+                program,
+                table_references,
+                unsafe { &*table_reference },
+                main_table_cursor_id,
+                columns_start_reg,
+                resolver,
+            )?;
 
             (Some(columns_start_reg), rowid_reg)
         }
@@ -873,7 +846,9 @@ fn emit_delete_row_common(
         let columns_start_reg = columns_start_reg
             .expect("columns_start_reg must be provided when there are triggers or RETURNING");
         let delete_table = unsafe { &*table_reference };
-        let delete_layout = ColumnLayout::from_columns(delete_table.columns())?;
+        let delete_layout = ColumnLayout::Identity {
+            column_count: delete_table.columns().len(),
+        };
         let cache_state = seed_returning_row_image_in_cache(
             program,
             table_references,
@@ -972,29 +947,25 @@ fn emit_delete_insns_when_triggers_present(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
     };
     let cols_len = unsafe { &*table_reference }.columns().len();
 
-    let internal_id = unsafe { (*table_reference).internal_id };
     let columns_start_reg = if !has_returning && !has_delete_triggers {
         None
     } else {
         let columns_start_reg = program.alloc_registers(cols_len);
-        for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-            emit_table_column(
-                program,
-                main_table_cursor_id,
-                internal_id,
-                table_references,
-                column,
-                i,
-                columns_start_reg + i,
-                resolver,
-            )?;
-        }
+        emit_deleted_row(
+            program,
+            table_references,
+            unsafe { &*table_reference },
+            main_table_cursor_id,
+            columns_start_reg,
+            resolver,
+        )?;
         Some(columns_start_reg)
     };
 
@@ -1009,6 +980,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::Before,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -1026,6 +998,7 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx = TriggerContext::new(
                 btree_table,
                 None, // No NEW for DELETE
+                DmlRowForm::Stored,
                 Some(old_registers),
             );
 
@@ -1075,6 +1048,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::After,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -1089,6 +1063,7 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx_after = TriggerContext::new(
                 btree_table,
                 None, // No NEW for DELETE
+                DmlRowForm::Stored,
                 Some(old_registers),
             );
 
@@ -1109,4 +1084,36 @@ fn emit_delete_insns_when_triggers_present(
     program.preassign_label_to_next_insn(skip_not_found_label);
 
     Ok(())
+}
+
+fn emit_deleted_row(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    cursor_id: usize,
+    columns_start_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let column_regs: Vec<usize> =
+        (columns_start_reg..columns_start_reg + table.columns().len()).collect();
+    match table.btree() {
+        Some(btree_table) => {
+            emit_row_from_cursor(program, &btree_table, cursor_id, &column_regs, resolver)
+        }
+        None => {
+            for (i, column) in table.columns().iter().enumerate() {
+                emit_table_column(
+                    program,
+                    cursor_id,
+                    table.internal_id,
+                    table_references,
+                    column,
+                    i,
+                    column_regs[i],
+                    resolver,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }

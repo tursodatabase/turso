@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO};
+use turso_sqlite::SqliteDialect;
 use turso_sync_engine::Result;
 
 use super::replica::Replica;
 use super::snapshot::Snapshot;
+use turso_core::SessionRole;
 
 pub struct Remote {
     conn: Arc<Connection>,
@@ -26,7 +26,7 @@ impl Remote {
             &db_path.to_string_lossy(),
             OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.set_portable_logical_changes_enabled(true);
         for sql in setup {

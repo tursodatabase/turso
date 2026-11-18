@@ -19,14 +19,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use turso_core::{ConnectOpts, Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database};
 use turso_parser::ast::{
     Cmd, Expr, InsertBody, Literal, OneSelect, ResultColumn, Select, SelectTable, Stmt,
 };
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 use crate::memory::MemorySimIO;
 use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};
+use turso_core::SessionRole;
 
 /// Upper bound on candidate executions per shrink, so a pathological
 /// statement cannot stall a fuzzing loop.
@@ -100,7 +102,7 @@ impl EnginePair {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso = turso_db.connect(ConnectOpts::new())?;
+        let turso = turso_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
             let stmt = stmt.trim();

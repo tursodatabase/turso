@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+import threading
 import types
 
 import pytest
@@ -127,6 +128,15 @@ class TestTursoDialectURLParsing:
 
         assert kwargs["isolation_level"] is None
 
+    def test_timeout_param(self):
+        """Test timeout query parameter is passed to turso.connect as seconds."""
+        dialect = TursoDialect()
+        url = URL.create("sqlite+turso", database="test.db", query={"timeout": "2.5"})
+
+        args, kwargs = dialect.create_connect_args(url)
+
+        assert kwargs["timeout"] == 2.5
+
 
 class TestTursoSyncDialectURLParsing:
     """Test URL parsing for TursoSyncDialect."""
@@ -171,12 +181,14 @@ class TestTursoSyncDialectURLParsing:
                 "long_poll_timeout_ms": "5000",
                 "bootstrap_if_empty": "false",
                 "isolation_level": "IMMEDIATE",
+                "timeout": "2.5",
             },
         )
 
         args, kwargs = dialect.create_connect_args(url)
 
         assert args == ["test.db", "https://db.turso.io"]
+        assert kwargs["timeout"] == 2.5
         assert kwargs["auth_token"] == "secret"
         assert kwargs["client_name"] == "my-app"
         assert kwargs["long_poll_timeout_ms"] == 5000
@@ -398,6 +410,32 @@ class TestBasicDialectIntegration:
             # Verify again
             result = pd.read_sql("SELECT * FROM test_table", conn)
             assert len(result) == 3
+
+    def test_threads_writing_to_one_file_database(self, tmp_path):
+        """Threads writing through one engine wait for each other's write locks."""
+        engine = create_engine(f"sqlite+turso:///{tmp_path / 'threads.db'}")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE test (thread INTEGER, n INTEGER)"))
+
+        errors = []
+
+        def write(thread_id):
+            try:
+                for n in range(20):
+                    with engine.begin() as conn:
+                        conn.execute(text("INSERT INTO test VALUES (:t, :n)"), {"t": thread_id, "n": n})
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM test")).scalar() == 200
 
     def test_reflection_on_simple_table(self):
         """Reflection on a table with no FKs, indexes, or UNIQUE clauses

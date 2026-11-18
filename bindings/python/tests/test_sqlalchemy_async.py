@@ -99,6 +99,16 @@ def test_autocommit_isolation_level():
     assert kwargs["isolation_level"] is None
 
 
+def test_timeout_param():
+    """The async dialect passes the timeout query parameter as seconds."""
+    dialect = AioTursoDialect()
+    url = URL.create("sqlite+aioturso", database="test.db", query={"timeout": "2.5"})
+
+    _, kwargs = dialect.create_connect_args(url)
+
+    assert kwargs["timeout"] == 2.5
+
+
 def test_memory_uses_static_pool():
     """Async :memory: databases use StaticPool."""
     from sqlalchemy import pool

@@ -915,3 +915,80 @@ test case-when-compares-with-comparison-affinity {
 expect {
     y|y|y|1
 }
+
+# The affinity of a scalar subquery comes from the column it selects, on either
+# side of IN (SELECT ...).
+setup in_scalar_subquery_values {
+    CREATE TABLE t(b TEXT, i INTEGER, r REAL);
+    INSERT INTO t VALUES ('1', 1, 1.0);
+}
+
+@setup in_scalar_subquery_values
+test in-select-left-scalar-subquery-column-affinity {
+    SELECT (SELECT b FROM t) IN (SELECT 1),
+           (SELECT i FROM t) IN (SELECT '1'),
+           (SELECT r FROM t) IN (SELECT '1'),
+           ((SELECT b FROM t)) IN (SELECT 1);
+}
+expect {
+    1|1|1|1
+}
+
+@setup in_scalar_subquery_values
+test in-select-left-nested-scalar-subquery-column-affinity {
+    SELECT (SELECT (SELECT b FROM t)) IN (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup in_scalar_subquery_values
+test not-in-select-left-scalar-subquery-column-affinity {
+    SELECT (SELECT b FROM t) NOT IN (SELECT 1);
+}
+expect {
+    0
+}
+
+@setup in_scalar_subquery_values
+test in-select-left-scalar-subquery-in-where {
+    SELECT 'matched' FROM t WHERE (SELECT b FROM t) IN (SELECT 1);
+}
+expect {
+    matched
+}
+
+@setup in_scalar_subquery_values
+test in-select-left-correlated-scalar-subquery {
+    SELECT (SELECT y.i FROM t y WHERE y.b = x.b) IN (SELECT '1') FROM t x;
+}
+expect {
+    1
+}
+
+@setup in_scalar_subquery_values
+test in-select-row-value-with-scalar-subquery {
+    SELECT ((SELECT b FROM t), 1) IN (SELECT 1, 1),
+           (1, (SELECT i FROM t)) IN (SELECT 1, '1');
+}
+expect {
+    1|1
+}
+
+@setup in_scalar_subquery_values
+test in-select-right-scalar-subquery-column-affinity {
+    SELECT 1 IN (SELECT (SELECT b FROM t)),
+           (SELECT i FROM t) IN (SELECT (SELECT b FROM t));
+}
+expect {
+    1|1
+}
+
+# A unary plus removes the affinity, so these do not match.
+@setup in_scalar_subquery_values
+test in-select-unary-plus-removes-scalar-subquery-affinity {
+    SELECT +(SELECT b FROM t) IN (SELECT 1);
+}
+expect {
+    0
+}

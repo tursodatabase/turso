@@ -5,9 +5,9 @@ use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
     OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
     backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
-    backends::rust::RustBackend, backends::tursopg::TursopgBackend, create_output,
-    find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
-    summarize, tcl_converter,
+    backends::rust::RustBackend, backends::tursopg::TursopgBackend,
+    backends::tursopg_embedded::TursopgEmbeddedBackend, create_output, find_all_pending_snapshots,
+    generate_database, generate_integrity_fixture, load_test_files, summarize, tcl_converter,
 };
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -37,7 +37,8 @@ enum Commands {
 
         /// Backend to use: "rust" (native), "cli" (subprocess), "js" (JavaScript
         /// bindings), "tursopg" (tursopg server over the PostgreSQL wire protocol),
-        /// or "postgres" (the real PostgreSQL server at --postgres-dsn)
+        /// "tursopg-embedded" (turso_pg in this process, without a server), or
+        /// "postgres" (the real PostgreSQL server at --postgres-dsn)
         #[arg(long, default_value = "rust")]
         backend: String,
 
@@ -98,6 +99,9 @@ enum Commands {
         /// create and drop databases.
         #[arg(long)]
         postgres_dsn: Option<String>,
+        /// Stop at the first failed test or error
+        #[arg(long)]
+        fail_fast: bool,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -168,6 +172,7 @@ async fn main() -> ExitCode {
             snapshot_filter,
             cross_check_binary,
             postgres_dsn,
+            fail_fast,
         } => {
             run_tests(
                 paths,
@@ -184,6 +189,7 @@ async fn main() -> ExitCode {
                 snapshot_filter,
                 cross_check_binary,
                 postgres_dsn,
+                fail_fast,
             )
             .await
         }
@@ -241,6 +247,7 @@ async fn run_tests(
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
     postgres_dsn: Option<String>,
+    fail_fast: bool,
 ) -> ExitCode {
     match (&postgres_dsn, backend_type.as_str()) {
         (None, "postgres") => {
@@ -253,6 +260,10 @@ async fn run_tests(
             return ExitCode::from(2);
         }
         _ => {}
+    }
+    if mvcc && backend_type == "tursopg-embedded" {
+        eprintln!("Error: --mvcc does not work with --backend tursopg-embedded");
+        return ExitCode::from(2);
     }
 
     // Resolve paths, trying to add .sqltest extension if missing
@@ -347,7 +358,8 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
-        .with_snapshot_update_mode(snapshot_mode);
+        .with_snapshot_update_mode(snapshot_mode)
+        .with_fail_fast(fail_fast);
     if let Some(f) = filter {
         config = config.with_filter(f);
     }
@@ -470,6 +482,20 @@ async fn run_tests(
                 })
                 .await
         }
+        "tursopg-embedded" => {
+            let mut backend =
+                TursopgEmbeddedBackend::new().with_timeout(Duration::from_secs(timeout));
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
         "postgres" => {
             let dsn = postgres_dsn.expect("--postgres-dsn is checked above");
             let backend = match PostgresBackend::connect(&dsn, Duration::from_secs(timeout)).await {
@@ -479,17 +505,23 @@ async fn run_tests(
                     return ExitCode::from(2);
                 }
             };
+            let role_cleanup = backend.role_cleanup();
             let runner = TestRunner::new(backend).with_config(config);
-            runner
+            let results = runner
                 .run_loaded_tests(loaded, |result| {
                     output.write_test(result);
                     output.flush();
                 })
-                .await
+                .await;
+            if let Err(e) = role_cleanup.drop_roles_created_by_the_run().await {
+                eprintln!("Error: cannot drop the roles that the tests created: {e}");
+                return ExitCode::from(2);
+            }
+            results
         }
         other => {
             eprintln!(
-                "Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', 'tursopg', or 'postgres'"
+                "Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', 'tursopg', 'tursopg-embedded', or 'postgres'"
             );
             return ExitCode::from(2);
         }

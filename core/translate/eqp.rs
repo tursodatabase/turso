@@ -406,19 +406,26 @@ impl Display for EqpDetail {
 
 /// Build the human-readable key constraints for an index seek,
 /// e.g. `["label=?", "fromId>?"]`.
-pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<String> {
+pub(crate) fn seek_constraint_parts(index: Option<&Index>, seek_def: &SeekDef) -> Vec<String> {
     let mut parts = Vec::new();
     // Equality prefix constraints
     for (i, _constraint) in seek_def.prefix.iter().enumerate() {
-        if let Some(col) = index.columns.get(i) {
+        if let Some(col) = index.and_then(|index| index.columns.get(i)) {
             parts.push(format!("{}=?", col.name));
         }
     }
     // Range constraint from start key
     let range_col_idx = seek_def.prefix.len();
+    let range_col = match index {
+        Some(index) => index
+            .columns
+            .get(range_col_idx)
+            .map(|col| (col.name.as_str(), col.order)),
+        None => Some(("rowid", SortOrder::Asc)),
+    };
     if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
-        if let Some(col) = index.columns.get(range_col_idx) {
-            let op = if col.order == SortOrder::Desc {
+        if let Some((name, order)) = range_col {
+            let op = if order == SortOrder::Desc {
                 seek_def.start.op.reverse()
             } else {
                 seek_def.start.op
@@ -429,15 +436,15 @@ pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<St
                 SeekOp::LE { .. } => "<=",
                 SeekOp::LT => "<",
             };
-            parts.push(format!("{}{op_str}?", col.name));
+            parts.push(format!("{name}{op_str}?"));
         }
     }
     // Range constraint from end key.
     // The end key's SeekOp is the B-tree termination condition (the negation of the
     // user-facing SQL operator), so we reverse it for display.
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
-        if let Some(col) = index.columns.get(range_col_idx) {
-            let op = if col.order == SortOrder::Desc {
+        if let Some((name, order)) = range_col {
+            let op = if order == SortOrder::Desc {
                 seek_def.end.op.reverse()
             } else {
                 seek_def.end.op
@@ -448,13 +455,12 @@ pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<St
                 SeekOp::LE { .. } => ">",
                 SeekOp::LT => ">=",
             };
-            parts.push(format!("{}{op_str}?", col.name));
+            parts.push(format!("{name}{op_str}?"));
         }
     }
-    if let Some(col) = index.columns.get(range_col_idx) {
+    if let Some((_, order)) = range_col {
         if parts.len() == range_col_idx + 2
-            && ((col.order == SortOrder::Desc)
-                != (seek_def.iter_dir == IterationDirection::Backwards))
+            && ((order == SortOrder::Desc) != (seek_def.iter_dir == IterationDirection::Backwards))
         {
             parts.swap(range_col_idx, range_col_idx + 1);
         }
@@ -515,10 +521,7 @@ pub(crate) fn eqp_detail_for_table_op(
                     index
                         .as_ref()
                         .map(|index| eqp_index(index, table.utilizes_covering_index())),
-                    match index {
-                        Some(index) => seek_constraint_parts(index, seek_def),
-                        None => vec!["rowid=?".to_string()],
-                    },
+                    seek_constraint_parts(index.as_deref(), seek_def),
                     seek_def.iter_dir == IterationDirection::Backwards,
                 ),
                 Search::InSeek { index, .. } => (

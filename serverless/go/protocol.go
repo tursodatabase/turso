@@ -252,8 +252,9 @@ type pipelineRequest struct {
 }
 
 type streamRequest struct {
-	Type string `json:"type"`
-	SQL  string `json:"sql,omitempty"`
+	SQLID *int   `json:"sql_id,omitempty"`
+	Type  string `json:"type"`
+	SQL   string `json:"sql,omitempty"`
 }
 
 type pipelineResponse struct {
@@ -274,10 +275,21 @@ type streamResponse struct {
 	IsAutocommit *bool           `json:"is_autocommit,omitempty"`
 }
 
-type describeResult struct {
-	Params []describeParam `json:"params"`
+// Description is statement metadata returned without executing the statement.
+type Description struct {
+	Params     []Parameter `json:"params"`
+	Columns    []Column    `json:"cols"`
+	IsExplain  bool        `json:"is_explain"`
+	IsReadOnly bool        `json:"is_readonly"`
 }
 
-type describeParam struct {
-	Name *string `json:"name,omitempty"`
+// Parameter describes a bind parameter; Name is nil for anonymous parameters.
+type Parameter struct {
+	Name *string `json:"name"`
+}
+
+// Column describes a result column; missing names and declared types remain nil.
+type Column struct {
+	Name     *string `json:"name"`
+	Decltype *string `json:"decltype"`
 }

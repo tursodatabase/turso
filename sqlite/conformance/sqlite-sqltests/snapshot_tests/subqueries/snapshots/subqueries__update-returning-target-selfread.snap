@@ -14,7 +14,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH t USING INTEGER PRIMARY KEY (rowid<?)
    `--CORRELATED SCALAR SUBQUERY 1
       `--SCAN t
 

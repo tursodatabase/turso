@@ -153,11 +153,16 @@
 //! 3. checkpoint WAL pages into DB file;
 //! 4. fsync DB file (unless `SyncMode::Off`);
 //! 5. truncate logical log to 0 (regenerates salt in memory; header written with next frame);
-//! 6. fsync logical log (unless `SyncMode::Off`);
-//! 7. truncate WAL last.
+//! 6. truncate WAL last.
 //!
 //! WAL-last is intentional: if crash happens mid-checkpoint, WAL remains a safety net until
-//! logical-log cleanup is complete.
+//! the DB file is durable.
+//!
+//! The logical log needs no fsync after step 5. If a crash loses the truncation, the old
+//! frames come back, but their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery
+//! skips them. A switch from MVCC to WAL mode is different: it fsyncs the log after the
+//! checkpoint, before it writes the WAL-mode header, because a database in WAL mode does not
+//! open while its logical log has frames.
 //!
 //! ### Frame Layout: Unencrypted vs Encrypted
 //!
@@ -302,12 +307,12 @@ const LOG_HDR_SALT_SIZE: usize = 8;
 const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
-pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
-pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
+pub const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
-pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
+pub const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
 // Fixed AAD width for one encrypted chunk:
 // salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
 const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
@@ -593,7 +598,10 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
-    pending_header_upgrade: Option<(LogHeader, Completion)>,
+    /// A header write whose result has not been looked at yet. Its header
+    /// becomes `header` once the write succeeded; see
+    /// `publish_finished_header_write`.
+    pending_header_write: Option<(LogHeader, Completion)>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -626,7 +634,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
-            pending_header_upgrade: None,
+            pending_header_write: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -652,7 +660,7 @@ impl LogicalLog {
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
-        self.discard_pending_header_upgrade();
+        self.finish_pending_header_write();
         self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
     }
@@ -678,6 +686,7 @@ impl LogicalLog {
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
+        self.finish_pending_header_write();
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
@@ -917,15 +926,9 @@ impl LogicalLog {
             return Ok(None);
         }
 
-        if let Some((header, c)) = self.pending_header_upgrade.take() {
-            if !c.finished() {
-                self.pending_header_upgrade = Some((header, c.clone()));
-                return Ok(Some(c));
-            }
-            if c.succeeded() {
-                self.header = Some(header);
-                return Ok(None);
-            }
+        self.publish_finished_header_write();
+        if let Some((_, c)) = &self.pending_header_write {
+            return Ok(Some(c.clone()));
         }
 
         let header = self.header.as_ref().ok_or_else(|| {
@@ -939,8 +942,7 @@ impl LogicalLog {
         let mut upgraded_header = header.clone();
         upgraded_header.version = LOG_VERSION;
 
-        let (upgraded_header, c) = self.write_header(upgraded_header, None)?;
-        self.pending_header_upgrade = Some((upgraded_header, c.clone()));
+        let c = self.write_header_and_publish_on_success(upgraded_header, None)?;
         Ok(Some(c))
     }
 
@@ -1001,9 +1003,23 @@ impl LogicalLog {
         ))
     }
 
-    /// Writes the header and returns it with its CRC filled in. The caller
-    /// decides when the returned header becomes the in-memory header. The
-    /// write is added to `group`, when given, before it is submitted.
+    /// Writes `header` to the start of the file. It becomes the in-memory
+    /// header only after the write succeeded: right away when the file
+    /// completes the write synchronously, otherwise the next time the log
+    /// looks at its header. The write is added to `group`, when given, before
+    /// it is submitted.
+    fn write_header_and_publish_on_success(
+        &mut self,
+        header: LogHeader,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Completion> {
+        let (header, c) = self.write_header(header, group)?;
+        self.pending_header_write = Some((header, c.clone()));
+        self.publish_finished_header_write();
+        Ok(c)
+    }
+
+    /// Issues the header write and returns the header with its CRC filled in.
     fn write_header(
         &self,
         mut header: LogHeader,
@@ -1038,18 +1054,17 @@ impl LogicalLog {
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
-        self.discard_pending_header_upgrade();
+        self.finish_pending_header_write();
         let header = self.current_or_new_header()?;
-        let (header, c) = self.write_header(header, None)?;
-        self.header = Some(header);
-        Ok(c)
+        self.write_header_and_publish_on_success(header, None)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
-        self.pending_header_upgrade = None;
+        self.publish_finished_header_write();
+        self.pending_header_write = None;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
@@ -1095,15 +1110,18 @@ impl LogicalLog {
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
-        self.discard_pending_header_upgrade();
+        self.finish_pending_header_write();
         let mut header = self.current_or_new_header()?;
-        header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
+        // The log is empty after the reset, so the CRC chain restarts from the
+        // header salt: the current salt until the new header is written, the
+        // new salt once that write succeeded.
+        self.offset = 0;
         self.pending_running_crc = None;
+        self.running_crc = derive_initial_crc(header.salt);
+        header.salt = self.io.generate_random_number() as u64;
 
         let mut group = CompletionGroup::new(|_| {});
-        let (header, _header_c) = self.write_header(header, Some(&mut group))?;
-        self.header = Some(header);
+        let _header_c = self.write_header_and_publish_on_success(header, Some(&mut group))?;
         let c = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
@@ -1111,17 +1129,42 @@ impl LogicalLog {
         });
         group.add(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
-        self.offset = 0;
         Ok(group.build())
     }
 
-    fn discard_pending_header_upgrade(&mut self) {
-        if let Some((_, c)) = self.pending_header_upgrade.take() {
-            turso_assert!(
-                c.finished(),
-                "logical log header was rewritten while a header upgrade write was in flight"
-            );
+    /// Publishes a finished header write and checks that none is still in
+    /// flight. Used before the header is read or rewritten by a path that
+    /// never runs while a header write is in progress.
+    fn finish_pending_header_write(&mut self) {
+        self.publish_finished_header_write();
+        turso_assert!(
+            self.pending_header_write.is_none(),
+            "logical log header was used while a header write was in flight"
+        );
+    }
+
+    /// Makes the header of a finished, successful header write the in-memory
+    /// header. A failed write leaves the in-memory header as it was, so no
+    /// later frame is chained against a header the file never received. A
+    /// write still in flight stays pending.
+    #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
+    fn publish_finished_header_write(&mut self) {
+        let Some((header, c)) = self.pending_header_write.take() else {
+            return;
+        };
+        if !c.finished() {
+            self.pending_header_write = Some((header, c));
+            return;
         }
+        if !c.succeeded() {
+            return;
+        }
+        if self.offset == 0 {
+            // No frame is chained yet, so the CRC chain starts from this
+            // header's salt.
+            self.running_crc = derive_initial_crc(header.salt);
+        }
+        self.header = Some(header);
     }
 }
 
@@ -3784,11 +3827,9 @@ pub(crate) enum IndexOpKind {
 
 #[cfg(test)]
 mod tests {
-    use crate::namespace::NamespaceId;
     use crate::types::IOResult;
     use crate::util::IOExt as _;
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
     use std::sync::Once;
 
     use quickcheck_macros::quickcheck;
@@ -3802,15 +3843,13 @@ mod tests {
     use crate::sync::Arc;
     use crate::{
         mvcc::database::{
-            tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-            MVTableId, Row, RowID, RowKey, SortableIndexKey,
+            tests::generate_simple_string_row, MVTableId, Row, RowID, RowKey, SortableIndexKey,
         },
-        schema::Table,
         storage::sqlite3_ondisk::{
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
-        types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, SharedBufferData, Value, ValueRef,
+        types::{ImmutableRecord, IndexInfo, Text},
+        Buffer, Completion, SharedBufferData, Value,
     };
 
     use super::{
@@ -4326,402 +4365,6 @@ mod tests {
             recovered, expected,
             "encrypted forced-yield recovery must match the synchronous path exactly"
         );
-    }
-
-    /// What this test checks: A committed transaction written to the logical log is replayed correctly after restart.
-    /// Why this matters: This is the baseline durability/recovery guarantee for MVCC commits.
-    #[test]
-    fn test_logical_log_read() {
-        init_tracing();
-        // Load a transaction
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-            let table_id: MVTableId = (-100).into();
-            let tx_id = mvcc_store.begin_tx(pager).unwrap();
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            // now insert a row into table -2
-            let row = generate_simple_string_row(table_id, 1, "foo");
-            mvcc_store.insert(tx_id, row).unwrap();
-            commit_tx(mvcc_store, &conn, tx_id).unwrap();
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now try to read it back - recovery happens automatically during bootstrap
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        let row = mvcc_store
-            .read(tx, &RowID::new((-100).into(), RowKey::Int(1)))
-            .unwrap()
-            .unwrap();
-        let record = ImmutableRecordRef::from_bin_record(row.payload());
-        let foo = record.iter().unwrap().next().unwrap().unwrap();
-        let ValueRef::Text(foo) = foo else {
-            unreachable!()
-        };
-        assert_eq!(foo.as_str(), "foo");
-    }
-
-    /// What this test checks: A long sequence of committed frames is replayed in order without dropping or reordering transactions.
-    /// Why this matters: Recovery must preserve commit order to maintain MVCC visibility semantics.
-    #[test]
-    fn test_logical_log_read_multiple_transactions() {
-        init_tracing();
-        let table_id: MVTableId = (-100).into();
-        let values = (0..100)
-            .map(|i| {
-                (
-                    RowID::new(table_id, RowKey::Int(i as i64)),
-                    format!("foo_{i}"),
-                )
-            })
-            .collect::<Vec<(RowID, String)>>();
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            // now insert a row into table -2
-            // generate insert per transaction
-            for (rowid, value) in &values {
-                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                let row = generate_simple_string_row(
-                    rowid.table_id,
-                    rowid.row_id.to_int_or_panic(),
-                    value,
-                );
-                mvcc_store.insert(tx_id, row).unwrap();
-                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            }
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now try to read it back - recovery happens automatically during bootstrap
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        for (rowid, value) in &values {
-            let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, rowid).unwrap().unwrap();
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let foo = record.iter().unwrap().next().unwrap().unwrap();
-            let ValueRef::Text(foo) = foo else {
-                unreachable!()
-            };
-            assert_eq!(foo.as_str(), value.as_str());
-        }
-    }
-
-    /// What this test checks: Randomized insert/delete workloads round-trip through write + restart replay with matching final contents.
-    /// Why this matters: Fuzz-style coverage catches edge combinations that hand-written examples miss.
-    #[test]
-    fn test_logical_log_read_fuzz() {
-        init_tracing();
-        let table_id: MVTableId = (-100).into();
-        let seed = rng().random();
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let num_transactions = rng.next_u64() % 128;
-        let mut txns = vec![];
-        let mut present_rowids = BTreeSet::new();
-        let mut non_present_rowids = BTreeSet::new();
-        for _ in 0..num_transactions {
-            let num_operations = rng.next_u64() % 8;
-            let mut ops = vec![];
-            for _ in 0..num_operations {
-                let op_type = rng.next_u64() % 2;
-                match op_type {
-                    0 => {
-                        // Generate a positive rowid that fits in i64
-                        let row_id = (rng.next_u64() % (i64::MAX as u64)) as i64;
-                        let rowid = RowID::new(table_id, RowKey::Int(row_id));
-                        let row = generate_simple_string_row(
-                            rowid.table_id,
-                            rowid.row_id.to_int_or_panic(),
-                            &format!("row_{row_id}"),
-                        );
-                        ops.push((true, Some(row), rowid.clone()));
-                        present_rowids.insert(rowid.clone());
-                        non_present_rowids.remove(&rowid);
-                        tracing::debug!("insert {rowid:?}");
-                    }
-                    1 => {
-                        if present_rowids.is_empty() {
-                            continue;
-                        }
-                        let row_id_pos = rng.next_u64() as usize % present_rowids.len();
-                        let row_id = present_rowids.iter().nth(row_id_pos).unwrap().clone();
-                        ops.push((false, None, row_id.clone()));
-                        present_rowids.remove(&row_id);
-                        non_present_rowids.insert(row_id.clone());
-                        tracing::debug!("removed {row_id:?}");
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            txns.push(ops);
-        }
-        // let's not drop db as we don't want files to be removed
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        let pager = {
-            let conn = db.connect();
-            let pager = conn.pager.load().clone();
-            let mvcc_store = db.get_mvcc_store();
-
-            // insert table id -2 into sqlite_schema table (table_id -1)
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let data = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new("table")),  // type
-                    Value::Text(Text::new("test")),   // name
-                    Value::Text(Text::new("test")),   // tbl_name
-                    Value::from_i64(table_id.into()), // rootpage
-                    Value::Text(Text::new(
-                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
-                    )), // sql
-                ],
-                5,
-            )
-            .unwrap();
-            mvcc_store
-                .insert(
-                    tx_id,
-                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
-                        .unwrap(),
-                )
-                .unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-
-            // insert rows
-            for ops in &txns {
-                let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                for (is_insert, maybe_row, rowid) in ops {
-                    if *is_insert {
-                        mvcc_store
-                            .insert(tx_id, maybe_row.as_ref().unwrap().clone())
-                            .unwrap();
-                    } else {
-                        mvcc_store.delete(tx_id, rowid.clone()).unwrap();
-                    }
-                }
-                commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
-            }
-
-            conn.close().unwrap();
-            pager
-        };
-
-        db.restart();
-
-        // connect after restart should recover log.
-        let _conn = db.connect();
-        let mvcc_store = db.get_mvcc_store();
-
-        // Check rowids that weren't deleted
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-        for present_rowid in present_rowids {
-            let row = mvcc_store.read(tx, &present_rowid).unwrap().unwrap();
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let foo = record.iter().unwrap().next().unwrap().unwrap();
-            let ValueRef::Text(foo) = foo else {
-                unreachable!()
-            };
-
-            assert_eq!(
-                foo.as_str(),
-                format!("row_{}", present_rowid.row_id.to_int_or_panic())
-            );
-        }
-
-        // Check rowids that were deleted
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        for present_rowid in non_present_rowids {
-            let row = mvcc_store.read(tx, &present_rowid).unwrap();
-            assert!(
-                row.is_none(),
-                "row {present_rowid:?} should have been removed"
-            );
-        }
-    }
-
-    /// What this test checks: Recovery rebuilds both table rows and index rows from logical-log operations.
-    /// Why this matters: Table/index divergence after restart would break query correctness.
-    #[test]
-    fn test_logical_log_read_table_and_index_rows() {
-        init_tracing();
-        // Test that both table rows and index rows can be read back after recovery
-        let mut db = MvccTestDbNoConn::new_with_random_db();
-        {
-            let conn = db.connect();
-
-            // Create a table with an index
-            conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)")
-                .unwrap();
-            conn.execute("CREATE INDEX idx_data ON test(data)").unwrap();
-
-            // Checkpoint to ensure the index has a root_page mapping
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-            // Insert some data - this will create both table rows and index rows in the logical log
-            // Don't checkpoint after inserts so they remain in the logical log for recovery testing
-            conn.execute("INSERT INTO test(id, data) VALUES (1, 'foo')")
-                .unwrap();
-            conn.execute("INSERT INTO test(id, data) VALUES (2, 'bar')")
-                .unwrap();
-            conn.execute("INSERT INTO test(id, data) VALUES (3, 'baz')")
-                .unwrap();
-        }
-
-        // Restart the database to trigger recovery
-        db.restart();
-
-        // Now verify that both table rows and index rows can be read back
-        let conn = db.connect();
-        let pager = conn.pager.load().clone();
-        let mvcc_store = db.get_mvcc_store();
-        let schema = conn.schema.read();
-        let table = schema
-            .get_table(NamespaceId::ROOT, "test")
-            .expect("table test should exist");
-        let Table::BTree(table) = table.as_ref() else {
-            panic!("table test should be btree");
-        };
-        let table_id = mvcc_store.get_table_id_from_root_page(table.root_page);
-
-        // Get the index from schema
-        let index = schema
-            .get_index(NamespaceId::ROOT, "test", "idx_data")
-            .expect("Index should exist");
-        // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
-        let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
-        let index_info = Arc::new(IndexInfo::new_from_index(index).unwrap());
-
-        // Verify table rows can be read
-        let tx = mvcc_store.begin_tx(pager).unwrap();
-        for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
-            let row = mvcc_store
-                .read(tx, &RowID::new(table_id, RowKey::Int(row_id)))
-                .unwrap()
-                .expect("Table row should exist");
-            let record = ImmutableRecordRef::from_bin_record(row.payload());
-            let values = record.get_values().unwrap();
-            let data_value = values.get(1).expect("Should have data column");
-            let ValueRef::Text(data_text) = data_value else {
-                panic!("Data column should be text");
-            };
-            assert_eq!(data_text.as_str(), expected_data);
-        }
-
-        // Verify index rows can be read
-        // Note: Index rows are written to the logical log, but we need to construct the correct key format
-        // The index key format is (indexed_column_value, table_rowid)
-        for (row_id, data_value) in [(1, "foo"), (2, "bar"), (3, "baz")] {
-            // Create the index key: (data_value, rowid)
-            // The index on data column stores (data_value, table_rowid) as the key
-            let key_record = ImmutableRecord::from_values(
-                &[
-                    Value::Text(Text::new(data_value.to_string())),
-                    Value::from_i64(row_id),
-                ],
-                2,
-            )
-            .unwrap();
-            let sortable_key = SortableIndexKey::new_from_payload_in(
-                &key_record,
-                index_info.clone(),
-                crate::alloc::TursoAllocator,
-            )
-            .unwrap();
-            let index_rowid = RowID::new(index_id, RowKey::Record(Arc::new(sortable_key)));
-
-            // Use read_from_table_or_index to read the index row
-            // This verifies that index rows were properly serialized and deserialized from the logical log
-            let index_row_opt = mvcc_store
-                .read_from_table_or_index(tx, &index_rowid, Some(index_id))
-                .unwrap_or_else(|e| {
-                    panic!("Failed to read index row for ({}, {}): {:?}. Index ID: {:?}, root_page: {}",
-                           data_value, row_id, e, index_id, index.root_page)
-                });
-
-            let Some(index_row) = index_row_opt else {
-                panic!(
-                    "Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log."
-                );
-            };
-            // Verify the index row contains the correct data
-            let RowKey::Record(sortable_key) = index_row.id.row_id else {
-                panic!("Index row should have a record row_id");
-            };
-            let record = sortable_key.key.clone();
-            let values = record.get_values().unwrap();
-            assert_eq!(
-                values.len(),
-                2,
-                "Index row should have 2 columns (data, rowid)"
-            );
-            let ValueRef::Text(index_data) = values[0] else {
-                panic!("First index column should be text");
-            };
-            assert_eq!(index_data.as_str(), data_value, "Index data should match");
-            let ValueRef::Numeric(crate::numeric::Numeric::Integer(index_rowid_val)) = values[1]
-            else {
-                panic!("Second index column should be integer (rowid)");
-            };
-            assert_eq!(index_rowid_val, row_id, "Index rowid should match");
-        }
     }
 
     /// What this test checks: If the last frame is torn, recovery keeps the valid prefix and ignores only the incomplete tail.
@@ -7394,6 +7037,91 @@ mod tests {
         let bytes = read_file_bytes(inner, &io);
         let header = LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap();
         assert_eq!(header.version, LOG_VERSION);
+    }
+
+    /// What this test checks: a header write that fails leaves the log without
+    /// an in-memory header, and the retry publishes the header the file holds.
+    #[test]
+    fn test_failed_header_write_keeps_header_unpublished_until_retry_succeeds() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-header-update.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeaderWriteFailingFile {
+            inner: inner.clone(),
+            fail_header_write: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let c = log.update_header().unwrap();
+        assert!(io.wait_for_completion(c).is_err());
+        assert!(
+            log.header().is_none(),
+            "a header whose write failed must not be published"
+        );
+        assert_eq!(inner.size().unwrap(), 0);
+
+        file.fail_header_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let c = log.update_header().unwrap();
+        io.wait_for_completion(c).unwrap();
+        let published = log.header().unwrap().clone();
+        let bytes = read_file_bytes(inner, &io);
+        let on_disk = LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(published.version, on_disk.version);
+        assert_eq!(published.salt, on_disk.salt);
+        assert_eq!(log.running_crc, derive_initial_crc(on_disk.salt));
+    }
+
+    /// What this test checks: a fresh-header reset whose header write fails
+    /// keeps the header and CRC seed the file still holds, and a later reset
+    /// publishes the new salt only once it is on disk.
+    #[test]
+    fn test_failed_fresh_header_reset_keeps_current_header_and_crc_seed() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-fresh-header-reset.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeaderWriteFailingFile {
+            inner: inner.clone(),
+            fail_header_write: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let before = log.header().unwrap().clone();
+
+        file.fail_header_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let c = log.reset_to_fresh_header().unwrap();
+        assert!(io.wait_for_completion(c).is_err());
+        assert_eq!(log.header().unwrap().salt, before.salt);
+        assert_eq!(log.offset, 0);
+        assert_eq!(log.running_crc, derive_initial_crc(before.salt));
+        let bytes = read_file_bytes(inner.clone(), &io);
+        assert_eq!(bytes.len(), LOG_HDR_SIZE);
+        assert_eq!(LogHeader::decode(&bytes).unwrap().salt, before.salt);
+
+        file.fail_header_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let c = log.reset_to_fresh_header().unwrap();
+        io.wait_for_completion(c).unwrap();
+        let after = log.header().unwrap().clone();
+        assert_ne!(after.salt, before.salt);
+        assert_eq!(log.running_crc, derive_initial_crc(after.salt));
+        let bytes = read_file_bytes(inner, &io);
+        assert_eq!(
+            LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap().salt,
+            after.salt
+        );
     }
 
     #[cfg(feature = "conn_raw_api")]

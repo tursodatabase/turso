@@ -1,0 +1,131 @@
+# json_strip_nulls(json): removes object fields whose value is null, at any
+# depth. Nulls inside arrays stay, and the result is the json input with
+# insignificant whitespace removed.
+
+@database :memory:
+
+test json-strip-nulls-removes-null-field {
+    SELECT json_strip_nulls('{"a":null,"b":1}');
+}
+expect {
+    {"b":1}
+}
+
+test json-strip-nulls-removes-nested-null-field {
+    SELECT json_strip_nulls('{"a":{"b":null,"c":2}}');
+}
+expect {
+    {"a":{"c":2}}
+}
+
+test json-strip-nulls-keeps-nulls-in-arrays {
+    SELECT json_strip_nulls('[1,null,{"a":null}]');
+    SELECT json_strip_nulls('{"a":[null,{"b":null}]}');
+}
+expect {
+    [1,null,{}]
+    {"a":[null,{}]}
+}
+
+test json-strip-nulls-of-scalars-and-empty-object {
+    SELECT json_strip_nulls('{}');
+    SELECT json_strip_nulls('null');
+    SELECT json_strip_nulls('"text with  spaces"');
+    SELECT json_strip_nulls('{"a":"null"}');
+}
+expect {
+    {}
+    null
+    "text with  spaces"
+    {"a":"null"}
+}
+
+test json-strip-nulls-removes-whitespace {
+    SELECT json_strip_nulls('{ "a" : 1 ,  "b" : null }');
+}
+expect {
+    {"a":1}
+}
+
+test json-strip-nulls-keeps-duplicate-keys {
+    SELECT json_strip_nulls('{"a":1,"a":null,"a":2}');
+}
+expect {
+    {"a":1,"a":2}
+}
+
+test json-strip-nulls-keeps-numbers-as-written {
+    SELECT json_strip_nulls('{"a":1.50,"b":1e2,"c":null}');
+}
+expect {
+    {"a":1.50,"b":1e2}
+}
+
+test json-strip-nulls-escapes-strings-again {
+    SELECT json_strip_nulls('{"a":"\u00e9","b":null}');
+    SELECT json_strip_nulls('{"a":"x\"y","b":"\/","c":"\n"}');
+}
+expect {
+    {"a":"é"}
+    {"a":"x\"y","b":"/","c":"\n"}
+}
+
+test json-strip-nulls-of-nul-escape-errors {
+    SELECT json_strip_nulls('{"a":"\u0000"}');
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}
+
+test json-strip-nulls-of-nul-escape-in-dropped-key-errors {
+    SELECT json_strip_nulls('{"\u0000":null}');
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}
+
+test json-strip-nulls-of-lone-surrogate-in-dropped-key-errors {
+    SELECT json_strip_nulls('{"\ud800":null}');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-strip-nulls-keeps-numbers-outside-double-range {
+    SELECT json_strip_nulls('{"a":1e400,"b":null}');
+}
+expect {
+    {"a":1e400}
+}
+
+test json-strip-nulls-keeps-input-nested-1000-levels {
+    SELECT length(json_strip_nulls((repeat('[', 1000) || repeat(']', 1000))::json)::text);
+}
+expect {
+    2000
+}
+
+test json-strip-nulls-of-deeply-nested-input-errors {
+    SELECT json_strip_nulls((repeat('[', 50000) || repeat(']', 50000))::json);
+}
+@sqlstate 54001
+expect error {
+    stack depth limit exceeded
+}
+
+test json-strip-nulls-of-null-is-null {
+    SELECT json_strip_nulls(NULL);
+}
+expect {
+}
+
+test json-strip-nulls-of-invalid-json-errors {
+    SELECT json_strip_nulls('[1,');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
