@@ -3847,6 +3847,16 @@ impl<'a> Parser<'a> {
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
             }
+            // SQLite's pragma value grammar does not accept NULL
+            TK_NULL => {
+                let offset = self.offset();
+                let token = self.peek_no_eof()?;
+                Err(unexpected_token_error(
+                    token,
+                    offset,
+                    &[TK_ID, TK_STRING, TK_INTEGER, TK_FLOAT],
+                ))
+            }
             tt if tt
                 .as_str()
                 .is_some_and(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())) =>
@@ -13438,6 +13448,17 @@ mod tests {
             b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
+    }
+
+    #[test]
+    fn test_pragma_value_rejects_null() {
+        for sql in [
+            b"PRAGMA foreign_keys = NULL".as_slice(),
+            b"PRAGMA foreign_keys(NULL)".as_slice(),
         ] {
             let result = Parser::new(sql).next().unwrap();
             assert!(result.is_err(), "expected parse error for {sql:?}");
