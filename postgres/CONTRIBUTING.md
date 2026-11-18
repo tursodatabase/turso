@@ -50,7 +50,7 @@ A known gap is a case where tursopg gives a different result than PostgreSQL. Ea
 - When you fix a gap, its `@tursopg` block fails. Delete the block in the same change.
 - Use `@skip "<gap id>: reason"` only when the tursopg result is not stable, for example a crash.
 - A test without an `@tursopg` block matches PostgreSQL. It is a regression test.
-- `run-postgres` needs a server with the `en_US.UTF-8` locale, which is the default of the Docker image. Some tests, such as B-12 (`ILIKE` with non-ASCII text), give different results with the `C` locale or an ICU locale.
+- `run-postgres` needs a server with the `en_US.UTF-8` locale, which is the default of the Docker image. B-12, B-74, B-94 and B-95 give different results with the `C` locale or an ICU locale.
 - Cases that need bound parameters, a database reopen, two commands in one prepared statement, MVCC, or a query after a failed statement are in [`tests/integration/postgres/gaps.rs`](tests/integration/postgres/gaps.rs), named `gap_<id>_<short_title>`. A test of a gap that matches PostgreSQL asserts the PostgreSQL result. A test of an open gap is named `gap_<id>_tursopg_returns_wrong_result_<short_title>` and asserts the current wrong tursopg result, with the PostgreSQL result in a comment above it. When you fix the gap, its test fails: change the assert to the PostgreSQL result and remove `tursopg_returns_wrong_result` from the name. Run them with `cargo test -p turso_pg_tests --test integration_tests gaps::`.
 
 Severity:
@@ -61,6 +61,8 @@ Severity:
 | S2 | Error where PostgreSQL succeeds |
 | S3 | Wrong error code or message |
 | S4 | Catalog or metadata gap |
+
+A catalog or metadata gap is S4, even when tursopg returns an error or no rows.
 
 ## Running the upstream regression suite
 
