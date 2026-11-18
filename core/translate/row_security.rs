@@ -968,6 +968,17 @@ mod tests {
             EngineDialect.parse(sql)
         }
 
+        fn parse_internal(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
+            EngineDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> crate::Result<ast::ColumnDefinition> {
+            EngineDialect.parse_internal_column_definition(sql)
+        }
+
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
             EngineDialect.parse_table_sql(sql, root_page)
         }

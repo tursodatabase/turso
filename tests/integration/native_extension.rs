@@ -1220,6 +1220,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             let table = turso_core::vtab::VirtualTable::table(
+                &SqliteDialect,
                 Some("arguments"),
                 "argument_module",
                 args,
@@ -1315,6 +1316,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                 }
             } else {
                 let result = turso_core::vtab::VirtualTable::table(
+                    &SqliteDialect,
                     Some("arguments"),
                     "c_arguments_module",
                     args,

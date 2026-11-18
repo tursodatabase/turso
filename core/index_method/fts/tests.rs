@@ -32,18 +32,21 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         "-1",
         "1e-46",
     ] {
-        let result = FtsIndexAttachment::new(IndexMethodConfiguration {
-            table_name: "w".to_string(),
-            index_name: "wx".to_string(),
-            columns: crate::alloc::vec![
-                IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
-                IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
-            ],
-            parameters: FxHashMap::from_iter([(
-                "weights".to_string(),
-                Value::from_text(format!("title={weight},body=1")),
-            )]),
-        });
+        let result = FtsIndexAttachment::new(
+            &crate::EngineDialect,
+            IndexMethodConfiguration {
+                table_name: "w".to_string(),
+                index_name: "wx".to_string(),
+                columns: crate::alloc::vec![
+                    IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
+                    IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
+                ],
+                parameters: FxHashMap::from_iter([(
+                    "weights".to_string(),
+                    Value::from_text(format!("title={weight},body=1")),
+                )]),
+            },
+        );
         match result {
             Ok(_) => accepted.push(weight),
             Err(error) => assert!(
@@ -101,15 +104,18 @@ fn field_weights_rename_column() {
 }
 
 fn test_attachment() -> FtsIndexAttachment {
-    FtsIndexAttachment::new(IndexMethodConfiguration {
-        table_name: "docs".to_string(),
-        index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![
-            IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::BINARY),
-            IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::BINARY)
-        ],
-        parameters: FxHashMap::<String, Value>::default(),
-    })
+    FtsIndexAttachment::new(
+        &crate::EngineDialect,
+        IndexMethodConfiguration {
+            table_name: "docs".to_string(),
+            index_name: "docs_fts".to_string(),
+            columns: crate::alloc::vec![
+                IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::BINARY)
+            ],
+            parameters: FxHashMap::<String, Value>::default(),
+        },
+    )
     .unwrap()
 }
 
@@ -162,16 +168,19 @@ fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
 }
 
 fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
-    let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
-        table_name: "docs".to_string(),
-        index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![IndexColumn::new(
-            "body",
-            1,
-            crate::translate::collate::CollationSeq::BINARY
-        )],
-        parameters: FxHashMap::<String, Value>::default(),
-    })
+    let attachment = FtsIndexAttachment::new(
+        &crate::EngineDialect,
+        IndexMethodConfiguration {
+            table_name: "docs".to_string(),
+            index_name: "docs_fts".to_string(),
+            columns: crate::alloc::vec![IndexColumn::new(
+                "body",
+                1,
+                crate::translate::collate::CollationSeq::BINARY
+            )],
+            parameters: FxHashMap::<String, Value>::default(),
+        },
+    )
     .unwrap();
     let cursor = attachment.init().unwrap();
     let mut arguments = vec![Expr::Literal(Literal::String("'database'".to_string()))];
