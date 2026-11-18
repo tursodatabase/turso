@@ -104,9 +104,13 @@ struct UnionTerm<'a> {
     table_idx: usize,
     disjuncts: Vec<&'a ast::Expr>,
     /// For each disjunct, its branch-local terms and constraints, made the
-    /// first time that the disjunct is planned. `None` if they cannot be made.
-    branches: Vec<OnceCell<Option<(Vec<WhereTerm>, TableConstraints)>>>,
+    /// first time that the disjunct is planned.
+    branches: Vec<OnceCell<UnionBranch>>,
 }
+
+/// The branch-local terms and constraints of one disjunct of a [UnionTerm].
+/// `None` if they cannot be made.
+type UnionBranch = Option<(Vec<WhereTerm>, TableConstraints)>;
 
 /// Internal branch representation while evaluating a candidate multi-index plan.
 struct MultiIdxBranch {

@@ -1568,7 +1568,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     && has_connected_legal_candidate(
                         &lhs_mask,
                         num_tables,
-                        &table_connections,
+                        table_connections,
                         required_lhs_by_table.as_deref(),
                         left_join_illegal_map.as_ref(),
                     )
@@ -4803,7 +4803,7 @@ mod tests {
             &constraints[0],
             &constraints[1],
             &joined_before_probe_mask,
-            &mut where_clause,
+            &where_clause,
             std::iter::once((
                 0,
                 table_references.joined_tables()[0].internal_id,
