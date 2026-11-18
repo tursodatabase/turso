@@ -1256,16 +1256,37 @@ where
     let rem_ms = rem_ms % 3600000;
     let mins = rem_ms / 60000;
     let rem_ms = rem_ms % 60000;
-    let secs = rem_ms as f64 / 1000.0;
+    turso_debug_assert!(
+        (0..60000).contains(&rem_ms),
+        "both branches subtract the smaller julian day from the larger one"
+    );
 
-    let mut res = String::new();
-    write!(
-        res,
-        "{sign}{y:04}-{m:02}-{days:02} {hours:02}:{mins:02}:{secs:06.3}"
-    )
-    .unwrap();
+    // `{sign}{y:04}-{m:02}-{days:02} {hours:02}:{mins:02}:{secs:06.3}`, with
+    // `secs = rem_ms as f64 / 1000.0`.
+    let mut res = String::with_capacity(24);
+    res.push(sign);
+    push_zero_padded(&mut res, i64::from(y), 4);
+    res.push('-');
+    push_zero_padded(&mut res, i64::from(m), 2);
+    res.push('-');
+    push_zero_padded(&mut res, days, 2);
+    res.push(' ');
+    push_zero_padded(&mut res, hours, 2);
+    res.push(':');
+    push_zero_padded(&mut res, mins, 2);
+    res.push(':');
+    push_seconds_with_millis(&mut res, rem_ms);
 
     Value::from_text(res)
+}
+
+/// Append `millis`, a count less than 60000, as seconds with three decimals.
+/// The text is the same as `write!(res, "{:06.3}", millis as f64 / 1000.0)`,
+/// because the float is so near the decimal value that it rounds to it.
+fn push_seconds_with_millis(res: &mut String, millis: i64) {
+    push_zero_padded(res, millis / 1000, 2);
+    res.push('.');
+    push_zero_padded(res, millis % 1000, 3);
 }
 
 pub fn exec_strftime<I, E, V>(clock: &dyn Clock, values: I) -> Value
@@ -1561,6 +1582,15 @@ fn push_zero_padded_any_width(res: &mut String, value: i64, width: usize) {
 mod tests {
     use super::*;
     use crate::io::clock::DefaultClock;
+
+    #[test]
+    fn push_seconds_with_millis_matches_float_fmt() {
+        for millis in 0..60000i64 {
+            let mut res = String::new();
+            push_seconds_with_millis(&mut res, millis);
+            assert_eq!(res, format!("{:06.3}", millis as f64 / 1000.0));
+        }
+    }
 
     #[test]
     fn push_zero_padded_matches_fmt() {
