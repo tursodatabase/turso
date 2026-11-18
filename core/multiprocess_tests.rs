@@ -2131,3 +2131,99 @@ fn subprocess_idle_begin_sees_table_created_by_other_process() {
     assert_eq!(rows.len(), 1);
     conn.execute("commit").unwrap();
 }
+
+const MULTIPROCESS_DEAD_WRITER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_dead_writer_child_process";
+
+/// Child roles for `new_writer_after_killed_writer_with_uncommitted_frames_commits`.
+/// `spill` appends uncommitted frames (the page cache spills them to the WAL),
+/// reports readiness and waits until the parent terminates it. `commit` is the
+/// next writer: one insert that must commit.
+#[test]
+fn multiprocess_dead_writer_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let role = std::env::var("TURSO_MULTIPROCESS_ROLE").unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    match role.as_str() {
+        "spill" => {
+            let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap();
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            for _ in 0..8000 {
+                conn.execute("insert into test(value) values (hex(randomblob(1000)))")
+                    .unwrap();
+            }
+            std::fs::write(&ready_file, b"ready").unwrap();
+            // Never released: the parent terminates this process.
+            wait_for_file(&ready_file.with_extension("never"));
+        }
+        "commit" => {
+            conn.execute("insert into test(value) values ('after-kill')")
+                .unwrap();
+        }
+        other => panic!("unknown role {other}"),
+    }
+}
+
+/// A writer terminated after its page cache spilled uncommitted frames leaves
+/// their entries in the shared frame index, above the published max_frame. The
+/// next writer must discard them instead of tripping the monotonic-frame assert.
+#[test]
+fn new_writer_after_killed_writer_with_uncommitted_frames_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("mp-dead-writer.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("spilled");
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('base')")
+        .unwrap();
+    let wal_len_before = std::fs::metadata(format!("{db_path_str}-wal"))
+        .unwrap()
+        .len();
+
+    let spawn = |role: &str| {
+        Command::new(std::env::current_exe().unwrap())
+            .arg(MULTIPROCESS_DEAD_WRITER_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_MULTIPROCESS_DB_PATH", &db_path)
+            .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+            .env("TURSO_MULTIPROCESS_ROLE", role)
+            .spawn()
+            .unwrap()
+    };
+
+    let mut victim = spawn("spill");
+    wait_for_file(&ready_file);
+    victim.kill().unwrap();
+    let status = victim.wait().unwrap();
+    #[cfg(unix)]
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "got {status:?}");
+    #[cfg(not(unix))]
+    assert!(!status.success());
+    let wal_len_after = std::fs::metadata(format!("{db_path_str}-wal"))
+        .unwrap()
+        .len();
+    assert!(
+        wal_len_after > wal_len_before,
+        "precondition: the terminated writer must have appended uncommitted frames"
+    );
+
+    let status = spawn("commit").wait().unwrap();
+    assert!(status.success(), "next writer failed: {status:?}");
+    assert_eq!(count_test_rows(&conn), 2);
+}
