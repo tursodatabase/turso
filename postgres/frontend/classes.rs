@@ -1959,5 +1959,8 @@ pub(crate) fn initialize_schema(
         statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
         statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
     }
+    if !crate::sql_functions::has_table(schema) {
+        statements.push(crate::sql_functions::CREATE_FUNCTIONS_TABLE_SQL.to_string());
+    }
     Ok(statements)
 }

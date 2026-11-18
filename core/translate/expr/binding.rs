@@ -3,7 +3,7 @@ use crate::namespace::NamespaceRef;
 use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
 };
-use crate::translate::catalog::CatalogContext;
+use crate::translate::catalog::{AggregateClauses, CatalogContext};
 use crate::translate::plan::{
     is_schema_table, merge_columns, resolve_unqualified_column, unqualified_column_sources,
     ColumnLookup, OuterQueryReference, ResolvedColumn,
@@ -584,11 +584,25 @@ pub fn bind_and_rewrite_expr<'a>(
                 // arms focused on code generation.
                 Expr::FunctionCall {
                     name,
+                    distinctness,
                     args,
                     filter_over,
                     order_by,
-                    ..
+                    within_group,
                 } => {
+                    let clauses =
+                        AggregateClauses::new(distinctness, order_by, within_group, filter_over);
+                    if let Some(expansion) =
+                        resolver
+                            .catalog
+                            .expand_function_call(name.as_str(), args, clauses)?
+                    {
+                        // The walk goes on with the children of the
+                        // expression it is at, so the parentheses make it
+                        // bind the whole expansion.
+                        *expr = Expr::Parenthesized(vec![Box::new(expansion)]);
+                        return Ok(WalkControl::Continue);
+                    }
                     validate_function_tail(
                         name.as_str(),
                         args.len(),

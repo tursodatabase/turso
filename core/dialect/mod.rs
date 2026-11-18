@@ -19,7 +19,7 @@ pub(crate) use engine::EngineDialect;
 
 use crate::{
     function::ScalarFunc,
-    namespace::NamespaceId,
+    namespace::{NamespaceId, NamespaceRef, Qualifiers},
     schema::{BTreeTable, RelationKind, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
@@ -27,7 +27,8 @@ use crate::{
 };
 use std::{any::Any, sync::Arc};
 use turso_parser::ast::{
-    self, Cmd, CreateTableBody, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec, Stmt,
+    self, Cmd, CreateTableBody, Expr, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec,
+    Stmt,
 };
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -132,6 +133,16 @@ pub enum NewOwner {
 pub struct OwnerColumn {
     pub table: String,
     pub column: String,
+}
+
+/// What a dialect looks its own functions up in when a statement calls one.
+pub struct FunctionScope<'a> {
+    pub schema: &'a Schema,
+    /// The names that can qualify a function name, with their namespaces.
+    pub qualifiers: &'a Qualifiers,
+    /// The namespaces that a function name without a qualifier is looked up
+    /// in, in order.
+    pub search_order: &'a [NamespaceRef],
 }
 
 /// What a built-in scalar function may read besides its arguments.
@@ -323,6 +334,30 @@ pub trait Dialect: Send + Sync + 'static {
         _args: &[Value],
     ) -> Result<Value> {
         Err(LimboError::ParseError(format!("no such function: {name}")))
+    }
+
+    /// The expression that a call of function `name` with `args` stands
+    /// for, or None when `name` is not a function that the dialect expands.
+    /// The engine compiles the expression in place of the call, so the
+    /// optimizer sees what the function computes. A dialect uses it for
+    /// functions that users define with an SQL expression, as PostgreSQL's
+    /// `CREATE FUNCTION ... LANGUAGE sql` does. Consulted for a name that
+    /// [`Dialect::resolve_function`] does not resolve, before extension
+    /// functions.
+    ///
+    /// The engine expands the calls inside the expression too, and fails
+    /// when expansions nest too deeply. It compiles a subquery on its own,
+    /// though, so it cannot tell when a call inside a subquery of the
+    /// expression expands into the same call again. The dialect has to
+    /// refuse such a call.
+    fn expand_function_call(
+        &self,
+        scope: &FunctionScope<'_>,
+        name: &str,
+        args: &[Box<Expr>],
+    ) -> Result<Option<Expr>> {
+        let _ = (scope, name, args);
+        Ok(None)
     }
 
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,

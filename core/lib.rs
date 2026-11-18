@@ -96,7 +96,7 @@ pub mod vtab;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
-pub use function::{ExternalFunc, Func, ScalarFunc};
+pub use function::{Deterministic, ExternalFunc, Func, ScalarFunc};
 /// The ENCODE of the built-in date and time types, also used by the PostgreSQL
 /// frontend to check input in `pg_input_is_valid`.
 pub use functions::datetime_input::exec_temporal_encode;
@@ -147,7 +147,7 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
-pub use dialect::{CatalogChange, Dialect, NewOwner, OwnerColumn};
+pub use dialect::{CatalogChange, Dialect, FunctionScope, NewOwner, OwnerColumn};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
     SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,
@@ -198,7 +198,7 @@ pub use turso_macros::{
 };
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
-pub use util::IOExt;
+pub use util::{walk_expr_with_subqueries, IOExt};
 pub use vdbe::array::{array_values_from_any, parse_text_array_of_texts, text_array_literal};
 pub use vdbe::builder::{CursorType, ProgramBuilder};
 pub use vdbe::insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
