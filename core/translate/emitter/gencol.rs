@@ -1,10 +1,45 @@
 use crate::schema::{BTreeTable, Column, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
-use crate::translate::expr::{emit_custom_type_encode_columns, translate_expr};
+use crate::translate::expr::{
+    emit_custom_type_encode_columns, emit_stored_column, maybe_apply_affinity, translate_expr,
+    translate_expr_no_constant_opt, NoConstantOptReason,
+};
 use crate::translate::plan::ColumnMask;
-use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
+use crate::vdbe::builder::{DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::{Arc, Result};
 
 use super::{ProgramBuilder, Resolver};
+
+/// Read the row at `cursor_id` into `column_regs`: each stored column once, then each
+/// virtual column, computed from those registers in dependency order.
+pub(crate) fn emit_row_from_cursor(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    cursor_id: usize,
+    column_regs: &[usize],
+    resolver: &Resolver,
+) -> Result<()> {
+    let columns = table.columns();
+    for (idx, column) in columns.iter().enumerate() {
+        if !column.is_virtual_generated() {
+            emit_stored_column(program, cursor_id, idx, column_regs[idx], resolver)?;
+            maybe_apply_affinity(column.ty(), column_regs[idx], program);
+        }
+    }
+    if !table.has_virtual_columns() {
+        return Ok(());
+    }
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        columns.iter().zip(column_regs.iter().copied()),
+        DmlRowForm::Stored,
+    );
+    compute_virtual_columns(
+        program,
+        &table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        table,
+    )
+}
 
 /// Emit bytecode to compute the generated columns of a row being written, in dependency order.
 ///
@@ -84,8 +119,26 @@ fn emit_generated_columns(
                 GeneratedType::Stored { .. } | GeneratedType::NotGenerated => continue,
             };
             let target_reg = dml_ctx.to_column_reg(idx);
-            translate_expr(program, None, expr, target_reg, resolver)?;
-            if column.is_virtual_generated() && dml_ctx.holds_stored_value(idx) {
+            let stores_value = column.is_virtual_generated() && dml_ctx.holds_stored_value(idx);
+            if stores_value
+                && resolver
+                    .schema()
+                    .column_has_custom_type(column, table.is_strict)
+            {
+                // ENCODE changes the register in place below, so the expression must
+                // write the register again for each row.
+                translate_expr_no_constant_opt(
+                    program,
+                    None,
+                    expr,
+                    target_reg,
+                    resolver,
+                    NoConstantOptReason::CustomTypeEncode,
+                )?;
+            } else {
+                translate_expr(program, None, expr, target_reg, resolver)?;
+            }
+            if stores_value {
                 emit_virtual_column_store(program, resolver, column, target_reg, table)?;
             }
             program.emit_column_affinity(target_reg, column.affinity());
