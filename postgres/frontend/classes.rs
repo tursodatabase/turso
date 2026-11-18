@@ -496,6 +496,7 @@ impl Catalog for PostgresCatalog {
                     new_name: column.definition.col_name.as_str(),
                 }],
             )?,
+            CatalogWrite::AddColumn(_) => {}
         }
         Ok(after_writes)
     }
@@ -522,13 +523,14 @@ fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
 }
 
 /// Whether the class table stores anything that `change` changes. A
-/// virtual table has no class row, and a column that keeps its name owns
-/// the same sequences as before.
+/// virtual table has no class row, a column that keeps its name owns the
+/// same sequences as before, and a new column owns none.
 fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
     match change {
         CatalogWrite::RenameTable(table) => !table.is_virtual,
         CatalogWrite::RenameColumn(column) => column.old_name != column.new_name.as_str(),
         CatalogWrite::AlterColumn(column) => column.old_name != column.definition.col_name.as_str(),
+        CatalogWrite::AddColumn(_) => false,
         _ => true,
     }
 }
