@@ -202,8 +202,11 @@ enum TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text_ref()
-            .map(|s| Value::build_text(s.to_ascii_lowercase()))
+        self.cast_text_ref().map(|s| {
+            let mut s = s.into_owned();
+            s.make_ascii_lowercase();
+            Value::build_text(s)
+        })
     }
 
     pub fn exec_length(&self) -> Self {
@@ -211,13 +214,12 @@ impl Value {
             Value::Text(t) => {
                 Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
             }
-            // The decimal text of an integer is ASCII, so it has one character for each byte.
+            // The text of a number is ASCII, so it has one character for each byte.
             Value::Numeric(Numeric::Integer(i)) => {
                 Value::from_i64(IntegerText::new(*i).as_str().len() as i64)
             }
-            Value::Numeric(_) => {
-                // For numbers, SQLite returns the length of the string representation
-                Value::from_i64(self.to_string().chars().count() as i64)
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::from_i64(format_float(f64::from(*f)).len() as i64)
             }
             Value::Blob(blob) => Value::from_i64(blob.len() as i64),
             _ => self.to_owned(),
@@ -231,14 +233,19 @@ impl Value {
             Value::Numeric(Numeric::Integer(i)) => {
                 Value::from_i64(IntegerText::new(*i).as_str().len() as i64)
             }
-            Value::Numeric(_) => Value::from_i64(self.to_string().len() as i64),
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::from_i64(format_float(f64::from(*f)).len() as i64)
+            }
             _ => self.to_owned(),
         }
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text_ref()
-            .map(|s| Value::build_text(s.to_ascii_uppercase()))
+        self.cast_text_ref().map(|s| {
+            let mut s = s.into_owned();
+            s.make_ascii_uppercase();
+            Value::build_text(s)
+        })
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
@@ -683,7 +690,12 @@ impl Value {
     pub fn exec_hex(&self) -> Value {
         match self {
             Value::Text(text) => Value::build_text(hex_upper(text.as_str().as_bytes())),
-            Value::Numeric(_) => Value::build_text(hex_upper(self.to_string().as_bytes())),
+            Value::Numeric(Numeric::Integer(i)) => {
+                Value::build_text(hex_upper(IntegerText::new(*i).as_str().as_bytes()))
+            }
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::build_text(hex_upper(format_float(f64::from(*f)).as_bytes()))
+            }
             Value::Blob(blob_bytes) => Value::build_text(hex_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
@@ -2859,6 +2871,47 @@ mod tests {
         let input_blob = blob(&[0xff]);
         let expected_val = Value::build_text("FF");
         assert_eq!(input_blob.exec_hex(), expected_val);
+    }
+
+    #[test]
+    fn text_functions_of_a_number_use_the_text_of_to_string() {
+        let numbers = [
+            Value::from_i64(0),
+            Value::from_i64(-42),
+            Value::from_i64(i64::MIN),
+            Value::from_i64(i64::MAX),
+            Value::from_f64(0.0),
+            Value::from_f64(-0.0),
+            Value::from_f64(123.456),
+            Value::from_f64(-1.5e-7),
+            Value::from_f64(1e100),
+            Value::from_f64(f64::INFINITY),
+            Value::from_f64(f64::NEG_INFINITY),
+        ];
+        for value in numbers {
+            let text = value.to_string();
+            assert_eq!(value.cast_text_ref().as_deref(), Some(text.as_str()));
+            assert_eq!(
+                value.exec_length(),
+                Value::from_i64(text.chars().count() as i64)
+            );
+            assert_eq!(
+                value.exec_octet_length(),
+                Value::from_i64(text.len() as i64)
+            );
+            assert_eq!(
+                value.exec_hex(),
+                Value::build_text(super::hex_upper(text.as_bytes()))
+            );
+            assert_eq!(
+                value.exec_upper(),
+                Some(Value::build_text(text.to_ascii_uppercase()))
+            );
+            assert_eq!(
+                value.exec_lower(),
+                Some(Value::build_text(text.to_ascii_lowercase()))
+            );
+        }
     }
 
     #[test]

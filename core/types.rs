@@ -910,13 +910,14 @@ impl Value {
         }
     }
 
-    /// The same text as `to_string()`, for a value that is not TEXT. An
-    /// integer does not go through the formatting machinery. Out of line, so
+    /// The same text as `to_string()`, for a value that is not TEXT. A
+    /// number does not go through the formatting machinery. Out of line, so
     /// that `cast_text_ref` stays small enough to inline.
     #[inline(never)]
     fn non_text_to_string(&self) -> String {
         match self {
             Value::Numeric(Numeric::Integer(i)) => IntegerText::new(*i).as_str().to_owned(),
+            Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
             other => other.to_string(),
         }
     }
