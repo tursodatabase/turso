@@ -1118,7 +1118,11 @@ impl Value {
             return Ok(Value::Null);
         }
         let replacement = text_of_cast(replacement);
-        Ok(Value::build_text(source.replace(&*pattern, &replacement)))
+        Ok(Value::build_text(replace_all(
+            &source,
+            &pattern,
+            &replacement,
+        )))
     }
 
     pub fn exec_math_unary(&self, function: &MathFunc) -> Value {
@@ -1665,6 +1669,21 @@ impl<const N: usize> std::fmt::Write for StackText<N> {
         self.len = end;
         Ok(())
     }
+}
+
+/// `source.replace(pattern, replacement)`, with the result allocated at the
+/// length of `source` first. `str::replace` starts with an empty `String`,
+/// which grows a few times for a short text.
+fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut last_end = 0;
+    for (start, part) in source.match_indices(pattern) {
+        result.push_str(&source[last_end..start]);
+        result.push_str(replacement);
+        last_end = start + part.len();
+    }
+    result.push_str(&source[last_end..]);
+    result
 }
 
 /// The text of `CAST(value AS TEXT)`, which is the text of `value.to_string()`.
@@ -2472,6 +2491,25 @@ mod tests {
         let expected_blob = blob(b"example");
         let expected_len = Value::from_i64(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
+    }
+
+    #[test]
+    fn replace_all_gives_the_result_of_str_replace() {
+        for (source, pattern, replacement) in [
+            ("banana banana banana", "banana", "apple"),
+            ("banana", "an", "ANANA"),
+            ("aaaa", "aa", "b"),
+            ("aaa", "aa", ""),
+            ("abc", "x", "y"),
+            ("", "a", "b"),
+            ("é'üé", "é", "e"),
+        ] {
+            assert_eq!(
+                super::replace_all(source, pattern, replacement),
+                source.replace(pattern, replacement),
+                "{source:?} {pattern:?} {replacement:?}"
+            );
+        }
     }
 
     #[test]
