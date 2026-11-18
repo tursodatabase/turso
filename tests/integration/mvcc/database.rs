@@ -10,6 +10,7 @@ use super::checkpoint::{
 };
 use super::test_db::MvccTestDbNoConn;
 use super::transactions::{generate_simple_string_row, get_record_value, write_synthetic_row};
+use crate::unreliable_io::UnreliableIo;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -12513,6 +12514,97 @@ fn rewrite_wal_frames_as_non_commit(path: &std::path::Path) {
     file.seek(SeekFrom::Start(0)).unwrap();
     file.write_all(&bytes).unwrap();
     file.sync_all().unwrap();
+}
+
+/// What this test checks: The checkpoint does not fsync the logical log after it truncates it,
+/// so a power loss right after the checkpoint brings back frames that the checkpoint already
+/// wrote to the database file. Recovery skips these frames, because their `commit_ts` is at or
+/// below `persistent_tx_ts_max`.
+/// Why this matters: A replay of such a frame writes an old value over a newer one.
+#[test]
+fn test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames() {
+    let db_path = "mvcc-power-loss-after-checkpoint.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    // This checkpoint truncates the log. The fsync of the INSERT commit makes the truncation
+    // durable, so that only the INSERT frame comes back after the power loss.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    // With synchronous=NORMAL, the commit does not fsync the logical log. The update becomes
+    // durable only when the checkpoint writes it to the database file.
+    conn.execute("PRAGMA synchronous = NORMAL").unwrap();
+    conn.execute("UPDATE t SET v = 'new' WHERE id = 1").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let durable_log_len = io.durable_files()[&format!("{db_path}-log")].len();
+    assert!(
+        durable_log_len > LOG_HDR_SIZE,
+        "after a power loss, the logical log must still have the INSERT frame"
+    );
+
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_text("new".to_string())
+        ]]
+    );
+    assert_integrity_ok(&recovered);
+}
+
+/// What this test checks: A switch from MVCC to WAL mode makes the truncation of the logical log
+/// durable before the header says WAL.
+/// Why this matters: A database in WAL mode does not open while its logical log has frames.
+#[test]
+fn test_switch_from_mvcc_to_wal_survives_power_loss() {
+    let db_path = "mvcc-power-loss-after-switch-to-wal.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    // This checkpoint fsyncs the database file, so the WAL-mode header becomes durable.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        io.durable_files()[db_path][18..20],
+        [2, 2],
+        "the header on disk must say WAL"
+    );
+
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::from_text("a".to_string())]]
+    );
 }
 
 /// Replay gate uses metadata boundary and never applies frames at or below it.

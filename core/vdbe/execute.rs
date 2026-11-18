@@ -18530,6 +18530,10 @@ pub enum OpJournalModeSubState {
     Start,
     /// Checkpointing WAL/MVCC before mode change
     Checkpoint,
+    /// Fsync the logical log that the MVCC checkpoint truncated. A database in WAL mode does
+    /// not open while its logical log has frames, so the truncation must be durable before
+    /// the header says WAL.
+    SyncLogicalLog,
     /// Update the header with new version and get page reference
     UpdateHeader,
     /// Write page 1 to disk
@@ -18804,7 +18808,7 @@ fn op_journal_mode_inner(
                     return_if_io!(state, ckpt_sm.step(&()));
                     state.active_op_state.journal_mode().checkpoint_sm = None;
                     state.active_op_state.journal_mode().sub_state =
-                        OpJournalModeSubState::UpdateHeader;
+                        OpJournalModeSubState::SyncLogicalLog;
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(
@@ -18817,6 +18821,18 @@ fn op_journal_mode_inner(
                     return_if_io!(state, checkpoint_result);
                     state.active_op_state.journal_mode().sub_state =
                         OpJournalModeSubState::UpdateHeader;
+                }
+            }
+
+            OpJournalModeSubState::SyncLogicalLog => {
+                state.active_op_state.journal_mode().sub_state =
+                    OpJournalModeSubState::UpdateHeader;
+                let mv_store = program
+                    .connection
+                    .mv_store_for_db(*db)
+                    .expect("the MVCC checkpoint ran, so the database has an MV store");
+                if let Some(completion) = mv_store.sync_logical_log(&program.connection)? {
+                    return Ok(state.suspend_on_io(IOCompletions(completion)));
                 }
             }
 

@@ -210,9 +210,11 @@ pub enum CheckpointState {
     /// This ensures durability: if we crash after WAL truncation but before DB fsync,
     /// the data would be lost.
     SyncDbFile,
+    /// Truncate the logical log. The log needs no fsync after this: if a crash loses the
+    /// truncation, the old frames come back, but their `commit_ts` is at or below
+    /// `persistent_tx_ts_max`, so recovery skips them.
     TruncateLogicalLog,
-    FsyncLogicalLog,
-    /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
+    /// Truncate the WAL file after the DB file is durable.
     TruncateWal,
     GcTableRows {
         next_index: usize,
@@ -281,7 +283,7 @@ pub struct LockStates {
 /// 5. Commits the pager transaction, effectively flushing to the WAL
 /// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
 /// 7. Fsync the DB file
-/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
+/// 8. Truncate logical log to 0 (salt regenerated in memory), then truncate WAL
 /// 9. Calls `on_checkpoint_end`, then releases checkpoint locks
 ///
 /// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
@@ -1831,11 +1833,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         false
     }
 
-    /// Fsync the logical log file
-    fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync(self.pager.get_sync_type())
-    }
-
     fn truncate_logical_log(&self) -> Result<Completion> {
         use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
         let boundary = if self.clears_whole_logical_log() {
@@ -3250,7 +3247,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
-                self.state = CheckpointState::FsyncLogicalLog;
+                self.state = CheckpointState::TruncateWal;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
                     if self.clears_whole_logical_log() {
@@ -3267,24 +3264,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             "TRUNCATE checkpoint must zero the logical log file"
                         );
                     }
-                    Ok(TransitionResult::Continue)
-                } else {
-                    Ok(TransitionResult::Io(IOCompletions(c)))
-                }
-            }
-
-            CheckpointState::FsyncLogicalLog => {
-                // Skip fsync when synchronous mode is off
-                if self.sync_mode == SyncMode::Off {
-                    tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
-                    self.state = CheckpointState::TruncateWal;
-                    return Ok(TransitionResult::Continue);
-                }
-                tracing::debug!("Fsyncing logical log file");
-                let c = self.fsync_logical_log()?;
-                self.state = CheckpointState::TruncateWal;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))

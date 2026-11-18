@@ -643,7 +643,6 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
     for _ in 0..50_000 {
         match checkpoint_sm.state() {
             CheckpointState::TruncateLogicalLog
-            | CheckpointState::FsyncLogicalLog
             | CheckpointState::TruncateWal
             | CheckpointState::GcTableRows { .. }
             | CheckpointState::GcIndexRows { .. } => {
