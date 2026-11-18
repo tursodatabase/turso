@@ -6340,15 +6340,14 @@ pub mod test {
 
     #[test]
     fn test_truncate_file() {
-        let (db, _path) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal_path = temp_dir.path().join("test.db-wal");
+        let one_frame = WAL_FRAME_HEADER_SIZE + 4096;
+        std::fs::write(&wal_path, vec![0u8; WAL_HEADER_SIZE + one_frame]).unwrap();
+        let wal_file = shared_wal_test_io()
+            .open_file(wal_path.to_str().unwrap(), OpenFlags::Create, false)
             .unwrap();
-        conn.execute("create table test (id integer primary key, value text)")
-            .unwrap();
-        let _ = conn.execute("insert into test (value) values ('test1'), ('test2'), ('test3')");
-        let wal = db.shared_wal.write();
-        let wal_file = wal.runtime.file.as_ref().unwrap().clone();
+        assert!(wal_file.size().unwrap() > WAL_HEADER_SIZE as u64);
         let done = Arc::new(Mutex::new(false));
         let _done = done.clone();
         let _ = wal_file.truncate(
