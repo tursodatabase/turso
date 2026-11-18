@@ -112,12 +112,7 @@ manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`, `age(timestamp[, timestamp])`
-(returns text in PostgreSQL's interval format, since intervals are stored as text;
-string literal arguments are cast to timestamptz, so they follow the timestamp input rules;
-other text arguments, such as text columns, are read as timestamps instead of being
-rejected, because tursopg chooses functions by name and argument count only;
-the `age(xid)` form is not supported).
+`transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
@@ -161,12 +156,18 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
 `<table>_<column>_seq`, or, when a relation of the schema has that name,
 the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
+smallint, bigint, uuid, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
-including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
+including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+date, time, timetz and interval, and arrays of every date and time type
+(`timestamp[]` and `timestamptz[]` included), are rejected as not supported
+(0A000) in column types, casts, typed literals and domains. So are
+`CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
+return date, time, timetz or interval, such as `age` and `make_date`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -242,7 +243,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
-| SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
+| SQL standard interval handling | ❌ Not supported | interval is rejected (0A000) |
 | SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
@@ -268,7 +269,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp` or `date`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
@@ -536,7 +537,7 @@ Upgrade is not supported.
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
-| Named parameters | ❌ Not supported | Named arguments in calls, such as `make_interval(days => 1)`, are rejected |
+| Named parameters | ❌ Not supported | Named arguments in calls, such as `jsonb_path_exists(j, p, silent => true)`, are rejected |
 | Non-superuser language creation | ❌ Not supported | |
 | pl/pgsql installed by default | ❌ Not supported | |
 | Polymorphic functions | ❌ Not supported | |

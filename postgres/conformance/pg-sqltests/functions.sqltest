@@ -1660,12 +1660,20 @@ test age-of-two-timestamps {
 expect {
     1 year 9 mons 7 days
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-an-earlier-timestamp-is-negative {
     SELECT age('2025-01-01'::timestamp, '2026-10-08 03:04:05.5'::timestamp);
 }
 expect {
     -1 years -9 mons -7 days -03:04:05.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
 }
 
 test age-borrows-the-length-of-the-earlier-month {
@@ -1675,6 +1683,10 @@ test age-borrows-the-length-of-the-earlier-month {
 expect {
     1 mon 1 day|-1 mons -1 days
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-borrows-a-day-for-the-time-part {
     SELECT age('2026-10-08 01:00:00.25'::timestamp, '2026-10-07 23:30:00.5'::timestamp),
@@ -1683,12 +1695,20 @@ test age-borrows-a-day-for-the-time-part {
 expect {
     01:29:59.75|1 year 1 mon 23:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-equal-timestamps-is-zero {
     SELECT age('2026-10-08'::timestamp, '2026-10-08'::timestamp);
 }
 expect {
     00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
 }
 
 test age-of-timestamp-columns {
@@ -1699,6 +1719,10 @@ test age-of-timestamp-columns {
 expect {
     1 year 9 mons 7 days 03:04:05.5|-1 years -9 mons -7 days -03:04:05.5
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-one-timestamp-counts-from-midnight-today {
     SELECT age(current_date::timestamp);
@@ -1706,12 +1730,20 @@ test age-of-one-timestamp-counts-from-midnight-today {
 expect {
     00:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-one-date-counts-from-midnight-today {
     SELECT age(current_date);
 }
 expect {
     00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
 }
 
 test age-of-date-columns {
@@ -1722,6 +1754,10 @@ test age-of-date-columns {
 expect {
     1 year 9 mons 7 days|1 year 9 mons 7 days 03:04:05
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test age-reads-untyped-text-as-a-timestamp {
     SELECT age('2026-10-08', '2025-01-01 01:02'),
@@ -1731,12 +1767,20 @@ test age-reads-untyped-text-as-a-timestamp {
 expect {
     1 year 9 mons 6 days 22:58:00|1 year 9 mons 6 days 22:57:57|1 year 9 mons 6 days 22:57:56.75
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-reads-midnight-at-the-end-of-the-day {
     SELECT age('2025-01-01 24:00:00', '2025-01-01'), age('2025-01-01 24:00', '2025-01-01');
 }
 expect {
     1 day|1 day
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
 }
 
 test age-converts-a-zone-in-untyped-text-to-utc {
@@ -1748,6 +1792,10 @@ test age-converts-a-zone-in-untyped-text-to-utc {
 expect {
     1 year 9 mons 6 days 22:57:57|1 year 9 mons 7 days 00:57:57|1 year 9 mons 6 days 21:28:00|1 year 9 mons 6 days 22:57:57
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-a-two-digit-year-errors {
     SELECT age('26-10-08', '2025-01-01');
@@ -1755,8 +1803,9 @@ test age-of-a-two-digit-year-errors {
 expect error {
     date/time field value out of range: "26-10-08"
 }
+@sqlstate 0A000
 expect @tursopg error {
-    invalid input syntax for type timestamp with time zone: "26-10-08"
+    type "interval" is not supported
 }
 
 test age-of-a-zone-hour-out-of-range-errors {
@@ -1765,12 +1814,20 @@ test age-of-a-zone-hour-out-of-range-errors {
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+99:00"
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-a-zone-minute-out-of-range-errors {
     SELECT age('2026-10-08 12:34:56+05:61', '2025-01-01');
 }
 expect error {
     time zone displacement out of range: "2026-10-08 12:34:56\+05:61"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
 }
 
 test age-of-integers-errors {
@@ -1779,12 +1836,20 @@ test age-of-integers-errors {
 expect error {
     function age\(integer, integer\) does not exist
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-a-fraction-errors {
     SELECT age(1.5, 2);
 }
 expect error {
     function age\(numeric, integer\) does not exist
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
 }
 
 test age-of-an-integer-column-errors {
@@ -1795,6 +1860,10 @@ test age-of-an-integer-column-errors {
 expect error {
     function age\(integer\) does not exist
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-with-null-is-null {
     SELECT coalesce(age(NULL, '2025-01-01'::timestamp)::text, '<null>'),
@@ -1803,6 +1872,10 @@ test age-with-null-is-null {
 expect {
     <null>|<null>
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "interval" is not supported
+}
 
 test age-of-invalid-text-errors {
     SELECT age('hello', '2025-01-01'::timestamp);
@@ -1810,8 +1883,9 @@ test age-of-invalid-text-errors {
 expect error {
     invalid input syntax for type timestamp: "hello"
 }
+@sqlstate 0A000
 expect @tursopg error {
-    invalid input syntax for type timestamp with time zone: "hello"
+    type "interval" is not supported
 }
 
 test check-constraint-calls-a-text-function {
@@ -1983,6 +2057,10 @@ test array-to-json-writes-dates-and-timestamps-in-iso-format {
 }
 expect {
     ["2024-01-02"]|["2024-01-02T03:04:05.5"]|["2024-01-02T03:04:05+00:00"]
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test array-to-json-embeds-json-and-jsonb-values {

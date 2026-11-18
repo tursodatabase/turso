@@ -2,7 +2,7 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
@@ -98,7 +98,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "to_char"(FunctionArity::Exact(2), true) => {
             exec_to_char(args[0].get_value(), &text_arg(args, 1))
         },
-        "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
         },
@@ -1272,115 +1271,6 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
         _ => return None,
     };
     Some(pg_to_char_numeric(num, format))
-}
-
-/// age(end, start) the way PostgreSQL's timestamp_age computes it: subtract the
-/// timestamps field by field and borrow from the next larger field, where a
-/// borrowed month is as long as the earlier timestamp's month. age(start)
-/// measures from midnight of the current date.
-fn exec_age(args: &[Register]) -> Result<Value> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.get_value(), Value::Numeric(_) | Value::Blob(_)))
-    {
-        let argument_types = args
-            .iter()
-            .map(|arg| match arg.get_value() {
-                Value::Null => "unknown",
-                Value::Numeric(Numeric::Integer(_)) => "integer",
-                Value::Numeric(Numeric::Float(_)) => "numeric",
-                Value::Text(_) => "timestamp",
-                Value::Blob(_) => "bytea",
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(LimboError::InvalidArgument(format!(
-            "function age({argument_types}) does not exist"
-        )));
-    }
-    let mut timestamps = Vec::with_capacity(args.len());
-    for arg in args {
-        match arg.get_value() {
-            Value::Text(text) => timestamps.push(parse_timestamp(text.as_str())?),
-            _ => return Ok(Value::Null),
-        }
-    }
-    let (end, start) = match timestamps[..] {
-        [start] => (Utc::now().date_naive().and_time(NaiveTime::MIN), start),
-        [end, start] => (end, start),
-        _ => unreachable!("age() is declared with one or two arguments"),
-    };
-    let (later, earlier, sign) = if end < start {
-        (start, end, -1)
-    } else {
-        (end, start, 1)
-    };
-
-    let micros_of_day = |t: NaiveDateTime| {
-        i64::from(t.num_seconds_from_midnight()) * 1_000_000 + i64::from(t.nanosecond() / 1000)
-    };
-    let mut micros = micros_of_day(later) - micros_of_day(earlier);
-    let mut days = i64::from(later.day()) - i64::from(earlier.day());
-    let mut months = i64::from(later.year() - earlier.year()) * 12 + i64::from(later.month())
-        - i64::from(earlier.month());
-    if micros < 0 {
-        micros += 86_400_000_000;
-        days -= 1;
-    }
-    if days < 0 {
-        days += i64::from(earlier.num_days_in_month());
-        months -= 1;
-    }
-    Ok(Value::build_text(format_interval(
-        sign * months,
-        sign * days,
-        sign * micros,
-    )))
-}
-
-/// Reads a timestamp in the form the timestamp type stores, `YYYY-MM-DD
-/// HH:MM:SS[.f]` (the timestamptz type stores the same form, in UTC), or a
-/// date in the form the date type stores, `YYYY-MM-DD`, as midnight of that
-/// day, since PostgreSQL casts a date to a timestamp.
-fn parse_timestamp(text: &str) -> Result<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| {
-            NaiveDate::parse_from_str(text, "%Y-%m-%d").map(|date| date.and_time(NaiveTime::MIN))
-        })
-        .map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "invalid input syntax for type timestamp: \"{text}\""
-            ))
-        })
-}
-
-/// Formats an interval like PostgreSQL's interval_out with IntervalStyle
-/// postgres, e.g. `-1 years -9 mons -7 days -03:04:05.5`. All parts must have
-/// the same sign.
-fn format_interval(months: i64, days: i64, micros: i64) -> String {
-    let mut parts = Vec::new();
-    for (value, unit) in [(months / 12, "year"), (months % 12, "mon"), (days, "day")] {
-        if value != 0 {
-            let plural = if value == 1 { "" } else { "s" };
-            parts.push(format!("{value} {unit}{plural}"));
-        }
-    }
-    if parts.is_empty() || micros != 0 {
-        let sign = if micros < 0 { "-" } else { "" };
-        let seconds = micros.abs() / 1_000_000;
-        let mut time = format!(
-            "{sign}{:02}:{:02}:{:02}",
-            seconds / 3600,
-            seconds / 60 % 60,
-            seconds % 60
-        );
-        let fraction = micros.abs() % 1_000_000;
-        if fraction != 0 {
-            time.push_str(format!(".{fraction:06}").trim_end_matches('0'));
-        }
-        parts.push(time);
-    }
-    parts.join(" ")
 }
 
 /// pg_input_is_valid(text, type) → boolean

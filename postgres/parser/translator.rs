@@ -3,7 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
-use crate::functions::{is_system_column, pg_func, Immutability};
+use crate::functions::{datetime_result_type, is_system_column, pg_func, Immutability};
 use crate::names::{
     extract_key_columns, is_default_schema, is_pg_catalog, object_name, schema_qualifier,
     unqualified_name,
@@ -3689,16 +3689,27 @@ impl PostgreSQLTranslator {
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
                 }
+                // CURRENT_DATE, CURRENT_TIME and LOCALTIME are refused if
+                // tursopg does not support the type each returns in
+                // PostgreSQL.
                 match SqlValueFunctionOp::try_from(svf.op) {
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
+                        check_type_is_supported("date", 0)?;
                         Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
                     }
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
-                        | SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopLocaltime
-                        | SqlValueFunctionOp::SvfopLocaltimeN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
+                        | SqlValueFunctionOp::SvfopCurrentTimeN,
+                    ) => {
+                        check_type_is_supported("timetz", 0)?;
+                        Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
+                    }
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltime | SqlValueFunctionOp::SvfopLocaltimeN,
+                    ) => {
+                        check_type_is_supported("time", 0)?;
+                        Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
+                    }
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
                         | SqlValueFunctionOp::SvfopCurrentTimestampN
@@ -4438,6 +4449,9 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        if let Some(result_type) = datetime_result_type(&func_name) {
+            check_type_is_supported(result_type, 0)?;
+        }
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
@@ -4502,27 +4516,6 @@ impl PostgreSQLTranslator {
         let func_name = match func_name.as_str() {
             "position" => "strpos".to_string(),
             _ => func_name,
-        };
-
-        // PostgreSQL reads untyped string literal arguments of age() as
-        // timestamptz. Casting them gives the text the timestamp type's input
-        // rules, so age() only sees timestamps in their stored form.
-        let args = if func_name == "age" {
-            args.into_iter()
-                .map(|arg| match *arg {
-                    ast::Expr::Literal(ast::Literal::String(_)) => Box::new(ast::Expr::Cast {
-                        expr: arg,
-                        type_name: Some(ast::Type {
-                            name: "timestamptz".to_string(),
-                            size: None,
-                            array_dimensions: 0,
-                        }),
-                    }),
-                    _ => arg,
-                })
-                .collect()
-        } else {
-            args
         };
 
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
@@ -6705,7 +6698,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "BIGINT" | "INT8" => "bigint".into(),
         "UUID" => "uuid".into(),
         "DATE" => "date".into(),
-        "TIME" | "TIMETZ" => "time".into(),
+        "TIME" => "time".into(),
         "TIMESTAMP" => "timestamp".into(),
         "TIMESTAMPTZ" => "timestamptz".into(),
         "BYTEA" => "bytea".into(),
@@ -6735,8 +6728,6 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
-        // PG types without Turso equivalents → base SQLite types
-        "INTERVAL" => "TEXT".into(),
         // Network types → custom types for proper PG wire OIDs
         "CIDR" => "cidr".into(),
         "MACADDR" => "macaddr".into(),
@@ -7332,7 +7323,7 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
-    let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
+    let pg_type = supported_type_name(type_name)?;
 
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
@@ -7346,13 +7337,11 @@ fn pg_type_name_to_ast_type(
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
         "DATE" => "date",
-        "TIME" | "TIMETZ" => "time",
+        "TIME" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
-        | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
-            "TEXT"
-        }
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
+        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => &pg_type,
     };
@@ -7369,13 +7358,53 @@ fn pg_type_name_to_ast_type(
 fn extract_type_name_from_typename(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<String, ParseError> {
-    let mut name = object_name(&type_name.names, is_default_schema, "type")?;
+    let mut name = supported_type_name(type_name)?;
     if !type_name.array_bounds.is_empty() {
         for _ in &type_name.array_bounds {
             name.push_str("[]");
         }
     }
     Ok(name)
+}
+
+/// The type name without its schema and array bounds, or an error if tursopg
+/// does not support the type. Casts, typed literals, column types and domains
+/// all read their type name here.
+fn supported_type_name(type_name: &pg_query::protobuf::TypeName) -> Result<String, ParseError> {
+    let name = object_name(&type_name.names, is_default_schema, "type")?;
+    check_type_is_supported(&name, type_name.array_bounds.len())?;
+    Ok(name)
+}
+
+/// Refuses the date and time types that tursopg does not support, and arrays
+/// of every date and time type. `_name` is PostgreSQL's name for the array of
+/// `name`. The names are compared without regard to case, so a quoted `"DATE"`
+/// is refused too, although PostgreSQL would not find a type of that name.
+fn check_type_is_supported(name: &str, array_dimensions: usize) -> Result<(), ParseError> {
+    const DATETIME_TYPES: &[&str] = &[
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+    ];
+    // The date and time types tursopg supports, as scalars only.
+    const SUPPORTED_DATETIME_TYPES: &[&str] = &["timestamp", "timestamptz"];
+    let (element, is_array) = match name.strip_prefix('_') {
+        Some(element) => (element, true),
+        None => (name, array_dimensions > 0),
+    };
+    let element = element.to_ascii_lowercase();
+    let is_supported = !DATETIME_TYPES.contains(&element.as_str())
+        || (!is_array && SUPPORTED_DATETIME_TYPES.contains(&element.as_str()));
+    if is_supported {
+        return Ok(());
+    }
+    Err(ParseError::not_supported(format!(
+        "type \"{name}{}\"",
+        "[]".repeat(array_dimensions)
+    )))
 }
 
 /// Extract an integer value from a DefElem's arg node.
@@ -11508,7 +11537,7 @@ mod tests {
     #[test]
     fn test_current_timestamp_translation() {
         let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME FROM t";
+        let sql = "SELECT CURRENT_TIMESTAMP FROM t";
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
 
@@ -11520,11 +11549,7 @@ mod tests {
             panic!("Expected SELECT body");
         };
 
-        let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
-            ast::Expr::Literal(ast::Literal::CurrentDate),
-            ast::Expr::Literal(ast::Literal::CurrentTime),
-        ];
+        let expected = [ast::Expr::Literal(ast::Literal::CurrentTimestamp)];
 
         assert_eq!(columns.len(), expected.len());
 
@@ -13035,7 +13060,7 @@ mod tests {
     #[test]
     fn fail_closed_column_type_modifiers() {
         assert_not_supported("CREATE TABLE t (a timestamp(3))", "a type modifier");
-        assert_not_supported("CREATE TABLE t (a time(0))", "a type modifier");
+        assert_not_supported("CREATE TABLE t (a time(0))", "type \"time\"");
         assert_not_supported("CREATE TABLE t (a bit(8))", "a type modifier");
         assert_not_supported(
             "ALTER TABLE t ADD COLUMN a timestamptz(0)",
