@@ -1464,7 +1464,6 @@ fn emit_update_insns<'a>(
                 let new_rowid_reg = effective_rowid_reg;
 
                 // Compute virtual columns for NEW values
-                //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
                     let new_ctx = DmlColumnContext::layout(
                         columns,
