@@ -6,7 +6,7 @@
 
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
-    schema::{load::LoadStep, BTreeTable, RelationKind, Schema},
+    schema::{load::LoadStep, BTreeTable, Schema},
     translate::{
         emitter::Resolver,
         sqlite_schema_rows::{
@@ -535,37 +535,6 @@ impl AfterWrites {
             trigger_target_database_id: None,
         });
     }
-}
-
-/// A relation that a statement created, dropped or renamed. The engine makes
-/// the change itself; the dialect records it in its own catalog through
-/// [`Dialect::translate_relation_changes`](super::Dialect::translate_relation_changes).
-#[derive(Debug, Clone, Copy)]
-pub enum RelationChange<'a> {
-    Created {
-        namespace: NamespaceId,
-        name: &'a str,
-        kind: RelationKind,
-        /// For an index, the table it is on, in the same namespace. Its
-        /// owner owns the index.
-        table: Option<&'a str>,
-    },
-    Dropped {
-        namespace: NamespaceId,
-        name: &'a str,
-    },
-    Renamed {
-        namespace: NamespaceId,
-        old_name: &'a str,
-        new_name: &'a str,
-    },
-    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
-    ColumnRenamed {
-        namespace: NamespaceId,
-        table: &'a str,
-        old_name: &'a str,
-        new_name: &'a str,
-    },
 }
 
 /// A statement about roles, ownership, privileges or row-level security.

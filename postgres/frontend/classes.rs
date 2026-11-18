@@ -41,8 +41,8 @@ use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
     CreateIndex, CursorType, DropIndex, DropView, InsertFlags, Insn, LimboError, LoadQuery,
-    LoadStep, NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationChange,
-    RelationName, RenameTable, Row, SchemaLoad, SqliteCatalog, Value, WriteContext, WriteOrigin,
+    LoadStep, NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName,
+    RenameTable, Row, SchemaLoad, SqliteCatalog, Value, WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -804,10 +804,41 @@ fn rename_class_rows_of_table(
     translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
 }
 
-/// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
-/// frontend: a class row per created relation, owned by the current role,
-/// which is what PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row
-/// for a dropped one; a rename keeps the oid and owner.
+/// A relation that a statement created, dropped or renamed, or a column of
+/// one that it renamed. [`translate_relation_changes`] makes the same change
+/// to the class rows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RelationChange<'a> {
+    Created {
+        namespace: NamespaceId,
+        name: &'a str,
+        kind: RelationKind,
+        /// For an index, the table it is on, in the same namespace. Its
+        /// owner owns the index.
+        table: Option<&'a str>,
+    },
+    Dropped {
+        namespace: NamespaceId,
+        name: &'a str,
+    },
+    Renamed {
+        namespace: NamespaceId,
+        old_name: &'a str,
+        new_name: &'a str,
+    },
+    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
+    ColumnRenamed {
+        namespace: NamespaceId,
+        table: &'a str,
+        old_name: &'a str,
+        new_name: &'a str,
+    },
+}
+
+/// Emits the bytecode that changes the class rows for `changes`: a class
+/// row per created relation, owned by the current role, which is what
+/// PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row for a dropped
+/// one; a rename keeps the oid and owner.
 pub(crate) fn translate_relation_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,

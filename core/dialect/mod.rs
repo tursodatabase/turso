@@ -23,7 +23,7 @@ pub use catalog::DropColumn;
 pub use catalog::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
     CreateMaterializedView, CreateTable, CreateView, DropIndex, DropView, NewOwner, OwnerColumn,
-    RelationChange, RelationName, TableText, WriteContext, WriteOrigin,
+    RelationName, TableText, WriteContext, WriteOrigin,
 };
 pub use catalog::{RenameColumn, RewrittenTrigger, RewrittenView};
 pub use catalog::{RenameTable, RenamedIndex, TempTriggerOfRenamedTable};
