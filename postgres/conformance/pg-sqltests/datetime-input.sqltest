@@ -79,6 +79,15 @@ expect @tursopg error {
     type "time" is not supported
 }
 
+test datetime-input-timestamptz-without-offset {
+    CREATE TABLE t (tz timestamptz);
+    INSERT INTO t VALUES ('2024-01-05 10:00');
+    SELECT tz FROM t;
+}
+expect {
+    2024-01-05 10:00:00+00
+}
+
 test datetime-input-midnight-and-leap-second-carry {
     CREATE TABLE t (id int, tm time, ts timestamp);
     INSERT INTO t VALUES (1, '24:00:00', '2024-01-05 24:00:00');
