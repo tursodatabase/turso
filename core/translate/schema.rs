@@ -1,5 +1,6 @@
-use crate::dialect::catalog::DropTable;
-use crate::dialect::{AutomaticIndex, CatalogWrite, CreateTable, TableText, WriteContext};
+use crate::dialect::{
+    AutomaticIndex, CatalogWrite, CreateTable, DropTable, TableText, WriteContext,
+};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;

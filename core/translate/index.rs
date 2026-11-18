@@ -1,5 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
-use crate::dialect::catalog::{CatalogWrite, CreateIndex, DropIndex, WriteContext};
+use crate::dialect::{CatalogWrite, CreateIndex, DropIndex, WriteContext};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;

@@ -145,18 +145,15 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::AddColumn;
-pub use dialect::AlterColumn;
-pub use dialect::DropColumn;
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
 pub use dialect::{
-    AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
-    CreateMaterializedView, CreateTable, CreateView, Dialect, DropIndex, DropView, NewOwner,
-    OwnerColumn, RelationName, SqliteCatalog, TableText, WriteContext, WriteOrigin,
+    AccessStatement, AddColumn, AfterWrites, AlterColumn, AutomaticIndex, Catalog, CatalogApply,
+    CatalogWrite, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView,
+    Dialect, DropColumn, DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn,
+    RelationName, RenameColumn, RenameTable, RenamedIndex, RewrittenTrigger, RewrittenView,
+    SqliteCatalog, TableText, TempTriggerOfRenamedTable, WriteContext, WriteOrigin,
 };
-pub use dialect::{RenameColumn, RewrittenTrigger, RewrittenView};
-pub use dialect::{RenameTable, RenamedIndex, TempTriggerOfRenamedTable};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
     SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,

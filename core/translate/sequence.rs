@@ -11,8 +11,10 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::catalog::{CatalogWrite, CreateSequence, DropSequence, WriteContext};
-use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, WriteOrigin};
+use crate::dialect::{
+    AccessStatement, CatalogWrite, CreateSequence, DropSequence, NewOwner, OwnerColumn,
+    WriteContext, WriteOrigin,
+};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
