@@ -38,6 +38,10 @@ impl Catalog for SqliteCatalog {
             CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
             CatalogWrite::CreateIndex(index) => emit_create_index_row(program, ctx, index),
             CatalogWrite::DropIndex(index) => emit_delete_index_row(program, ctx, index),
+            // A sequence has no `sqlite_schema` row of its own. The schema
+            // reads it from the row of its backing table, which the
+            // statement writes as an engine table.
+            CatalogWrite::CreateSequence(_) => Ok(AfterWrites::none()),
         }
     }
 }
