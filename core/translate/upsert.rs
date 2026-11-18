@@ -6,12 +6,16 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_generated_columns;
+use super::emitter::gencol::{
+    compute_generated_columns, compute_virtual_columns, sets_custom_type_column,
+};
 use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
+use crate::schema::{
+    BTreeTable, Column, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -833,7 +837,23 @@ pub fn emit_upsert(
         DmlRowForm::UserFacing,
         resolver,
     )?;
-    emit_generated_column_notnull_checks(program, ctx, new_start, &layout, constraint_on_error);
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    // When a SET column has a custom type, the virtual columns are computed again
+    // after ENCODE, below, and their NOT NULL checks wait for these values.
+    let computes_virtual_columns_after_encode = table.btree().is_some_and(|bt| {
+        bt.is_strict && sets_custom_type_column(&bt, &updated_positions, resolver)
+    });
+    emit_generated_column_notnull_checks(
+        program,
+        ctx,
+        new_start,
+        &layout,
+        constraint_on_error,
+        |column| !(computes_virtual_columns_after_encode && column.is_virtual_generated()),
+    );
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -850,6 +870,26 @@ pub fn emit_upsert(
                 &layout,
             )?;
 
+            // The virtual columns were computed from the SET values. When a SET column
+            // has a custom type, a read of the row can give other values, so compute
+            // them again from the encoded row, as a read of the row gives them.
+            if computes_virtual_columns_after_encode {
+                let dml_ctx = DmlColumnContext::layout(
+                    bt.columns(),
+                    new_start,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    layout.clone(),
+                    DmlRowForm::Stored,
+                );
+                compute_virtual_columns(
+                    program,
+                    &bt.columns_topo_sort()?,
+                    &dml_ctx,
+                    resolver,
+                    &bt,
+                )?;
+            }
+
             // Post-encode TypeCheck: validate encoded values match storage type.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
@@ -857,6 +897,17 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
+
+            if computes_virtual_columns_after_encode {
+                emit_generated_column_notnull_checks(
+                    program,
+                    ctx,
+                    new_start,
+                    &layout,
+                    constraint_on_error,
+                    Column::is_virtual_generated,
+                );
+            }
         }
 
         // Rows that row-level security does not let the role write fail
@@ -901,10 +952,6 @@ pub fn emit_upsert(
     // Fire BEFORE UPDATE triggers
     let upsert_namespace: NamespaceRef = ctx.namespace;
     let upsert_database_id = upsert_namespace.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -1030,6 +1077,7 @@ pub fn emit_upsert(
                 new_start,
                 &layout,
                 constraint_on_error,
+                |_| true,
             );
 
             let has_relevant_after_triggers = has_triggers_including_temp(
@@ -1764,9 +1812,10 @@ fn emit_generated_column_notnull_checks(
     new_start: usize,
     layout: &ColumnLayout,
     on_error: Option<ast::ResolveType>,
+    include_column: impl Fn(&Column) -> bool,
 ) {
     for (idx, column) in ctx.table.columns().iter().enumerate() {
-        if !column.is_generated() || !column.notnull() {
+        if !column.is_generated() || !column.notnull() || !include_column(column) {
             continue;
         }
         program.emit_insn(Insn::HaltIfNull {
