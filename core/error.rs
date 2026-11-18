@@ -120,6 +120,10 @@ pub enum LimboError {
     /// A date or time field is out of range, such as `2024-02-30`.
     #[error("Parse error: {0}")]
     DatetimeFieldOverflow(String),
+    /// A date or time in a form that PostgreSQL reads and this engine does
+    /// not, such as `2024-01-05 10:00 EST`.
+    #[error("Parse error: {0}")]
+    DatetimeNotSupported(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]

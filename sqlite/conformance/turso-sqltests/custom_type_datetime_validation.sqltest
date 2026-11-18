@@ -27,7 +27,7 @@ test invalid-date-format-rejected {
     INSERT INTO t1 VALUES (1, '15/01/2024');
 }
 expect error {
-    invalid input syntax for type date
+    date/time field value out of range: "15/01/2024"
 }
 
 @requires strict "uses STRICT tables"

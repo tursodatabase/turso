@@ -269,52 +269,177 @@ expect @tursopg error {
     type "time" is not supported
 }
 
-# PostgreSQL accepts the values below. Turso compares these types by their
-# text, which must sort in time order. The text of these values would not, so
-# it rejects them.
+# PostgreSQL reads the values below and tursopg does not, so tursopg refuses
+# them as unsupported (0A000), not as invalid input (22007).
 
-@skip-if postgres "PostgreSQL accepts BC dates"
-test datetime-input-rejects-bc {
-    CREATE TABLE t (d date);
-    INSERT INTO t VALUES ('0044-03-15 BC');
+test datetime-input-bc {
+    SELECT '0044-03-15 10:00 BC'::timestamptz;
 }
-expect error {
-    BC dates are not supported for type date
+expect {
+    0044-03-15 10:00:00+00 BC
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    BC dates are not supported for type timestamp with time zone
 }
 
-@skip-if postgres "PostgreSQL accepts years past 9999"
-test datetime-input-rejects-year-past-9999 {
-    CREATE TABLE t (ts timestamp);
-    INSERT INTO t VALUES ('10000-01-01 00:00:00');
+test datetime-input-year-past-9999 {
+    SELECT '10000-01-01 00:00:00'::timestamp;
 }
-expect error {
+expect {
+    10000-01-01 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
     years must be written with 4 digits
 }
 
-@skip-if postgres "PostgreSQL accepts infinity"
-test datetime-input-rejects-infinity {
-    CREATE TABLE t (ts timestamp);
-    INSERT INTO t VALUES ('infinity');
+test datetime-input-infinity {
+    SELECT 'infinity'::timestamp;
 }
-expect error {
+expect {
+    infinity
+}
+@sqlstate 0A000
+expect @tursopg error {
     the timestamp value "infinity" is not supported
 }
 
-# PostgreSQL reads `z10` as a POSIX time zone 10 hours behind UTC, so this is
-# midnight in that zone: 2024-01-05 00:00:00 as a timestamp. Time zones are not
-# supported yet; reading `z` as UTC followed by 10:00 would give 10:00:00.
-
-@skip-if postgres "PostgreSQL reads z10 as a time zone"
-test datetime-input-rejects-posix-time-zone {
-    CREATE TABLE t (ts timestamp);
-    INSERT INTO t VALUES ('2024-01-05 z10:00');
+test datetime-input-time-zone-name {
+    SELECT '2024-01-05 10:00:00 Europe/Helsinki'::timestamptz;
 }
+expect {
+    2024-01-05 08:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    time zone names are not supported for type timestamp with time zone
+}
+
+test datetime-input-time-zone-abbreviation {
+    SELECT '2024-01-05 10:00:00 EST'::timestamptz;
+}
+expect {
+    2024-01-05 15:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    time zone names are not supported for type timestamp with time zone
+}
+
+# PostgreSQL reads `z10` as a POSIX time zone 10 hours behind UTC, so this is
+# midnight in that zone.
+
+test datetime-input-posix-time-zone {
+    SELECT '2024-01-05 z10:00'::timestamp;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    time zone names are not supported for type timestamp
+}
+
+# 1 BC is a leap year.
+
+test datetime-input-bc-leap-day {
+    SELECT '0001-02-29 BC'::timestamp;
+}
+expect {
+    0001-02-29 00:00:00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    BC dates are not supported for type timestamp
+}
+
+test datetime-input-month-name-glued-to-day {
+    SELECT '2024 Feb-05'::timestamptz;
+}
+expect {
+    2024-02-05 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp with time zone input is not supported
+}
+
+# A date that starts with a month name must be a whole date, and `at` or `on`
+# in it is invalid.
+
+test datetime-input-month-name-glued-to-day-without-year {
+    SELECT 'Feb-05 2024'::timestamp;
+}
+@sqlstate 22007
 expect error {
-    invalid input syntax for type timestamp: "2024-01-05 z10:00"
+    invalid input syntax for type timestamp: "Feb-05 2024"
+}
+
+test datetime-input-month-name-glued-to-time {
+    SELECT 'Feb-05-2024-1000'::timestamp;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type timestamp: "Feb-05-2024-1000"
+}
+
+test datetime-input-on-glued-to-date {
+    SELECT '2024 on-01-05'::timestamp;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type timestamp: "2024 on-01-05"
+}
+
+test datetime-input-at-glued-to-date {
+    SELECT 'at-jan-05-2024'::timestamp;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type timestamp: "at-jan-05-2024"
+}
+
+test datetime-input-julian-day {
+    SELECT 'J2451187'::timestamp;
+}
+expect {
+    1999-01-08 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp input is not supported
+}
+
+# There is no year 0 BC. A 2-digit year is not read as 2000 when BC follows.
+
+test datetime-input-bc-year-zero {
+    SELECT 'Jan 5 00 BC'::timestamp;
+}
+@sqlstate 22008
+expect error {
+    date/time field value out of range: "Jan 5 00 BC"
+}
+
+test datetime-input-sept {
+    SELECT 'Sept 5 2024'::timestamp;
+}
+expect {
+    2024-09-05 00:00:00
+}
+
+# pg_input_is_valid refuses input it cannot read instead of answering false,
+# since PostgreSQL answers true.
+
+test datetime-input-is-valid-time-zone-name {
+    SELECT CASE WHEN pg_input_is_valid('2024-01-05 10:00:00 EST', 'timestamptz') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+}
+@sqlstate 0A000
+expect @tursopg error {
+    time zone names are not supported for type timestamp with time zone
 }
 
 # A string compared with a date or time column is read as a value of the
