@@ -164,6 +164,7 @@ pub use dialect::{
     CreateMaterializedView, CreateTable, CreateView, Dialect, DropIndex, DropView, NewOwner,
     OwnerColumn, RelationChange, RelationName, SqliteCatalog, TableText, WriteContext, WriteOrigin,
 };
+pub use dialect::{RenameColumn, RewrittenTrigger, RewrittenView};
 pub use dialect::{RenameTable, TempTriggerOfRenamedTable};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
