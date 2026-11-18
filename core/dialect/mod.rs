@@ -25,8 +25,7 @@ pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
 pub use catalog::{
-    AccessStatement, CatalogApply, CatalogChange, NewOwner, OwnerColumn, RelationChange,
-    RelationName,
+    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
 };
 
 #[cfg(test)]
