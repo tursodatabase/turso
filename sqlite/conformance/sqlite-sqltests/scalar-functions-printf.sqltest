@@ -1,5 +1,19 @@
 @database :memory:
 
+test printf-character-multibyte-width {
+    SELECT hex(printf('%3c', char(233))),
+           hex(printf('%!3c', char(233))),
+           hex(printf('%-3c', char(233))),
+           hex(printf('%4.2c', char(233))),
+           hex(printf('%3s', char(233))),
+           hex(printf('%3c', char(0))),
+           hex(printf('%3c', char(128512))),
+           hex(printf('%*c', -3, char(233)));
+}
+expect {
+    2020C3A9|2020C3A9|C3A92020|2020C3A9C3A9|20C3A9|202000|2020F09F9880|C3A92020
+}
+
 test printf-character-nul {
     SELECT hex(printf('%c', char(0) || 'a')),
            hex(printf('%c', '')),
