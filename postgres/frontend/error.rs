@@ -362,7 +362,10 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("there is no parameter $") {
         SQLSTATE_UNDEFINED_PARAMETER
-    } else if msg == "subqueries in policies are not supported" {
+    } else if msg == "subqueries in policies are not supported"
+        || ((msg.starts_with("comparing type ") || msg.starts_with("using type "))
+            && msg.ends_with(" is not supported"))
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE

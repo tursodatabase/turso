@@ -331,3 +331,31 @@ test set-default-encodes-default-value {
 expect {
     8
 }
+
+# A foreign key compares the child's key with the parent's, so a timestamptz
+# or timestamp key can only reference a key of its own type.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test timestamp-key-references-integer-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(k timestamptz PRIMARY KEY) STRICT;
+    CREATE TABLE child(k integer REFERENCES parent(k)) STRICT;
+    INSERT INTO parent VALUES ('2000-01-01 00:00+00');
+    INSERT INTO child VALUES (0);
+}
+expect error {
+    comparing type timestamptz with type integer is not supported
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test timestamptz-key-references-timestamp-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(k timestamp PRIMARY KEY) STRICT;
+    CREATE TABLE child(k timestamptz REFERENCES parent(k) ON DELETE CASCADE) STRICT;
+    INSERT INTO parent VALUES ('2024-01-05 08:00');
+    DELETE FROM parent;
+}
+expect error {
+    comparing type timestamptz with type timestamp is not supported
+}

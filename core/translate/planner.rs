@@ -12,7 +12,7 @@ use super::{
         JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResolvedColumn,
         ResultSetColumn, Scan, TableReferences, WhereTerm, WhereTermOrigin,
     },
-    select::{prepare_select_plan, prepare_select_plan_from_arms},
+    select::{prepare_select_plan, prepare_select_plan_from_arms, ValuesColumnTypes},
 };
 use crate::security::permission::Object;
 use crate::translate::plan::BitSet;
@@ -1430,6 +1430,7 @@ fn prepare_recursive_cte_plan(
         program,
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
+        ValuesColumnTypes::CommonType,
         connection,
     )?;
 
@@ -1491,6 +1492,7 @@ fn prepare_recursive_cte_plan(
         program,
         &recursive_query_outer_refs,
         QueryDestination::placeholder_for_subquery(),
+        ValuesColumnTypes::CommonType,
         connection,
     )?;
 

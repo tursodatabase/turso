@@ -9,7 +9,9 @@ use crate::schema::Table;
 use crate::security::policy::Command;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
+use crate::translate::collate::{
+    compound_order_by_collation, convert_values_column, CollationSeq, TextCollation,
+};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -39,20 +41,38 @@ use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
+/// How the columns of a VALUES list get their types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuesColumnTypes {
+    /// The VALUES list is read as a table: each column takes the common type of
+    /// its rows, and untyped literals are converted to that type.
+    CommonType,
+    /// The VALUES list holds the rows of an INSERT: each row keeps its own
+    /// types, as in PostgreSQL, and INSERT converts each value to the type of
+    /// its target column.
+    TargetColumnType,
+}
+
 #[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
+    values_column_types: ValuesColumnTypes,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = prepare_select_plan(
-        select,
+    let plan = prepare_select_plan_from_arms(
+        select.body.select,
+        select.body.compounds,
+        select.with,
+        select.order_by,
+        select.limit,
         resolver,
         program,
         &[],
         query_destination,
+        values_column_types,
         connection,
     )?;
     if program.trigger.is_some() {
@@ -183,6 +203,7 @@ pub fn prepare_select_plan(
         program,
         outer_query_refs,
         query_destination,
+        ValuesColumnTypes::CommonType,
         connection,
     )
 }
@@ -191,6 +212,9 @@ pub fn prepare_select_plan(
 ///
 /// Accepting the arms directly lets recursive CTE planning divide a stored
 /// SELECT without allocating temporary compound-arm vectors.
+///
+/// `values_column_types` applies only when the first arm is the only arm: the
+/// arms of a compound SELECT always take a common type.
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub(crate) fn prepare_select_plan_from_arms(
@@ -203,6 +227,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
+    values_column_types: ValuesColumnTypes,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let mut compound_arms = compound_arms.into_iter().peekable();
@@ -216,6 +241,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             with,
             outer_query_refs,
             query_destination,
+            values_column_types,
             connection,
         )?)));
     }
@@ -231,6 +257,7 @@ pub(crate) fn prepare_select_plan_from_arms(
         with.clone(),
         outer_query_refs,
         query_destination.clone(),
+        ValuesColumnTypes::CommonType,
         connection,
     )?;
 
@@ -250,6 +277,7 @@ pub(crate) fn prepare_select_plan_from_arms(
             with.clone(),
             outer_query_refs,
             query_destination.clone(),
+            ValuesColumnTypes::CommonType,
             connection,
         )?;
     }
@@ -307,6 +335,7 @@ fn prepare_one_select_plan(
     with: Option<ast::With>,
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
+    values_column_types: ValuesColumnTypes,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
     match select {
@@ -923,6 +952,14 @@ fn prepare_one_select_plan(
                 resolver,
                 connection,
             )?;
+
+            if values_column_types == ValuesColumnTypes::CommonType
+                && !resolver.schema().type_registry.is_empty()
+            {
+                for column in 0..len {
+                    convert_values_column(&mut values, column, &table_references, resolver)?;
+                }
+            }
 
             let plan = SelectPlan {
                 join_order: vec![],

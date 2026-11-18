@@ -150,6 +150,12 @@ fn translate_expr_by_kind(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    // Some expressions are compiled without being bound first, such as a
+    // generated column's or an UPSERT's `excluded.ts`, so the check that
+    // binding does runs here as well.
+    if !resolver.schema().type_registry.is_empty() {
+        check_only_stored_and_compared(expr, &ExprContext::new(referenced_tables, resolver))?;
+    }
     match expr {
         ast::Expr::SubqueryResult { .. } => translate_subquery_result_expr(
             program,

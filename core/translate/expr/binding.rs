@@ -1,4 +1,5 @@
 use super::*;
+use crate::function::AggFunc;
 use crate::namespace::NamespaceRef;
 use crate::schema::{
     SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME, TEMP_SCHEMA_TABLE_NAME_ALT,
@@ -632,12 +633,14 @@ pub fn bind_and_rewrite_expr_except<'a>(
     check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 
-/// Fails when `expr` uses an operator that no function of its operands' types
-/// runs, such as `d * 2` for a date d, applies a COLLATE to a type that takes
-/// none, or compares two types with different orders. This runs on every
-/// expression a statement binds, so it also catches what the planner never
-/// compiles, as in `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are
-/// bound only once the binding walk is done, so these are further walks.
+/// Fails when `expr` uses a value of a type that can only be stored and
+/// compared other than that way, as in `ts + 1` for a timestamp ts, uses an
+/// operator that no function of its operands' types runs, such as `d * 2` for
+/// a date d, applies a COLLATE to a type that takes none, or compares two
+/// types with different orders. This runs on every expression a statement
+/// binds, so it also catches what the planner never compiles, as in `WHERE 0
+/// AND d COLLATE nocase = 'x'`. The operands are bound only once the binding
+/// walk is done, so these are further walks.
 pub(crate) fn check_custom_types(
     expr: &ast::Expr,
     tables: Option<&TableReferences>,
@@ -650,7 +653,13 @@ pub(crate) fn check_custom_types(
         return Ok(());
     }
     let context = ExprContext::new(tables, resolver);
-    // Operators first: `(d * 2) COLLATE nocase` fails because `*` does not
+    // First, so that `ts - ts` is refused as a use of a timestamp, rather
+    // than failing because no function runs `-` for two timestamps.
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        check_only_stored_and_compared(expr, &context)?;
+        Ok(WalkControl::Continue)
+    })?;
+    // Operators next: `(d * 2) COLLATE nocase` fails because `*` does not
     // exist for a date, not because its result has no type.
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         check_custom_operator(expr, &context.type_env())?;
@@ -660,6 +669,167 @@ pub(crate) fn check_custom_types(
         check_expr_collation(expr, &context)?;
         Ok(WalkControl::Continue)
     })?;
+    Ok(())
+}
+
+/// Fails when an operand of `expr` has a type whose values can only be
+/// stored and compared (see `TypeDef::only_stored_and_compared`), such as
+/// timestamptz, and `expr` is not one of those uses: `ts + 1`, `coalesce(ts,
+/// x)` and `length(ts)` fail, `ts < $1`, `ts IS NULL`, `max(ts)` and
+/// `ts::text` don't. Which types a comparison accepts is checked where its
+/// order is decided (`check_compared_with_own_type`). `expr` itself is an
+/// operand of the expression around it, so a value of the type can be a
+/// whole result column, ORDER BY key or stored value.
+pub(crate) fn check_only_stored_and_compared(
+    expr: &ast::Expr,
+    context: &ExprContext,
+) -> Result<()> {
+    let refuse = |operand: &ast::Expr, place: &dyn Fn() -> String| -> Result<()> {
+        let ty = type_of(operand, &context.type_env());
+        match ty.only_stored_and_compared_type(context.schema())? {
+            Some(_) => crate::bail_parse_error!("using type {ty} in {} is not supported", place()),
+            None => Ok(()),
+        }
+    };
+    match expr {
+        Expr::Binary(_, op, _) if op.is_comparison() => Ok(()),
+        Expr::Between { .. }
+        | Expr::InList { .. }
+        | Expr::InSelect { .. }
+        | Expr::SubqueryResult { .. }
+        | Expr::IsNull(_)
+        | Expr::NotNull(_)
+        // The value of a column that a USING join merges.
+        | Expr::MergedColumn(_) => Ok(()),
+        Expr::Binary(lhs, op, rhs) => {
+            refuse(lhs, &|| format!("operator {op}"))?;
+            refuse(rhs, &|| format!("operator {op}"))
+        }
+        Expr::Unary(op, operand) => refuse(operand, &|| format!("operator {op}")),
+        // LIKE, GLOB, REGEXP and MATCH all match a pattern.
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            let place = || "a pattern match".to_string();
+            refuse(lhs, &place)?;
+            refuse(rhs, &place)?;
+            escape
+                .iter()
+                .try_for_each(|escape| refuse(escape, &place))
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            let place = || "CASE".to_string();
+            let pairs = when_then_pairs
+                .iter()
+                .flat_map(|(when, then)| [when.as_ref(), then.as_ref()]);
+            base.iter()
+                .map(|base| base.as_ref())
+                .chain(pairs)
+                .chain(else_expr.iter().map(|else_expr| else_expr.as_ref()))
+                .try_for_each(|operand| refuse(operand, &place))
+        }
+        // A cast to text, as in `ts::text`, or between timestamp and
+        // timestamptz.
+        Expr::Cast { expr: operand, .. } => {
+            let target = type_of(expr, &context.type_env());
+            let allowed = match &target {
+                ExprType::Builtin(BuiltinType::Text) => true,
+                ExprType::Custom { .. } => target
+                    .only_stored_and_compared_type(context.schema())?
+                    .is_some(),
+                _ => false,
+            };
+            if allowed {
+                return Ok(());
+            }
+            refuse(operand, &|| format!("a cast to {target}"))
+        }
+        Expr::Collate(operand, _) => refuse(operand, &|| "COLLATE".to_string()),
+        // `(ts)` is the value itself; `(ts, 1)` is a row value.
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => Ok(()),
+        Expr::Parenthesized(exprs) => exprs
+            .iter()
+            .try_for_each(|operand| refuse(operand, &|| "a row value".to_string())),
+        Expr::FunctionCall {
+            name,
+            args,
+            within_group,
+            filter_over,
+            ..
+        } => {
+            let func = context
+                .catalog()
+                .resolve_function(name.as_str(), args.len())?;
+            let takes_the_type = args.len() == 1
+                && matches!(
+                    func,
+                    Some(Func::Agg(AggFunc::Min | AggFunc::Max | AggFunc::Count))
+                );
+            if !takes_the_type {
+                args.iter()
+                    .try_for_each(|arg| refuse(arg, &|| format!("function {name}()")))?;
+            }
+            within_group
+                .iter()
+                .try_for_each(|key| refuse(&key.expr, &|| "WITHIN GROUP".to_string()))?;
+            check_function_tail(filter_over, &refuse)
+        }
+        Expr::FunctionCallStar { filter_over, .. } => check_function_tail(filter_over, &refuse),
+        Expr::InTable { rhs, args, .. } => args
+            .iter()
+            .try_for_each(|arg| refuse(arg, &|| format!("function {}()", rhs.name))),
+        Expr::Raise(_, operand) => operand
+            .iter()
+            .try_for_each(|operand| refuse(operand, &|| "RAISE".to_string())),
+        Expr::FieldAccess { base, .. } => refuse(base, &|| "a field access".to_string()),
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+        Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::Id(_)
+        | Expr::Column { .. }
+        | Expr::RowId { .. }
+        | Expr::Literal(_)
+        | Expr::DoublyQualified(..)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_)
+        | Expr::Register { .. }
+        | Expr::Default => Ok(()),
+    }
+}
+
+/// Fails when an operand has a type whose values can only be stored and
+/// compared. The second argument names the place for the error message.
+type RefuseUse<'a> = dyn Fn(&ast::Expr, &dyn Fn() -> String) -> Result<()> + 'a;
+
+/// [check_only_stored_and_compared] for a function's FILTER and window
+/// frame. A window's PARTITION BY and ORDER BY keys may have the type.
+fn check_function_tail(tail: &ast::FunctionTail, refuse: &RefuseUse) -> Result<()> {
+    if let Some(filter) = &tail.filter_clause {
+        refuse(filter, &|| "FILTER".to_string())?;
+    }
+    let Some(ast::Over::Window(window)) = tail.over_clause.as_deref() else {
+        return Ok(());
+    };
+    let Some(frame) = &window.frame_clause else {
+        return Ok(());
+    };
+    for bound in std::iter::once(&frame.start).chain(frame.end.as_ref()) {
+        match bound {
+            ast::FrameBound::Preceding(offset) | ast::FrameBound::Following(offset) => {
+                refuse(offset, &|| "a window frame".to_string())?
+            }
+            ast::FrameBound::CurrentRow
+            | ast::FrameBound::UnboundedPreceding
+            | ast::FrameBound::UnboundedFollowing => {}
+        }
+    }
     Ok(())
 }
 

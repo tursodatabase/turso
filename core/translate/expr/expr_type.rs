@@ -144,6 +144,21 @@ impl ExprType {
             _ => 0,
         }
     }
+
+    /// The custom type whose values can only be stored and compared (see
+    /// `TypeDef::only_stored_and_compared`), such as timestamptz, when this is
+    /// that type or a domain over it.
+    pub(crate) fn only_stored_and_compared_type(
+        &self,
+        schema: &Schema,
+    ) -> Result<Option<Arc<TypeDef>>> {
+        let Self::Custom { type_def, .. } = self else {
+            return Ok(None);
+        };
+        Ok(schema
+            .without_domains(type_def)?
+            .filter(|base| base.only_stored_and_compared))
+    }
 }
 
 /// The type's name for an error message, as a column declares it: `date`,
@@ -624,14 +639,23 @@ pub(crate) fn compound_column_type<'p>(
     )
 }
 
-fn select_column_type(select: &SelectPlan, column: usize, resolver: &Resolver) -> ExprType {
-    match select.result_columns.get(column) {
-        Some(result_column) => type_of(
-            &result_column.expr,
-            &TypeEnv::new(Some(&select.table_references), resolver),
-        ),
-        None => ExprType::Unknown,
+/// The type of column `column` of `select`. For a VALUES list it is the
+/// common type of the column in every row, except for arrays.
+pub(crate) fn select_column_type(
+    select: &SelectPlan,
+    column: usize,
+    resolver: &Resolver,
+) -> ExprType {
+    let Some(result_column) = select.result_columns.get(column) else {
+        return ExprType::Unknown;
+    };
+    let env = TypeEnv::new(Some(&select.table_references), resolver);
+    let column_type = common_type(select.column_exprs(column), &env);
+    // A column typed as an array is decoded to text before an outer query reads it (#9203).
+    if !select.values.is_empty() && column_type.is_array() {
+        return type_of(&result_column.expr, &env);
     }
+    column_type
 }
 
 /// The type of a column of a table or of the table being written. Derived
