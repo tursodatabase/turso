@@ -673,8 +673,9 @@ mod tests {
             .contains("expected an array, but the value is not an array");
     }
 
-    /// CREATE TABLE refuses varchar(2,3), but a database may already have such
-    /// a column. Writing to it must fail, not apply varchar(2).
+    /// CREATE TABLE refuses varchar(2,3), but loading a schema does not check
+    /// type arguments (#12012). Writing to such a column must fail, not apply
+    /// varchar(2).
     #[test]
     fn test_write_to_column_with_too_many_type_arguments_fails() {
         let temp_dir = TempDir::new().unwrap();
@@ -699,7 +700,7 @@ mod tests {
         assert_that!(conn.execute("INSERT INTO t VALUES ('ab')"))
             .err()
             .display_string()
-            .contains("type \"varchar\" takes 1 argument(s), got 2");
+            .contains("type \"varchar\" requires 1 parameter(s), got 2");
     }
 
     /// After reopening, schema changes (CREATE TABLE) that use a previously

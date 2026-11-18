@@ -861,14 +861,7 @@ pub(crate) fn check_column_type(
             type_name
         );
     };
-    // A type with parameters besides `value` needs each one given, as in `p(10)`.
-    if td.type_args(col_type)?.is_none() {
-        bail_parse_error!(
-            "type \"{}\" requires {} parameter(s), got 0",
-            td.name,
-            td.user_params().count()
-        );
-    }
+    td.type_args(col_type)?;
     Ok(())
 }
 

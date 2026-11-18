@@ -773,15 +773,9 @@ fn emit_coerce(
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
-    // CREATE TABLE and CAST refuse other counts (see TypeDef::type_args).
-    let param_count = type_def.user_params().count();
-    if type_params.len() != param_count {
-        return Err(LimboError::InternalError(format!(
-            "type \"{}\" takes {param_count} argument(s), got {}",
-            type_def.name,
-            type_params.len()
-        )));
-    }
+    // Loading a schema does not check a column's type arguments (#12012), so
+    // a column can have a count CREATE TABLE refuses.
+    type_def.check_type_arg_count(type_params.len())?;
     let bindings: Vec<(&str, &ast::Expr)> = type_def
         .user_params()
         .zip(type_params)

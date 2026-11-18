@@ -779,10 +779,11 @@ pub(crate) fn check_cast_type_args(expr: &ast::Expr, schema: &Schema) -> Result<
             ..
         } = expr
         {
-            // A name no custom type has is SQLite's CAST, which takes any
-            // arguments.
-            if let Some(type_def) =
-                schema.get_type_def_unchecked(&crate::util::dequote(&type_name.name))
+            // SQLite's CAST takes any arguments: a CAST to a name no custom
+            // type has, and CAST(x AS NUMERIC) (see TypeDef::is_sqlite_type).
+            if let Some(type_def) = schema
+                .get_type_def_unchecked(&crate::util::dequote(&type_name.name))
+                .filter(|type_def| !type_def.is_sqlite_type(type_name))
             {
                 type_def.type_args(type_name)?;
             }

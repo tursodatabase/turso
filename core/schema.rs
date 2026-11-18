@@ -988,24 +988,24 @@ impl TypeDef {
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
     }
 
-    /// The arguments `type_name`, a use of this type, gives the type's
-    /// parameters: `10, 2` in `numeric(10, 2)`, and none for a type without
-    /// parameters. None for a use that is SQLite's type (see
-    /// [Self::is_sqlite_type]). Any other number of arguments is an error.
-    /// PostgreSQL gives a modifier on some types without parameters a meaning
-    /// Turso does not implement, such as the precision in `timestamp(3)`.
+    /// The arguments written after the name in `type_name`, a use of this
+    /// type: `10, 2` in `numeric(10, 2)`. Fails unless there is one for each
+    /// of the type's parameters.
     #[allow(clippy::vec_box)]
-    pub fn type_args(
-        &self,
-        type_name: &ast::Type,
-    ) -> Result<Option<std::vec::Vec<Box<ast::Expr>>>> {
-        if self.is_sqlite_type(type_name) {
-            return Ok(None);
-        }
+    pub fn type_args(&self, type_name: &ast::Type) -> Result<std::vec::Vec<Box<ast::Expr>>> {
         let args = written_type_args(type_name);
+        self.check_type_arg_count(args.len())?;
+        Ok(args)
+    }
+
+    /// Fails unless `count` arguments give each of this type's parameters a
+    /// value. PostgreSQL gives a modifier on some types without parameters a
+    /// meaning Turso does not implement, such as the precision in
+    /// `timestamp(3)`.
+    pub fn check_type_arg_count(&self, count: usize) -> Result<()> {
         let param_count = self.user_params().count();
-        if args.len() == param_count {
-            return Ok(Some(args));
+        if count == param_count {
+            return Ok(());
         }
         if param_count == 0 {
             return Err(LimboError::NotSupported(format!(
@@ -1015,15 +1015,13 @@ impl TypeDef {
         }
         Err(LimboError::ParseError(format!(
             "type \"{}\" requires {} parameter(s), got {}",
-            self.name,
-            param_count,
-            args.len()
+            self.name, param_count, count
         )))
     }
 
-    /// Whether `type_name`, a use of this type, names SQLite's type of the
-    /// same name rather than this one: the type has parameters and the use
-    /// gives no arguments, as `CAST(x AS NUMERIC)` does.
+    /// Whether a CAST to `type_name` is SQLite's CAST rather than a CAST to
+    /// this type: the type has parameters and the CAST gives no arguments, as
+    /// `CAST(x AS NUMERIC)` does.
     pub fn is_sqlite_type(&self, type_name: &ast::Type) -> bool {
         type_name.size.is_none() && self.user_params().next().is_some()
     }

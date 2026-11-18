@@ -965,9 +965,10 @@ fn custom_type_cast_chain(
     };
     // A CAST that gives no arguments to a type that takes some is SQLite's
     // CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
-    let Some(args) = resolved.leaf().type_args(type_name)? else {
+    if resolved.leaf().is_sqlite_type(type_name) {
         return Ok(None);
-    };
+    }
+    let args = resolved.leaf().type_args(type_name)?;
     if !resolved.is_domain() {
         resolved.chain.truncate(1);
     }

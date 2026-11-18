@@ -848,3 +848,16 @@ test varchar-cast-with-too-many-arguments-in-domain-check-is-refused {
 expect error {
     type "varchar" requires 1 parameter\(s\), got 2
 }
+
+@requires strict "uses STRICT tables"
+test domain-over-numeric-without-arguments-has-no-limits {
+    -- numeric with no arguments takes any precision and scale, as in
+    -- PostgreSQL.
+    CREATE DOMAIN d AS numeric;
+    CREATE TABLE t(x d) STRICT;
+    INSERT INTO t VALUES (1.555);
+    SELECT CAST(1.555 AS d), x FROM t;
+}
+expect {
+    1.555|1.555
+}
