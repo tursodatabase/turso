@@ -5231,6 +5231,56 @@ mod tests {
     }
 
     #[test]
+    fn views_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            let attached = Database::open(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                turso_core::OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect))
+                    .db_opts(crate::DatabaseOpts::new().with_mvcc(true)),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE VIEW existing AS SELECT 1 AS one")
+                .unwrap();
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "CREATE VIEW aux.added AS SELECT 2 AS two",
+            "DROP VIEW aux.existing",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+        assert_eq!(
+            conn.prepare("SELECT name FROM aux.sqlite_schema WHERE type = 'view'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::build_text("existing")]]
+        );
+    }
+
+    #[test]
 
     fn test_pg_namespace_query() {
         let temp_dir = tempdir().unwrap();
