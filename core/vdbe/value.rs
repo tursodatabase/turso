@@ -610,6 +610,11 @@ impl Value {
                     let char_count = s.chars().count();
                     let (mut start, mut end) =
                         calculate_postions(start, char_count, length_value.as_ref());
+                    if char_count == s.len() {
+                        // Each character is one byte, so the character positions are
+                        // the byte positions.
+                        return Ok(Value::build_text(s[start..end].to_string()));
+                    }
 
                     // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
                     let mut start_byte_idx = 0;
@@ -3628,6 +3633,25 @@ mod tests {
                 .unwrap(),
             Value::build_text("limbo")
         );
+    }
+
+    #[test]
+    fn substring_of_ascii_text_takes_the_same_characters_as_of_utf8_text() {
+        let ascii = Value::build_text("hello");
+        let utf8 = Value::build_text("h\u{e9}llo");
+        let lengths = std::iter::once(None).chain((-7..=7).map(|l| Some(Value::from_i64(l))));
+        for length in lengths {
+            for start in -7..=7 {
+                let start = Value::from_i64(start);
+                let of_ascii = allocated(Value::exec_substring(&ascii, &start, length.as_ref()));
+                let of_utf8 = allocated(Value::exec_substring(&utf8, &start, length.as_ref()));
+                let expected = match of_ascii {
+                    Value::Text(text) => Value::build_text(text.as_str().replace('e', "\u{e9}")),
+                    other => other,
+                };
+                assert_eq!(expected, of_utf8, "start {start:?}, length {length:?}");
+            }
+        }
     }
 
     #[test]
