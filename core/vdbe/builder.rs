@@ -1147,6 +1147,17 @@ impl ProgramBuilder {
             .reserve(opts.approx_num_labels);
     }
 
+    /// Make room for at least `additional` more instructions. The capacity
+    /// grows to a power of two, as repeated doubling of the `Vec` would make
+    /// it, but the instructions are copied only once.
+    pub fn reserve_insns(&mut self, additional: usize) {
+        let needed = self.insns.len() + additional;
+        if needed > self.insns.capacity() {
+            self.insns
+                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+        }
+    }
+
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
     pub fn constant_span_start(&mut self) -> usize {
