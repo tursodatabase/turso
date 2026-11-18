@@ -342,6 +342,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
     {
         let conn = &self.conn;
         let query = &portal.statement.statement;
+        if has_no_statements(query)? {
+            return Ok(Response::EmptyQuery);
+        }
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
@@ -367,6 +370,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
+        if has_no_statements(&target.statement)? {
+            return Ok(DescribeStatementResponse::new(vec![], vec![]));
+        }
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
@@ -388,6 +394,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
+        if has_no_statements(&portal.statement.statement)? {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
@@ -395,6 +404,15 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let fields = describe_fields(&stmt, &portal.result_column_format)?;
         Ok(DescribePortalResponse::new(fields))
     }
+}
+
+/// Whether `sql` holds only whitespace, semicolons and comments. PostgreSQL
+/// answers Describe of such a query with NoData and Execute with
+/// EmptyQueryResponse, not an error.
+fn has_no_statements(sql: &str) -> PgWireResult<bool> {
+    let statements = turso_pg_parser::split_statements(sql)
+        .map_err(|error| pg_error(sql_parse_error(error).into()))?;
+    Ok(statements.is_empty())
 }
 
 /// The fields of an ordinary result set, or none for commands and COPY.
@@ -1530,6 +1548,39 @@ mod tests {
         assert_refused(&events, b'E');
         let events = client.simple_query("COMMIT").unwrap();
         assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "ROLLBACK"));
+    }
+
+    #[test]
+    fn an_empty_extended_query_keeps_the_transaction_block() {
+        let (mut client, _conn) = copy_test_client();
+        client.simple_query("CREATE TABLE q (i int)").unwrap();
+        client.simple_query("BEGIN").unwrap();
+        client.simple_query("INSERT INTO q VALUES (1)").unwrap();
+        for sql in ["", ";", "-- c", "/* c */"] {
+            // Parse, Describe statement, Bind, Describe portal, Execute, Sync.
+            let mut parse = vec![0];
+            parse.extend_from_slice(sql.as_bytes());
+            parse.extend_from_slice(b"\0\0\0");
+            client.write_message(b'P', &parse).unwrap();
+            client.write_message(b'D', b"S\0").unwrap();
+            client.write_message(b'B', b"\0\0\0\0\0\0\0\0").unwrap();
+            client.write_message(b'D', b"P\0").unwrap();
+            client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+            client.write_message(b'S', b"").unwrap();
+            let mut events = Vec::new();
+            while !matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))) {
+                events.push(client.read_event().unwrap());
+            }
+            // ParseComplete, ParameterDescription, NoData, BindComplete, NoData.
+            let [BackendEvent::Other(b'1'), BackendEvent::Other(b't'), BackendEvent::Other(b'n'), BackendEvent::Other(b'2'), BackendEvent::Other(b'n'), BackendEvent::EmptyQueryResponse, BackendEvent::ReadyForQuery(b'T')] =
+                &events[..]
+            else {
+                panic!("{sql:?}: {events:?}");
+            };
+        }
+        let events = client.simple_query("COMMIT").unwrap();
+        assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "COMMIT"));
+        assert_row_count(&mut client, "q", "1");
     }
 
     // 3000000000 doesn't fit the int4 column, so the second row is refused
