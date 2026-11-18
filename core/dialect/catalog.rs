@@ -169,6 +169,8 @@ pub enum CatalogWrite<'a> {
     AlterColumn(AlterColumn<'a>),
     /// `ALTER TABLE ... ADD COLUMN`.
     AddColumn(AddColumn<'a>),
+    /// `ALTER TABLE ... DROP COLUMN`.
+    DropColumn(DropColumn<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -453,6 +455,23 @@ pub struct AddColumn<'a> {
     pub name: &'a str,
     /// The table with the new column, and with the constraints and foreign
     /// keys that the column's definition adds.
+    pub table: &'a BTreeTable,
+    /// The text of the statement, for change data capture.
+    pub statement: &'a str,
+}
+
+/// A table that loses a column. The statement rewrites the rows of the
+/// table and drops the sequences that the column owns after the catalog has
+/// written.
+#[derive(Debug, Clone, Copy)]
+pub struct DropColumn<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table.
+    pub name: &'a str,
+    /// The normalized name of the dropped column.
+    pub column: &'a str,
+    /// The table without the column.
     pub table: &'a BTreeTable,
     /// The text of the statement, for change data capture.
     pub statement: &'a str,

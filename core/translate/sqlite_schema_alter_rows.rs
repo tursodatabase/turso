@@ -2,13 +2,13 @@
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
 use crate::dialect::catalog::{
-    AddColumn, AfterWrites, AlterColumn, RenameColumn, RenameTable, WriteContext,
+    AddColumn, AfterWrites, AlterColumn, DropColumn, RenameColumn, RenameTable, WriteContext,
 };
 use crate::function::{AlterTableFunc, Func, FuncCtx};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::alter::{database_uses_mvcc, schema_table_name_for_db};
+use crate::translate::alter::database_uses_mvcc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::SQLITE_TABLEID;
@@ -193,6 +193,23 @@ pub(super) fn emit_add_column_rows(
     program: &mut ProgramBuilder,
     ctx: &WriteContext<'_>,
     column: &AddColumn<'_>,
+) -> Result<AfterWrites> {
+    emit_update_of_table_sql(
+        program,
+        ctx,
+        column.namespace,
+        column.name,
+        column.table,
+        column.statement,
+    )?;
+    Ok(AfterWrites::none())
+}
+
+/// Stores the `CREATE TABLE` text of a table without its dropped column.
+pub(super) fn emit_drop_column_rows(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    column: &DropColumn<'_>,
 ) -> Result<AfterWrites> {
     emit_update_of_table_sql(
         program,
@@ -566,4 +583,19 @@ struct StoredSqlUpdate<'a> {
     new_tbl_name: Option<&'a str>,
     /// The text of the `ALTER TABLE` statement, for change data capture.
     statement: &'a str,
+}
+
+/// The name of `sqlite_schema` in SQL text, qualified with the database
+/// name for the temp database and for an attached one.
+fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
+    if database_id == crate::MAIN_DB_ID {
+        SQLITE_TABLEID.to_string()
+    } else if database_id == crate::TEMP_DB_ID {
+        format!("temp.{SQLITE_TABLEID}")
+    } else {
+        let db_name = resolver
+            .namespace_name(database_id)
+            .unwrap_or_else(|| "main".to_string());
+        format!("{db_name}.{SQLITE_TABLEID}")
+    }
 }

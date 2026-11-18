@@ -19,6 +19,7 @@ pub mod engine;
 pub use crate::translate::sqlite_schema_rows::SqliteCatalog;
 pub use catalog::AddColumn;
 pub use catalog::AlterColumn;
+pub use catalog::DropColumn;
 pub use catalog::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
     CreateMaterializedView, CreateTable, CreateView, DropIndex, DropView, NewOwner, OwnerColumn,
