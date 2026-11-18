@@ -47,6 +47,7 @@ pub struct WriteContext<'a> {
     sqlite_schema_cursor: Cell<Option<usize>>,
     /// A cursor for `sqlite_schema` that has a number and is not open yet.
     unopened_sqlite_schema_cursor: Cell<Option<usize>>,
+    sqlite_schema_rowid_reg: Cell<Option<usize>>,
 }
 
 impl<'a> WriteContext<'a> {
@@ -68,6 +69,7 @@ impl<'a> WriteContext<'a> {
             resolver,
             sqlite_schema_cursor: Cell::new(None),
             unopened_sqlite_schema_cursor: Cell::new(None),
+            sqlite_schema_rowid_reg: Cell::new(None),
         }
     }
 
@@ -105,6 +107,17 @@ impl<'a> WriteContext<'a> {
     pub(crate) fn open_sqlite_schema_cursor(&self) -> Option<usize> {
         self.sqlite_schema_cursor.get()
     }
+
+    /// The statement's register for the rowid of a `sqlite_schema` row it
+    /// deletes. The first call allocates it.
+    pub(crate) fn sqlite_schema_rowid_reg(&self, program: &mut ProgramBuilder) -> usize {
+        if let Some(reg) = self.sqlite_schema_rowid_reg.get() {
+            return reg;
+        }
+        let reg = program.alloc_register();
+        self.sqlite_schema_rowid_reg.set(Some(reg));
+        reg
+    }
 }
 
 /// Who runs a DDL statement.
@@ -139,6 +152,8 @@ pub enum CatalogWrite<'a> {
     CreateView(CreateView<'a>),
     /// `CREATE MATERIALIZED VIEW`, before its rows are computed.
     CreateMaterializedView(CreateMaterializedView<'a>),
+    /// `DROP VIEW` of a view or a materialized view.
+    DropView(DropView<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -292,6 +307,17 @@ pub struct CreateMaterializedView<'a> {
     /// Register that holds the root page of the B-tree with the view's
     /// rows.
     pub root_reg: usize,
+}
+
+/// A view or materialized view that the statement drops. The statement
+/// destroys the B-trees of a materialized view and removes the engine
+/// tables with the state of its maintenance itself.
+#[derive(Debug, Clone, Copy)]
+pub struct DropView<'a> {
+    /// The namespace of the view in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the view in its namespace.
+    pub name: &'a str,
 }
 
 /// What a statement emits after all of its schema writes, so that the
