@@ -1,7 +1,8 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::catalog::{
-    AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateTable, TableText, WriteContext,
+    AfterWrites, Catalog, CatalogWrite, CreateIndex, CreateTable, DropIndex, TableText,
+    WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -36,6 +37,7 @@ impl Catalog for SqliteCatalog {
         match change {
             CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
             CatalogWrite::CreateIndex(index) => emit_create_index_row(program, ctx, index),
+            CatalogWrite::DropIndex(index) => emit_delete_index_row(program, ctx, index),
         }
     }
 }
@@ -165,20 +167,31 @@ fn emit_create_index_row(
 }
 
 /// Deletes the row of an index.
-pub(crate) fn emit_delete_index_row(
+fn emit_delete_index_row(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    namespace: NamespaceRef,
-    index_name: &str,
-    cdc_table: Option<(usize, Arc<BTreeTable>)>,
-) -> Result<()> {
+    ctx: &WriteContext<'_>,
+    index: &DropIndex<'_>,
+) -> Result<AfterWrites> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: index.namespace,
+    };
+
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+
     // According to sqlite should emit Null instruction
     // but why?
     let null_reg = program.alloc_register();
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, index_name));
+    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, index.name));
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 
@@ -190,8 +203,7 @@ pub(crate) fn emit_delete_index_row(
         .schema()
         .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
-    let sqlite_schema_cursor_id =
-        open_sqlite_schema_for_write(program, resolver, namespace.database_id);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
 
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
@@ -283,7 +295,7 @@ pub(crate) fn emit_delete_index_row(
         emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
     }
 
-    Ok(())
+    Ok(AfterWrites::none())
 }
 
 /// Gives a cursor for writing `sqlite_schema` of the given database its

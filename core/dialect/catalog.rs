@@ -126,6 +126,8 @@ pub enum CatalogWrite<'a> {
     CreateTable(CreateTable<'a>),
     /// `CREATE INDEX`, before the index is filled.
     CreateIndex(CreateIndex<'a>),
+    /// `DROP INDEX`, before the index's B-tree is destroyed.
+    DropIndex(DropIndex<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -194,6 +196,15 @@ pub struct CreateIndex<'a> {
     /// Register that holds the root page of the index's B-tree, or 0 for an
     /// index whose index method stores it elsewhere.
     pub root_reg: usize,
+}
+
+/// An index that the statement removes from the schema in memory itself.
+#[derive(Debug, Clone, Copy)]
+pub struct DropIndex<'a> {
+    /// The namespace of the index in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the index in its namespace.
+    pub name: &'a str,
 }
 
 /// What a statement emits after all of its schema writes, so that the
