@@ -723,7 +723,7 @@ pub(crate) fn emit_backing_table_compaction(
 ///
 /// Returns `Ok(false)` and emits nothing if the `sqlite_sequence`
 /// table does not exist in this database — the schema-bootstrap path
-/// in `translate/schema.rs` creates it lazily on first need; until
+/// in `translate/schema/mod.rs` creates it lazily on first need; until
 /// then no AUTOINCREMENT activity is possible so there is nothing to
 /// sync.
 pub(crate) fn emit_sqlite_sequence_sync(
