@@ -20,6 +20,7 @@ enum TemporalType {
     Time,
     Timestamp,
     Timestamptz,
+    Timetz,
 }
 
 impl TemporalType {
@@ -30,6 +31,7 @@ impl TemporalType {
             Self::Time => "time",
             Self::Timestamp => "timestamp",
             Self::Timestamptz => "timestamp with time zone",
+            Self::Timetz => "time with time zone",
         }
     }
 }
@@ -45,6 +47,7 @@ pub fn exec_temporal_encode(value: &Value, type_name: &Value) -> Result<Value> {
         Some("time") => TemporalType::Time,
         Some("timestamp") => TemporalType::Timestamp,
         Some("timestamptz") => TemporalType::Timestamptz,
+        Some("timetz") => TemporalType::Timetz,
         _ => {
             return Err(LimboError::InvalidArgument(format!(
                 "temporal_encode: unknown type {type_name}"
@@ -229,6 +232,11 @@ impl Fields {
         };
         let (date, ty) = match (date, ty) {
             (_, TemporalType::Time) => {
+                let mut out = String::new();
+                push_time(&mut out, time);
+                return Ok(out);
+            }
+            (_, TemporalType::Timetz) => {
                 let mut out = String::new();
                 push_time(&mut out, time);
                 return Ok(out);

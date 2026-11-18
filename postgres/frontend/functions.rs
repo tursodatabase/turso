@@ -1,17 +1,18 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
-use crate::error::sqlstate_error;
+use crate::error::{sql_parse_error, sqlstate_error};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
+use turso_pg_parser::ParseError;
 
 use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    array_values_from_any, exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError,
+    Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
@@ -99,7 +100,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             exec_to_char(args[0].get_value(), &text_arg(args, 1))
         },
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
-            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
+            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))?
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -1275,13 +1276,17 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
+fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Result<Option<Boolean>> {
     let s = match input {
         Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return None,
+        Value::Null => return Ok(None),
         v => v.to_string(),
     };
-    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
+    match validate_pg_input(&s, type_name) {
+        Ok(None) => Ok(Some(Boolean(true))),
+        Ok(Some(_)) => Ok(Some(Boolean(false))),
+        Err(error) => Err(sql_parse_error(error)),
+    }
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
@@ -1328,10 +1333,19 @@ fn pg_type_name(value: &Value) -> &'static str {
 
 /// Validate input for a PostgreSQL type, returning error info if invalid.
 ///
-/// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
+/// Returns `Ok(None)` for valid input, or `Ok(Some((message, sql_error_code)))` for invalid input.
 /// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
-pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
+pub(crate) fn validate_pg_input(
+    input: &str,
+    type_name: &str,
+) -> Result<Option<(String, String)>, ParseError> {
     let trimmed = input.trim();
+
+    let error =
+        |sqlstate: &'static str, message: String| ParseError::Sqlstate { sqlstate, message };
+    let invalid = |sqlstate: &'static str, message: String| {
+        Ok::<_, ParseError>(Some((message, sqlstate.to_string())))
+    };
 
     // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
     let (base_type, type_mod) = match type_name.find('(') {
@@ -1347,152 +1361,162 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
     match base_type.as_str() {
         "bool" | "boolean" => {
             if parse_pg_bool(trimmed).is_some() {
-                None
+                Ok(None)
             } else {
-                Some((
+                invalid(
+                    "22P02",
                     format!("invalid input syntax for type boolean: \"{input}\""),
-                    "22P02".to_string(),
-                ))
+                )
             }
         }
         "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
+            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => invalid(
+                "22003",
                 format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
+            ),
+            Ok(_) => Ok(None),
+            Err(_) => invalid(
+                "22P02",
                 format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
+            ),
         },
         "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
+            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => invalid(
+                "22003",
                 format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
+            ),
+            Ok(_) => Ok(None),
+            Err(_) => invalid(
+                "22P02",
                 format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
+            ),
         },
         "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
+            Ok(_) => Ok(None),
             Err(_) => {
                 if trimmed.parse::<i128>().is_ok() {
-                    Some((
+                    invalid(
+                        "22003",
                         format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
+                    )
                 } else {
-                    Some((
+                    invalid(
+                        "22P02",
                         format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
+                    )
                 }
             }
         },
         "float4" | "real" => match trimmed.parse::<f32>() {
-            Ok(v) if v.is_infinite() => Some((
+            Ok(v) if v.is_infinite() => invalid(
+                "22003",
                 format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
+            ),
+            Ok(_) => Ok(None),
+            Err(_) => invalid(
+                "22P02",
                 format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
-            )),
+            ),
         },
         "float8" | "double precision" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_infinite() => Some((
+            Ok(v) if v.is_infinite() => invalid(
+                "22003",
                 format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
+            ),
+            Ok(_) => Ok(None),
+            Err(_) => invalid(
+                "22P02",
                 format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
-            )),
+            ),
         },
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_nan() || v.is_infinite() => Some((
+            Ok(v) if v.is_nan() || v.is_infinite() => invalid(
+                "22003",
                 format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
+            ),
+            Ok(_) => Ok(None),
+            Err(_) => invalid(
+                "22P02",
                 format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
-            )),
+            ),
         },
-        "text" => None,
+        "int2[]" | "smallint[]" => check_array_input(input, "smallint"),
+        "int4[]" | "integer[]" | "int[]" => check_array_input(input, "integer"),
+        "int8[]" | "bigint[]" => check_array_input(input, "bigint"),
+        "float4[]" | "real[]" => check_array_input(input, "real"),
+        "float8[]" | "double precision[]" => check_array_input(input, "double precision"),
+        "text" => Ok(None),
         "varchar" | "character varying" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
-                    return Some((
+                    return invalid(
+                        "22001",
                         format!("value too long for type character varying({max_len})"),
-                        "22001".to_string(),
-                    ));
+                    );
                 }
             }
-            None
+            Ok(None)
         }
         "char" | "character" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
-                    return Some((
+                    return invalid(
+                        "22001",
                         format!("value too long for type character({max_len})"),
-                        "22001".to_string(),
-                    ));
+                    );
                 }
             }
-            None
+            Ok(None)
         }
         "uuid" => {
             let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
             if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                Some((
+                invalid(
+                    "22P02",
                     format!("invalid input syntax for type uuid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
+                )
             } else {
-                None
+                Ok(None)
             }
         }
-        "date" => check_temporal_input(input, "date"),
-        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
-        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
-        "time" | "time without time zone" => check_temporal_input(input, "time"),
+        "date" => Ok(check_temporal_input(input, "date")),
+        "timestamp" | "timestamp without time zone" => Ok(check_temporal_input(input, "timestamp")),
+        "timestamptz" | "timestamp with time zone" => {
+            Ok(check_temporal_input(input, "timestamptz"))
+        }
+        "time" | "time without time zone" => Ok(check_temporal_input(input, "time")),
+        "timetz" | "time with time zone" => Ok(check_temporal_input(input, "timetz")),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
-                None
+                Ok(None)
             } else {
                 let type_label = if base_type == "jsonb" {
                     "jsonb"
                 } else {
                     "json"
                 };
-                Some((
+                invalid(
+                    "22P02",
                     format!("invalid input syntax for type {type_label}: \"{input}\""),
-                    "22P02".to_string(),
-                ))
+                )
             }
         }
+        "interval" => Ok(None),
+        "point" => Ok(None),
         "bytea" => {
             // Accept \x hex format
             if let Some(hex) = trimmed.strip_prefix("\\x") {
                 if hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    None
+                    Ok(None)
                 } else {
-                    Some((
+                    invalid(
+                        "22P02",
                         format!("invalid input syntax for type bytea: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
+                    )
                 }
             } else {
                 // Plain text is valid bytea input (escape format)
-                None
+                Ok(None)
             }
         }
         "inet" | "cidr" => {
@@ -1502,48 +1526,48 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 // If there's a prefix, validate it
                 if let Some(prefix_str) = trimmed.split('/').nth(1) {
                     if prefix_str.parse::<u8>().is_err() {
-                        return Some((
+                        return invalid(
+                            "22P02",
                             format!("invalid input syntax for type {base_type}: \"{input}\""),
-                            "22P02".to_string(),
-                        ));
+                        );
                     }
                 }
-                None
+                Ok(None)
             } else {
-                Some((
+                invalid(
+                    "22P02",
                     format!("invalid input syntax for type {base_type}: \"{input}\""),
-                    "22P02".to_string(),
-                ))
+                )
             }
         }
-        "macaddr" => {
+        "macaddr" | "macaddr8" => {
             let parts: Vec<&str> = trimmed.split(':').collect();
-            if parts.len() == 6
+            if (parts.len() == 6 || parts.len() == 8)
                 && parts
                     .iter()
                     .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
             {
-                None
+                Ok(None)
             } else {
-                Some((
+                invalid(
+                    "22P02",
                     format!("invalid input syntax for type macaddr: \"{input}\""),
-                    "22P02".to_string(),
-                ))
+                )
             }
         }
         "oid" => {
             if trimmed.parse::<u32>().is_ok() {
-                None
+                Ok(None)
             } else {
-                Some((
+                invalid(
+                    "22P02",
                     format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
+                )
             }
         }
-        _ => Some((
+        _ => Err(error(
+            "42704",
             format!("type \"{type_name}\" does not exist"),
-            "42704".to_string(),
         )),
     }
 }
@@ -1583,6 +1607,39 @@ fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String,
         }
         Err(other) => unreachable!("temporal_encode of text failed with {other}"),
     }
+}
+
+fn check_array_input(
+    input: &str,
+    element_type: &str,
+) -> Result<Option<(String, String)>, ParseError> {
+    let invalid = |sqlstate: &'static str, message: String| {
+        Ok::<_, ParseError>(Some((message, sqlstate.to_string())))
+    };
+    let elements =
+        array_values_from_any(&Value::build_text(input.to_string())).ok_or_else(|| {
+            ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                message: format!("malformed array literal: \"{input}\""),
+            }
+        })?;
+    for element in elements {
+        let text = match element {
+            Value::Null => continue,
+            Value::Numeric(number) => Value::Numeric(number).to_string(),
+            Value::Text(text) => text.to_string(),
+            Value::Blob(_) => {
+                return invalid(
+                    "22P02",
+                    format!("invalid input syntax for type {element_type}: \"{input}\""),
+                );
+            }
+        };
+        if let Some(error) = validate_pg_input(&text, element_type)? {
+            return Ok(Some(error));
+        }
+    }
+    Ok(None)
 }
 
 /// Minimal JSON validation without requiring serde_json.
