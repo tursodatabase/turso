@@ -11,8 +11,8 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::catalog::{CatalogWrite, CreateSequence, WriteContext};
-use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
+use crate::dialect::catalog::{CatalogWrite, CreateSequence, DropSequence, WriteContext};
+use crate::dialect::{AccessStatement, NewOwner, OwnerColumn};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -1251,7 +1251,7 @@ pub fn translate_drop_sequence(
 }
 
 /// Emits the removal of sequence `seq_name` of `namespace` from the schema
-/// and from the dialect's schema state. Returns false, emitting nothing,
+/// and from the dialect's catalog. Returns false, emitting nothing,
 /// when the sequence does not exist.
 pub(crate) fn emit_drop_sequence(
     program: &mut ProgramBuilder,
@@ -1263,17 +1263,18 @@ pub(crate) fn emit_drop_sequence(
     if !emit_drop_sequence_cleanup(program, resolver, namespace, seq_name)? {
         return Ok(false);
     }
-    if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: seq_name,
-            }],
-        )?;
-    }
+    let write_context = WriteContext::new(connection, resolver, namespace.database_id);
+    let after_writes = resolver.catalog.dialect.catalog().write(
+        program,
+        &write_context,
+        &CatalogWrite::DropSequence(DropSequence {
+            namespace: namespace.id,
+            name: seq_name,
+        }),
+    )?;
+    // No catalog has rows to read back for a sequence that is gone:
+    // `Insn::DropSequence` has taken it out of the schema in memory.
+    after_writes.emit(program, namespace.database_id, None);
     Ok(true)
 }
 

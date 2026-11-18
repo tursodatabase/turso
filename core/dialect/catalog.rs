@@ -130,6 +130,9 @@ pub enum CatalogWrite<'a> {
     DropIndex(DropIndex<'a>),
     /// `CREATE SEQUENCE`.
     CreateSequence(CreateSequence<'a>),
+    /// A sequence that goes away: `DROP SEQUENCE`, or `ALTER TABLE ... DROP
+    /// COLUMN` of the column that owns the sequence.
+    DropSequence(DropSequence<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -213,6 +216,16 @@ pub struct DropIndex<'a> {
 /// table that the statement creates itself.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateSequence<'a> {
+    /// The namespace of the sequence in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the sequence in its namespace.
+    pub name: &'a str,
+}
+
+/// A sequence whose backing table the statement has already emitted the
+/// removal of.
+#[derive(Debug, Clone, Copy)]
+pub struct DropSequence<'a> {
     /// The namespace of the sequence in the database the statement changes.
     pub namespace: NamespaceId,
     /// The normalized name of the sequence in its namespace.
