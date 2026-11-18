@@ -1,13 +1,14 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::catalog::{
-    AfterWrites, Catalog, CatalogWrite, CreateMaterializedView, CreateTable, CreateView, TableText,
-    WriteContext,
+    AfterWrites, Catalog, CatalogWrite, CreateMaterializedView, CreateTable, CreateView, DropView,
+    TableText, WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
@@ -15,7 +16,7 @@ use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
@@ -37,6 +38,7 @@ impl Catalog for SqliteCatalog {
             CatalogWrite::CreateMaterializedView(view) => {
                 emit_create_materialized_view_row(program, ctx, view)
             }
+            CatalogWrite::DropView(view) => emit_drop_view_row(program, ctx, view),
         }
     }
 }
@@ -199,6 +201,87 @@ fn emit_create_materialized_view_row(
         "name = '{}'",
         escape_sql_string_literal(&stored_name)
     )))
+}
+
+/// Deletes the row of a view or materialized view.
+fn emit_drop_view_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    view: &DropView<'_>,
+) -> Result<AfterWrites> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
+    let view_name_reg = program.alloc_register();
+    let type_reg = program.alloc_register();
+    let rowid_reg = ctx.sqlite_schema_rowid_reg(program);
+
+    program.emit_insn(Insn::String8 {
+        dest: view_name_reg,
+        value: ctx.resolver.mangle_name(namespace, view.name),
+    });
+    program.emit_insn(Insn::String8 {
+        dest: type_reg,
+        value: "view".to_string(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Column 0 is type, column 1 is name.
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: type_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col1_reg,
+        rhs: view_name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_delete_label);
+
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+
+    Ok(AfterWrites::none())
 }
 
 /// The SQL text to store for a new view or materialized view.

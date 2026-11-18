@@ -39,9 +39,9 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
-    CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn, ProgramBuilder,
-    RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value, WriteContext,
-    WriteOrigin,
+    CursorType, DropView, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn,
+    ProgramBuilder, RegisterOrLiteral, RelationChange, RelationName, SqliteCatalog, Value,
+    WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -448,6 +448,9 @@ impl Catalog for PostgresCatalog {
         ctx: &WriteContext<'_>,
         change: &CatalogWrite<'_>,
     ) -> turso_core::Result<AfterWrites> {
+        if let CatalogWrite::DropView(view) = change {
+            return write_drop_view(program, ctx, view);
+        }
         let after_writes = SqliteCatalog.write(program, ctx, change)?;
         if !writes_class_rows(ctx)? {
             return Ok(after_writes);
@@ -484,6 +487,7 @@ impl Catalog for PostgresCatalog {
                 view.name,
                 RelationKind::MaterializedView,
             )?,
+            CatalogWrite::DropView(_) => unreachable!("DROP VIEW returned above"),
         }
         Ok(after_writes)
     }
@@ -507,6 +511,27 @@ fn writes_class_rows(ctx: &WriteContext<'_>) -> turso_core::Result<bool> {
         ));
     }
     Ok(ctx.database_id == MAIN_DB_ID)
+}
+
+/// Deletes the class row of a dropped view or materialized view, and then
+/// the engine's row.
+fn write_drop_view(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    view: &DropView<'_>,
+) -> turso_core::Result<AfterWrites> {
+    if writes_class_rows(ctx)? {
+        translate_relation_changes(
+            program,
+            ctx.schema,
+            ctx.connection,
+            &[RelationChange::Dropped {
+                namespace: view.namespace,
+                name: view.name,
+            }],
+        )?;
+    }
+    SqliteCatalog.write(program, ctx, &CatalogWrite::DropView(*view))
 }
 
 /// Writes the class row of a new view or materialized view.

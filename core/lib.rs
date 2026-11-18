@@ -149,7 +149,7 @@ pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub(crate) use dialect::EngineDialect;
 pub use dialect::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite,
-    CreateMaterializedView, CreateTable, CreateView, Dialect, NewOwner, OwnerColumn,
+    CreateMaterializedView, CreateTable, CreateView, Dialect, DropView, NewOwner, OwnerColumn,
     RelationChange, RelationName, SqliteCatalog, TableText, WriteContext, WriteOrigin,
 };
 pub use error::{
