@@ -332,6 +332,35 @@ expect {
     8
 }
 
+# A timestamptz or timestamp can only be compared with a value of its own
+# type, so the action's parent key parameter must have the key's type.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-on-timestamp-keys {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(k timestamptz PRIMARY KEY) STRICT;
+    CREATE TABLE child(k timestamptz
+        REFERENCES parent(k) ON DELETE CASCADE ON UPDATE CASCADE) STRICT;
+    CREATE TABLE parent2(k timestamp PRIMARY KEY) STRICT;
+    CREATE TABLE child2(id INTEGER PRIMARY KEY, k timestamp
+        REFERENCES parent2(k) ON DELETE SET NULL) STRICT;
+
+    INSERT INTO parent VALUES ('2024-01-05 08:00+00'), ('2024-01-06 08:00+00');
+    INSERT INTO child VALUES ('2024-01-05 08:00+00'), ('2024-01-06 08:00+00');
+    INSERT INTO parent2 VALUES ('2024-01-05 08:00');
+    INSERT INTO child2 VALUES (1, '2024-01-05 08:00');
+
+    UPDATE parent SET k = '2024-02-01 00:00+00' WHERE k = '2024-01-05 08:00+00';
+    DELETE FROM parent WHERE k = '2024-01-06 08:00+00';
+    DELETE FROM parent2;
+    SELECT k FROM child;
+    SELECT id, k IS NULL FROM child2;
+}
+expect {
+    2024-02-01 00:00:00+00
+    1|1
+}
+
 # A foreign key compares the child's key with the parent's, so a timestamptz
 # or timestamp key can only reference a key of its own type.
 @requires strict "uses STRICT tables"

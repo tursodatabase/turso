@@ -1744,18 +1744,22 @@ impl FkActionContext {
 
 /// Context for compiling FK action subprograms - maps parameter indices to column values
 #[derive(Debug)]
-struct FkSubprogramContext {
+struct FkSubprogramContext<'a> {
     /// Map from column index to parameter index (1-indexed) for OLD key values
     old_param_start: usize,
     /// Map from column index to parameter index (1-indexed) for NEW key values (UPDATE only)
     new_param_start: Option<usize>,
+    /// The custom type of each OLD key parameter.
+    old_key_types: &'a [Option<ast::Type>],
 }
 
-impl FkSubprogramContext {
-    fn new(num_cols: usize, has_new: bool) -> Self {
+impl<'a> FkSubprogramContext<'a> {
+    fn new(fk_ref: &'a ResolvedFkRef, has_new: bool) -> Self {
+        let num_cols = fk_ref.parent_key_types.len();
         Self {
             old_param_start: 1,
             new_param_start: if has_new { Some(num_cols + 1) } else { None },
+            old_key_types: &fk_ref.parent_key_types,
         }
     }
 
@@ -2104,6 +2108,7 @@ fn build_fk_match_where_clause(
     ctx: &FkSubprogramContext,
 ) -> Expr {
     turso_assert!(child_cols.len() == parent_collations.len());
+    turso_assert!(child_cols.len() == ctx.old_key_types.len());
     let mut conditions: Vec<Expr> = Vec::with_capacity(child_cols.len());
 
     for (i, (col, collation)) in child_cols.iter().zip(parent_collations).enumerate() {
@@ -2113,7 +2118,7 @@ fn build_fk_match_where_clause(
                 .ok()
                 .and_then(std::num::NonZeroU32::new)
                 .expect("fk parameter index must fit into NonZeroU32"),
-            None,
+            ctx.old_key_types[i].clone(),
             Some(&collation.name()),
         );
         let cond = Expr::Binary(
@@ -2160,7 +2165,7 @@ fn fire_fk_cascade_delete(
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
+    let subprog_ctx = FkSubprogramContext::new(fk_ref, false);
     let stmt = generate_cascade_delete_stmt(
         &fk_ref.child_table.name,
         child_cols,
@@ -2191,7 +2196,7 @@ fn fire_fk_set_null(
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
+    let subprog_ctx = FkSubprogramContext::new(fk_ref, false);
     let stmt = generate_set_null_stmt(
         &fk_ref.child_table.name,
         child_cols,
@@ -2222,7 +2227,7 @@ fn fire_fk_set_default(
 ) -> Result<()> {
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
+    let subprog_ctx = FkSubprogramContext::new(fk_ref, false);
     let stmt = generate_set_default_stmt(
         &fk_ref.child_table,
         child_cols,
@@ -2254,7 +2259,7 @@ fn fire_fk_cascade_update(
     let db_name = child_namespace_name(resolver, fk_ref, database_id);
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
+    let subprog_ctx = FkSubprogramContext::new(fk_ref, true);
     let stmt = generate_cascade_update_stmt(
         &fk_ref.child_table.name,
         child_cols,
