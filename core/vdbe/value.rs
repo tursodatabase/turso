@@ -9,6 +9,7 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::fmt::Write as _;
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
@@ -918,7 +919,10 @@ impl Value {
 
         let f: f64 =
             crate::numeric::round_half_away_from_zero_tie(f, precision).unwrap_or_else(|| {
-                crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                // A sign, at most 16 integer digits, a point and at most 30 decimals.
+                let mut text = StackText::<64>::new();
+                write!(text, "{f:.precision$}").expect("the rounded float fits in 64 bytes");
+                crate::numeric::str_to_f64(text.as_str())
                     .expect("formatted float should always parse successfully")
                     .into()
             });
@@ -1616,6 +1620,35 @@ fn push_hex_upper(out: &mut String, bytes: &[u8]) {
     for &byte in bytes {
         out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
         out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+}
+
+/// Text of at most `N` bytes in a stack buffer, written with `write!`.
+struct StackText<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackText<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).expect("only whole strings are written")
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackText<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
 
@@ -3254,6 +3287,35 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+    }
+
+    #[test]
+    fn round_gives_the_float_of_the_text_with_precision_decimals() {
+        // The first two values have the longest text that round() formats.
+        let floats = [
+            -4503599627370496.0,
+            4503599627370496.0,
+            123.456789,
+            -0.000123456,
+            std::f64::consts::PI,
+            -2.675,
+            1e-300,
+        ];
+        for f in floats {
+            for precision in 1..=30 {
+                let expected = crate::numeric::round_half_away_from_zero_tie(f, precision)
+                    .unwrap_or_else(|| {
+                        crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                            .unwrap()
+                            .into()
+                    });
+                let precision = Value::from_i64(precision as i64);
+                assert_eq!(
+                    Value::from_f64(f).exec_round(Some(&precision)),
+                    Value::from_f64(expected)
+                );
+            }
+        }
     }
 
     #[test]
