@@ -6,7 +6,8 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
-    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, OperationMode, Resolver,
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
 };
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -133,6 +134,230 @@ pub(crate) fn emit_delete_index_row(
         emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
     }
 
+    Ok(())
+}
+
+/// Deletes every row whose `tbl_name` is the table: its own row and the
+/// rows of its indexes and triggers.
+pub(crate) fn emit_delete_rows_of_table(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    stored_name: String,
+    scratch_regs: [usize; 2],
+) -> Result<()> {
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+
+    let [null_reg, tbl_name_reg] = scratch_regs;
+    program.emit_null(null_reg, None);
+    let table_reg = program.emit_string8_new_reg(stored_name);
+    program.mark_last_insn_constant();
+    let _table_type = program.emit_string8_new_reg("trigger".to_string());
+    program.mark_last_insn_constant();
+    let row_id_reg = program.alloc_register();
+
+    let schema_table = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+        .unwrap();
+    let sqlite_schema_cursor_id_0 = open_sqlite_schema_for_write(program, resolver, database_id);
+
+    //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
+    //  loop to beginning of schema table
+    let end_metadata_label = program.allocate_label();
+    let metadata_loop = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id_0,
+        pc_if_empty: end_metadata_label,
+    });
+    program.preassign_label_to_next_insn(metadata_loop);
+
+    // start loop on schema table
+    program.emit_column_or_rowid(sqlite_schema_cursor_id_0, 2, tbl_name_reg);
+    let next_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: tbl_name_reg,
+        rhs: table_reg,
+        target_pc: next_label,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: crate::translate::collate::CollationSeq::NOCASE,
+    });
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id_0,
+        dest: row_id_reg,
+    });
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        let table_type = program.emit_string8_new_reg("table".to_string()); // r4
+        program.mark_last_insn_constant();
+
+        let skip_cdc_label = program.allocate_label();
+
+        let entry_type_reg = program.alloc_register();
+        program.emit_column_or_rowid(sqlite_schema_cursor_id_0, 0, entry_type_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: entry_type_reg,
+            rhs: table_type,
+            target_pc: skip_cdc_label,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: crate::translate::collate::CollationSeq::for_internal_values(),
+        });
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
+            Some(crate::translate::emitter::emit_cdc_full_record(
+                program,
+                resolver,
+                schema_table.columns(),
+                sqlite_schema_cursor_id_0,
+                row_id_reg,
+            )?)
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::DELETE,
+            cdc_cursor_id,
+            row_id_reg,
+            before_record_reg,
+            None,
+            None,
+            SQLITE_TABLEID,
+        )?;
+        program.preassign_label_to_next_insn(skip_cdc_label);
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id_0,
+        table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id_0,
+        pc_if_next: metadata_loop,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(end_metadata_label);
+    // end of loop on schema table
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
+    }
+    Ok(())
+}
+
+/// Deletes the rows of the triggers in the temp database that are on the
+/// table, when the table is in another database.
+pub(crate) fn emit_delete_temp_triggers_on_table(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    table_name: &str,
+) -> Result<()> {
+    // SQLite removes temp triggers targeting the dropped table.
+    // Enumerate the temp schema triggers at translate time (which is
+    // safe because a concurrent DDL would bump the schema cookie and
+    // force a reprepare) and emit per-trigger bytecode to delete only
+    // the rows that should be removed. Filtering in the bytecode by
+    // `tbl_name` alone is not enough: two triggers with the same
+    // unqualified table name can live in the temp schema but point to
+    // different databases (e.g. one on `main.t`, one on `temp.t` when a
+    // shadow table exists). We must key on trigger name.
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        // A temp schema trigger targets the dropped db iff:
+        //   - it explicitly qualifies with the dropped db, or
+        //   - it is unqualified AND dropping from main AND temp has no
+        //     shadow table of the same name (in which case the
+        //     unqualified reference resolves to main).
+        let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_table(NamespaceId::ROOT, table_name).is_some()
+        });
+        let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_triggers_for_table(NamespaceId::ROOT, table_name)
+                .filter(|trigger| match trigger.target_database_id {
+                    Some(db_id) => db_id == database_id,
+                    None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
+                })
+                .map(|trigger| trigger.name.clone())
+                .collect()
+        });
+
+        if !trigger_names_to_drop.is_empty() {
+            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie)?;
+            let temp_cursor = open_sqlite_schema_for_write(program, resolver, crate::TEMP_DB_ID);
+            // Hoist the literal trigger names + `"trigger"` type
+            // string into constant registers before the loop.
+            let trigger_type_reg = program.emit_string8_new_reg("trigger".to_string());
+            program.mark_last_insn_constant();
+            let name_regs: Vec<usize> = trigger_names_to_drop
+                .iter()
+                .map(|name| {
+                    let reg = program.emit_string8_new_reg(name.clone());
+                    program.mark_last_insn_constant();
+                    reg
+                })
+                .collect();
+
+            let temp_end_label = program.allocate_label();
+            let temp_loop_label = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: temp_cursor,
+                pc_if_empty: temp_end_label,
+            });
+            program.preassign_label_to_next_insn(temp_loop_label);
+            let temp_next_label = program.allocate_label();
+            let temp_delete_label = program.allocate_label();
+
+            // Skip non-trigger rows (column 0 = type).
+            let temp_type_reg = program.alloc_register();
+            program.emit_column_or_rowid(temp_cursor, 0, temp_type_reg);
+            program.emit_insn(Insn::Ne {
+                lhs: temp_type_reg,
+                rhs: trigger_type_reg,
+                target_pc: temp_next_label,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: crate::translate::collate::CollationSeq::for_internal_values(),
+            });
+
+            // Cascade-check name (column 1) against each trigger we
+            // want to drop. First match jumps to the delete label.
+            let temp_name_reg = program.alloc_register();
+            program.emit_column_or_rowid(temp_cursor, 1, temp_name_reg);
+            for name_reg in &name_regs {
+                program.emit_insn(Insn::Eq {
+                    lhs: temp_name_reg,
+                    rhs: *name_reg,
+                    target_pc: temp_delete_label,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: crate::translate::collate::CollationSeq::for_internal_values(),
+                });
+            }
+            // No name matched — skip the delete.
+            program.emit_insn(Insn::Goto {
+                target_pc: temp_next_label,
+            });
+            program.preassign_label_to_next_insn(temp_delete_label);
+            program.emit_insn(Insn::Delete {
+                cursor_id: temp_cursor,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: false,
+            });
+            program.preassign_label_to_next_insn(temp_next_label);
+            program.emit_insn(Insn::Next {
+                cursor_id: temp_cursor,
+                pc_if_next: temp_loop_label,
+                fullscan: false,
+                is_index: false,
+            });
+            program.preassign_label_to_next_insn(temp_end_label);
+        }
+    }
     Ok(())
 }
 
