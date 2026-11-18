@@ -64,7 +64,7 @@ impl Dialect for PostgresDialect {
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
-            return turso_core::dialect::engine::parse(sql);
+            return self.parse_internal(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
@@ -81,8 +81,21 @@ impl Dialect for PostgresDialect {
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
-            Err(_) => turso_core::dialect::engine::parse(sql),
+            Err(_) => self.parse_internal(sql),
         }
+    }
+
+    fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        Ok((cmd, parser.offset()))
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> Result<turso_parser::ast::ColumnDefinition> {
+        Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -90,7 +103,7 @@ impl Dialect for PostgresDialect {
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
-                canonical_table_sql_ast(sql)?
+                canonical_table_sql_ast(self, sql)?
             else {
                 unreachable!("canonical_table_sql_ast returned a non-CREATE TABLE statement");
             };
@@ -124,7 +137,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return canonical_table_sql_ast(sql);
+            return canonical_table_sql_ast(self, sql);
         };
 
         let parse_result =
@@ -143,7 +156,7 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::engine::table_sql_for_replay(sql);
+            return turso_core::dialect::table_sql_for_replay(self, sql);
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -192,7 +205,7 @@ impl Dialect for PostgresDialect {
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        let sql = turso_core::dialect::engine::format_table_sql(tbl_name, body)?;
+        let sql = turso_core::dialect::format_table_sql(tbl_name, body)?;
         let identity_marker = identity_table_sql_marker(
             table_columns(body)
                 .iter()
@@ -403,9 +416,9 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// The `CREATE TABLE` of stored table SQL that is SQLite text, with its
 /// identity columns marked as the SQL says.
-fn canonical_table_sql_ast(sql: &str) -> Result<ast::Stmt> {
+fn canonical_table_sql_ast(dialect: &PostgresDialect, sql: &str) -> Result<ast::Stmt> {
     let (identity_columns, sql) = split_identity_table_sql_marker(sql)?;
-    let mut stmt = turso_core::dialect::engine::parse_table_sql_ast(sql)?;
+    let mut stmt = turso_core::dialect::parse_table_sql_ast(dialect, sql)?;
     let ast::Stmt::CreateTable { body, .. } = &mut stmt else {
         unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
     };
@@ -4700,8 +4713,13 @@ mod tests {
                 .add_btree_table(
                     public,
                     Arc::new(
-                        BTreeTable::from_sql(&format!("CREATE TABLE {name} ({columns})"), 2)
-                            .unwrap(),
+                        BTreeTable::from_stored_sql(
+                            &PostgresDialect,
+                            &format!("CREATE TABLE {name} ({columns})"),
+                            2,
+                            false,
+                        )
+                        .unwrap(),
                     ),
                 )
                 .unwrap();
@@ -4714,7 +4732,11 @@ mod tests {
     #[test]
     fn postgres_rejects_without_rowid_schema() {
         let sql = "CREATE TABLE t(a TEXT PRIMARY KEY, b) WITHOUT ROWID";
-        assert!(!BTreeTable::from_sql(sql, 2).unwrap().has_rowid);
+        assert!(
+            !BTreeTable::from_stored_sql(&PostgresDialect, sql, 2, false)
+                .unwrap()
+                .has_rowid
+        );
         let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
         assert_eq!(
             error.to_string(),

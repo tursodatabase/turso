@@ -868,6 +868,24 @@ impl Dialect for SecretTableDialect {
         "secret-table-test"
     }
 
+    fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse(sql)
+    }
+
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        turso_sqlite::SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+    }
+
     fn role_has_privilege(
         &self,
         _schema: &Schema,

@@ -354,6 +354,7 @@ pub fn parse_schema_rows(
 /// statements `type_sqls`, then build the materialized views and indexes
 /// collected during the scan.
 pub fn populate_types_views_then_indices(
+    dialect: &dyn crate::dialect::Dialect,
     state: &mut ParseSchemaRowsState,
     schema: &mut Schema,
     syms: &SymbolTable,
@@ -365,6 +366,7 @@ pub fn populate_types_views_then_indices(
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
     schema.populate_types_views_then_indices(
+        dialect,
         syms,
         type_sqls,
         inner.materialized_view_info,

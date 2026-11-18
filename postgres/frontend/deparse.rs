@@ -658,10 +658,12 @@ mod tests {
     use crate::policies::parse_condition;
 
     fn table() -> BTreeTable {
-        BTreeTable::from_sql(
+        BTreeTable::from_stored_sql(
+            &crate::catalog::PostgresDialect,
             "CREATE TABLE t (id INT, owner TEXT, published BOOLEAN, n BIGINT, \
              v VARCHAR(10), \"Weird Col\" INT, price NUMERIC)",
             2,
+            false,
         )
         .unwrap()
     }

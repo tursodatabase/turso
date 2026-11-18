@@ -706,12 +706,13 @@ impl IncrementalView {
     /// Builds the view from its `CREATE MATERIALIZED VIEW` text. `namespace`
     /// is the namespace the view is in, where its unqualified names resolve.
     pub fn from_sql(
+        dialect: &dyn crate::dialect::Dialect,
         sql: &str,
         schema: &Schema,
         main_data_root: i64,
         namespace: NamespaceId,
     ) -> Result<Self> {
-        let cmd = crate::dialect::engine::parse_statement(sql)?;
+        let cmd = crate::dialect::parse_statement(dialect, sql)?;
         let cmd = cmd.expect("View is an empty statement");
         match cmd {
             Cmd::Stmt(Stmt::CreateMaterializedView {

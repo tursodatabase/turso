@@ -11,11 +11,13 @@
 //! ([`resolve_builtin_function`], [`call_builtin_scalar`]) and the catalog
 //! tables (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
 //! `btree_dump`, `sqlite_turso_types`) that
-//! [`crate::schema::builtin::schema_builder`] installs. The [`engine`]
-//! module has the parser entry points and the dialect of the statements
-//! the engine runs for itself.
+//! [`crate::schema::builtin::schema_builder`] installs.
+//!
+//! The SQL text that core keeps, such as the definitions in
+//! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
+//! [`Dialect::parse_internal`] of the database's dialect.
 
-pub mod engine;
+mod engine;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
@@ -196,9 +198,21 @@ pub trait Dialect: Send + Sync + 'static {
     /// connection compilation state changes. Implementations must accept the
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
-    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-        engine::parse(sql)
-    }
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)>;
+
+    /// Parse the first statement in SQL that core keeps: the stored
+    /// definitions of tables, indexes, views, triggers and virtual tables,
+    /// the statements that `ALTER TABLE` generates, the built-in
+    /// `CREATE TYPE` text, the patterns of index methods, and the schema
+    /// writes of the engine. The text is SQLite syntax in every dialect.
+    ///
+    /// Returns the parsed command, if any, and the number of input bytes
+    /// consumed.
+    fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)>;
+
+    /// Parse the column definition that core keeps for `ALTER TABLE`, such
+    /// as `b INTEGER DEFAULT 0`. The text is SQLite syntax in every dialect.
+    fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition>;
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -208,8 +222,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// marker, so every implementation must fall back to SQLite parsing
     /// for text it does not recognize as its own.
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        engine::reject_postgres_table_sql(sql)?;
-        BTreeTable::from_sql(sql, root_page)
+        reject_postgres_table_sql(sql)?;
+        BTreeTable::from_stored_sql(self, sql, root_page, false)
     }
 
     /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
@@ -222,8 +236,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// plain SQLite text, so implementations must retain the same SQLite
     /// fallback required by [`Dialect::parse_table_sql`].
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-        engine::reject_postgres_table_sql(sql)?;
-        engine::parse_table_sql_ast(sql)
+        reject_postgres_table_sql(sql)?;
+        parse_table_sql_ast(self, sql)
     }
 
     /// Recover SQL that can be prepared to recreate a persisted table.
@@ -235,8 +249,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// internal engine tables must retain the SQLite fallback used by the
     /// schema parsing methods.
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-        engine::reject_postgres_table_sql(sql)?;
-        engine::table_sql_for_replay(sql)
+        reject_postgres_table_sql(sql)?;
+        table_sql_for_replay(self, sql)
     }
 
     /// Produce the SQL text to store in `sqlite_schema` for a
@@ -253,7 +267,7 @@ pub trait Dialect: Send + Sync + 'static {
         tbl_name: &QualifiedName,
         body: &CreateTableBody,
     ) -> Result<String> {
-        engine::format_table_sql(tbl_name, body)
+        format_table_sql(tbl_name, body)
     }
 
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
@@ -279,7 +293,7 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// [`Dialect::new_schema`] finishes the schema.
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
-        crate::schema::builtin::schema_builder(enable_custom_types)
+        crate::schema::builtin::schema_builder(self, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -682,6 +696,72 @@ pub trait Dialect: Send + Sync + 'static {
     }
 }
 
+/// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that
+/// marks it is valid SQLite syntax, so without this check the SQLite parser
+/// would accept the PostgreSQL DDL with SQLite column semantics.
+pub fn reject_postgres_table_sql(sql: &str) -> Result<()> {
+    if sql.starts_with(POSTGRES_TABLE_SQL_PREFIX) {
+        return Err(LimboError::Corrupt(format!(
+            "malformed database schema: table was created by the postgres frontend: {sql}"
+        )));
+    }
+    Ok(())
+}
+
+/// Formats canonical SQLite `CREATE TABLE` text from its AST.
+pub fn format_table_sql(tbl_name: &QualifiedName, body: &CreateTableBody) -> Result<String> {
+    match body {
+        CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
+            "CREATE TABLE {} {}",
+            tbl_name.name.as_ident(),
+            body
+        )),
+        CreateTableBody::AsSelect(_) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
+    }
+}
+
+/// Recover persisted SQLite table SQL for schema replay.
+///
+/// SQLite text without a database qualifier can be replayed unchanged. A
+/// qualified name must be removed because the vacuum target only exposes its
+/// main schema.
+pub fn table_sql_for_replay(dialect: &(impl Dialect + ?Sized), sql: &str) -> Result<String> {
+    let stmt = parse_table_sql_ast(dialect, sql)?;
+    let Stmt::CreateTable {
+        mut tbl_name,
+        temporary,
+        if_not_exists,
+        body,
+    } = stmt
+    else {
+        unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+    };
+
+    if tbl_name.namespace.take().is_none() {
+        return Ok(sql.to_string());
+    }
+
+    Ok(Stmt::CreateTable {
+        tbl_name,
+        temporary,
+        if_not_exists,
+        body,
+    }
+    .to_string())
+}
+
+/// Parse persisted SQLite table SQL into a `CREATE TABLE` statement.
+pub fn parse_table_sql_ast(dialect: &(impl Dialect + ?Sized), sql: &str) -> Result<Stmt> {
+    match parse_statement(dialect, sql)? {
+        Some(Cmd::Stmt(stmt @ Stmt::CreateTable { .. })) => Ok(stmt),
+        other => Err(LimboError::Corrupt(format!(
+            "persisted table SQL is not CREATE TABLE: {other:?}"
+        ))),
+    }
+}
+
 /// Returns true if `sql` parses as a `CREATE VIRTUAL TABLE` statement.
 ///
 /// Like SQLite (whose `sqlite3InitCallback` feeds schema SQL to the real
@@ -689,11 +769,16 @@ pub trait Dialect: Send + Sync + 'static {
 /// `create_vtab` grammar rule), classification is done by parsing rather than
 /// by substring or token matching, which would misclassify regular tables
 /// whose SQL merely contains the text (e.g. in a DEFAULT literal).
-pub fn sql_is_create_virtual_table(sql: &str) -> bool {
+pub fn sql_is_create_virtual_table(dialect: &dyn Dialect, sql: &str) -> bool {
     matches!(
-        engine::parse_statement(sql),
+        parse_statement(dialect, sql),
         Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
     )
+}
+
+/// Parse the first statement in SQL that core keeps, which is SQLite syntax.
+pub fn parse_statement(dialect: &(impl Dialect + ?Sized), sql: &str) -> Result<Option<Cmd>> {
+    Ok(dialect.parse_internal(sql)?.0)
 }
 
 /// The comment that marks the columns at the given positions as identity

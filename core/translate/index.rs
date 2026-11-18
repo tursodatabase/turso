@@ -275,12 +275,15 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            index_method = Some(index_module.attach(&IndexMethodConfiguration {
-                table_name: tbl.name.clone(),
-                index_name: idx_name.clone(),
-                columns: columns.try_clone()?,
-                parameters,
-            })?);
+            index_method = Some(index_module.attach(
+                connection.dialect().as_ref(),
+                &IndexMethodConfiguration {
+                    table_name: tbl.name.clone(),
+                    index_name: idx_name.clone(),
+                    columns: columns.try_clone()?,
+                    parameters,
+                },
+            )?);
         }
     }
     let idx = Arc::new(Index {
@@ -1754,14 +1757,16 @@ mod tests {
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-        let stmt =
-            match crate::dialect::engine::parse_statement("CREATE INDEX aux.idx1 ON t1(name);")
-                .unwrap()
-                .unwrap()
-            {
-                ast::Cmd::Stmt(stmt) => stmt,
-                other => panic!("expected statement, got {other:?}"),
-            };
+        let stmt = match crate::dialect::parse_statement(
+            &crate::EngineDialect,
+            "CREATE INDEX aux.idx1 ON t1(name);",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            ast::Cmd::Stmt(stmt) => stmt,
+            other => panic!("expected statement, got {other:?}"),
+        };
 
         // let's confirm that the stmt does carry `aux`
         let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {

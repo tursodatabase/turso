@@ -1235,7 +1235,7 @@ impl Connection {
                 // An engine schema statement is the engine's own SQLite text,
                 // whatever the database's dialect parses.
                 if matches!(origin, StatementOrigin::EngineSchemaWrite) {
-                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                    self.dialect().parse_internal(sql)?
                 } else {
                     self.parse_sql(sql)?
                 }
@@ -1657,7 +1657,9 @@ impl Connection {
                             rows: Vec::new(),
                         };
                     } else {
-                        inner.fresh.load_namespace_names(&[])?;
+                        inner
+                            .fresh
+                            .load_namespace_names(self.dialect().as_ref(), &[])?;
                         inner.phase = ReparsePhase::populate_sequences();
                     }
                 }
@@ -1666,7 +1668,9 @@ impl Connection {
                         rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
                         Ok(())
                     }));
-                    inner.fresh.load_namespace_names(rows)?;
+                    inner
+                        .fresh
+                        .load_namespace_names(self.dialect().as_ref(), rows)?;
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::populate_sequences();
                 }
@@ -1793,6 +1797,7 @@ impl Connection {
                 }
                 ReparsePhase::BuildIndexes { type_sqls } => {
                     crate::util::populate_types_views_then_indices(
+                        self.dialect().as_ref(),
                         &mut inner.parse,
                         &mut inner.fresh,
                         &self.syms.read(),
@@ -3204,6 +3209,7 @@ impl Connection {
 
             // The schema already holds every stored type.
             match schema.populate_types_views_then_indices(
+                self.dialect().as_ref(),
                 &syms,
                 &[],
                 materialized_view_info,
@@ -5690,7 +5696,7 @@ mod tests {
             schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
-        let fresh = crate::schema::builtin::schema_builder(false)
+        let fresh = crate::schema::builtin::schema_builder(&EngineDialect, false)
             .unwrap()
             .build();
         assert!(fresh.dialect_schema.is_none());
