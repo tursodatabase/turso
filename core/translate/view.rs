@@ -1,6 +1,4 @@
-use crate::dialect::catalog::{
-    CatalogWrite, CreateMaterializedView, CreateView, DropView, WriteContext,
-};
+use crate::dialect::{CatalogWrite, CreateMaterializedView, CreateView, DropView, WriteContext};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;

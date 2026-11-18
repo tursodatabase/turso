@@ -1,9 +1,9 @@
 use crate::alloc::TursoIteratorExt;
-use crate::dialect::catalog::{
-    AddColumn, AlterColumn, CatalogWrite, DropColumn, RenameColumn, RenameTable, RenamedIndex,
-    RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable, WriteContext,
+use crate::dialect::{
+    AccessStatement, AddColumn, AlterColumn, CatalogWrite, DropColumn, NewOwner, RenameColumn,
+    RenameTable, RenamedIndex, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
+    WriteContext,
 };
-use crate::dialect::{AccessStatement, NewOwner};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
