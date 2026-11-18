@@ -4,10 +4,14 @@
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
 
+mod builtin;
+
 use std::sync::Arc;
+use turso_core::schema::SchemaBuilder;
 use turso_core::{Dialect, Result};
 use turso_parser::{ast, parser::Parser};
 
+pub use builtin::schema_builder;
 pub use turso_core::dialect::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 
 /// The SQLite dialect.
@@ -34,5 +38,9 @@ impl Dialect for SqliteDialect {
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
+    }
+
+    fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
+        schema_builder(self, enable_custom_types)
     }
 }

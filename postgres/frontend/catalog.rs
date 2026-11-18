@@ -219,6 +219,16 @@ impl Dialect for PostgresDialect {
         Ok(format!("{identity_marker}{sql}"))
     }
 
+    /// A PostgreSQL database starts with the types and catalog tables of a
+    /// SQLite database. Its own catalog tables are modules, which
+    /// `register_native_extensions` adds.
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> Result<turso_core::schema::SchemaBuilder> {
+        turso_sqlite::schema_builder(self, enable_custom_types)
+    }
+
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         let options = crate::functions::register_functions(options);
         let options = crate::auth_functions::register_functions(options);

@@ -8,10 +8,11 @@
 //! The frontends live in their own crates: the SQLite dialect in
 //! `turso_sqlite` and the PostgreSQL dialect in `turso_pg`. Both compose
 //! with what ships with every Turso build: the built-in functions
-//! ([`resolve_builtin_function`], [`call_builtin_scalar`]) and the catalog
-//! tables (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
-//! `btree_dump`, `sqlite_turso_types`) that
-//! [`crate::schema::builtin::schema_builder`] installs.
+//! ([`resolve_builtin_function`], [`call_builtin_scalar`]) and the
+//! implementations of the catalog tables (`pragma_*`,
+//! `json_each`/`json_tree`, `sqlite_dbpage`, `btree_dump`,
+//! `sqlite_turso_types`). A dialect says in [`Dialect::schema_builder`]
+//! which types and catalog tables its databases start with.
 //!
 //! The SQL text that core keeps, such as the definitions in
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
@@ -293,15 +294,13 @@ pub trait Dialect: Send + Sync + 'static {
     }
 
     /// Starts the schema a database of this dialect has before its objects
-    /// are read from the file. The default has the catalog tables and
-    /// built-in types that every dialect has. A dialect with catalog tables
-    /// of its own adds them to the default (constructed with
-    /// [`crate::VirtualTable::new_internal`], which requires no connection).
+    /// are read from the file: the types and catalog tables that every
+    /// database of the dialect has. The constructors of
+    /// [`crate::VirtualTable`] make the catalog tables, and need no
+    /// connection.
     ///
     /// [`Dialect::new_schema`] finishes the schema.
-    fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
-        crate::schema::builtin::schema_builder(self, enable_custom_types)
-    }
+    fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder>;
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         options

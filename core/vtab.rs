@@ -44,6 +44,109 @@ impl VirtualTable {
         }
     }
 
+    /// The `pragma_*` table-valued functions.
+    pub fn pragma_functions(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> crate::Result<Vec<VirtualTable>> {
+        PragmaVirtualTable::functions()
+            .into_iter()
+            .map(|(pragma, sql)| {
+                Ok(VirtualTable {
+                    name: format!("pragma_{}", pragma.pragma_name),
+                    columns: Self::resolve_columns(dialect, sql)?,
+                    kind: VTabKind::TableValuedFunction,
+                    vtab_type: VirtualTableType::Pragma(pragma),
+                    vtab_id: 0,
+                    is_droppable: false,
+                    innocuous: true,
+                })
+            })
+            .collect()
+    }
+
+    /// The `json_each` table-valued function. `None` when core is built
+    /// without the `json` feature.
+    pub fn json_each(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> crate::Result<Option<VirtualTable>> {
+        #[cfg(feature = "json")]
+        {
+            Self::builtin_table(dialect, crate::json::vtab::JsonVirtualTable::json_each()).map(Some)
+        }
+        #[cfg(not(feature = "json"))]
+        {
+            let _ = dialect;
+            Ok(None)
+        }
+    }
+
+    /// The `json_tree` table-valued function. `None` when core is built
+    /// without the `json` feature.
+    pub fn json_tree(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> crate::Result<Option<VirtualTable>> {
+        #[cfg(feature = "json")]
+        {
+            Self::builtin_table(dialect, crate::json::vtab::JsonVirtualTable::json_tree()).map(Some)
+        }
+        #[cfg(not(feature = "json"))]
+        {
+            let _ = dialect;
+            Ok(None)
+        }
+    }
+
+    /// The `sqlite_dbpage` table. `None` when core is built without the
+    /// `cli_only` feature.
+    pub fn sqlite_dbpage(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> crate::Result<Option<VirtualTable>> {
+        #[cfg(feature = "cli_only")]
+        {
+            Self::builtin_table(dialect, crate::dbpage::DbPageTable::new()).map(Some)
+        }
+        #[cfg(not(feature = "cli_only"))]
+        {
+            let _ = dialect;
+            Ok(None)
+        }
+    }
+
+    /// The `btree_dump` table. `None` when core is built without the
+    /// `cli_only` feature.
+    pub fn btree_dump(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> crate::Result<Option<VirtualTable>> {
+        #[cfg(feature = "cli_only")]
+        {
+            Self::builtin_table(dialect, crate::btree_dump::BtreeDumpTable::new()).map(Some)
+        }
+        #[cfg(not(feature = "cli_only"))]
+        {
+            let _ = dialect;
+            Ok(None)
+        }
+    }
+
+    /// The `sqlite_turso_types` table, which lists the types of the schema.
+    pub fn sqlite_turso_types(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> crate::Result<VirtualTable> {
+        Self::builtin_table(dialect, crate::turso_types_vtab::TursoTypesTable::new())
+    }
+
+    fn builtin_table<T>(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        table: T,
+    ) -> crate::Result<VirtualTable>
+    where
+        T: InternalVirtualTable + 'static,
+    {
+        Ok(Arc::unwrap_or_clone(Self::wrap_internal_table(
+            dialect, table,
+        )?))
+    }
+
     /// Wrap an `InternalVirtualTable` implementation so it can appear in a
     /// `Schema`'s catalog. The table's `name()` becomes the catalog name and
     /// its `sql()` is parsed to derive the column metadata. Returns an error

@@ -896,6 +896,13 @@ impl Dialect for SecretTableDialect {
         Arc::new(SqliteDialect)
     }
 
+    fn schema_builder(
+        &self,
+        enable_custom_types: bool,
+    ) -> turso_core::Result<turso_core::schema::SchemaBuilder> {
+        turso_sqlite::schema_builder(self, enable_custom_types)
+    }
+
     fn role_has_privilege(
         &self,
         _schema: &Schema,

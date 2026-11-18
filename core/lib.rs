@@ -209,6 +209,12 @@ pub use vdbe::{
 };
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 
+/// Whether core is built with the `uuid` feature, which has the UUID functions.
+pub const HAS_UUID: bool = cfg!(feature = "uuid");
+
+/// Whether core is built with the `json` feature, which has the JSON functions.
+pub const HAS_JSON: bool = cfg!(feature = "json");
+
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
