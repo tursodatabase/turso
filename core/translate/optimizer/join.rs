@@ -449,14 +449,19 @@ fn can_defer_where_subquery(subquery: &NonFromClauseSubquery, where_clause: &[Wh
 #[derive(Debug, Clone)]
 pub struct JoinN {
     /// Tuple: (table_number, access_method_index)
-    pub data: Vec<(usize, usize)>,
+    pub data: SmallVec<[(usize, usize); JOIN_TABLES_INLINE]>,
     /// The estimated number of rows returned by joining these n tables together.
     pub output_cardinality: f64,
     /// Estimated execution cost of this N-ary join.
     pub cost: Cost,
     /// Estimated output rows after each table access in `data`.
-    pub prefix_cardinalities: Vec<f64>,
+    pub prefix_cardinalities: SmallVec<[f64; JOIN_TABLES_INLINE]>,
 }
+
+/// The number of tables for which a [JoinN] keeps its data without a heap
+/// allocation. The join search makes a [JoinN] for each join order that it
+/// tries, and most joins have at most this many tables.
+const JOIN_TABLES_INLINE: usize = 8;
 
 struct WhereTermInfo {
     table_mask: TableMask,
@@ -1125,12 +1130,12 @@ fn join_lhs_and_rhs<'a, 'w>(
 
     access_methods_arena.push(best_access_method);
 
-    let mut best_access_methods = Vec::with_capacity(join_order.len());
+    let mut best_access_methods = SmallVec::with_capacity(join_order.len());
     if let Some(lhs) = lhs {
         best_access_methods.extend_from_slice(&lhs.data);
     }
     best_access_methods.push((rhs_table_number, access_methods_arena.len() - 1));
-    let mut prefix_cardinalities = Vec::with_capacity(join_order.len());
+    let mut prefix_cardinalities = SmallVec::with_capacity(join_order.len());
     if let Some(lhs) = lhs {
         prefix_cardinalities.extend_from_slice(&lhs.prefix_cardinalities);
     }
