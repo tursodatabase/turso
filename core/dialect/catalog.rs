@@ -5,7 +5,7 @@
 //! is written.
 
 use crate::{
-    namespace::NamespaceId,
+    namespace::{NamespaceId, NamespaceRef},
     schema::{load::LoadStep, RelationKind, Schema},
     translate::{
         emitter::Resolver,
@@ -163,6 +163,8 @@ pub enum CatalogWrite<'a> {
     DropView(DropView<'a>),
     /// `ALTER TABLE ... RENAME TO`.
     RenameTable(RenameTable<'a>),
+    /// `ALTER TABLE ... RENAME COLUMN`.
+    RenameColumn(RenameColumn<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -373,6 +375,49 @@ pub struct TempTriggerOfRenamedTable {
     /// Whether the trigger is on the renamed table. If not, only its body
     /// names the table.
     pub is_on_the_table: bool,
+}
+
+/// A column that gets a new name. Everything stored that names the column
+/// changes with it: the table's indexes, the foreign keys of other tables,
+/// triggers and views.
+#[derive(Debug, Clone, Copy)]
+pub struct RenameColumn<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table.
+    pub table: &'a str,
+    /// The table's name as the statement spells it.
+    pub written_table_name: &'a str,
+    /// The column's name before the statement, as the table has it.
+    pub old_name: &'a str,
+    /// The old name as the statement spells it.
+    pub written_old_name: &'a str,
+    pub new_name: &'a ast::Name,
+    /// The triggers whose text names the column, in any database.
+    pub triggers: &'a [RewrittenTrigger],
+    /// The views whose text names the column, in the table's database and
+    /// in the temp database.
+    pub views: &'a [RewrittenView],
+    /// The text of the statement, for change data capture.
+    pub statement: &'a str,
+}
+
+/// A trigger whose text changes because it names a renamed column.
+#[derive(Debug, Clone)]
+pub struct RewrittenTrigger {
+    pub namespace: NamespaceRef,
+    pub name: String,
+    /// The new `CREATE TRIGGER` text.
+    pub sql: String,
+}
+
+/// A view whose text changes because it names a renamed column.
+#[derive(Debug, Clone)]
+pub struct RewrittenView {
+    pub namespace: NamespaceRef,
+    pub name: String,
+    /// The new `CREATE VIEW` text.
+    pub sql: String,
 }
 
 /// What a statement emits after all of its schema writes, so that the
