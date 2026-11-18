@@ -1367,7 +1367,9 @@ where
     }
     p.compute_ymd_hms();
 
-    let mut res = String::new();
+    // Most directives write a few more characters than their two, and `%J`
+    // writes up to 17, so this capacity usually holds the whole result.
+    let mut res = String::with_capacity(fmt_str.len() + 16);
     let mut chars = fmt_str.chars().peekable();
 
     let days_after_jan1 = |curr: &DateTime| -> i64 {
