@@ -3,7 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
-use crate::functions::{is_system_column, pg_func, Immutability};
+use crate::functions::{datetime_result_type, is_system_column, pg_func, Immutability};
 use crate::names::{
     extract_key_columns, is_default_schema, is_pg_catalog, object_name, schema_qualifier,
     unqualified_name,
@@ -3689,16 +3689,27 @@ impl PostgreSQLTranslator {
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
                 }
+                // CURRENT_DATE, CURRENT_TIME and LOCALTIME are refused if
+                // tursopg does not support the type each returns in
+                // PostgreSQL.
                 match SqlValueFunctionOp::try_from(svf.op) {
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
+                        check_type_is_supported("date", 0)?;
                         Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
                     }
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
-                        | SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopLocaltime
-                        | SqlValueFunctionOp::SvfopLocaltimeN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
+                        | SqlValueFunctionOp::SvfopCurrentTimeN,
+                    ) => {
+                        check_type_is_supported("timetz", 0)?;
+                        Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
+                    }
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltime | SqlValueFunctionOp::SvfopLocaltimeN,
+                    ) => {
+                        check_type_is_supported("time", 0)?;
+                        Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
+                    }
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
                         | SqlValueFunctionOp::SvfopCurrentTimestampN
@@ -4438,6 +4449,9 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        if let Some(result_type) = datetime_result_type(&func_name) {
+            check_type_is_supported(result_type, 0)?;
+        }
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
@@ -11544,7 +11558,7 @@ mod tests {
     #[test]
     fn test_current_timestamp_translation() {
         let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME FROM t";
+        let sql = "SELECT CURRENT_TIMESTAMP FROM t";
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
 
@@ -11556,11 +11570,7 @@ mod tests {
             panic!("Expected SELECT body");
         };
 
-        let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
-            ast::Expr::Literal(ast::Literal::CurrentDate),
-            ast::Expr::Literal(ast::Literal::CurrentTime),
-        ];
+        let expected = [ast::Expr::Literal(ast::Literal::CurrentTimestamp)];
 
         assert_eq!(columns.len(), expected.len());
 
