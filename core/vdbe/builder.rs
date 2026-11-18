@@ -1699,7 +1699,10 @@ impl ProgramBuilder {
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        let mut non_constant = Vec::with_capacity(self.insns.len());
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, that push copies the whole program to a
+        // larger buffer.
+        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
         let mut constant = Vec::new();
         let mut span_idx = 0;
 
