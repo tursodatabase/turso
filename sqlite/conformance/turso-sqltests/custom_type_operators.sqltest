@@ -532,12 +532,12 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-type-without-arithmetic-error {
-    CREATE TABLE t1(ts timestamp) STRICT;
-    INSERT INTO t1 VALUES ('2024-01-05 10:00:00');
-    SELECT ts + 1 FROM t1;
+    CREATE TABLE t1(u uuid) STRICT;
+    INSERT INTO t1 VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT u + 1 FROM t1;
 }
 expect error {
-    operator does not exist: timestamp \+ integer
+    operator does not exist: uuid \+ integer
 }
 
 @requires strict "uses STRICT tables"

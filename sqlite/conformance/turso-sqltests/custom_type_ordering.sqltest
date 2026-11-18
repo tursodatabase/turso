@@ -560,6 +560,17 @@ expect error {
     collations are not supported by type date
 }
 
+# The COLLATE applies to every row of a VALUES list, not only the first.
+@requires strict "uses STRICT tables"
+test compound-order-by-rejects-collate-on-timestamptz-in-second-row-of-values {
+    CREATE TABLE t(at timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-01 00:00:00+00');
+    SELECT NULL UNION VALUES (NULL), ((SELECT at FROM t)) ORDER BY 1 COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type timestamptz
+}
+
 # A text collation would sort 10.00 before 9.00.
 @requires strict "uses STRICT tables"
 test compound-order-by-rejects-collate-on-numeric-column {

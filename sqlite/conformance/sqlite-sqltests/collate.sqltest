@@ -542,6 +542,19 @@ expect {
     order|b
 }
 
+# A VALUES list in a UNION compares with the collation of its first row.
+test collate_union_values_uses_first_row_collation {
+    SELECT 'first', * FROM (SELECT 'a' UNION VALUES ('A' COLLATE NOCASE), ('b')) ORDER BY 2;
+    SELECT 'second', * FROM (SELECT 'a' UNION VALUES ('b'), ('A' COLLATE NOCASE)) ORDER BY 2;
+}
+expect {
+    first|A
+    first|b
+    second|A
+    second|a
+    second|b
+}
+
 # --- CASE expression: NOCASE column in WHEN clause after hash join ---
 @cross-check-integrity
 test collate_case_when_nocase_after_join {

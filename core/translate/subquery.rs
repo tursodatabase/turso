@@ -13,7 +13,7 @@ use super::{
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr::expr_type::{type_of, TypeEnv};
+use crate::translate::expr::expr_type::{query_column_type, select_column_type};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -916,16 +916,16 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                let env = TypeEnv::new(Some(&plan.table_references), resolver);
                 let columns: Vec<_> = plan
                     .result_columns
                     .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
+                    .enumerate()
+                    .map(|(column, result_col)| RowValueSubqueryColumn {
                         affinity: get_expr_affinity(
                             &result_col.expr,
                             &ExprContext::new(Some(&plan.table_references), resolver),
                         ),
-                        expr_type: type_of(&result_col.expr, &env),
+                        expr_type: select_column_type(&plan, column, resolver),
                     })
                     .collect();
                 if let [column] = columns.as_slice() {
@@ -1145,14 +1145,12 @@ fn get_subquery_parser<'a>(
 
                 // A string literal or parameter on the left is read as the
                 // type of the column it is compared with.
-                let result_column_env = TypeEnv::new(Some(table_references), resolver);
-                resolver.in_subquery_column_types.insert(
-                    subquery_id,
-                    result_columns
-                        .iter()
-                        .map(|result_col| type_of(&result_col.expr, &result_column_env))
-                        .collect(),
-                );
+                let column_types = (0..result_columns.len())
+                    .map(|column| query_column_type(&plan, column, resolver))
+                    .collect();
+                resolver
+                    .in_subquery_column_types
+                    .insert(subquery_id, column_types);
 
                 let columns = result_columns
                     .iter()
