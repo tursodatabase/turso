@@ -1,7 +1,7 @@
 use super::{Connection, SchemaReparseGuard, TransactionState};
 use crate::alloc::TryClone;
 use crate::namespace::NamespaceId;
-use crate::schema::load::{NamespaceNames, SchemaLoader, SchemaRows};
+use crate::schema::load::{NamespaceNames, SchemaLoader, SchemaRows, Sequences};
 use crate::schema::SequencesByNamespace;
 use crate::sync::Arc;
 use crate::util::IOExt;
@@ -28,39 +28,13 @@ pub struct ReparseSchemaInner {
     /// Runs the steps converted to [`LoadStep`](crate::schema::load::LoadStep)
     /// and holds the schema that is being read.
     loader: SchemaLoader,
-    /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
-    /// instead of re-reading each backing table. `None` for a normal reparse,
-    /// which recovers descriptors from disk in the `PopulateSequences` phase.
-    preserved_sequences: Option<SequencesByNamespace>,
     phase: ReparsePhase,
 }
 
 enum ReparsePhase {
-    /// Running the steps of the schema loader: the schema rows and the
-    /// names of the namespaces.
+    /// Running the steps of the schema loader: the schema rows, the names
+    /// of the namespaces and the sequences.
     RunLoadSteps,
-    /// Recovering sequence descriptors from each `__turso_internal_seq_*`
-    /// backing table via SQL (or grafting the VACUUM-preserved map). The
-    /// per-backing-table descriptor read yields IO, so the worklist and the
-    /// in-flight statement are carried across re-entry here.
-    PopulateSequences {
-        /// `(backing_table_name, seq_name)` worklist; `None` until lazily
-        /// computed. Left empty when preserved sequences are grafted.
-        pending: Option<crate::alloc::Vec<(String, String)>>,
-        /// Index of the backing table currently being read.
-        idx: usize,
-        /// In-flight descriptor `SELECT`, created lazily per backing table.
-        stmt: Option<Box<Statement>>,
-        /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
-        meta: Option<(i64, i64, i64, i64, bool)>,
-        /// Sequence reconstructed from `meta`, retained while the watermark
-        /// query yields IO.
-        seq: Option<crate::schema::Sequence>,
-        /// In-flight watermark `SELECT`, created after `seq` is known.
-        watermark_stmt: Option<Box<Statement>>,
-        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
-        watermark_row: Option<(i64, bool)>,
-    },
     /// Loading custom type definitions from the internal types table.
     LoadTypes { stmt: Box<Statement> },
     /// Loading the CREATE TYPE statements, then building the materialized
@@ -80,20 +54,6 @@ enum ReparsePhase {
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
     },
-}
-
-impl ReparsePhase {
-    fn populate_sequences() -> Self {
-        ReparsePhase::PopulateSequences {
-            pending: None,
-            idx: 0,
-            stmt: None,
-            meta: None,
-            seq: None,
-            watermark_stmt: None,
-            watermark_row: None,
-        }
-    }
 }
 
 impl Connection {
@@ -189,6 +149,7 @@ impl Connection {
             vec![
                 Box::new(SchemaRows::new(self.clone())),
                 Box::new(NamespaceNames::default()),
+                Box::new(Sequences::new(self.clone(), preserved_sequences)),
             ],
         );
         loader.prepare_next_statement(self)?;
@@ -200,7 +161,6 @@ impl Connection {
         Ok(ReparseSchemaInner {
             _guard: guard,
             loader,
-            preserved_sequences,
             phase: ReparsePhase::RunLoadSteps,
         })
     }
@@ -219,114 +179,6 @@ impl Connection {
             match &mut inner.phase {
                 ReparsePhase::RunLoadSteps => {
                     crate::return_if_io!(inner.loader.run(self));
-                    // Next: recover sequence descriptors (or graft the VACUUM map).
-                    inner.phase = ReparsePhase::populate_sequences();
-                }
-                ReparsePhase::PopulateSequences {
-                    pending,
-                    idx,
-                    stmt,
-                    meta,
-                    seq,
-                    watermark_stmt,
-                    watermark_row,
-                } => {
-                    // Lazy init: graft the VACUUM-preserved descriptor map, or
-                    // compute the worklist of backing tables to read from disk.
-                    // When there is real work, install `fresh` first so the
-                    // descriptor SELECTs can resolve the backing tables.
-                    if pending.is_none() {
-                        if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner
-                                .loader
-                                .load
-                                .schema
-                                .set_sequences_by_namespace(sequences);
-                            *pending = Some(crate::alloc::vec![]);
-                        } else {
-                            let work = inner.loader.load.schema.sequence_backing_table_names();
-                            if !work.is_empty() {
-                                self.install_schema_keeping_dialect_schema(
-                                    &inner.loader.load.schema,
-                                )?;
-                            }
-                            *pending = Some(work);
-                        }
-                    }
-
-                    // Read each remaining backing table's descriptor row. The
-                    // backing table is internal; a missing/unreadable descriptor
-                    // row is on-disk corruption (not "sequence missing"), so any
-                    // failure surfaces as `Corrupt` and fails the open rather than
-                    // silently dropping the sequence.
-                    loop {
-                        let entry = {
-                            let work = pending.as_ref().expect("pending initialized above");
-                            if *idx >= work.len() {
-                                break;
-                            }
-                            work[*idx].clone()
-                        };
-                        let (backing_table_name, seq_name) = entry;
-                        let normalized = crate::util::normalize_ident(&seq_name);
-                        let (namespace, sequence_name) =
-                            inner.loader.load.schema.demangle_name(&normalized);
-                        if inner
-                            .loader
-                            .load
-                            .schema
-                            .has_sequence(namespace, sequence_name)
-                        {
-                            *idx += 1;
-                            *stmt = None;
-                            *meta = None;
-                            *seq = None;
-                            *watermark_stmt = None;
-                            *watermark_row = None;
-                            continue;
-                        }
-                        if seq.is_none() {
-                            crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
-                                &backing_table_name,
-                                &seq_name,
-                                stmt,
-                                meta,
-                            ));
-                            *seq = Some(Self::sequence_from_descriptor_meta(
-                                sequence_name,
-                                &backing_table_name,
-                                *meta,
-                            )?);
-                            *stmt = None;
-                            *meta = None;
-                        }
-                        let sequence = seq.as_ref().expect("sequence set above");
-                        crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
-                            &backing_table_name,
-                            sequence,
-                            watermark_stmt,
-                            watermark_row,
-                        ));
-                        let watermark = Self::sequence_watermark_from_row(
-                            &backing_table_name,
-                            sequence,
-                            *watermark_row,
-                        )?;
-                        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                            mv_store.set_sequence_watermark(&normalized, watermark);
-                        }
-                        let sequence = seq.take().expect("sequence set above");
-                        inner
-                            .loader
-                            .load
-                            .schema
-                            .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
-                        *idx += 1;
-                        *stmt = None;
-                        *meta = None;
-                        *watermark_stmt = None;
-                        *watermark_row = None;
-                    }
 
                     // Decide whether to load custom types next.
                     if self.experimental_custom_types_enabled()

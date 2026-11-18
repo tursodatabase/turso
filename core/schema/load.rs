@@ -3,7 +3,9 @@
 
 use crate::connection::Connection;
 use crate::namespace::NamespaceId;
-use crate::schema::{Schema, StoredMaterializedView, TURSO_NAMESPACES_TABLE_NAME};
+use crate::schema::{
+    Schema, Sequence, SequencesByNamespace, StoredMaterializedView, TURSO_NAMESPACES_TABLE_NAME,
+};
 use crate::statement::StatementOrigin;
 use crate::sync::Arc;
 use crate::types::{IOResult, IOResultOr};
@@ -301,5 +303,194 @@ impl LoadStep for NamespaceNames {
 
     fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
         load.schema.load_namespace_names(&self.rows)
+    }
+}
+
+/// Reads the description of every sequence from its backing table.
+pub(crate) struct Sequences {
+    conn: Arc<Connection>,
+    /// The sequences that VACUUM kept from before it rebuilt the file. They
+    /// replace reading the backing tables.
+    preserved: Option<SequencesByNamespace>,
+    /// `(backing table name, sequence name)` of each backing table, or None
+    /// before the first call of `next_query`.
+    backing_tables: Option<crate::alloc::Vec<(String, String)>>,
+    /// Index in `backing_tables` of the backing table being read.
+    current: usize,
+    read: SequenceRead,
+}
+
+/// How far the read of one sequence backing table is.
+enum SequenceRead {
+    NotStarted,
+    /// Reading the row `(start, inc, min, max, cycle)`.
+    Descriptor {
+        row: Option<(i64, i64, i64, i64, bool)>,
+    },
+    /// The descriptor row is read, and the watermark query is next.
+    DescriptorRead {
+        sequence: Sequence,
+    },
+    /// Reading the row `(value, is_called)`.
+    Watermark {
+        sequence: Sequence,
+        row: Option<(i64, bool)>,
+    },
+}
+
+impl Sequences {
+    pub(crate) fn new(conn: Arc<Connection>, preserved: Option<SequencesByNamespace>) -> Self {
+        Self {
+            conn,
+            preserved,
+            backing_tables: None,
+            current: 0,
+            read: SequenceRead::NotStarted,
+        }
+    }
+
+    fn current_backing_table(&self) -> (&str, &str) {
+        let backing_tables = self
+            .backing_tables
+            .as_ref()
+            .expect("set by the first call of next_query");
+        let (backing_table_name, sequence_name) = &backing_tables[self.current];
+        (backing_table_name, sequence_name)
+    }
+}
+
+impl LoadStep for Sequences {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+        if self.backing_tables.is_none() {
+            if let Some(sequences) = self.preserved.take() {
+                load.schema.set_sequences_by_namespace(sequences);
+                self.backing_tables = Some(crate::alloc::vec![]);
+            } else {
+                self.backing_tables = Some(load.schema.sequence_backing_table_names());
+            }
+        }
+        let backing_tables = self.backing_tables.as_ref().expect("set above");
+        if let SequenceRead::DescriptorRead { .. } = &self.read {
+            let SequenceRead::DescriptorRead { sequence } =
+                std::mem::replace(&mut self.read, SequenceRead::NotStarted)
+            else {
+                unreachable!("matched above");
+            };
+            let (backing_table_name, _) = &backing_tables[self.current];
+            let sql = Connection::sequence_watermark_query(backing_table_name, &sequence);
+            self.read = SequenceRead::Watermark {
+                sequence,
+                row: None,
+            };
+            return Ok(Some(LoadQuery::internal_helper(sql)));
+        }
+        turso_assert!(
+            matches!(self.read, SequenceRead::NotStarted),
+            "the statement before must be read to its end"
+        );
+        while let Some((backing_table_name, mangled_name)) = backing_tables.get(self.current) {
+            let normalized = crate::util::normalize_ident(mangled_name);
+            let (namespace, sequence_name) = load.schema.demangle_name(&normalized);
+            if load.schema.has_sequence(namespace, sequence_name) {
+                self.current += 1;
+                continue;
+            }
+            self.read = SequenceRead::Descriptor { row: None };
+            return Ok(Some(LoadQuery::internal_helper(
+                Connection::sequence_descriptor_query(backing_table_name),
+            )));
+        }
+        Ok(None)
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> Result<()> {
+        match &mut self.read {
+            SequenceRead::Descriptor { row: descriptor } => {
+                *descriptor = Some(Connection::sequence_descriptor_from_row(row)?);
+            }
+            SequenceRead::Watermark { row: watermark, .. } => {
+                *watermark = Some(Connection::sequence_watermark_row(row)?);
+            }
+            SequenceRead::NotStarted | SequenceRead::DescriptorRead { .. } => {
+                unreachable!("a row without a statement being read")
+            }
+        }
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+        let backing_tables = self
+            .backing_tables
+            .as_ref()
+            .expect("set by the first call of next_query");
+        let (backing_table_name, mangled_name) = &backing_tables[self.current];
+        let normalized = crate::util::normalize_ident(mangled_name);
+        match std::mem::replace(&mut self.read, SequenceRead::NotStarted) {
+            SequenceRead::Descriptor { row } => {
+                let (_, sequence_name) = load.schema.demangle_name(&normalized);
+                let sequence = Connection::sequence_from_descriptor_meta(
+                    sequence_name,
+                    backing_table_name,
+                    row,
+                )?;
+                self.read = SequenceRead::DescriptorRead { sequence };
+            }
+            SequenceRead::Watermark { sequence, row } => {
+                let watermark =
+                    Connection::sequence_watermark_from_row(backing_table_name, &sequence, row)?;
+                if let Some(mv_store) = self.conn.db.get_mv_store().as_ref() {
+                    mv_store.set_sequence_watermark(&normalized, watermark);
+                }
+                load.schema
+                    .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
+                self.current += 1;
+            }
+            SequenceRead::NotStarted | SequenceRead::DescriptorRead { .. } => {
+                unreachable!("the end of rows without a statement being read")
+            }
+        }
+        Ok(())
+    }
+
+    /// A backing table is the engine's own, so a statement on it fails only
+    /// when the file is corrupt. Reporting that the sequence does not exist
+    /// would hide it.
+    fn query_failed(&self, failure: QueryFailure, err: LimboError) -> LimboError {
+        let (backing_table_name, mangled_name) = self.current_backing_table();
+        match (&self.read, failure) {
+            (SequenceRead::Descriptor { .. }, QueryFailure::Prepare) => {
+                Connection::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    mangled_name,
+                    "cannot prepare descriptor SELECT",
+                    &err,
+                )
+            }
+            (SequenceRead::Descriptor { .. }, QueryFailure::Read) => {
+                Connection::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    mangled_name,
+                    "descriptor row read failed",
+                    &err,
+                )
+            }
+            (SequenceRead::Watermark { sequence, .. }, QueryFailure::Prepare) => {
+                Connection::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    &sequence.name,
+                    "cannot prepare watermark SELECT",
+                    &err,
+                )
+            }
+            (SequenceRead::Watermark { sequence, .. }, QueryFailure::Read) => {
+                Connection::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    &sequence.name,
+                    "watermark row read failed",
+                    &err,
+                )
+            }
+            (SequenceRead::NotStarted | SequenceRead::DescriptorRead { .. }, _) => err,
+        }
     }
 }
