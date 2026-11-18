@@ -2,8 +2,8 @@ mod sqlite_schema_rows;
 
 pub(crate) use sqlite_schema_rows::{
     emit_create_internal_table, emit_delete_index_row, emit_delete_rows_of_table,
-    emit_delete_temp_triggers_on_table, emit_schema_entry, open_sqlite_schema_for_write,
-    SchemaEntryType,
+    emit_delete_temp_triggers_on_table, emit_drop_view_row, emit_schema_entry,
+    open_sqlite_schema_for_write, SchemaEntryType,
 };
 
 use crate::dialect::CatalogChange;
