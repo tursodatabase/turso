@@ -2690,7 +2690,7 @@ fn encrypted_restore_rejects_storage_changes_but_allows_schema_publication() -> 
             owner.publish_schema_after_external_restore()?;
             if let Some(store) = owner.mv_store().as_ref() {
                 assert!(store.reset_logical_log_after_external_restore().is_err());
-                if let Some(completion) = store.sync_logical_log_after_external_restore(&owner)? {
+                if let Some(completion) = store.sync_logical_log(&owner)? {
                     tmp.io.wait_for_completion(completion)?;
                 }
             }

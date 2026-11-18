@@ -2178,8 +2178,7 @@ mod explicit_page_size {
                     for api in [OpenApi::Open, OpenApi::OpenWithStorage, OpenApi::OpenAsync] {
                         let error =
                             open(io.clone(), path, options.clone().page_size(requested), api)
-                                .err()
-                                .expect("cached open accepted a mismatching page size");
+                                .expect_err("cached open accepted a mismatching page size");
                         assert_mismatch(error, requested, actual);
 
                         for size in [None, Some(actual)] {
@@ -2208,8 +2207,7 @@ mod explicit_page_size {
                                 })
                                 .page_size(requested);
                             let error = open(io.clone(), path, wrong_key, api)
-                                .err()
-                                .expect("cached open accepted the wrong key");
+                                .expect_err("cached open accepted the wrong key");
                             assert!(
                                 matches!(
                                     error,
@@ -2260,8 +2258,7 @@ mod explicit_page_size {
                     OpenApi::RawOpenAsync,
                 ] {
                     let error = open(io.clone(), path, options.clone().page_size(requested), api)
-                        .err()
-                        .expect("cold open accepted a mismatching page size");
+                        .expect_err("cold open accepted a mismatching page size");
                     assert_mismatch(error, requested, actual);
                     assert_eq!(std::fs::read(path)?, original);
 
@@ -2274,8 +2271,7 @@ mod explicit_page_size {
                             })
                             .page_size(requested);
                         let error = open(io.clone(), path, wrong_key, api)
-                            .err()
-                            .expect("cold open accepted the wrong key");
+                            .expect_err("cold open accepted the wrong key");
                         assert!(
                             matches!(
                                 error,
