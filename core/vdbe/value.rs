@@ -364,7 +364,6 @@ impl Value {
     }
 
     pub fn exec_quote(&self) -> Self {
-        use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Numeric(Numeric::Integer(i)) => Value::build_text(i.to_string()),
@@ -375,9 +374,7 @@ impl Value {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
                 quoted.push_str("X'");
-                for byte in b.iter() {
-                    write!(&mut quoted, "{byte:02X}").expect("unable to write hex bytes");
-                }
+                push_hex_upper(&mut quoted, b);
                 quoted.push('\'');
                 Value::build_text(quoted)
             }
@@ -669,11 +666,9 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) => {
-                let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
-            }
-            Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
+            Value::Text(text) => Value::build_text(hex_upper(text.as_str().as_bytes())),
+            Value::Numeric(_) => Value::build_text(hex_upper(self.to_string().as_bytes())),
+            Value::Blob(blob_bytes) => Value::build_text(hex_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
     }
@@ -1568,6 +1563,22 @@ impl Value {
             })
             .collect();
         Value::build_text(result)
+    }
+}
+
+/// `bytes` as upper-case hex digits, two for each byte, as `hex::encode_upper`
+/// writes them.
+fn hex_upper(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    push_hex_upper(&mut hex, bytes);
+    hex
+}
+
+fn push_hex_upper(out: &mut String, bytes: &[u8]) {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in bytes {
+        out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
     }
 }
 
@@ -3551,6 +3562,12 @@ mod tests {
         // Test TooBig error
         let input = Value::from_i64(Value::MAX_BLOB_LENGTH + 1);
         assert!(input.exec_zeroblob().is_err());
+    }
+
+    #[test]
+    fn hex_upper_matches_hex_crate() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(super::hex_upper(&bytes), hex::encode_upper(&bytes));
     }
 
     #[test]
