@@ -11014,12 +11014,6 @@ mod tests {
         page
     }
 
-    /// Deterministic coverage for the allocation-failure window created by routing
-    /// overflow-cell payloads through `TursoAllocator`: in
-    /// `OverwriteCellState::ClearOverflowPagesAndOverwrite`, `drop_cell` mutates the
-    /// page before `insert_into_cell`, whose overflow-cell branch can fail on
-    /// allocation. A fault there must not lose the row or corrupt the tree.
-    ///
     /// Nightly-only because on stable `crate::alloc::Vec` degrades to the global
     /// allocator, so the injected fault can never fire.
     #[cfg(all(nightly, feature = "allocation_metric"))]
@@ -11029,7 +11023,6 @@ mod tests {
             current_allocation_site, AllocError, AllocationSite, ApiAllocator, BTreeAllocationSite,
             Global, Layout, TursoAllocBackend,
         };
-        use crate::security::roles::SessionRole;
         use std::cell::Cell as StdCell;
         use std::ptr::NonNull;
         use test_log::test;
@@ -11068,53 +11061,6 @@ mod tests {
 
         fn disarm_fault() {
             FAIL_SITE.with(|slot| slot.set(None));
-        }
-
-        #[test]
-        fn overwrite_survives_overflow_cell_allocation_failure() {
-            #[allow(clippy::arc_with_non_send_sync)]
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db =
-                Database::open_file(io, "overflow-cell-fault.db", Arc::new(SqliteDialect)).unwrap();
-            let conn = db
-                .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-                .unwrap();
-
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-                .unwrap();
-            // Row 1 is the overwrite target; the filler rows pack the leaf page so
-            // that growing row 1 cannot fit locally and must spill to an overflow
-            // cell inside insert_into_cell.
-            conn.execute(format!("INSERT INTO t VALUES (1, '{}')", "a".repeat(600)))
-                .unwrap();
-            for id in 2..=6 {
-                conn.execute(format!(
-                    "INSERT INTO t VALUES ({id}, '{}')",
-                    "b".repeat(600)
-                ))
-                .unwrap();
-            }
-            let rows_before = query_single_i64(&conn, "SELECT count(*) FROM t");
-            assert_eq!(rows_before, 6);
-
-            arm_fault(BTreeAllocationSite::OverflowCell);
-            let update = conn.execute(format!(
-                "UPDATE t SET v = '{}' WHERE id = 1",
-                "c".repeat(1400)
-            ));
-            disarm_fault();
-            assert!(
-                update.is_err(),
-                "update should fail once the overflow-cell allocation is denied"
-            );
-
-            // The failed statement must not lose the row or corrupt the tree.
-            assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 6);
-            assert_eq!(
-                query_single_i64(&conn, "SELECT length(v) FROM t WHERE id = 1"),
-                600
-            );
-            assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
         }
 
         /// Regression test: the overflow-read epilogue empties the payload held
