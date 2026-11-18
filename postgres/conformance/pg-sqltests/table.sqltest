@@ -260,6 +260,10 @@ test table-date-arithmetic {
 expect {
     2025-01-06|2025-01-04|4
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test table-indexed-date-column-with-default {
     CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
@@ -272,6 +276,10 @@ expect {
     2024-05-06
     1|2024-05-06
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test table-cast-timestamp-column-to-date-and-time {
     CREATE TABLE events (ts timestamp);
@@ -280,6 +288,10 @@ test table-cast-timestamp-column-to-date-and-time {
 }
 expect {
     2024-01-15|10:30:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test table-check-on-smallint-column {
@@ -844,6 +856,10 @@ test array-columns-hold-element-values {
 expect {
     1|1|1|1|1|1|1|0
     {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}|{2024-01-02}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test array-of-booleans-from-literal-and-aggregate {
