@@ -5182,6 +5182,55 @@ mod tests {
     }
 
     #[test]
+    fn sequences_and_tables_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        // `aux.name` finds only objects that are in no schema, which a file
+        // made with the SQLite dialect has.
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_mvcc(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            conn.execute("CREATE SEQUENCE s").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "CREATE SEQUENCE aux.other",
+            "DROP SEQUENCE aux.s",
+            "DROP TABLE aux.t",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
 
     fn test_pg_namespace_query() {
         let temp_dir = tempdir().unwrap();
