@@ -1,4 +1,5 @@
 mod acl;
+mod attributes;
 mod auth_functions;
 mod auth_members;
 mod catalog;

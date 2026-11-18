@@ -129,12 +129,12 @@ impl PostgreSQLTranslator {
     }
 
     /// Maps PostgreSQL system table names to their Turso equivalents.
-    /// pg_class, pg_namespace, and pg_attribute have virtual table implementations
-    /// and are passed through as-is. Other information_schema names are mapped
-    /// to SQLite equivalents.
+    /// The catalog tables that the frontend has under their PostgreSQL names,
+    /// such as pg_class, pg_namespace and pg_attribute, are passed through
+    /// as-is. Other information_schema names are mapped to SQLite equivalents.
     fn map_table_name(&self, table_name: &str) -> String {
         match table_name.to_lowercase().as_str() {
-            // These have virtual table implementations in pg_catalog.rs - pass through
+            // The frontend has these under the same name - pass through
             "pg_class"
             | "pg_namespace"
             | "pg_attribute"

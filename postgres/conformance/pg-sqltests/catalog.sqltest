@@ -1763,3 +1763,110 @@ expect {
     zz_serial_depend_owned_seq|2|a
     zz_serial_depend_c_seq|3|a
 }
+
+test pg-attribute-follows-alter-table {
+    CREATE TABLE zz_attr_alter (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL);
+    ALTER TABLE zz_attr_alter ADD COLUMN extra TEXT DEFAULT 'x';
+    ALTER TABLE zz_attr_alter RENAME COLUMN name TO full_name;
+    ALTER TABLE zz_attr_alter DROP COLUMN score;
+    ALTER TABLE zz_attr_alter RENAME TO zz_attr_altered;
+    SELECT a.attname, a.attnotnull, a.atthasdef
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'zz_attr_altered' AND a.attnum > 0 AND NOT a.attisdropped
+    ORDER BY a.attnum;
+}
+expect {
+    id|t|f
+    full_name|t|f
+    extra|f|t
+}
+
+test pg-attribute-has-no-rows-of-a-dropped-table {
+    CREATE TABLE zz_attr_dropped (zz_attr_dropped_a INTEGER, zz_attr_dropped_b TEXT);
+    DROP TABLE zz_attr_dropped;
+    SELECT count(*) FROM pg_attribute WHERE attname LIKE 'zz_attr_dropped%';
+}
+expect {
+    0
+}
+
+test pg-attribute-has-no-rows-of-a-rolled-back-table {
+    CREATE TABLE zz_attr_kept (zz_attr_kept_a INTEGER);
+    BEGIN;
+    CREATE TABLE zz_attr_rolled_back (zz_attr_rolled_back_a INTEGER);
+    ALTER TABLE zz_attr_kept ADD COLUMN zz_attr_rolled_back_b TEXT;
+    ALTER TABLE zz_attr_kept RENAME COLUMN zz_attr_kept_a TO zz_attr_rolled_back_c;
+    ROLLBACK;
+    SELECT attname FROM pg_attribute WHERE attname LIKE 'zz_attr_%' ORDER BY attname;
+}
+expect {
+    zz_attr_kept_a
+}
+
+test pg-attribute-follows-a-table-created-and-altered-in-one-transaction {
+    BEGIN;
+    CREATE TABLE zz_attr_tx (zz_attr_tx_a INTEGER);
+    ALTER TABLE zz_attr_tx ADD COLUMN zz_attr_tx_b TEXT;
+    COMMIT;
+    SELECT attname FROM pg_attribute WHERE attname LIKE 'zz_attr_tx%' ORDER BY attnum;
+}
+expect {
+    zz_attr_tx_a
+    zz_attr_tx_b
+}
+
+test pg-attribute-has-the-columns-of-a-table-of-a-schema {
+    CREATE SCHEMA zz_attr_schema;
+    CREATE TABLE zz_attr_schema.zz_attr_t (a INTEGER, b TEXT);
+    CREATE TABLE zz_attr_t (c INTEGER);
+    SELECT n.nspname, a.attname
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'zz_attr_t' AND a.attnum > 0
+    ORDER BY n.nspname, a.attnum;
+    DROP SCHEMA zz_attr_schema CASCADE;
+    SELECT a.attname
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'zz_attr_t' AND a.attnum > 0;
+}
+expect {
+    public|c
+    zz_attr_schema|a
+    zz_attr_schema|b
+    c
+}
+
+test pg-attribute-alter-table-errors {
+    ALTER TABLE pg_attribute ADD COLUMN zz_added INTEGER;
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-rename-errors {
+    ALTER TABLE pg_catalog.pg_attribute RENAME TO zz_renamed;
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-drop-table-errors {
+    DROP TABLE pg_attribute;
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-create-index-errors {
+    CREATE INDEX zz_attr_idx ON pg_attribute (attname);
+}
+@sqlstate 42501
+expect error {permission denied: "pg_attribute" is a system catalog}
+
+test pg-attribute-is-read-by-a-role-without-privileges {
+    CREATE TABLE zz_attr_read (zz_attr_read_a INTEGER, zz_attr_read_b TEXT);
+    CREATE ROLE zz_attr_reader;
+    GRANT SELECT ON pg_attribute TO zz_attr_reader;
+    SET ROLE zz_attr_reader;
+    SELECT count(*) FROM pg_attribute WHERE attname LIKE 'zz_attr_read%';
+}
+expect {
+    2
+}

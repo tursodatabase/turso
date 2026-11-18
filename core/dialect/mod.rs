@@ -73,6 +73,14 @@ pub enum CatalogChange {
         name: String,
         owner: NewOwner,
     },
+    /// The columns that table `name` has from now on. Sent when the table is
+    /// created, and when `ALTER TABLE` adds, drops, renames or alters one of
+    /// its columns.
+    SetColumns {
+        namespace: NamespaceId,
+        name: String,
+        table: Arc<BTreeTable>,
+    },
     /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
     RenameColumn {
         namespace: NamespaceId,

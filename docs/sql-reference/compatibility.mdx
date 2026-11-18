@@ -34,6 +34,14 @@ The PostgreSQL opening functions initialize the relation catalog before returnin
 the database, including for asynchronous server opens. Relations receive stable,
 persisted OIDs when created, and column `attrelid` values identify those relations.
 
+`pg_catalog.pg_attribute` is a table in the database file. A statement that
+creates a table, drops it or changes its columns writes the rows of the table's
+columns in the same transaction. Every role reads `pg_attribute`. No statement
+of a user writes it: `INSERT`, `UPDATE`, `DELETE`, `ALTER TABLE`, `DROP TABLE`
+and `CREATE INDEX` on it fail with SQLSTATE 42501. A database that an earlier
+version made has no such table, and opening it for writing creates the table
+and writes the rows of the tables the database has.
+
 The PostgreSQL frontend exposes the default `standard public schema` comment in
 `pg_catalog.pg_description`. This lets `pg_dump` preserve the default comment on
 `public` without emitting an empty `COMMENT ON SCHEMA` statement. User-defined

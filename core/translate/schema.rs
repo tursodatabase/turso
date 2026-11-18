@@ -1506,12 +1506,29 @@ pub fn translate_create_table(
     }
 
     if dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![CatalogChange::Create {
-            namespace: namespace.id,
-            name: normalized_tbl_name.clone(),
-            kind: RelationKind::Table,
-            table: None,
-        }];
+        let mut created_table = BTreeTable::from_create_table_ast(
+            &tbl_name,
+            &body,
+            0,
+            resolver.catalog.dialect.supports_namespaces(),
+        )?;
+        resolver.with_schema(database_id, |schema| {
+            created_table.resolve_custom_types(schema)?;
+            created_table.propagate_domain_constraints(schema)
+        })?;
+        let mut changes = vec![
+            CatalogChange::Create {
+                namespace: namespace.id,
+                name: normalized_tbl_name.clone(),
+                kind: RelationKind::Table,
+                table: None,
+            },
+            CatalogChange::SetColumns {
+                namespace: namespace.id,
+                name: normalized_tbl_name.clone(),
+                table: Arc::new(created_table),
+            },
+        ];
         for index_name in autoindex_names {
             changes.push(CatalogChange::Create {
                 namespace: namespace.id,
