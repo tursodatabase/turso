@@ -1,7 +1,7 @@
 use crate::schema::{BTreeTable, Column, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
 use crate::translate::expr::{emit_custom_type_encode_columns, translate_expr};
 use crate::translate::plan::ColumnMask;
-use crate::vdbe::builder::{DmlColumnContext, DmlRowForm, SelfTableContext};
+use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
 use crate::{Arc, Result};
 
 use super::{ProgramBuilder, Resolver};
@@ -92,42 +92,6 @@ fn emit_generated_columns(
         }
         Ok(())
     })
-}
-
-/// Emit bytecode to compute the stored value of a single virtual generated
-/// column from a row whose registers hold stored values.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_gencol_expr_from_registers(
-    program: &mut ProgramBuilder,
-    column: &Column,
-    target_reg: usize,
-    registers_start: usize,
-    columns: &[Column],
-    resolver: &Resolver,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-    table: &Arc<BTreeTable>,
-) -> Result<()> {
-    let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
-        unreachable!("emit_gencol_expr_from_registers expects a virtual generated column");
-    };
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::layout(
-            columns,
-            registers_start,
-            rowid_reg,
-            layout.clone(),
-            DmlRowForm::Stored,
-        ),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, expr, target_reg, resolver)?;
-        Ok(())
-    })?;
-    emit_virtual_column_store(program, resolver, column, target_reg, table)?;
-
-    Ok(())
 }
 
 /// Turns the value of a virtual generated column's expression in `reg` into
