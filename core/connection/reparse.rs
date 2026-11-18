@@ -1,19 +1,19 @@
-use super::{Connection, SchemaReparseGuard, TransactionState};
+use super::{Connection, SchemaReparseGuard};
 use crate::alloc::TryClone;
 use crate::namespace::NamespaceId;
-use crate::schema::load::{NamespaceNames, SchemaLoader, SchemaRows, Sequences};
+use crate::schema::load::{
+    CustomTypes, DialectState, NamespaceNames, SchemaLoader, SchemaRows, Sequences, ViewsAndIndexes,
+};
 use crate::schema::SequencesByNamespace;
 use crate::sync::Arc;
 use crate::util::IOExt;
-use crate::{turso_assert, Result, Schema, Statement, Value};
-use std::collections::VecDeque;
+use crate::{Result, Schema};
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
 /// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
 /// `Start` is the fresh state (cookie not yet read / schema build not yet
-/// begun); `Building` carries the half-built schema, captured table-valued
-/// functions, the held reparse guard, and the current sub-phase across IO
-/// yields.
+/// begun); `Building` carries the schema loader with the half-built schema,
+/// the held reparse guard, and the current phase across IO yields.
 #[derive(Default)]
 pub enum ReparseSchemaState {
     #[default]
@@ -25,31 +25,15 @@ pub struct ReparseSchemaInner {
     /// Held for the whole reparse so a concurrent reparse on this connection
     /// trips the recursion assert. Dropped when the schema is finalized.
     _guard: SchemaReparseGuard,
-    /// Runs the steps converted to [`LoadStep`](crate::schema::load::LoadStep)
-    /// and holds the schema that is being read.
+    /// Runs the steps that read the schema, and holds the schema that is
+    /// being read.
     loader: SchemaLoader,
     phase: ReparsePhase,
 }
 
 enum ReparsePhase {
-    /// Running the steps of the schema loader: the schema rows, the names
-    /// of the namespaces and the sequences.
+    /// Running the steps of the schema loader.
     RunLoadSteps,
-    /// Loading custom type definitions from the internal types table.
-    LoadTypes { stmt: Box<Statement> },
-    /// Loading the CREATE TYPE statements, then building the materialized
-    /// views and indexes that the schema rows step collected.
-    BuildIndexes,
-    /// Loading the dialect's own schema state, such as the PostgreSQL
-    /// frontend's relation catalog: `stmt` reads one query into `rows`, the
-    /// rows of the queries before it are in `results`, and `queries` are
-    /// still to be read.
-    LoadDialectSchema {
-        stmt: Box<Statement>,
-        rows: Vec<Vec<Value>>,
-        results: Vec<Vec<Vec<Value>>>,
-        queries: VecDeque<String>,
-    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -76,8 +60,8 @@ impl Connection {
     ///
     /// Blocking shim: VACUUM runs through the VDBE stepping layer (which
     /// does not thread IO out), so it drives the non-blocking reparse to
-    /// completion here, seeding the `PopulateSequences` phase with the
-    /// preserved map so it grafts rather than re-reading each backing table.
+    /// completion here, passing the preserved map to the sequences step so
+    /// it grafts rather than re-reading each backing table.
     pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
         self: &Arc<Connection>,
         cookie: u32,
@@ -121,7 +105,7 @@ impl Connection {
     /// build a fresh schema, capture table-valued functions, install the empty
     /// schema (the reprepare hack), and prepare the sqlite_schema scan.
     /// `preserved_sequences` is `Some` only for VACUUM, which grafts the map in
-    /// the `PopulateSequences` phase instead of re-reading the backing tables.
+    /// the sequences step instead of re-reading the backing tables.
     fn init_reparse_building(
         self: &Arc<Connection>,
         cookie: u32,
@@ -150,6 +134,9 @@ impl Connection {
                 Box::new(SchemaRows::new(self.clone())),
                 Box::new(NamespaceNames::new(self.clone())),
                 Box::new(Sequences::new(self.clone(), preserved_sequences)),
+                Box::new(CustomTypes::new(self.clone())),
+                Box::new(ViewsAndIndexes::new(self.clone())),
+                Box::new(DialectState::new(self.clone())),
             ],
         );
         loader.prepare_next_statement(self)?;
@@ -179,68 +166,6 @@ impl Connection {
             match &mut inner.phase {
                 ReparsePhase::RunLoadSteps => {
                     crate::return_if_io!(inner.loader.run(self));
-
-                    // Decide whether to load custom types next.
-                    if self.experimental_custom_types_enabled()
-                        && inner
-                            .loader
-                            .load
-                            .schema
-                            .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
-                    {
-                        // Temporarily install the schema so we can query against it.
-                        self.install_schema_keeping_dialect_schema(&inner.loader.load.schema)?;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT name, sql FROM {}",
-                            crate::schema::TURSO_TYPES_TABLE_NAME
-                        ))?;
-                        inner.phase = ReparsePhase::LoadTypes {
-                            stmt: Box::new(stmt),
-                        };
-                    } else {
-                        inner.phase = ReparsePhase::BuildIndexes;
-                    }
-                }
-                ReparsePhase::LoadTypes { stmt } => {
-                    let type_sqls = &mut inner.loader.load.type_sqls;
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        type_sqls.push(row.get::<&str>(1)?.to_string());
-                        Ok(())
-                    }));
-                    inner.phase = ReparsePhase::BuildIndexes;
-                }
-                ReparsePhase::BuildIndexes => {
-                    inner.loader.load.load_types_then_build_views_and_indexes(
-                        self.dialect().as_ref(),
-                        &self.syms.read(),
-                        self.mv_store().is_some(),
-                    )?;
-                    inner.phase = self.load_dialect_schema_phase(&inner.loader.load.schema)?;
-                }
-                ReparsePhase::LoadDialectSchema {
-                    stmt,
-                    rows,
-                    results,
-                    queries,
-                } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        turso_assert!(
-                            !matches!(self.get_tx_state(), TransactionState::None),
-                            "dialect schema state must be read in a transaction"
-                        );
-                        rows.push(row.get_values().cloned().collect());
-                        Ok(())
-                    }));
-                    results.push(std::mem::take(rows));
-                    if let Some(sql) = queries.pop_front() {
-                        *stmt = Box::new(self.prepare_engine_metadata_read(&sql)?);
-                        continue;
-                    }
-                    inner.loader.load.schema.dialect_schema = Some(
-                        self.db
-                            .dialect()
-                            .build_schema_state(&inner.loader.load.schema, results)?,
-                    );
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -267,27 +192,6 @@ impl Connection {
                 }
             }
         }
-    }
-
-    /// Returns the phase that loads the dialect's own schema state into
-    /// `fresh`, or the stats refresh phase if the dialect keeps none in this
-    /// database. The fresh schema is installed first, because the current
-    /// schema may not contain the dialect's tables yet.
-    fn load_dialect_schema_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        let mut queries = VecDeque::from(self.db.dialect().schema_state_queries(fresh));
-        let Some(sql) = queries.pop_front() else {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
-        };
-        self.install_schema_keeping_dialect_schema(fresh)?;
-        let stmt = self.prepare_engine_metadata_read(&sql)?;
-        Ok(ReparsePhase::LoadDialectSchema {
-            stmt: Box::new(stmt),
-            rows: Vec::new(),
-            results: Vec::new(),
-            queries,
-        })
     }
 
     /// Installs a copy of `fresh` as the connection's schema while the schema
