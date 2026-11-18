@@ -3145,22 +3145,9 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
         if range_func.ordinality {
-            let one = ast::Expr::Literal(ast::Literal::Numeric("1".into()));
-            let ordinality = if is_recordset {
-                ast::Expr::Binary(
-                    Box::new(ast::Expr::Qualified(
-                        exact_name("element"),
-                        exact_name("key"),
-                    )),
-                    ast::Operator::Add,
-                    Box::new(one),
-                )
-            } else {
-                one
-            };
             let name = names.last().expect("WITH ORDINALITY adds a column name");
             columns.push(ast::ResultColumn::Expr(
-                Box::new(bigint(ordinality)),
+                Box::new(row_number()),
                 Some(ast::As::Elided(exact_name(name.clone()))),
             ));
         }
@@ -5632,8 +5619,6 @@ struct RewrittenFunction {
     /// The column of the engine's table function that holds each column of the result,
     /// and the name PostgreSQL gives that column, for a call with this many arguments.
     columns: fn(usize) -> Vec<(ast::Expr, String)>,
-    /// The column of the engine's table function that holds WITH ORDINALITY.
-    ordinality: fn(usize) -> ast::Expr,
 }
 
 /// The most arrays one call of unnest() in FROM can take.
@@ -5693,7 +5678,6 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 2] = [
                 })
                 .collect()
         },
-        ordinality: |_| ast::Expr::Id(exact_name("ordinality")),
     },
     RewrittenFunction {
         name: "generate_series",
@@ -5711,13 +5695,6 @@ const REWRITTEN_FUNCTIONS: [RewrittenFunction; 2] = [
             Ok(())
         },
         columns: |_| vec![(ast::Expr::Id(exact_name("value")), "generate_series".into())],
-        ordinality: |_| {
-            let column = |name: &str| ast::Expr::Id(exact_name(name));
-            function_call(
-                "pg_generate_series_ordinality",
-                vec![column("value"), column("start"), column("step")],
-            )
-        },
     },
 ];
 
@@ -5753,7 +5730,9 @@ fn translate_rewritten_function(
         name.clone_from(&table_alias.aliasname);
     }
     let names = range_function_column_names(range_func, default_names)?;
-    sources.push(bigint((function.ordinality)(args.len())));
+    if range_func.ordinality {
+        sources.push(row_number());
+    }
     let columns = sources
         .into_iter()
         .zip(names)
@@ -5805,6 +5784,26 @@ fn bigint(expr: ast::Expr) -> ast::Expr {
             array_dimensions: 0,
         }),
     }
+}
+
+/// The number of a row of a function in FROM, counted from 1 for each call of the function.
+fn row_number() -> ast::Expr {
+    bigint(ast::Expr::FunctionCall {
+        name: exact_name("row_number"),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: Some(Box::new(ast::Over::Window(ast::Window {
+                base: None,
+                partition_by: vec![],
+                order_by: vec![],
+                frame_clause: None,
+            }))),
+        },
+    })
 }
 
 /// The names of the columns of a function in FROM. `function_columns` are the

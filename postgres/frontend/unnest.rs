@@ -19,10 +19,7 @@ impl VirtualTableModule for Unnest {
     fn schema(&self, _args: &[Value]) -> Result<String> {
         let elements = (1..=MAX_UNNEST_ARRAYS).map(unnest_column_name);
         let inputs = (1..=MAX_UNNEST_ARRAYS).map(|array| format!("input{array} HIDDEN"));
-        let columns: Vec<String> = elements
-            .chain(inputs)
-            .chain(["ordinality INTEGER HIDDEN".to_string()])
-            .collect();
+        let columns: Vec<String> = elements.chain(inputs).collect();
         Ok(format!("CREATE TABLE unnest ({})", columns.join(", ")))
     }
 
@@ -109,10 +106,8 @@ impl VirtualTableCursor for UnnestCursor {
                 .get(column)
                 .and_then(|elements| elements.get(self.position))
                 .cloned()
-        } else if column < 2 * MAX_UNNEST_ARRAYS {
-            self.inputs.get(column - MAX_UNNEST_ARRAYS).cloned()
         } else {
-            Some(Value::from_i64(self.position as i64 + 1))
+            self.inputs.get(column - MAX_UNNEST_ARRAYS).cloned()
         };
         Ok(IOResult::Done(value.unwrap_or(Value::Null)))
     }

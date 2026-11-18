@@ -146,24 +146,6 @@ expect {
     100000|100000
 }
 
-@skip-if postgres "pg_generate_series_ordinality is a function of tursopg"
-test position-in-a-series-with-step-zero-errors {
-    SELECT pg_generate_series_ordinality(5, 1, 0);
-}
-@sqlstate 22023
-expect error {
-    step size cannot equal zero
-}
-
-@skip-if postgres "pg_generate_series_ordinality is a function of tursopg"
-test position-in-a-series-beyond-bigint-errors {
-    SELECT pg_generate_series_ordinality(9223372036854775807, -9223372036854775807 - 1, 1);
-}
-@sqlstate 22003
-expect error {
-    bigint out of range
-}
-
 test ordinality-restarts-for-each-outer-row {
     SELECT * FROM generate_series(1, 2) AS a(i), generate_series(1, a.i) WITH ORDINALITY AS b(j, o);
 }
