@@ -813,19 +813,12 @@ impl Value {
     }
 
     pub fn exec_unicode(&self) -> Value {
-        match self {
-            Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
-                let text = self.to_string();
-                if let Some(first_char) = text.chars().next() {
-                    if first_char == '\0' {
-                        return Value::Null;
-                    }
-                    Value::from_i64(first_char as u32 as i64)
-                } else {
-                    Value::Null
-                }
-            }
-            _ => Value::Null,
+        let Some(text) = self.cast_text_ref() else {
+            return Value::Null;
+        };
+        match text.chars().next() {
+            None | Some('\0') => Value::Null,
+            Some(first_char) => Value::from_i64(first_char as u32 as i64),
         }
     }
 
@@ -1016,7 +1009,9 @@ impl Value {
                 }
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
-                let text = self.to_string();
+                let text = self
+                    .cast_text_ref()
+                    .expect("a NULL value returns before the match");
                 return Value::from_slice(text.as_bytes());
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
@@ -1024,7 +1019,11 @@ impl Value {
             Affinity::Text => {
                 // Convert everything to text representation
                 // TODO: handle encoding and whatever sqlite3_snprintf does
-                Value::build_text(self.to_string())
+                Value::build_text(
+                    self.cast_text_ref()
+                        .expect("NULL returned before")
+                        .into_owned(),
+                )
             }
             Affinity::Real => match self {
                 Value::Blob(b) => {
