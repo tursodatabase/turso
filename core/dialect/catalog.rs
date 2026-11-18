@@ -6,7 +6,7 @@
 
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
-    schema::{load::LoadStep, RelationKind, Schema},
+    schema::{load::LoadStep, BTreeTable, RelationKind, Schema},
     translate::{
         emitter::Resolver,
         sqlite_schema_rows::{
@@ -167,6 +167,8 @@ pub enum CatalogWrite<'a> {
     RenameColumn(RenameColumn<'a>),
     /// `ALTER TABLE ... ALTER COLUMN`.
     AlterColumn(AlterColumn<'a>),
+    /// `ALTER TABLE ... ADD COLUMN`.
+    AddColumn(AddColumn<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -439,6 +441,21 @@ pub struct AlterColumn<'a> {
     pub written_old_name: &'a str,
     /// The column's new name, type and constraints.
     pub definition: &'a ast::ColumnDefinition,
+}
+
+/// A table that gets a new last column. The rows of the table are already
+/// rewritten if the column needs a stored value in each.
+#[derive(Debug, Clone, Copy)]
+pub struct AddColumn<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table.
+    pub name: &'a str,
+    /// The table with the new column, and with the constraints and foreign
+    /// keys that the column's definition adds.
+    pub table: &'a BTreeTable,
+    /// The text of the statement, for change data capture.
+    pub statement: &'a str,
 }
 
 /// What a statement emits after all of its schema writes, so that the
