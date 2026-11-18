@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::dialect::catalog::{
-    AlterColumn, CatalogWrite, RenameColumn, RenameTable, RenamedIndex, RewrittenTrigger,
-    RewrittenView, TempTriggerOfRenamedTable, WriteContext,
+    AddColumn, AlterColumn, CatalogWrite, RenameColumn, RenameTable, RenamedIndex,
+    RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable, WriteContext,
 };
 use crate::dialect::{AccessStatement, NewOwner};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -1226,30 +1226,6 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(
-                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
-            );
-            let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
-            let stmt = format!(
-                r#"
-                    UPDATE {qualified_schema_table}
-                    SET sql = '{escaped}'
-                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
-                "#,
-            );
-
-            let cmd = crate::dialect::parse_statement(connection.dialect().as_ref(), &stmt)
-                .map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse generated UPDATE statement: {e}"
-                    ))
-                })?;
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                return Err(LimboError::ParseError(
-                    "generated UPDATE statement did not parse as expected".to_string(),
-                ));
-            };
-
             if is_stored {
                 btree.check_stored_columns_have_no_custom_types(resolver.schema())?;
                 emit_halt_if_table_has_rows(
@@ -1359,31 +1335,34 @@ pub fn translate_alter_table(
                 namespace,
             )?;
 
-            translate_update_for_schema_change(
-                update,
-                resolver,
+            let write_context = WriteContext::new(connection, resolver, database_id);
+            let after_writes = resolver.catalog.dialect.catalog().write(
                 program,
-                connection,
-                input,
-                |program| {
-                    program.emit_insn(Insn::SetCookie {
-                        db: database_id,
-                        cookie: Cookie::SchemaVersion,
-                        value: schema_version as i32 + 1,
-                        p5: 0,
-                    });
-                    program.emit_insn(Insn::AddColumn {
-                        data: Box::new(AddColumnData {
-                            db: database_id,
-                            namespace: namespace.id,
-                            table: table_name.to_owned(),
-                            column,
-                            check_constraints: btree.check_constraints.to_vec(),
-                            foreign_keys: btree.foreign_keys.to_vec(),
-                        }),
-                    });
-                },
-            )?
+                &write_context,
+                &CatalogWrite::AddColumn(AddColumn {
+                    namespace: namespace.id,
+                    name: &normalize_ident(table_name),
+                    table: &btree,
+                    statement: input,
+                }),
+            )?;
+            program.emit_insn(Insn::SetCookie {
+                db: database_id,
+                cookie: Cookie::SchemaVersion,
+                value: schema_version as i32 + 1,
+                p5: 0,
+            });
+            after_writes.emit(program, database_id, None);
+            program.emit_insn(Insn::AddColumn {
+                data: Box::new(AddColumnData {
+                    db: database_id,
+                    namespace: namespace.id,
+                    table: table_name.to_owned(),
+                    column,
+                    check_constraints: btree.check_constraints.to_vec(),
+                    foreign_keys: btree.foreign_keys.to_vec(),
+                }),
+            });
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             let new_name = new_name.as_str();
