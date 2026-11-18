@@ -2,7 +2,7 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::Utc;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
@@ -10,15 +10,17 @@ use turso_core::security::roles::RoleId;
 use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    exec_printf_values, exec_temporal_encode, exec_timestamp_encode, exec_timestamptz_encode,
+    format_timestamp, format_timestamptz, timestamp_of_micros, Connection, ExternalFunc, IOResult,
+    LimboError, Numeric, OpenOptions, Register, Result, Value, POSTGRES_EPOCH_IN_UNIX_MICROS,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -148,7 +150,22 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
             FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        ) => Timestamptz(format_timestamptz(Utc::now().naive_utc())),
+        // CURRENT_TIMESTAMP(precision).
+        "current_timestamp"(FunctionArity::Exact(1), false) => {
+            Timestamptz(format_timestamptz(current_time_rounded(args)?))
+        },
+        // LOCALTIMESTAMP and LOCALTIMESTAMP(precision). The session's time
+        // zone is always UTC.
+        "localtimestamp"(FunctionArity::OneOf(&[0, 1]), false) => {
+            let now = match args {
+                [] => Utc::now().naive_utc(),
+                _ => current_time_rounded(args)?,
+            };
+            Timestamp(format_timestamp(now))
+        },
+        "to_timestamp"(FunctionArity::OneOf(&[1, 2]), true) => exec_to_timestamp(args)?,
+        "make_timestamp"(FunctionArity::Exact(6), true) => exec_make_timestamp(args)?,
     })
 }
 
@@ -198,13 +215,24 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     }
 }
 
-/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
+/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5+00`.
 /// Returning one gives the function the type `timestamptz`, so `now() + 1` is
 /// an error as in PostgreSQL instead of adding 1 to text.
 struct Timestamptz(String);
 
 impl ScalarReturn for Timestamptz {
     const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `timestamp` value in its text form, such as `2000-01-01 00:00:00.5`.
+struct Timestamp(String);
+
+impl ScalarReturn for Timestamp {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamp"));
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
@@ -424,8 +452,7 @@ fn parse_oid(text: &str) -> Result<i64> {
         || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
     let out_of_range =
         || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
-    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
-    let number = text.trim_matches(is_space);
+    let number = trim_space(text);
     let (negative, unsigned) = match number.as_bytes().first() {
         Some(b'-') => (true, &number[1..]),
         Some(b'+') => (false, &number[1..]),
@@ -456,6 +483,11 @@ fn parse_oid(text: &str) -> Result<i64> {
         return Err(out_of_range());
     }
     Ok(i64::from(oid))
+}
+
+/// `text` without the spaces that PostgreSQL allows around a number.
+fn trim_space(text: &str) -> &str {
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
 }
 
 fn text_arg(args: &[Register], i: usize) -> String {
@@ -815,10 +847,14 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
         (JsonElement::Timestamp, Value::Text(text)) => {
             write_json_string(&text.as_str().replacen(' ', "T", 1), json)
         }
-        (JsonElement::Timestamptz, Value::Text(text)) => write_json_string(
-            &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
-            json,
-        ),
+        // `2024-01-05 10:00:00+00` is `"2024-01-05T10:00:00+00:00"`.
+        (JsonElement::Timestamptz, Value::Text(text)) => {
+            assert!(
+                text.as_str().ends_with("+00"),
+                "timestamptz_decode writes every timestamptz in UTC"
+            );
+            write_json_string(&format!("{}:00", text.as_str().replacen(' ', "T", 1)), json)
+        }
         (JsonElement::Text, Value::Numeric(number)) => {
             write_json_string(&Value::Numeric(*number).to_string(), json)
         }
@@ -1256,6 +1292,186 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
     Some(pg_to_char_numeric(num, format))
 }
 
+/// Seconds from 1970-01-01, where Unix time starts, to 2000-01-01, where
+/// PostgreSQL's time starts.
+const POSTGRES_EPOCH_IN_UNIX_SECONDS: i64 = POSTGRES_EPOCH_IN_UNIX_MICROS / 1_000_000;
+
+/// The current time rounded to `args[0]` digits after the decimal point.
+fn current_time_rounded(args: &[Register]) -> Result<NaiveDateTime> {
+    let precision = int4_arg(args, 0)?;
+    // PostgreSQL lowers a precision above 6 to 6 and sends a warning. tursopg
+    // sends no warnings, so it refuses such a precision.
+    let Ok(precision @ 0..=6) = u32::try_from(precision) else {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            format!("a precision of {precision} is not supported"),
+        ));
+    };
+    let micros = Utc::now().timestamp_micros() - POSTGRES_EPOCH_IN_UNIX_MICROS;
+    supported_timestamp(round_to_precision(micros, precision))
+}
+
+/// Rounds microseconds since 2000-01-01 to `precision` digits after the
+/// decimal point the way PostgreSQL's AdjustTimestampForTypmod does: a half
+/// rounds away from 2000-01-01.
+fn round_to_precision(micros: i64, precision: u32) -> i64 {
+    let scale = 10_i64.pow(6 - precision);
+    if micros >= 0 {
+        (micros + scale / 2) / scale * scale
+    } else {
+        -((-micros + scale / 2) / scale * scale)
+    }
+}
+
+/// to_timestamp(seconds) the way PostgreSQL's float8_timestamptz computes it:
+/// the seconds since 1970-01-01 00:00:00 UTC, rounded to the microsecond.
+/// The form to_timestamp(text, format) is not supported.
+fn exec_to_timestamp(args: &[Register]) -> Result<Option<Timestamptz>> {
+    if args.len() == 2 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "to_timestamp() with a format is not supported",
+        ));
+    }
+    let Some(seconds) = float8_arg(args, 0)? else {
+        return Ok(None);
+    };
+    if seconds.is_nan() {
+        return Err(sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            "timestamp cannot be NaN",
+        ));
+    }
+    if seconds.is_infinite() {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "an infinite timestamp is not supported",
+        ));
+    }
+    // PostgreSQL's range: from 4714-11-24 BC up to 294277-01-01.
+    if !(-210_866_803_200.0..9_224_318_016_000.0).contains(&seconds) {
+        // PostgreSQL prints the seconds with C's "%g".
+        let shown = exec_printf_values(&Value::build_text("%g"), &[&Value::from_f64(seconds)])?;
+        return Err(sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            format!("timestamp out of range: \"{shown}\""),
+        ));
+    }
+    let micros = ((seconds - POSTGRES_EPOCH_IN_UNIX_SECONDS as f64) * 1e6).round_ties_even();
+    Ok(Some(Timestamptz(format_timestamptz(supported_timestamp(
+        micros as i64,
+    )?))))
+}
+
+/// make_timestamp(year, month, day, hour, min, sec) the way PostgreSQL's
+/// make_timestamp_internal computes it. Hour 24 and second 60 roll over, as
+/// long as the time is at most 24:00:00.
+fn exec_make_timestamp(args: &[Register]) -> Result<Option<Timestamp>> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(None);
+    }
+    let year = int4_arg(args, 0)?;
+    let month = int4_arg(args, 1)?;
+    let day = int4_arg(args, 2)?;
+    let hour = int4_arg(args, 3)?;
+    let minute = int4_arg(args, 4)?;
+    let second = float8_arg(args, 5)?.expect("NULL arguments return NULL above");
+    if year < 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "a year before Christ is not supported",
+        ));
+    }
+    // There is no year 0: the year before 0001 is 0001 BC.
+    let date = match (year, u32::try_from(month), u32::try_from(day)) {
+        (1.., Ok(month), Ok(day)) => NaiveDate::from_ymd_opt(year, month, day),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            format!("date field value out of range: {year}-{month:02}-{day:02}"),
+        )
+    })?;
+    // PostgreSQL's float_time_overflows. The seconds are rounded to the
+    // microsecond first, so that 59.9999999 is not out of range.
+    let second_micros = (second * 1e6).round_ties_even();
+    let time = ((i64::from(hour) * 60 + i64::from(minute)) * 60) * 1_000_000;
+    if !(0..=24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0.0..=60e6).contains(&second_micros)
+        || time + second_micros as i64 > 86_400_000_000
+    {
+        return Err(sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            format!("time field value out of range: {hour}:{minute:02}:{second:02}"),
+        ));
+    }
+    let midnight = date.and_time(NaiveTime::MIN).and_utc().timestamp();
+    let micros =
+        (midnight - POSTGRES_EPOCH_IN_UNIX_SECONDS) * 1_000_000 + time + second_micros as i64;
+    Ok(Some(Timestamp(format_timestamp(supported_timestamp(
+        micros,
+    )?))))
+}
+
+/// The timestamp `micros` microseconds after 2000-01-01 00:00:00. PostgreSQL
+/// has timestamps outside the years 0001 to 9999, but Turso does not.
+fn supported_timestamp(micros: i64) -> Result<NaiveDateTime> {
+    timestamp_of_micros(micros).ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "a timestamp outside the years 0001 to 9999 is not supported",
+        )
+    })
+}
+
+/// A double precision argument, or None for NULL. A string literal or a
+/// parameter arrives as text and is read as a number.
+fn float8_arg(args: &[Register], i: usize) -> Result<Option<f64>> {
+    match args[i].get_value() {
+        Value::Null => Ok(None),
+        Value::Numeric(Numeric::Integer(value)) => Ok(Some(*value as f64)),
+        Value::Numeric(Numeric::Float(value)) => Ok(Some(f64::from(*value))),
+        Value::Text(text) => trim_space(text.as_str()).parse().map(Some).map_err(|_| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!("invalid input syntax for type double precision: \"{text}\""),
+            )
+        }),
+        Value::Blob(_) => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            "a bytea where a double precision is expected is not supported",
+        )),
+    }
+}
+
+/// An integer argument. A string literal or a parameter arrives as text and is
+/// read as a number. A number that does not fit in an integer, such as 2024.5
+/// or 3000000000, is an error, as PostgreSQL has no function that takes it.
+fn int4_arg(args: &[Register], i: usize) -> Result<i32> {
+    let value = args[i].get_value();
+    let not_an_integer = || {
+        sqlstate_error(
+            SQLSTATE_UNDEFINED_FUNCTION,
+            format!("{value} where an integer is expected is not supported"),
+        )
+    };
+    match value {
+        Value::Numeric(Numeric::Integer(int)) => i32::try_from(*int).map_err(|_| not_an_integer()),
+        Value::Text(text) => trim_space(text.as_str()).parse().map_err(|_| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!("invalid input syntax for type integer: \"{text}\""),
+            )
+        }),
+        Value::Null | Value::Numeric(Numeric::Float(_)) | Value::Blob(_) => Err(not_an_integer()),
+    }
+}
+
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
 fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
@@ -1443,10 +1659,18 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => check_temporal_input(input, "date"),
-        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
-        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
-        "time" | "time without time zone" => check_temporal_input(input, "time"),
+        "date" => check_temporal_input(input, |text| {
+            exec_temporal_encode(text, &Value::build_text("date"))
+        }),
+        "timestamp" | "timestamp without time zone" => {
+            check_temporal_input(input, exec_timestamp_encode)
+        }
+        "timestamptz" | "timestamp with time zone" => {
+            check_temporal_input(input, exec_timestamptz_encode)
+        }
+        "time" | "time without time zone" => check_temporal_input(input, |text| {
+            exec_temporal_encode(text, &Value::build_text("time"))
+        }),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1550,13 +1774,13 @@ pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Reads `input` as the date or time type `type_name` does when it stores a
-/// value, so `pg_input_is_valid` and the type agree on what is valid.
-fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, String)> {
-    match exec_temporal_encode(
-        &Value::build_text(input.to_string()),
-        &Value::build_text(type_name),
-    ) {
+/// Reads `input` with `encode`, the ENCODE of a date or time type, so
+/// `pg_input_is_valid` and the type agree on what is valid.
+fn check_temporal_input(
+    input: &str,
+    encode: impl Fn(&Value) -> Result<Value>,
+) -> Option<(String, String)> {
+    match encode(&Value::build_text(input.to_string())) {
         Ok(_) => None,
         Err(LimboError::InvalidDate(message)) => {
             Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
@@ -1564,7 +1788,7 @@ fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String,
         Err(LimboError::DatetimeFieldOverflow(message)) => {
             Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
         }
-        Err(other) => unreachable!("temporal_encode of text failed with {other}"),
+        Err(other) => unreachable!("the ENCODE of a date or time type failed on text with {other}"),
     }
 }
 
@@ -1734,6 +1958,16 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_to_precision_rounds_a_half_away_from_2000() {
+        // 2000-01-01 00:00:00.5 and 1999-12-31 23:59:59.5 with precision 0.
+        assert_eq!(round_to_precision(500_000, 0), 1_000_000);
+        assert_eq!(round_to_precision(-500_000, 0), -1_000_000);
+        assert_eq!(round_to_precision(499_999, 0), 0);
+        assert_eq!(round_to_precision(123_500, 3), 124_000);
+        assert_eq!(round_to_precision(123_456, 6), 123_456);
+    }
 
     #[test]
     fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {

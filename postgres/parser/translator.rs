@@ -3628,14 +3628,11 @@ impl PostgreSQLTranslator {
                 use pg_query::protobuf::SqlValueFunctionOp;
                 if matches!(
                     SqlValueFunctionOp::try_from(svf.op),
-                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimeN
-                        | SqlValueFunctionOp::SvfopLocaltimestampN)
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN | SqlValueFunctionOp::SvfopLocaltimeN)
                 ) && svf.typmod != 0
                 {
                     return Err(ParseError::not_supported(
-                        "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
+                        "a fractional-second precision on CURRENT_TIME/LOCALTIME",
                     ));
                 }
                 // CURRENT_DATE, CURRENT_TIME and LOCALTIME are refused if
@@ -3659,12 +3656,27 @@ impl PostgreSQLTranslator {
                         check_type_is_supported("time", 0)?;
                         Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
                     }
-                    Ok(
-                        SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
-                        | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    // A timestamptz, as now() returns.
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestamp) => {
+                        Ok(function_call("now", vec![]))
+                    }
+                    Ok(SqlValueFunctionOp::SvfopLocaltimestamp) => {
+                        Ok(function_call("localtimestamp", vec![]))
+                    }
+                    // CURRENT_TIMESTAMP(p) and LOCALTIMESTAMP(p) round the
+                    // time to p digits after the decimal point.
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestampN) => Ok(function_call(
+                        "current_timestamp",
+                        vec![ast::Expr::Literal(ast::Literal::Numeric(
+                            svf.typmod.to_string(),
+                        ))],
+                    )),
+                    Ok(SqlValueFunctionOp::SvfopLocaltimestampN) => Ok(function_call(
+                        "localtimestamp",
+                        vec![ast::Expr::Literal(ast::Literal::Numeric(
+                            svf.typmod.to_string(),
+                        ))],
+                    )),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
                     // keyword that was written.
@@ -11703,7 +11715,7 @@ mod tests {
             panic!("Expected SELECT body");
         };
 
-        let expected = [ast::Expr::Literal(ast::Literal::CurrentTimestamp)];
+        let expected = [function_call("now", vec![])];
 
         assert_eq!(columns.len(), expected.len());
 
@@ -13977,9 +13989,9 @@ mod tests {
 
     #[test]
     fn fail_closed_current_timestamp_precision() {
-        assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
         assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
-        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        assert_translates("SELECT CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        assert_translates("SELECT CURRENT_TIMESTAMP(0), LOCALTIMESTAMP(3)");
     }
 
     #[test]

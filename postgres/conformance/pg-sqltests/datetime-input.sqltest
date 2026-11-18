@@ -269,8 +269,9 @@ expect @tursopg error {
     type "time" is not supported
 }
 
-# PostgreSQL accepts the values below. Turso stores these types as text that
-# must sort in time order, which these values would not, so it rejects them.
+# PostgreSQL accepts the values below. Turso compares these types by their
+# text, which must sort in time order. The text of these values would not, so
+# it rejects them.
 
 @skip-if postgres "PostgreSQL accepts BC dates"
 test datetime-input-rejects-bc {
@@ -322,14 +323,16 @@ expect error {
 
 setup datetime-compare-no-index {
     CREATE TABLE c (id int, ts timestamp, tz timestamptz);
-    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00'),
+        (2, NULL, '2024-01-05 13:30:00.000001+05:30');
 }
 
 setup datetime-compare-index {
     CREATE TABLE c (id int, ts timestamp, tz timestamptz);
     CREATE INDEX c_ts ON c (ts);
-    CREATE INDEX c_tz ON c (tz);
-    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    CREATE INDEX c_tz ON c (tz, id);
+    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00'),
+        (2, NULL, '2024-01-05 13:30:00.000001+05:30');
 }
 
 @setup datetime-compare-no-index
@@ -381,6 +384,42 @@ expect {
 }
 
 @setup datetime-compare-no-index
+test datetime-compare-timestamptz-forms-scan {
+    SELECT id FROM c WHERE tz = '2024-01-05T08:00:00.000001Z';
+    SELECT id FROM c WHERE tz IN ('2024-01-05 12:00:00+02', '2024-01-06', NULL);
+    SELECT id FROM c WHERE tz BETWEEN '2024-01-05' AND '2024-01-05 08:00:00.000001';
+    SELECT id FROM c WHERE tz < '2024-01-05 08:00:00.000002';
+    SELECT id FROM c WHERE tz = CAST('2024-01-05 08:00:00.000001' AS timestamptz) AND id < 5;
+    SELECT id FROM c WHERE tz = (SELECT max(tz) FROM c);
+}
+expect {
+    2
+    1
+    2
+    2
+    2
+    1
+}
+
+@setup datetime-compare-index
+test datetime-compare-timestamptz-forms-index {
+    SELECT id FROM c WHERE tz = '2024-01-05T08:00:00.000001Z';
+    SELECT id FROM c WHERE tz IN ('2024-01-05 12:00:00+02', '2024-01-06', NULL);
+    SELECT id FROM c WHERE tz BETWEEN '2024-01-05' AND '2024-01-05 08:00:00.000001';
+    SELECT id FROM c WHERE tz < '2024-01-05 08:00:00.000002';
+    SELECT id FROM c WHERE tz = CAST('2024-01-05 08:00:00.000001' AS timestamptz) AND id < 5;
+    SELECT id FROM c WHERE tz = (SELECT max(tz) FROM c);
+}
+expect {
+    2
+    1
+    2
+    2
+    2
+    1
+}
+
+@setup datetime-compare-no-index
 test datetime-compare-timestamp-t-form-scan {
     SELECT id FROM c WHERE ts > '2024-01-05T09:00';
 }
@@ -423,17 +462,795 @@ expect @tursopg error {
     type "date" is not supported
 }
 
-# With the session time zone UTC, a timestamp equals the timestamptz of the
-# same wall-clock time.
-@requires strict "uses STRICT tables"
-test datetime-timestamp-equals-timestamptz {
-    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
-    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
-    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
-    SELECT id FROM t WHERE ts = tz;
+# A timestamptz orders by its instant, whatever offset it was written with.
+test datetime-timestamptz-order {
+    CREATE TABLE o (id int, tz timestamptz);
+    INSERT INTO o VALUES (1, '2024-01-05 10:00:00+02'), (2, '2024-01-05 08:00:00.000001Z'),
+        (3, '2024-01-05 13:29:59.999999+05:30'), (4, '0001-01-01'), (5, '9999-12-31 23:59:59.999999');
+    SELECT id FROM o ORDER BY tz;
+    SELECT min(tz)::text, max(tz) FROM o;
+}
+expect {
+    4
+    3
+    1
+    2
+    5
+    0001-01-01 00:00:00+00|9999-12-31 23:59:59.999999+00
+}
+
+test datetime-timestamptz-copied-between-columns {
+    CREATE TABLE a (tz timestamptz, tz2 timestamptz);
+    INSERT INTO a VALUES ('2024-01-05 10:00:00.5+02', NULL);
+    UPDATE a SET tz2 = tz;
+    INSERT INTO a SELECT tz2, tz FROM a;
+    SELECT tz, tz2 FROM a;
+}
+expect {
+    2024-01-05 08:00:00.5+00|2024-01-05 08:00:00.5+00
+    2024-01-05 08:00:00.5+00|2024-01-05 08:00:00.5+00
+}
+
+# CURRENT_TIMESTAMP is a timestamptz, as now() is.
+test datetime-timestamptz-default-now {
+    CREATE TABLE n (id int, tz timestamptz DEFAULT now());
+    INSERT INTO n (id) VALUES (1);
+    SELECT id FROM n WHERE tz <= CURRENT_TIMESTAMP AND tz > '2024-01-01' AND CURRENT_TIMESTAMP::text LIKE '%+00';
 }
 expect {
     1
+}
+
+setup datetime-uses {
+    CREATE TABLE r (id int, ts timestamp, tz timestamptz);
+    INSERT INTO r VALUES (1, '2024-01-05 10:00:00.5', '2024-01-05 10:00:00+02'), (2, NULL, NULL);
+}
+
+# A timestamptz prints with the offset of the session's time zone, which is
+# UTC, and a timestamp prints without an offset.
+@setup datetime-uses
+test datetime-timestamp-and-timestamptz-as-text {
+    SELECT id, ts::text, tz::text FROM r ORDER BY id;
+    SELECT CAST(ts AS text), CAST(tz AS text) FROM r WHERE id = 1;
+}
+expect {
+    1|2024-01-05 10:00:00.5|2024-01-05 08:00:00+00
+    2||
+    2024-01-05 10:00:00.5|2024-01-05 08:00:00+00
+}
+
+@setup datetime-uses
+test datetime-timestamp-compared-with-columns-and-null {
+    SELECT id FROM r WHERE ts = (SELECT ts FROM r WHERE id = 1);
+    SELECT id FROM r WHERE tz IN (SELECT tz FROM r WHERE id = 1);
+    SELECT id FROM r WHERE ts IS NULL;
+    SELECT id FROM r WHERE tz IS NOT NULL;
+    SELECT id FROM r WHERE ts BETWEEN '2024-01-05' AND '2024-01-06' AND tz IN ('2024-01-05 08:00:00+00', NULL);
+    SELECT count(DISTINCT tz) FROM r;
+    SELECT tz, count(*) FROM r GROUP BY tz ORDER BY tz;
+}
+expect {
+    1
+    1
+    2
+    1
+    1
+    1
+    2024-01-05 08:00:00+00|1
+    |1
+}
+
+# Turso supports a timestamp or timestamptz only where it is stored or
+# compared with a value of its own type. Everything else fails with 0A000.
+@setup datetime-uses
+test datetime-timestamptz-in-coalesce-is-refused {
+    SELECT coalesce(tz, '2024-01-01') FROM r ORDER BY id;
+}
+expect {
+    2024-01-05 08:00:00+00
+    2024-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in function COALESCE\(\) is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-case-is-refused {
+    SELECT 'a', CASE WHEN id = 1 THEN ts END FROM r ORDER BY id;
+}
+expect {
+    a|2024-01-05 10:00:00.5
+    a|
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in CASE is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-concatenated-is-refused {
+    SELECT ts || 'x' FROM r WHERE id = 1;
+}
+expect {
+    2024-01-05 10:00:00.5x
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in operator \|\| is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-plus-integer-is-refused {
+    SELECT tz + 1 FROM r;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone \+ integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in operator \+ is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-compared-with-integer-is-refused {
+    SELECT id FROM r WHERE ts = 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamp with type integer is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-compared-with-text-is-refused {
+    SELECT id FROM r WHERE ts = '2024-01-05 10:00:00.5'::text;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamp with type text is not supported
+}
+
+# A string literal is read as a timestamp only when it is itself compared with
+# one. In a subquery or a UNION it is text.
+@setup datetime-uses
+test datetime-timestamp-compared-with-subquery-literal-is-refused {
+    SELECT id FROM r WHERE ts = (SELECT '2024-01-05 10:00:00.5');
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamp with type text is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-union-of-literals-is-refused {
+    SELECT id FROM r WHERE ts IN (SELECT '2024-01-05 10:00:00.5' UNION SELECT '2024-01-06');
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamp with type text is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-sum-is-refused {
+    SELECT sum(tz) FROM r;
+}
+@sqlstate 42883
+expect error {
+    function sum\(timestamp with time zone\) does not exist
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in function sum\(\) is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-like-is-refused {
+    SELECT id FROM r WHERE tz LIKE '2024%';
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone ~~ unknown
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in a pattern match is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-cast-to-bigint-is-refused {
+    SELECT tz::bigint FROM r;
+}
+@sqlstate 42846
+expect error {
+    cannot cast type timestamp with time zone to bigint
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in a cast to bigint is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-cast-to-date-is-refused {
+    SELECT tz::date FROM r WHERE id = 1;
+}
+expect {
+    2024-01-05
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-pg-typeof-is-refused {
+    SELECT pg_typeof(ts) FROM r WHERE id = 1;
+}
+expect {
+    timestamp without time zone
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in function pg_typeof\(\) is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-not-is-refused {
+    SELECT id FROM r WHERE NOT ts;
+}
+@sqlstate 42804
+expect error {
+    argument of NOT must be type boolean, not type timestamp without time zone
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in operator NOT is not supported
+}
+
+# PostgreSQL converts the timestamp to timestamptz in the session's time zone.
+@setup datetime-uses
+test datetime-timestamp-compared-with-timestamptz-is-refused {
+    SELECT count(*) FROM r WHERE ts = tz;
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamp with type timestamptz is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-sqlite-date-function-is-refused {
+    SELECT date(tz) FROM r WHERE id = 1;
+}
+expect {
+    2024-01-05
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
+
+test datetime-timestamptz-in-array-is-refused {
+    SELECT ARRAY['2024-01-01 10:00:00+02'::timestamptz];
+}
+expect {
+    {"2024-01-01 08:00:00+00"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in function array\(\) is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-array-is-refused {
+    SELECT ARRAY[ts] FROM r WHERE id = 1;
+}
+expect {
+    {"2024-01-05 10:00:00.5"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in function array\(\) is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-array-agg-is-refused {
+    SELECT array_agg(tz) FROM r WHERE id = 1;
+}
+expect {
+    {"2024-01-05 08:00:00+00"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in function array_agg\(\) is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-in-array-agg-is-refused {
+    SELECT array_agg(ts) FROM r WHERE id = 1;
+}
+expect {
+    {"2024-01-05 10:00:00.5"}
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in function array_agg\(\) is not supported
+}
+
+test datetime-timestamptz-in-generate-series-is-refused {
+    SELECT generate_series('2024-01-01 00:00:00+00'::timestamptz, '2024-01-02 00:00:00+00'::timestamptz, '6 hours');
+}
+expect {
+    2024-01-01 00:00:00+00
+    2024-01-01 06:00:00+00
+    2024-01-01 12:00:00+00
+    2024-01-01 18:00:00+00
+    2024-01-02 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in function generate_series\(\) is not supported
+}
+
+test datetime-timestamptz-in-generate-series-in-from-is-refused {
+    SELECT * FROM generate_series('2024-01-01 00:00:00+00'::timestamptz, '2024-01-02 00:00:00+00'::timestamptz, '6 hours');
+}
+expect {
+    2024-01-01 00:00:00+00
+    2024-01-01 06:00:00+00
+    2024-01-01 12:00:00+00
+    2024-01-01 18:00:00+00
+    2024-01-02 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in .+ is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamp-minus-timestamp-is-refused {
+    SELECT ts - ts FROM r WHERE id = 1;
+}
+expect {
+    00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamp in operator - is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-minus-timestamptz-is-refused {
+    SELECT tz - tz FROM r WHERE id = 1;
+}
+expect {
+    00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in operator - is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-minus-timestamp-is-refused {
+    SELECT tz - ts FROM r WHERE id = 1;
+}
+expect {
+    -02:00:00.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in operator - is not supported
+}
+
+# A column of a VALUES list has one type. A string literal in it is read as a
+# timestamptz when another row is one.
+@setup datetime-uses
+test datetime-timestamptz-values-column-reads-literals-as-timestamptz {
+    SELECT x FROM (VALUES ('2024-01-01 10:00:00+02'::timestamptz), ('2024-01-02'), (NULL)) v(x) ORDER BY x;
+    INSERT INTO r VALUES (3, '2024-01-02', now()), (4, now(), '2024-01-02 03:00:00+02');
+    SELECT id, tz FROM r WHERE id = 4;
+}
+expect {
+    2024-01-01 08:00:00+00
+    2024-01-02 00:00:00+00
+
+    4|2024-01-02 01:00:00+00
+}
+
+# The rows of INSERT ... VALUES don't share a type: each value is converted to
+# the type of its target column, so a literal next to a timestamptz in a text
+# column stays text.
+test datetime-insert-values-rows-keep-their-own-types {
+    CREATE TABLE w (id int, s text);
+    INSERT INTO w VALUES (1, now()), (2, '2024-01-01'), (3, 'abc');
+    SELECT id, s FROM w WHERE id > 1 ORDER BY id;
+}
+expect {
+    2|2024-01-01
+    3|abc
+}
+
+# A VALUES list used as a value or as the right side of IN has the type of its
+# column, so a string literal next to it is read as a timestamptz.
+test datetime-timestamptz-values-list-as-subquery {
+    CREATE TABLE ev (id int, at timestamptz);
+    INSERT INTO ev VALUES (1, '2024-01-05 10:00:00+00'), (2, '2024-01-01 00:00:00+00');
+    SELECT x FROM (VALUES ('2024-01-01'), ((VALUES ('2024-01-05 10:00:00+00'::timestamptz)))) v(x) ORDER BY x;
+    SELECT id FROM ev WHERE at IN (VALUES ('2024-01-05 12:00:00+02'::timestamptz)) ORDER BY id;
+    SELECT id FROM ev WHERE at IN (VALUES ('2024-01-05 10:00:00+00'::timestamptz), ('2024-01-01')) ORDER BY id;
+    SELECT 'found' WHERE '2024-01-05 12:00:00+02' IN (VALUES ('2024-01-05 10:00:00+00'::timestamptz));
+    SELECT 'found' WHERE '2024-01-01 02:00:00+02' IN (VALUES ((SELECT at FROM ev WHERE id = 1)), ('2024-01-01'));
+}
+expect {
+    2024-01-01 00:00:00+00
+    2024-01-05 10:00:00+00
+    1
+    1
+    2
+    found
+    found
+}
+
+test datetime-timestamptz-from-values-plus-integer-is-refused {
+    SELECT x + 1 FROM (VALUES ('2024-01-01 00:00:00+00'::timestamptz)) v(x);
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone \+ integer
+}
+@sqlstate 0A000
+expect @tursopg error {
+    using type timestamptz in operator \+ is not supported
+}
+
+test datetime-timestamptz-and-integer-in-values-is-refused {
+    SELECT x FROM (VALUES ('2024-01-01 00:00:00+00'::timestamptz), (1)) v(x);
+}
+@sqlstate 42804
+expect error {
+    VALUES types timestamp with time zone and integer cannot be matched
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamptz with type integer is not supported
+}
+
+# The first SELECT of a recursive CTE gives a column its type, and NULL there
+# is text.
+@setup datetime-uses
+test datetime-timestamptz-after-null-in-recursive-cte-is-refused {
+    WITH RECURSIVE c(x, n) AS (SELECT NULL, 1 UNION ALL SELECT tz, n + 1 FROM r, c WHERE n < 2 AND r.id = 1) SELECT x FROM c;
+}
+@sqlstate 42804
+expect error {
+    recursive query "c" column 1 has type text in non-recursive term but type timestamp with time zone overall
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamptz with type text is not supported
+}
+
+@setup datetime-uses
+test datetime-timestamptz-in-recursive-cte {
+    WITH RECURSIVE c(x, n) AS (SELECT tz, 1 FROM r WHERE id = 1 UNION ALL SELECT x, n + 1 FROM c WHERE n < 3) SELECT x, n FROM c ORDER BY n;
+}
+expect {
+    2024-01-05 08:00:00+00|1
+    2024-01-05 08:00:00+00|2
+    2024-01-05 08:00:00+00|3
+}
+
+# A string literal in the recursive query is not converted to the type of the
+# column, as in an arm of a compound SELECT.
+@setup datetime-uses
+test datetime-literal-in-recursive-query-of-timestamptz-cte-is-refused {
+    WITH RECURSIVE c(x, n) AS (SELECT tz, 1 FROM r WHERE id = 1 UNION ALL SELECT '2024-01-01', n + 1 FROM c WHERE n < 2) SELECT x, n FROM c ORDER BY n;
+}
+expect {
+    2024-01-05 08:00:00+00|1
+    2024-01-01 00:00:00+00|2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    comparing type timestamptz with type text is not supported
+}
+
+# to_timestamp() reads seconds since 1970-01-01 00:00:00+00 and rounds them to
+# microseconds, a half to even.
+test datetime-to-timestamp {
+    SELECT to_timestamp(1704067200.5), to_timestamp(0), to_timestamp(-1.25);
+    SELECT 'null', to_timestamp(NULL);
+    SELECT to_timestamp(' 12 ');
+    SELECT to_timestamp(0.0000005), to_timestamp(0.0000015), to_timestamp(0.0000025);
+    SELECT to_timestamp(-62135596800), to_timestamp(1704067200)::text;
+}
+expect {
+    2024-01-01 00:00:00.5+00|1970-01-01 00:00:00+00|1969-12-31 23:59:58.75+00
+    null|
+    1970-01-01 00:00:12+00
+    1970-01-01 00:00:00+00|1970-01-01 00:00:00.000002+00|1970-01-01 00:00:00.000002+00
+    0001-01-01 00:00:00+00|2024-01-01 00:00:00+00
+}
+
+test datetime-to-timestamp-of-text-that-is-no-number {
+    SELECT to_timestamp('abc');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type double precision: "abc"
+}
+
+test datetime-to-timestamp-of-nan {
+    SELECT to_timestamp('NaN');
+}
+@sqlstate 22008
+expect error {
+    timestamp cannot be NaN
+}
+
+test datetime-to-timestamp-out-of-range {
+    SELECT to_timestamp(9224318016000);
+}
+@sqlstate 22008
+expect error {
+    timestamp out of range: "9.22432e\+12"
+}
+
+test datetime-to-timestamp-far-out-of-range {
+    SELECT to_timestamp(-1e20);
+}
+@sqlstate 22008
+expect error {
+    timestamp out of range: "-1e\+20"
+}
+
+test datetime-to-timestamp-of-infinity-is-refused {
+    SELECT to_timestamp('infinity');
+}
+expect {
+    infinity
+}
+@sqlstate 0A000
+expect @tursopg error {
+    an infinite timestamp is not supported
+}
+
+test datetime-to-timestamp-after-year-9999-is-refused {
+    SELECT to_timestamp(253402300800);
+}
+expect {
+    10000-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a timestamp outside the years 0001 to 9999 is not supported
+}
+
+test datetime-to-timestamp-before-year-1-is-refused {
+    SELECT to_timestamp(-62135596801);
+}
+expect {
+    0001-12-31 23:59:59+00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a timestamp outside the years 0001 to 9999 is not supported
+}
+
+test datetime-to-timestamp-with-format-is-refused {
+    SELECT to_timestamp('2024', 'YYYY');
+}
+expect {
+    2024-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    to_timestamp\(\) with a format is not supported
+}
+
+# make_timestamp() rounds the seconds to microseconds. 24:00:00 and a second
+# of 60 carry into the next day and minute.
+test datetime-make-timestamp {
+    SELECT make_timestamp(2024, 1, 5, 8, 0, 59.999999), make_timestamp(2024, 1, 5, 8, 0, 1.0000005);
+    SELECT make_timestamp(2024, 1, 5, 24, 0, 0), make_timestamp(2024, 1, 5, 8, 0, 60);
+    SELECT make_timestamp('2024', '1', '5', '8', '0', '1.5');
+    SELECT 'null', make_timestamp(NULL, 1, 1, 0, 0, 0);
+    SELECT make_timestamp(2024, 1, 5, 8, 0, 1)::text;
+}
+expect {
+    2024-01-05 08:00:59.999999|2024-01-05 08:00:01.000001
+    2024-01-06 00:00:00|2024-01-05 08:01:00
+    2024-01-05 08:00:01.5
+    null|
+    2024-01-05 08:00:01
+}
+
+test datetime-make-timestamp-of-february-30 {
+    SELECT make_timestamp(2024, 2, 30, 0, 0, 0);
+}
+@sqlstate 22008
+expect error {
+    date field value out of range: 2024-02-30
+}
+
+test datetime-make-timestamp-of-year-0 {
+    SELECT make_timestamp(0, 1, 1, 0, 0, 0);
+}
+@sqlstate 22008
+expect error {
+    date field value out of range: 0-01-01
+}
+
+test datetime-make-timestamp-of-month-13 {
+    SELECT make_timestamp(2024, 13, 1, 0, 0, 0);
+}
+@sqlstate 22008
+expect error {
+    date field value out of range: 2024-13-01
+}
+
+test datetime-make-timestamp-after-24-00 {
+    SELECT make_timestamp(2024, 1, 5, 24, 0, 1);
+}
+@sqlstate 22008
+expect error {
+    time field value out of range: 24:00:01
+}
+
+test datetime-make-timestamp-of-negative-hour {
+    SELECT make_timestamp(2024, 1, 5, -1, 0, 0);
+}
+@sqlstate 22008
+expect error {
+    time field value out of range: -1:00:00
+}
+
+test datetime-make-timestamp-of-minute-60 {
+    SELECT make_timestamp(2024, 1, 5, 8, 60, 0);
+}
+@sqlstate 22008
+expect error {
+    time field value out of range: 8:60:00
+}
+
+test datetime-make-timestamp-after-second-60 {
+    SELECT make_timestamp(2024, 1, 5, 8, 0, 60.5);
+}
+@sqlstate 22008
+expect error {
+    time field value out of range: 8:00:60.5
+}
+
+test datetime-make-timestamp-of-negative-second {
+    SELECT make_timestamp(2024, 1, 5, 8, 0, -1);
+}
+@sqlstate 22008
+expect error {
+    time field value out of range: 8:00:-1
+}
+
+test datetime-make-timestamp-of-nan-second {
+    SELECT make_timestamp(2024, 1, 5, 8, 0, 'NaN');
+}
+@sqlstate 22008
+expect error {
+    time field value out of range: 8:00:NaN
+}
+
+test datetime-make-timestamp-of-text-that-is-no-integer {
+    SELECT make_timestamp('x', 1, 1, 0, 0, 0);
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+test datetime-make-timestamp-of-bigint {
+    SELECT make_timestamp(3000000000, 1, 1, 0, 0, 0);
+}
+@sqlstate 42883
+expect error {
+    function make_timestamp\(bigint, integer, integer, integer, integer, integer\) does not exist
+}
+@sqlstate 42883
+expect @tursopg error {
+    3000000000 where an integer is expected is not supported
+}
+
+test datetime-make-timestamp-before-christ-is-refused {
+    SELECT make_timestamp(-1, 1, 1, 0, 0, 0);
+}
+expect {
+    0001-01-01 00:00:00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a year before Christ is not supported
+}
+
+test datetime-make-timestamp-after-year-9999-is-refused {
+    SELECT make_timestamp(10000, 1, 1, 0, 0, 0);
+}
+expect {
+    10000-01-01 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a timestamp outside the years 0001 to 9999 is not supported
+}
+
+# LOCALTIMESTAMP is a timestamp in the session's time zone, which is UTC.
+test datetime-localtimestamp {
+    CREATE TABLE l (id int, ts timestamp);
+    INSERT INTO l VALUES (1, localtimestamp), (2, '2000-01-01');
+    SELECT id FROM l WHERE ts <= localtimestamp AND ts >= '2000-01-01' ORDER BY id;
+    SELECT 1 WHERE localtimestamp > '2024-01-01' AND localtimestamp::text NOT LIKE '%+%';
+}
+expect {
+    1
+    2
+    1
+}
+
+# CURRENT_TIMESTAMP(p) and LOCALTIMESTAMP(p) round the time to p digits after
+# the decimal point.
+test datetime-current-timestamp-and-localtimestamp-with-precision {
+    SELECT 1 WHERE LOCALTIMESTAMP(0)::text NOT LIKE '%.%' AND CURRENT_TIMESTAMP(0)::text NOT LIKE '%.%';
+    SELECT 1 WHERE LOCALTIMESTAMP(2)::text NOT LIKE '%.___%' AND CURRENT_TIMESTAMP(3)::text NOT LIKE '%.____%+00';
+    SELECT 1 WHERE CURRENT_TIMESTAMP(0)::text LIKE '%+00' AND LOCALTIMESTAMP(0)::text NOT LIKE '%+%';
+}
+expect {
+    1
+    1
+    1
+}
+
+# PostgreSQL lowers a precision above 6 to 6 with a warning.
+test datetime-localtimestamp-with-precision-above-6-is-refused {
+    SELECT 1 WHERE LOCALTIMESTAMP(7) IS NOT NULL;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a precision of 7 is not supported
+}
+
+test datetime-function-results-in-columns {
+    CREATE TABLE p (id int, ts timestamp, tz timestamptz);
+    INSERT INTO p VALUES (1, make_timestamp(2024, 1, 5, 8, 0, 1.5), to_timestamp(1704067200.5)),
+        (2, make_timestamp(2023, 1, 1, 0, 0, 0), to_timestamp(0));
+    SELECT id, ts, tz FROM p ORDER BY id;
+    SELECT id FROM p WHERE tz > to_timestamp(100) ORDER BY id;
+    SELECT id FROM p WHERE ts = make_timestamp(2024, 1, 5, 8, 0, 1.5);
+    SELECT to_timestamp(1704067200)::timestamp, make_timestamp(2024, 1, 5, 8, 0, 1.5)::timestamptz;
+}
+expect {
+    1|2024-01-05 08:00:01.5|2024-01-01 00:00:00.5+00
+    2|2023-01-01 00:00:00|1970-01-01 00:00:00+00
+    1
+    1
+    2024-01-01 00:00:00|2024-01-05 08:00:01.5+00
 }
 
 # The order of the fields matters: `T` needs a date before it and a time after it,
