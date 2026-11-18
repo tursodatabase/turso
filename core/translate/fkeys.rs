@@ -1937,7 +1937,7 @@ fn emit_fk_action_subprogram(
             )
         })?;
         subprogram_builder.epilogue(resolver.schema());
-        let built = subprogram_builder.build(connection.clone(), true, description)?;
+        let built = subprogram_builder.build(connection, true, description)?;
         let prepared = built.prepared().clone();
         entry
             .slot
