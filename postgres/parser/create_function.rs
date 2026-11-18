@@ -565,6 +565,35 @@ fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
     Ok(text)
 }
 
+/// The name PostgreSQL's errors give `type_name` if it is a built-in type:
+/// a base, pseudo or polymorphic type, or an array of a base or pseudo type,
+/// written `int4[]` or `_int4`. `None` for any other type.
+pub(crate) fn builtin_type_name(type_name: &TypeName) -> Result<Option<String>, ParseError> {
+    Ok(match classify_type(type_name)? {
+        TypeClass::Base => Some(
+            extract_key_columns(&type_name.names)?
+                .pop()
+                .unwrap_or_default(),
+        ),
+        TypeClass::Polymorphic(name) | TypeClass::Pseudo(name) | TypeClass::Array(name) => {
+            Some(name)
+        }
+        // `_int4` is how the catalog names the array type of `int4`.
+        TypeClass::NotBuiltIn { schema, name }
+            if schema
+                .as_deref()
+                .is_none_or(|schema| schema == "pg_catalog")
+                && type_name.array_bounds.is_empty()
+                && name.strip_prefix('_').is_some_and(|element| {
+                    BASE_TYPES.contains(&element) || PSEUDO_TYPES.contains(&element)
+                }) =>
+        {
+            Some(name)
+        }
+        TypeClass::NotBuiltIn { .. } | TypeClass::ColumnType => None,
+    })
+}
+
 // FIXME: the three lists that follow are written by hand, and they must
 // follow the PostgreSQL version of pg_query. They are also one of three
 // places that say what a type name is. The FIXME in

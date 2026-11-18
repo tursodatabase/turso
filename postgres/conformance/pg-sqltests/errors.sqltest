@@ -104,3 +104,83 @@ test error-drop-type-used-by-a-cast-in-a-policy {
 }
 @sqlstate 2BP01
 expect error {}
+
+# A built-in type belongs to the system, so dropping it is refused even with
+# IF EXISTS (#12023). `integer` reaches the parser as pg_catalog.int4.
+test error-drop-builtin-type {
+    DROP TYPE int4;
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-builtin-type-if-exists {
+    DROP TYPE IF EXISTS int4;
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-builtin-type-by-sql-name {
+    DROP TYPE integer;
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-builtin-array-type {
+    DROP TYPE IF EXISTS _text;
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-missing-type {
+    DROP TYPE err_no_such_type;
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-missing-domain {
+    DROP DOMAIN err_no_such_domain;
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-builtin-array-type-written-with-brackets {
+    DROP TYPE IF EXISTS int4[];
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-builtin-pseudo-array-type {
+    DROP TYPE IF EXISTS _record;
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-builtin-type-cascade {
+    DROP TYPE int4 CASCADE;
+}
+@sqlstate 2BP01
+expect error {}
+
+test error-drop-domain-builtin-type {
+    DROP DOMAIN IF EXISTS int4;
+}
+@sqlstate 42809
+expect error {}
+
+# Only an unqualified or pg_catalog name is the built-in type.
+test error-drop-builtin-type-name-in-public {
+    DROP TYPE public.int4;
+}
+@sqlstate 42704
+expect error {}
+
+# PostgreSQL refuses with 2BP01 because the element type requires the array
+# type; tursopg refuses dropping an array type instead of dropping mood.
+@skip-if postgres "PostgreSQL reports that mood requires mood[] (2BP01)"
+test error-drop-array-of-custom-type {
+    DROP TYPE IF EXISTS err_array_mood;
+    CREATE TYPE err_array_mood AS ENUM ('a');
+    DROP TYPE err_array_mood[];
+}
+@sqlstate 0A000
+expect error {}
