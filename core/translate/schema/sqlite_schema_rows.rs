@@ -44,6 +44,7 @@ impl Catalog for SqliteCatalog {
             CatalogWrite::CreateSequence(_) | CatalogWrite::DropSequence(_) => {
                 Ok(AfterWrites::none())
             }
+            CatalogWrite::DropTable(table) => emit_drop_table_rows(program, ctx, table),
         }
     }
 }
@@ -331,15 +332,33 @@ pub(crate) fn emit_open_sqlite_schema_cursor(
     });
 }
 
+/// Deletes the rows of a dropped table and of its indexes and triggers.
+fn emit_drop_table_rows(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    table: &crate::dialect::catalog::DropTable<'_>,
+) -> Result<AfterWrites> {
+    emit_delete_rows_of_table(program, ctx, table)?;
+    emit_delete_temp_triggers_on_table(program, ctx, table)?;
+    Ok(AfterWrites::none())
+}
+
 /// Deletes every row whose `tbl_name` is the table: its own row and the
 /// rows of its indexes and triggers.
-pub(crate) fn emit_delete_rows_of_table(
+fn emit_delete_rows_of_table(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    stored_name: String,
-    scratch_regs: [usize; 2],
+    ctx: &WriteContext<'_>,
+    table: &crate::dialect::catalog::DropTable<'_>,
 ) -> Result<()> {
+    let resolver = ctx.resolver;
+    let database_id = ctx.database_id;
+    let stored_name = resolver.mangle_name(
+        NamespaceRef {
+            database_id,
+            id: table.namespace,
+        },
+        table.name,
+    );
     let cdc_table = prepare_cdc_if_necessary(
         program,
         resolver.schema(),
@@ -347,7 +366,7 @@ pub(crate) fn emit_delete_rows_of_table(
         Some(SQLITE_TABLEID),
     )?;
 
-    let [null_reg, tbl_name_reg] = scratch_regs;
+    let [null_reg, tbl_name_reg] = table.scratch_regs;
     program.emit_null(null_reg, None);
     let table_reg = program.emit_string8_new_reg(stored_name);
     program.mark_last_insn_constant();
@@ -359,7 +378,7 @@ pub(crate) fn emit_delete_rows_of_table(
         .schema()
         .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
         .unwrap();
-    let sqlite_schema_cursor_id_0 = open_sqlite_schema_for_write(program, resolver, database_id);
+    let sqlite_schema_cursor_id_0 = ctx.sqlite_schema_cursor(program);
 
     //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
     //  loop to beginning of schema table
@@ -447,11 +466,10 @@ pub(crate) fn emit_delete_rows_of_table(
 
 /// Deletes the rows of the triggers in the temp database that are on the
 /// table, when the table is in another database.
-pub(crate) fn emit_delete_temp_triggers_on_table(
+fn emit_delete_temp_triggers_on_table(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    table_name: &str,
+    ctx: &WriteContext<'_>,
+    table: &crate::dialect::catalog::DropTable<'_>,
 ) -> Result<()> {
     // SQLite removes temp triggers targeting the dropped table.
     // Enumerate the temp schema triggers at translate time (which is
@@ -462,6 +480,8 @@ pub(crate) fn emit_delete_temp_triggers_on_table(
     // unqualified table name can live in the temp schema but point to
     // different databases (e.g. one on `main.t`, one on `temp.t` when a
     // shadow table exists). We must key on trigger name.
+    let resolver = ctx.resolver;
+    let database_id = ctx.database_id;
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         // A temp schema trigger targets the dropped db iff:
         //   - it explicitly qualifies with the dropped db, or
@@ -469,10 +489,10 @@ pub(crate) fn emit_delete_temp_triggers_on_table(
         //     shadow table of the same name (in which case the
         //     unqualified reference resolves to main).
         let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(NamespaceId::ROOT, table_name).is_some()
+            s.get_table(NamespaceId::ROOT, table.name).is_some()
         });
         let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(NamespaceId::ROOT, table_name)
+            s.get_triggers_for_table(NamespaceId::ROOT, table.name)
                 .filter(|trigger| match trigger.target_database_id {
                     Some(db_id) => db_id == database_id,
                     None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,

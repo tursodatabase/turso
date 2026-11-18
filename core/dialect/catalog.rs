@@ -133,6 +133,8 @@ pub enum CatalogWrite<'a> {
     /// A sequence that goes away: `DROP SEQUENCE`, or `ALTER TABLE ... DROP
     /// COLUMN` of the column that owns the sequence.
     DropSequence(DropSequence<'a>),
+    /// `DROP TABLE`, of a virtual table too.
+    DropTable(DropTable<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -230,6 +232,27 @@ pub struct DropSequence<'a> {
     pub namespace: NamespaceId,
     /// The normalized name of the sequence in its namespace.
     pub name: &'a str,
+}
+
+/// A table that the statement drops, before the statement destroys the
+/// B-trees of the table and of its indexes.
+#[derive(Debug, Clone, Copy)]
+pub struct DropTable<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table in its namespace.
+    pub name: &'a str,
+    /// Whether the table is a virtual table, which has no B-tree.
+    pub is_virtual: bool,
+    /// The names of the table's indexes, the automatic ones among them.
+    /// They are dropped with the table.
+    pub indexes: &'a [&'a str],
+    /// The names of the sequences in the table's namespace that the
+    /// table's columns own. They are dropped with the table.
+    pub owned_sequences: &'a [String],
+    /// Two registers that the catalog may overwrite while it deletes its
+    /// rows. The statement reads neither before it writes it again.
+    pub scratch_regs: [usize; 2],
 }
 
 /// What a statement emits after all of its schema writes, so that the
