@@ -1432,6 +1432,15 @@ impl Value {
         let pattern = sqlite_text_prefix(pattern);
         let text = sqlite_text_prefix(text);
 
+        // ASCII pattern and text without a set, the usual case: match the
+        // bytes directly, as LIKE does.
+        if !pattern.contains('[')
+            && crate::types::is_ascii(pattern.as_bytes())
+            && crate::types::is_ascii(text.as_bytes())
+        {
+            return Ok(glob_ascii(pattern.as_bytes(), text.as_bytes()));
+        }
+
         // 1. Exact match (no wildcards)
         if !pattern.contains(GLOB_CHARS) {
             return Ok(pattern == text);
@@ -1705,23 +1714,41 @@ const LIKE_INFO: PatternInfo = PatternInfo {
 };
 
 /// LIKE without an escape character over ASCII bytes: `_` matches one byte,
-/// `%` any run of bytes, letters compare without case. The last `%` seen is
-/// the only backtrack point, as in the classic wildcard match: when the
-/// bytes after it stop matching, the run it covers grows by one and the
-/// match resumes after it. Same answers as `pattern_compare` with
-/// `LIKE_INFO` for every ASCII input (see the tests).
+/// `%` any run of bytes, letters compare without case. Same answers as
+/// `pattern_compare` with `LIKE_INFO` for every ASCII input (see the tests).
 fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
+    wildcard_ascii::<b'%', b'_', true>(pattern, text)
+}
+
+/// GLOB without a set over ASCII bytes: `?` matches one byte, `*` any run of
+/// bytes, letters compare with case. Same answers as `pattern_compare` with
+/// `GLOB_INFO` for every ASCII input (see the tests).
+fn glob_ascii(pattern: &[u8], text: &[u8]) -> bool {
+    wildcard_ascii::<b'*', b'?', false>(pattern, text)
+}
+
+/// Match ASCII bytes with a pattern in which `ANY` matches any run of bytes
+/// and `ONE` matches one byte. With `NO_CASE`, letters compare without case.
+/// The last `ANY` seen is the only backtrack point, as in the classic
+/// wildcard match: when the bytes after it stop matching, the run it covers
+/// grows by one and the match resumes after it.
+fn wildcard_ascii<const ANY: u8, const ONE: u8, const NO_CASE: bool>(
+    pattern: &[u8],
+    text: &[u8],
+) -> bool {
     let (mut p, mut t) = (0, 0);
     let mut backtrack: Option<(usize, usize)> = None;
     while t < text.len() {
         match pattern.get(p) {
-            Some(b'%') => {
+            Some(&c) if c == ANY => {
                 backtrack = Some((p, t));
                 p += 1;
             }
             // The equal-bytes test comes first: most pattern bytes match the
             // text exactly, and folding both sides costs four times as much.
-            Some(&c) if c == text[t] || c == b'_' || c.eq_ignore_ascii_case(&text[t]) => {
+            Some(&c)
+                if c == text[t] || c == ONE || (NO_CASE && c.eq_ignore_ascii_case(&text[t])) =>
+            {
                 p += 1;
                 t += 1;
             }
@@ -1735,7 +1762,7 @@ fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
             },
         }
     }
-    pattern[p..].iter().all(|&c| c == b'%')
+    pattern[p..].iter().all(|&c| c == ANY)
 }
 
 const GLOB_INFO: PatternInfo = PatternInfo {
@@ -3092,23 +3119,6 @@ mod tests {
 
     #[test]
     fn like_ascii_agrees_with_pattern_compare() {
-        fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
-            let mut all = vec![Vec::new()];
-            let mut last = vec![Vec::new()];
-            for _ in 0..max_len {
-                let mut next = Vec::new();
-                for word in &last {
-                    for &c in alphabet {
-                        let mut longer = word.clone();
-                        longer.push(c);
-                        next.push(longer);
-                    }
-                }
-                all.extend(next.iter().cloned());
-                last = next;
-            }
-            all
-        }
         for pattern in words(b"ab%_", 4) {
             for text in words(b"abA", 4) {
                 let pattern_str = std::str::from_utf8(&pattern).unwrap();
@@ -3140,6 +3150,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn glob_ascii_agrees_with_pattern_compare() {
+        for pattern in words(b"ab*?", 4) {
+            for text in words(b"abA", 4) {
+                let pattern_str = std::str::from_utf8(&pattern).unwrap();
+                let text_str = std::str::from_utf8(&text).unwrap();
+                let expected =
+                    super::pattern_compare(pattern_str, text_str, &super::GLOB_INFO, None)
+                        == super::CompareResult::Match;
+                assert_eq!(
+                    super::glob_ascii(&pattern, &text),
+                    expected,
+                    "pattern {pattern_str:?}, text {text_str:?}"
+                );
+                assert_eq!(
+                    Value::exec_glob(pattern_str, text_str).unwrap(),
+                    expected,
+                    "exec_glob: pattern {pattern_str:?}, text {text_str:?}"
+                );
+            }
+        }
+    }
+
+    /// All words of at most `max_len` bytes of `alphabet`, with the empty word.
+    fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+        let mut all = vec![Vec::new()];
+        let mut last = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for word in &last {
+                for &c in alphabet {
+                    let mut longer = word.clone();
+                    longer.push(c);
+                    next.push(longer);
+                }
+            }
+            all.extend(next.iter().cloned());
+            last = next;
+        }
+        all
     }
 
     #[test]
