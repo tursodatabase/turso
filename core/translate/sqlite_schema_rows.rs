@@ -1,7 +1,7 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::catalog::{
-    AfterWrites, Catalog, CatalogWrite, CreateTable, TableText, WriteContext,
+    AfterWrites, Catalog, CatalogWrite, CreateTable, CreateView, TableText, WriteContext,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -32,6 +32,7 @@ impl Catalog for SqliteCatalog {
     ) -> Result<AfterWrites> {
         match change {
             CatalogWrite::CreateTable(table) => emit_create_table_rows(program, ctx, table),
+            CatalogWrite::CreateView(view) => emit_create_view_row(program, ctx, view),
         }
     }
 }
@@ -115,6 +116,65 @@ fn table_sql(
         }),
         TableText::Statement(input) => dialect.format_table_sql(input, &name_in_sql, table.body),
     }
+}
+
+/// Writes the row of a new view.
+fn emit_create_view_row(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    view: &CreateView<'_>,
+) -> Result<AfterWrites> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, view.name);
+    let sql = create_view_sql(
+        "VIEW",
+        &resolver
+            .name_in_sql(namespace, view.written_name)
+            .as_ident(),
+        view.columns,
+        view.select,
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::View,
+        &stored_name,
+        &stored_name,
+        // A view has no B-tree.
+        0,
+        Some(sql),
+    )?;
+
+    Ok(AfterWrites::parse_sqlite_schema_rows(format!(
+        "name = '{}'",
+        escape_sql_string_literal(&stored_name)
+    )))
+}
+
+/// The SQL text to store for a new view or materialized view.
+pub(crate) fn create_view_sql(
+    view_kind: &str,
+    view_name: &str,
+    columns: &[ast::IndexedColumn],
+    select_stmt: &ast::Select,
+) -> String {
+    let columns_str = columns
+        .iter()
+        .map(|col| col.col_name.as_ident())
+        .collect::<Vec<String>>()
+        .join(", ");
+    if !columns_str.is_empty() {
+        return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
+    }
+    format!("CREATE {view_kind} {view_name} AS {select_stmt}")
 }
 
 /// Creates one of the engine's own tables in the main database the first

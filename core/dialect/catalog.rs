@@ -91,6 +91,8 @@ pub enum CatalogWrite<'a> {
     /// `CREATE TABLE`, or `CREATE TABLE ... AS SELECT` before its rows are
     /// inserted.
     CreateTable(CreateTable<'a>),
+    /// `CREATE VIEW`.
+    CreateView(CreateView<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -137,6 +139,21 @@ pub struct AutomaticIndex {
     pub name: String,
     /// Register that holds the root page of the index's B-tree.
     pub root_reg: usize,
+}
+
+/// A new view. It has no B-tree.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateView<'a> {
+    /// The namespace of the view in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the view in its namespace.
+    pub name: &'a str,
+    /// The name as the statement spells it.
+    pub written_name: &'a ast::Name,
+    /// The names the statement gives the view's columns. Empty when it
+    /// gives none.
+    pub columns: &'a [ast::IndexedColumn],
+    pub select: &'a ast::Select,
 }
 
 /// What a statement emits after all of its schema writes, so that the
