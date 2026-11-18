@@ -1,8 +1,9 @@
 //! How a dialect stores the objects of a database: the [`Catalog`] that
-//! DDL translation writes through, what translation tells the dialect about
-//! a statement that changes the dialect's catalog of the main database, and
-//! what the dialect's bytecode tells the in-memory schema once the change
-//! is written.
+//! every DDL statement about a relation writes through, what translation
+//! tells the catalog about each statement ([`CatalogWrite`] for relations,
+//! [`AccessStatement`] for roles, owners, privileges and policies), and
+//! what the catalog's bytecode tells the in-memory schema once the change
+//! is written ([`AfterWrites`], [`CatalogApply`]).
 
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
