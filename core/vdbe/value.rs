@@ -3,6 +3,7 @@ use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, IntegerText, NullableInteger, Numeric},
     translate::collate::CollationSeq,
+    turso_assert,
     types::{AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
@@ -1658,14 +1659,28 @@ impl<const N: usize> std::fmt::Write for StackText<N> {
 
 /// `source.replace(pattern, replacement)`, with the result allocated at the
 /// length of `source` first. `str::replace` starts with an empty `String`,
-/// which grows a few times for a short text.
+/// which grows a few times for a short text. A short source is searched with
+/// `find_text`, which costs less than the setup of the general search.
 fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
+    turso_assert!(
+        !pattern.is_empty(),
+        "replace() returns before the search for an empty pattern"
+    );
     let mut result = String::with_capacity(source.len());
     let mut last_end = 0;
-    for (start, part) in source.match_indices(pattern) {
-        result.push_str(&source[last_end..start]);
-        result.push_str(replacement);
-        last_end = start + part.len();
+    if source.len() <= SHORT_TEXT_BYTES {
+        while let Some(offset) = find_text(&source[last_end..], pattern) {
+            let start = last_end + offset;
+            result.push_str(&source[last_end..start]);
+            result.push_str(replacement);
+            last_end = start + pattern.len();
+        }
+    } else {
+        for (start, part) in source.match_indices(pattern) {
+            result.push_str(&source[last_end..start]);
+            result.push_str(replacement);
+            last_end = start + part.len();
+        }
     }
     result.push_str(&source[last_end..]);
     result
@@ -1677,7 +1692,6 @@ fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
 /// needle can only match at the start of a character, so the offset is the
 /// same.
 fn find_text(haystack: &str, needle: &str) -> Option<usize> {
-    const SHORT_TEXT_BYTES: usize = 64;
     let needle_bytes = needle.as_bytes();
     match needle_bytes {
         [first, ..] if haystack.len() <= SHORT_TEXT_BYTES => haystack
@@ -1687,6 +1701,9 @@ fn find_text(haystack: &str, needle: &str) -> Option<usize> {
         _ => haystack.find(needle),
     }
 }
+
+/// The longest text that `find_text` searches byte by byte.
+const SHORT_TEXT_BYTES: usize = 64;
 
 /// `lhs` followed by `rhs`, as a TEXT value.
 #[inline]
@@ -2597,6 +2614,18 @@ mod tests {
                 source.replace(pattern, replacement),
                 "{source:?} {pattern:?} {replacement:?}"
             );
+        }
+        // Sources of more than 64 bytes take the general search.
+        let long = "ab".repeat(40) + "\u{e9}a";
+        let sources = [long.as_str(), &long[..64], &long[..63], "abababa\u{e9}"];
+        for source in sources {
+            for pattern in ["a", "ab", "ba", "aba", "\u{e9}", "b\u{e9}a", "x"] {
+                assert_eq!(
+                    super::replace_all(source, pattern, "-"),
+                    source.replace(pattern, "-"),
+                    "{source:?} {pattern:?}"
+                );
+            }
         }
     }
 
