@@ -293,8 +293,8 @@ impl OpenOptions {
         self
     }
 
-    /// Select the page size for a new database. Existing databases retain their
-    /// stored page size, and cached opens retain the live database's page size.
+    /// Select the page size for a new database. Opening an existing or cached
+    /// database fails if its page size differs from this value.
     /// An encrypted database's page size cannot change after open.
     pub fn page_size(mut self, page_size: PageSize) -> Self {
         self.page_size = Some(page_size);
@@ -1213,6 +1213,7 @@ impl Database {
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
+        requested_page_size: Option<PageSize>,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
@@ -1236,6 +1237,7 @@ impl Database {
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
+        db.validate_requested_page_size(requested_page_size)?;
 
         Ok(Some(db))
     }
@@ -1348,6 +1350,7 @@ impl Database {
                 &options.encryption,
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
+                options.page_size,
             )? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
@@ -1509,6 +1512,7 @@ impl Database {
                             db.validate_encryption_options(options.encryption.as_ref())?;
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            db.validate_requested_page_size(options.page_size)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1752,6 +1756,7 @@ impl Database {
                     );
                     state.header_validation_state = hv_state;
                     let pager = return_if_io!(result);
+                    db.validate_requested_page_size(state.initial_page_size)?;
 
                     let db = state
                         .building_db
@@ -2007,6 +2012,23 @@ impl Database {
                 }
             }
         }
+    }
+
+    fn validate_requested_page_size(&self, requested: Option<PageSize>) -> Result<()> {
+        if let Some(requested) = requested {
+            let actual = self
+                .pager_state
+                .page_size()
+                .expect("opened database page size must be initialized");
+            if requested != actual {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page size mismatch: requested {} bytes, database uses {} bytes",
+                    requested.get(),
+                    actual.get()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
