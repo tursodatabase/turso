@@ -1283,13 +1283,15 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         let start = self.offset();
-        let first_word = match token_type.fallback_id_if_ok() {
+        let is_struct_or_union =
+            |word: &str| word.eq_ignore_ascii_case("STRUCT") || word.eq_ignore_ascii_case("UNION");
+        let first_word_is_struct_or_union = match token_type.fallback_id_if_ok() {
             TK_ID | TK_STRING => {
                 let tok = eat_assert!(self, TK_ID, TK_STRING);
-                from_bytes(tok.as_bytes())
+                is_struct_or_union(from_bytes_as_str(tok.as_bytes()))
             }
             TK_LBRACKET if !self.peeked_empty_brackets() => {
-                self.parse_bracket_quoted_name()?.as_str().to_owned()
+                is_struct_or_union(self.parse_bracket_quoted_name()?.as_str())
             }
             _ => return Ok(None),
         };
@@ -1298,9 +1300,7 @@ impl<'a> Parser<'a> {
         // Inline STRUCT/UNION types (e.g. `col STRUCT(x INT)`) are only valid
         // inside CREATE TYPE field lists (tracked by type_nesting_depth > 0).
         // In column definitions and CAST expressions, reject them.
-        let is_struct = first_word.eq_ignore_ascii_case("STRUCT");
-        let is_union = first_word.eq_ignore_ascii_case("UNION");
-        if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+        if first_word_is_struct_or_union && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
             if self.type_nesting_depth == 0 {
                 return Err(Error::ParseError(
                     "inline STRUCT/UNION column types are not supported; \
