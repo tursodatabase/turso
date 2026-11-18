@@ -1741,11 +1741,14 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
             }
 
             // A frame without an extension block carries no portable changes,
-            // so its row changes cannot be replayed here.
+            // so its row changes cannot be replayed here. A log that needs
+            // portable changes never contains such a frame, so the log is corrupt.
             if extension_size == 0 {
-                return Err(Error::DatabaseSyncEngineError(format!(
-                    "MVCC logical-log frame at range offset {frame_start} has no portable changes"
-                )));
+                return Err(turso_core::LimboError::Corrupt(format!(
+                    "MVCC logical-log frame at range offset {frame_start} has no portable changes; \
+                     the remote database must be upgraded with PRAGMA journal_mode = 'mvcc'"
+                ))
+                .into());
             }
             let extension_block = &range_body[extension_start..recovery_start];
             let recovery_payload = &range_body[recovery_start..trailer_start];

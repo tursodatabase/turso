@@ -12,7 +12,9 @@ fn pull_of_plain_frames_fails() -> Result<()> {
 
     let err = replica.pull().expect_err("pull of plain frames must fail");
     assert!(
-        err.to_string().contains("has no portable changes"),
+        err.to_string().contains("Corrupt database")
+            && err.to_string().contains("has no portable changes")
+            && err.to_string().contains("PRAGMA journal_mode = 'mvcc'"),
         "unexpected error: {err}"
     );
     Ok(())
