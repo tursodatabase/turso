@@ -976,7 +976,8 @@ fn push_time(res: &mut String, p: &DateTime) {
     res.push(':');
     push_zero_padded(res, i64::from(p.min), 2);
     if p.use_subsec {
-        write!(res, ":{:06.3}", p.s).unwrap();
+        res.push(':');
+        push_seconds(res, p.s);
     } else {
         res.push(':');
         push_zero_padded(res, i64::from(p.s as i32), 2);
@@ -1280,15 +1281,6 @@ where
     Value::from_text(res)
 }
 
-/// Append `millis`, a count less than 60000, as seconds with three decimals.
-/// The text is the same as `write!(res, "{:06.3}", millis as f64 / 1000.0)`,
-/// because the float is so near the decimal value that it rounds to it.
-fn push_seconds_with_millis(res: &mut String, millis: i64) {
-    push_zero_padded(res, millis / 1000, 2);
-    res.push('.');
-    push_zero_padded(res, millis % 1000, 3);
-}
-
 pub fn exec_strftime<I, E, V>(clock: &dyn Clock, values: I) -> Value
 where
     V: AsValueRef,
@@ -1424,7 +1416,7 @@ where
                 if s > 59.999 {
                     s = 59.999;
                 }
-                write!(res, "{s:06.3}").unwrap()
+                push_seconds(&mut res, s);
             }
             Some('g') => {
                 let mut y_iso = p;
@@ -1519,6 +1511,50 @@ where
     Value::from_text(res)
 }
 
+/// Append `s` as `write!(res, "{s:06.3}")` does.
+fn push_seconds(res: &mut String, s: f64) {
+    // The text of -0.0 has a minus sign.
+    if s.is_sign_positive() && s < 60.0 {
+        push_seconds_with_millis(res, round_to_millis(s));
+    } else {
+        write!(res, "{s:06.3}").unwrap();
+    }
+}
+
+/// `s * 1000`, for `s` in [0, 60), rounded to the nearest integer with ties
+/// to even. Float formatting rounds the exact value of `s` the same way.
+fn round_to_millis(s: f64) -> i64 {
+    use num_traits::Float;
+
+    // s = mantissa * 2^exponent, where mantissa < 2^53.
+    let (mantissa, exponent, _) = s.integer_decode();
+    turso_debug_assert!(exponent < 0, "s is less than 60");
+    let shift = u32::from(exponent.unsigned_abs());
+    if shift >= 64 {
+        // s * 1000 < 2^63 * 2^-64, which is less than one half.
+        return 0;
+    }
+    let scaled = u128::from(mantissa) * 1000;
+    let whole = scaled >> shift;
+    let rest = scaled & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    let rounded = if rest > half || (rest == half && whole % 2 == 1) {
+        whole + 1
+    } else {
+        whole
+    };
+    rounded as i64
+}
+
+/// Append `millis`, a count of at most 60000, as seconds with three decimals.
+/// The text is the same as `write!(res, "{:06.3}", millis as f64 / 1000.0)`,
+/// because the float is so near the decimal value that it rounds to it.
+fn push_seconds_with_millis(res: &mut String, millis: i64) {
+    push_zero_padded(res, millis / 1000, 2);
+    res.push('.');
+    push_zero_padded(res, millis % 1000, 3);
+}
+
 /// SQLite reads date/time arguments with sqlite3_value_text(), which hands back a
 /// BLOB's bytes unchanged, so a blob holding '2024-01-01' parses like that text.
 /// The result is read as a C string, so text and blobs both end at the first NUL.
@@ -1589,6 +1625,42 @@ mod tests {
             let mut res = String::new();
             push_seconds_with_millis(&mut res, millis);
             assert_eq!(res, format!("{:06.3}", millis as f64 / 1000.0));
+        }
+    }
+
+    #[test]
+    fn push_seconds_matches_float_fmt() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let random = std::iter::repeat_with(move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 61.0
+        })
+        .take(200_000);
+        let millis = (0..=60000).map(|millis| millis as f64 / 1000.0);
+        // The exact value of a multiple of 1/16 times 1000 is a tie when it ends in .5.
+        let ties = (0..=976).map(|sixteenths| sixteenths as f64 / 16.0);
+        let other = [
+            0.0005,
+            0.0015,
+            59.9994,
+            59.9995,
+            59.99950000000001,
+            59.9996,
+            60.0,
+            60.5,
+            123.4567,
+            1e-300,
+            -0.0,
+            -1.5,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for s in random.chain(millis).chain(ties).chain(other) {
+            let mut res = String::new();
+            push_seconds(&mut res, s);
+            assert_eq!(res, format!("{s:06.3}"), "{s:?}");
         }
     }
 
