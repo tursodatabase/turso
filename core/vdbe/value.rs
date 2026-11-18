@@ -1337,21 +1337,21 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
-        let Some(lhs) = self.cast_text_ref() else {
-            return Ok(Value::Null);
-        };
-
-        let Some(rhs) = rhs.cast_text_ref() else {
-            return Ok(Value::Null);
-        };
-
-        if lhs.len() + rhs.len() > Self::MAX_BLOB_LENGTH as usize {
-            return Err(LimboError::TooBig);
+        if let (Value::Text(lhs), Value::Text(rhs)) = (self, rhs) {
+            return join_text(lhs.as_str(), rhs.as_str());
         }
-        let mut joined = String::with_capacity(lhs.len() + rhs.len());
-        joined.push_str(&lhs);
-        joined.push_str(&rhs);
-        Ok(Value::build_text(joined))
+
+        let mut lhs_integer = None;
+        let Some(lhs) = text_of_operand(self, &mut lhs_integer) else {
+            return Ok(Value::Null);
+        };
+
+        let mut rhs_integer = None;
+        let Some(rhs) = text_of_operand(rhs, &mut rhs_integer) else {
+            return Ok(Value::Null);
+        };
+
+        join_text(&lhs, &rhs)
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1684,6 +1684,33 @@ fn replace_all(source: &str, pattern: &str, replacement: &str) -> String {
     }
     result.push_str(&source[last_end..]);
     result
+}
+
+/// `lhs` followed by `rhs`, as a TEXT value.
+#[inline]
+fn join_text(lhs: &str, rhs: &str) -> Result<Value> {
+    if lhs.len() + rhs.len() > Value::MAX_BLOB_LENGTH as usize {
+        return Err(LimboError::TooBig);
+    }
+    let mut joined = String::with_capacity(lhs.len() + rhs.len());
+    joined.push_str(lhs);
+    joined.push_str(rhs);
+    Ok(Value::build_text(joined))
+}
+
+/// The text of `value` as `cast_text_ref` gives it, but the text of an
+/// integer goes into `integer`, on the stack of the caller, and not into a
+/// new `String`.
+fn text_of_operand<'a>(
+    value: &'a Value,
+    integer: &'a mut Option<IntegerText>,
+) -> Option<Cow<'a, str>> {
+    match value {
+        Value::Numeric(Numeric::Integer(i)) => {
+            Some(Cow::Borrowed(integer.insert(IntegerText::new(*i)).as_str()))
+        }
+        value => value.cast_text_ref(),
+    }
 }
 
 /// The text of `CAST(value AS TEXT)`, which is the text of `value.to_string()`.
@@ -2030,6 +2057,32 @@ mod tests {
         let rhs = blob(&[3, 4]);
 
         assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn concat_joins_the_text_of_both_operands() {
+        let values = [
+            Value::build_text("id="),
+            Value::from_i64(-42),
+            Value::from_i64(i64::MIN),
+            Value::from_f64(2.5),
+            blob(b"ab"),
+            Value::Null,
+        ];
+        for lhs in &values {
+            for rhs in &values {
+                let expected = match (lhs, rhs) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    (Value::Blob(l), Value::Blob(r)) => blob(&[&l[..], &r[..]].concat()),
+                    _ => Value::build_text(format!("{lhs}{rhs}")),
+                };
+                assert_eq!(
+                    lhs.exec_concat(rhs).unwrap(),
+                    expected,
+                    "{lhs:?} || {rhs:?}"
+                );
+            }
+        }
     }
 
     #[test]
