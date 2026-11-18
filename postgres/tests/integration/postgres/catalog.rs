@@ -305,6 +305,60 @@ fn catalogs_report_the_same_objects_after_open_and_after_the_schema_is_read_agai
     assert_eq!(after_open, after_reading_again);
 }
 
+/// Every relation of a user has a row in the classes table. A file where
+/// one is missing is corrupt, and neither opening it nor reading its schema
+/// again may load it.
+#[test]
+fn a_table_without_a_class_row_fails_the_load_at_open_and_when_the_schema_is_read_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE docs (id int)").unwrap();
+    conn.inner()
+        .prepare_engine_schema_statement(
+            "DELETE FROM __turso_internal_classes WHERE relname = 'docs'",
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    let expected = format!(
+        "relation \"docs\" of namespace {} has no row in __turso_internal_classes",
+        public_namespace(&conn)
+    );
+
+    let error = conn
+        .inner()
+        .force_reparse_schema_without_publish()
+        .unwrap_err();
+    assert!(
+        matches!(&error, turso_core::LimboError::Corrupt(message) if *message == expected),
+        "{error:?}"
+    );
+
+    conn.close().unwrap();
+    drop(conn);
+    let TempDatabase { path, io, db } = db;
+    drop(db);
+    let Err(error) = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_encryption(true),
+    ) else {
+        panic!("a database with a table that has no class row opened");
+    };
+    assert!(error.to_string().contains(&expected), "{error}");
+}
+
+/// The id of the namespace of the schema `public`.
+fn public_namespace(conn: &turso_pg::Connection) -> u32 {
+    conn.inner().with_schema(turso_core::MAIN_DB_ID, |schema| {
+        schema
+            .namespace_named("public")
+            .expect("a PostgreSQL database has the schema public")
+            .as_u32()
+    })
+}
+
 /// What the catalogs report about schemas, relations, sequences, types and
 /// roles.
 fn catalog_rows(conn: &turso_pg::Connection) -> Vec<Vec<Value>> {
