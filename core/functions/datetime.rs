@@ -1,4 +1,4 @@
-use crate::functions::printf::exec_printf_values;
+use crate::functions::printf::push_general_format;
 use crate::io::clock::Clock;
 use crate::numeric::{format_float, Numeric};
 use crate::types::AsValueRef;
@@ -1441,10 +1441,8 @@ where
                 write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
             }
             Some('J') => {
-                let val = Value::from_f64(p.i_jd as f64 / 86400000.0);
-                let julian_day = exec_printf_values(&Value::build_text("%.16g"), &[&val])
-                    .expect("%.16g of a float cannot fail");
-                write!(res, "{julian_day}").unwrap();
+                let julian_day = Value::from_f64(p.i_jd as f64 / 86400000.0);
+                push_general_format(&mut res, &julian_day, 16);
             }
             Some('k') => write!(res, "{:2}", p.h).unwrap(),
             Some('l') => {
