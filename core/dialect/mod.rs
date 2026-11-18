@@ -25,6 +25,7 @@ pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
 pub use crate::translate::sqlite_schema_rows::SqliteCatalog;
+pub use catalog::AlterColumn;
 pub use catalog::{
     AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateIndex,
     CreateMaterializedView, CreateTable, CreateView, DropIndex, DropView, NewOwner, OwnerColumn,

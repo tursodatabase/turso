@@ -1,9 +1,9 @@
 use crate::alloc::TursoIteratorExt;
 use crate::dialect::catalog::{
-    AfterWrites, CatalogWrite, RenameColumn, RenameTable, RenamedIndex, RewrittenTrigger,
+    AlterColumn, CatalogWrite, RenameColumn, RenameTable, RenamedIndex, RewrittenTrigger,
     RewrittenView, TempTriggerOfRenamedTable, WriteContext,
 };
-use crate::dialect::{AccessStatement, NewOwner, RelationChange};
+use crate::dialect::{AccessStatement, NewOwner};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
@@ -20,11 +20,9 @@ use super::{
         self, check_column_type, validate_check_expr, validate_default_expr,
         validate_generated_function_calls, SQLITE_TABLEID,
     },
-    sqlite_schema_alter_rows::emit_rewrite_of_every_row,
     update::translate_update_for_schema_change,
 };
 use crate::{
-    function::AlterTableFunc,
     schema::alter_table::{
         rename_identifiers, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
         rewrite_view_sql_for_column_rename,
@@ -1969,41 +1967,43 @@ pub fn translate_alter_table(
                 None
             };
 
+            let rewritten_triggers: Vec<RewrittenTrigger> = triggers_to_rewrite
+                .iter()
+                .map(|(namespace, name, sql)| RewrittenTrigger {
+                    namespace: *namespace,
+                    name: name.clone(),
+                    sql: sql.clone(),
+                })
+                .collect();
             let write_context = WriteContext::new(connection, resolver, database_id);
-            let after_writes = if rename {
-                let rewritten_triggers: Vec<RewrittenTrigger> = triggers_to_rewrite
-                    .iter()
-                    .map(|(namespace, name, sql)| RewrittenTrigger {
-                        namespace: *namespace,
-                        name: name.clone(),
-                        sql: sql.clone(),
-                    })
-                    .collect();
-                resolver.catalog.dialect.catalog().write(
-                    program,
-                    &write_context,
-                    &CatalogWrite::RenameColumn(RenameColumn {
-                        namespace: namespace.id,
-                        table: &normalize_ident(table_name),
-                        written_table_name: table_name,
-                        old_name: old_column_name,
-                        written_old_name: from,
-                        new_name: &definition.col_name,
-                        triggers: &rewritten_triggers,
-                        views: &views_to_rewrite,
-                        statement: input,
-                    }),
-                )?
+            let normalized_table_name = normalize_ident(table_name);
+            let catalog_write = if rename {
+                CatalogWrite::RenameColumn(RenameColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    written_table_name: table_name,
+                    old_name: old_column_name,
+                    written_old_name: from,
+                    new_name: &definition.col_name,
+                    triggers: &rewritten_triggers,
+                    views: &views_to_rewrite,
+                    statement: input,
+                })
             } else {
-                emit_rewrite_of_every_row(
-                    program,
-                    &write_context,
-                    AlterTableFunc::AlterColumn,
-                    &[mangled_table_name, from.to_string(), definition.to_string()],
-                    table_name,
-                );
-                AfterWrites::none()
+                CatalogWrite::AlterColumn(AlterColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    written_table_name: table_name,
+                    old_name: old_column_name,
+                    written_old_name: from,
+                    definition: &definition,
+                })
             };
+            let after_writes = resolver.catalog.dialect.catalog().write(
+                program,
+                &write_context,
+                &catalog_write,
+            )?;
 
             if let Some(temp_schema_version) = temp_schema_version {
                 program.emit_insn(Insn::SetCookie {
@@ -2074,23 +2074,6 @@ pub fn translate_alter_table(
                     namespace,
                     &altered_table,
                     &indexes_to_rewrite,
-                )?;
-            }
-
-            if !rename
-                && col_name != old_column_name
-                && schema::dialect_relation_hooks_apply(connection, database_id)?
-            {
-                resolver.catalog.dialect.translate_relation_changes(
-                    program,
-                    resolver.schema(),
-                    connection,
-                    &[RelationChange::ColumnRenamed {
-                        namespace: namespace.id,
-                        table: &normalize_ident(table_name),
-                        old_name: old_column_name,
-                        new_name: col_name,
-                    }],
                 )?;
             }
 

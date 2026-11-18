@@ -145,6 +145,7 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
+pub use dialect::AlterColumn;
 #[cfg(test)]
 pub(crate) use dialect::EngineDialect;
 pub use dialect::{
