@@ -22,8 +22,10 @@ pub mod catalog;
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
+pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
-    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, AfterWrites, AutomaticIndex, Catalog, CatalogApply, CatalogWrite, CreateTable,
+    NewOwner, OwnerColumn, RelationChange, RelationName, TableText, WriteContext, WriteOrigin,
 };
 
 use crate::{
@@ -324,6 +326,12 @@ pub trait Dialect: Send + Sync + 'static {
         Err(LimboError::InternalError(
             "the dialect queried schema state it cannot build".to_string(),
         ))
+    }
+
+    /// Where the dialect stores the objects of a database. The default
+    /// stores them as rows of `sqlite_schema`.
+    fn catalog(&self) -> &dyn Catalog {
+        &SqliteCatalog
     }
 
     /// Translates `changes`, which the statement being compiled makes to
