@@ -27,6 +27,7 @@
 //! own name, like an AUTOINCREMENT table's watermark. Row-level security
 //! policies take their oids from the same counter.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -42,7 +43,7 @@ use turso_core::{
     AfterWrites, Catalog, CatalogApply, CatalogWrite, CmpInsFlags, CollationSeq, Connection,
     CreateIndex, CursorType, DropIndex, DropView, InsertFlags, Insn, LimboError, LoadQuery,
     LoadStep, NewOwner, Numeric, OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationChange,
-    RelationName, Row, SchemaLoad, SqliteCatalog, Value, WriteContext, WriteOrigin,
+    RelationName, RenameTable, Row, SchemaLoad, SqliteCatalog, Value, WriteContext, WriteOrigin,
 };
 use turso_parser::ast;
 
@@ -499,6 +500,9 @@ impl Catalog for PostgresCatalog {
         if matches!(change, CatalogWrite::DropTable(table) if table.is_virtual) {
             return Ok(after_writes);
         }
+        if !changes_class_rows(change) {
+            return Ok(after_writes);
+        }
         if !writes_class_rows(ctx)? {
             return Ok(after_writes);
         }
@@ -544,6 +548,7 @@ impl Catalog for PostgresCatalog {
                 RelationKind::MaterializedView,
             )?,
             CatalogWrite::DropView(_) => unreachable!("DROP VIEW returned above"),
+            CatalogWrite::RenameTable(table) => rename_class_rows_of_table(program, ctx, table)?,
         }
         Ok(after_writes)
     }
@@ -708,6 +713,39 @@ fn write_created_view_class_row(
             table: None,
         }],
     )
+}
+
+/// Whether the class table stores anything that `change` changes. A
+/// virtual table has no class row.
+fn changes_class_rows(change: &CatalogWrite<'_>) -> bool {
+    match change {
+        CatalogWrite::RenameTable(table) => !table.is_virtual,
+        _ => true,
+    }
+}
+
+/// Gives the class rows of a renamed table and of its automatic indexes
+/// their new names.
+fn rename_class_rows_of_table(
+    program: &mut ProgramBuilder,
+    ctx: &WriteContext<'_>,
+    table: &RenameTable<'_>,
+) -> turso_core::Result<()> {
+    let mut changes = vec![RelationChange::Renamed {
+        namespace: table.namespace,
+        old_name: table.old_name,
+        new_name: Cow::Borrowed(table.new_name),
+    }];
+    changes.extend(
+        table
+            .renamed_automatic_indexes()
+            .map(|(old_name, new_name)| RelationChange::Renamed {
+                namespace: table.namespace,
+                old_name,
+                new_name: Cow::Owned(new_name),
+            }),
+    );
+    translate_relation_changes(program, ctx.schema, ctx.connection, &changes)
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL

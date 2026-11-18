@@ -6,7 +6,7 @@
 
 use crate::{
     namespace::NamespaceId,
-    schema::{load::LoadStep, RelationKind, Schema},
+    schema::{load::LoadStep, Index, RelationKind, Schema},
     translate::{
         emitter::Resolver,
         schema::{
@@ -14,6 +14,7 @@ use crate::{
             open_sqlite_schema_for_write,
         },
     },
+    util::renamed_automatic_index_name,
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Connection, LimboError, Result, Value,
 };
@@ -161,6 +162,8 @@ pub enum CatalogWrite<'a> {
     CreateMaterializedView(CreateMaterializedView<'a>),
     /// `DROP VIEW` of a view or a materialized view.
     DropView(DropView<'a>),
+    /// `ALTER TABLE ... RENAME TO`.
+    RenameTable(RenameTable<'a>),
 }
 
 /// A new table whose B-tree, and the B-trees of its automatic indexes, the
@@ -325,6 +328,64 @@ pub struct DropView<'a> {
     pub namespace: NamespaceId,
     /// The normalized name of the view in its namespace.
     pub name: &'a str,
+}
+
+/// A table that gets a new name in the same namespace. Everything stored
+/// that names the table changes with it: its indexes, the foreign keys and
+/// checks of other tables, triggers and views.
+#[derive(Debug, Clone, Copy)]
+pub struct RenameTable<'a> {
+    /// The namespace of the table in the database the statement changes.
+    pub namespace: NamespaceId,
+    /// The normalized name of the table before the statement.
+    pub old_name: &'a str,
+    /// The normalized name of the table after the statement.
+    pub new_name: &'a str,
+    /// The old name as the statement spells it.
+    pub written_old_name: &'a str,
+    /// The new name as the statement spells it.
+    pub written_new_name: &'a str,
+    /// Whether the table is a virtual table, which has no B-tree, no
+    /// indexes and no triggers.
+    pub is_virtual: bool,
+    /// The indexes of the table; empty for a virtual table. The name of an
+    /// automatic index contains the table's name, so it is renamed with
+    /// the table: see [`RenameTable::renamed_automatic_indexes`].
+    pub(crate) indexes: &'a [Arc<Index>],
+    /// The name the table's schema rows have before the statement.
+    pub(crate) stored_old_name: &'a str,
+    /// The name the table's schema rows have after the statement.
+    pub(crate) stored_new_name: &'a str,
+    /// The triggers of the temp database whose text names the table.
+    pub temp_triggers: &'a [TempTriggerOfRenamedTable],
+    /// The text of the statement, for change data capture.
+    pub statement: &'a str,
+}
+
+impl<'a> RenameTable<'a> {
+    /// The old and the new name of each automatic index of the table.
+    pub fn renamed_automatic_indexes(&self) -> impl Iterator<Item = (&'a str, String)> + '_ {
+        self.indexes.iter().filter_map(|index| {
+            let new_name = renamed_automatic_index_name(
+                &index.name,
+                self.stored_old_name,
+                self.stored_new_name,
+            )?;
+            Some((index.name.as_str(), new_name))
+        })
+    }
+}
+
+/// A trigger of the temp database whose text names a table of another
+/// database that is renamed.
+#[derive(Debug, Clone)]
+pub struct TempTriggerOfRenamedTable {
+    pub name: String,
+    /// The `CREATE TRIGGER` text with the table's new name.
+    pub sql: String,
+    /// Whether the trigger is on the renamed table. If not, only its body
+    /// names the table.
+    pub is_on_the_table: bool,
 }
 
 /// What a statement emits after all of its schema writes, so that the

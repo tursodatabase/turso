@@ -1,9 +1,6 @@
 mod sqlite_schema_alter_rows;
 mod sqlite_schema_rows;
 
-pub(crate) use sqlite_schema_alter_rows::{
-    emit_rename_autoincrement_backing_table_entry, emit_rename_sqlite_sequence_entry,
-};
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
     alloc_sqlite_schema_cursor, emit_create_internal_table, emit_open_sqlite_schema_cursor,
