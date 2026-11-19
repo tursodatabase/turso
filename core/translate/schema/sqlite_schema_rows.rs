@@ -14,7 +14,9 @@ use crate::translate::emitter::{
     OperationMode, Resolver,
 };
 use crate::translate::index::canonical_create_index_sql;
-use crate::translate::schema::sqlite_schema_alter_rows::emit_rename_table_rows;
+use crate::translate::schema::sqlite_schema_alter_rows::{
+    emit_rename_column_rows, emit_rename_table_rows,
+};
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
@@ -25,8 +27,8 @@ use turso_parser::ast;
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
 /// the SQL text that creates it. So far it stores `CREATE TABLE`, `CREATE
 /// INDEX`, `DROP INDEX`, `DROP TABLE`, `CREATE VIEW`, `CREATE MATERIALIZED
-/// VIEW`, `DROP VIEW` and `ALTER TABLE ... RENAME TO`; every other statement
-/// writes its `sqlite_schema` rows itself.
+/// VIEW`, `DROP VIEW`, `ALTER TABLE ... RENAME TO` and `ALTER TABLE ... RENAME
+/// COLUMN`; every other statement writes its `sqlite_schema` rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
 
@@ -52,7 +54,8 @@ impl Catalog for SqliteCatalog {
             }
             CatalogCmd::DropView(view) => emit_drop_view_row(program, ctx, view),
             CatalogCmd::RenameTable(table) => emit_rename_table_rows(program, ctx, table),
-            CatalogCmd::RenameColumn(_) | CatalogCmd::AlterColumn(_) => Ok(()),
+            CatalogCmd::RenameColumn(column) => emit_rename_column_rows(program, ctx, column),
+            CatalogCmd::AlterColumn(_) => Ok(()),
         }
     }
 }

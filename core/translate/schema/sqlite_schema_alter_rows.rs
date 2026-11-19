@@ -1,9 +1,9 @@
 //! Bytecode that rewrites stored rows for `ALTER TABLE`: the rows of
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
-use crate::dialect::{CmdContext, RenameTable};
+use crate::dialect::{CmdContext, RenameColumn, RenameTable};
 use crate::function::{AlterTableFunc, Func, FuncCtx};
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::alter::{database_uses_mvcc, schema_table_name_for_db};
 use crate::translate::collate::CollationSeq;
@@ -91,12 +91,77 @@ pub(super) fn emit_rename_table_rows(
     Ok(())
 }
 
+/// Renames a column in every row of `sqlite_schema` of the table's
+/// database, and stores the new text of the triggers and views that name
+/// the column.
+pub(super) fn emit_rename_column_rows(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    column: &RenameColumn<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: column.namespace,
+    };
+    let new_definition = ast::ColumnDefinition {
+        col_name: column.new_name.clone(),
+        col_type: None,
+        constraints: vec![],
+    };
+    emit_rewrite_of_every_row(
+        program,
+        ctx,
+        AlterTableFunc::RenameColumn,
+        &[
+            resolver.mangle_name(namespace, column.table),
+            column.written_old_name.to_string(),
+            new_definition.to_string(),
+        ],
+        column.written_table_name,
+    );
+
+    for trigger in column.triggers {
+        let stored_name = resolver.mangle_name(trigger.namespace, &trigger.name);
+        emit_update_of_stored_sql(
+            program,
+            ctx,
+            &StoredSqlUpdate {
+                database_id: trigger.namespace.database_id,
+                object_type: "trigger",
+                name_for_errors: &trigger.name,
+                name_in_where_clause: &escape_sql_string_literal(&stored_name),
+                sql: &trigger.sql,
+                new_tbl_name: None,
+                statement: column.statement,
+            },
+        )?;
+    }
+    for view in column.views {
+        let stored_name = resolver.mangle_name(view.namespace, &view.name);
+        emit_update_of_stored_sql(
+            program,
+            ctx,
+            &StoredSqlUpdate {
+                database_id: view.namespace.database_id,
+                object_type: "view",
+                name_for_errors: &stored_name,
+                name_in_where_clause: &stored_name,
+                sql: &view.sql,
+                new_tbl_name: None,
+                statement: column.statement,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Emits a loop over every row of `sqlite_schema` of the database the
 /// statement changes. `func` gets the five columns of a row and then
 /// `arguments`, and gives the five columns to store in place of the row.
 /// `written_table_name` is the table the statement alters, as the statement
 /// spells it.
-fn emit_rewrite_of_every_row(
+pub(crate) fn emit_rewrite_of_every_row(
     program: &mut ProgramBuilder,
     ctx: &CmdContext<'_>,
     func: AlterTableFunc,

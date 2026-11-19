@@ -3,7 +3,7 @@
 //! in-memory schema once the command is stored.
 
 use crate::{
-    namespace::NamespaceId,
+    namespace::{NamespaceId, NamespaceRef},
     schema::{Index, Schema},
     translate::{
         emitter::Resolver,
@@ -328,8 +328,29 @@ pub struct TempTriggerOfRenamedTable {
 pub struct RenameColumn<'a> {
     pub namespace: NamespaceId,
     pub table: &'a str,
+    pub written_table_name: &'a str,
     pub old_name: &'a str,
+    pub written_old_name: &'a str,
     pub new_name: &'a ast::Name,
+    pub triggers: &'a [RewrittenTrigger],
+    pub views: &'a [RewrittenView],
+    pub statement: &'a str,
+}
+
+/// A trigger whose text names a renamed column, with its new text.
+#[derive(Debug, Clone)]
+pub struct RewrittenTrigger {
+    pub namespace: NamespaceRef,
+    pub name: String,
+    pub sql: String,
+}
+
+/// A view whose text names a renamed column, with its new text.
+#[derive(Debug, Clone)]
+pub struct RewrittenView {
+    pub namespace: NamespaceRef,
+    pub name: String,
+    pub sql: String,
 }
 
 /// A column that gets a new definition, and with it possibly a new name.
