@@ -83,6 +83,32 @@ expect error {
     invalid input syntax for type bigint: "1.5"
 }
 
+# PostgreSQL checks INCREMENT and the bounds before it reads START, and START
+# before it reads CACHE, so those errors come first.
+test create-sequence-zero-increment-before-fractional-start {
+    CREATE SEQUENCE seq_order_incr INCREMENT 0 START 1.5;
+}
+@sqlstate 22023
+expect error {
+    INCREMENT must not be zero
+}
+
+test create-sequence-bounds-before-fractional-start {
+    CREATE SEQUENCE seq_order_bounds MINVALUE 5 MAXVALUE 1 START 1.5;
+}
+@sqlstate 22023
+expect error {
+    MINVALUE \(5\) must be less than MAXVALUE \(1\)
+}
+
+test create-sequence-start-range-before-fractional-cache {
+    CREATE SEQUENCE seq_order_start START 100 MAXVALUE 10 CACHE 1.5;
+}
+@sqlstate 22023
+expect error {
+    START value \(100\) cannot be greater than MAXVALUE \(10\)
+}
+
 test create-sequence-with-exponent-increment {
     CREATE SEQUENCE increment_exponent INCREMENT 1e3;
 }

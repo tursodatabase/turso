@@ -6075,8 +6075,20 @@ impl SequenceOptions {
         let ascending = increment.unwrap_or(1) > 0;
         let mut max_value = read_bound("MAXVALUE", max_elem)?;
         let mut min_value = read_bound("MINVALUE", min_elem)?;
-        let start = read(start_elem)?;
-        match read(cache_elem)? {
+        // PostgreSQL checks INCREMENT and the bounds before it reads START, and
+        // START against the bounds before it reads CACHE. Core makes these
+        // checks for a sequence it creates; when START or CACHE can't be read,
+        // the error PostgreSQL would have raised first is reported instead.
+        let checks = EarlierSequenceChecks {
+            increment,
+            min_value,
+            max_value,
+            ascending,
+            type_min,
+            type_max,
+        };
+        let start = read(start_elem).map_err(|e| checks.first_error(None).unwrap_or(e))?;
+        match read(cache_elem).map_err(|e| checks.first_error(Some(start)).unwrap_or(e))? {
             None | Some(1) => {}
             Some(cache) if cache < 1 => {
                 return Err(invalid(format!(
@@ -6107,6 +6119,56 @@ impl SequenceOptions {
             max_value,
             cycle,
         })
+    }
+}
+
+/// The values of a sequence's options that PostgreSQL checks before it reads
+/// START and CACHE (see `SequenceOptions::new`).
+struct EarlierSequenceChecks {
+    increment: Option<i64>,
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+    ascending: bool,
+    type_min: i64,
+    type_max: i64,
+}
+
+impl EarlierSequenceChecks {
+    /// The first of PostgreSQL's checks that fails, in its order: INCREMENT,
+    /// MINVALUE against MAXVALUE, and, once START was read (`start` is
+    /// `Some`), START against the bounds. The messages are core's
+    /// (`Sequence::new`).
+    fn first_error(&self, start: Option<Option<i64>>) -> Option<ParseError> {
+        let invalid = |message: String| ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_PARAMETER_VALUE,
+            message,
+        };
+        if self.increment == Some(0) {
+            return Some(invalid("INCREMENT must not be zero".to_string()));
+        }
+        let max = self
+            .max_value
+            .unwrap_or(if self.ascending { self.type_max } else { -1 });
+        let min = self
+            .min_value
+            .unwrap_or(if self.ascending { 1 } else { self.type_min });
+        if min >= max {
+            return Some(invalid(format!(
+                "MINVALUE ({min}) must be less than MAXVALUE ({max})"
+            )));
+        }
+        let start = start?.unwrap_or(if self.ascending { min } else { max });
+        if start < min {
+            return Some(invalid(format!(
+                "START value ({start}) cannot be less than MINVALUE ({min})"
+            )));
+        }
+        if start > max {
+            return Some(invalid(format!(
+                "START value ({start}) cannot be greater than MAXVALUE ({max})"
+            )));
+        }
+        None
     }
 }
 
