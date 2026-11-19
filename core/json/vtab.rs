@@ -522,7 +522,7 @@ fn navigate_to_path(
 mod columns {
     use crate::{
         json::{
-            json_string_to_db_type,
+            json_ref_to_db_type,
             jsonb::{self, ElementType, Jsonb},
             OutputVariant,
         },
@@ -596,7 +596,7 @@ mod columns {
             let element_type = self.value.element_type()?;
             Ok(match element_type {
                 ElementType::ARRAY | ElementType::OBJECT => {
-                    json_string_to_db_type(self.value.clone(), element_type, OutputVariant::String)?
+                    json_ref_to_db_type(&self.value, element_type, OutputVariant::String)?
                 }
                 _ => Self::atom_from_value(&self.value)?,
             })
@@ -613,7 +613,7 @@ mod columns {
                 jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
                 jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
                 jsonb::ElementType::INT | jsonb::ElementType::INT5 => {
-                    json_string_to_db_type(value.clone(), element_type, OutputVariant::ElementType)
+                    json_ref_to_db_type(value, element_type, OutputVariant::ElementType)
                 }
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
@@ -621,11 +621,9 @@ mod columns {
                 jsonb::ElementType::TEXT
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
-                    value.clone(),
-                    element_type,
-                    OutputVariant::ElementTypePlain,
-                ),
+                | jsonb::ElementType::TEXTRAW => {
+                    json_ref_to_db_type(value, element_type, OutputVariant::ElementTypePlain)
+                }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
                 jsonb::ElementType::RESERVED1 => Ok(Value::Null),
@@ -637,6 +635,16 @@ mod columns {
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
+            // The JSON text of a FLOAT element is its payload, so a UTF-8
+            // payload is parsed without the text.
+            if value.element_type_at(0).ok() == Some(ElementType::FLOAT) {
+                if let Some(text) = value
+                    .scalar_payload()
+                    .and_then(|payload| std::str::from_utf8(payload).ok())
+                {
+                    return Ok(Value::from_f64(text.parse::<f64>()?));
+                }
+            }
             let string = value.to_string()?;
             let float = string.parse::<f64>()?;
 

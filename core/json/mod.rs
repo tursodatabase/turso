@@ -5,6 +5,7 @@ mod ops;
 pub(crate) mod path;
 pub(crate) mod vtab;
 
+use crate::alloc::TryClone;
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
@@ -629,6 +630,22 @@ pub fn json_string_to_db_type(
     }
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
+    }
+    json_ref_to_db_type(&json, element_type, flag)
+}
+
+/// Like [json_string_to_db_type], for a document that the caller keeps. Only
+/// `OutputVariant::Binary` copies the document.
+pub(crate) fn json_ref_to_db_type(
+    json: &Jsonb,
+    element_type: ElementType,
+    flag: OutputVariant,
+) -> crate::Result<Value> {
+    if element_type == ElementType::NULL {
+        return Ok(Value::Null);
+    }
+    if matches!(flag, OutputVariant::Binary) {
+        return Ok(Value::Blob(json.try_clone()?.data()));
     }
     // SQL values of TEXT5 strings are decoded from the payload, not from the
     // JSON rendering, because escapes that cannot be rendered as JSON text
