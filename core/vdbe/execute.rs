@@ -9561,15 +9561,24 @@ pub fn op_agg_step(
                 }
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let counts = matches!(agg, AggFunc::Count0)
-                    || matches!(
-                        state.registers[data.col],
-                        Register::Value(Value::Numeric(_))
-                    );
-                if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
+                // COUNT(x) counts each value that is not NULL, of every type.
+                let counts = if matches!(agg, AggFunc::Count0) {
+                    Some(true)
+                } else {
+                    match &state.registers[data.col] {
+                        Register::Value(Value::Null) => Some(false),
+                        Register::Value(_) => Some(true),
+                        _ => None,
+                    }
+                };
+                if let (Some(counts), Register::Aggregate(AggContext::Builtin(payload))) =
                     (counts, &mut state.registers[data.acc_reg])
                 {
                     if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
+                        if !counts {
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
                         if let Some(rows) = count.checked_add(1) {
                             *count = rows;
                             state.pc += 1;
