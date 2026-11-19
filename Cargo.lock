@@ -4336,9 +4336,9 @@ dependencies = [
 
 [[package]]
 name = "pg_query"
-version = "6.1.1"
+version = "18.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ca6fdb8f9d32182abf17328789f87f305dd8c8ce5bf48c5aa2b5cffc94e1c04"
+checksum = "457bfe74085c505ecaf5468416450969e2e52a66d26bc1a4b2f6944a2daee73f"
 dependencies = [
  "bindgen 0.66.1",
  "cc",
@@ -6175,6 +6175,7 @@ dependencies = [
  "tokio",
  "turso",
  "turso_parser",
+ "turso_pg",
  "turso_pg_client",
 ]
 

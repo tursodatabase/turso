@@ -815,7 +815,7 @@ pub fn group_by_process_single_group(
                     agg_result_reg,
                     &t_ctx.resolver,
                 )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
@@ -873,7 +873,7 @@ pub fn group_by_process_single_group(
                     agg_result_reg,
                     &t_ctx.resolver,
                 )?;
-                if let Distinctness::Distinct { ctx } = &agg.distinctness {
+                if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                     let ctx = ctx
                         .as_ref()
                         .expect("distinct aggregate context not populated");
@@ -1044,7 +1044,7 @@ pub fn group_by_emit_row_phase<'a>(
     // If no data, return without outputting a row
     program.preassign_label_to_next_insn(labels.label_group_by_end_without_emitting_row);
     // SELECT DISTINCT also jumps here if there is a duplicate.
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
@@ -1165,7 +1165,7 @@ pub fn group_by_emit_row_phase<'a>(
     plan.aggregates
         .iter()
         .filter_map(|agg| {
-            if let Distinctness::Distinct { ctx } = &agg.distinctness {
+            if let Distinctness::Distinct { ctx, .. } = &agg.distinctness {
                 Some(ctx)
             } else {
                 None
@@ -1175,9 +1175,7 @@ pub fn group_by_emit_row_phase<'a>(
             let ctx = ctx
                 .as_ref()
                 .expect("distinct aggregate context not populated");
-            program.emit_insn(Insn::HashClear {
-                hash_table_id: ctx.hash_table_id,
-            });
+            ctx.emit_reset(program);
         });
 
     program.emit_insn(Insn::Integer {

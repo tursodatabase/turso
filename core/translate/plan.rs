@@ -27,7 +27,7 @@ use crate::{
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
-        insn::{HashDistinctData, Insn},
+        insn::{CmpInsFlags, HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable, MAIN_DB_ID, TEMP_DB_ID,
@@ -105,7 +105,7 @@ enum CompoundPart<'a> {
     /// A SELECT with these result columns.
     Select(&'a [ResultSetColumn]),
     /// One row of a VALUES list.
-    Row(&'a [ast::Expr]),
+    Row(&'a [Box<ast::Expr>]),
     /// Constant rows of a VALUES list read through a co-routine.
     CoRoutine,
 }
@@ -133,7 +133,7 @@ fn compound_column_affinity(
                 CompoundPart::Select(columns) => {
                     column_types(columns.get(i).map(|rc| &rc.expr), metadata)
                 }
-                CompoundPart::Row(row) => column_types(row.get(i), metadata),
+                CompoundPart::Row(row) => column_types(row.get(i).map(|expr| &**expr), metadata),
                 // A co-routine's column has no affinity and can hold any type.
                 CompoundPart::CoRoutine => (Affinity::None, StorageClassMask::all()),
             });
@@ -144,7 +144,11 @@ fn compound_column_affinity(
     };
     let first_expr_is_cast = match arms.first() {
         Some(arm) if arm.values.is_empty() => arm.result_columns.get(i).map(|rc| &rc.expr),
-        Some(arm) => arm.values.first().and_then(|row| row.get(i)),
+        Some(arm) => arm
+            .values
+            .first()
+            .and_then(|row| row.get(i))
+            .map(|expr| &**expr),
         None => None,
     }
     .is_some_and(|expr| matches!(unwrap_parens(expr), Ok(ast::Expr::Cast { .. })));
@@ -190,7 +194,7 @@ pub(super) struct CompoundColumnAffinity {
 /// One of the SELECTs that SQLite builds for a VALUES list.
 enum ValuesPart<'a> {
     /// A single row.
-    Row(&'a [ast::Expr]),
+    Row(&'a [Box<ast::Expr>]),
     /// Constant rows read through a co-routine. Its columns have no affinity
     /// and can hold values of any type.
     CoRoutine,
@@ -204,13 +208,14 @@ enum ValuesPart<'a> {
 /// SQLite also gives every row its own SELECT when the statement has a WITH
 /// clause or belongs to the schema, such as a view. Turso does not do that, so
 /// there a constant row after a first row without affinity does not count.
+#[allow(clippy::vec_box)]
 fn values_parts<'a>(
-    values: &'a [Vec<ast::Expr>],
+    values: &'a [Vec<Box<ast::Expr>>],
     metadata: &impl ExprProperties,
     resolver: &Resolver,
 ) -> Vec<ValuesPart<'a>> {
-    let is_constant = |row: &[ast::Expr]| row.iter().all(|expr| expr.is_constant(resolver));
-    let has_affinity = |row: &[ast::Expr]| {
+    let is_constant = |row: &[Box<ast::Expr>]| row.iter().all(|expr| expr.is_constant(resolver));
+    let has_affinity = |row: &[Box<ast::Expr>]| {
         row.iter()
             .any(|expr| get_expr_affinity(expr, metadata) != Affinity::None)
     };
@@ -892,13 +897,20 @@ pub enum Distinctness {
     NonDistinct,
     /// The column is a DISTINCT column,
     /// and includes a translation context for handling duplicates.
-    Distinct { ctx: Option<DistinctCtx> },
+    Distinct {
+        ctx: Option<DistinctCtx>,
+        /// rows already come sorted by the distinct columns
+        ordered: bool,
+    },
 }
 
 impl Distinctness {
     pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
         match distinctness {
-            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
+            Some(ast::Distinctness::Distinct) => Self::Distinct {
+                ctx: None,
+                ordered: false,
+            },
             Some(ast::Distinctness::All) => Self::NonDistinct,
             None => Self::NonDistinct,
         }
@@ -906,13 +918,31 @@ impl Distinctness {
     pub fn is_distinct(&self) -> bool {
         matches!(self, Distinctness::Distinct { .. })
     }
+    pub fn is_ordered(&self) -> bool {
+        matches!(self, Distinctness::Distinct { ordered: true, .. })
+    }
+    pub fn set_ordered(&mut self, value: bool) {
+        if let Distinctness::Distinct { ordered, .. } = self {
+            *ordered = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DistinctMethod {
+    Hash {
+        hash_table_id: usize,
+    },
+    Ordered {
+        previous_key_reg: usize,
+        has_previous_reg: usize,
+    },
 }
 
 /// Translation context for handling DISTINCT columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistinctCtx {
-    /// Hash table id used to deduplicate results.
-    pub hash_table_id: usize,
+    pub method: DistinctMethod,
     /// Collations for each distinct key column.
     pub collations: Vec<CollationSeq>,
     /// The label for the on conflict branch.
@@ -921,17 +951,52 @@ pub struct DistinctCtx {
 }
 
 impl DistinctCtx {
-    /// A DISTINCT that finds duplicates with a hash table. The values are
-    /// compared with `collations`, so each must be one that can be hashed.
-    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+    pub fn new(
+        program: &mut ProgramBuilder,
+        collations: Vec<CollationSeq>,
+        ordered: bool,
+    ) -> Result<Self> {
         if let Some(collation) = collations.iter().find(|collation| !collation.can_hash()) {
             crate::bail_parse_error!("DISTINCT does not support the custom collation {collation}");
         }
+        let method = if ordered {
+            DistinctMethod::Ordered {
+                previous_key_reg: program.alloc_registers(collations.len()),
+                has_previous_reg: program.alloc_register(),
+            }
+        } else {
+            DistinctMethod::Hash {
+                hash_table_id: program.alloc_hash_table_id(),
+            }
+        };
         Ok(Self {
-            hash_table_id: program.alloc_hash_table_id(),
+            method,
             collations,
             label_on_conflict: program.allocate_label(),
         })
+    }
+
+    pub fn is_ordered(&self) -> bool {
+        matches!(self.method, DistinctMethod::Ordered { .. })
+    }
+
+    // a subquery can run many times, so we reset every time
+    pub fn emit_reset(&self, program: &mut ProgramBuilder) {
+        match &self.method {
+            DistinctMethod::Hash { hash_table_id } => {
+                program.emit_insn(Insn::HashClear {
+                    hash_table_id: *hash_table_id,
+                });
+            }
+            DistinctMethod::Ordered {
+                has_previous_reg, ..
+            } => {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: *has_previous_reg,
+                });
+            }
+        }
     }
 
     pub fn emit_deduplication_insns(
@@ -940,15 +1005,52 @@ impl DistinctCtx {
         num_regs: usize,
         start_reg: usize,
     ) {
-        program.emit_insn(Insn::HashDistinct {
-            data: Box::new(HashDistinctData {
-                hash_table_id: self.hash_table_id,
-                key_start_reg: start_reg,
-                num_keys: num_regs,
-                collations: self.collations.clone(),
-                target_pc: self.label_on_conflict,
-            }),
-        });
+        match &self.method {
+            DistinctMethod::Hash { hash_table_id } => {
+                program.emit_insn(Insn::HashDistinct {
+                    data: Box::new(HashDistinctData {
+                        hash_table_id: *hash_table_id,
+                        key_start_reg: start_reg,
+                        num_keys: num_regs,
+                        collations: self.collations.clone(),
+                        target_pc: self.label_on_conflict,
+                    }),
+                });
+            }
+            DistinctMethod::Ordered {
+                previous_key_reg,
+                has_previous_reg,
+            } => {
+                let new_key = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: *has_previous_reg,
+                    target_pc: new_key,
+                    jump_if_null: true,
+                });
+                for (i, collation) in self.collations.iter().enumerate() {
+                    program.emit_insn(Insn::Ne {
+                        lhs: previous_key_reg + i,
+                        rhs: start_reg + i,
+                        target_pc: new_key,
+                        flags: CmpInsFlags::default().null_eq(),
+                        collation: *collation,
+                    });
+                }
+                program.emit_insn(Insn::Goto {
+                    target_pc: self.label_on_conflict,
+                });
+                program.preassign_label_to_next_insn(new_key);
+                program.emit_insn(Insn::Copy {
+                    src_reg: start_reg,
+                    dst_reg: *previous_key_reg,
+                    extra_amount: num_regs - 1,
+                });
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: *has_previous_reg,
+                });
+            }
+        }
     }
 }
 
@@ -1003,7 +1105,9 @@ pub struct SelectPlan {
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
+    // The parser gives these expressions boxed. Unboxing them copies each one.
+    #[allow(clippy::vec_box)]
+    pub values: Vec<Vec<Box<Expr>>>,
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
     pub window: Option<Window>,
@@ -1735,20 +1839,32 @@ pub fn resolve_unqualified_column(
     tables: &[JoinedTable],
     column_name: &str,
 ) -> Result<Option<ResolvedColumn>> {
+    resolve_unqualified_column_except(tables, column_name, &[])
+}
+
+/// Like [resolve_unqualified_column], but the tables in `excluded` have no columns.
+pub fn resolve_unqualified_column_except(
+    tables: &[JoinedTable],
+    column_name: &str,
+    excluded: &[TableInternalId],
+) -> Result<Option<ResolvedColumn>> {
+    let lookup = |table: &JoinedTable, include_rowid_names: bool| {
+        if excluded.contains(&table.internal_id) {
+            return ColumnLookup::Missing;
+        }
+        lookup_unqualified_column(&table.table, column_name, include_rowid_names)
+    };
     let has_declared_column = crate::translate::planner::ROWID_STRS
         .iter()
         .any(|name| name.eq_ignore_ascii_case(column_name))
-        && tables.iter().any(|table| {
-            !matches!(
-                lookup_unqualified_column(&table.table, column_name, false),
-                ColumnLookup::Missing
-            )
-        });
+        && tables
+            .iter()
+            .any(|table| !matches!(lookup(table, false), ColumnLookup::Missing));
     let found = unqualified_column_sources(
         tables,
         column_name,
         |table| table.join_info.as_ref(),
-        |table| lookup_unqualified_column(&table.table, column_name, !has_declared_column),
+        |table| lookup(table, !has_declared_column),
     );
     if found.ambiguous {
         crate::bail_parse_error!("ambiguous column name: {}", column_name);
@@ -2788,20 +2904,27 @@ impl<T: From<usize>> BitSet<T>
 where
     usize: From<T>,
 {
+    #[inline]
     pub fn set(&mut self, index: T) -> Result<(), alloc::TryReserveError> {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
-        } else {
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if overflow_idx >= overflow.len() {
-                overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
-                overflow.resize(overflow_idx + 1, 0);
-            }
-            overflow[overflow_idx] |= 1 << bit;
+            return Ok(());
         }
+        self.set_overflow_bit(index)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_overflow_bit(&mut self, index: usize) -> Result<(), alloc::TryReserveError> {
+        let overflow_idx = (index - Self::INLINE_BITS) / 64;
+        let bit = (index - Self::INLINE_BITS) % 64;
+        let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if overflow_idx >= overflow.len() {
+            overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
+            overflow.resize(overflow_idx + 1, 0);
+        }
+        overflow[overflow_idx] |= 1 << bit;
         Ok(())
     }
 
@@ -2899,17 +3022,25 @@ where
         }
     }
 
+    #[inline]
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
-        if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if self_ov.len() < other_ov.len() {
-                self_ov.try_reserve(other_ov.len() - self_ov.len())?;
-                self_ov.resize(other_ov.len(), 0);
-            }
-            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
-                *s |= o;
-            }
+        match &other.overflow {
+            None => Ok(()),
+            Some(other_ov) => self.union_overflow_with(other_ov),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn union_overflow_with(&mut self, other_ov: &[u64]) -> Result<(), alloc::TryReserveError> {
+        let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if self_ov.len() < other_ov.len() {
+            self_ov.try_reserve(other_ov.len() - self_ov.len())?;
+            self_ov.resize(other_ov.len(), 0);
+        }
+        for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+            *s |= o;
         }
         Ok(())
     }

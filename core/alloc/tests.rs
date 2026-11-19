@@ -121,7 +121,7 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
     let db = crate::Database::open(
         StdArc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(StdArc::new(crate::EngineDialect))
+        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true))
             .allocators(DatabaseAllocators {
                 mv_store: DynAllocator::new(CountingAlloc {

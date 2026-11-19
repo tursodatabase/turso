@@ -25,7 +25,7 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogChange, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
+    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
     ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID,
 };
 use turso_parser::ast::RoleOptions;
@@ -33,6 +33,7 @@ use turso_pg_parser::sqlstate::SQLSTATE_DUPLICATE_OBJECT;
 
 use crate::auth_members::Memberships;
 use crate::error::sqlstate_error;
+use crate::schema_state::{change_schema_state, emit_catalog_apply};
 use crate::unique_index::emit_unique_index_insert;
 
 /// The table that stores the roles created with `CREATE ROLE`.
@@ -210,41 +211,8 @@ impl RoleCatalog {
         &self.memberships
     }
 
-    /// Applies what `GRANT role TO role` or `REVOKE role FROM role` wrote,
-    /// one membership at a time.
-    pub(crate) fn apply_grant_role(
-        &mut self,
-        revoke: bool,
-        values: &[Value],
-    ) -> turso_core::Result<()> {
-        if revoke {
-            self.memberships.apply_revoke(values)
-        } else {
-            self.memberships.apply_grant(values)
-        }
-    }
-
-    /// Adds the role that `CREATE ROLE name` stored, under the id that the
-    /// statement read back.
-    pub(crate) fn apply_create_role(
-        &mut self,
-        name: &str,
-        options: &RoleOptions,
-        values: &[Value],
-    ) -> turso_core::Result<()> {
-        let [Value::Numeric(Numeric::Integer(id))] = values else {
-            return Err(LimboError::InternalError(format!(
-                "CREATE ROLE read back {values:?} where the role's id was written"
-            )));
-        };
-        self.add(Role {
-            id: RoleId::from_stored(*id),
-            name: name.to_string(),
-            superuser: false,
-            inherit: options.inherit,
-            bypassrls: options.bypassrls,
-        });
-        Ok(())
+    pub(crate) fn memberships_mut(&mut self) -> &mut Memberships {
+        &mut self.memberships
     }
 
     /// Adds `role` to the catalog. Panics if its id or name is already in
@@ -371,15 +339,50 @@ pub(crate) fn translate_create_role(
     });
     emit_name_index_insert(program, index_cursor_id, name, id_reg);
 
-    program.emit_insn(Insn::CatalogChange {
-        db: MAIN_DB_ID,
-        change: Box::new(CatalogChange::CreateRole {
-            name: name.to_string(),
-            options: options.clone(),
-        }),
-        value_regs: vec![id_reg],
-    });
+    RoleCreated {
+        name: name.to_string(),
+        options: options.clone(),
+    }
+    .emit(program, id_reg);
     Ok(())
+}
+
+/// A role that `CREATE ROLE` inserted.
+#[derive(Debug)]
+struct RoleCreated {
+    name: String,
+    options: RoleOptions,
+}
+
+impl RoleCreated {
+    /// `id_reg` holds the id the role was stored under.
+    fn emit(self, program: &mut ProgramBuilder, id_reg: usize) {
+        emit_catalog_apply(program, self, vec![id_reg]);
+    }
+
+    fn apply_to(&self, roles: &mut RoleCatalog, values: &[Value]) -> turso_core::Result<()> {
+        let [Value::Numeric(Numeric::Integer(id))] = values else {
+            return Err(LimboError::InternalError(format!(
+                "CREATE ROLE read back {values:?} where the role's id was written"
+            )));
+        };
+        roles.add(Role {
+            id: RoleId::from_stored(*id),
+            name: self.name.clone(),
+            superuser: false,
+            inherit: self.options.inherit,
+            bypassrls: self.options.bypassrls,
+        });
+        Ok(())
+    }
+}
+
+impl CatalogApply for RoleCreated {
+    fn apply(&self, schema: &mut Schema, values: &[Value]) -> turso_core::Result<()> {
+        change_schema_state(schema, |state| {
+            self.apply_to(Arc::make_mut(&mut state.roles), values)
+        })
+    }
 }
 
 /// Adds the role's name to the name index, failing if another role has the
@@ -422,6 +425,31 @@ mod tests {
         assert!(catalog.get(RoleId::SUPERUSER).is_none());
         assert!(catalog.is_superuser(RoleId::SUPERUSER));
         assert!(!catalog.is_superuser(RoleId::PUBLIC));
+    }
+
+    #[test]
+    fn role_created_adds_the_role_under_the_id_it_reads_back() {
+        let mut catalog = RoleCatalog::new(&[], &[]).unwrap();
+        let created = RoleCreated {
+            name: "alice".to_string(),
+            options: RoleOptions {
+                inherit: false,
+                bypassrls: true,
+            },
+        };
+
+        created
+            .apply_to(&mut catalog, &[Value::from_i64(5)])
+            .unwrap();
+
+        let alice = catalog.get_by_name("alice").unwrap();
+        assert_eq!(alice.id, RoleId::from_stored(5));
+        assert!(!alice.superuser);
+        assert!(!alice.inherit);
+        assert!(alice.bypassrls);
+
+        let no_id = created.apply_to(&mut catalog, &[]);
+        assert!(matches!(no_id, Err(LimboError::InternalError(_))));
     }
 
     #[test]

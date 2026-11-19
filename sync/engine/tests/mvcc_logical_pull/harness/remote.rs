@@ -19,6 +19,15 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::with_portable_changes(setup, true)
+    }
+
+    /// A remote whose commits write plain frames with no portable changes.
+    pub fn without_portable_changes(setup: &[&str]) -> Result<Arc<Self>> {
+        Self::with_portable_changes(setup, false)
+    }
+
+    fn with_portable_changes(setup: &[&str], enabled: bool) -> Result<Arc<Self>> {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("remote.db");
         let db = Database::open(
@@ -28,7 +37,7 @@ impl Remote {
         )?;
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-        conn.set_portable_logical_changes_enabled(true);
+        conn.set_portable_logical_changes_enabled(enabled);
         for sql in setup {
             conn.execute(sql)?;
         }

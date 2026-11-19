@@ -267,6 +267,22 @@ fn test_reprepare_after_temp_store_reset_does_not_panic() {
 }
 
 #[test]
+fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("main.db");
+    let conn = open_connection(&db_path);
+
+    conn.execute("CREATE TABLE t1(a)").unwrap();
+    let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
+
+    conn.execute("PRAGMA automatic_index = OFF").unwrap();
+    stmt.run_collect_rows().unwrap();
+
+    let reprepares = stmt.stmt_status(turso_core::StatementStatusCounter::Reprepare);
+    assert_eq!(reprepares, 1);
+}
+
+#[test]
 fn test_prepared_insert_checks_constraints_after_ignore_check_constraints_off() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("main.db");

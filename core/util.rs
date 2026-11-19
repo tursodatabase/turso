@@ -2,9 +2,8 @@ use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::CheckConstraint;
-use crate::schema::FromDefinitionFlags;
 use crate::security::policy::RowPolicy;
-use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
@@ -14,14 +13,13 @@ use crate::IO;
 use crate::{
     schema::{Column, Index, Schema, Table, Trigger, Type},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
+    LimboError, OpenFlags, Result,
 };
 use either::Either;
 use rustc_hash::FxHashMap as HashMap;
 use std::future::Future;
-use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
+use turso_parser::ast::{self, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -256,124 +254,6 @@ pub struct UnparsedFromSqlIndex {
     pub table_name: String,
     pub root_page: i64,
     pub sql: String,
-}
-
-/// Carries the in-progress state of [`parse_schema_rows`] across IO yields:
-/// the schema-scan statement plus the accumulators that `handle_schema_row`
-/// fills row-by-row. Without this, a yield mid-scan would lose the partially
-/// accumulated indexes/materialized-view info and re-run the statement from
-/// scratch.
-#[derive(Default)]
-pub struct ParseSchemaRowsState {
-    inner: Option<ParseSchemaRowsInner>,
-}
-
-struct ParseSchemaRowsInner {
-    rows: Statement,
-    from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
-    automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
-    dbsp_state_roots: HashMap<String, i64>,
-    dbsp_state_index_roots: HashMap<String, i64>,
-    materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView>,
-}
-
-impl ParseSchemaRowsState {
-    /// Initialize the scan state from a prepared `SELECT * FROM sqlite_schema`
-    /// statement (or equivalent) and the MVCC transaction it should read under.
-    pub fn new(mut rows: Statement, mv_tx: Option<(u64, TransactionMode)>) -> Self {
-        rows.set_mv_tx(mv_tx);
-        Self {
-            inner: Some(ParseSchemaRowsInner {
-                rows,
-                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG),
-                automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
-                dbsp_state_roots: HashMap::default(),
-                dbsp_state_index_roots: HashMap::default(),
-                materialized_view_info: HashMap::default(),
-            }),
-        }
-    }
-}
-
-/// Non-blocking schema-row parser: steps the schema-scan statement held in
-/// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
-/// pumping it. Re-invoke after each yielded completion; accumulators persist in
-/// `state`. Indexes and materialized views are built afterwards by
-/// [`populate_types_views_then_indices`], once the types are loaded.
-#[instrument(skip_all, level = Level::DEBUG)]
-pub fn parse_schema_rows(
-    state: &mut ParseSchemaRowsState,
-    schema: &mut Schema,
-    syms: &SymbolTable,
-    resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-    dialect: &dyn crate::dialect::Dialect,
-) -> IOResultOr<()> {
-    {
-        let inner = state
-            .inner
-            .as_mut()
-            .expect("ParseSchemaRowsState not initialized");
-        // Destructure so the statement (receiver) and the accumulators (captured
-        // by the closure) are borrowed as disjoint fields.
-        let ParseSchemaRowsInner {
-            rows,
-            from_sql_indexes,
-            automatic_indices,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            materialized_view_info,
-        } = inner;
-        crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
-            let ty = row.get::<&str>(0)?;
-            let name = row.get::<&str>(1)?;
-            let table_name = row.get::<&str>(2)?;
-            let root_page = row.get::<i64>(3)?;
-            let sql = row.get::<&str>(4).ok();
-            schema.handle_schema_row(
-                ty,
-                name,
-                table_name,
-                root_page,
-                sql,
-                syms,
-                from_sql_indexes,
-                automatic_indices,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-                materialized_view_info,
-                resolve_attached_db,
-                dialect,
-            )
-        }));
-    }
-
-    Ok(IOResult::Done(()))
-}
-
-/// After [`parse_schema_rows`] has scanned every row: load the CREATE TYPE
-/// statements `type_sqls`, then build the materialized views and indexes
-/// collected during the scan.
-pub fn populate_types_views_then_indices(
-    state: &mut ParseSchemaRowsState,
-    schema: &mut Schema,
-    syms: &SymbolTable,
-    type_sqls: &[String],
-) -> Result<()> {
-    let inner = state
-        .inner
-        .take()
-        .expect("ParseSchemaRowsState not initialized");
-    let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_types_views_then_indices(
-        syms,
-        type_sqls,
-        inner.materialized_view_info,
-        inner.dbsp_state_roots,
-        inner.dbsp_state_index_roots,
-        inner.from_sql_indexes,
-        inner.automatic_indices,
-        has_mv_store,
-    )
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
@@ -979,21 +859,6 @@ pub(crate) fn is_rowid_alias_type(written_type: &ast::Type) -> bool {
             || written_type.name.eq_ignore_ascii_case("[INTEGER]"))
 }
 
-pub fn columns_from_create_table_body(
-    body: &turso_parser::ast::CreateTableBody,
-) -> crate::Result<Vec<Column>> {
-    let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Err(crate::LimboError::ParseError(
-            "CREATE TABLE body must contain columns and constraints".to_string(),
-        ));
-    };
-
-    columns
-        .iter()
-        .map(|column| Column::from_definition(column, FromDefinitionFlags::empty()))
-        .collect::<crate::Result<Vec<Column>>>()
-}
-
 #[derive(Debug, Default, PartialEq)]
 pub struct OpenOptions<'a> {
     /// The authority component of the URI. may be 'localhost' or empty
@@ -1423,6 +1288,9 @@ pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
 
 // we don't need to verify the numeric literal here, as it is already verified by the parser
 pub fn parse_numeric_literal(text: &str) -> Result<Value> {
+    if let Some(value) = parse_short_decimal_integer(text) {
+        return Ok(Value::from_i64(value));
+    }
     // a single extra underscore ("_") character can exist between any two digits
     let text = if text.contains('_') {
         std::borrow::Cow::Owned(text.replace('_', ""))
@@ -1455,6 +1323,24 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         unreachable!();
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
+}
+
+/// The value of `text` if it has only ASCII digits, at most 18 of them. Such
+/// a number always fits in an `i64`.
+fn parse_short_decimal_integer(text: &str) -> Option<i64> {
+    let digits = text.as_bytes();
+    if digits.is_empty() || digits.len() > 18 {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value * 10 + i64::from(digit);
+    }
+    Some(value)
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
@@ -3358,6 +3244,20 @@ pub mod tests {
     #[test]
     fn test_parse_numeric_literal_integer() {
         assert_eq!(parse_numeric_literal("123").unwrap(), Value::from_i64(123));
+        assert_eq!(parse_numeric_literal("0").unwrap(), Value::from_i64(0));
+        assert_eq!(parse_numeric_literal("007").unwrap(), Value::from_i64(7));
+        assert_eq!(
+            parse_numeric_literal("999999999999999999").unwrap(),
+            Value::from_i64(999_999_999_999_999_999)
+        );
+        assert_eq!(
+            parse_numeric_literal("9223372036854775807").unwrap(),
+            Value::from_i64(i64::MAX)
+        );
+        assert_eq!(
+            parse_numeric_literal("-9223372036854775808").unwrap(),
+            Value::from_i64(i64::MIN)
+        );
         assert_eq!(
             parse_numeric_literal("9_223_372_036_854_775_807").unwrap(),
             Value::from_i64(9223372036854775807)

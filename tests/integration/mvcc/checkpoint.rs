@@ -1077,6 +1077,42 @@ fn test_integrity_check_after_drop_autoincrement_table_before_checkpoint() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
+#[test]
+fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..500 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
+    assert!(page_count > 2, "t should span multiple pages");
+
+    db.get_mvcc_store()
+        .with_header_mut(
+            |header| {
+                header.freelist_trunk_page = (page_count as u32).into();
+                header.freelist_pages = 1.into();
+            },
+            None,
+        )
+        .unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0][0].to_string(),
+        "ok",
+        "passive integrity_check must read the freelist from the pager's live page 1, not the stale MVCC header"
+    );
+}
+
 #[test]
 fn test_idxdelete_after_truncate_clears_checkpointed_index() {
     let db = MvccTestDbNoConn::new_with_random_db();

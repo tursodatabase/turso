@@ -10,6 +10,7 @@ use super::checkpoint::{
 };
 use super::test_db::MvccTestDbNoConn;
 use super::transactions::{generate_simple_string_row, get_record_value, write_synthetic_row};
+use crate::unreliable_io::UnreliableIo;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -2797,6 +2798,52 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     assert_eq!(rows.len(), 1, "committed row must survive recovery");
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(rows[0][1].to_string(), "x");
+}
+
+/// A TRUNCATE checkpoint truncates the logical log (step 8) before it truncates the WAL
+/// (step 10). A process killed between the two leaves a committed WAL and a 0-byte log.
+/// Every frame the log held is at or below the boundary committed to the WAL, so recovery
+/// must complete the checkpoint, not fail closed with "logical log header is missing"
+/// (#7480). Passive checkpoints stay OFF here: this is the default-mode crash window.
+#[test]
+fn test_bootstrap_recovers_truncate_checkpoint_killed_before_wal_truncate() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let mvcc_store = db.get_mvcc_store();
+        // Stop right after the pager commit: the WAL holds the committed frames.
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store.clone(), &conn);
+        // The crash window: logical log already truncated to 0, WAL not yet truncated.
+        let log_file = mvcc_store.get_logical_log_file();
+        let c = log_file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+        conn.db.io.wait_for_completion(c).unwrap();
+    }
+    db.close();
+    let wal_path = wal_path_for_db(&db_path);
+    assert!(wal_path.metadata().map(|m| m.len()).unwrap_or(0) > 0);
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+        .expect("a TRUNCATE checkpoint killed before its WAL truncate must stay openable");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should complete the checkpoint");
+    let rows = get_rows(&conn, "SELECT count(*), min(id), max(id) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 50);
+    assert_eq!(rows[0][1].as_int().unwrap(), 0);
+    assert_eq!(rows[0][2].as_int().unwrap(), 49);
+    assert_eq!(wal_path.metadata().map(|m| m.len()).unwrap_or(0), 0);
+    assert_integrity_ok(&conn);
+    conn.execute("INSERT INTO t VALUES (100, 'after')").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 51);
 }
 
 /// MVCC supports only Passive and Truncate, so a requested FULL checkpoint maps to
@@ -12513,6 +12560,97 @@ fn rewrite_wal_frames_as_non_commit(path: &std::path::Path) {
     file.seek(SeekFrom::Start(0)).unwrap();
     file.write_all(&bytes).unwrap();
     file.sync_all().unwrap();
+}
+
+/// What this test checks: The checkpoint does not fsync the logical log after it truncates it,
+/// so a power loss right after the checkpoint brings back frames that the checkpoint already
+/// wrote to the database file. Recovery skips these frames, because their `commit_ts` is at or
+/// below `persistent_tx_ts_max`.
+/// Why this matters: A replay of such a frame writes an old value over a newer one.
+#[test]
+fn test_power_loss_after_checkpoint_recovery_skips_checkpointed_log_frames() {
+    let db_path = "mvcc-power-loss-after-checkpoint.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    // This checkpoint truncates the log. The fsync of the INSERT commit makes the truncation
+    // durable, so that only the INSERT frame comes back after the power loss.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    // With synchronous=NORMAL, the commit does not fsync the logical log. The update becomes
+    // durable only when the checkpoint writes it to the database file.
+    conn.execute("PRAGMA synchronous = NORMAL").unwrap();
+    conn.execute("UPDATE t SET v = 'new' WHERE id = 1").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let durable_log_len = io.durable_files()[&format!("{db_path}-log")].len();
+    assert!(
+        durable_log_len > LOG_HDR_SIZE,
+        "after a power loss, the logical log must still have the INSERT frame"
+    );
+
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_text("new".to_string())
+        ]]
+    );
+    assert_integrity_ok(&recovered);
+}
+
+/// What this test checks: A switch from MVCC to WAL mode makes the truncation of the logical log
+/// durable before the header says WAL.
+/// Why this matters: A database in WAL mode does not open while its logical log has frames.
+#[test]
+fn test_switch_from_mvcc_to_wal_survives_power_loss() {
+    let db_path = "mvcc-power-loss-after-switch-to-wal.db";
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+    // This checkpoint fsyncs the database file, so the WAL-mode header becomes durable.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        io.durable_files()[db_path][18..20],
+        [2, 2],
+        "the header on disk must say WAL"
+    );
+
+    let (_dir, recovered) = io.crash_now_and_recover(db_path).unwrap();
+    assert_eq!(
+        get_rows(&recovered, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), Value::from_text("a".to_string())]]
+    );
 }
 
 /// Replay gate uses metadata boundary and never applies frames at or below it.

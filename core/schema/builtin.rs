@@ -10,15 +10,21 @@ use turso_ext::VTabKind;
 /// Starts the schema of a database: the built-in catalog tables and, if
 /// `enable_custom_types`, the built-in types. A dialect adds its own tables
 /// and types to the builder.
-pub fn schema_builder(enable_custom_types: bool) -> crate::Result<SchemaBuilder> {
+pub fn schema_builder(
+    dialect: &(impl crate::dialect::Dialect + ?Sized),
+    enable_custom_types: bool,
+) -> crate::Result<SchemaBuilder> {
     let mut builder = SchemaBuilder::new()?.custom_types(enable_custom_types);
     if enable_custom_types {
-        builder = builtin_types(builder)?;
+        builder = builtin_types(dialect, builder)?;
     }
     builtin_catalog(builder, enable_custom_types)
 }
 
-fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
+fn builtin_types(
+    dialect: &(impl crate::dialect::Dialect + ?Sized),
+    mut builder: SchemaBuilder,
+) -> crate::Result<SchemaBuilder> {
     use turso_parser::ast::{Cmd, Stmt};
 
     // Whether values of the type take a COLLATE. In PostgreSQL only text
@@ -62,7 +68,7 @@ fn builtin_types(mut builder: SchemaBuilder) -> crate::Result<SchemaBuilder> {
     for &(accepts_collate, range_offsets, stored_form_sorts_in_value_order, sql) in types {
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
-        }))) = crate::dialect::engine::parse_statement(sql)
+        }))) = crate::dialect::parse_statement(dialect, sql)
         else {
             return Err(crate::LimboError::InternalError(format!(
                 "failed to parse built-in type SQL: {sql}"
@@ -99,7 +105,7 @@ fn builtin_catalog(
     mut builder: SchemaBuilder,
     enable_custom_types: bool,
 ) -> crate::Result<SchemaBuilder> {
-    for vtab in pragma_vtabs() {
+    for vtab in pragma_vtabs()? {
         builder = builder.table(
             vtab.name.to_owned(),
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
@@ -125,20 +131,64 @@ fn builtin_catalog(
 }
 
 /// Build a `VirtualTable` for each PRAGMA table-valued function.
-fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
+fn pragma_vtabs() -> crate::Result<Vec<Arc<VirtualTable>>> {
     PragmaVirtualTable::functions()
         .into_iter()
-        .map(|(tab, schema_sql)| {
-            Arc::new(VirtualTable {
+        .map(|(tab, columns)| {
+            Ok(Arc::new(VirtualTable {
                 name: format!("pragma_{}", tab.pragma_name),
-                columns: VirtualTable::resolve_columns(schema_sql)
-                    .expect("pragma table-valued function schema resolution should not fail"),
+                columns: VirtualTable::columns_from_definitions(&columns)?,
                 kind: VTabKind::TableValuedFunction,
                 vtab_type: VirtualTableType::Pragma(tab),
                 vtab_id: 0,
                 is_droppable: false,
                 innocuous: true,
-            })
+            }))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dialect::Dialect;
+    use crate::security::roles::SessionRole;
+    use crate::sync::Arc;
+    use crate::{ConnectOpts, Database, LimboError, MemoryIO, Result};
+    use turso_parser::ast;
+
+    struct DialectThatCannotParse;
+
+    impl Dialect for DialectThatCannotParse {
+        fn name(&self) -> &'static str {
+            "cannot-parse"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
+            self.parse_internal(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
+            Err(LimboError::ParseError(format!("asked to parse: {sql}")))
+        }
+
+        fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition> {
+            Err(LimboError::ParseError(format!("asked to parse: {sql}")))
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(DialectThatCannotParse)
+        }
+    }
+
+    #[test]
+    fn opening_a_new_database_parses_no_sql() {
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(DialectThatCannotParse),
+        )
+        .unwrap();
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+    }
 }

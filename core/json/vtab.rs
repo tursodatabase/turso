@@ -14,9 +14,10 @@ use crate::{
         Conv,
     },
     types::AsValueRef,
-    vtab::{InternalVirtualTable, InternalVirtualTableCursor},
+    vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
+use turso_parser::ast;
 
 use super::jsonb;
 
@@ -165,20 +166,29 @@ impl InternalVirtualTable for JsonVirtualTable {
         })
     }
 
-    fn sql(&self) -> String {
-        "CREATE TABLE x(
-            key,                 -- key for current element relative to its parent
-            value,               -- value for the current element
-            type,                -- 'object','array','string','integer', etc.
-            atom,                -- value for primitive types, null for array & object
-            id,                  -- integer ID for this element
-            parent,              -- integer ID for the parent of this element
-            fullkey,             -- full path describing the current element
-            path,                -- path to the container of the current row
-            json HIDDEN,         -- 1st input parameter: the raw JSON
-            root HIDDEN          -- 2nd input parameter: the PATH at which to start
-        );"
-        .to_owned()
+    fn columns(&self) -> Vec<ast::ColumnDefinition> {
+        vec![
+            // key for current element relative to its parent
+            column_definition("key", ""),
+            // value for the current element
+            column_definition("value", ""),
+            // 'object','array','string','integer', etc.
+            column_definition("type", ""),
+            // value for primitive types, null for array & object
+            column_definition("atom", ""),
+            // integer ID for this element
+            column_definition("id", ""),
+            // integer ID for the parent of this element
+            column_definition("parent", ""),
+            // full path describing the current element
+            column_definition("fullkey", ""),
+            // path to the container of the current row
+            column_definition("path", ""),
+            // 1st input parameter: the raw JSON
+            column_definition("json", "HIDDEN"),
+            // 2nd input parameter: the PATH at which to start
+            column_definition("root", "HIDDEN"),
+        ]
     }
 
     fn superuser_only(&self) -> bool {

@@ -1147,6 +1147,17 @@ impl ProgramBuilder {
             .reserve(opts.approx_num_labels);
     }
 
+    /// Make room for at least `additional` more instructions. The capacity
+    /// grows to a power of two, as repeated doubling of the `Vec` would make
+    /// it, but the instructions are copied only once.
+    pub fn reserve_insns(&mut self, additional: usize) {
+        let needed = self.insns.len() + additional;
+        if needed > self.insns.capacity() {
+            self.insns
+                .reserve_exact(needed.next_power_of_two() - self.insns.len());
+        }
+    }
+
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
     pub fn constant_span_start(&mut self) -> usize {
@@ -1699,7 +1710,10 @@ impl ProgramBuilder {
         // Since spans are sorted and non-overlapping, we track our position
         // in the span list and never look back - O(n + m) total, where
         // n = number of instructions, m = number of constant spans.
-        let mut non_constant = Vec::with_capacity(self.insns.len());
+        // One more slot for the `Goto` that `epilogue` emits after the constant
+        // instructions. Without it, that push copies the whole program to a
+        // larger buffer.
+        let mut non_constant = Vec::with_capacity(self.insns.len() + 1);
         let mut constant = Vec::new();
         let mut span_idx = 0;
 
@@ -2633,18 +2647,18 @@ impl ProgramBuilder {
     #[turso_macros::trace_stack]
     pub fn build(
         self,
-        connection: Arc<Connection>,
+        connection: &Connection,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
-        let prepare_context = PrepareContext::from_connection(&connection);
+        let prepare_context = PrepareContext::from_connection(connection);
         let prepared = self.build_prepared_program(
             prepare_context,
             connection.custom_collations(),
             change_cnt_on,
             sql,
         )?;
-        Ok(Program::from_prepared(Arc::new(prepared), connection))
+        Ok(Program::from_prepared(Arc::new(prepared)))
     }
 }
 

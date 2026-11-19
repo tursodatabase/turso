@@ -2407,7 +2407,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         continue;
                     }
                     for row_version in row_versions.read().iter() {
-                        let Some(identity) = sqlite_schema_btree_identity(id.table_id, row_version)
+                        let Some(identity) =
+                            sqlite_schema_btree_identity(id.table_id, row_version)?
                         else {
                             continue;
                         };
@@ -3536,7 +3537,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
             CommitState::SyncLogicalLog { end_ts } => {
                 // Skip fsync unless this transaction or a written group member uses FULL.
-                // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
+                // In NORMAL mode, the commit becomes durable when a checkpoint writes it to
+                // the database file and fsyncs that file.
                 if !self.log_sync_required() {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
@@ -5621,6 +5623,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
         if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)? {
+            // The caller may have read a version created by a transaction that was
+            // committing at the time and has aborted since, which removed the version.
+            // This transaction depends on that one, so it must abort too.
+            if self.tx_should_abort(tx_id) {
+                return Err(LimboError::CommitDependencyAborted);
+            }
             return Ok(false);
         }
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
@@ -9190,20 +9198,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// The returned completion must finish before reopening/recovering MVCC
     /// state. Otherwise recovery could replay stale local logical-log frames on
-    /// top of the restored database image.
+    /// top of the restored database image. To make the reset durable, call
+    /// `sync_logical_log` after the completion finishes.
     pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
         self.storage.reset_to_fresh_header()
     }
 
-    /// Return the durable sync completion for the freshly reset logical log.
-    ///
-    /// This is separate from `reset_logical_log_after_external_restore` so
-    /// callers can drive the reset completion cooperatively, then issue the
-    /// ordered sync only after the header/truncate group has completed.
-    pub fn sync_logical_log_after_external_restore(
-        &self,
-        connection: &Arc<Connection>,
-    ) -> Result<Option<Completion>> {
+    /// Fsync the logical log and return the completion. When `synchronous` is OFF on
+    /// `connection`, do nothing and return `None`.
+    pub fn sync_logical_log(&self, connection: &Arc<Connection>) -> Result<Option<Completion>> {
         if connection.get_sync_mode() != SyncMode::Off {
             let pager = connection.pager.load().clone();
             return Ok(Some(self.storage.sync(pager.get_sync_type())?));
@@ -9274,13 +9277,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             self.storage.set_header(header);
                         }
                         HeaderReadResult::NoLog => {
-                            if !connection.experimental_mvcc_passive_checkpoint_enabled() {
-                                return Err(LimboError::Corrupt(
-                                    "WAL has committed frames but logical log header is missing"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                            // Committed WAL + empty/absent log. Passive checkpoints leave
+                            // this as their steady state. A TRUNCATE checkpoint leaves it
+                            // too when the process dies between truncating the logical log
+                            // (step 8) and truncating the WAL (step 10): the log is only
+                            // truncated to 0 once every frame in it is at or below the
+                            // boundary committed to the WAL, so the WAL holds everything
+                            // the log did. Completing the checkpoint loses nothing; failing
+                            // closed made the database permanently unopenable (#7480).
                         }
                         HeaderReadResult::Invalid => {
                             // Present but undecodable: a torn header write / genuine
@@ -10090,8 +10094,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 } = SqliteSchemaRow::from_record_bytes(row.payload())?;
                                 let has_btree = match row_type {
                                     "index" => root_page != 0,
-                                    "table" => !sql
-                                        .is_some_and(crate::dialect::sql_is_create_virtual_table),
+                                    "table" => !sql.is_some_and(|sql| {
+                                        crate::dialect::sql_is_create_virtual_table(
+                                            connection.dialect().as_ref(),
+                                            sql,
+                                        )
+                                    }),
                                     _ => false,
                                 };
                                 if has_btree {
@@ -10456,6 +10464,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )?;
         }
         fresh.populate_types_views_then_indices(
+            connection.dialect().as_ref(),
             &syms,
             type_sqls,
             materialized_view_info,

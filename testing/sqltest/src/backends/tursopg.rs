@@ -73,29 +73,7 @@ impl SqlBackend for TursopgBackend {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Box<dyn DatabaseInstance>, BackendError> {
-        let (db_path, temp_file) = match &config.location {
-            DatabaseLocation::Memory => (":memory:".to_string(), None),
-            DatabaseLocation::TempFile => {
-                let temp = NamedTempFile::new()
-                    .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
-                let path = temp.path().to_string_lossy().to_string();
-                (path, Some(temp))
-            }
-            DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None),
-            DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
-                let resolved = self
-                    .default_db_resolver
-                    .as_ref()
-                    .and_then(|r| r.resolve(&config.location))
-                    .ok_or_else(|| {
-                        BackendError::CreateDatabase(
-                            "default database not generated - no resolver configured".to_string(),
-                        )
-                    })?;
-                (resolved.to_string_lossy().to_string(), None)
-            }
-        };
-
+        let (db_path, temp_file) = database_path(config, self.default_db_resolver.as_deref())?;
         let mut cmd = tokio::process::Command::new(&self.binary_path);
         cmd.arg(&db_path)
             .arg("--server")
@@ -171,6 +149,34 @@ impl SqlBackend for TursopgBackend {
             _temp_file: temp_file,
         }))
     }
+}
+
+/// The path of the database that `config` names, and the temporary file that
+/// must stay alive while the database is in use.
+pub(super) fn database_path(
+    config: &DatabaseConfig,
+    default_db_resolver: Option<&dyn DefaultDatabaseResolver>,
+) -> Result<(String, Option<NamedTempFile>), BackendError> {
+    Ok(match &config.location {
+        DatabaseLocation::Memory => (":memory:".to_string(), None),
+        DatabaseLocation::TempFile => {
+            let temp =
+                NamedTempFile::new().map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+            let path = temp.path().to_string_lossy().to_string();
+            (path, Some(temp))
+        }
+        DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None),
+        DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
+            let resolved = default_db_resolver
+                .and_then(|r| r.resolve(&config.location))
+                .ok_or_else(|| {
+                    BackendError::CreateDatabase(
+                        "default database not generated - no resolver configured".to_string(),
+                    )
+                })?;
+            (resolved.to_string_lossy().to_string(), None)
+        }
+    })
 }
 
 /// Reads the server's `PostgreSQL server listening on <host>:<port> ...`

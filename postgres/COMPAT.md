@@ -112,12 +112,7 @@ manual lists under `CREATE POLICY`, and return TursoPG's stored SQL for
 other forms; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`, `age(timestamp[, timestamp])`
-(returns text in PostgreSQL's interval format, since intervals are stored as text;
-string literal arguments are cast to timestamptz, so they follow the timestamp input rules;
-other text arguments, such as text columns, are read as timestamps instead of being
-rejected, because tursopg chooses functions by name and argument count only;
-the `age(xid)` form is not supported).
+`transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
@@ -161,12 +156,18 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
 `<table>_<column>_seq`, or, when a relation of the schema has that name,
 the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
+smallint, bigint, uuid, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
-including char(n), timestamp(p) and bit(n), are rejected. interval, xml, tsvector/tsquery,
+including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
+
+date, time, timetz and interval, and arrays of every date and time type
+(`timestamp[]` and `timestamptz[]` included), are rejected as not supported
+(0A000) in column types, casts, typed literals and domains. So are
+`CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
+return date, time, timetz or interval, such as `age` and `make_date`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -242,15 +243,15 @@ INTEGER. Unknown type names pass through as custom types.
 | Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Rejected |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Rejected |
-| SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
+| SQL standard interval handling | ❌ Not supported | interval is rejected (0A000) |
 | SYSTEM_USER | ❌ Not supported | current_user, current_role and session_user are supported |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
-| unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
+| unnest/array_agg | 🟡 Partial | array_agg works; unnest works in FROM with up to 100 arrays, and not in the select list. `unnest(a, b)` needs a column alias list that gives its columns different names, because two columns named `unnest` are rejected |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
-| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(), unnest(), current_schema(), current_database(), version(), and on json_to_record / json_to_recordset and their jsonb_ variants in `ROWS FROM (f(...) AS (...))`; rejected on other functions and on ROWS FROM with several functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
+| WITH ORDINALITY clause | 🟡 Partial | Works on generate_series(), unnest(), json_each(), current_schema(), current_database(), version(), and on json_to_record / json_to_recordset and their jsonb_ variants in `ROWS FROM (f(...) AS (...))`; rejected on other functions and on ROWS FROM with several functions. Two columns with the same name, as in `generate_series(1, 2) WITH ORDINALITY AS ordinality`, are rejected. The ordinality column has type `integer`; in PostgreSQL it is `bigint` |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
@@ -268,7 +269,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp` or `date`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `+`, `-`, `||` and casts to text or date/time types need the type of their operands, which is known for a literal, a cast, a column of the table being created, and the result of an operator with a known type rule, so any other operand (a function result, a `CASE` or `COALESCE`, or any column in `ADD COLUMN`) is rejected as not supported (0A000); a generated column of a custom type such as `timestamp`, or one whose expression reads such a column, is rejected with 42601; `extract`, `date_part` and `date_trunc` are not implemented |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
@@ -344,6 +345,8 @@ INTEGER. Unknown type names pass through as custom types.
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
 | array_to_json | ✅ Supported | |
 | json_strip_nulls | 🟡 Partial | Input nested deeper than 1000 levels errors with `stack depth limit exceeded`, where PostgreSQL's limit depends on `max_stack_depth`; a text or jsonb argument is accepted, where PostgreSQL only takes json; `jsonb_strip_nulls` is not supported |
+| json_each | 🟡 Partial | Returns `key` (text) and `value` (json), accepts WITH ORDINALITY and column aliases, and fails on an array or a scalar like PostgreSQL. A member that is a number is written from its SQL value, so `12345678901234567890` comes back as `1.23456789012346e+19`, `1e2` as `100.0` and `1.50` as `1.5`, where PostgreSQL returns the text of the input (`->` keeps the spelling of a number). An object or an array comes back without the whitespace of the input (`[1, 2]` as `[1,2]`). A text or jsonb argument is accepted, where PostgreSQL only takes json. `jsonb_each`, `json_each_text`, `jsonb_each_text` and the other functions that return members are not supported |
+| Table functions of SQLite (json_tree, completion, ...) | ❌ Not supported | Refused with `0A000` as a function in FROM; PostgreSQL has no such function and reports `42883`. The `pragma_*` functions work and check the privilege of the PRAGMA |
 | json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list, after the alias or inside ROWS FROM (); WITH ORDINALITY works on the ROWS FROM form; ROWS FROM with several functions is not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
@@ -536,7 +539,7 @@ Upgrade is not supported.
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
-| Named parameters | ❌ Not supported | Named arguments in calls, such as `make_interval(days => 1)`, are rejected |
+| Named parameters | ❌ Not supported | Named arguments in calls, such as `jsonb_path_exists(j, p, silent => true)`, are rejected |
 | Non-superuser language creation | ❌ Not supported | |
 | pl/pgsql installed by default | ❌ Not supported | |
 | Polymorphic functions | ❌ Not supported | |

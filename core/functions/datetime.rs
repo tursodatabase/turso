@@ -1,4 +1,4 @@
-use crate::functions::printf::exec_printf_values;
+use crate::functions::printf::push_general_format;
 use crate::io::clock::Clock;
 use crate::numeric::{format_float, Numeric};
 use crate::types::AsValueRef;
@@ -6,7 +6,7 @@ use crate::types::{TextRef, TextSubtype, Value};
 use crate::vdbe::affinity::is_space;
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::LimboError::InvalidModifier;
-use crate::{Result, ValueRef};
+use crate::{turso_debug_assert, Result, ValueRef};
 // chrono isn't used more due to incompatibility with sqlite
 use chrono::{Local, Offset, TimeZone};
 use std::borrow::Cow;
@@ -187,21 +187,22 @@ impl DateTime {
 }
 
 fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32, &str)> {
-    if z.len() < digits {
-        return None;
+    turso_debug_assert!(
+        (1..=9).contains(&digits),
+        "an i32 holds every number of 1 to 9 digits"
+    );
+    let digit_bytes = z.as_bytes().get(..digits)?;
+    let mut val = 0i32;
+    for &byte in digit_bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + i32::from(byte - b'0');
     }
-    if !z.is_char_boundary(digits) {
-        return None;
-    }
-    let bytes = z.as_bytes();
-    if !bytes.iter().take(digits).all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let slice = &z[..digits];
-    let val = slice.parse::<i32>().ok()?;
     if val < min_val || val > max_val {
         return None;
     }
+    // The bytes before `digits` are ASCII, so `digits` is a char boundary.
     Some((val, &z[digits..]))
 }
 
@@ -940,49 +941,46 @@ where
                 return Value::Null;
             }
 
-            let mut res = String::new();
+            let mut res = String::with_capacity(32);
             if func_type == "date" {
-                if p.y < 0 {
-                    write!(res, "-{:04}-{:02}-{:02}", p.y.abs(), p.m, p.d).unwrap();
-                } else {
-                    write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap();
-                }
+                push_date(&mut res, &p);
             } else if func_type == "time" {
-                write!(res, "{:02}:{:02}", p.h, p.min).unwrap();
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
-                }
+                push_time(&mut res, &p);
             } else {
-                if p.y < 0 {
-                    write!(
-                        res,
-                        "-{:04}-{:02}-{:02} {:02}:{:02}",
-                        p.y.abs(),
-                        p.m,
-                        p.d,
-                        p.h,
-                        p.min
-                    )
-                    .unwrap();
-                } else {
-                    write!(
-                        res,
-                        "{:04}-{:02}-{:02} {:02}:{:02}",
-                        p.y, p.m, p.d, p.h, p.min
-                    )
-                    .unwrap();
-                }
-
-                if p.use_subsec {
-                    write!(res, ":{:06.3}", p.s).unwrap();
-                } else {
-                    write!(res, ":{:02}", p.s as i32).unwrap();
-                }
+                push_date(&mut res, &p);
+                res.push(' ');
+                push_time(&mut res, &p);
             }
             Value::from_text(res)
         }
+    }
+}
+
+/// Append `[-]YYYY-MM-DD`.
+fn push_date(res: &mut String, p: &DateTime) {
+    if p.y < 0 {
+        res.push('-');
+        push_zero_padded(res, i64::from(p.y.abs()), 4);
+    } else {
+        push_zero_padded(res, i64::from(p.y), 4);
+    }
+    res.push('-');
+    push_zero_padded(res, i64::from(p.m), 2);
+    res.push('-');
+    push_zero_padded(res, i64::from(p.d), 2);
+}
+
+/// Append `HH:MM:SS`, or `HH:MM:SS.SSS` with the `subsec` modifier.
+fn push_time(res: &mut String, p: &DateTime) {
+    push_zero_padded(res, i64::from(p.h), 2);
+    res.push(':');
+    push_zero_padded(res, i64::from(p.min), 2);
+    if p.use_subsec {
+        res.push(':');
+        push_seconds(res, p.s);
+    } else {
+        res.push(':');
+        push_zero_padded(res, i64::from(p.s as i32), 2);
     }
 }
 
@@ -1259,14 +1257,26 @@ where
     let rem_ms = rem_ms % 3600000;
     let mins = rem_ms / 60000;
     let rem_ms = rem_ms % 60000;
-    let secs = rem_ms as f64 / 1000.0;
+    turso_debug_assert!(
+        (0..60000).contains(&rem_ms),
+        "both branches subtract the smaller julian day from the larger one"
+    );
 
-    let mut res = String::new();
-    write!(
-        res,
-        "{sign}{y:04}-{m:02}-{days:02} {hours:02}:{mins:02}:{secs:06.3}"
-    )
-    .unwrap();
+    // `{sign}{y:04}-{m:02}-{days:02} {hours:02}:{mins:02}:{secs:06.3}`, with
+    // `secs = rem_ms as f64 / 1000.0`.
+    let mut res = String::with_capacity(24);
+    res.push(sign);
+    push_zero_padded(&mut res, i64::from(y), 4);
+    res.push('-');
+    push_zero_padded(&mut res, i64::from(m), 2);
+    res.push('-');
+    push_zero_padded(&mut res, days, 2);
+    res.push(' ');
+    push_zero_padded(&mut res, hours, 2);
+    res.push(':');
+    push_zero_padded(&mut res, mins, 2);
+    res.push(':');
+    push_seconds_with_millis(&mut res, rem_ms);
 
     Value::from_text(res)
 }
@@ -1357,7 +1367,9 @@ where
     }
     p.compute_ymd_hms();
 
-    let mut res = String::new();
+    // Most directives write a few more characters than their two, and `%J`
+    // writes up to 17, so this capacity usually holds the whole result.
+    let mut res = String::with_capacity(fmt_str.len() + 16);
     let mut chars = fmt_str.chars().peekable();
 
     let days_after_jan1 = |curr: &DateTime| -> i64 {
@@ -1392,15 +1404,21 @@ where
         }
 
         match chars.next() {
-            Some('d') => write!(res, "{:02}", p.d).unwrap(),
+            Some('d') => push_zero_padded(&mut res, i64::from(p.d), 2),
             Some('e') => write!(res, "{:2}", p.d).unwrap(),
-            Some('F') => write!(res, "{:04}-{:02}-{:02}", p.y, p.m, p.d).unwrap(),
+            Some('F') => {
+                push_zero_padded(&mut res, i64::from(p.y), 4);
+                res.push('-');
+                push_zero_padded(&mut res, i64::from(p.m), 2);
+                res.push('-');
+                push_zero_padded(&mut res, i64::from(p.d), 2);
+            }
             Some('f') => {
                 let mut s = p.s;
                 if s > 59.999 {
                     s = 59.999;
                 }
-                write!(res, "{s:06.3}").unwrap()
+                push_seconds(&mut res, s);
             }
             Some('g') => {
                 let mut y_iso = p;
@@ -1416,7 +1434,7 @@ where
                 y_iso.compute_ymd();
                 write!(res, "{:04}", y_iso.y).unwrap();
             }
-            Some('H') => write!(res, "{:02}", p.h).unwrap(),
+            Some('H') => push_zero_padded(&mut res, i64::from(p.h), 2),
             Some('I') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
                 write!(res, "{h:02}").unwrap();
@@ -1425,21 +1443,23 @@ where
                 write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
             }
             Some('J') => {
-                let val = Value::from_f64(p.i_jd as f64 / 86400000.0);
-                let julian_day = exec_printf_values(&Value::build_text("%.16g"), &[&val])
-                    .expect("%.16g of a float cannot fail");
-                write!(res, "{julian_day}").unwrap();
+                let julian_day = Value::from_f64(p.i_jd as f64 / 86400000.0);
+                push_general_format(&mut res, &julian_day, 16);
             }
             Some('k') => write!(res, "{:2}", p.h).unwrap(),
             Some('l') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
                 write!(res, "{h:2}").unwrap();
             }
-            Some('m') => write!(res, "{:02}", p.m).unwrap(),
-            Some('M') => write!(res, "{:02}", p.min).unwrap(),
+            Some('m') => push_zero_padded(&mut res, i64::from(p.m), 2),
+            Some('M') => push_zero_padded(&mut res, i64::from(p.min), 2),
             Some('p') => write!(res, "{}", if p.h >= 12 { "PM" } else { "AM" }).unwrap(),
             Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
-            Some('R') => write!(res, "{:02}:{:02}", p.h, p.min).unwrap(),
+            Some('R') => {
+                push_zero_padded(&mut res, i64::from(p.h), 2);
+                res.push(':');
+                push_zero_padded(&mut res, i64::from(p.min), 2);
+            }
             Some('s') => {
                 let s = (p.i_jd - 210866760000000) as f64 / 1000.0;
                 if p.use_subsec {
@@ -1448,8 +1468,14 @@ where
                     write!(res, "{}", s.floor()).unwrap();
                 }
             }
-            Some('S') => write!(res, "{:02}", p.s as i32).unwrap(),
-            Some('T') => write!(res, "{:02}:{:02}:{:02}", p.h, p.min, p.s as i32).unwrap(),
+            Some('S') => push_zero_padded(&mut res, i64::from(p.s as i32), 2),
+            Some('T') => {
+                push_zero_padded(&mut res, i64::from(p.h), 2);
+                res.push(':');
+                push_zero_padded(&mut res, i64::from(p.min), 2);
+                res.push(':');
+                push_zero_padded(&mut res, i64::from(p.s as i32), 2);
+            }
             Some('u') => {
                 let mut w = days_after_sun(&p);
                 if w == 0 {
@@ -1476,13 +1502,57 @@ where
                 let w = (days_after_jan1(&p) - days_after_mon(&p) + 7) / 7;
                 write!(res, "{w:02}").unwrap();
             }
-            Some('Y') => write!(res, "{:04}", p.y).unwrap(),
+            Some('Y') => push_zero_padded(&mut res, i64::from(p.y), 4),
             Some('%') => res.push('%'),
             _ => return Value::Null,
         }
     }
 
     Value::from_text(res)
+}
+
+/// Append `s` as `write!(res, "{s:06.3}")` does.
+fn push_seconds(res: &mut String, s: f64) {
+    // The text of -0.0 has a minus sign.
+    if s.is_sign_positive() && s < 60.0 {
+        push_seconds_with_millis(res, round_to_millis(s));
+    } else {
+        write!(res, "{s:06.3}").unwrap();
+    }
+}
+
+/// `s * 1000`, for `s` in [0, 60), rounded to the nearest integer with ties
+/// to even. Float formatting rounds the exact value of `s` the same way.
+fn round_to_millis(s: f64) -> i64 {
+    use num_traits::Float;
+
+    // s = mantissa * 2^exponent, where mantissa < 2^53.
+    let (mantissa, exponent, _) = s.integer_decode();
+    turso_debug_assert!(exponent < 0, "s is less than 60");
+    let shift = u32::from(exponent.unsigned_abs());
+    if shift >= 64 {
+        // s * 1000 < 2^63 * 2^-64, which is less than one half.
+        return 0;
+    }
+    let scaled = u128::from(mantissa) * 1000;
+    let whole = scaled >> shift;
+    let rest = scaled & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    let rounded = if rest > half || (rest == half && whole % 2 == 1) {
+        whole + 1
+    } else {
+        whole
+    };
+    rounded as i64
+}
+
+/// Append `millis`, a count of at most 60000, as seconds with three decimals.
+/// The text is the same as `write!(res, "{:06.3}", millis as f64 / 1000.0)`,
+/// because the float is so near the decimal value that it rounds to it.
+fn push_seconds_with_millis(res: &mut String, millis: i64) {
+    push_zero_padded(res, millis / 1000, 2);
+    res.push('.');
+    push_zero_padded(res, millis % 1000, 3);
 }
 
 /// SQLite reads date/time arguments with sqlite3_value_text(), which hands back a
@@ -1506,10 +1576,109 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
     }
 }
 
+/// Append `value` as `write!(res, "{value:0width$}")` does: zero padded to
+/// `width` characters, with the sign counted in the width.
+fn push_zero_padded(res: &mut String, value: i64, width: usize) {
+    // Most date and time fields are two or four digits with no sign.
+    match (width, u16::try_from(value)) {
+        (2, Ok(value @ 0..=99)) => push_two_digits(res, value),
+        (4, Ok(value @ 0..=9999)) => {
+            push_two_digits(res, value / 100);
+            push_two_digits(res, value % 100);
+        }
+        _ => push_zero_padded_any_width(res, value, width),
+    }
+}
+
+/// Append `value`, which is less than 100, as two digits.
+fn push_two_digits(res: &mut String, value: u16) {
+    let digit = |digit: u16| {
+        char::from_digit(u32::from(digit), 10).expect("a number less than 100 has two digits")
+    };
+    res.push(digit(value / 10));
+    res.push(digit(value % 10));
+}
+
+fn push_zero_padded_any_width(res: &mut String, value: i64, width: usize) {
+    let mut buf = [0u8; 20];
+    let digits = crate::numeric::write_decimal_digits(&mut buf, value.unsigned_abs());
+    let negative = value < 0;
+    if negative {
+        res.push('-');
+    }
+    for _ in digits.len() + usize::from(negative)..width {
+        res.push('0');
+    }
+    for &digit in digits {
+        res.push(char::from(digit));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::clock::DefaultClock;
+
+    #[test]
+    fn push_seconds_with_millis_matches_float_fmt() {
+        for millis in 0..60000i64 {
+            let mut res = String::new();
+            push_seconds_with_millis(&mut res, millis);
+            assert_eq!(res, format!("{:06.3}", millis as f64 / 1000.0));
+        }
+    }
+
+    #[test]
+    fn push_seconds_matches_float_fmt() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let random = std::iter::repeat_with(move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 61.0
+        })
+        .take(200_000);
+        let millis = (0..=60000).map(|millis| millis as f64 / 1000.0);
+        // The exact value of a multiple of 1/16 times 1000 is a tie when it ends in .5.
+        let ties = (0..=976).map(|sixteenths| sixteenths as f64 / 16.0);
+        let other = [
+            0.0005,
+            0.0015,
+            59.9994,
+            59.9995,
+            59.99950000000001,
+            59.9996,
+            60.0,
+            60.5,
+            123.4567,
+            1e-300,
+            -0.0,
+            -1.5,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for s in random.chain(millis).chain(ties).chain(other) {
+            let mut res = String::new();
+            push_seconds(&mut res, s);
+            assert_eq!(res, format!("{s:06.3}"), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn push_zero_padded_matches_fmt() {
+        for value in (-12_345i64..12_345).chain([
+            i64::MIN,
+            i64::MAX,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+        ]) {
+            for width in 0..7 {
+                let mut res = String::new();
+                push_zero_padded(&mut res, value, width);
+                assert_eq!(res, format!("{value:0width$}"));
+            }
+        }
+    }
 
     #[test]
     fn test_valid_get_date_from_time_value() {
