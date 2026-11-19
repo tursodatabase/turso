@@ -137,10 +137,10 @@ fn key_info() -> KeyInfo {
 /// Memory budget for Tantivy's per-segment writer arena.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Memory budget of the segment writer for each buffered document. With this
-/// value, a batch of `BATCH_COMMIT_SIZE` documents gets the largest initial
-/// term table, as with `DEFAULT_MEMORY_BUDGET_BYTES`.
-const SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC: usize = 16 * 1024;
+/// Memory budget of the segment writer for each buffered document. A batch of
+/// `BATCH_COMMIT_SIZE` documents gets an initial term table of 2^15 entries,
+/// which holds 16,384 terms before it grows.
+const SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC: usize = 1024;
 
 /// The smallest memory budget of the segment writer. It gives Tantivy's
 /// smallest initial term table (2^10 entries). Tantivy refuses a budget of
