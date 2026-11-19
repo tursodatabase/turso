@@ -1165,3 +1165,9 @@ test foreign-key-period {
 expect error {
     PERIOD in a key is not supported
 }
+
+# A double-quoted name is always an identifier in PostgreSQL, never a string as in SQLite.
+test table-check-double-quoted-name-is-not-a-string {
+    CREATE TABLE t (c text CHECK (c <> "q"));
+}
+expect error {}

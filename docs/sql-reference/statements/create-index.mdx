@@ -126,6 +126,8 @@ CREATE INDEX idx_items_total ON items (quantity * unit_price);
 
 Each expression in the index must be a deterministic expression that references only columns of the indexed table. Aggregate functions and subqueries are not allowed. Columns must be named without a table qualifier: `t.a` is rejected with `the "." operator prohibited in index expressions`. The `WHERE` clause of a partial index may use qualified names.
 
+As in SQLite, a double-quoted name that is not a column of the table, such as `"+1 month"` in `datetime(created_at, "+1 month")`, is read as a string literal. This applies to index expressions and to the `WHERE` clause of a partial index. `ALTER TABLE ... RENAME COLUMN` and `ALTER TABLE ... DROP COLUMN` rewrite such strings with single quotes in the stored index SQL, so the index does not start reading a column of that name added later. Without that rewrite, `ALTER TABLE ... ADD COLUMN` of that name makes the index read the new column, as in SQLite; index entries of rows that already exist then no longer match. Use single quotes for string literals in new indexes.
+
 ## Custom Index Methods {#using-method}
 
 <Info>

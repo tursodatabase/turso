@@ -2016,6 +2016,7 @@ fn emit_update_insns<'a>(
                 new_where_expr,
                 columns,
                 &column_regs,
+                effective_rowid_reg,
                 &bt,
                 new_satisfied_reg,
             )?;

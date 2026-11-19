@@ -7203,3 +7203,22 @@ setup gencol_virtual_columns_delete_trigger {
 snapshot gencol_delete_old_row_computes_virtual_columns_from_registers {
     DELETE FROM t WHERE b = 3;
 }
+
+# Like SQLite, a double-quoted name that is not a column is a string literal in a
+# generated column, also when it is a rowid name.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test gencol_double_quoted_string {
+    CREATE TABLE t(c, v AS (c || "q"), s AS (c || "rowid") STORED, n AS ("c" + 1));
+    INSERT INTO t(c) VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    1|1q|1rowid|2
+}
+
+test gencol_unquoted_name_is_not_a_string {
+    CREATE TABLE t(c, v AS (c || q));
+}
+expect error {
+    no such column: q
+}

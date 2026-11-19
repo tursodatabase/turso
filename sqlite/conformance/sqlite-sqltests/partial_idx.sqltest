@@ -1854,6 +1854,22 @@ expect {
     2|1|9
 }
 
+@cross-check-integrity
+test partial-index-rowid-where-without-rowid-alias {
+    CREATE TABLE t(a UNIQUE, b);
+    CREATE INDEX ib ON t(b) WHERE b > rowid;
+    INSERT INTO t VALUES (1, 5), (2, 0);
+    INSERT INTO t(rowid, a, b) VALUES (100, 3, 50);
+    UPDATE t SET b = b + 100 WHERE a = 3;
+    INSERT INTO t VALUES (2, 9) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT a, b FROM t INDEXED BY ib WHERE b > rowid ORDER BY a;
+}
+expect {
+    1|5
+    2|9
+    3|150
+}
+
 test partial-index-where-current-timestamp-rejected {
     CREATE TABLE t(a);
     CREATE INDEX i ON t(a) WHERE CURRENT_TIMESTAMP IS NOT NULL;

@@ -1800,6 +1800,7 @@ pub enum AlterTableFunc {
     RenameTable,
     AlterColumn,
     RenameColumn,
+    QuoteFix,
 }
 
 impl Display for AlterTableFunc {
@@ -1808,6 +1809,7 @@ impl Display for AlterTableFunc {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
             AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
+            AlterTableFunc::QuoteFix => write!(f, "limbo_rename_quotefix"),
         }
     }
 }
