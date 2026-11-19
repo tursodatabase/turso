@@ -119,6 +119,12 @@ pub fn numeric_compare_operands(left: ValueRef, right: ValueRef) -> crate::Resul
     Ok(compare_sort_keys(left, right))
 }
 
+/// Fails where [numeric_compare_operands] would fail for `value` as either
+/// side.
+pub fn numeric_check_operand(value: ValueRef) -> crate::Result<()> {
+    NumericSortKey::of(value).check_is_number()
+}
+
 fn compare_sort_keys(left: NumericSortKey, right: NumericSortKey) -> Ordering {
     match (left, right) {
         (NumericSortKey::Number(l), NumericSortKey::Number(r)) => compare_numbers(&l, &r),

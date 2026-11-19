@@ -111,6 +111,14 @@ impl OpenLoop {
 
             match &table.op {
                 Operation::HashJoin(hash_join_op) => {
+                    let prefilter_terms = super::conditions::hash_probe_prefilter_where_terms(
+                        t_ctx,
+                        table_references,
+                        join_order,
+                        predicates,
+                        subqueries,
+                        join_index,
+                    )?;
                     HashProbeSetupEmitter::new(
                         program,
                         t_ctx,
@@ -118,6 +126,7 @@ impl OpenLoop {
                         subqueries,
                         predicates,
                         hash_join_op,
+                        &prefilter_terms,
                         &mode,
                         table_cursor_id.expect("Probe table must have a cursor"),
                         loop_start,
