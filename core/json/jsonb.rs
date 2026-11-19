@@ -56,6 +56,23 @@ const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
 static ENDS_DOUBLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'"');
 static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'\'');
 
+/// For each byte, whether the JSON text of a string escapes it: a control
+/// character, and for TEXT and TEXTRAW also `"` and `\`. A TEXTJ payload
+/// holds its quotes and backslashes as escapes already.
+const fn make_escaped_table(escape_quote_and_backslash: bool) -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = byte <= 0x1F
+            || (escape_quote_and_backslash && (byte == b'"' as usize || byte == b'\\' as usize));
+        byte += 1;
+    }
+    table
+}
+
+static ESCAPED_IN_TEXT: [bool; 256] = make_escaped_table(true);
+static ESCAPED_IN_TEXTJ: [bool; 256] = make_escaped_table(false);
+
 const fn make_character_type_table() -> [u8; 256] {
     let mut table = [0u8; 256];
 
@@ -1365,15 +1382,14 @@ impl Jsonb {
 
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
+                let escaped = if *kind == ElementType::TEXTJ {
+                    &ESCAPED_IN_TEXTJ
+                } else {
+                    &ESCAPED_IN_TEXT
+                };
                 for i in 0..bytes.len() {
                     let b = bytes[i];
-                    let needs_escape = if *kind == ElementType::TEXTJ {
-                        b <= 0x1F
-                    } else {
-                        b == b'"' || b == b'\\' || b <= 0x1F
-                    };
-
-                    if needs_escape {
+                    if escaped[b as usize] {
                         string.push_str(&word[last_end..i]);
                         match b {
                             b'"' => string.push_str("\\\""),
