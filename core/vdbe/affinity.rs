@@ -380,9 +380,6 @@ impl Affinity {
     }
 }
 
-/// Whether `haystack` contains `needle`, an upper-case ASCII string, when
-/// ASCII letters are compared without case. This is the same as
-/// `haystack.to_ascii_uppercase().contains(needle)`, without the copy.
 #[derive(Debug, PartialEq)]
 pub enum NumericParseResult {
     NotNumeric,      // not a valid number
