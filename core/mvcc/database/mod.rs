@@ -8202,6 +8202,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.durable_txid_max.store(tx_id, Ordering::SeqCst);
     }
 
+    /// The number of entries in the write set of transaction `tx_id`, and the
+    /// number of distinct version chains that they point to.
+    #[cfg(feature = "test_helper")]
+    pub fn write_set_counts_for_testing(&self, tx_id: TxID) -> (usize, usize) {
+        let tx = self.txs.get(&tx_id).expect("transaction should exist");
+        let write_set = tx.value().write_set.lock();
+        let distinct_chains: HashSet<usize> = write_set
+            .iter()
+            .map(|(_, row_versions)| Arc::as_ptr(row_versions) as usize)
+            .collect();
+        (write_set.len(), distinct_chains.len())
+    }
+
     /// Whether an incremental GC pass should run now: inline GC is enabled
     /// (threshold >= 0) and `live_version_count_approx` has grown past the threshold
     /// since the last pass. Heuristic — drift only changes GC frequency.
