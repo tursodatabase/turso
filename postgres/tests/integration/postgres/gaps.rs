@@ -507,7 +507,7 @@ fn gap_b_89_limit_offset_with_text_params(db: TempDatabase) {
 }
 
 // B-118 (S2): json_populate_recordset
-// tursopg: json_populate_recordset with a row type fails with 42P01.
+// tursopg: json_populate_recordset in FROM is refused with 0A000.
 // PostgreSQL: 1|a
 #[turso_macros::test(views)]
 fn gap_b_118_tursopg_returns_wrong_result_json_populate_recordset(db: TempDatabase) {
@@ -518,7 +518,7 @@ fn gap_b_118_tursopg_returns_wrong_result_json_populate_recordset(db: TempDataba
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 42P01");
+    assert_eq!(out, "ERROR 0A000");
 }
 
 // B-119: json_to_recordset with column defs

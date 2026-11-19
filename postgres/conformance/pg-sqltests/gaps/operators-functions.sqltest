@@ -1088,7 +1088,7 @@ expect {
     1
     {"a": 2}
 }
-@sqlstate 42P01
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-121 (S2): jsonb_each
@@ -1098,7 +1098,7 @@ test gap-b-121-jsonb-each {
 expect {
     a|1
 }
-@sqlstate 42P01
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-122 (S2): jsonb_set / || / - operators
