@@ -4929,6 +4929,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Runs [`Self::reset_after_vacuum`] while holding the vacuum gate, as
+    /// VACUUM does.
+    #[cfg(feature = "test_helper")]
+    pub fn reset_after_vacuum_for_testing(&self, header: DatabaseHeader, schema: &Schema) {
+        self.try_begin_vacuum_gate()
+            .expect("no transaction should be active");
+        self.reset_after_vacuum(header, schema);
+        self.release_vacuum_gate();
+    }
+
     /// VACUUM copies the physical DB image, so any transaction frames in the
     /// MVCC logical log must be checkpointed first.
     ///

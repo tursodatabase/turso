@@ -41,10 +41,12 @@ use turso_core::mvcc::persistent_storage::logical_log::{
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::namespace::NamespaceId;
+use turso_core::schema::{Schema, Table};
 use turso_core::state_machine::{StateTransition, TransitionResult};
 use turso_core::storage::sqlite3_ondisk::checksum_wal;
 use turso_core::storage::sqlite3_ondisk::read_varint;
 use turso_core::storage::sqlite3_ondisk::write_varint;
+use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
 use turso_core::storage::sqlite3_ondisk::WalHeader;
 use turso_core::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE;
@@ -64,6 +66,7 @@ use turso_core::IOExt;
 use turso_core::MemoryIO;
 use turso_core::Numeric;
 use turso_core::OpenFlags;
+use turso_core::ReparseSchemaState;
 use turso_core::Result;
 use turso_core::Statement;
 use turso_core::StatementStatusCounter;
@@ -1896,6 +1899,158 @@ impl MvccTestDb {
         db.conn.set_portable_logical_changes_enabled(true);
         db
     }
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let schema = reparse_physical_schema(&db.conn);
+    let table_root = match schema
+        .get_table(NamespaceId::ROOT, "t")
+        .expect("table t")
+        .as_ref()
+    {
+        Table::BTree(btree) => btree.root_page,
+        _ => panic!("expected btree table"),
+    };
+    let index_root = schema
+        .indices_including_backing(NamespaceId::ROOT, "t")
+        .next()
+        .map(|index| index.root_page)
+        .expect("index idx_t_v");
+
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+
+    db.mvcc_store
+        .with_header_mut(|header| *header = DatabaseHeader::default(), None)
+        .unwrap();
+    db.mvcc_store
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+
+    db.mvcc_store
+        .reset_after_vacuum_for_testing(header, schema.as_ref());
+
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.schema_cookie.get(), None)
+            .unwrap(),
+        77
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&SQLITE_SCHEMA_MVCC_TABLE_ID),
+        Some(1)
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(table_root))),
+        Some(table_root as u64)
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(index_root))),
+        Some(index_root as u64)
+    );
+    assert!(
+        db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-999_i64))
+            .is_none(),
+        "stale root-page entries must be cleared"
+    );
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    db.conn
+        .execute("UPDATE t SET v = 'z' WHERE id = 1")
+        .unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Checkpoint-time GC removes the buckets it empties (it runs under the
+    // blocking lock), so recreate the condition VACUUM reset must handle:
+    // lazy background GC empties chains but leaves the buckets in the maps.
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+    db.conn.execute("ROLLBACK").unwrap();
+    db.mvcc_store.drop_unused_row_versions();
+
+    let empty_row_ids = db
+        .mvcc_store
+        .rows
+        .iter()
+        .filter(|entry| entry.value().read().is_empty())
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    let empty_index_ids = db
+        .mvcc_store
+        .index_rows
+        .iter()
+        .filter(|entry| {
+            entry
+                .value()
+                .iter()
+                .all(|row_entry| row_entry.value().read().is_empty())
+        })
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    assert!(
+        !empty_row_ids.is_empty(),
+        "lazy GC should leave empty table row buckets before VACUUM reset"
+    );
+    assert!(
+        !empty_index_ids.is_empty(),
+        "lazy GC should leave empty index buckets before VACUUM reset"
+    );
+
+    let schema = reparse_physical_schema(&db.conn);
+
+    db.mvcc_store
+        .reset_after_vacuum_for_testing(DatabaseHeader::default(), schema.as_ref());
+
+    for row_id in empty_row_ids {
+        assert!(
+            db.mvcc_store.rows.get(&row_id).is_none(),
+            "empty table row buckets must be cleared across VACUUM reset"
+        );
+    }
+    for index_id in empty_index_ids {
+        assert!(
+            db.mvcc_store.index_rows.get(&index_id).is_none(),
+            "empty index buckets must be cleared across VACUUM reset"
+        );
+    }
+}
+
+/// Reads the schema from the B-tree image, as VACUUM does after it rewrote it,
+/// instead of from the MVCC store.
+fn reparse_physical_schema(conn: &Arc<Connection>) -> Arc<Schema> {
+    conn.demote_to_mvcc_connection();
+    let mut state = ReparseSchemaState::default();
+    conn.get_pager()
+        .io
+        .block(|| conn.reparse_schema_nonblock(&mut state))
+        .unwrap();
+    let schema = conn.current_schema();
+    conn.promote_to_regular_connection();
+    schema
 }
 
 #[test]

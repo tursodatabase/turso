@@ -1,4 +1,3 @@
-use crate::namespace::NamespaceId;
 use crate::SqliteDialect;
 use rustc_hash::FxHashSet as HashSet;
 
@@ -394,77 +393,6 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
 }
 
 #[test]
-fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
-    let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
-    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    db.conn.demote_to_mvcc_connection();
-    db.conn.reparse_schema().unwrap();
-    let schema = db.conn.schema.read().clone();
-    db.conn.promote_to_regular_connection();
-    let table_root = match schema
-        .get_table(NamespaceId::ROOT, "t")
-        .expect("table t")
-        .as_ref()
-    {
-        Table::BTree(btree) => btree.root_page,
-        _ => panic!("expected btree table"),
-    };
-    let index_root = schema
-        .indices_including_backing(NamespaceId::ROOT, "t")
-        .next()
-        .map(|index| index.root_page)
-        .expect("index idx_t_v");
-
-    let mut header = DatabaseHeader::default();
-    header.schema_cookie = 77.into();
-
-    db.mvcc_store
-        .global_header
-        .write()
-        .replace(DatabaseHeader::default());
-    db.mvcc_store
-        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
-
-    db.mvcc_store.try_begin_vacuum_gate().unwrap();
-    db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
-    db.mvcc_store.release_vacuum_gate();
-
-    assert_eq!(
-        db.mvcc_store
-            .with_header(|header| header.schema_cookie.get(), None)
-            .unwrap(),
-        77
-    );
-    assert_eq!(
-        db.mvcc_store
-            .current_root_page(&SQLITE_SCHEMA_MVCC_TABLE_ID),
-        Some(1)
-    );
-    assert_eq!(
-        db.mvcc_store
-            .current_root_page(&MVTableId::from(-(table_root))),
-        Some(table_root as u64)
-    );
-    assert_eq!(
-        db.mvcc_store
-            .current_root_page(&MVTableId::from(-(index_root))),
-        Some(index_root as u64)
-    );
-    assert!(
-        db.mvcc_store
-            .table_id_to_rootpage
-            .get(&MVTableId::from(-999_i64))
-            .is_none(),
-        "stale root-page entries must be cleared"
-    );
-}
-
-#[test]
 fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     use crate::mvcc::database::WalPos;
     let frame = |f: u64| WalPos {
@@ -694,83 +622,6 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
         wal_bf > 0,
         "passive checkpoint must still publish nbackfills, got {wal_bf}"
     );
-}
-
-#[test]
-fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
-    let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
-
-    db.conn
-        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
-        .unwrap();
-    db.conn
-        .execute("UPDATE t SET v = 'z' WHERE id = 1")
-        .unwrap();
-    db.conn.execute("DELETE FROM t WHERE id = 2").unwrap();
-    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    // Checkpoint-time GC removes the buckets it empties (it runs under the
-    // blocking lock), so recreate the condition VACUUM reset must handle:
-    // lazy background GC empties chains but leaves the buckets in the maps.
-    db.conn.execute("BEGIN").unwrap();
-    db.conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
-    db.conn.execute("ROLLBACK").unwrap();
-    db.mvcc_store.drop_unused_row_versions();
-
-    let empty_row_ids = db
-        .mvcc_store
-        .rows
-        .iter()
-        .filter(|entry| entry.value().read().is_empty())
-        .map(|entry| entry.key().clone())
-        .collect::<Vec<_>>();
-    let empty_index_ids = db
-        .mvcc_store
-        .index_rows
-        .iter()
-        .filter(|entry| {
-            entry
-                .value()
-                .iter()
-                .all(|row_entry| row_entry.value().read().is_empty())
-        })
-        .map(|entry| *entry.key())
-        .collect::<Vec<_>>();
-    assert!(
-        !empty_row_ids.is_empty(),
-        "lazy GC should leave empty table row buckets before VACUUM reset"
-    );
-    assert!(
-        !empty_index_ids.is_empty(),
-        "lazy GC should leave empty index buckets before VACUUM reset"
-    );
-
-    db.conn.demote_to_mvcc_connection();
-    db.conn.reparse_schema().unwrap();
-    let schema = db.conn.current_schema();
-    db.conn.promote_to_regular_connection();
-
-    db.mvcc_store.try_begin_vacuum_gate().unwrap();
-    db.mvcc_store
-        .reset_after_vacuum(DatabaseHeader::default(), schema.as_ref());
-    db.mvcc_store.release_vacuum_gate();
-
-    for row_id in empty_row_ids {
-        assert!(
-            db.mvcc_store.rows.get(&row_id).is_none(),
-            "empty table row buckets must be cleared across VACUUM reset"
-        );
-    }
-    for index_id in empty_index_ids {
-        assert!(
-            db.mvcc_store.index_rows.get(&index_id).is_none(),
-            "empty index buckets must be cleared across VACUUM reset"
-        );
-    }
 }
 
 impl MvccTestDbNoConn {
