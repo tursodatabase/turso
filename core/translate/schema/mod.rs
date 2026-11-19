@@ -2081,7 +2081,6 @@ pub fn translate_drop_table(
             name: &normalized_name,
             is_virtual: table.btree().is_none(),
             indexes: &index_names,
-            owned_sequences: &owned_sequences,
             scratch_regs: [scratch_reg, table_name_and_root_page_register],
         }),
     )?;
@@ -2504,8 +2503,8 @@ pub fn translate_drop_table(
     }
 
     for sequence in &owned_sequences {
-        crate::translate::sequence::emit_drop_sequence_cleanup(
-            program, resolver, namespace, sequence,
+        crate::translate::sequence::emit_drop_sequence(
+            program, resolver, connection, namespace, sequence,
         )?;
     }
 

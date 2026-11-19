@@ -244,18 +244,17 @@ pub struct DropSequence<'a> {
     pub name: &'a str,
 }
 
-/// A table that the statement drops, with its indexes and the sequences
-/// that its columns own, before the statement destroys their B-trees.
-/// `scratch_regs` are two registers for the catalog to use. The statement
-/// allocates them because Destroy later reuses the second, as in SQLite's
-/// bytecode.
+/// A table that the statement drops, with its indexes, before the
+/// statement destroys their B-trees. A sequence that a column of the table
+/// owns gets a [`DropSequence`] of its own. `scratch_regs` are two
+/// registers for the catalog to use. The statement allocates them because
+/// Destroy later reuses the second, as in SQLite's bytecode.
 #[derive(Debug, Clone, Copy)]
 pub struct DropTable<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
     pub is_virtual: bool,
     pub indexes: &'a [&'a str],
-    pub owned_sequences: &'a [String],
     pub scratch_regs: [usize; 2],
 }
 
