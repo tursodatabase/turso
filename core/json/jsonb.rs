@@ -41,6 +41,21 @@ const fn make_whitespace_table() -> [u8; 256] {
 
 static WS_TABLE: [u8; 256] = make_whitespace_table();
 
+/// For each byte, whether it ends the part of a string that the parser copies
+/// as it is: the quote of the string, a backslash or a control character.
+const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = byte == quote as usize || byte == b'\\' as usize || byte < 0x20;
+        byte += 1;
+    }
+    table
+}
+
+static ENDS_DOUBLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'"');
+static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'\'');
+
 const fn make_character_type_table() -> [u8; 256] {
     let mut table = [0u8; 256];
 
@@ -1978,39 +1993,36 @@ impl Jsonb {
         let quoted = quote == b'"' || quote == b'\'';
 
         if quoted {
-            // Try to find the closing quote and check for simple string
-            let mut end_pos = pos;
-            let is_simple = true;
+            // A string with no escape and no control character ends at the
+            // first quote, and its payload is the bytes before the quote.
+            let ends_plain_part = if quote == b'"' {
+                &ENDS_DOUBLE_QUOTED_PLAIN_PART
+            } else {
+                &ENDS_SINGLE_QUOTED_PLAIN_PART
+            };
+            let rest = &input[pos..];
+            let len = rest
+                .iter()
+                .position(|&c| ends_plain_part[c as usize])
+                .unwrap_or(rest.len());
+            if rest.get(len) == Some(&quote) {
+                let end_pos = pos + len;
+                let header_pos = self.data.len();
 
-            while end_pos < input.len() {
-                let c = input[end_pos];
-                if c == quote {
-                    // Found end of string - check if it's simple
-                    if is_simple {
-                        let len = end_pos - pos;
-                        let header_pos = self.data.len();
-
-                        // Write header and content
-                        if len <= 11 {
-                            self.data
-                                .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                        } else {
-                            self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                                .map_err(|_| PError::Message {
-                                    msg: "Failed to write header".to_string(),
-                                    location: Some(pos),
-                                })?;
-                        }
-
-                        self.data.extend_from_slice(&input[pos..end_pos]);
-                        return Ok(end_pos + 1); // Skip past closing quote
-                    }
-                    break;
-                } else if c == b'\\' || c < 32 {
-                    // Not a simple string
-                    break;
+                // Write header and content
+                if len <= 11 {
+                    self.data
+                        .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                } else {
+                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                        .map_err(|_| PError::Message {
+                            msg: "Failed to write header".to_string(),
+                            location: Some(pos),
+                        })?;
                 }
-                end_pos += 1;
+
+                self.data.extend_from_slice(&input[pos..end_pos]);
+                return Ok(end_pos + 1); // Skip past closing quote
             }
         }
 
