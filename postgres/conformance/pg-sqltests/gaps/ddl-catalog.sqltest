@@ -438,28 +438,6 @@ expect {
 expect @tursopg {
 }
 
-# E-37: cross-schema FK (public -> auth)
-test gap-e-37-cross-schema-fk-public-auth {
-    CREATE SCHEMA IF NOT EXISTS auth;
-    CREATE TABLE auth.users (id uuid PRIMARY KEY);
-    CREATE TABLE profiles (id uuid PRIMARY KEY REFERENCES auth.users(id));
-    INSERT INTO auth.users VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
-    INSERT INTO profiles VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') RETURNING id;
-}
-expect {
-    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
-}
-
-# E-38: cross-schema FK rejects orphan
-test gap-e-38-cross-schema-fk-rejects-orphan {
-    CREATE SCHEMA IF NOT EXISTS auth;
-    CREATE TABLE auth.users (id uuid PRIMARY KEY);
-    CREATE TABLE profiles (id uuid PRIMARY KEY REFERENCES auth.users(id));
-    INSERT INTO profiles VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
-}
-@sqlstate 23503
-expect error {}
-
 # E-39 (S4): FK in pg_constraint confrelid/conkey/confkey
 test gap-e-39-fk-in-pg-constraint-confrelid-conkey-confkey {
     CREATE TABLE p (id int PRIMARY KEY);

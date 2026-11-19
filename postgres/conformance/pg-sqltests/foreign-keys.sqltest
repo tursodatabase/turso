@@ -39,6 +39,15 @@ expect {
     2
 }
 
+test fk-insert-missing-parent-of-unique-column {
+    CREATE TABLE parent (id int PRIMARY KEY, code text UNIQUE);
+    CREATE TABLE child (id int PRIMARY KEY, code text REFERENCES parent(code));
+    INSERT INTO parent VALUES (1, 'x');
+    INSERT INTO child VALUES (1, 'nope');
+}
+@sqlstate 23503
+expect error {insert or update on table "child" violates foreign key constraint "child_code_fkey"}
+
 test fk-update-to-missing-parent {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (pid int REFERENCES parent(id));
@@ -200,6 +209,17 @@ test fk-references-table-in-other-schema {
 }
 @sqlstate 23503
 expect error {}
+
+test fk-references-table-in-other-schema-with-parent {
+    CREATE SCHEMA IF NOT EXISTS auth;
+    CREATE TABLE auth.users (id uuid PRIMARY KEY);
+    CREATE TABLE profiles (id uuid PRIMARY KEY REFERENCES auth.users(id));
+    INSERT INTO auth.users VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    INSERT INTO profiles VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') RETURNING id;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
 
 test fk-drop-referenced-table {
     CREATE TABLE parent (id int PRIMARY KEY);
