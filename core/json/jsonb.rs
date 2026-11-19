@@ -1746,13 +1746,12 @@ impl Jsonb {
             });
         }
 
-        let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::OBJECT, 0, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
-        let obj_start = self.len();
+        let header_pos =
+            self.start_container(ElementType::OBJECT)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
         let mut first = true;
 
         loop {
@@ -1821,8 +1820,7 @@ impl Jsonb {
         }
 
         pos += 1; // consume '}'
-        let obj_size = self.len() - obj_start;
-        self.write_element_header(header_pos, ElementType::OBJECT, obj_size, false)
+        self.finish_container(header_pos, ElementType::OBJECT)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
@@ -1844,13 +1842,12 @@ impl Jsonb {
             });
         }
 
-        let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::ARRAY, 0, false)
+        let header_pos = self
+            .start_container(ElementType::ARRAY)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
-        let arr_start = self.len();
         let mut first = true;
 
         loop {
@@ -1885,13 +1882,55 @@ impl Jsonb {
         }
 
         pos += 1; // consume ']'
-        let arr_len = self.len() - arr_start;
-        self.write_element_header(header_pos, ElementType::ARRAY, arr_len, false)
+        self.finish_container(header_pos, ElementType::ARRAY)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
         Ok(pos)
+    }
+
+    /// Starts a container element at the end of the document: writes a 2-byte
+    /// header with no size and returns its offset. [Self::finish_container]
+    /// writes the real header when the payload is complete.
+    ///
+    /// A payload of 12 to 255 bytes has a 2-byte header, and most containers
+    /// have a payload of that size. For them, the payload does not move when
+    /// the real header is written, as it does after a 1-byte placeholder.
+    fn start_container(&mut self, element_type: ElementType) -> Result<usize> {
+        let header_pos = self.len();
+        self.data.try_reserve(2)?;
+        self.data.push(element_type as u8 | (SIZE_MARKER_8BIT << 4));
+        self.data.push(0);
+        Ok(header_pos)
+    }
+
+    /// Writes the header of the container that [Self::start_container] started
+    /// at `header_pos`, for the payload after the 2-byte placeholder. When the
+    /// header is not 2 bytes, the payload moves to follow it. The result is
+    /// the same as a header written for the payload size in the first place.
+    fn finish_container(&mut self, header_pos: usize, element_type: ElementType) -> Result<()> {
+        let payload_start = header_pos + 2;
+        let payload_end = self.len();
+        let header = JsonbHeader::new(element_type, payload_end - payload_start).into_bytes();
+        let header = header.as_bytes();
+        match header.len() {
+            1 => {
+                self.data
+                    .copy_within(payload_start..payload_end, header_pos + 1);
+                self.data.truncate(payload_end - 1);
+            }
+            2 => {}
+            header_len => {
+                let extra = header_len - 2;
+                self.data.try_reserve(extra)?;
+                self.data.resize(payload_end + extra, 0);
+                self.data
+                    .copy_within(payload_start..payload_end, payload_start + extra);
+            }
+        }
+        self.data[header_pos..header_pos + header.len()].copy_from_slice(header);
+        Ok(())
     }
 
     fn deserialize_string(
@@ -4826,6 +4865,36 @@ mod tests {
         let blob = [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7];
         let jsonb = Jsonb::from_raw_data(&blob).unwrap();
         assert!(jsonb.scalar_string_value().is_err());
+    }
+
+    #[test]
+    fn parsed_containers_have_the_minimal_header() {
+        // Payloads of 0, 10, 12, 254, 256, 65534 and 65536 bytes need each
+        // header size: 1, 2, 3 and 5 bytes.
+        for elements in [0usize, 5, 6, 127, 128, 32767, 32768] {
+            // Each element "1" is INT with a 1-byte payload: 0x13 '1'.
+            let array = format!("[{}]", vec!["1"; elements].join(","));
+            let jsonb = Jsonb::from_str(&array).unwrap();
+            let header = JsonbHeader::new(ElementType::ARRAY, elements * 2).into_bytes();
+            let header = header.as_bytes();
+            assert_eq!(&jsonb.data[..header.len()], header, "{elements} elements");
+            assert_eq!(jsonb.data.len(), header.len() + elements * 2);
+            assert!(jsonb.data[header.len()..]
+                .chunks(2)
+                .all(|element| element == [0x13, b'1']));
+
+            // Each member "k":1 is TEXT 0x17 'k' and INT 0x13 '1'.
+            let members = elements / 2;
+            let object = format!("{{{}}}", vec!["\"k\":1"; members].join(","));
+            let jsonb = Jsonb::from_str(&object).unwrap();
+            let header = JsonbHeader::new(ElementType::OBJECT, members * 4).into_bytes();
+            let header = header.as_bytes();
+            assert_eq!(&jsonb.data[..header.len()], header, "{members} members");
+            assert_eq!(jsonb.data.len(), header.len() + members * 4);
+            assert!(jsonb.data[header.len()..]
+                .chunks(4)
+                .all(|member| member == [0x17, b'k', 0x13, b'1']));
+        }
     }
 
     /// The element that the parser makes for `text` quoted as a JSON string.
