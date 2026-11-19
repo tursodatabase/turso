@@ -632,6 +632,7 @@ test index-order-needs-no-sort {
 }
 expect {
     1|0|0|SCAN t USING INDEX t_a_b
+    3|0|0|KEEP FIRST ROW PER DISTINCT ON KEY
     |1|n1
     1|10|x
     2|5|w
@@ -669,6 +670,7 @@ test index-order-of-the-key-only-still-sorts-by-the-other-terms {
 expect {
     1|0|0|SCAN t
     10|0|0|USE SORTER FOR ORDER BY
+    13|0|0|KEEP FIRST ROW PER DISTINCT ON KEY
     |n2
     1|y
     2|z

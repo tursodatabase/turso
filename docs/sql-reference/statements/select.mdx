@@ -343,6 +343,8 @@ These forms are not supported:
 - An aggregate in a DISTINCT ON expression when the query has no GROUP BY and no other aggregate.
 - A DISTINCT ON expression computed on an aggregate, such as `1 / sum(x)`, when the query has no GROUP BY.
 
+`EXPLAIN QUERY PLAN` shows the step as `KEEP FIRST ROW PER DISTINCT ON KEY`.
+
 ## ORDER BY
 
 Sorts the result set. Without ORDER BY, the row order is unspecified.

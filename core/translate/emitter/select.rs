@@ -226,6 +226,7 @@ pub fn emit_query<'a>(
     }
     if let Distinctness::DistinctOnRowsInOrder { keys, registers } = &mut plan.distinctness {
         *registers = Some(DistinctOnRegisters::alloc(program, keys.len()));
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::DistinctOn);
     }
 
     let end_label = program.allocate_label();

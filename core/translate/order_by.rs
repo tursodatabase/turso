@@ -308,6 +308,7 @@ impl EmitOrderBy {
         let distinct_on = match plan.distinctness {
             Distinctness::DistinctOn { key_count } => {
                 turso_assert!(!use_heap_sort, "DISTINCT ON reads its rows from a sorter");
+                emit_explain!(program, false, EqpDetail::DistinctOn);
                 Some(DistinctOnRegisters::alloc(program, key_count))
             }
             _ => None,
