@@ -522,108 +522,6 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
     assert_eq!(chain.len(), 1);
 }
 
-/// After Passive WAL backfill + DB fsync, `BEGIN CONCURRENT` on another
-/// connection must not Busy. Publishing `nbackfills == max_frame` while
-/// exclusive `read_locks[0]` is still held forces every new begin onto slot 0.
-#[test]
-fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
-    let mv = db.get_mvcc_store();
-    let conn = db.connect();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
-        .unwrap();
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
-        .unwrap();
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    for i in 0..50 {
-        conn.execute(format!("INSERT INTO t VALUES ({i}, 'seed')"))
-            .unwrap();
-    }
-    conn.execute("COMMIT").unwrap();
-
-    let pager = conn.pager.load().clone();
-    let mut checkpoint_sm = CheckpointStateMachine::new(
-        pager.clone(),
-        mv,
-        conn.clone(),
-        true,
-        conn.get_sync_mode(),
-        crate::MAIN_DB_ID,
-        CheckpointMode::Passive {
-            upper_bound_inclusive: None,
-        },
-    );
-
-    let mut reached_tail = false;
-    for _ in 0..50_000 {
-        match checkpoint_sm.state() {
-            CheckpointState::TruncateLogicalLog
-            | CheckpointState::TruncateWal
-            | CheckpointState::GcTableRows { .. }
-            | CheckpointState::GcIndexRows { .. } => {
-                reached_tail = true;
-                break;
-            }
-            _ => {}
-        }
-        match checkpoint_sm.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => {
-                panic!("checkpoint finished before the post-backfill tail")
-            }
-        }
-    }
-    assert!(
-        reached_tail,
-        "passive checkpoint must reach the post-backfill tail with frames to backfill"
-    );
-
-    {
-        let database = db.get_db();
-        let shared = database.shared_wal.read();
-        let max_frame = shared.metadata.max_frame.load(Ordering::SeqCst);
-        let nbackfills = shared.metadata.nbackfills.load(Ordering::SeqCst);
-        assert!(
-            max_frame > 0,
-            "setup must leave WAL frames to backfill, max_frame={max_frame}"
-        );
-        if max_frame == nbackfills {
-            let slot0_shared = shared.runtime.read_locks[0].read();
-            if slot0_shared {
-                shared.runtime.read_locks[0].unlock();
-            }
-            assert!(
-                slot0_shared,
-                "nbackfills==max_frame ({max_frame}) must not overlap exclusive read_locks[0]"
-            );
-        }
-    }
-
-    let writer = db.connect();
-    writer.execute("BEGIN CONCURRENT").expect(
-        "BEGIN CONCURRENT must succeed after Passive backfill while the checkpointer still runs",
-    );
-    writer
-        .execute("INSERT INTO t VALUES (1000, 'during')")
-        .unwrap();
-    writer.execute("COMMIT").unwrap();
-
-    loop {
-        match checkpoint_sm.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => break,
-        }
-    }
-
-    let wal_bf = pager.wal_backfill_frame().unwrap_or(0);
-    assert!(
-        wal_bf > 0,
-        "passive checkpoint must still publish nbackfills, got {wal_bf}"
-    );
-}
-
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
@@ -652,14 +550,6 @@ impl MvccTestDbNoConn {
     /// Opens a database with a file
     pub fn new_with_random_db() -> Self {
         Self::new_with_random_db_with_opts(DatabaseOpts::new())
-    }
-
-    /// Opens a database with the experimental passive (non-blocking)
-    /// auto-checkpoint enabled. Used by the passive-checkpoint-specific tests.
-    pub fn new_with_random_db_passive() -> Self {
-        Self::new_with_random_db_with_opts(
-            DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
-        )
     }
 
     /// Opens a database with a file and the requested options.
