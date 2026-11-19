@@ -163,7 +163,7 @@ pub use dialect::{
     AccessStatement, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd, CmdContext,
     CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView,
     Dialect, DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, SqliteCatalog, TableText,
+    RenameColumn, RenameTable, SqliteCatalog, TableText, TempTriggerOfRenamedTable,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
