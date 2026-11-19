@@ -8,9 +8,7 @@ use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
-    schema::{
-        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
-    },
+    schema::{self, emit_schema_entry, SchemaEntryType},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
@@ -596,20 +594,14 @@ pub fn translate_drop_view(
         }),
     )?;
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
+    // The tables with the state of a materialized view are engine tables,
+    // so their sqlite_schema rows are deleted here and not by the catalog.
+    let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
+    let rowid_reg = cmd_context.sqlite_schema_rowid_reg(program);
 
-    let rowid_reg = emit_drop_view_row(
-        program,
-        resolver,
-        namespace,
-        &normalized_view_name,
-        sqlite_schema_cursor_id,
-    )?;
-
-    // If this is a materialized view, delete internal table and index
-    // entries in a second pass, one loop per internal table. We do this in
-    // separate loops to ensure we catch all entries even if they come in
-    // different orders in sqlite_schema.
+    // Delete internal table and index entries, one loop per internal table.
+    // We do this in separate loops to ensure we catch all entries even if
+    // they come in different orders in sqlite_schema.
     for dbsp_table_name in &internal_table_names {
         // Set up registers for the table name and types (outside the loop for efficiency)
         let dbsp_table_name_reg_2 = program.alloc_register();

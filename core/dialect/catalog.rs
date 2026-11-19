@@ -57,6 +57,7 @@ pub struct CmdContext<'a> {
     pub origin: CmdOrigin,
     pub(crate) resolver: &'a Resolver<'a>,
     sqlite_schema_cursor: Cell<SqliteSchemaCursor>,
+    sqlite_schema_rowid_reg: Cell<Option<usize>>,
 }
 
 impl<'a> CmdContext<'a> {
@@ -77,6 +78,7 @@ impl<'a> CmdContext<'a> {
             origin,
             resolver,
             sqlite_schema_cursor: Cell::new(SqliteSchemaCursor::Unallocated),
+            sqlite_schema_rowid_reg: Cell::new(None),
         }
     }
 
@@ -120,6 +122,17 @@ impl<'a> CmdContext<'a> {
             self.sqlite_schema_cursor
                 .set(SqliteSchemaCursor::Allocated(cursor_id));
         }
+    }
+
+    /// The statement's register for the rowid of a `sqlite_schema` row it
+    /// deletes. The first call allocates it.
+    pub(crate) fn sqlite_schema_rowid_reg(&self, program: &mut ProgramBuilder) -> usize {
+        if let Some(reg) = self.sqlite_schema_rowid_reg.get() {
+            return reg;
+        }
+        let reg = program.alloc_register();
+        self.sqlite_schema_rowid_reg.set(Some(reg));
+        reg
     }
 }
 
