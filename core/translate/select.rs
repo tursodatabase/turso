@@ -13,7 +13,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
+    walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -743,10 +744,12 @@ fn prepare_one_select_plan(
                 }
             }
 
-            if let Some(ast::SelectDistinctness::DistinctOn(distinct_on)) = distinctness {
-                sort_by_distinct_on_exprs(distinct_on, &mut key, &mut plan, resolver)?;
-                crate::bail_parse_error!("SELECT DISTINCT ON is not supported");
-            }
+            let distinct_on_expr_count = match distinctness {
+                Some(ast::SelectDistinctness::DistinctOn(distinct_on)) => {
+                    sort_by_distinct_on_exprs(distinct_on, &mut key, &mut plan, resolver)?
+                }
+                _ => 0,
+            };
 
             // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
             // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
@@ -778,6 +781,15 @@ fn prepare_one_select_plan(
                 let is_aggregate_query = has_group_by
                     || agg_count_before_order_by > 0
                     || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
+                if !is_aggregate_query {
+                    for (expr, _, _) in key.iter().take(distinct_on_expr_count) {
+                        if first_aggregate_without_over_clause(expr, resolver)?.is_some() {
+                            crate::bail_parse_error!(
+                                "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported"
+                            );
+                        }
+                    }
+                }
                 for (expr, _, _) in key.iter() {
                     let had_agg = resolve_window_and_aggregate_functions(
                         expr,
@@ -828,7 +840,24 @@ fn prepare_one_select_plan(
                 && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
                 && windows.is_empty();
             if is_single_row_aggregate {
+                let keys_are_aggregate_calls = plan
+                    .order_by
+                    .iter()
+                    .take(distinct_on_expr_count)
+                    .all(|(expr, _, _)| aggregate_call_name(expr, resolver).is_some());
+                if !keys_are_aggregate_calls {
+                    crate::bail_parse_error!(
+                        "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported"
+                    );
+                }
                 plan.order_by.clear();
+            }
+            let distinct_on_key_count = distinct_on_expr_count.min(plan.order_by.len());
+            if distinct_on_key_count > 0 {
+                check_distinct_on_can_run_after_the_sort(&plan, distinct_on_key_count, resolver)?;
+                plan.distinctness = Distinctness::DistinctOn {
+                    key_count: distinct_on_key_count,
+                };
             }
 
             if let Some(group_by) = &mut plan.group_by {
@@ -988,34 +1017,38 @@ fn first_aggregate_without_over_clause<'a>(
 ) -> Result<Option<&'a str>> {
     let mut found = None;
     walk_expr(expr, &mut |e: &'a ast::Expr| -> Result<WalkControl> {
-        let (name, args_count, filter_over) = match e {
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } => (name, args.len(), filter_over),
-            ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
-            _ => return Ok(WalkControl::Continue),
-        };
-        if found.is_some() || filter_over.over_clause.is_some() {
-            return Ok(WalkControl::Continue);
-        }
-        let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
-        {
-            Ok(Some(crate::function::Func::Agg(_))) => true,
-            _ => resolver
-                .catalog
-                .symbol_table
-                .resolve_function(name.as_str(), args_count)
-                .is_some_and(|f| f.func.is_aggregate()),
-        };
-        if is_aggregate {
-            found = Some(name.as_str());
+        if found.is_none() {
+            found = aggregate_call_name(e, resolver);
         }
         Ok(WalkControl::Continue)
     })?;
     Ok(found)
+}
+
+/// The function name when `expr` itself is an aggregate call without an OVER clause.
+fn aggregate_call_name<'a>(expr: &'a ast::Expr, resolver: &Resolver) -> Option<&'a str> {
+    let (name, args_count, filter_over) = match expr {
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => (name, args.len(), filter_over),
+        ast::Expr::FunctionCallStar { name, filter_over } => (name, 0, filter_over),
+        _ => return None,
+    };
+    if filter_over.over_clause.is_some() {
+        return None;
+    }
+    let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count) {
+        Ok(Some(crate::function::Func::Agg(_))) => true,
+        _ => resolver
+            .catalog
+            .symbol_table
+            .resolve_function(name.as_str(), args_count)
+            .is_some_and(|f| f.func.is_aggregate()),
+    };
+    is_aggregate.then_some(name.as_str())
 }
 
 /// Validate that all expressions in the plan return the correct number of values;
@@ -1318,6 +1351,65 @@ fn sort_by_distinct_on_exprs(
         }
     }
     Ok(distinct_expr_count)
+}
+
+/// DISTINCT ON drops rows after every result column was computed, and in a grouped query its
+/// expressions are computed from the group's row.
+fn check_distinct_on_can_run_after_the_sort(
+    plan: &SelectPlan,
+    key_count: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for result_column in plan.result_columns.iter() {
+        if expr_contains_function_that_changes_within_statement(&result_column.expr, resolver)? {
+            crate::bail_parse_error!(
+                "SELECT DISTINCT ON with a volatile function in the select list is not supported"
+            );
+        }
+    }
+    let group_exprs: &[ast::Expr] = match &plan.group_by {
+        Some(group_by) => &group_by.exprs,
+        None if plan.aggregates.is_empty() => return Ok(()),
+        None => &[],
+    };
+    for (expr, _, _) in plan.order_by.iter().take(key_count) {
+        if !expr_reads_only_grouped_values(expr, group_exprs, resolver)? {
+            crate::bail_parse_error!(
+                "a DISTINCT ON expression that is neither a GROUP BY expression nor an aggregate is not supported"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn expr_reads_only_grouped_values(
+    expr: &ast::Expr,
+    group_exprs: &[ast::Expr],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut only_grouped = true;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if group_exprs
+            .iter()
+            .any(|group_expr| exprs_are_equivalent(group_expr, e))
+            || aggregate_call_name(e, resolver).is_some()
+        {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if matches!(
+            e,
+            ast::Expr::Column { .. }
+                | ast::Expr::RowId { .. }
+                | ast::Expr::Subquery(_)
+                | ast::Expr::SubqueryResult { .. }
+                | ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+        ) {
+            only_grouped = false;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(only_grouped)
 }
 
 fn check_sort_name_is_one_output_column(

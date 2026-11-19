@@ -421,10 +421,17 @@ fn collect_non_aggregate_expressions<'a>(
     }
     result_columns.extend(&group_by.columns_read_by_group_subqueries);
 
+    let distinct_on_keys: &[ast::Expr] = match &plan.distinctness {
+        Distinctness::DistinctOnRowsInOrder { keys, .. } => keys,
+        _ => &[],
+    };
     for group_expr in &group_by.exprs {
         let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
+            || distinct_on_keys
+                .iter()
+                .any(|key| expr_contains(key, group_expr))
             || (!can_return_json_subtype(group_expr)
                 && root_result_columns
                     .iter()
@@ -441,6 +448,16 @@ fn collect_non_aggregate_expressions<'a>(
         }
     }
     Ok(())
+}
+
+fn expr_contains(expr: &ast::Expr, part: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        found |= exprs_are_equivalent(e, part);
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression cannot fail");
+    found
 }
 
 /// Collects columns from different parts of a SELECT that are needed for

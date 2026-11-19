@@ -1081,7 +1081,11 @@ fn optimize_select_plan_form(
 /// SQLite removes DISTINCT in the same cases.
 fn distinct_is_redundant(plan: &SelectPlan, resolver: &Resolver) -> Result<bool> {
     let exprs: Vec<&ast::Expr> = match plan.aggregates.as_slice() {
-        [] if plan.distinctness.is_distinct() && plan.group_by.is_none() => {
+        [] if matches!(
+            plan.distinctness,
+            super::plan::Distinctness::Distinct { .. }
+        ) && plan.group_by.is_none() =>
+        {
             plan.result_columns.iter().map(|col| &col.expr).collect()
         }
         [agg] if agg.is_distinct() => plan
@@ -1197,6 +1201,7 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan, resolver)?;
+    let distinct_on_order_by = order_by_of_distinct_on(plan);
     let mut table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -1216,6 +1221,7 @@ fn find_select_plan_form(
         // comes between.
         !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
     )?;
+    keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
         && !table_plan
@@ -1358,6 +1364,7 @@ fn apply_select_table_plan(
         return Ok(());
     };
     mark_distinct_ordered(plan, &table_plan, resolver)?;
+    let distinct_on_order_by = order_by_of_distinct_on(plan);
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1366,6 +1373,7 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    keep_distinct_on_if_order_by_was_removed(plan, distinct_on_order_by);
     Ok(())
 }
 
@@ -1399,6 +1407,46 @@ fn mark_distinct_ordered(
     distinctness.set_ordered(ordered);
     Ok(())
 }
+
+fn order_by_of_distinct_on(plan: &SelectPlan) -> Option<OrderBy> {
+    matches!(
+        plan.distinctness,
+        super::plan::Distinctness::DistinctOn { .. }
+    )
+    .then(|| plan.order_by.clone())
+}
+
+/// The optimizer removes ORDER BY when the rows already arrive in that order. DISTINCT ON then
+/// compares neighboring rows as they are read. Rows that leave a window function no longer
+/// have the values of a key outside the select list, so such a query keeps its sort.
+fn keep_distinct_on_if_order_by_was_removed(plan: &mut SelectPlan, order_by: Option<OrderBy>) {
+    let (Some(order_by), super::plan::Distinctness::DistinctOn { key_count }) =
+        (order_by, &plan.distinctness)
+    else {
+        return;
+    };
+    if !plan.order_by.is_empty() {
+        return;
+    }
+    if plan.window.is_some() {
+        plan.order_by = order_by;
+        return;
+    }
+    plan.distinctness = super::plan::Distinctness::DistinctOnRowsInOrder {
+        keys: order_by
+            .into_iter()
+            .take(*key_count)
+            .map(|(expr, _, _)| *expr)
+            .collect(),
+        registers: None,
+    };
+}
+
+type OrderBy = Vec<(
+    Box<ast::Expr>,
+    SortOrder,
+    Option<turso_parser::ast::NullsOrder>,
+)>;
 
 fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
     let schema = resolver.schema();
