@@ -1,8 +1,8 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::{
-    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateTable, CreateView,
-    DropIndex, DropTable, DropView, TableText,
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateSequence,
+    CreateTable, CreateView, DropIndex, DropTable, DropView, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -19,6 +19,7 @@ use crate::translate::schema::sqlite_schema_alter_rows::{
     emit_rename_table_rows,
 };
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
+use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
 use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -41,10 +42,12 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateTable(table) => emit_create_table_rows(program, ctx, table),
             CatalogCmd::CreateIndex(index) => emit_create_index_row(program, ctx, index),
             CatalogCmd::DropIndex(index) => emit_delete_index_row(program, ctx, index),
-            // A sequence has no `sqlite_schema` row of its own. The schema
-            // reads it from the row of its backing table, which the
-            // statement writes and deletes as an engine table.
-            CatalogCmd::CreateSequence(_) | CatalogCmd::DropSequence(_) => Ok(()),
+            CatalogCmd::CreateSequence(sequence) => {
+                emit_create_sequence_row(program, ctx, sequence)
+            }
+            // The statement still deletes the row of a dropped sequence's
+            // backing table itself.
+            CatalogCmd::DropSequence(_) => Ok(()),
             CatalogCmd::DropTable(table) => emit_drop_table_rows(program, ctx, table),
             CatalogCmd::CreateView(view) => emit_create_view_row(program, ctx, view),
             CatalogCmd::CreateMaterializedView(view) => {
@@ -176,6 +179,33 @@ fn emit_create_index_row(
     )?;
 
     Ok(())
+}
+
+/// Writes the row of a new sequence. The schema reads a sequence from the
+/// row of its backing table, so that row is the one written.
+fn emit_create_sequence_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    sequence: &CreateSequence<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: sequence.namespace,
+    };
+    let stored_name = ctx.resolver.mangle_name(namespace, sequence.name);
+    let backing_table_name = sequence_backing_table_name(&stored_name);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        ctx.resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::Table,
+        &backing_table_name,
+        &backing_table_name,
+        sequence.root_reg,
+        Some(sequence_backing_table_sql(&stored_name)),
+    )
 }
 
 /// Deletes the row of an index.

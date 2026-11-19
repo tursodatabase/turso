@@ -226,11 +226,14 @@ pub struct DropIndex<'a> {
     pub name: &'a str,
 }
 
-/// A new sequence. The statement creates its backing table itself.
+/// A new sequence. The statement has already emitted the creation of the
+/// B-tree of its backing table, whose root page is in `root_reg`, and
+/// inserts the table's initial row itself.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateSequence<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
+    pub root_reg: usize,
 }
 
 /// A sequence that is dropped, by `DROP SEQUENCE` or with the column that

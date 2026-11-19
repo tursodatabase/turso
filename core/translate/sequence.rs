@@ -62,9 +62,11 @@ pub fn sequence_backing_table_sql(seq_name: &str) -> String {
     )
 }
 
-/// Emit bytecode to create a sequence backing table (B-tree + sqlite_schema entry +
-/// initial row + ParseSchema). Used by both CREATE SEQUENCE and CREATE TABLE with
-/// AUTOINCREMENT. The sqlite_schema cursor must already be open for writing.
+/// Emit bytecode to create the backing table of the sequence that CREATE
+/// TABLE makes for an AUTOINCREMENT column (B-tree + sqlite_schema entry +
+/// initial row + ParseSchema). It is an engine table, so its sqlite_schema
+/// row is written here. The sqlite_schema cursor must already be open for
+/// writing.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_sequence_backing_table(
     program: &mut ProgramBuilder,
@@ -79,15 +81,7 @@ pub fn emit_sequence_backing_table(
     cycle: bool,
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
-    let sql = sequence_backing_table_sql(seq_name);
-
-    let table_root_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: database_id,
-        root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
-    });
-
+    let table_root_reg = emit_create_sequence_btree(program, database_id);
     emit_schema_entry(
         program,
         resolver,
@@ -97,8 +91,52 @@ pub fn emit_sequence_backing_table(
         &backing_table_name,
         &backing_table_name,
         table_root_reg,
-        Some(sql.clone()),
+        Some(sequence_backing_table_sql(seq_name)),
     )?;
+    emit_sequence_initial_row(
+        program,
+        resolver,
+        database_id,
+        seq_name,
+        table_root_reg,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    )
+}
+
+/// Emits the creation of the B-tree of a sequence's backing table. Returns
+/// the register that holds its root page.
+fn emit_create_sequence_btree(program: &mut ProgramBuilder, database_id: usize) -> usize {
+    let table_root_reg = program.alloc_register();
+    program.emit_insn(Insn::CreateBtree {
+        db: database_id,
+        root: table_root_reg,
+        flags: CreateBTreeFlags::new_table(),
+    });
+    table_root_reg
+}
+
+/// Inserts the initial row into the new backing table of sequence
+/// `seq_name`, whose root page is in `table_root_reg`, and emits the
+/// ParseSchema that reads the table's `sqlite_schema` row.
+#[allow(clippy::too_many_arguments)]
+fn emit_sequence_initial_row(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    seq_name: &str,
+    table_root_reg: usize,
+    start: i64,
+    increment: i64,
+    min_value: i64,
+    max_value: i64,
+    cycle: bool,
+) -> Result<()> {
+    let backing_table_name = sequence_backing_table_name(seq_name);
+    let sql = sequence_backing_table_sql(seq_name);
 
     // Open the newly-created table by its root page register and insert the initial row.
     let seq_btree = Arc::new(BTreeTable::from_stored_sql(
@@ -1050,28 +1088,31 @@ pub fn translate_create_sequence(
     )?;
 
     let cmd_context = CmdContext::new(connection, resolver, database_id);
-    let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
-
-    emit_sequence_backing_table(
-        program,
-        resolver,
-        database_id,
-        sqlite_schema_cursor_id,
-        &mangled_seq_name,
-        seq.start_value,
-        seq.increment_by,
-        seq.min_value,
-        seq.max_value,
-        seq.cycle,
-    )?;
-
+    // The statement has always opened sqlite_schema before it creates the
+    // B-tree. A catalog that writes a row for the sequence finds the cursor
+    // open.
+    cmd_context.sqlite_schema_cursor(program);
+    let root_reg = emit_create_sequence_btree(program, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
         &cmd_context,
         &CatalogCmd::CreateSequence(CreateSequence {
             namespace: namespace.id,
             name: &normalized_name,
+            root_reg,
         }),
+    )?;
+    emit_sequence_initial_row(
+        program,
+        resolver,
+        database_id,
+        &mangled_seq_name,
+        root_reg,
+        seq.start_value,
+        seq.increment_by,
+        seq.min_value,
+        seq.max_value,
+        seq.cycle,
     )?;
 
     // Add the fully-configured Sequence to the in-memory schema
