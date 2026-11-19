@@ -1382,15 +1382,26 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = utf8_lossy(word_slice);
-
-                let mut last_end = 0;
-                let bytes = word.as_bytes();
                 let escaped = if *kind == ElementType::TEXTJ {
                     &ESCAPED_IN_TEXTJ
                 } else {
                     &ESCAPED_IN_TEXT
                 };
+                // Usually the payload is UTF-8 with no byte to escape, and
+                // its JSON text is the payload itself.
+                if let Some(text) = validate_utf8(word_slice)
+                    .filter(|text| !text.bytes().any(|b| escaped[b as usize]))
+                {
+                    string.push_str(text);
+                    if quote {
+                        string.push('"');
+                    }
+                    return Ok(end_cursor);
+                }
+                let word = utf8_lossy(word_slice);
+
+                let mut last_end = 0;
+                let bytes = word.as_bytes();
                 for i in 0..bytes.len() {
                     let b = bytes[i];
                     if escaped[b as usize] {
