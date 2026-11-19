@@ -1,9 +1,7 @@
 use super::{Connection, SchemaReparseGuard};
 use crate::alloc::TryClone;
 use crate::namespace::NamespaceId;
-use crate::schema::load::{
-    CustomTypes, DialectState, NamespaceNames, SchemaLoader, SchemaRows, Sequences, ViewsAndIndexes,
-};
+use crate::schema::load::{load_steps, SchemaInstall, SchemaLoader, StepsFor};
 use crate::schema::SequencesByNamespace;
 use crate::sync::Arc;
 use crate::util::IOExt;
@@ -130,14 +128,13 @@ impl Connection {
         // before it prepares its first statement.
         let mut loader = SchemaLoader::new(
             Arc::new(fresh),
-            vec![
-                Box::new(SchemaRows::new(self.clone())),
-                Box::new(NamespaceNames::new(self.clone())),
-                Box::new(Sequences::new(self.clone(), preserved_sequences)),
-                Box::new(CustomTypes::new(self.clone())),
-                Box::new(ViewsAndIndexes::new(self.clone())),
-                Box::new(DialectState::new(self.clone())),
-            ],
+            load_steps(
+                self,
+                StepsFor::Reload {
+                    preserved_sequences,
+                },
+            ),
+            SchemaInstall::ConnectionCopy,
         );
         loader.prepare_next_statement(self)?;
 
