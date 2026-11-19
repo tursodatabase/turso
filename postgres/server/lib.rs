@@ -2,14 +2,14 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{ConnectOpts, Database, Value};
+use turso_core::{CommandTimes, ConnectOpts, Database, Value, WallClockInstant};
 use turso_pg::{
     split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
     TransactionState,
@@ -31,15 +31,16 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    DEFAULT_NAME,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::extendedquery::{Describe, Execute};
+use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Sync as PgSync};
 use pgwire::messages::response::{
     EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
 };
@@ -112,10 +113,7 @@ impl TursoPgServer {
                                 }
                             };
                             let factory = Arc::new(TursoPgFactory {
-                                handler: Arc::new(TursoPgHandler {
-                                    conn: session.clone(),
-                                    query_parser: Arc::new(NoopQueryParser::new()),
-                                }),
+                                handler: Arc::new(TursoPgHandler::new(session.clone())),
                             });
                             tokio::spawn(async move {
                                 if let Err(e) = process_socket(socket, None, factory).await {
@@ -149,7 +147,24 @@ impl TursoPgServer {
 
 struct TursoPgHandler {
     conn: PgConnection,
-    query_parser: Arc<NoopQueryParser>,
+    query_parser: Arc<TimedQueryParser>,
+    message_times: Arc<MessageTimes>,
+}
+
+impl TursoPgHandler {
+    fn new(conn: PgConnection) -> Self {
+        let message_times = Arc::new(MessageTimes {
+            conn: conn.clone(),
+            implicit_transaction_start: Mutex::new(None),
+        });
+        Self {
+            conn,
+            query_parser: Arc::new(TimedQueryParser {
+                message_times: message_times.clone(),
+            }),
+            message_times,
+        }
+    }
 }
 
 struct TursoPgFactory {
@@ -178,6 +193,7 @@ impl SimpleQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _times = self.message_times.simple_query_received();
         let result = self.run_simple_query(client, query).await;
         finish_query(client, result, false, &self.conn).await
     }
@@ -303,7 +319,7 @@ where
 #[async_trait]
 impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type QueryParser = TimedQueryParser;
 
     async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
     where
@@ -312,8 +328,49 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _times = self.message_times.extended_message_received();
+        let in_transaction_block = !self.conn.inner().get_auto_commit();
         let result = self._on_execute(client, message).await;
+        if in_transaction_block && self.conn.inner().get_auto_commit() {
+            self.message_times.transaction_ended();
+        }
         finish_query(client, result, true, &self.conn).await
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.message_times.extended_message_received();
+        let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
+        let Some(statement) = client.portal_store().get_statement(statement_name) else {
+            return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
+        };
+        let portal = Portal::try_new(&message, statement)?;
+        client.portal_store().put_portal(Arc::new(portal));
+        client
+            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_sync<C>(&self, client: &mut C, _message: PgSync) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.message_times.sync_received();
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                client.transaction_status(),
+            )))
+            .await?;
+        client.flush().await?;
+        Ok(())
     }
 
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
@@ -323,6 +380,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let _times = self.message_times.extended_message_received();
         let result = self._on_describe(client, message).await;
         finish_query(client, result, true, &self.conn).await
     }
@@ -403,6 +461,93 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let fields = describe_fields(&stmt, &portal.result_column_format)?;
         Ok(DescribePortalResponse::new(fields))
+    }
+}
+
+/// The clock of the messages of one session, for the times that
+/// `now()` and `statement_timestamp()` report. PostgreSQL takes the time of
+/// a statement from the time it received the client message, and an
+/// implicit transaction starts with the first message after the previous
+/// Sync.
+struct MessageTimes {
+    conn: PgConnection,
+    /// The first extended-protocol message since the last Sync or the end
+    /// of a transaction block.
+    implicit_transaction_start: Mutex<Option<WallClockInstant>>,
+}
+
+impl MessageTimes {
+    /// A Query message is a whole implicit transaction.
+    fn simple_query_received(&self) -> CommandTimesGuard<'_> {
+        let now = self.conn.inner().current_time_wall_clock();
+        self.set(CommandTimes {
+            statement: now,
+            transaction: now,
+        })
+    }
+
+    fn extended_message_received(&self) -> CommandTimesGuard<'_> {
+        let now = self.conn.inner().current_time_wall_clock();
+        let transaction = *self
+            .implicit_transaction_start
+            .lock()
+            .expect("the lock is not held across a panic")
+            .get_or_insert(now);
+        self.set(CommandTimes {
+            statement: now,
+            transaction,
+        })
+    }
+
+    fn sync_received(&self) {
+        self.transaction_ended();
+    }
+
+    /// The next message starts a new transaction, as after COMMIT or
+    /// ROLLBACK of a transaction block in PostgreSQL.
+    fn transaction_ended(&self) {
+        *self
+            .implicit_transaction_start
+            .lock()
+            .expect("the lock is not held across a panic") = None;
+    }
+
+    fn set(&self, times: CommandTimes) -> CommandTimesGuard<'_> {
+        self.conn.inner().set_command_times(Some(times));
+        CommandTimesGuard(&self.conn)
+    }
+}
+
+/// Clears the times of the message when its handling ends.
+struct CommandTimesGuard<'a>(&'a PgConnection);
+
+impl Drop for CommandTimesGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inner().set_command_times(None);
+    }
+}
+
+/// Keeps the text of a statement as it is, and starts the implicit
+/// transaction at the Parse message when it is the first message since Sync.
+struct TimedQueryParser {
+    message_times: Arc<MessageTimes>,
+}
+
+#[async_trait]
+impl QueryParser for TimedQueryParser {
+    type Statement = String;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        self.message_times.extended_message_received();
+        Ok(sql.to_owned())
     }
 }
 

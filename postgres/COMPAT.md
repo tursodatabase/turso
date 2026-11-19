@@ -169,6 +169,8 @@ date, time, timetz and interval, and arrays of every date and time type
 `CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
 return date, time, timetz or interval, such as `age` and `make_date`.
 
+timestamp and timestamptz values can be stored, compared (`=`, `<`, `IN`, `BETWEEN`, `IS NULL`, `max`, `min`, ORDER BY) and cast to text. Any other use is rejected as not supported (0A000) instead of returning a value that may differ from PostgreSQL: arithmetic, `coalesce` and other functions on them, `CASE` that returns one, comparing one with an untyped text literal inside an array (`= ANY(ARRAY['...'])`), `AT TIME ZONE`, `SET TimeZone`, `LOCALTIMESTAMP`, a foreign key on a timestamptz column, and `CREATE TABLE AS` of a query that returns one. `now()` and `statement_timestamp()` are the time the server received the message, shared by all statements of a simple Query message.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

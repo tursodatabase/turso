@@ -2,23 +2,26 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::Utc;
-use std::{fmt, sync::Arc};
+use chrono::{DateTime, NaiveDateTime};
+use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    exec_temporal_encode, exec_timestamp_encode, exec_timestamptz_encode, format_timestamptz,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
+    WallClockInstant,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -26,13 +29,14 @@ use turso_pg_parser::sqlstate::{
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
 /// the body returns.
 macro_rules! scalar_functions {
-    ($options:expr, |$connection:ident, $args:ident| {
+    ($options:expr, |$context:ident, $connection:ident, $args:ident| {
         $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $($(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
+                let $connection = $context.connection;
                 Ok($body)
             };
             options = options.extension_function(pg_scalar_function(
@@ -60,7 +64,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
-    scalar_functions!(options, |connection, args| {
+    scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
@@ -146,17 +150,45 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        // The time the transaction started, or the statement outside a
+        // transaction.
+        "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(timestamp_at(context.statement_times().transaction)))
+        },
+        "statement_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(timestamp_at(context.statement_times().statement)))
+        },
+        // The clock at each call.
+        "clock_timestamp"(FunctionArity::Exact(0), false) => {
+            Timestamptz(format_timestamptz(timestamp_at(context.current_time())))
+        },
+        "to_timestamp" | "make_timestamp"(FunctionArity::Variadic, false) => {
+            refuse_timestamp_function()?
+        },
     })
+}
+
+/// The UTC date and time of `instant`, a reading of the system clock.
+fn timestamp_at(instant: WallClockInstant) -> NaiveDateTime {
+    DateTime::from_timestamp(instant.secs, instant.micros * 1_000)
+        .expect("a system clock reading is a valid date and time")
+        .naive_utc()
+}
+
+/// PostgreSQL has to_timestamp() and make_timestamp(), so tursopg refuses them
+/// as unsupported instead of reporting unknown functions.
+fn refuse_timestamp_function() -> Result<Timestamptz> {
+    Err(sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "to_timestamp() and make_timestamp() are not supported",
+    ))
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
@@ -170,7 +202,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 }
 
 impl<O> fmt::Debug for PgScalarFunction<O> {
@@ -193,12 +225,12 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
 impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
-        Ok(IOResult::Done((self.step)(connection, args)?))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<O> {
+        Ok(IOResult::Done((self.step)(context, args)?))
     }
 }
 
-/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
+/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5+00`.
 /// Returning one gives the function the type `timestamptz`, so `now() + 1` is
 /// an error as in PostgreSQL instead of adding 1 to text.
 struct Timestamptz(String);
@@ -815,10 +847,14 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
         (JsonElement::Timestamp, Value::Text(text)) => {
             write_json_string(&text.as_str().replacen(' ', "T", 1), json)
         }
-        (JsonElement::Timestamptz, Value::Text(text)) => write_json_string(
-            &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
-            json,
-        ),
+        // `2024-01-05 10:00:00+00` is `"2024-01-05T10:00:00+00:00"`.
+        (JsonElement::Timestamptz, Value::Text(text)) => {
+            assert!(
+                text.as_str().ends_with("+00"),
+                "timestamptz_decode writes every timestamptz in UTC"
+            );
+            write_json_string(&format!("{}:00", text.as_str().replacen(' ', "T", 1)), json)
+        }
         (JsonElement::Text, Value::Numeric(number)) => {
             write_json_string(&Value::Numeric(*number).to_string(), json)
         }
@@ -1443,10 +1479,18 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => check_temporal_input(input, "date"),
-        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
-        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
-        "time" | "time without time zone" => check_temporal_input(input, "time"),
+        "date" => check_temporal_input(input, |text| {
+            exec_temporal_encode(text, &Value::build_text("date"))
+        }),
+        "timestamp" | "timestamp without time zone" => {
+            check_temporal_input(input, exec_timestamp_encode)
+        }
+        "timestamptz" | "timestamp with time zone" => {
+            check_temporal_input(input, exec_timestamptz_encode)
+        }
+        "time" | "time without time zone" => check_temporal_input(input, |text| {
+            exec_temporal_encode(text, &Value::build_text("time"))
+        }),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1550,13 +1594,13 @@ pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Reads `input` as the date or time type `type_name` does when it stores a
-/// value, so `pg_input_is_valid` and the type agree on what is valid.
-fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, String)> {
-    match exec_temporal_encode(
-        &Value::build_text(input.to_string()),
-        &Value::build_text(type_name),
-    ) {
+/// Reads `input` with `encode`, the ENCODE of a date or time type, so
+/// `pg_input_is_valid` and the type agree on what is valid.
+fn check_temporal_input(
+    input: &str,
+    encode: impl Fn(&Value) -> Result<Value>,
+) -> Option<(String, String)> {
+    match encode(&Value::build_text(input.to_string())) {
         Ok(_) => None,
         Err(LimboError::InvalidDate(message)) => {
             Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
@@ -1564,7 +1608,7 @@ fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String,
         Err(LimboError::DatetimeFieldOverflow(message)) => {
             Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
         }
-        Err(other) => unreachable!("temporal_encode of text failed with {other}"),
+        Err(other) => unreachable!("the ENCODE of a date or time type failed on text with {other}"),
     }
 }
 

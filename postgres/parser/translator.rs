@@ -3642,14 +3642,11 @@ impl PostgreSQLTranslator {
                 use pg_query::protobuf::SqlValueFunctionOp;
                 if matches!(
                     SqlValueFunctionOp::try_from(svf.op),
-                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimeN
-                        | SqlValueFunctionOp::SvfopLocaltimestampN)
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN | SqlValueFunctionOp::SvfopLocaltimeN)
                 ) && svf.typmod != 0
                 {
                     return Err(ParseError::not_supported(
-                        "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
+                        "a fractional-second precision on CURRENT_TIME/LOCALTIME",
                     ));
                 }
                 // CURRENT_DATE, CURRENT_TIME and LOCALTIME are refused if
@@ -3673,12 +3670,18 @@ impl PostgreSQLTranslator {
                         check_type_is_supported("time", 0)?;
                         Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
                     }
+                    // A timestamptz, as now() returns.
+                    // A timestamptz, as now() returns.
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestamp) => {
+                        Ok(function_call("now", vec![]))
+                    }
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimestampN) => Err(
+                        ParseError::not_supported("a precision on CURRENT_TIMESTAMP"),
+                    ),
                     Ok(
-                        SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Err(ParseError::not_supported("LOCALTIMESTAMP")),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
                     // keyword that was written.
@@ -4258,6 +4261,25 @@ impl PostgreSQLTranslator {
                 .iter()
                 .map(|e| Ok(Box::new(self.translate_expr(e)?)))
                 .collect::<Result<Vec<_>, ParseError>>()?;
+            // PostgreSQL types `ARRAY['a', 'b']` as text[], unlike the
+            // unknown-typed literals of `IN ('a', 'b')`, so `ts = ANY(ARRAY['a'])`
+            // compares a timestamp with text, which has no operator.
+            let rhs = if rhs.iter().all(|e| is_untyped_literal(e)) {
+                rhs.into_iter()
+                    .map(|untyped| {
+                        Box::new(ast::Expr::Cast {
+                            expr: untyped,
+                            type_name: Some(ast::Type {
+                                name: "text".to_string(),
+                                size: None,
+                                array_dimensions: 0,
+                            }),
+                        })
+                    })
+                    .collect()
+            } else {
+                rhs
+            };
             return Ok(ast::Expr::InList {
                 lhs: Box::new(lhs),
                 not,
@@ -7539,6 +7561,15 @@ fn pg_type_name_to_ast_type(
         size: None,
         array_dimensions,
     })
+}
+
+/// Whether `expr` is a quoted string or NULL, which PostgreSQL gives the type
+/// of the other operands, or text when there are none.
+fn is_untyped_literal(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Literal(ast::Literal::String(_) | ast::Literal::Null)
+    )
 }
 
 fn extract_type_name_from_typename(
