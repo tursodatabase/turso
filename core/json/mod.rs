@@ -17,8 +17,8 @@ use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
-    ParseInfo, PathOperationMode, SearchOperation, SetOperation,
+    jsonb_error_position, unescape_string, utf8_lossy, validate_jsonb, ElementType, Jsonb,
+    JsonbHeader, ParseInfo, PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -656,9 +656,7 @@ pub fn json_string_to_db_type(
                         .iter()
                         .all(|&byte| byte > 0x1F && byte != b'"' && byte != b'\\') =>
                 {
-                    return Ok(Value::Text(Text::new(
-                        String::from_utf8_lossy(payload).into_owned(),
-                    )));
+                    return Ok(Value::Text(Text::new(utf8_lossy(payload).into_owned())));
                 }
                 ElementType::INT => {
                     if let Ok(text) = std::str::from_utf8(payload) {

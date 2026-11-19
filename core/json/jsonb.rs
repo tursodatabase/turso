@@ -1107,7 +1107,7 @@ impl Jsonb {
             .data
             .get(header_size..payload_end)
             .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        Ok(String::from_utf8_lossy(payload))
+        Ok(utf8_lossy(payload))
     }
 
     /// Returns the payload of the element at the start of the document, or
@@ -1306,7 +1306,7 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = String::from_utf8_lossy(word_slice);
+                let word = utf8_lossy(word_slice);
 
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
@@ -3652,6 +3652,16 @@ impl std::str::FromStr for Jsonb {
 /// JSONB documents are validated on entry, but text payloads are read from
 /// buffers that user-supplied blobs flow into, so the range may not be
 /// assumed here.
+/// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the
+/// usual case, is checked with [std::str::from_utf8], which is faster than the
+/// byte-at-a-time decoder of the lossy conversion.
+pub(crate) fn utf8_lossy(bytes: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(bytes),
+    }
+}
+
 fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
     let Some(end) = start.checked_add(len) else {
         bail_parse_error!("malformed JSON: text payload size overflow");
