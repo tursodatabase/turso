@@ -9,8 +9,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
     schema::{
-        self, create_view_sql, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write,
-        SchemaEntryType,
+        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
     },
 };
 use crate::util::{
@@ -152,14 +151,6 @@ pub fn translate_create_materialized_view(
         .cloned()
         .collect::<Vec<_>>();
 
-    // Reconstruct the SQL string for storage
-    let sql = create_view_sql(
-        "MATERIALIZED VIEW",
-        &view_name.name.as_ident(),
-        columns,
-        select_stmt,
-    );
-
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
     let view_root_reg = program.alloc_register();
@@ -223,21 +214,6 @@ pub fn translate_create_materialized_view(
 
     program.preassign_label_to_next_insn(clear_done_label);
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    // Add the materialized view entry to sqlite_schema
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for views
-        SchemaEntryType::View,
-        &view_key,
-        &view_key,
-        view_root_reg, // btree root for materialized view data
-        Some(sql),
-    )?;
-
     let cmd_context = CmdContext::new(&connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -245,12 +221,19 @@ pub fn translate_create_materialized_view(
         &CatalogCmd::CreateMaterializedView(CreateMaterializedView {
             namespace: namespace.id,
             name: &normalized_view_name,
+            written_name: &view_name.name,
+            columns,
+            select: select_stmt,
+            root_reg: view_root_reg,
         }),
     )?;
 
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
-    // codegen; the marker only persists compatibility metadata.
+    // codegen; the marker only persists compatibility metadata. They are
+    // engine tables, so their sqlite_schema rows are written here and not by
+    // the catalog.
+    let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
     let mut parse_schema_names = vec![escape_sql_string_literal(&view_key)];
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();

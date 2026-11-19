@@ -1,8 +1,8 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::{
-    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateTable, CreateView, DropIndex, DropTable,
-    TableText,
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateTable, CreateView,
+    DropIndex, DropTable, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -23,8 +23,8 @@ use turso_parser::ast;
 
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
 /// the SQL text that creates it. So far it stores `CREATE TABLE`, `CREATE
-/// INDEX`, `DROP INDEX`, `DROP TABLE` and `CREATE VIEW`; every other statement
-/// writes its `sqlite_schema` rows itself.
+/// INDEX`, `DROP INDEX`, `DROP TABLE`, `CREATE VIEW` and `CREATE MATERIALIZED
+/// VIEW`; every other statement writes its `sqlite_schema` rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
 
@@ -45,8 +45,10 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateSequence(_) | CatalogCmd::DropSequence(_) => Ok(()),
             CatalogCmd::DropTable(table) => emit_drop_table_rows(program, ctx, table),
             CatalogCmd::CreateView(view) => emit_create_view_row(program, ctx, view),
-            CatalogCmd::CreateMaterializedView(_)
-            | CatalogCmd::DropView(_)
+            CatalogCmd::CreateMaterializedView(view) => {
+                emit_create_materialized_view_row(program, ctx, view)
+            }
+            CatalogCmd::DropView(_)
             | CatalogCmd::RenameTable(_)
             | CatalogCmd::RenameColumn(_)
             | CatalogCmd::AlterColumn(_) => Ok(()),
@@ -585,6 +587,41 @@ fn emit_create_view_row(
     Ok(())
 }
 
+/// Writes the row of a new materialized view.
+fn emit_create_materialized_view_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    view: &CreateMaterializedView<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, view.name);
+    let sql = create_view_sql(
+        "MATERIALIZED VIEW",
+        &view.written_name.as_ident(),
+        view.columns,
+        view.select,
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::View,
+        &stored_name,
+        &stored_name,
+        view.root_reg,
+        Some(sql),
+    )?;
+
+    Ok(())
+}
+
 /// Deletes the row of a view or materialized view. Returns the register
 /// with the rowid of the deleted row.
 pub(crate) fn emit_drop_view_row(
@@ -664,7 +701,7 @@ pub(crate) fn emit_drop_view_row(
 }
 
 /// The SQL text to store for a new view or materialized view.
-pub(crate) fn create_view_sql(
+fn create_view_sql(
     view_kind: &str,
     view_name: &str,
     columns: &[ast::IndexedColumn],

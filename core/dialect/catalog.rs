@@ -257,6 +257,10 @@ pub struct CreateView<'a> {
 pub struct CreateMaterializedView<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
+    pub written_name: &'a ast::Name,
+    pub columns: &'a [ast::IndexedColumn],
+    pub select: &'a ast::Select,
+    pub root_reg: usize,
 }
 
 /// A view or materialized view that the statement drops.
