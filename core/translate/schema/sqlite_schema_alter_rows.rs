@@ -82,7 +82,7 @@ pub(super) fn emit_rename_table_rows(
                 database_id: TEMP_DB_ID,
                 object_type: "trigger",
                 name_for_errors: &trigger.name,
-                name_in_where_clause: &escape_sql_string_literal(&trigger.name),
+                name: &trigger.name,
                 sql: &trigger.sql,
                 new_tbl_name: trigger.is_on_the_table.then_some(table.written_new_name),
                 statement: table.statement,
@@ -131,7 +131,7 @@ pub(super) fn emit_rename_column_rows(
                 database_id: trigger.namespace.database_id,
                 object_type: "trigger",
                 name_for_errors: &trigger.name,
-                name_in_where_clause: &escape_sql_string_literal(&stored_name),
+                name: &stored_name,
                 sql: &trigger.sql,
                 new_tbl_name: None,
                 statement: column.statement,
@@ -147,7 +147,7 @@ pub(super) fn emit_rename_column_rows(
                 database_id: view.namespace.database_id,
                 object_type: "view",
                 name_for_errors: &stored_name,
-                name_in_where_clause: &stored_name,
+                name: &stored_name,
                 sql: &view.sql,
                 new_tbl_name: None,
                 statement: column.statement,
@@ -506,7 +506,7 @@ fn emit_update_of_table_sql(
             database_id: ctx.database_id,
             object_type: "table",
             name_for_errors: name,
-            name_in_where_clause: &escape_sql_string_literal(&stored_name),
+            name: &stored_name,
             sql: &sql,
             new_tbl_name: None,
             statement,
@@ -523,9 +523,9 @@ fn emit_update_of_stored_sql(
     let StoredSqlUpdate {
         object_type,
         name_for_errors,
-        name_in_where_clause,
         ..
     } = update;
+    let escaped_name = escape_sql_string_literal(update.name);
     let schema_table = schema_table_name_for_db(ctx.resolver, update.database_id);
     let escaped_sql = escape_sql_string_literal(update.sql);
     let tbl_name_update = match update.new_tbl_name {
@@ -536,7 +536,7 @@ fn emit_update_of_stored_sql(
         r#"
             UPDATE {schema_table}
             SET sql = '{escaped_sql}'{tbl_name_update}
-            WHERE name = '{name_in_where_clause}' COLLATE NOCASE AND type = '{object_type}'
+            WHERE name = '{escaped_name}' COLLATE NOCASE AND type = '{object_type}'
         "#,
     );
 
@@ -568,9 +568,8 @@ struct StoredSqlUpdate<'a> {
     /// The `type` column of the row.
     object_type: &'a str,
     name_for_errors: &'a str,
-    /// The `name` column of the row, as the text between the quotes of a
-    /// SQL string literal.
-    name_in_where_clause: &'a str,
+    /// The `name` column of the row.
+    name: &'a str,
     /// The new `sql` column.
     sql: &'a str,
     /// The new `tbl_name` column, if it changes.
