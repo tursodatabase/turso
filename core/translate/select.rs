@@ -205,6 +205,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
     // The first arm and the compound arms. The parser does not apply this limit
     // to the SQL that the schema stores, and the code generator recurses one

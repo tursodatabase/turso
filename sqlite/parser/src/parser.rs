@@ -119,12 +119,16 @@ fn too_many_compound_terms_error() -> Error {
     Error::ParseError(TOO_MANY_COMPOUND_TERMS_MESSAGE.to_owned())
 }
 
+/// The message of the error for a query nested deeper than [`MAX_QUERY_DEPTH`].
+/// The planner gives the same error for nesting that the SQL text does not show.
+pub fn query_nested_too_deeply_message() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
+
 #[cold]
 #[inline(never)]
 fn query_nested_too_deeply_error() -> Error {
-    Error::ParseError(format!(
-        "Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})"
-    ))
+    Error::ParseError(query_nested_too_deeply_message())
 }
 
 #[inline(always)]
@@ -283,8 +287,8 @@ impl<'a> Parser<'a> {
     /// Makes a parser for SQL that the schema or the engine stores. SQLite and
     /// older versions of Turso can have written this SQL without the limits
     /// [`MAX_QUERY_DEPTH`] and [`MAX_COMPOUND_SELECT`], so this parser does not
-    /// apply them. The planner still applies [`MAX_COMPOUND_SELECT`] when a
-    /// statement uses this SQL.
+    /// apply them. The planner still applies both limits when a statement uses
+    /// this SQL.
     pub fn new_for_stored_sql(input: &'a [u8]) -> Self {
         let mut parser = Self::new(input);
         parser.applies_statement_limits = false;

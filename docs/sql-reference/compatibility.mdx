@@ -44,14 +44,17 @@ A `VALUES` list with many rows is one term. SQLite does not count the terms of
 a compound `SELECT` whose last term is `VALUES`, but Turso counts them.
 
 The depth of nested queries counts subqueries in a `FROM` clause or in an
-expression, CTE bodies, and parenthesized `FROM` terms. Sibling subqueries do
-not add to the depth.
+expression, CTE bodies, and parenthesized `FROM` terms. It also counts each
+view or CTE that a query reads through another view or CTE, and each
+different window in a `SELECT`, because each of these adds one level of
+subquery to the plan. Sibling subqueries do not add to the depth.
 
 The limits on compound terms and on nested queries do not apply when Turso
 reads the views and triggers that a database stores, because SQLite and older
 versions of Turso can have written them without these limits. Thus such a
-database opens. A statement that uses a stored view or trigger with a compound
-`SELECT` of more than 500 terms gets the error of that limit.
+database opens. A statement that uses a stored view or trigger with more than
+500 levels of nested queries, or with a compound `SELECT` of more than 500
+terms, gets the error of that limit.
 
 ## PostgreSQL schema metadata
 

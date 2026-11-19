@@ -286,11 +286,92 @@ fn sibling_subqueries_do_not_count_toward_the_query_nesting_limit() {
     run_with_stack(WORKER_STACK, vec![format!("SELECT {columns}")]).unwrap();
 }
 
+/// Statements whose SQL text is flat, but whose plan nests one query in another
+/// `depth` times. Only the planner can count this depth.
+struct PlannedNesting {
+    name: &'static str,
+    build: fn(depth: usize) -> Vec<String>,
+}
+
+const PLANNED_NESTINGS: &[PlannedNesting] = &[
+    PlannedNesting {
+        name: "cte-chain",
+        build: |depth| {
+            let ctes = std::iter::once("n0 AS (SELECT x FROM t)".to_string())
+                .chain((1..depth).map(|i| format!("n{i} AS (SELECT * FROM n{})", i - 1)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![
+                CREATE_T.to_string(),
+                format!("WITH {ctes} SELECT * FROM n{}", depth - 1),
+            ]
+        },
+    },
+    PlannedNesting {
+        name: "view-chain",
+        build: |depth| {
+            let mut statements = vec![
+                CREATE_T.to_string(),
+                "CREATE VIEW v0 AS SELECT x FROM t".to_string(),
+            ];
+            statements.extend(
+                (1..depth).map(|i| format!("CREATE VIEW v{i} AS SELECT * FROM v{}", i - 1)),
+            );
+            statements.push(format!("SELECT * FROM v{}", depth - 1));
+            statements
+        },
+    },
+    // Each different window adds one level of subquery to the plan.
+    PlannedNesting {
+        name: "windows",
+        build: |depth| {
+            let columns = (0..depth)
+                .map(|i| format!("sum(x) OVER (ORDER BY x ROWS {i} PRECEDING)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![CREATE_T.to_string(), format!("SELECT {columns} FROM t")]
+        },
+    },
+];
+
+#[test]
+fn planned_nesting_over_the_limit_is_an_error() {
+    for nesting in PLANNED_NESTINGS {
+        let err = run_with_stack(WORKER_STACK, (nesting.build)(MAX_QUERY_DEPTH + 1))
+            .expect_err(nesting.name);
+        assert_eq!(
+            err.to_string(),
+            query_nested_too_deeply(),
+            "{}: {err:?}",
+            nesting.name
+        );
+    }
+}
+
+#[test]
+fn planned_nesting_at_the_limit_completes() {
+    for nesting in PLANNED_NESTINGS.iter().filter(|n| n.name != "windows") {
+        run_with_stack(WORKER_STACK, (nesting.build)(MAX_QUERY_DEPTH))
+            .unwrap_or_else(|err| panic!("{}: {err:?}", nesting.name));
+    }
+}
+
+/// A separate test, because 500 windows take long to plan in a debug build,
+/// and separate tests run in parallel.
+#[test]
+fn windows_at_the_query_nesting_limit_complete() {
+    let windows = PLANNED_NESTINGS
+        .iter()
+        .find(|n| n.name == "windows")
+        .unwrap();
+    run_with_stack(WORKER_STACK, (windows.build)(MAX_QUERY_DEPTH)).unwrap();
+}
+
 /// SQLite has no limit on the nesting of queries, and it does not count the
 /// terms of a compound whose last term is VALUES. So a database that it wrote
 /// can store views and triggers that go past the parse limits of Turso. Turso
-/// opens such a database. A statement that uses the compound view past the
-/// limit gets the error of the limit from the planner.
+/// opens such a database. The statements that use a view or trigger past a
+/// limit get the error of that limit from the planner.
 #[test]
 fn stored_sql_over_the_parse_limits_still_loads() {
     on_worker_thread(|| {
@@ -310,8 +391,19 @@ fn stored_sql_over_the_parse_limits_still_loads() {
                 MAX_COMPOUND_SELECT as i64
             )]]
         );
-        let err = conn.execute("SELECT count(*) FROM x").unwrap_err();
-        assert_eq!(err.to_string(), TOO_MANY_COMPOUND_TERMS_MESSAGE);
+        for (sql, error) in [
+            ("SELECT * FROM v", query_nested_too_deeply()),
+            ("INSERT INTO u VALUES (1)", query_nested_too_deeply()),
+            (
+                "SELECT count(*) FROM x",
+                TOO_MANY_COMPOUND_TERMS_MESSAGE.to_string(),
+            ),
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert_eq!(err.to_string(), error, "{sql}");
+        }
+        let rows = crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM u");
+        assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(0)]]);
     });
 }
 
