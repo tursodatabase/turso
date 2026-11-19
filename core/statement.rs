@@ -1461,46 +1461,44 @@ impl Statement {
 
     /// Returns the SQL text with every parameter marker replaced by the
     /// literal of its currently bound value (NULL when unbound), following
-    /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized
-    /// with the lexer — whose token stream partitions the input, emitting
-    /// whitespace and comments as TK_NONE tokens carrying their bytes — so
-    /// string literals, quoted identifiers and comments are never mistaken
-    /// for markers. Each TK_VARIABLE token resolves to its bind index from
-    /// its own text: `?N` carries the number, named markers are looked up
-    /// in the parameter table (the same marker can occur several times),
+    /// SQLite's sqlite3_expanded_sql rendering. The dialect finds the
+    /// markers, so string literals, quoted identifiers and comments are
+    /// never mistaken for markers. Each marker resolves to its bind index
+    /// from its own text: `?N` carries the number, named markers are looked
+    /// up in the parameter table (the same marker can occur several times),
     /// and a bare `?` takes one more than the largest number assigned so
     /// far, which is SQLite's numbering rule.
     pub fn expanded_sql(&self) -> String {
         let sql = self.get_sql();
+        let Ok(markers) = self.connection.dialect().parameter_marker_ranges(sql) else {
+            // The statement already parsed once, so finding its markers
+            // cannot fail; return the unexpanded SQL if it somehow does.
+            return sql.to_string();
+        };
         let params = &self.program.parameters;
         let mut out = String::with_capacity(sql.len());
         let mut max_index = 0usize;
-        for token in turso_parser::lexer::Lexer::new(sql.as_bytes()) {
-            let Ok(token) = token else {
-                // The statement already parsed once, so re-lexing its text
-                // cannot fail; return the unexpanded SQL if it somehow does.
-                return sql.to_string();
-            };
-            if token.token_type == turso_parser::token::TokenType::TK_VARIABLE {
-                let text = String::from_utf8_lossy(token.value);
-                let index = if let Some(digits) = text.strip_prefix('?') {
-                    if digits.is_empty() {
-                        max_index + 1
-                    } else {
-                        digits.parse().unwrap_or(0)
-                    }
+        let mut copied_up_to = 0;
+        for marker in markers {
+            out.push_str(&sql[copied_up_to..marker.start]);
+            copied_up_to = marker.end;
+            let text = &sql[marker];
+            let index = if let Some(digits) = text.strip_prefix('?') {
+                if digits.is_empty() {
+                    max_index + 1
                 } else {
-                    params.index(text.as_ref()).map_or(0, |i| i.get())
-                };
-                max_index = max_index.max(index);
-                let value = NonZero::new(index)
-                    .map(|i| self.state.get_parameter(i))
-                    .unwrap_or(Value::Null);
-                append_expanded_literal(&mut out, &value);
+                    digits.parse().unwrap_or(0)
+                }
             } else {
-                out.push_str(&String::from_utf8_lossy(token.value));
-            }
+                params.index(text).map_or(0, |i| i.get())
+            };
+            max_index = max_index.max(index);
+            let value = NonZero::new(index)
+                .map(|i| self.state.get_parameter(i))
+                .unwrap_or(Value::Null);
+            append_expanded_literal(&mut out, &value);
         }
+        out.push_str(&sql[copied_up_to..]);
         out
     }
 

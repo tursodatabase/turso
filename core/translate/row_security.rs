@@ -980,6 +980,10 @@ mod tests {
             SqliteDialect.parse_internal_column_definition(sql)
         }
 
+        fn parameter_marker_ranges(&self, sql: &str) -> crate::Result<Vec<std::ops::Range<usize>>> {
+            SqliteDialect.parameter_marker_ranges(sql)
+        }
+
         fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
             Arc::new(SqliteDialect)
         }

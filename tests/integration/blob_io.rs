@@ -892,6 +892,13 @@ impl Dialect for SecretTableDialect {
         turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
     }
 
+    fn parameter_marker_ranges(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
     }

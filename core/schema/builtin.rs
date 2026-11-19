@@ -175,6 +175,10 @@ mod tests {
             Err(LimboError::ParseError(format!("asked to parse: {sql}")))
         }
 
+        fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+            Err(LimboError::ParseError(format!("asked to parse: {sql}")))
+        }
+
         fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
             Arc::new(DialectThatCannotParse)
         }

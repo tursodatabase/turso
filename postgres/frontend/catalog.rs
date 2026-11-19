@@ -99,6 +99,10 @@ impl Dialect for PostgresDialect {
         Ok(turso_parser::parser::Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+        turso_sqlite::SqliteDialect.parameter_marker_ranges(sql)
+    }
+
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(turso_sqlite::SqliteDialect)
     }
