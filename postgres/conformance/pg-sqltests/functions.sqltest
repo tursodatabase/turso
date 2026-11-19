@@ -2595,6 +2595,87 @@ test json-each-with-a-column-definition-list-errors {
 expect error {
 }
 
+test json-each-returns-the-text-of-each-number {
+    SELECT * FROM json_each('{"a":12345678901234567890,"b":1e2,"c":1.50,"d":-0,"e":0.10,"f":1E2,"g":1e+2,"h":-1.5e-3}');
+}
+expect {
+    a|12345678901234567890
+    b|1e2
+    c|1.50
+    d|-0
+    e|0.10
+    f|1E2
+    g|1e+2
+    h|-1.5e-3
+}
+
+test json-each-keeps-the-whitespace-inside-a-value {
+    SELECT * FROM json_each(E'\n {\t"a" :\r\n  [ 1 , {"b" : 2 } ]  ,"b":{ "x" : 1 }, "c":[], "d" : "  " }  ');
+}
+expect {
+    a|[ 1 , {"b" : 2 } ]
+    b|{ "x" : 1 }
+    c|[]
+    d|"  "
+}
+
+test json-each-unescapes-the-key-and-keeps-the-escapes-of-the-value {
+    SELECT * FROM json_each('{"aA":"xA","b\"c":"😀","":"\/"}');
+}
+expect {
+    aA|"xA"
+    b"c|"😀"
+    |"\/"
+}
+
+test json-each-of-invalid-json-errors {
+    SELECT * FROM json_each('{"a":01}');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-each-of-json-with-text-after-it-errors {
+    SELECT * FROM json_each('{"a":1} x');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-each-of-a-lone-surrogate-in-a-nested-value-errors {
+    SELECT * FROM json_each('{"a":{"b":["\udc00"]}}');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
+test json-each-of-a-null-character-in-a-nested-value-errors {
+    SELECT * FROM json_each('{"a":1,"b":{"c":"x\u0000y"}}');
+}
+@sqlstate 22P05
+expect error {
+    unsupported Unicode escape sequence
+}
+
+test json-each-of-an-array-with-a-null-character-errors-on-the-array {
+    SELECT * FROM json_each('["\u0000"]');
+}
+@sqlstate 22023
+expect error {
+    cannot deconstruct an array as an object
+}
+
+test json-each-of-an-integer-errors {
+    SELECT * FROM json_each(1);
+}
+@sqlstate 42883
+expect error {
+    function json_each\(integer\) does not exist
+}
+
 test json-tree-is-not-a-function-of-postgresql {
     SELECT * FROM json_tree('{"a":1}');
 }
