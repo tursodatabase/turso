@@ -33,7 +33,7 @@ pub fn dump_ast(dump: &str) -> Result<Vec<Value>> {
         }
         pending.push_str(line);
         if line.contains(';') {
-            if let Ok(parsed) = pg_query::parse(&pending) {
+            if let Ok(parsed) = pg_query::parse(&pending, pg_query::ParserOptions::DEFAULT) {
                 copy_columns = append_statements(parsed, &mut statements, &mut inserts)?;
                 pending.clear();
             }
@@ -42,7 +42,8 @@ pub fn dump_ast(dump: &str) -> Result<Vec<Value>> {
     if copy_columns.is_some() {
         bail!("unterminated COPY data");
     }
-    let parsed = pg_query::parse(&pending).context("parse dump SQL")?;
+    let parsed =
+        pg_query::parse(&pending, pg_query::ParserOptions::DEFAULT).context("parse dump SQL")?;
     if append_statements(parsed, &mut statements, &mut inserts)?.is_some() {
         bail!("COPY statement has no data terminator");
     }

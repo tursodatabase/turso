@@ -1085,3 +1085,83 @@ expect {
     1|b
     2|c
 }
+
+test returning-with-new-alias {
+    CREATE TABLE returning_alias (a int);
+    INSERT INTO returning_alias VALUES (1) RETURNING WITH (NEW AS n) n.a;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    RETURNING with OLD or NEW aliases is not supported
+}
+
+test returning-old-from-aliased-update {
+    CREATE TABLE returning_old (a int);
+    INSERT INTO returning_old VALUES (11);
+    UPDATE returning_old AS o SET a = a + 10 RETURNING old.a, new.a;
+}
+expect {
+    11|21
+}
+@sqlstate 0A000
+expect @tursopg error {
+    old or new as a row name in RETURNING is not supported
+}
+
+test returning-old-from-update {
+    CREATE TABLE returning_old_plain (a int);
+    INSERT INTO returning_old_plain VALUES (11);
+    UPDATE returning_old_plain SET a = a + 10 RETURNING old.a;
+}
+expect {
+    11
+}
+@sqlstate 0A000
+expect @tursopg error {
+    old or new as a row name in RETURNING is not supported
+}
+
+test returning-from-a-table-named-old {
+    CREATE TABLE old (a int);
+    INSERT INTO old VALUES (11);
+    UPDATE old SET a = a + 10 RETURNING old.a;
+}
+expect {
+    21
+}
+
+test foreign-key-not-enforced {
+    CREATE TABLE fk_parent (a int PRIMARY KEY);
+    CREATE TABLE fk_child (a int, FOREIGN KEY (a) REFERENCES fk_parent (a) NOT ENFORCED);
+    INSERT INTO fk_child VALUES (5);
+    SELECT a FROM fk_child;
+}
+expect {
+    5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    a NOT ENFORCED constraint is not supported
+}
+
+@skip-if postgres "PostgreSQL needs range columns for WITHOUT OVERLAPS"
+test primary-key-without-overlaps {
+    CREATE TABLE pk_overlaps (a int, b int, PRIMARY KEY (a, b WITHOUT OVERLAPS));
+}
+@sqlstate 0A000
+expect error {
+    WITHOUT OVERLAPS is not supported
+}
+
+@skip-if postgres "PostgreSQL needs range columns for PERIOD"
+test foreign-key-period {
+    CREATE TABLE fk_period_parent (a int, b int, PRIMARY KEY (a, b));
+    CREATE TABLE fk_period_child (a int, b int, FOREIGN KEY (a, PERIOD b) REFERENCES fk_period_parent (a, PERIOD b));
+}
+@sqlstate 0A000
+expect error {
+    PERIOD in a key is not supported
+}

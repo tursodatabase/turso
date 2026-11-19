@@ -12,8 +12,7 @@ use crate::ParseError;
 /// prints them. A condition can only read the columns of the policy's
 /// table, and without the table's name the text stays valid after the
 /// table is renamed. A condition whose text does not parse back is refused,
-/// because pg_query does not print every expression as valid SQL: it prints
-/// `(ARRAY[x, 1])[1]` without its parentheses.
+/// because pg_query does not print every expression as valid SQL.
 pub(crate) fn written_condition(condition: &Node) -> Result<String, ParseError> {
     let mut condition = condition.clone();
     for_each_node(&mut condition, &mut |node| {
@@ -151,7 +150,7 @@ fn deparse_expr(expr: &Node) -> Result<String, ParseError> {
         ..Default::default()
     }));
     let sql = select
-        .deparse()
+        .deparse(pg_query::DeparseOptions::default())
         .map_err(|e| ParseError::ParseError(e.to_string()))?;
     sql.strip_prefix("SELECT ")
         .map(str::to_string)
