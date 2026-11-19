@@ -343,6 +343,11 @@ pub trait PathOperation {
     // Execute the actual operation
     fn execute(&mut self, json: &mut Jsonb, stack: Vec<JsonTraversalResult>) -> Result<()>;
 
+    /// Whether `execute` can change the document.
+    fn changes_document(&self) -> bool {
+        true
+    }
+
     // Name of the operation for logging/debugging
 }
 
@@ -681,13 +686,17 @@ pub struct SearchOperation {
 }
 
 impl SearchOperation {
-    pub fn new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
-        Ok(Self {
+    #[expect(
+        clippy::new_without_default,
+        reason = "each path operation makes its own search"
+    )]
+    pub fn new() -> Self {
+        Self {
             mode: PathOperationMode::ReplaceExisting,
-            value: Jsonb::new(capacity)?,
+            value: Jsonb::empty(),
             value_offset: 0,
             label_offset: None,
-        })
+        }
     }
 
     pub fn value_offset(&self) -> usize {
@@ -721,11 +730,15 @@ impl PathOperation for SearchOperation {
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         let end = json.element_end(idx, &[header_size, size])?;
-        self.value.data.extend_from_slice(&json.data[idx..end]);
+        self.value = Jsonb::from_raw_data(&json.data[idx..end])?;
         self.value_offset = idx;
         self.label_offset = label_idx;
 
         Ok(())
+    }
+
+    fn changes_document(&self) -> bool {
+        false
     }
 }
 
@@ -2643,7 +2656,11 @@ impl Jsonb {
                 path_iter.peek().is_some()
             };
 
-            let segment_mode = if is_intermediate_segment {
+            // An intermediate segment creates a missing container only when
+            // the operation can insert. In ReplaceExisting mode the final
+            // segment cannot match inside a new, empty container, so the path
+            // fails either way, and a search does not change the document.
+            let segment_mode = if is_intermediate_segment && mode.allows_insert() {
                 PathOperationMode::Upsert
             } else {
                 mode
@@ -2690,14 +2707,22 @@ impl Jsonb {
         // Traversal appends placeholder containers as it walks insert
         // and upsert segments, so a failure part-way through must not
         // publish those edits: a failed operation leaves the document
-        // unchanged.
-        let snapshot = self.data.clone();
+        // unchanged. A traversal that cannot insert followed by an
+        // operation that does not edit leaves nothing to undo, so the
+        // copy is not made for a search.
+        let snapshot = if mode.allows_insert() || operation.changes_document() {
+            Some(self.data.clone())
+        } else {
+            None
+        };
         let result = match self.navigate_path(path, mode) {
             Ok(stack) => operation.execute(self, stack),
             Err(e) => Err(e),
         };
         if result.is_err() {
-            self.data = snapshot;
+            if let Some(snapshot) = snapshot {
+                self.data = snapshot;
+            }
         }
         result
     }
@@ -5610,7 +5635,7 @@ mod path_operations_tests {
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
 
         // Create a search operation
-        let mut operation = SearchOperation::new(100).unwrap();
+        let mut operation = SearchOperation::new();
 
         // Create a path to the "person" property
         let path = create_path(vec![
@@ -5796,7 +5821,7 @@ mod path_operations_tests {
         let mut jsonb = Jsonb {
             data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         };
-        let mut search = SearchOperation::new(bytes.len()).unwrap();
+        let mut search = SearchOperation::new();
         assert!(
             jsonb.operate_on_path(&path, &mut search).is_err(),
             "oversized child size must not be sliced out of bounds"

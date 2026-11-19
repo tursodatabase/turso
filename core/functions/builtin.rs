@@ -841,7 +841,7 @@ pub fn call_builtin_scalar(
 
                 let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                 for i in 0..columns_len {
-                    let mut op = json::jsonb::SearchOperation::new(0)?;
+                    let mut op = json::jsonb::SearchOperation::new();
                     let path = json::path::JsonPath {
                         elements: vec![
                             json::path::PathElement::Root(),

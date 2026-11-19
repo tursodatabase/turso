@@ -504,7 +504,7 @@ fn navigate_to_path(
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
+    let mut search_operation = SearchOperation::new();
     if jsonb
         .operate_on_path(&json_path, &mut search_operation)
         .is_err()
