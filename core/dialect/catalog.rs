@@ -4,7 +4,7 @@
 
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
-    schema::{Index, Schema},
+    schema::{BTreeTable, Index, Schema},
     translate::{
         emitter::Resolver,
         schema::{
@@ -169,6 +169,7 @@ pub enum CatalogCmd<'a> {
     RenameTable(RenameTable<'a>),
     RenameColumn(RenameColumn<'a>),
     AlterColumn(AlterColumn<'a>),
+    AddColumn(AddColumn<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
@@ -362,6 +363,15 @@ pub struct AlterColumn<'a> {
     pub old_name: &'a str,
     pub written_old_name: &'a str,
     pub definition: &'a ast::ColumnDefinition,
+}
+
+/// A table that gets a new last column. `table` is the table with it.
+#[derive(Debug, Clone, Copy)]
+pub struct AddColumn<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub table: &'a BTreeTable,
+    pub statement: &'a str,
 }
 
 /// A statement about roles, ownership, privileges or row-level security.

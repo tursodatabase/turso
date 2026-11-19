@@ -579,6 +579,8 @@ impl Catalog for PostgresCatalog {
                     column.definition.col_name.as_str(),
                 )?;
             }
+            // A new column owns no sequence, so no class row changes.
+            CatalogCmd::AddColumn(_) => {}
         }
         Ok(())
     }

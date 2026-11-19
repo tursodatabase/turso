@@ -1,9 +1,10 @@
 //! Bytecode that rewrites stored rows for `ALTER TABLE`: the rows of
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
-use crate::dialect::{AlterColumn, CmdContext, RenameColumn, RenameTable};
+use crate::dialect::{AddColumn, AlterColumn, CmdContext, RenameColumn, RenameTable};
 use crate::function::{AlterTableFunc, Func, FuncCtx};
 use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::schema::BTreeTable;
 use crate::sync::Arc;
 use crate::translate::alter::{database_uses_mvcc, schema_table_name_for_db};
 use crate::translate::collate::CollationSeq;
@@ -178,6 +179,23 @@ pub(super) fn emit_alter_column_rows(
         ],
         column.written_table_name,
     );
+    Ok(())
+}
+
+/// Stores the `CREATE TABLE` text of a table with its new column.
+pub(super) fn emit_add_column_rows(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    column: &AddColumn<'_>,
+) -> Result<()> {
+    emit_update_of_table_sql(
+        program,
+        ctx,
+        column.namespace,
+        column.name,
+        column.table,
+        column.statement,
+    )?;
     Ok(())
 }
 
@@ -445,6 +463,38 @@ fn emit_rename_sqlite_sequence_entry(
 
         program.preassign_label_to_next_insn(continue_loop_label);
     });
+}
+
+/// Stores the `CREATE TABLE` text of `table`, which `ALTER TABLE` has
+/// changed the columns of, in the row of the table `name`.
+fn emit_update_of_table_sql(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    namespace: NamespaceId,
+    name: &str,
+    table: &BTreeTable,
+    statement: &str,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, name);
+    let sql = table.to_sql_as(&resolver.mangle_name(namespace, &table.declared_name));
+    emit_update_of_stored_sql(
+        program,
+        ctx,
+        &StoredSqlUpdate {
+            database_id: ctx.database_id,
+            object_type: "table",
+            name_for_errors: name,
+            name_in_where_clause: &escape_sql_string_literal(&stored_name),
+            sql: &sql,
+            new_tbl_name: None,
+            statement,
+        },
+    )
 }
 
 /// Emits `UPDATE sqlite_schema SET sql = ...` for the row of one object.
