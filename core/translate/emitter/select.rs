@@ -980,6 +980,15 @@ fn build_materialized_build_input_plan(
                     }
                 }
             }
+            Operation::Search(Search::InSeek { prefix, .. }) => {
+                // The equality prefix can be bound by other tables, like a seek key.
+                for term in prefix {
+                    if expr_depends_outside_prefix(&term.expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
             Operation::IndexMethodQuery(IndexMethodQuery { arguments, .. }) => {
                 // Index method queries are driven by argument expressions.
                 // If any argument depends on non-prefix tables, we cannot use it.
