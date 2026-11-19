@@ -1139,6 +1139,25 @@ impl Jsonb {
         self.data.get(header_size..payload_end)
     }
 
+    /// Returns the payload of the string element at the start of the document
+    /// when its JSON text has no escape: the element is TEXT, TEXTJ or TEXTRAW,
+    /// and the payload has no `"`, `\` or control character. The JSON text of
+    /// the string is then the payload in quotes, and its decoded text is the
+    /// payload.
+    pub fn plain_string_payload(&self) -> Option<&[u8]> {
+        if !matches!(
+            self.element_type_at(0).ok()?,
+            ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXTRAW
+        ) {
+            return None;
+        }
+        let payload = self.scalar_payload()?;
+        payload
+            .iter()
+            .all(|&byte| byte > 0x1F && byte != b'"' && byte != b'\\')
+            .then_some(payload)
+    }
+
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
         let mut result = String::with_capacity(self.data.len() * 2);
         let ind = if let Some(ind) = indentation {

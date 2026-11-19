@@ -716,6 +716,13 @@ impl InPlaceJsonPath {
     }
 
     fn push_object_key(&mut self, key: &Jsonb) -> crate::Result<()> {
+        // A key with no escape is its own name, so it needs no JSON text.
+        if let Some(payload) = key.plain_string_payload() {
+            let name = jsonb::utf8_lossy(payload);
+            self.last_element = Key::String(name.to_string());
+            self.push_object_name(&name);
+            return Ok(());
+        }
         let key_text = key.to_string()?;
         // Keys must be properly quoted strings
         let inner = key_text

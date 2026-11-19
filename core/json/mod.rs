@@ -649,15 +649,11 @@ pub fn json_string_to_db_type(
         flag,
         OutputVariant::ElementType | OutputVariant::ElementTypePlain
     ) {
+        if let Some(payload) = json.plain_string_payload() {
+            return Ok(Value::Text(Text::new(utf8_lossy(payload).into_owned())));
+        }
         if let Some(payload) = json.scalar_payload() {
             match element_type {
-                ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXTRAW
-                    if payload
-                        .iter()
-                        .all(|&byte| byte > 0x1F && byte != b'"' && byte != b'\\') =>
-                {
-                    return Ok(Value::Text(Text::new(utf8_lossy(payload).into_owned())));
-                }
                 ElementType::INT => {
                     if let Ok(text) = std::str::from_utf8(payload) {
                         return int_text_to_db_type(text, text);
