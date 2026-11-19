@@ -1,0 +1,69 @@
+@database :memory:
+
+# The second argument of group_concat, string_agg and json_group_object is
+# read in its register for each row. These tests use a second argument that
+# changes from row to row, and the same expression for both arguments.
+
+setup rows {
+    CREATE TABLE t(g INTEGER, x TEXT, sep TEXT);
+    INSERT INTO t VALUES (1, 'a', ','), (1, 'b', ';'), (2, 'c', '|'), (2, 'd', NULL), (2, 'e', 7);
+}
+
+@setup rows
+test group-concat-same-expression-twice {
+    SELECT group_concat(x, x) FROM t;
+}
+expect {
+    abbccddee
+}
+
+@setup rows
+test group-concat-separator-of-each-row {
+    SELECT g, group_concat(x, sep) FROM t GROUP BY g;
+}
+expect {
+    1|a;b
+    2|cd7e
+}
+
+@setup rows
+test group-concat-separator-expression {
+    SELECT group_concat(x, x || sep) FROM t;
+}
+expect {
+    ab;bc|cde7e
+}
+
+@setup rows
+test group-concat-separator-column-twice {
+    SELECT group_concat(sep, sep) FROM t;
+}
+expect {
+    ,;;||77
+}
+
+@setup rows
+test string-agg-separator-of-each-row {
+    SELECT g, string_agg(x, sep) FROM t GROUP BY g;
+}
+expect {
+    1|a;b
+    2|cd7e
+}
+
+@setup rows
+test json-group-object-same-expression-twice {
+    SELECT json_group_object(x, x) FROM t;
+}
+expect {
+    {"a":"a","b":"b","c":"c","d":"d","e":"e"}
+}
+
+@setup rows
+test json-group-object-value-of-each-row {
+    SELECT g, json_group_object(x, sep) FROM t GROUP BY g;
+}
+expect {
+    1|{"a":",","b":";"}
+    2|{"c":"|","d":null,"e":"7"}
+}

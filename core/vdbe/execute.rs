@@ -9722,55 +9722,90 @@ fn op_agg_step_slow(
             unreachable!("extension aggregates are stepped above")
         }
         _ => {
-            let maybe_arg2 = match func {
-                AggFunc::GroupConcat | AggFunc::StringAgg => {
-                    Some(state.registers[*delimiter].get_value().try_clone()?)
-                }
-                #[cfg(feature = "json")]
-                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                    Some(state.registers[*delimiter].get_value().try_clone()?)
-                }
-                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-                    Some(state.registers[*delimiter].get_value().try_clone()?)
-                }
-                _ => None,
-            };
-
-            let [arg_reg, acc_slot] =
-                state
-                    .registers
-                    .get_disjoint_mut([*col, *acc_reg])
-                    .map_err(|_| {
-                        LimboError::InternalError(format!(
-                        "AggStep: input register {} and accumulator register {} must be distinct",
-                        *col, *acc_reg
-                    ))
-                    })?;
-            let arg = arg_reg.get_value();
-            let Register::Aggregate(agg) = acc_slot else {
-                return Err(LimboError::InternalError(format!(
-                    "AggStep: register {} does not hold an aggregate accumulator",
-                    *acc_reg
-                ))
-                .into());
-            };
-            let payload = agg.payload_vec_mut();
             let counts_infinite_inputs =
                 matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
                     && connection.dialect().sum_counts_infinite_inputs();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                collation,
-                counts_infinite_inputs,
-            )?;
+            let arg2_reg = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => Some(*delimiter),
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => Some(*delimiter),
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => Some(*delimiter),
+                _ => None,
+            };
+            match arg2_reg
+                .map(|arg2_reg| state.registers.get_disjoint_mut([*col, *acc_reg, arg2_reg]))
+            {
+                // The second argument has a register of its own, so the step
+                // reads it in that register. A clone for each row allocates
+                // when the second argument is TEXT, as a separator is.
+                Some(Ok([arg_reg, acc_slot, arg2_slot])) => step_builtin_agg(
+                    func,
+                    arg_reg,
+                    acc_slot,
+                    *acc_reg,
+                    Some(arg2_slot.get_value()),
+                    collation,
+                    counts_infinite_inputs,
+                )?,
+                _ => {
+                    let maybe_arg2 = match arg2_reg {
+                        Some(arg2_reg) => Some(state.registers[arg2_reg].get_value().try_clone()?),
+                        None => None,
+                    };
+                    let [arg_reg, acc_slot] = state
+                        .registers
+                        .get_disjoint_mut([*col, *acc_reg])
+                        .map_err(|_| {
+                            LimboError::InternalError(format!(
+                        "AggStep: input register {} and accumulator register {} must be distinct",
+                        *col, *acc_reg
+                    ))
+                        })?;
+                    step_builtin_agg(
+                        func,
+                        arg_reg,
+                        acc_slot,
+                        *acc_reg,
+                        maybe_arg2.as_ref(),
+                        collation,
+                        counts_infinite_inputs,
+                    )?;
+                }
+            }
         }
     };
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Steps the builtin aggregate in `acc_slot`, register `acc_reg`, with the
+/// value of `arg_reg`, and with `arg2` for an aggregate with a second
+/// argument. `counts_infinite_inputs` is the argument of the same name of
+/// [update_agg_payload].
+fn step_builtin_agg(
+    func: &AggFunc,
+    arg_reg: &Register,
+    acc_slot: &mut Register,
+    acc_reg: usize,
+    arg2: Option<&Value>,
+    collation: CollationSeq,
+    counts_infinite_inputs: bool,
+) -> Result<()> {
+    let arg = arg_reg.get_value();
+    let Register::Aggregate(agg) = acc_slot else {
+        return Err(LimboError::InternalError(format!(
+            "AggStep: register {acc_reg} does not hold an aggregate accumulator"
+        )));
+    };
+    update_agg_payload(
+        func,
+        arg,
+        arg2,
+        agg.payload_vec_mut(),
+        collation,
+        counts_infinite_inputs,
+    )
 }
 
 /// Adds `value` to a float total and its error term like [apply_kbn_step], or
