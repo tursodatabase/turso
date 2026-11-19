@@ -840,7 +840,8 @@ async fn acknowledge_existing_cdc_for_client<Ctx>(
 /// Recreates the local sync metadata table after page-level restore.
 ///
 /// Raw page replay can replace the table contents along with ordinary pages.
-/// This helper writes the high-water mark that should survive the restore.
+/// This helper writes the high-water mark that should survive the restore. It does not publish
+/// a sync table it creates; the caller publishes the schema once the write is committed.
 #[allow(dead_code)]
 async fn rebuild_local_sync_metadata_table<Ctx>(
     coro: &Coro<Ctx>,
@@ -2482,12 +2483,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 "failed to refresh replay connection schema after replace-base snapshot: {error}",
                             ))
                         })?;
-                        crate::database_sync_operations::ensure_sync_last_change_id_table(
-                            coro,
-                            &conn,
-                            &self.client_unique_id,
-                        )
-                        .await
+                        crate::database_sync_operations::ensure_sync_last_change_id_table(&conn)
                         .map_err(|error| {
                             Error::DatabaseSyncEngineError(format!(
                                 "failed to initialize sync high-water mark table after replace-base snapshot: {error}"
@@ -2943,29 +2939,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
 
             if let Some(logical_conn) = logical_replay_conn {
-                logical_conn.execute("COMMIT").map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "failed to commit remote apply replay transaction: {error}",
-                    ))
-                })?;
-                if had_cdc_table || replace_base_pages {
-                    tracing::info!(
-                        "apply_changes(path={}): reinitialize CDC pragma after logical replay commit",
-                        self.main_db_path,
-                    );
-                    logical_conn
-                        .pragma_update(CDC_PRAGMA_NAME, "'full'")
-                        .map_err(|error| {
-                            Error::DatabaseSyncEngineError(format!(
-                                "failed to reinitialize CDC pragma after remote apply: {error}",
-                            ))
-                        })?;
-                    let change_id = max_local_change_id(coro, &logical_conn).await?.unwrap_or(0);
-                    tracing::info!(
-                        "apply_changes(path={}): post-logical-replay CDC high-water mark: {}",
-                        self.main_db_path,
-                        change_id
-                    );
+                let persist_synced_change_id = had_cdc_table || replace_base_pages;
+                let synced_change_id_for = |change_id: i64| {
                     let synced_change_id = synced_change_id_after_remote_apply(
                         recaptured_local_changes,
                         pre_apply_local_change_id,
@@ -2979,23 +2954,58 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     };
                     let synced_change_id = preserve_local_replay_floor
                         .map_or(synced_change_id, |floor| synced_change_id.min(floor));
-                    let synced_change_id = synced_change_id.min(change_id);
+                    synced_change_id.min(change_id)
+                };
+                if persist_synced_change_id && !raw_page_replay_on_sql_conn {
+                    // Write the last synced change id in the same commit as the remote pages.
+                    // Otherwise another connection can commit a change in between, and the id
+                    // then counts that change as synced, so it is never pushed.
+                    let change_id = max_local_change_id(coro, &logical_conn).await?.unwrap_or(0);
+                    tracing::info!(
+                        "apply_changes(path={}): pre-commit CDC high-water mark: {}",
+                        self.main_db_path,
+                        change_id
+                    );
+                    update_last_change_id(
+                        coro,
+                        &logical_conn,
+                        &self.client_unique_id,
+                        local_pull_gen + 1,
+                        synced_change_id_for(change_id),
+                    )
+                    .await?;
+                }
+                logical_conn.execute("COMMIT").map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to commit remote apply replay transaction: {error}",
+                    ))
+                })?;
+                if persist_synced_change_id {
+                    tracing::info!(
+                        "apply_changes(path={}): reinitialize CDC pragma after logical replay commit",
+                        self.main_db_path,
+                    );
+                    logical_conn
+                        .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                        .map_err(|error| {
+                            Error::DatabaseSyncEngineError(format!(
+                                "failed to reinitialize CDC pragma after remote apply: {error}",
+                            ))
+                        })?;
                     if raw_page_replay_on_sql_conn {
+                        let change_id =
+                            max_local_change_id(coro, &logical_conn).await?.unwrap_or(0);
+                        tracing::info!(
+                            "apply_changes(path={}): post-logical-replay CDC high-water mark: {}",
+                            self.main_db_path,
+                            change_id
+                        );
                         rebuild_local_sync_metadata_table(
                             coro,
                             &logical_conn,
                             &self.client_unique_id,
                             local_pull_gen + 1,
-                            synced_change_id,
-                        )
-                        .await?;
-                    } else {
-                        update_last_change_id(
-                            coro,
-                            &logical_conn,
-                            &self.client_unique_id,
-                            local_pull_gen + 1,
-                            synced_change_id,
+                            synced_change_id_for(change_id),
                         )
                         .await?;
                     }
@@ -3040,6 +3050,47 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             "failed to reinitialize CDC pragma before remote apply commit: {error}",
                         ))
                     })?;
+            }
+            // Write the last synced change id in the same commit as the remote pages. Otherwise
+            // another connection can commit a change in between, and the id then counts that
+            // change as synced, so it is never pushed.
+            if recreate_cdc {
+                let change_id = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
+                tracing::info!(
+                    "apply_changes(path={}): post-WAL-replay CDC high-water mark: {}",
+                    self.main_db_path,
+                    change_id
+                );
+                let synced_change_id = synced_change_id_after_remote_apply(
+                    recaptured_local_changes,
+                    pre_apply_local_change_id,
+                    change_id,
+                );
+                let synced_change_id =
+                    if recaptured_local_changes && (replace_base_pages || raw_page_replay_on_sql_conn)
+                    {
+                        post_remote_apply_change_id
+                    } else {
+                        synced_change_id
+                };
+                let synced_change_id = preserve_local_replay_floor
+                    .map_or(synced_change_id, |floor| synced_change_id.min(floor));
+                let synced_change_id = synced_change_id.min(change_id);
+                // The WAL commit below publishes the schema (see "post-raw-WAL-replay schema
+                // publish"), so a sync table created here must not be published yet.
+                update_last_change_id(
+                    coro,
+                    &main_conn,
+                    &self.client_unique_id,
+                    local_pull_gen + 1,
+                    synced_change_id,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to persist sync high-water mark after raw remote apply: {error}",
+                    ))
+                })?;
             }
 
             if main_conn.has_main_mvcc_tx_for_wal_session() {
@@ -3100,42 +3151,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     &main_conn,
                     "post-raw-WAL-replay schema publish",
                 )?;
-            }
-            if recreate_cdc {
-                let change_id = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
-                tracing::info!(
-                    "apply_changes(path={}): post-WAL-replay CDC high-water mark: {}",
-                    self.main_db_path,
-                    change_id
-                );
-                let synced_change_id = synced_change_id_after_remote_apply(
-                    recaptured_local_changes,
-                    pre_apply_local_change_id,
-                    change_id,
-                );
-                let synced_change_id =
-                    if recaptured_local_changes && (replace_base_pages || raw_page_replay_on_sql_conn)
-                    {
-                        post_remote_apply_change_id
-                    } else {
-                        synced_change_id
-                };
-                let synced_change_id = preserve_local_replay_floor
-                    .map_or(synced_change_id, |floor| synced_change_id.min(floor));
-                let synced_change_id = synced_change_id.min(change_id);
-                update_last_change_id(
-                    coro,
-                    &main_conn,
-                    &self.client_unique_id,
-                    local_pull_gen + 1,
-                    synced_change_id,
-                )
-                .await
-                .map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "failed to persist sync high-water mark after raw remote apply: {error}",
-                    ))
-                })?;
             }
 
             let logical_table_names_by_stable_id =

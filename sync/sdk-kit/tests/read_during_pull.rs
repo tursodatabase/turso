@@ -208,6 +208,56 @@ fn read(conn: &TursoConnection, io: &MemoryYieldIO) -> Result<Vec<String>, Strin
     }
 }
 
+/// The pull writes the last synced change id in the same commit as the remote pages. If it wrote
+/// the id after the page commit, an app commit between the two would count as synced and never
+/// be pushed. MemoryYieldIO stops the pull at each disk write, so the test looks at the database
+/// at every stop: once the remote row is readable, the change id must already be its final value.
+#[test]
+fn pull_commits_the_change_id_together_with_the_pages() {
+    let remote =
+        Remote::new_wal(&["CREATE TABLE t(x TEXT)", "INSERT INTO t VALUES ('first')"]).unwrap();
+    let server = InProcessServer::pages_only(remote.clone());
+    let io = Arc::new(MemoryYieldIO::new());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local.db").to_str().unwrap().to_string();
+    let sync = open(&path, io.clone(), None);
+
+    run(&sync, &server, &io, &sync.create());
+    let conn = connect(&sync, &server, &io);
+    // A local change makes the final change id non-zero.
+    execute(&conn, &io, "INSERT INTO t VALUES ('app')");
+
+    remote
+        .execute_transaction(&["INSERT INTO t VALUES ('second')"])
+        .unwrap();
+    let wait = sync.wait_changes();
+    run(&sync, &server, &io, &wait);
+    let TursoAsyncOperationResult::Changes { changes } = wait.take_result().unwrap() else {
+        panic!("wait_changes returned no changes");
+    };
+    let apply = sync.apply_changes(changes);
+
+    let mut change_ids_with_new_pages = Vec::new();
+    while run_once(&sync, &server, &io, &apply) == TursoStatusCode::Io {
+        if read(&conn, &io).unwrap().contains(&"second".to_string()) {
+            change_ids_with_new_pages.push(last_synced_change_id(&conn, &io));
+        }
+    }
+    let final_change_id = last_synced_change_id(&conn, &io);
+    assert_ne!(final_change_id, 0);
+    assert!(
+        !change_ids_with_new_pages.is_empty(),
+        "the test never saw the remote pages"
+    );
+    assert!(
+        change_ids_with_new_pages
+            .iter()
+            .all(|id| *id == final_change_id),
+        "the remote pages were readable before the final change id: \
+         {change_ids_with_new_pages:?}, final {final_change_id}"
+    );
+}
+
 /// Number of local changes that are waiting to be pushed.
 fn pending_cdc_operations(
     sync: &TursoDatabaseSync<Vec<u8>>,
@@ -220,4 +270,25 @@ fn pending_cdc_operations(
         panic!("stats returned no stats");
     };
     stats.cdc_operations
+}
+
+fn last_synced_change_id(conn: &TursoConnection, io: &MemoryYieldIO) -> i64 {
+    query_integer(conn, io, "SELECT change_id FROM turso_sync_last_change_id")
+}
+
+fn query_integer(conn: &TursoConnection, io: &MemoryYieldIO, sql: &str) -> i64 {
+    let mut stmt = conn.prepare_single(sql).unwrap();
+    let mut result = None;
+    loop {
+        match stmt.step(None).unwrap() {
+            TursoStatusCode::Row => match stmt.row_value(0).unwrap() {
+                Value::Numeric(turso_core::Numeric::Integer(value)) => result = Some(value),
+                other => panic!("unexpected value {other:?}"),
+            },
+            TursoStatusCode::Io => io.step().unwrap(),
+            TursoStatusCode::Done => {
+                return result.unwrap_or_else(|| panic!("{sql} returned no row"))
+            }
+        }
+    }
 }
