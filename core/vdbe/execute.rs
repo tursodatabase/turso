@@ -817,6 +817,21 @@ pub fn op_compare(
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
+        // Two texts under BINARY compare byte by byte, and NULL order does
+        // not apply to them: the case of every GROUP BY on a text key.
+        if key_info[0].collation == CollationSeq::BINARY {
+            if let (Register::Value(Value::Text(a)), Register::Value(Value::Text(b))) =
+                (&state.registers[start_reg_a], &state.registers[start_reg_b])
+            {
+                let cmp = a.as_str().cmp(b.as_str());
+                state.last_compare = Some(match key_info[0].sort_order {
+                    turso_parser::ast::SortOrder::Asc => cmp,
+                    turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                });
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
 
     return op_compare_slow(state, start_reg_a, start_reg_b, count, key_info);
