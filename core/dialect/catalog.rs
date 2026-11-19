@@ -358,7 +358,9 @@ pub struct RewrittenView {
 pub struct AlterColumn<'a> {
     pub namespace: NamespaceId,
     pub table: &'a str,
+    pub written_table_name: &'a str,
     pub old_name: &'a str,
+    pub written_old_name: &'a str,
     pub definition: &'a ast::ColumnDefinition,
 }
 

@@ -1,7 +1,7 @@
 //! Bytecode that rewrites stored rows for `ALTER TABLE`: the rows of
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
-use crate::dialect::{CmdContext, RenameColumn, RenameTable};
+use crate::dialect::{AlterColumn, CmdContext, RenameColumn, RenameTable};
 use crate::function::{AlterTableFunc, Func, FuncCtx};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
@@ -156,12 +156,37 @@ pub(super) fn emit_rename_column_rows(
     Ok(())
 }
 
+/// Replaces the definition of a column in every row of `sqlite_schema` of
+/// the table's database.
+pub(super) fn emit_alter_column_rows(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    column: &AlterColumn<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: column.namespace,
+    };
+    emit_rewrite_of_every_row(
+        program,
+        ctx,
+        AlterTableFunc::AlterColumn,
+        &[
+            ctx.resolver.mangle_name(namespace, column.table),
+            column.written_old_name.to_string(),
+            column.definition.to_string(),
+        ],
+        column.written_table_name,
+    );
+    Ok(())
+}
+
 /// Emits a loop over every row of `sqlite_schema` of the database the
 /// statement changes. `func` gets the five columns of a row and then
 /// `arguments`, and gives the five columns to store in place of the row.
 /// `written_table_name` is the table the statement alters, as the statement
 /// spells it.
-pub(crate) fn emit_rewrite_of_every_row(
+fn emit_rewrite_of_every_row(
     program: &mut ProgramBuilder,
     ctx: &CmdContext<'_>,
     func: AlterTableFunc,

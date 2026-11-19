@@ -15,13 +15,12 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        self, check_column_type, emit_rewrite_of_every_row, validate_check_expr,
-        validate_default_expr, validate_generated_function_calls, SQLITE_TABLEID,
+        self, check_column_type, validate_check_expr, validate_default_expr,
+        validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
 use crate::{
-    function::AlterTableFunc,
     schema::alter_table::{
         rename_identifiers, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
         rewrite_view_sql_for_column_rename,
@@ -1953,40 +1952,43 @@ pub fn translate_alter_table(
                 None
             };
 
+            let rewritten_triggers: Vec<RewrittenTrigger> = triggers_to_rewrite
+                .iter()
+                .map(|(namespace, name, sql)| RewrittenTrigger {
+                    namespace: *namespace,
+                    name: name.clone(),
+                    sql: sql.clone(),
+                })
+                .collect();
             let cmd_context = CmdContext::new(connection, resolver, database_id);
-            if rename {
-                let rewritten_triggers: Vec<RewrittenTrigger> = triggers_to_rewrite
-                    .iter()
-                    .map(|(namespace, name, sql)| RewrittenTrigger {
-                        namespace: *namespace,
-                        name: name.clone(),
-                        sql: sql.clone(),
-                    })
-                    .collect();
-                resolver.catalog.dialect.catalog().emit(
-                    program,
-                    &cmd_context,
-                    &CatalogCmd::RenameColumn(RenameColumn {
-                        namespace: namespace.id,
-                        table: &normalize_ident(table_name),
-                        written_table_name: table_name,
-                        old_name: old_column_name,
-                        written_old_name: from,
-                        new_name: &definition.col_name,
-                        triggers: &rewritten_triggers,
-                        views: &views_to_rewrite,
-                        statement: input,
-                    }),
-                )?;
+            let normalized_table_name = normalize_ident(table_name);
+            let catalog_cmd = if rename {
+                CatalogCmd::RenameColumn(RenameColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    written_table_name: table_name,
+                    old_name: old_column_name,
+                    written_old_name: from,
+                    new_name: &definition.col_name,
+                    triggers: &rewritten_triggers,
+                    views: &views_to_rewrite,
+                    statement: input,
+                })
             } else {
-                emit_rewrite_of_every_row(
-                    program,
-                    &cmd_context,
-                    AlterTableFunc::AlterColumn,
-                    &[mangled_table_name, from.to_string(), definition.to_string()],
-                    table_name,
-                );
-            }
+                CatalogCmd::AlterColumn(AlterColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    written_table_name: table_name,
+                    old_name: old_column_name,
+                    written_old_name: from,
+                    definition: &definition,
+                })
+            };
+            resolver
+                .catalog
+                .dialect
+                .catalog()
+                .emit(program, &cmd_context, &catalog_cmd)?;
 
             if let Some(temp_schema_version) = temp_schema_version {
                 program.emit_insn(Insn::SetCookie {
@@ -2057,19 +2059,6 @@ pub fn translate_alter_table(
                     namespace,
                     &altered_table,
                     &indexes_to_rewrite,
-                )?;
-            }
-
-            if !rename {
-                resolver.catalog.dialect.catalog().emit(
-                    program,
-                    &cmd_context,
-                    &CatalogCmd::AlterColumn(AlterColumn {
-                        namespace: namespace.id,
-                        table: &normalize_ident(table_name),
-                        old_name: old_column_name,
-                        definition: &definition,
-                    }),
                 )?;
             }
 
