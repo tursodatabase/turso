@@ -2,7 +2,7 @@
 
 use crate::dialect::{
     Catalog, CatalogCmd, CmdContext, CreateIndex, CreateMaterializedView, CreateTable, CreateView,
-    DropIndex, DropTable, TableText,
+    DropIndex, DropTable, DropView, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -23,8 +23,9 @@ use turso_parser::ast;
 
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
 /// the SQL text that creates it. So far it stores `CREATE TABLE`, `CREATE
-/// INDEX`, `DROP INDEX`, `DROP TABLE`, `CREATE VIEW` and `CREATE MATERIALIZED
-/// VIEW`; every other statement writes its `sqlite_schema` rows itself.
+/// INDEX`, `DROP INDEX`, `DROP TABLE`, `CREATE VIEW`, `CREATE MATERIALIZED
+/// VIEW` and `DROP VIEW`; every other statement writes its `sqlite_schema`
+/// rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
 
@@ -48,8 +49,8 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateMaterializedView(view) => {
                 emit_create_materialized_view_row(program, ctx, view)
             }
-            CatalogCmd::DropView(_)
-            | CatalogCmd::RenameTable(_)
+            CatalogCmd::DropView(view) => emit_drop_view_row(program, ctx, view),
+            CatalogCmd::RenameTable(_)
             | CatalogCmd::RenameColumn(_)
             | CatalogCmd::AlterColumn(_) => Ok(()),
         }
@@ -622,22 +623,25 @@ fn emit_create_materialized_view_row(
     Ok(())
 }
 
-/// Deletes the row of a view or materialized view. Returns the register
-/// with the rowid of the deleted row.
-pub(crate) fn emit_drop_view_row(
+/// Deletes the row of a view or materialized view.
+fn emit_drop_view_row(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    namespace: NamespaceRef,
-    view_name: &str,
-    sqlite_schema_cursor_id: usize,
-) -> Result<usize> {
+    ctx: &CmdContext<'_>,
+    view: &DropView<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+
     let view_name_reg = program.alloc_register();
     let type_reg = program.alloc_register();
-    let rowid_reg = program.alloc_register();
+    let rowid_reg = ctx.sqlite_schema_rowid_reg(program);
 
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: resolver.mangle_name(namespace, view_name),
+        value: ctx.resolver.mangle_name(namespace, view.name),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -697,7 +701,7 @@ pub(crate) fn emit_drop_view_row(
 
     program.preassign_label_to_next_insn(end_loop_label);
 
-    Ok(rowid_reg)
+    Ok(())
 }
 
 /// The SQL text to store for a new view or materialized view.
