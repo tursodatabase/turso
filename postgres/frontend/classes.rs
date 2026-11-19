@@ -436,9 +436,8 @@ pub(crate) fn row_security_policies<'a>(
 }
 
 /// [`turso_core::Dialect::translate_relation_changes`] for the PostgreSQL
-/// frontend: a class row per created relation, owned by the current role,
-/// which is what PostgreSQL's `GetUserId()` gives after `SET ROLE`; no row
-/// for a dropped one; a rename keeps the oid and owner.
+/// frontend: a class row per created relation, no row for a dropped one;
+/// a rename keeps the oid and owner.
 pub(crate) fn translate_relation_changes(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -448,7 +447,7 @@ pub(crate) fn translate_relation_changes(
     let allocates_oids = changes
         .iter()
         .any(|change| matches!(change, RelationChange::Created { .. }));
-    let Some(cursors) = open_class_table_for_writing(program, schema, allocates_oids)? else {
+    let Some(rows) = ClassRowWriter::open(program, schema, connection, allocates_oids)? else {
         return Ok(());
     };
     for change in changes {
@@ -458,87 +457,150 @@ pub(crate) fn translate_relation_changes(
                 name,
                 kind,
                 table,
-            } => {
-                // Relation names are unique per schema across kinds.
-                if is_user_relation_name(*kind, name)
-                    && class_catalog(schema)
-                        .is_some_and(|catalog| catalog.get_by_name(*namespace, name).is_some())
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "relation \"{name}\" already exists"
-                    )));
-                }
-                // An index is owned by its table's owner, anything else by
-                // the current role, which is what PostgreSQL's GetUserId()
-                // gives after SET ROLE.
-                let owner = table
-                    .and_then(|table| relation_owner(schema, *namespace, table))
-                    .unwrap_or_else(|| connection.current_role());
-                emit_class_row_insert(program, &cursors, *namespace, name, *kind, owner)
-            }
+            } => rows.new_relation(program, *namespace, name, *kind, *table)?,
             RelationChange::Dropped { namespace, name } => {
-                // An engine relation has no row and nothing to do.
-                if class_catalog(schema)
-                    .and_then(|catalog| catalog.get_by_name(*namespace, name))
-                    .is_none()
-                {
-                    continue;
-                }
-                emit_class_row_delete(program, &cursors, *namespace, name)
+                rows.dropped_relation(program, *namespace, name)
             }
             RelationChange::ColumnRenamed {
                 namespace,
                 table,
                 old_name,
                 new_name,
-            } => {
-                let owned: Vec<(String, i64)> = class_catalog(schema)
-                    .and_then(|catalog| {
-                        let table = catalog.get_by_name(*namespace, table)?;
-                        Some(
-                            catalog
-                                .owned_by(table.oid)
-                                .filter(|owned| owned.is_owned_by_column(old_name))
-                                .map(|owned| (owned.relname.clone(), table.oid))
-                                .collect(),
-                        )
-                    })
-                    .unwrap_or_default();
-                if owned.is_empty() {
-                    continue;
-                }
-                for (sequence, table_oid) in owned {
-                    emit_class_row_set_owned_by(
-                        program,
-                        &cursors,
-                        *namespace,
-                        &sequence,
-                        table_oid,
-                        Some(new_name),
-                    );
-                }
-                OwnerColumnRenamed {
-                    namespace: *namespace,
-                    table: table.to_string(),
-                    old_name: old_name.to_string(),
-                    new_name: new_name.to_string(),
-                }
-                .emit(program);
-            }
+            } => rows.renamed_owner_column(program, *namespace, table, old_name, new_name),
             RelationChange::Renamed {
                 namespace,
                 old_name,
                 new_name,
-            } => {
-                let has_row = class_catalog(schema)
-                    .is_some_and(|catalog| catalog.get_by_name(*namespace, old_name).is_some());
-                if has_row {
-                    emit_class_row_rename(program, &cursors, *namespace, old_name, new_name);
-                }
-            }
+            } => rows.renamed_relation(program, *namespace, old_name, new_name),
         }
     }
     Ok(())
+}
+
+/// Writes the class rows that one statement changes, with cursors that it
+/// opens once.
+struct ClassRowWriter<'a> {
+    schema: &'a Schema,
+    connection: &'a Arc<Connection>,
+    cursors: ClassTableCursors,
+}
+
+impl<'a> ClassRowWriter<'a> {
+    /// Opens the class table for a statement that `connection` compiles
+    /// against `schema`. None when the database has no class table.
+    /// `allocates_oids` says that the statement adds a class row.
+    fn open(
+        program: &mut ProgramBuilder,
+        schema: &'a Schema,
+        connection: &'a Arc<Connection>,
+        allocates_oids: bool,
+    ) -> turso_core::Result<Option<Self>> {
+        let cursors = open_class_table_for_writing(program, schema, allocates_oids)?;
+        Ok(cursors.map(|cursors| Self {
+            schema,
+            connection,
+            cursors,
+        }))
+    }
+
+    /// Inserts the class row of a relation that the statement creates.
+    /// `table` is the table of an index, in the same namespace: its owner
+    /// owns the index. Anything else is owned by the current role, which is
+    /// what PostgreSQL's `GetUserId()` gives after `SET ROLE`.
+    fn new_relation(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        name: &str,
+        kind: RelationKind,
+        table: Option<&str>,
+    ) -> turso_core::Result<()> {
+        // Relation names are unique per schema across kinds.
+        if is_user_relation_name(kind, name)
+            && class_catalog(self.schema)
+                .is_some_and(|catalog| catalog.get_by_name(namespace, name).is_some())
+        {
+            return Err(LimboError::ParseError(format!(
+                "relation \"{name}\" already exists"
+            )));
+        }
+        let owner = table
+            .and_then(|table| relation_owner(self.schema, namespace, table))
+            .unwrap_or_else(|| self.connection.current_role());
+        emit_class_row_insert(program, &self.cursors, namespace, name, kind, owner);
+        Ok(())
+    }
+
+    /// Deletes the class row of a relation that the statement drops.
+    fn dropped_relation(&self, program: &mut ProgramBuilder, namespace: NamespaceId, name: &str) {
+        // An engine relation has no row and nothing to do.
+        if class_catalog(self.schema)
+            .and_then(|catalog| catalog.get_by_name(namespace, name))
+            .is_none()
+        {
+            return;
+        }
+        emit_class_row_delete(program, &self.cursors, namespace, name)
+    }
+
+    /// Stores the new name of a relation. Its row keeps its oid and owner.
+    fn renamed_relation(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        let has_row = class_catalog(self.schema)
+            .is_some_and(|catalog| catalog.get_by_name(namespace, old_name).is_some());
+        if has_row {
+            emit_class_row_rename(program, &self.cursors, namespace, old_name, new_name);
+        }
+    }
+
+    /// Stores the new name of column `old_name` of `table` in the class
+    /// rows of the sequences that the column owns.
+    fn renamed_owner_column(
+        &self,
+        program: &mut ProgramBuilder,
+        namespace: NamespaceId,
+        table: &str,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        let owned: Vec<(String, i64)> = class_catalog(self.schema)
+            .and_then(|catalog| {
+                let table = catalog.get_by_name(namespace, table)?;
+                Some(
+                    catalog
+                        .owned_by(table.oid)
+                        .filter(|owned| owned.is_owned_by_column(old_name))
+                        .map(|owned| (owned.relname.clone(), table.oid))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        if owned.is_empty() {
+            return;
+        }
+        for (sequence, table_oid) in owned {
+            emit_class_row_set_owned_by(
+                program,
+                &self.cursors,
+                namespace,
+                &sequence,
+                table_oid,
+                Some(new_name),
+            );
+        }
+        OwnerColumnRenamed {
+            namespace,
+            table: table.to_string(),
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
+        }
+        .emit(program);
+    }
 }
 
 /// [`turso_core::Dialect::translate_access_statement`] for the statements
