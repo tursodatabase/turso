@@ -321,12 +321,16 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open(
+            io,
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_mvcc(true)),
+        )
+        .unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        // Enable MVCC via PRAGMA
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
             mvcc_store,
@@ -525,7 +529,7 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let opts = DatabaseOpts::new();
+        let opts = DatabaseOpts::new().with_mvcc(true);
         let db = Database::open_file_with_flags(
             io,
             ":memory:",
@@ -535,12 +539,6 @@ impl MvccTestDbNoConn {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        // Enable MVCC via PRAGMA
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.close().unwrap();
         Self {
             db: Some(db),
             _temp_dir: None,
@@ -554,6 +552,7 @@ impl MvccTestDbNoConn {
 
     /// Opens a database with a file and the requested options.
     pub fn new_with_random_db_with_opts(opts: DatabaseOpts) -> Self {
+        let opts = opts.with_mvcc(true);
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir
             .path()
@@ -570,12 +569,6 @@ impl MvccTestDbNoConn {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        // Enable MVCC via PRAGMA
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.close().unwrap();
         Self {
             db: Some(db),
             _temp_dir: Some(temp_dir),
@@ -4154,20 +4147,15 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let path_str = path.to_str().unwrap().to_string();
     {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
+        let _db = Database::open_file_with_flags(
             io,
             &path_str,
             OpenFlags::default(),
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_mvcc(true),
             None,
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.close().unwrap();
         remove_file_from_database_registry(&path_str);
     }
 
