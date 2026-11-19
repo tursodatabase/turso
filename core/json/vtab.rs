@@ -1,5 +1,6 @@
 use crate::sync::{Arc, RwLock};
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::iter::successors;
 use std::result::Result;
 
@@ -708,7 +709,10 @@ impl InPlaceJsonPath {
 
     fn push_array_index(&mut self, idx: &usize) {
         self.last_element = Key::Integer(*idx as i64);
-        self.push(format!("[{idx}]"));
+        let start = self.string.len();
+        // Writing to a String cannot fail.
+        let _ = write!(self.string, "[{idx}]");
+        self.element_lengths.push(self.string.len() - start);
     }
 
     fn push_object_key(&mut self, key: &Jsonb) -> crate::Result<()> {
@@ -748,11 +752,16 @@ impl InPlaceJsonPath {
                 !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
             }
         };
-        self.push(if needs_quotes {
-            format!(".\"{name}\"")
+        let start = self.string.len();
+        self.string.push('.');
+        if needs_quotes {
+            self.string.push('"');
+            self.string.push_str(name);
+            self.string.push('"');
         } else {
-            format!(".{name}")
-        });
+            self.string.push_str(name);
+        }
+        self.element_lengths.push(self.string.len() - start);
     }
 
     /// True when a stored name holds a control character or a double quote that is not part of
@@ -772,11 +781,6 @@ impl InPlaceJsonPath {
             }
         }
         false
-    }
-
-    fn push(&mut self, element: String) {
-        self.element_lengths.push(element.len());
-        self.string.push_str(&element);
     }
 
     fn cursor(&self) -> InPlaceJsonPathCursor {
