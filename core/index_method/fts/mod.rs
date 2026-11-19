@@ -137,6 +137,16 @@ fn key_info() -> KeyInfo {
 /// Memory budget for Tantivy's per-segment writer arena.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Memory budget of the segment writer for each buffered document. With this
+/// value, a batch of `BATCH_COMMIT_SIZE` documents gets the largest initial
+/// term table, as with `DEFAULT_MEMORY_BUDGET_BYTES`.
+const SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC: usize = 16 * 1024;
+
+/// The smallest memory budget of the segment writer. It gives Tantivy's
+/// smallest initial term table (2^10 entries). Tantivy refuses a budget of
+/// 24 KiB or less.
+const MIN_SEGMENT_MEMORY_BUDGET_BYTES: usize = 32 * 1024;
+
 /// Chunk size (512 KiB) for splitting segment files into backing rows.
 pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 
@@ -2201,7 +2211,8 @@ impl FtsCursor {
         self.register_tokenizers(&index);
         let segment_id = self.mint_segment_id();
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
-        let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
+        let memory_budget = Self::segment_memory_budget(self.doc_buffer.len());
+        let mut writer = SegmentWriter::for_segment(memory_budget, segment)
             .map_err(|e| build_dir.write_error(e, "FTS segment writer"))?;
         let identity_base = self.mint_identity_base();
         let mut added = 0u32;
@@ -2244,6 +2255,22 @@ impl FtsCursor {
         );
         let captured = build_dir.captured_files();
         segment_rows_from_files(segment_id, max_doc, captured, identities)
+    }
+
+    /// The memory budget of the segment writer for `doc_count` buffered
+    /// documents.
+    ///
+    /// Tantivy uses the budget only to size the initial hash table of terms:
+    /// the largest power of two from 2^10 to 2^19 entries of 8 bytes that
+    /// is less than a third of the budget. The table grows when it is half
+    /// full, and the writer sorts the terms before it writes them, so the
+    /// size does not change the segment files. Each build fills the table
+    /// and `finalize` reads all of it, so a table that is too large for the
+    /// batch makes the build slow.
+    fn segment_memory_budget(doc_count: usize) -> usize {
+        doc_count
+            .saturating_mul(SEGMENT_MEMORY_BUDGET_BYTES_PER_DOC)
+            .clamp(MIN_SEGMENT_MEMORY_BUDGET_BYTES, DEFAULT_MEMORY_BUDGET_BYTES)
     }
 
     /// Drive the in-flight publication (row deletions, then row inserts,
