@@ -2428,6 +2428,15 @@ impl Schema {
         self.update_value_types(syms)
     }
 
+    /// Adds a type to the in-memory registry. `syms` has the functions its
+    /// DECODE may call.
+    #[cfg(test)]
+    pub(crate) fn add_type(&mut self, type_def: TypeDef, syms: &SymbolTable) -> crate::Result<()> {
+        self.type_registry
+            .insert(type_registry_key(&type_def.name), Arc::new(type_def));
+        self.update_value_types(syms)
+    }
+
     /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
     /// in-memory registry without working out the kind its DECODE gives.
     fn insert_type_from_sql(
