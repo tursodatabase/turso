@@ -307,8 +307,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.json = root_json;
         self.root_offset = root_offset;
         self.id = root_id;
-        self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(root_path.to_string(), json_path(&root_path)?);
+        self.path_to_current_value
+            .set(&root_path, &json_path(&root_path)?);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -835,38 +835,27 @@ impl InPlaceJsonPath {
         self.string.len()
     }
 
-    fn from_json_path(path: String, json_path: JsonPath<'_>) -> Self {
-        let (json_path, last_element) = if json_path.elements.is_empty() {
-            (
-                JsonPath {
-                    elements: vec![PathElement::Root()],
-                },
-                Key::None,
-            )
-        } else {
-            let last_element = json_path
-                .elements
-                .last()
-                .and_then(|path_element| match path_element {
-                    PathElement::Key(cow, _) => Some(Key::String(cow.to_string())),
-                    PathElement::ArrayLocator(Some(idx)) => Some(Key::Integer(*idx as i64)),
-                    _ => None,
-                })
-                .unwrap_or(Key::None);
-
-            (json_path, last_element)
-        };
-
-        let element_lengths = json_path
-            .elements
-            .iter()
-            .map(Self::element_length)
-            .collect();
-
-        Self {
-            string: path,
-            element_lengths,
-            last_element,
+    /// Makes this the path `path`, which parses to `json_path`. The path keeps
+    /// its buffers, so that the rows of each new document do not allocate
+    /// and grow new buffers.
+    fn set(&mut self, path: &str, json_path: &JsonPath<'_>) {
+        self.string.clear();
+        self.string.push_str(path);
+        self.element_lengths.clear();
+        if json_path.elements.is_empty() {
+            self.element_lengths
+                .push(Self::element_length(&PathElement::Root()));
+            self.last_element = Key::None;
+            return;
+        }
+        self.element_lengths
+            .extend(json_path.elements.iter().map(Self::element_length));
+        match json_path.elements.last() {
+            Some(PathElement::Key(name, _)) => self.set_last_element_name(name),
+            Some(PathElement::ArrayLocator(Some(idx))) => {
+                self.last_element = Key::Integer(*idx as i64)
+            }
+            _ => self.last_element = Key::None,
         }
     }
 
