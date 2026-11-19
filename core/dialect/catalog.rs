@@ -290,9 +290,14 @@ pub struct RenameTable<'a> {
     pub namespace: NamespaceId,
     pub old_name: &'a str,
     pub new_name: &'a str,
+    pub written_old_name: &'a str,
+    pub written_new_name: &'a str,
+    pub is_virtual: bool,
     pub(crate) indexes: &'a [Arc<Index>],
     pub(crate) stored_old_name: &'a str,
     pub(crate) stored_new_name: &'a str,
+    pub temp_triggers: &'a [TempTriggerOfRenamedTable],
+    pub statement: &'a str,
 }
 
 impl<'a> RenameTable<'a> {
@@ -307,6 +312,15 @@ impl<'a> RenameTable<'a> {
             Some((index.name.as_str(), new_name))
         })
     }
+}
+
+/// A trigger of the temp database whose text names a renamed table, with
+/// its new text.
+#[derive(Debug, Clone)]
+pub struct TempTriggerOfRenamedTable {
+    pub name: String,
+    pub sql: String,
+    pub is_on_the_table: bool,
 }
 
 /// A column that gets a new name.

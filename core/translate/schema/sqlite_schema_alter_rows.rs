@@ -1,15 +1,161 @@
 //! Bytecode that rewrites stored rows for `ALTER TABLE`: the rows of
 //! `sqlite_schema`, and the rows of engine tables that name a user table.
 
+use crate::dialect::{CmdContext, RenameTable};
+use crate::function::{AlterTableFunc, Func, FuncCtx};
 use crate::namespace::NamespaceId;
 use crate::sync::Arc;
-use crate::translate::alter::database_uses_mvcc;
+use crate::translate::alter::{database_uses_mvcc, schema_table_name_for_db};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::sqlite_schema_rows::open_sqlite_schema_for_write;
 use crate::translate::schema::SQLITE_TABLEID;
+use crate::translate::update::translate_update_for_schema_change;
+use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::{LimboError, Result, TEMP_DB_ID};
+use turso_parser::ast;
+
+/// Renames a table in every row of `sqlite_schema` of its database, in its
+/// row of `sqlite_sequence`, in the row of its AUTOINCREMENT backing table,
+/// and in the triggers of the temp database.
+pub(super) fn emit_rename_table_rows(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    table: &RenameTable<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let stored_old_name = table.stored_old_name;
+    let stored_new_name = table.stored_new_name;
+
+    // The rewrite function normalizes the old name it is given, and a
+    // virtual table is in no namespace that changes its stored name.
+    let old_name_argument = if table.is_virtual {
+        table.written_old_name
+    } else {
+        stored_old_name
+    };
+    emit_rewrite_of_every_row(
+        program,
+        ctx,
+        AlterTableFunc::RenameTable,
+        &[old_name_argument.to_string(), stored_new_name.to_string()],
+        table.written_old_name,
+    );
+    if table.is_virtual {
+        return Ok(());
+    }
+
+    emit_rename_sqlite_sequence_entry(
+        program,
+        resolver,
+        ctx.connection,
+        ctx.database_id,
+        stored_old_name,
+        stored_new_name,
+    );
+    let has_autoincrement_backing_table = resolver.with_schema(ctx.database_id, |s| {
+        s.get_sequence(
+            NamespaceId::ROOT,
+            &crate::schema::autoincrement_sequence_name(stored_old_name),
+        )
+        .is_some()
+    });
+    if has_autoincrement_backing_table {
+        emit_rename_autoincrement_backing_table_entry(
+            program,
+            resolver,
+            ctx.connection,
+            ctx.database_id,
+            stored_old_name,
+            stored_new_name,
+        );
+    }
+
+    for trigger in table.temp_triggers {
+        emit_update_of_stored_sql(
+            program,
+            ctx,
+            &StoredSqlUpdate {
+                database_id: TEMP_DB_ID,
+                object_type: "trigger",
+                name_for_errors: &trigger.name,
+                name_in_where_clause: &escape_sql_string_literal(&trigger.name),
+                sql: &trigger.sql,
+                new_tbl_name: trigger.is_on_the_table.then_some(table.written_new_name),
+                statement: table.statement,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Emits a loop over every row of `sqlite_schema` of the database the
+/// statement changes. `func` gets the five columns of a row and then
+/// `arguments`, and gives the five columns to store in place of the row.
+/// `written_table_name` is the table the statement alters, as the statement
+/// spells it.
+fn emit_rewrite_of_every_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    func: AlterTableFunc,
+    arguments: &[String],
+    written_table_name: &str,
+) {
+    let cursor_id = ctx.sqlite_schema_cursor(program);
+    program.cursor_loop(cursor_id, |program, rowid| {
+        let first_column = program.alloc_registers(SQLITE_SCHEMA_COLUMN_COUNT);
+        for i in 0..SQLITE_SCHEMA_COLUMN_COUNT {
+            program.emit_column_or_rowid(cursor_id, i, first_column + i);
+        }
+        for argument in arguments {
+            program.emit_string8_new_reg(argument.clone());
+            program.mark_last_insn_constant();
+        }
+
+        let out = program.alloc_registers(SQLITE_SCHEMA_COLUMN_COUNT);
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: first_column,
+            dest: out,
+            func: FuncCtx {
+                func: Func::AlterTable(func),
+                arg_count: SQLITE_SCHEMA_COLUMN_COUNT + arguments.len(),
+                collation: CollationSeq::BINARY,
+            },
+        });
+
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(out),
+            count: to_u32(SQLITE_SCHEMA_COLUMN_COUNT),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+
+        // In MVCC mode, we need to delete before insert to properly
+        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+        if database_uses_mvcc(ctx.connection, ctx.database_id) {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg: record,
+            flag: InsertFlags(0),
+            table_name: written_table_name.to_string(),
+        });
+    });
+}
+
+const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 
 /// Rewrite the sqlite_schema row for the AUTOINCREMENT backing table when
 /// the parent table is renamed. The backing table is keyed by name
@@ -25,7 +171,7 @@ use crate::vdbe::insn::{to_u32, CmpInsFlags, Insn, RegisterOrLiteral};
 /// Mirrors the existing `emit_rename_sqlite_sequence_entry` helper for
 /// the `sqlite_sequence` row; the in-memory rename of `schema.sequences`
 /// and `schema.tables` happens in `op_rename_table`.
-pub(crate) fn emit_rename_autoincrement_backing_table_entry(
+fn emit_rename_autoincrement_backing_table_entry(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
@@ -120,7 +266,7 @@ pub(crate) fn emit_rename_autoincrement_backing_table_entry(
     });
 }
 
-pub(crate) fn emit_rename_sqlite_sequence_entry(
+fn emit_rename_sqlite_sequence_entry(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
@@ -209,4 +355,70 @@ pub(crate) fn emit_rename_sqlite_sequence_entry(
 
         program.preassign_label_to_next_insn(continue_loop_label);
     });
+}
+
+/// Emits `UPDATE sqlite_schema SET sql = ...` for the row of one object.
+fn emit_update_of_stored_sql(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    update: &StoredSqlUpdate<'_>,
+) -> Result<()> {
+    let StoredSqlUpdate {
+        object_type,
+        name_for_errors,
+        name_in_where_clause,
+        ..
+    } = update;
+    let schema_table = schema_table_name_for_db(ctx.resolver, update.database_id);
+    let escaped_sql = escape_sql_string_literal(update.sql);
+    let tbl_name_update = match update.new_tbl_name {
+        Some(tbl_name) => format!(", tbl_name = '{}'", escape_sql_string_literal(tbl_name)),
+        None => String::new(),
+    };
+    let update_stmt = format!(
+        r#"
+            UPDATE {schema_table}
+            SET sql = '{escaped_sql}'{tbl_name_update}
+            WHERE name = '{name_in_where_clause}' COLLATE NOCASE AND type = '{object_type}'
+        "#,
+    );
+
+    let cmd = crate::dialect::parse_statement(ctx.connection.dialect().as_ref(), &update_stmt)
+        .map_err(|e| {
+            LimboError::ParseError(format!(
+                "failed to parse {object_type} update SQL for {name_for_errors}: {e}"
+            ))
+        })?;
+    let Some(ast::Cmd::Stmt(ast::Stmt::Update(update_ast))) = cmd else {
+        return Err(LimboError::ParseError(format!(
+            "failed to parse {object_type} update SQL for {name_for_errors}",
+        )));
+    };
+
+    translate_update_for_schema_change(
+        update_ast,
+        ctx.resolver,
+        program,
+        ctx.connection,
+        update.statement,
+        |_program| {},
+    )
+}
+
+/// The row of `sqlite_schema` that gets new SQL text.
+struct StoredSqlUpdate<'a> {
+    /// The database of the row.
+    database_id: usize,
+    /// The `type` column of the row.
+    object_type: &'a str,
+    name_for_errors: &'a str,
+    /// The `name` column of the row, as the text between the quotes of a
+    /// SQL string literal.
+    name_in_where_clause: &'a str,
+    /// The new `sql` column.
+    sql: &'a str,
+    /// The new `tbl_name` column, if it changes.
+    new_tbl_name: Option<&'a str>,
+    /// The text of the `ALTER TABLE` statement, for change data capture.
+    statement: &'a str,
 }

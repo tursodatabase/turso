@@ -547,6 +547,10 @@ impl Catalog for PostgresCatalog {
                 }
             }
             CatalogCmd::RenameTable(table) => {
+                // A virtual table has no class row, in any database.
+                if table.is_virtual {
+                    return Ok(());
+                }
                 // The automatic indexes get their new names with the table.
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
                     rows.renamed_relation(program, table.namespace, table.old_name, table.new_name);
