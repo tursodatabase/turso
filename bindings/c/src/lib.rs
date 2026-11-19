@@ -597,9 +597,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     };
 
-    match db.connect(
-        ConnectOpts::new(SessionRole::Superuser).with_readonly(connection_readonly),
-    ) {
+    match db.connect(ConnectOpts::new(SessionRole::Superuser).with_readonly(connection_readonly)) {
         Ok(conn) => {
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
