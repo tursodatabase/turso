@@ -2403,7 +2403,10 @@ fn test_update_fails_when_speculatively_read_writer_aborts() {
         let table_id: MVTableId = (-2).into();
         let id = RowID::new(table_id, RowKey::Int(1));
 
-        let writer_conn = db.db.connect(ConnectOpts::new()).unwrap();
+        let writer_conn = db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let writer = db
             .mvcc_store
             .begin_tx(writer_conn.pager.load().clone())
@@ -2426,7 +2429,10 @@ fn test_update_fails_when_speculatively_read_writer_aborts() {
                 .store(TransactionState::Preparing(ts));
         });
 
-        let updater_conn = db.db.connect(ConnectOpts::new()).unwrap();
+        let updater_conn = db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         let updater = db
             .mvcc_store
             .begin_tx(updater_conn.pager.load().clone())
