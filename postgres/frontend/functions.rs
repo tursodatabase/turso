@@ -1501,8 +1501,7 @@ pub(crate) fn validate_pg_input(
                 )
             }
         }
-        "interval" => Ok(None),
-        "point" => Ok(None),
+        "point" => check_point_input(trimmed),
         "bytea" => {
             // Accept \x hex format
             if let Some(hex) = trimmed.strip_prefix("\\x") {
@@ -1609,6 +1608,7 @@ fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String,
     }
 }
 
+/// Check array values as in range with `element_type`
 fn check_array_input(
     input: &str,
     element_type: &str,
@@ -1637,6 +1637,42 @@ fn check_array_input(
         };
         if let Some(error) = validate_pg_input(&text, element_type)? {
             return Ok(Some(error));
+        }
+    }
+    Ok(None)
+}
+
+// point	(1,2) or 1,2	Exactly two coordinates, x and y.
+fn check_point_input(input: &str) -> Result<Option<(String, String)>, ParseError> {
+    let invalid = || {
+        Ok::<_, ParseError>(Some((
+            format!("invalid input syntax for type point: \"{input}\""),
+            SQLSTATE_INVALID_TEXT_REPRESENTATION.to_string(),
+        )))
+    };
+    let coords = if input.starts_with('(') {
+        let Some(inner) = input.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+            return invalid();
+        };
+        inner
+    } else if input.contains('(') || input.contains(')') {
+        return invalid();
+    } else {
+        input
+    };
+    let mut parts = coords.split(',').map(str::trim);
+    let (Some(x), Some(y), None) = (parts.next(), parts.next(), parts.next()) else {
+        return invalid();
+    };
+    if x.is_empty() || y.is_empty() {
+        return invalid();
+    }
+    for coord in [x, y] {
+        let Ok(value) = coord.parse::<f64>() else {
+            return invalid();
+        };
+        if !value.is_finite() {
+            return invalid();
         }
     }
     Ok(None)
