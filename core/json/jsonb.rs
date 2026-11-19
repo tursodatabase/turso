@@ -4,7 +4,7 @@ use crate::alloc::{
 };
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
-use crate::types::{validate_utf8, value_blob_from_slice, ValueBlob};
+use crate::types::{validate_utf8, value_blob_from_slice, ValueBlob, ValueRef};
 use crate::{bail_parse_error, LimboError, Result};
 use std::{borrow::Cow, fmt::Write};
 
@@ -2754,62 +2754,23 @@ impl Jsonb {
     /// payload is the escaped text, and the element is TEXT5 when `text` has a
     /// control character, TEXTJ when it has an escape, and TEXT otherwise.
     pub fn from_string_literal(text: &str) -> PResult<Self> {
-        let bytes = text.as_bytes();
-        let mut element_type = ElementType::TEXT;
-        let mut escapes = 0;
-        for &byte in bytes {
-            if byte == b'\\' || byte == b'"' {
-                escapes += 1;
-                if element_type == ElementType::TEXT {
-                    element_type = ElementType::TEXTJ;
-                }
-            } else if byte <= 0x1F {
-                element_type = ElementType::TEXT5;
-            }
-        }
-        let payload_size = bytes.len() + escapes;
-        let header = JsonbHeader::new(element_type, payload_size).into_bytes();
-        let header = header.as_bytes();
-        let mut jsonb = Self::new(header.len() + payload_size)?;
-        jsonb.data.extend_from_slice(header);
-        if escapes == 0 {
-            jsonb.data.extend_from_slice(bytes);
-        } else {
-            for &byte in bytes {
-                if byte == b'\\' || byte == b'"' {
-                    jsonb.data.push(b'\\');
-                }
-                jsonb.data.push(byte);
-            }
-        }
+        let mut jsonb = Self::empty();
+        append_string_literal(&mut jsonb.data, text)?;
         Ok(jsonb)
     }
 
     /// Makes the JSONB INT element for `int`: the element that the parser makes
     /// for the decimal text of `int`, without that text.
     pub fn from_i64(int: i64) -> PResult<Self> {
-        let mut digits = [0u8; 20];
-        let mut start = digits.len();
-        let mut rest = int.unsigned_abs();
-        loop {
-            start -= 1;
-            digits[start] = b'0' + (rest % 10) as u8;
-            rest /= 10;
-            if rest == 0 {
-                break;
-            }
-        }
-        let digits = &digits[start..];
-        let payload_size = digits.len() + usize::from(int < 0);
-        let header = JsonbHeader::new(ElementType::INT, payload_size).into_bytes();
-        let header = header.as_bytes();
-        let mut jsonb = Self::new(header.len() + payload_size)?;
-        jsonb.data.extend_from_slice(header);
-        if int < 0 {
-            jsonb.data.push(b'-');
-        }
-        jsonb.data.extend_from_slice(digits);
+        let mut jsonb = Self::empty();
+        append_i64(&mut jsonb.data, int)?;
         Ok(jsonb)
+    }
+
+    /// Appends the element for the SQL value `val` to the end of the
+    /// document, as [super::append_dbtype_as_jsonb] writes it.
+    pub(crate) fn append_sql_value(&mut self, val: ValueRef<'_>, strict: Conv) -> Result<()> {
+        super::append_dbtype_as_jsonb(&mut self.data, val, strict)
     }
 
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbCopy)]
@@ -3813,6 +3774,75 @@ impl std::str::FromStr for Jsonb {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::from_str(s)
     }
+}
+
+/// Appends to `data` the JSONB string element for `text`, as
+/// [Jsonb::from_string_literal] makes it.
+#[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbConstruction)]
+pub(crate) fn append_string_literal(
+    data: &mut ValueBlob,
+    text: &str,
+) -> std::result::Result<(), TryReserveError> {
+    let bytes = text.as_bytes();
+    let mut element_type = ElementType::TEXT;
+    let mut escapes = 0;
+    for &byte in bytes {
+        if byte == b'\\' || byte == b'"' {
+            escapes += 1;
+            if element_type == ElementType::TEXT {
+                element_type = ElementType::TEXTJ;
+            }
+        } else if byte <= 0x1F {
+            element_type = ElementType::TEXT5;
+        }
+    }
+    let payload_size = bytes.len() + escapes;
+    let header = JsonbHeader::new(element_type, payload_size).into_bytes();
+    let header = header.as_bytes();
+    data.try_reserve(header.len() + payload_size)?;
+    data.extend_from_slice(header);
+    if escapes == 0 {
+        data.extend_from_slice(bytes);
+    } else {
+        for &byte in bytes {
+            if byte == b'\\' || byte == b'"' {
+                data.push(b'\\');
+            }
+            data.push(byte);
+        }
+    }
+    Ok(())
+}
+
+/// Appends to `data` the JSONB INT element for `int`, as [Jsonb::from_i64]
+/// makes it.
+#[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbConstruction)]
+pub(crate) fn append_i64(
+    data: &mut ValueBlob,
+    int: i64,
+) -> std::result::Result<(), TryReserveError> {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let mut rest = int.unsigned_abs();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let digits = &digits[start..];
+    let payload_size = digits.len() + usize::from(int < 0);
+    let header = JsonbHeader::new(ElementType::INT, payload_size).into_bytes();
+    let header = header.as_bytes();
+    data.try_reserve(header.len() + payload_size)?;
+    data.extend_from_slice(header);
+    if int < 0 {
+        data.push(b'-');
+    }
+    data.extend_from_slice(digits);
+    Ok(())
 }
 
 /// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the

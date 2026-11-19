@@ -13,7 +13,7 @@ pub use crate::json::ops::{
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
-use crate::types::{validate_utf8, AsValueRef, Text, TextSubtype, Value, ValueType};
+use crate::types::{validate_utf8, AsValueRef, Text, TextSubtype, Value, ValueBlob, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{LimboError, ValueRef};
 pub use cache::JsonCacheCell;
@@ -84,11 +84,6 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
                 _ => LimboError::ParseError("malformed JSON".to_string()),
             })?;
     Ok(Value::Blob(jsonbin.data()))
-}
-
-pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<crate::ValueBlob> {
-    let json = convert_dbtype_to_jsonb(data, strict)?;
-    Ok(json.data())
 }
 
 /// Return the encoded length of the raw JSONB element beginning at `cursor`.
@@ -258,6 +253,33 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
     }
 }
 
+/// Appends the JSONB element for `val` to `data`: the element that
+/// [convert_ref_dbtype_to_jsonb] makes for it. A string or an integer, the
+/// usual values, is written in place, without a JSONB value of its own.
+pub(crate) fn append_dbtype_as_jsonb(
+    data: &mut ValueBlob,
+    val: ValueRef<'_>,
+    strict: Conv,
+) -> crate::Result<()> {
+    match val {
+        ValueRef::Text(text)
+            if matches!(strict, Conv::ToString)
+                || (text.subtype != TextSubtype::Json && !matches!(strict, Conv::Strict)) =>
+        {
+            jsonb::append_string_literal(data, text.as_str())?;
+        }
+        ValueRef::Numeric(Numeric::Integer(int)) if !matches!(strict, Conv::ToString) => {
+            jsonb::append_i64(data, int)?;
+        }
+        _ => {
+            let json = convert_ref_dbtype_to_jsonb(val, strict)?.data();
+            data.try_reserve(json.len())?;
+            data.extend_from_slice(&json);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
     if let ValueRef::Blob(blob) = value {
         if !is_jsonb_blob(blob) {
@@ -287,8 +309,7 @@ where
     for value in values {
         let value = value.as_value_ref();
         ensure_blob_arg_is_jsonb(value)?;
-        let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
-        json.append_jsonb_to_end(value.data());
+        json.append_sql_value(value, Conv::NotStrict)?;
     }
     json.finalize_unsafe(ElementType::ARRAY)?;
 
@@ -307,8 +328,7 @@ where
     for value in values {
         let value = value.as_value_ref();
         ensure_blob_arg_is_jsonb(value)?;
-        let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
-        json.append_jsonb_to_end(value.data());
+        json.append_sql_value(value, Conv::NotStrict)?;
     }
     json.finalize_unsafe(ElementType::ARRAY)?;
 
@@ -989,8 +1009,7 @@ where
                 "json_object() labels must be TEXT".to_string(),
             ));
         }
-        let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
-        json.append_jsonb_to_end(key.data());
+        json.append_sql_value(first, Conv::ToString)?;
 
         let second = values.next().ok_or_else(|| {
             crate::LimboError::InternalError(
@@ -998,8 +1017,7 @@ where
             )
         })?;
         ensure_blob_arg_is_jsonb(second.as_value_ref())?;
-        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
-        json.append_jsonb_to_end(value.data());
+        json.append_sql_value(second.as_value_ref(), Conv::NotStrict)?;
     }
 
     json.finalize_unsafe(ElementType::OBJECT)?;
@@ -1034,8 +1052,7 @@ where
                 "json_object() labels must be TEXT".to_string(),
             ));
         }
-        let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
-        json.append_jsonb_to_end(key.data());
+        json.append_sql_value(first, Conv::ToString)?;
 
         let second = values.next().ok_or_else(|| {
             crate::LimboError::InternalError(
@@ -1043,8 +1060,7 @@ where
             )
         })?;
         ensure_blob_arg_is_jsonb(second.as_value_ref())?;
-        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
-        json.append_jsonb_to_end(value.data());
+        json.append_sql_value(second.as_value_ref(), Conv::NotStrict)?;
     }
 
     json.finalize_unsafe(ElementType::OBJECT)?;
