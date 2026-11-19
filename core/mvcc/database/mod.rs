@@ -8195,6 +8195,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.park_calls()
     }
 
+    /// Makes GC treat every transaction up to `tx_id` as written to the WAL by
+    /// a checkpoint, whether a checkpoint wrote it or not.
+    #[cfg(feature = "test_helper")]
+    pub fn set_durable_txid_max_for_testing(&self, tx_id: u64) {
+        self.durable_txid_max.store(tx_id, Ordering::SeqCst);
+    }
+
     /// Whether an incremental GC pass should run now: inline GC is enabled
     /// (threshold >= 0) and `live_version_count_approx` has grown past the threshold
     /// since the last pass. Heuristic — drift only changes GC frequency.
@@ -10824,6 +10831,12 @@ impl RowVersion {
     /// ([`WalPos::ORIGIN`] = not materialized). See the field doc.
     #[inline]
     pub(crate) fn materialized_at(&self) -> WalPos {
+        self.materialized_at
+    }
+
+    /// [`Self::materialized_at`] for integration tests.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_at_for_testing(&self) -> WalPos {
         self.materialized_at
     }
 
