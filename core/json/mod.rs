@@ -127,7 +127,7 @@ pub fn convert_dbtype_to_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Res
 }
 
 fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
-    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let zero_pos = first_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     // Like CAST(blob AS TEXT), bytes that are not UTF-8 become U+FFFD.
     let str = String::from_utf8_lossy(truncated);
@@ -138,7 +138,7 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
 /// used any JSON5-only syntax, which json_valid needs to tell strict
 /// RFC 8259 documents apart from merely parseable ones.
 fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
-    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let zero_pos = first_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     let str = String::from_utf8_lossy(truncated);
     Jsonb::from_str_tracking(&str).map_err(Into::into)
@@ -209,7 +209,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 let str = if matches!(strict, Conv::ToString) {
                     str
                 } else {
-                    &str[..str.find('\0').unwrap_or(str.len())]
+                    sqlite_text_prefix(str)
                 };
                 Jsonb::from_str_with_mode(str, strict)
             } else {
@@ -910,7 +910,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             // Like SQLite, text parsed as a JSON document stops at the
             // first NUL.
             let text = t.as_str();
-            let text = &text[..text.find('\0').unwrap_or(text.len())];
+            let text = sqlite_text_prefix(text);
             match Jsonb::from_str(text) {
                 Ok(_) => Ok(Value::from_i64(0)),
                 Err(JsonError::Message { location, .. }) => {
@@ -945,7 +945,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             if looks_like_jsonb_blob(blob) {
                 return Ok(Value::from_i64(jsonb_error_position(blob) as i64));
             }
-            let zero_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+            let zero_pos = first_nul(blob).unwrap_or(blob.len());
             match Jsonb::from_str(&String::from_utf8_lossy(&blob[..zero_pos])) {
                 Ok(_) => Ok(Value::from_i64(0)),
                 Err(JsonError::Message { location, .. }) => {
