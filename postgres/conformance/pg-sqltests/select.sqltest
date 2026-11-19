@@ -2762,3 +2762,96 @@ expect {
     3
     3
 }
+
+setup distinct_rows {
+    CREATE TABLE distinct_rows (a int, b int, c text);
+    INSERT INTO distinct_rows VALUES (2, 10, 'x'), (1, 20, 'y'), (1, 20, 'z'), (2, 30, 'w');
+}
+
+@setup distinct_rows
+test distinct-order-by-terms-that-are-in-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a DESC;
+    SELECT DISTINCT a, b FROM distinct_rows ORDER BY 2 DESC, distinct_rows.a;
+    SELECT DISTINCT a + b AS total FROM distinct_rows ORDER BY total;
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY a + b DESC;
+    SELECT DISTINCT a AS x FROM distinct_rows ORDER BY a;
+    SELECT DISTINCT a, count(*) FROM distinct_rows GROUP BY a ORDER BY count(*), a;
+    SELECT DISTINCT * FROM distinct_rows ORDER BY b, c DESC;
+}
+expect {
+    2
+    1
+    2|30
+    1|20
+    2|10
+    12
+    21
+    32
+    32
+    21
+    12
+    1
+    2
+    1|2
+    2|2
+    2|10|x
+    1|20|z
+    1|20|y
+    2|30|w
+}
+
+@setup distinct_rows
+test error-distinct-order-by-column-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY b;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-over-a-selected-column {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a + 0;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-with-operands-swapped {
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY b + a;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-aggregate-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows GROUP BY a ORDER BY count(*);
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-in-a-subquery-order-by-column-outside-the-select-list {
+    SELECT * FROM (SELECT DISTINCT a FROM distinct_rows ORDER BY b) AS s;
+}
+@sqlstate 42P10
+expect error {}
+
+# tursopg has one collation and cannot tell these expressions apart.
+@setup distinct_rows
+test error-distinct-order-by-with-another-collation {
+    SELECT DISTINCT c FROM distinct_rows ORDER BY c COLLATE "C";
+}
+@sqlstate 42P10
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@setup distinct_rows
+test distinct-all-rows-order-by-column-outside-the-select-list {
+    SELECT ALL a FROM distinct_rows ORDER BY b, c;
+}
+expect {
+    2
+    1
+    1
+    2
+}

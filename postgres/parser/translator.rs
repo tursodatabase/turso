@@ -2633,18 +2633,20 @@ impl PostgreSQLTranslator {
         if distinct_clause.is_empty() {
             return Ok(None);
         }
-        if distinct_clause.iter().all(|node| node.node.is_none()) {
-            return Ok(Some(ast::SelectDistinctness::Distinct));
-        }
         // A COLLATE that names the binary collation is translated to nothing, so two
         // expressions that PostgreSQL finds different would compare as the same.
-        let has_collate = distinct_clause
-            .iter()
-            .chain(&select.sort_clause)
-            .filter_map(|node| node.node.as_ref())
-            .flat_map(|node| node.nodes())
-            .any(|(node, ..)| matches!(node, NodeRef::CollateClause(_)));
-        if has_collate {
+        if distinct_clause.iter().all(|node| node.node.is_none()) {
+            let has_order_by = !select.sort_clause.is_empty();
+            if has_order_by
+                && Self::has_collate(select.target_list.iter().chain(&select.sort_clause))
+            {
+                return Err(ParseError::not_supported(
+                    "COLLATE in a SELECT DISTINCT with ORDER BY",
+                ));
+            }
+            return Ok(Some(ast::SelectDistinctness::Distinct));
+        }
+        if Self::has_collate(distinct_clause.iter().chain(&select.sort_clause)) {
             return Err(ParseError::not_supported(
                 "COLLATE in a SELECT DISTINCT ON expression or in its ORDER BY",
             ));
@@ -2655,6 +2657,14 @@ impl PostgreSQLTranslator {
             .map(|node| self.translate_expr(node).map(Box::new))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some(ast::SelectDistinctness::DistinctOn(exprs)))
+    }
+
+    fn has_collate<'a>(exprs: impl IntoIterator<Item = &'a pg_query::protobuf::Node>) -> bool {
+        exprs
+            .into_iter()
+            .filter_map(|node| node.node.as_ref())
+            .flat_map(|node| node.nodes())
+            .any(|(node, ..)| matches!(node, NodeRef::CollateClause(_)))
     }
 
     /// Translate multiple FROM items. The first becomes the primary table,

@@ -730,6 +730,9 @@ fn prepare_one_select_plan(
                 )?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
+            if matches!(distinctness, Some(ast::SelectDistinctness::Distinct)) {
+                check_order_by_of_distinct_is_in_select_list(&key, &plan, resolver)?;
+            }
             // Remove duplicate ORDER BY expressions, keeping the first occurrence.
             // Duplicates are semantically redundant.
             let mut i = 0;
@@ -1410,6 +1413,28 @@ fn expr_reads_only_grouped_values(
         Ok(WalkControl::Continue)
     })?;
     Ok(only_grouped)
+}
+
+#[allow(clippy::vec_box)]
+fn check_order_by_of_distinct_is_in_select_list(
+    order_by: &[(Box<ast::Expr>, ast::SortOrder, Option<ast::NullsOrder>)],
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if resolver.catalog.dialect.sort_term_matching() == SortTermMatching::Sqlite {
+        return Ok(());
+    }
+    let is_in_select_list = |expr: &ast::Expr| {
+        plan.result_columns
+            .iter()
+            .any(|column| exprs_are_equivalent_as_written(&column.expr, expr))
+    };
+    if !order_by.iter().all(|(expr, _, _)| is_in_select_list(expr)) {
+        crate::bail_parse_error!(
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        );
+    }
+    Ok(())
 }
 
 fn check_sort_name_is_one_output_column(

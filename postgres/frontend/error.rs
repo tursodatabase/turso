@@ -340,6 +340,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_WINDOWING_ERROR
     } else if msg.starts_with("invalid reference to FROM-clause entry")
         || msg == "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        || msg == "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
         || msg.contains(" term out of range - should be between ")
     {
         SQLSTATE_INVALID_COLUMN_REFERENCE
@@ -593,6 +594,10 @@ mod tests {
             ),
             (
                 "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
                 SQLSTATE_INVALID_COLUMN_REFERENCE,
             ),
             (
