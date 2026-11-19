@@ -7434,7 +7434,9 @@ pub(crate) mod test_writes {
         });
     }
 
-    fn commit_write_tx(conn: &Connection, write: impl FnOnce(&Pager)) {
+    /// Commits one write transaction of `conn` in which `write` changes pages
+    /// through the pager.
+    pub(crate) fn commit_write_tx(conn: &Connection, write: impl FnOnce(&Pager)) {
         let pager = conn.pager.load();
         pager.begin_read_tx().unwrap();
         pager
