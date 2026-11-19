@@ -35,6 +35,11 @@ setup schema_api_api_items_id {
     CREATE TABLE api.items (id int PRIMARY KEY);
 }
 
+setup p_a_b_c_x_y_fkey {
+    CREATE TABLE p (a int, b int, PRIMARY KEY (a, b));
+    CREATE TABLE c (x int, y int, CONSTRAINT c_xy_fkey FOREIGN KEY (x, y) REFERENCES p (a, b));
+}
+
 @backend postgres
 setup auth_uid_on_postgres {
     CREATE SCHEMA auth;
@@ -989,3 +994,207 @@ test gap-e-98-pg-policies {
 expect {
     p
 }
+
+# E-99 (S4): pg_available_extensions()
+test gap-e-99-pg-available-extensions {
+    SELECT name, default_version FROM pg_available_extensions() WHERE name = 'plpgsql';
+}
+expect {
+    plpgsql|1.0
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-100 (S4): pg_indexes names of PRIMARY KEY and UNIQUE indexes
+test gap-e-100-pg-indexes-names-of-primary-key-and-unique-indexes {
+    CREATE TABLE u (id text PRIMARY KEY, e text UNIQUE);
+    SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('u_e_key', 'u_pkey');
+}
+expect {
+    2
+}
+expect @tursopg {
+    0
+}
+
+# E-101 (S4): conkey of a two-column UNIQUE constraint as text
+# Fails because tursopg returns int2vector columns as text, see E-39.
+@setup schema_api_api_items_id
+test gap-e-101-conkey-of-a-two-column-unique-constraint-as-text {
+    CREATE TABLE api.pairs (id int PRIMARY KEY, a int, b int, UNIQUE (a, b));
+    SELECT conkey::text FROM pg_constraint WHERE conname = 'pairs_a_b_key';
+}
+expect {
+    {2,3}
+}
+expect @tursopg {
+    2 3
+}
+
+# E-102 (S4): conkey subscript and array_length
+# Fails because tursopg returns int2vector columns as text, see E-39.
+@setup p_a_b_c_x_y_fkey
+test gap-e-102-conkey-subscript-and-array-length {
+    SELECT conkey[1], array_length(conkey, 1) FROM pg_constraint WHERE conname = 'c_xy_fkey';
+}
+expect {
+    1|2
+}
+expect @tursopg {
+    |
+}
+
+# E-103 (S4): indkey cast to int2[]
+# Fails because tursopg returns int2vector columns as text, see E-39.
+@setup p_a_b_c_x_y_fkey
+test gap-e-103-indkey-cast-to-int2 {
+    SELECT indkey::int2[] FROM pg_index WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 'p');
+}
+expect {
+    [0:1]={1,2}
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# E-104 (S1): unquoted name does not find a quoted mixed-case schema
+# Fails because tursopg folds the quoted schema name to lower case, see E-81.
+test gap-e-104-unquoted-name-does-not-find-a-quoted-mixed-case-schema {
+    CREATE SCHEMA "Api";
+    CREATE TABLE "Api".t (id int);
+    INSERT INTO api.t VALUES (1);
+}
+@sqlstate 42P01
+expect error {}
+expect @tursopg {
+}
+
+# E-105 (S4): regclass cast of an unknown name
+test gap-e-105-regclass-cast-of-an-unknown-name {
+    SELECT 'nosuch'::regclass;
+}
+@sqlstate 42P01
+expect error {}
+expect @tursopg {
+    0
+}
+
+# E-106: pg_class row level security flags
+test gap-e-106-pg-class-row-level-security-flags {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+    SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 't';
+}
+expect {
+    t|f
+}
+
+# E-107 (S2): PL/pgSQL trigger function
+test gap-e-107-pl-pgsql-trigger-function {
+    CREATE TABLE users (id int PRIMARY KEY, meta jsonb);
+    CREATE TABLE profiles (id int PRIMARY KEY, first_name text);
+    CREATE FUNCTION handle_new_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO profiles (id, first_name) VALUES (new.id, new.meta ->> 'first_name');
+      RETURN new;
+    END;
+    $$;
+    CREATE TRIGGER on_user_created AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+    INSERT INTO users VALUES (1, '{"first_name":"Ada"}');
+    SELECT id, first_name FROM profiles;
+}
+expect {
+    1|Ada
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-108 (S2): SECURITY DEFINER function with SET search_path
+test gap-e-108-security-definer-function-with-set-search-path {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql SECURITY DEFINER SET search_path = '' AS $$ SELECT 1 $$;
+    SELECT f();
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# E-109 (S4): table and column privilege functions
+test gap-e-109-table-and-column-privilege-functions {
+    CREATE ROLE gap_e_109_reader;
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    GRANT SELECT ON t TO gap_e_109_reader;
+    SELECT has_table_privilege('gap_e_109_reader', 't', 'SELECT'),
+           has_table_privilege('gap_e_109_reader', 't', 'INSERT'),
+           has_any_column_privilege('gap_e_109_reader', 't', 'SELECT'),
+           has_column_privilege('gap_e_109_reader', 't', 's', 'SELECT');
+}
+expect {
+    t|f|t|t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-110 (S4): pg_has_role
+test gap-e-110-pg-has-role {
+    CREATE ROLE gap_e_110_role;
+    SELECT pg_has_role('gap_e_110_role', 'USAGE'), pg_has_role('gap_e_110_role', 'postgres', 'MEMBER');
+}
+expect {
+    t|f
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-111 (S4): pg_is_other_temp_schema
+test gap-e-111-pg-is-other-temp-schema {
+    SELECT pg_is_other_temp_schema((SELECT oid FROM pg_namespace WHERE nspname = 'public'));
+}
+expect {
+    f
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-112 (S4): pg_column_is_updatable
+test gap-e-112-pg-column-is-updatable {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    SELECT pg_column_is_updatable((SELECT oid FROM pg_class WHERE relname = 't'), 1::smallint, false);
+}
+expect {
+    t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-113 (S4): pg_total_relation_size and pg_relation_size
+@setup t_id_s_with_rows
+test gap-e-113-pg-total-relation-size-and-pg-relation-size {
+    SELECT pg_total_relation_size('t') > 0, pg_relation_size('t') > 0;
+}
+expect {
+    t|t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-114 (S4): pg_size_pretty
+test gap-e-114-pg-size-pretty {
+    SELECT pg_size_pretty(8192::bigint), pg_size_pretty(10485760::bigint);
+}
+expect {
+    8192 bytes|10 MB
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# E-115 (S4): pg_stat_user_tables
+@setup t_id_s_with_rows
+test gap-e-115-pg-stat-user-tables {
+    SELECT count(*) FROM pg_stat_user_tables WHERE relname = 't';
+}
+expect {
+    1
+}
+@sqlstate 42P01
+expect @tursopg error {}
