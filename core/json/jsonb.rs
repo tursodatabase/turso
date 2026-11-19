@@ -263,6 +263,27 @@ impl From<ElementType> for String {
     }
 }
 
+/// The element type of each value of the low 4 bits of a header byte. Codes 13
+/// to 15 are reserved and have no element type.
+const ELEMENT_TYPE_BY_CODE: [Option<ElementType>; 16] = [
+    Some(ElementType::NULL),
+    Some(ElementType::TRUE),
+    Some(ElementType::FALSE),
+    Some(ElementType::INT),
+    Some(ElementType::INT5),
+    Some(ElementType::FLOAT),
+    Some(ElementType::FLOAT5),
+    Some(ElementType::TEXT),
+    Some(ElementType::TEXTJ),
+    Some(ElementType::TEXT5),
+    Some(ElementType::TEXTRAW),
+    Some(ElementType::ARRAY),
+    Some(ElementType::OBJECT),
+    None,
+    None,
+    None,
+];
+
 impl TryFrom<u8> for ElementType {
     type Error = LimboError;
 
@@ -813,66 +834,77 @@ impl JsonbHeader {
         self.1
     }
 
+    /// Reads the header at `cursor` and returns it with the header length.
+    ///
+    /// Every read of a JSONB document goes through here, once per element, so
+    /// the headers with the payload size in the header byte or in one more byte
+    /// are decoded inline. The longer size encodings are rare and are decoded by
+    /// [Self::from_slice_with_wide_size].
+    #[inline]
     pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
-        match slice.get(cursor) {
-            Some(header_byte) => {
-                // Extract first 4 bits (values 0-15)
-                let element_type = header_byte & 15;
-                if element_type > 12 {
-                    bail_parse_error!("Invalid element type: {}", element_type);
-                }
-                // Get the last 4 bits for header_size
-                let header_size = header_byte >> 4;
-                let offset: usize;
-                let total_size = match header_size {
-                    size if size <= 11 => {
-                        offset = 1;
-                        size as usize
-                    }
-
-                    12 => match slice.get(cursor + 1) {
-                        Some(value) => {
-                            offset = 2;
-                            *value as usize
-                        }
-                        None => bail_parse_error!("Failed to read 1-byte size"),
-                    },
-
-                    13 => match Self::get_size_bytes(slice, cursor + 1, 2) {
-                        Ok(bytes) => {
-                            offset = 3;
-                            u16::from_be_bytes([bytes[0], bytes[1]]) as usize
-                        }
-                        Err(e) => return Err(e),
-                    },
-
-                    14 => match Self::get_size_bytes(slice, cursor + 1, 4) {
-                        Ok(bytes) => {
-                            offset = 5;
-                            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
-                        }
-                        Err(e) => return Err(e),
-                    },
-
-                    // 15 = 8-byte payload size (for future expansion per SQLite spec)
-                    15 => match Self::get_size_bytes(slice, cursor + 1, 8) {
-                        Ok(bytes) => {
-                            offset = 9;
-                            u64::from_be_bytes([
-                                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-                                bytes[6], bytes[7],
-                            ]) as usize
-                        }
-                        Err(e) => return Err(e),
-                    },
-
-                    _ => unreachable!(),
-                };
-
-                Ok((Self(element_type.try_into()?, total_size), offset))
+        let Some(&header_byte) = slice.get(cursor) else {
+            bail_parse_error!("Failed to read header byte");
+        };
+        // Extract first 4 bits (values 0-15)
+        let element_type = header_byte & 15;
+        let Some(element_type) = ELEMENT_TYPE_BY_CODE[element_type as usize] else {
+            bail_parse_error!("Invalid element type: {}", element_type);
+        };
+        // Get the last 4 bits for header_size
+        match header_byte >> 4 {
+            size @ 0..=11 => Ok((Self(element_type, size as usize), 1)),
+            12 => match slice.get(cursor + 1) {
+                Some(&size) => Ok((Self(element_type, size as usize), 2)),
+                None => bail_parse_error!("Failed to read 1-byte size"),
+            },
+            header_size => {
+                Self::from_slice_with_wide_size(cursor, slice, element_type, header_size)
             }
-            None => bail_parse_error!("Failed to read header byte"),
         }
+    }
+
+    /// Reads the payload size of a header that stores it in 2, 4 or 8 bytes
+    /// after the header byte (`header_size` 13, 14 or 15).
+    fn from_slice_with_wide_size(
+        cursor: usize,
+        slice: &[u8],
+        element_type: ElementType,
+        header_size: u8,
+    ) -> Result<(Self, usize)> {
+        let offset: usize;
+        let total_size = match header_size {
+            13 => match Self::get_size_bytes(slice, cursor + 1, 2) {
+                Ok(bytes) => {
+                    offset = 3;
+                    u16::from_be_bytes([bytes[0], bytes[1]]) as usize
+                }
+                Err(e) => return Err(e),
+            },
+
+            14 => match Self::get_size_bytes(slice, cursor + 1, 4) {
+                Ok(bytes) => {
+                    offset = 5;
+                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+                }
+                Err(e) => return Err(e),
+            },
+
+            // 15 = 8-byte payload size (for future expansion per SQLite spec)
+            15 => match Self::get_size_bytes(slice, cursor + 1, 8) {
+                Ok(bytes) => {
+                    offset = 9;
+                    u64::from_be_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]) as usize
+                }
+                Err(e) => return Err(e),
+            },
+
+            _ => unreachable!(),
+        };
+
+        Ok((Self(element_type, total_size), offset))
     }
 
     pub fn into_bytes(self) -> HeaderFormat {
@@ -994,6 +1026,7 @@ impl Jsonb {
         Ok(())
     }
 
+    #[inline]
     fn read_header(&self, cursor: usize) -> Result<(JsonbHeader, usize)> {
         let (header, offset) = JsonbHeader::from_slice(cursor, &self.data)?;
 
