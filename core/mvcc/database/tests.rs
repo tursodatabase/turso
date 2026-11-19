@@ -4010,9 +4010,11 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+    let tx_id = mv_store.begin_tx(conn.pager.load().clone()).unwrap();
+    mv_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "a"))
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    commit_tx(mv_store.clone(), &conn, tx_id).unwrap();
     conn.checkpoint(CheckpointMode::Truncate {
         upper_bound_inclusive: None,
     })
