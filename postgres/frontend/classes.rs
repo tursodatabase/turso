@@ -462,7 +462,7 @@ impl Catalog for PostgresCatalog {
                         rows.new_relation(
                             program,
                             table.namespace,
-                            index,
+                            &index.name,
                             RelationKind::Index,
                             Some(table.name),
                         )?;
