@@ -49,6 +49,7 @@ use super::{
     join::JoinPlanningContext,
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
+        MultiIndexTableWork,
     },
     order::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
@@ -409,18 +410,15 @@ pub(super) fn choose_best_btree_candidate(
                 .into_iter()
                 .flatten()
                 {
-                    let c = &rhs_constraints.constraints[idx];
-                    mask = mask.iter().chain(c.lhs_mask.iter()).try_collect()?;
+                    mask.union_with(&rhs_constraints.constraints[idx].lhs_mask)?;
                 }
             }
             mask
         };
         // Tables whose constraints this loop can account for: the loop's own
         // prerequisite tables plus the current table itself.
-        let allowed_mask: TableMask = loop_prereq_mask
-            .iter()
-            .chain(rhs_table_mask.iter())
-            .try_collect()?;
+        let mut allowed_mask = loop_prereq_mask;
+        allowed_mask.union_with(&rhs_table_mask)?;
 
         // Collect which constraint positions are consumed by the index seek.
         let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
@@ -554,6 +552,9 @@ pub(super) fn choose_best_in_seek_candidate(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
     };
+    if !has_in_seek_constraint(rhs_constraints) {
+        return Ok(None);
+    }
 
     let base = *base_row_count;
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
@@ -678,6 +679,14 @@ pub(super) fn choose_best_in_seek_candidate(
     Ok(best_in_seek)
 }
 
+/// Whether a constraint of the table is an `IN` that can drive an IN seek.
+pub(super) fn has_in_seek_constraint(constraints: &TableConstraints) -> bool {
+    constraints
+        .constraints
+        .iter()
+        .any(|c| matches!(c.operator, ConstraintOperator::In { not: false, .. }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
@@ -766,13 +775,13 @@ fn replace_if_cheaper(
 
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
-pub fn find_best_access_method_for_join_order(
+pub fn find_best_access_method_for_join_order<'a>(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -782,6 +791,7 @@ pub fn find_best_access_method_for_join_order(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -802,10 +812,14 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
             planning_context.resolver,
+            multi_index_work,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
+            rhs_table,
             vtab,
             &rhs_constraints.constraints,
+            where_clause,
+            lhs_mask,
             join_order,
             input_cardinality,
             base_row_count,
@@ -843,14 +857,14 @@ pub fn find_best_access_method_for_join_order(
 
 #[allow(clippy::too_many_arguments)]
 /// Return the best B-tree access method, or `None` if `INDEXED BY` leaves no valid method.
-fn find_best_access_method_for_btree(
+fn find_best_access_method_for_btree<'a>(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     allow_automatic_index: bool,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
@@ -861,6 +875,7 @@ fn find_best_access_method_for_btree(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     resolver: &Resolver,
+    multi_index_work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     let Some(best) = choose_best_btree_candidate(
@@ -1070,7 +1085,9 @@ fn find_best_access_method_for_btree(
 
         // Multi-index scans do not record matched rowids for a RIGHT or FULL JOIN,
         // so the unmatched-row pass would emit matched right rows again.
-        if keeps_right_rows {
+        // They also check each branch's conditions on rows before the loop
+        // checks their row-level security filter.
+        if keeps_right_rows || rhs_table.row_filter.is_some() {
             return Ok(Some(best_access_method));
         }
 
@@ -1088,6 +1105,7 @@ fn find_best_access_method_for_btree(
             lhs_mask,
             analyze_stats,
             resolver,
+            multi_index_work,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1116,6 +1134,7 @@ fn find_best_access_method_for_btree(
             lhs_mask,
             analyze_stats,
             resolver,
+            multi_index_work,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1149,14 +1168,62 @@ fn has_two_local_constraint_terms(
     false
 }
 
+/// Whether an argument of this table function reads a table that is not joined before it.
+fn table_function_argument_reads_a_later_table(
+    table_function: &JoinedTable,
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    lhs_mask: &TableMask,
+    join_order: &[JoinOrderMember],
+) -> bool {
+    let own_index = join_order
+        .iter()
+        .find(|member| member.table_id == table_function.internal_id)
+        .map(|member| member.original_idx);
+    constraints.iter().any(|constraint| {
+        let term = &where_clause[constraint.where_clause_pos.0];
+        if term.origin.table_function_table() != Some(table_function.internal_id) {
+            return false;
+        }
+        let mut read = constraint.lhs_mask.clone();
+        if let Some(own_index) = own_index {
+            read.clear(own_index);
+        }
+        !lhs_mask.contains_all_set_bits_of(&read)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn find_best_access_method_for_vtab(
+    table: &JoinedTable,
     vtab: &VirtualTable,
     constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
+    debug_assert!(
+        where_clause
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| term.origin.table_function_table() == Some(table.internal_id))
+            .all(|(pos, _)| constraints
+                .iter()
+                .any(|constraint| constraint.where_clause_pos.0 == pos)),
+        "every argument of a table function must be one of its constraints"
+    );
+    if table_function_argument_reads_a_later_table(
+        table,
+        constraints,
+        where_clause,
+        lhs_mask,
+        join_order,
+    ) {
+        return Ok(None);
+    }
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
 
     // TODO: get proper order_by information to pass to the vtab.
@@ -1383,7 +1450,7 @@ pub fn try_hash_join_access_method(
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
     joined_before_probe_mask: &TableMask,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
     build_cardinality: f64,
@@ -1843,10 +1910,11 @@ fn find_best_access_method_for_subquery(
 
     // SQLite does not build an automatic index on the right side of a
     // RIGHT JOIN or FULL JOIN. The unmatched-row pass must scan that source.
-    if rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(JoinInfo::keeps_right_rows)
+    if !planning_context.allow_automatic_index
+        || rhs_table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::keeps_right_rows)
     {
         return Ok(Some(AccessMethod {
             cost: scan_cost,
@@ -2110,14 +2178,14 @@ fn materialized_subquery_ephemeral_index(
 ) -> Result<Arc<Index>> {
     let mut index_columns: crate::alloc::Vec<IndexColumn> =
         crate::alloc::Vec::try_with_capacity_ext(subquery.columns.len())?;
-    let mut seen_col_positions = std::collections::HashSet::new();
+    let mut is_key_column = vec![false; subquery.columns.len()];
 
     for &col_pos in key_col_positions {
         let column = subquery
             .columns
             .get(col_pos)
             .expect("key column position out of bounds for materialized subquery");
-        if !seen_col_positions.insert(col_pos) {
+        if std::mem::replace(&mut is_key_column[col_pos], true) {
             continue;
         }
         index_columns
@@ -2135,7 +2203,7 @@ fn materialized_subquery_ephemeral_index(
     }
 
     for (col_pos, column) in subquery.columns.iter().enumerate() {
-        if seen_col_positions.contains(&col_pos) {
+        if is_key_column[col_pos] {
             continue;
         }
         index_columns

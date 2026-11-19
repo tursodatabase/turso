@@ -30,6 +30,7 @@ DROP VIEW [IF EXISTS] [schema-name.]view-name;
 
 - Any triggers defined as INSTEAD OF on the dropped view are also removed.
 - If the view is a materialized view, the stored data is also removed.
+- Dropping a materialized view fails with `database table is locked` while any other statement on the same connection that reads the database is running.
 
 ## Examples
 

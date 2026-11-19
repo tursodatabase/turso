@@ -695,7 +695,7 @@ fn test_pg_sequences_columns(db: TempDatabase) {
 
     pg_execute(
         &conn,
-        "CREATE SEQUENCE cat_full START WITH 5 INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CACHE 10",
+        "CREATE SEQUENCE cat_full START WITH 5 INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CACHE 1",
     );
 
     let schema = pg_query_text(
@@ -728,13 +728,6 @@ fn test_pg_sequences_columns(db: TempDatabase) {
     );
     assert_eq!(max, 1000);
 
-    // pg_sequences.cache_size reports the value the engine actually uses for
-    // allocation, not the value requested in CREATE SEQUENCE. Turso's
-    // disk-only sequence design never caches values (every nextval reads and
-    // writes the backing-table watermark inline with the executing
-    // transaction), so cache_size is always 1 regardless of the requested
-    // `CACHE n`. PG's behavior on a server that physically can't cache is
-    // the same — it reports the actual cache size, not the requested one.
     let cache = pg_query_int(
         &conn,
         "SELECT cache_size FROM pg_sequences WHERE sequencename = 'cat_full'",
@@ -1027,4 +1020,40 @@ fn test_pg_prepare_and_serial_ddl_dst_fuzz() {
             );
         }
     }
+}
+
+#[test]
+fn a_serial_column_keeps_its_sequence_across_a_reopen_when_another_relation_had_the_default_name() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "CREATE TABLE t_id_seq (a int)");
+    pg_execute(&pg, "CREATE TABLE t (id bigserial, b int)");
+    pg_execute(&pg, "INSERT INTO t (b) VALUES (1)");
+    assert_eq!(pg_query_int(&pg, "SELECT id FROM t"), 1);
+
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "INSERT INTO t (b) VALUES (2)");
+    assert_eq!(pg_query_int(&pg, "SELECT max(id) FROM t"), 2);
+    assert_eq!(
+        pg_query_int(&pg, "SELECT count(*) FROM t WHERE id IN (1, 2)"),
+        2
+    );
+}
+
+#[test]
+fn a_serial_column_of_a_schema_whose_name_has_a_quote_keeps_its_sequence_across_a_reopen() {
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "CREATE SCHEMA \"o'k\"");
+    pg_execute(&pg, "CREATE TABLE \"o'k\".t_id_seq (a int)");
+    pg_execute(&pg, "CREATE TABLE \"o'k\".t (id serial, b int)");
+    pg_execute(&pg, "INSERT INTO \"o'k\".t (b) VALUES (1)");
+
+    drop(pg);
+    let db = db.reopen();
+    let pg = db.connect_postgres();
+    pg_execute(&pg, "INSERT INTO \"o'k\".t (b) VALUES (2)");
+    assert_eq!(pg_query_int(&pg, "SELECT max(id) FROM \"o'k\".t"), 2);
 }

@@ -1,5 +1,15 @@
 @database :memory:
 
+test printf-character-nul {
+    SELECT hex(printf('%c', char(0) || 'a')),
+           hex(printf('%c', '')),
+           hex(printf('%3c', char(0))),
+           hex(printf('%.3c', char(0) || 'a'));
+}
+expect {
+    00|00|202000|000000
+}
+
 # ============================================
 # Basic string formatting (no flags/width/precision)
 # ============================================

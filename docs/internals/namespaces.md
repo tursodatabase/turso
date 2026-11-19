@@ -70,7 +70,7 @@ Places that address an internal table like `sqlite_schema` name `NamespaceId::RO
 
 ## Creating and dropping namespaces
 
-`CREATE SCHEMA app` and `DROP SCHEMA app` are statements of core (`translate_create_schema` and `translate_drop_schema` in `core/translate/schema.rs`), accepted only when the dialect supports namespaces. They exist only in the AST: the SQLite parser has no such syntax, and a frontend runs them through `Connection::create_namespace` and `drop_namespace`, which prepare the statement without parsing it.
+`CREATE SCHEMA app` and `DROP SCHEMA app` are statements of core (`translate_create_schema` and `translate_drop_schema` in `core/translate/schema/mod.rs`), accepted only when the dialect supports namespaces. They exist only in the AST: the SQLite parser has no such syntax, and a frontend runs them through `Connection::create_namespace` and `drop_namespace`, which prepare the statement without parsing it.
 
 CREATE SCHEMA picks the next id, one more than the largest id that a namespace or any object stored under a namespace has, so an id whose objects are still stored is never given out again. It inserts the namespace's row into the namespaces table, names the namespace in the schema in memory with the `AddNamespace` opcode, and bumps the schema cookie. The cookie change makes the namespace visible to every connection of the database, and the row is deleted again if the transaction rolls back.
 

@@ -72,3 +72,27 @@ expect {
     1
     2
 }
+
+# A virtual column of a custom type with a constant expression. ENCODE changes
+# its register for each row, so the expression must write the register again
+# for each row. Before, the second row read 500 and the third read 50000.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-constant-custom-type-is-computed-for-each-row {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, v cents AS (5) CHECK (v = 5)) STRICT;
+    INSERT INTO t(id, x) VALUES (1, 5), (2, 6), (3, 7) RETURNING v;
+    UPDATE t SET x = x + 1 RETURNING v;
+    DELETE FROM t RETURNING v;
+}
+expect {
+    5
+    5
+    5
+    5
+    5
+    5
+    5
+    5
+    5
+}

@@ -117,5 +117,5 @@ db-file reader might still need the SkipMap copy.
 | File | Contents |
 |------|----------|
 | `core/mvcc/database/mod.rs` | `sample_gc_lwm`, `gc_chain_now`, `gc_version_chain`, `stamp_chain_materialized`, incremental + Finalize sweeps |
-| `core/mvcc/database/checkpoint_state_machine.rs` | `written_*`, stamp sites, `gc_checkpointed_*`, `gc_floor_reader_mark` |
+| `core/mvcc/database/checkpoint.rs` | `written_*`, stamp sites, `gc_checkpointed_*`, `gc_floor_reader_mark` |
 | `core/mvcc/database/tests.rs` | Rule 2/3 unit tests, Passive transfer / unique-miss regressions |

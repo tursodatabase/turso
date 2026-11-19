@@ -29,3 +29,7 @@ precise-builds = true
 # which cargo-dist can't generate itself. Allow the CI file to differ from
 # `dist generate` output so the `dist plan` check doesn't fail.
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+x86_64-apple-darwin = "macos-15-intel"

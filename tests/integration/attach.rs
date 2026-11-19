@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 const PAGE_SIZE_OFFSET: u64 = 16;
@@ -182,8 +182,10 @@ fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> any
         before.get(AUX_PATH),
         "an attached MVCC checkpoint must write and fsync the attached database"
     );
-    assert!(
-        !io.has_unsynced_writes(&format!("{AUX_PATH}-log")),
+    let aux_log_path = format!("{AUX_PATH}-log");
+    assert_ne!(
+        after.get(&aux_log_path),
+        before.get(&aux_log_path),
         "an attached MVCC commit must fsync using aux.synchronous=FULL"
     );
     Ok(())
@@ -201,7 +203,7 @@ fn open_unreliable_attached_database(
         None,
         Arc::new(SqliteDialect),
     )?;
-    Ok(db.connect(ConnectOpts::new())?)
+    Ok(db.connect(ConnectOpts::new(SessionRole::Superuser))?)
 }
 
 #[turso_macros::test]
@@ -398,7 +400,7 @@ fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect(ConnectOpts::new())?;
+    let aux_conn = aux_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     assert!(aux_conn.mvcc_enabled());
 
     Ok(())
@@ -420,7 +422,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect(ConnectOpts::new())?;
+    let aux_conn = aux_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
 
     let err = conn
@@ -539,7 +541,7 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
                 durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
             ),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let err = conn
@@ -910,7 +912,7 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
         Arc::new(SqliteDialect),
     )?;
 
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
     conn.execute("CREATE TABLE main_t (x INTEGER)")?;
     conn.execute("INSERT INTO main_t VALUES (1)")?;
@@ -924,7 +926,7 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     // next attached read transaction sees the database as changed, drops its
     // cached pages and cached schema cookie, and must re-read the header page
     // from disk inside its attached Transaction opcode.
-    let conn2 = db.connect(ConnectOpts::new())?;
+    let conn2 = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     conn2.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
     conn2.execute("INSERT INTO aux1.t VALUES (2)")?;
 

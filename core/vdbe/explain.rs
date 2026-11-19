@@ -1038,6 +1038,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::RowSecurityViolation { denial } => (
+                "RowSecurityViolation",
+                0,
+                0,
+                0,
+                Value::build_text(denial.to_string()),
+                0,
+                "".to_string(),
+            ),
             Insn::Transaction { db, tx_mode, schema_cookie} => (
                 "Transaction",
                 *db as i64,
@@ -2089,19 +2098,18 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
-            Insn::AddRole {
+            Insn::CatalogApply {
                 db,
-                id_reg,
-                name,
-                superuser,
+                apply,
+                value_regs,
             } => (
-                "AddRole",
+                "CatalogApply",
                 *db as i64,
-                *id_reg as i64,
+                value_regs.first().map_or(0, |reg| *reg as i64),
                 0,
-                Value::build_text(name.clone()),
+                Value::build_text(format!("{apply:?}")),
                 0,
-                format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
+                "apply the change to the dialect's state in the schema".to_string(),
             ),
             Insn::DropView {
                 db,

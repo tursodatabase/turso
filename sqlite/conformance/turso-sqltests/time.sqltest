@@ -355,6 +355,13 @@ expect {
     2011-11-18T15:56:35Z
 }
 
+test time_fmt_iso_seconds_out_of_range {
+    SELECT time_fmt_iso(x'01800000000000000000000000');
+}
+expect error {
+    invalid datetime format
+}
+
 test time_fmt_datetime {
     SELECT time_fmt_datetime(time_date(2011, 11, 18, 15, 56, 35), 3*3600);
     SELECT time_fmt_datetime(time_date(2011, 11, 18, 15, 56, 35));

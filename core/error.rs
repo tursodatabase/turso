@@ -117,6 +117,9 @@ pub enum LimboError {
     ParseFloatError(#[from] std::num::ParseFloatError),
     #[error("Parse error: {0}")]
     InvalidDate(String),
+    /// A date or time field is out of range, such as `2024-02-30`.
+    #[error("Parse error: {0}")]
+    DatetimeFieldOverflow(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]
@@ -264,6 +267,7 @@ impl LimboError {
             | Self::TxError(message)
             | Self::LockingError(message)
             | Self::InvalidDate(message)
+            | Self::DatetimeFieldOverflow(message)
             | Self::InvalidTime(message)
             | Self::InvalidModifier(message)
             | Self::InvalidArgument(message)

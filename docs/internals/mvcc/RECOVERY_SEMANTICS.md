@@ -1,7 +1,7 @@
 # MVCC Recovery and Checkpoint Semantics
 
 This document describes the MVCC recovery and checkpoint behavior as implemented in
-`core/mvcc/database/mod.rs` and `core/mvcc/database/checkpoint_state_machine.rs`.
+`core/mvcc/database/mod.rs` and `core/mvcc/database/checkpoint.rs`.
 
 The checkpoint model is stop-the-world (blocking checkpoint lock).
 
@@ -66,12 +66,20 @@ Notes:
 6. Checkpoint WAL (backfill WAL frames into DB file).
 7. Fsync DB file (unless `SyncMode::Off`).
 8. Truncate logical log to 0 (salt regenerated in memory; header written with next frame).
-9. Fsync logical log (unless `SyncMode::Off`).
-10. Truncate WAL.
-11. Finalize: GC checkpointed versions, release lock.
+9. Truncate WAL.
+10. Finalize: GC checkpointed versions, release lock.
 
-WAL truncation is last. Until the DB file and logical-log cleanup are durable,
-the WAL remains the authoritative recovery source.
+WAL truncation is last. Until the DB file is durable, the WAL remains the
+authoritative recovery source.
+
+The logical log needs no fsync after step 8. If a crash loses the truncation,
+the old frames come back, but their `commit_ts` is at or below
+`persistent_tx_ts_max`, so recovery skips them (invariant 5).
+
+A switch from MVCC to WAL mode (`PRAGMA journal_mode = 'wal'`) is different. It
+fsyncs the logical log after the checkpoint, before it writes the WAL-mode
+header, because a database in WAL mode does not open while its logical log has
+frames.
 
 ## Correctness Invariants
 

@@ -1,10 +1,11 @@
+#[cfg(feature = "conn_raw_api")]
 use crate::alloc::TryClone;
 use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
+use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -14,6 +15,7 @@ use crate::sync::{
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::IOResult;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -43,6 +45,7 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::borrow::Cow;
 
+use crate::security::roles::SessionRole;
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -51,6 +54,9 @@ use std::path::Path;
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+
+mod reparse;
+pub use reparse::{ReparseSchemaInner, ReparseSchemaState};
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -70,7 +76,7 @@ fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
 }
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TransactionState {
+pub enum TransactionState {
     Write {
         schema_did_change: bool,
     },
@@ -189,34 +195,6 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-/// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
-/// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
-/// `Start` is the fresh state (cookie not yet read / schema build not yet
-/// begun); `Building` carries the half-built schema, captured table-valued
-/// functions, the held reparse guard, and the current sub-phase across IO
-/// yields.
-#[derive(Default)]
-pub enum ReparseSchemaState {
-    #[default]
-    Start,
-    Building(Box<ReparseSchemaInner>),
-}
-
-pub struct ReparseSchemaInner {
-    /// Held for the whole reparse so a concurrent reparse on this connection
-    /// trips the recursion assert. Dropped when the schema is finalized.
-    _guard: SchemaReparseGuard,
-    fresh: Schema,
-    /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
-    /// instead of re-reading each backing table. `None` for a normal reparse,
-    /// which recovers descriptors from disk in the `PopulateSequences` phase.
-    preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
-    /// The `sqlite_schema` scan, which also collects the indexes and
-    /// materialized views that are built once the types are loaded.
-    parse: Box<crate::util::ParseSchemaRowsState>,
-    phase: ReparsePhase,
-}
-
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -227,69 +205,6 @@ pub enum SubqueryUnnestingMode {
     Disabled = 1,
     /// Use the rewritten plan whenever the rewrite applies.
     Forced = 2,
-}
-
-enum ReparsePhase {
-    /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
-    ParseSchema,
-    /// Loading the names of the namespaces from the namespaces table.
-    LoadNamespaces {
-        stmt: Box<Statement>,
-        rows: Vec<(i64, String)>,
-    },
-    /// Recovering sequence descriptors from each `__turso_internal_seq_*`
-    /// backing table via SQL (or grafting the VACUUM-preserved map). The
-    /// per-backing-table descriptor read yields IO, so the worklist and the
-    /// in-flight statement are carried across re-entry here.
-    PopulateSequences {
-        /// `(backing_table_name, seq_name)` worklist; `None` until lazily
-        /// computed. Left empty when preserved sequences are grafted.
-        pending: Option<crate::alloc::Vec<(String, String)>>,
-        /// Index of the backing table currently being read.
-        idx: usize,
-        /// In-flight descriptor `SELECT`, created lazily per backing table.
-        stmt: Option<Box<Statement>>,
-        /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
-        meta: Option<(i64, i64, i64, i64, bool)>,
-        /// Sequence reconstructed from `meta`, retained while the watermark
-        /// query yields IO.
-        seq: Option<crate::schema::Sequence>,
-        /// In-flight watermark `SELECT`, created after `seq` is known.
-        watermark_stmt: Option<Box<Statement>>,
-        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
-        watermark_row: Option<(i64, bool)>,
-    },
-    /// Loading custom type definitions from the internal types table.
-    LoadTypes {
-        stmt: Box<Statement>,
-        type_rows: Vec<String>,
-    },
-    /// Loading the CREATE TYPE statements `type_sqls`, then building the
-    /// materialized views and indexes collected by the `sqlite_schema` scan.
-    BuildIndexes { type_sqls: Vec<String> },
-    /// Loading roles from the roles table into the role catalog.
-    LoadRoles {
-        stmt: Box<Statement>,
-        rows: Vec<Vec<Value>>,
-    },
-    /// Best-effort ANALYZE-stats refresh before finalizing.
-    RefreshStats {
-        stats: crate::stats::RefreshAnalyzeStatsState,
-    },
-}
-
-impl ReparsePhase {
-    fn populate_sequences() -> Self {
-        ReparsePhase::PopulateSequences {
-            pending: None,
-            idx: 0,
-            stmt: None,
-            meta: None,
-            seq: None,
-            watermark_stmt: None,
-            watermark_row: None,
-        }
-    }
 }
 
 /// Re-entrant driver state for
@@ -385,13 +300,80 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// How much storage the main database uses, read by
+/// [`Connection::storage_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageStats {
+    /// The page size in bytes, as `PRAGMA page_size` returns it.
+    pub page_size: u32,
+    /// The pages in the database, as `PRAGMA page_count` returns it. Under
+    /// MVCC this counts the pages as of the last checkpoint of the logical
+    /// log: rows committed since then are only in the log.
+    pub page_count: u32,
+    /// The unused pages, as `PRAGMA freelist_count` returns it. Under MVCC,
+    /// as of the last checkpoint, like `page_count`.
+    pub freelist_count: u32,
+    /// The bytes written to the MVCC logical log since its last checkpoint,
+    /// which holds every change committed since then, deleted and replaced
+    /// rows included. 0 without MVCC.
+    pub logical_log_bytes: u64,
+}
+
+/// A read of [`StorageStats`], started by [`Connection::storage_stats`].
+pub struct StorageStatsRead {
+    connection: Arc<Connection>,
+    statement: Option<Statement>,
+    stats: Option<StorageStats>,
+}
+
+impl StorageStatsRead {
+    /// Reads the counts with a query of the engine's own, which the role the
+    /// connection's user set does not limit. It runs like a top-level
+    /// statement, in its own read transaction when no transaction is open.
+    /// Returns [`IOResult::IO`] when the query waits for storage: wait for
+    /// the completions and call `read` again. Do not run other statements
+    /// on the connection until it returns [`IOResult::Done`] or an error,
+    /// or until this value is dropped.
+    pub fn read(&mut self) -> Result<IOResult<StorageStats>> {
+        let statement = match &mut self.statement {
+            Some(statement) => statement,
+            None => self
+                .statement
+                .insert(self.connection.prepare_engine_metadata_read(
+                "SELECT * FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count()",
+            )?),
+        };
+        let stats = &mut self.stats;
+        crate::return_if_io!(statement.run_with_row_callback_nonblock(|row| {
+            let count = |idx| {
+                u32::try_from(row.get::<i64>(idx)?)
+                    .map_err(|_| LimboError::InternalError("negative storage count".to_string()))
+            };
+            *stats = Some(StorageStats {
+                page_size: count(0)?,
+                page_count: count(1)?,
+                freelist_count: count(2)?,
+                logical_log_bytes: 0,
+            });
+            Ok(())
+        }));
+        let mut stats = self.stats.ok_or_else(|| {
+            LimboError::InternalError("storage stats query returned no row".to_string())
+        })?;
+        if let Some(mv_store) = self.connection.mv_store().as_ref() {
+            stats.logical_log_bytes = mv_store.logical_log_offset();
+        }
+        Ok(IOResult::Done(stats))
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
-    pub(crate) db: Arc<Database>,
+    pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -409,7 +391,7 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
-    pub(crate) syms: parking_lot::RwLock<SymbolTable>,
+    pub syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// Page size from the last `PRAGMA page_size` on any database of this connection, or 0.
@@ -526,7 +508,7 @@ pub struct Connection {
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
-    pub(super) executing_triggers: RwLock<Vec<Arc<Trigger>>>,
+    pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
@@ -546,6 +528,9 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// The namespace whose objects this connection is dropping one statement
+    /// at a time.
+    pub(super) namespace_being_dropped: RwLock<Option<NamespaceId>>,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Whether non-TEMP triggers fire for statements prepared on this
     /// connection. TEMP triggers always fire, matching SQLite's
@@ -577,10 +562,18 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// How many unfinished statements have opened a transaction with a
+    /// `Transaction` instruction, that is, read or write a database file.
+    /// SQLite's `db->nVdbeRead`.
+    pub(crate) n_active_read_statements: AtomicI32,
+    /// How many of `n_active_read_statements` free a b-tree
+    /// (`PreparedProgram::destroys_btree`), as DROP TABLE and DROP INDEX do.
+    pub(crate) n_active_destroy_statements: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    pub(super) automatic_index_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// One prepared cursor per index-method attachment touched by the active
@@ -708,12 +701,12 @@ impl Connection {
     }
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(
-            self.db.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )
-        .expect("built-in type definitions are malformed");
+        // new_schema only fails if built-in type SQL is malformed (programmer bug).
+        let mut schema = self
+            .db
+            .dialect()
+            .new_schema(self.db.experimental_custom_types_enabled())
+            .expect("built-in type definitions are malformed");
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -939,7 +932,7 @@ impl Connection {
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.
     #[inline]
-    pub(crate) fn bump_prepare_context_generation(&self) {
+    pub fn bump_prepare_context_generation(&self) {
         self.prepare_context_generation
             .fetch_add(1, Ordering::Release);
     }
@@ -1145,7 +1138,13 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                // An engine schema statement is the engine's own SQLite text,
+                // whatever the database's dialect parses.
+                if matches!(origin, StatementOrigin::EngineSchemaWrite) {
+                    self.dialect().parse_internal(sql)?
+                } else {
+                    self.parse_sql(sql)?
+                }
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1162,6 +1161,7 @@ impl Connection {
 
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 byte_offset_end,
@@ -1218,6 +1218,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 0,
@@ -1413,380 +1414,29 @@ impl Connection {
         pager.cleanup_read_tx();
     }
 
-    /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
-    /// Retained for the many synchronous callers (statement reprepare, attach,
-    /// extension load, vacuum). The genuinely non-blocking callers (MVCC
-    /// bootstrap, the open-db state machine) drive `*_nonblock` directly.
-    pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let io = self.pager.load().io.clone();
-        let mut state = ReparseSchemaState::default();
-        io.block(|| self.reparse_schema_nonblock(&mut state))
-    }
-
-    /// VACUUM-only reparse that grafts a caller-supplied sequence-
-    /// descriptor map onto the freshly parsed schema rather than re-
-    /// reading the backing tables from disk. VACUUM preserves every
-    /// sequence's definition (start/inc/min/max/cycle) — only physical
-    /// page locations change — so the source connection's pre-VACUUM
-    /// sequences map is still valid for the post-VACUUM image.
-    ///
-    /// Blocking shim: VACUUM runs through the VDBE stepping layer (which
-    /// does not thread IO out), so it drives the non-blocking reparse to
-    /// completion here, seeding the `PopulateSequences` phase with the
-    /// preserved map so it grafts rather than re-reading each backing table.
-    pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
+    /// Prepares a read of an engine table that holds state the schema is
+    /// built from: the schema table or the dialect's own schema state. The table belongs to the engine, so its name is looked up in
+    /// every database, whatever the search path says, and no role's
+    /// privileges limit the read. The read is a top-level statement, so it
+    /// runs in its own read transaction when the schema is read outside a
+    /// transaction.
+    pub(crate) fn prepare_engine_metadata_read(
         self: &Arc<Connection>,
-        cookie: u32,
-        sequences: rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>,
-    ) -> Result<()> {
-        let io = self.pager.load().io.clone();
-        let mut state = ReparseSchemaState::default();
-        // `init_reparse_building` consumes the preserved map exactly once, on
-        // the first (Start) invocation; `io.block` re-invokes the closure on
-        // every IO completion, so `take()` yields `Some` only that first time.
-        let mut preserved = Some(sequences);
-        io.block(|| {
-            if matches!(state, ReparseSchemaState::Start) {
-                state = ReparseSchemaState::Building(Box::new(
-                    self.init_reparse_building(cookie, preserved.take())?,
-                ));
-            }
-            self.drive_reparse_building(&mut state)
-        })
+        sql: &str,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
     }
 
-    /// Non-blocking schema reparse. Reads the current schema cookie, then drives
-    /// the schema rebuild via the shared [`ReparseSchemaState`].
-    pub(crate) fn reparse_schema_nonblock(
-        self: &Arc<Connection>,
-        state: &mut ReparseSchemaState,
-    ) -> crate::types::IOResultOr<()> {
-        use crate::types::IOResult;
-        if matches!(state, ReparseSchemaState::Start) {
-            // read cookie before consuming statement program - otherwise we can
-            // end up reading cookie with closed transaction state
-            let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
-            *state =
-                ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
-        }
-        self.drive_reparse_building(state)
-    }
-
-    /// Synchronous setup shared by the reparse entry points: install the cookie,
-    /// build a fresh schema, capture table-valued functions, install the empty
-    /// schema (the reprepare hack), and prepare the sqlite_schema scan.
-    /// `preserved_sequences` is `Some` only for VACUUM, which grafts the map in
-    /// the `PopulateSequences` phase instead of re-reading the backing tables.
-    fn init_reparse_building(
-        self: &Arc<Connection>,
-        cookie: u32,
-        preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
-    ) -> Result<ReparseSchemaInner> {
-        let guard = self.schema_reparse_guard();
-        self.pager.load().set_schema_cookie(Some(cookie));
-        // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(
-            self.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )?;
-        fresh.schema_version = cookie;
-
-        fresh.copy_table_valued_functions(&self.schema.read());
-
-        // TODO: this is hack to avoid a cyclical problem with schema reprepare
-        // The problem here is that we prepare a statement here, but when the statement tries
-        // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
-        // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
-        // with a new clean schema that has the same header cookie.
-        self.with_schema_mut(|schema| {
-            *schema = fresh.try_clone()?;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
-
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
-
-        // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
-        let mv_tx = if self.is_mvcc_bootstrap_connection() {
-            None
-        } else {
-            self.get_mv_tx()
-        };
-        Ok(ReparseSchemaInner {
-            _guard: guard,
-            fresh,
-            preserved_sequences,
-            parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
-            phase: ReparsePhase::ParseSchema,
-        })
-    }
-
-    /// Drive the schema-rebuild phases held in `state` (must be `Building`).
-    /// Yields IO; on completion installs the finished schema and resets `state`.
-    fn drive_reparse_building(
-        self: &Arc<Connection>,
-        state: &mut ReparseSchemaState,
-    ) -> crate::types::IOResultOr<()> {
-        use crate::types::IOResult;
-        loop {
-            let ReparseSchemaState::Building(inner) = state else {
-                unreachable!("drive_reparse_building requires Building state");
-            };
-            match &mut inner.phase {
-                ReparsePhase::ParseSchema => {
-                    // Resolver so attached-db qualifiers in temp triggers can be
-                    // mapped to their actual index on this connection.
-                    let attached_resolver = |name: &str| -> Option<usize> {
-                        self.qualifiers
-                            .database_id(&crate::util::normalize_ident(name))
-                    };
-                    crate::return_if_io!(crate::util::parse_schema_rows(
-                        &mut inner.parse,
-                        &mut inner.fresh,
-                        &self.syms.read(),
-                        &attached_resolver,
-                        self.db.dialect().as_ref(),
-                    ));
-
-                    // Under a dialect without namespaces, a table of that name
-                    // is an ordinary table.
-                    if inner.fresh.supports_namespaces()
-                        && inner.fresh.has_table(
-                            NamespaceId::ROOT,
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-                        )
-                    {
-                        // Install the schema so the namespaces table can be read.
-                        self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.try_clone()?;
-                            Ok::<_, crate::alloc::TryReserveError>(())
-                        })??;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT id, name FROM {}",
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-                        ))?;
-                        inner.phase = ReparsePhase::LoadNamespaces {
-                            stmt: Box::new(stmt),
-                            rows: Vec::new(),
-                        };
-                    } else {
-                        inner.fresh.load_namespace_names(&[])?;
-                        inner.phase = ReparsePhase::populate_sequences();
-                    }
-                }
-                ReparsePhase::LoadNamespaces { stmt, rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
-                        Ok(())
-                    }));
-                    inner.fresh.load_namespace_names(rows)?;
-                    // Next: recover sequence descriptors (or graft the VACUUM map).
-                    inner.phase = ReparsePhase::populate_sequences();
-                }
-                ReparsePhase::PopulateSequences {
-                    pending,
-                    idx,
-                    stmt,
-                    meta,
-                    seq,
-                    watermark_stmt,
-                    watermark_row,
-                } => {
-                    // Lazy init: graft the VACUUM-preserved descriptor map, or
-                    // compute the worklist of backing tables to read from disk.
-                    // When there is real work, install `fresh` first so the
-                    // descriptor SELECTs can resolve the backing tables.
-                    if pending.is_none() {
-                        if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.set_sequences(NamespaceId::ROOT, sequences);
-                            *pending = Some(crate::alloc::vec![]);
-                        } else {
-                            let work = inner.fresh.sequence_backing_table_names();
-                            if !work.is_empty() {
-                                self.with_schema_mut(|schema| {
-                                    *schema = inner.fresh.try_clone()?;
-                                    Ok::<_, crate::alloc::TryReserveError>(())
-                                })??;
-                            }
-                            *pending = Some(work);
-                        }
-                    }
-
-                    // Read each remaining backing table's descriptor row. The
-                    // backing table is internal; a missing/unreadable descriptor
-                    // row is on-disk corruption (not "sequence missing"), so any
-                    // failure surfaces as `Corrupt` and fails the open rather than
-                    // silently dropping the sequence.
-                    loop {
-                        let entry = {
-                            let work = pending.as_ref().expect("pending initialized above");
-                            if *idx >= work.len() {
-                                break;
-                            }
-                            work[*idx].clone()
-                        };
-                        let (backing_table_name, seq_name) = entry;
-                        let normalized = crate::util::normalize_ident(&seq_name);
-                        let (namespace, sequence_name) = inner.fresh.demangle_name(&normalized);
-                        if inner.fresh.has_sequence(namespace, sequence_name) {
-                            *idx += 1;
-                            *stmt = None;
-                            *meta = None;
-                            *seq = None;
-                            *watermark_stmt = None;
-                            *watermark_row = None;
-                            continue;
-                        }
-                        if seq.is_none() {
-                            crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
-                                &backing_table_name,
-                                &seq_name,
-                                stmt,
-                                meta,
-                            ));
-                            *seq = Some(Self::sequence_from_descriptor_meta(
-                                sequence_name,
-                                &backing_table_name,
-                                *meta,
-                            )?);
-                            *stmt = None;
-                            *meta = None;
-                        }
-                        let sequence = seq.as_ref().expect("sequence set above");
-                        crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
-                            &backing_table_name,
-                            sequence,
-                            watermark_stmt,
-                            watermark_row,
-                        ));
-                        let watermark = Self::sequence_watermark_from_row(
-                            &backing_table_name,
-                            sequence,
-                            *watermark_row,
-                        )?;
-                        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                            mv_store.set_sequence_watermark(&normalized, watermark);
-                        }
-                        let sequence = seq.take().expect("sequence set above");
-                        inner
-                            .fresh
-                            .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
-                        *idx += 1;
-                        *stmt = None;
-                        *meta = None;
-                        *watermark_stmt = None;
-                        *watermark_row = None;
-                    }
-
-                    // Decide whether to load custom types next.
-                    if self.experimental_custom_types_enabled()
-                        && inner
-                            .fresh
-                            .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
-                    {
-                        // Temporarily install the schema so we can query against it.
-                        self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.try_clone()?;
-                            Ok::<_, crate::alloc::TryReserveError>(())
-                        })??;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT name, sql FROM {}",
-                            crate::schema::TURSO_TYPES_TABLE_NAME
-                        ))?;
-                        inner.phase = ReparsePhase::LoadTypes {
-                            stmt: Box::new(stmt),
-                            type_rows: Vec::new(),
-                        };
-                    } else {
-                        inner.phase = ReparsePhase::BuildIndexes { type_sqls: vec![] };
-                    }
-                }
-                ReparsePhase::LoadTypes { stmt, type_rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        type_rows.push(row.get::<&str>(1)?.to_string());
-                        Ok(())
-                    }));
-                    inner.phase = ReparsePhase::BuildIndexes {
-                        type_sqls: std::mem::take(type_rows),
-                    };
-                }
-                ReparsePhase::BuildIndexes { type_sqls } => {
-                    crate::util::populate_types_views_then_indices(
-                        &mut inner.parse,
-                        &mut inner.fresh,
-                        &self.syms.read(),
-                        type_sqls,
-                    )?;
-                    inner.phase = self.load_roles_phase(&inner.fresh)?;
-                }
-                ReparsePhase::LoadRoles { stmt, rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        turso_assert!(
-                            !matches!(self.get_tx_state(), TransactionState::None),
-                            "roles must be read in a transaction"
-                        );
-                        rows.push(row.get_values().cloned().collect());
-                        Ok(())
-                    }));
-                    inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
-                    inner.phase = ReparsePhase::RefreshStats {
-                        stats: Default::default(),
-                    };
-                }
-                ReparsePhase::RefreshStats { stats } => {
-                    // Best-effort load stats if sqlite_stat1 is present.
-                    crate::return_if_io!(crate::stats::refresh_analyze_stats_nonblock(self, stats));
-
-                    // Finalize: install the rebuilt schema. Take ownership so the
-                    // guard drops and `state` is reusable.
-                    let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
-                        unreachable!("state is Building");
-                    };
-                    let fresh = inner.fresh;
-                    tracing::debug!(
-                        "reparse_schema: schema_version={}, tables={:?}",
-                        fresh.schema_version,
-                        fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
-                    );
-                    self.with_schema_mut(|schema| {
-                        *schema = fresh;
-                    })?;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
-    /// Returns the phase that loads the roles table into `fresh`, or the
-    /// stats refresh phase if the dialect has no roles or the database has no
-    /// roles table. The fresh
-    /// schema is installed first, because the current schema may not contain
-    /// the roles table yet.
-    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !self.db.dialect().supports_roles()
-            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-        {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
-        }
-        self.with_schema_mut(|schema| {
-            *schema = fresh.try_clone()?;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
-        let stmt = self.prepare_roles_read()?;
-        Ok(ReparsePhase::LoadRoles {
-            stmt: Box::new(stmt),
-            rows: Vec::new(),
-        })
-    }
-
-    /// Prepares the read of the roles table, for opening the database and
-    /// for reading the schema again. The table belongs to the engine, so its
-    /// name is looked up in every database, whatever the search path says.
-    /// The read is a top-level statement, so it runs in its own read
-    /// transaction when the schema is read outside a transaction.
-    pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
-        self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
+    /// Prepares a schema statement of the engine's own: SQLite text whatever
+    /// the database's dialect, allowed to name the engine's reserved objects,
+    /// and run as an ordinary top-level statement with its own transaction
+    /// work. Frontends use it to create and fill their internal tables at
+    /// open, like the relation catalog of the PostgreSQL frontend.
+    pub fn prepare_engine_schema_statement(self: &Arc<Connection>, sql: &str) -> Result<Statement> {
+        self.start_nested();
+        let statement = self.prepare_with_origin(sql, StatementOrigin::EngineSchemaWrite);
+        self.end_nested();
+        statement
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1838,7 +1488,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1860,7 +1510,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -1880,7 +1530,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -1903,7 +1553,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 
@@ -1930,7 +1580,7 @@ impl Connection {
                 None,
                 dialect,
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
             return Ok((io, conn));
         }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
@@ -1960,7 +1610,7 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -2026,6 +1676,18 @@ impl Connection {
         self.fk_pragma.load(Ordering::Acquire)
     }
 
+    /// Names the namespace whose objects the statements prepared from now on
+    /// drop one at a time, or None. An object of that namespace that depends
+    /// on a dropped object does not stop the drop, because it is dropped too.
+    pub fn set_namespace_being_dropped(&self, namespace: Option<NamespaceId>) {
+        *self.namespace_being_dropped.write() = namespace;
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn namespace_being_dropped(&self) -> Option<NamespaceId> {
+        *self.namespace_being_dropped.read()
+    }
+
     /// Turns non-TEMP triggers on or off for statements prepared from now on.
     /// TEMP triggers keep firing either way (SQLite's
     /// `SQLITE_DBCONFIG_ENABLE_TRIGGER` rule). Already-prepared statements are
@@ -2056,6 +1718,15 @@ impl Connection {
 
     pub fn check_constraints_ignored(&self) -> bool {
         self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_automatic_index(&self, enable: bool) {
+        self.automatic_index_pragma.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn automatic_index(&self) -> bool {
+        self.automatic_index_pragma.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
@@ -2190,7 +1861,39 @@ impl Connection {
         Ok(Some(generation))
     }
 
-    pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+    pub(crate) fn refresh_schema_for_reprepare(self: &Arc<Self>) -> Result<()> {
+        let in_snapshot_without_ddl = matches!(
+            self.get_tx_state(),
+            TransactionState::Read
+                | TransactionState::Write {
+                    schema_did_change: false
+                }
+        );
+        if self.mv_store().is_none() && in_snapshot_without_ddl {
+            // Compile against the schema cookie in this connection's read snapshot. The schema
+            // cache shared by all connections can be older (a writer's commit is visible before
+            // it calls `publish_schema_if_newer`) or newer (another connection committed after
+            // this snapshot was taken).
+            let cookie = match self.read_current_schema_cookie() {
+                Ok(cookie) => cookie,
+                // An empty database has no page 1 yet, and its schema cookie is 0.
+                Err(LimboError::Page1NotAlloc) => 0,
+                Err(err) => return Err(err),
+            };
+            if self.schema.read().schema_version == cookie {
+                return Ok(());
+            }
+            // Copy the shared schema when it matches the snapshot. Reparse only if neither the
+            // connection's schema nor the shared one does.
+            let shared_schema = self.db.schema.lock().clone();
+            if shared_schema.schema_version == cookie {
+                *self.schema.write() = shared_schema;
+            } else {
+                self.reparse_schema()?;
+            }
+            self.bump_prepare_context_generation();
+            return Ok(());
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
@@ -2201,6 +1904,7 @@ impl Connection {
             *self.schema.write() = schema;
             self.bump_prepare_context_generation();
         }
+        Ok(())
     }
 
     /// Read schema version at current transaction
@@ -2348,8 +2052,18 @@ impl Connection {
         use crate::Buffer;
 
         let buffer = Arc::new(Buffer::new_temporary(frame.len()));
-        let c = self.pager.load().wal_get_frame(frame_no, buffer.clone())?;
-        self.db.io.wait_for_completion(c)?;
+        let pager = self.pager.load();
+        let started_read_tx = !pager.holds_read_lock();
+        if started_read_tx {
+            pager.begin_read_tx()?;
+        }
+        let result = pager
+            .wal_get_frame(frame_no, buffer.clone())
+            .and_then(|c| self.db.io.wait_for_completion(c));
+        if started_read_tx {
+            pager.end_read_tx();
+        }
+        result?;
         frame.copy_from_slice(buffer.as_slice());
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
@@ -2847,6 +2561,18 @@ impl Connection {
         self.pager.load().get_page_size_unchecked()
     }
 
+    /// Starts reading the page size, page count and freelist count of the
+    /// main database, and the size of its MVCC logical log. An embedder uses
+    /// it to measure the database on a user's connection, whatever role the
+    /// user set.
+    pub fn storage_stats(self: &Arc<Connection>) -> StorageStatsRead {
+        StorageStatsRead {
+            connection: self.clone(),
+            statement: None,
+            stats: None,
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -2981,9 +2707,7 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            let mut rows = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -3038,6 +2762,7 @@ impl Connection {
 
             // The schema already holds every stored type.
             match schema.populate_types_views_then_indices(
+                self.dialect().as_ref(),
                 &syms,
                 &[],
                 materialized_view_info,
@@ -3306,7 +3031,7 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
+    pub fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
             crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
@@ -3502,7 +3227,7 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::CreateSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        self.prepare_namespace_stmt(statement)?.run_ignore_rows()?;
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()?;
         let namespace = self
             .current_qualifiers()
             .get(name)
@@ -3526,13 +3251,14 @@ impl Connection {
         let statement = turso_parser::ast::Stmt::DropSchema {
             name: turso_parser::ast::Name::exact(name.to_string()),
         };
-        self.prepare_namespace_stmt(statement)?.run_ignore_rows()
+        self.prepare_ast_stmt(statement)?.run_ignore_rows()
     }
 
-    /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
+    /// Prepares a statement that a frontend built as an AST, such as CREATE
+    /// SCHEMA, DROP SCHEMA or GRANT. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
-    /// schema, translates the statement itself.
-    pub fn prepare_namespace_stmt(
+    /// schema, translates the AST itself.
+    pub fn prepare_ast_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
@@ -3578,14 +3304,6 @@ impl Connection {
             .search_order(self.search_path.read().as_deref())
     }
 
-    /// Returns the roles of the main database as seen by this connection.
-    /// Outside a transaction, this includes roles that other connections
-    /// committed.
-    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
-        self.maybe_update_schema();
-        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
-    }
-
     pub fn session_role(&self) -> RoleId {
         self.session_role
     }
@@ -3594,8 +3312,31 @@ impl Connection {
         *self.current_role.read()
     }
 
+    /// Whether the current role passes every privilege check. Outside a
+    /// transaction, this sees role changes that other connections committed.
     pub fn current_role_is_superuser(&self) -> bool {
-        self.role_catalog().is_superuser(self.current_role())
+        self.maybe_update_schema();
+        let role = self.current_role();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            self.db.dialect().role_is_superuser(schema, role)
+        })
+    }
+
+    /// Whether the current role may read the value of `sequence` of
+    /// `namespace`, which needs SELECT or USAGE on it, as in PostgreSQL.
+    pub fn may_read_sequence(&self, namespace: NamespaceRef, sequence: &str) -> bool {
+        if namespace.database_id != MAIN_DB_ID || self.current_role_is_superuser() {
+            return true;
+        }
+        let role = self.current_role();
+        let dialect = self.dialect();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            [ast::Privilege::Select, ast::Privilege::Usage]
+                .into_iter()
+                .any(|privilege| {
+                    dialect.role_has_privilege(schema, namespace.id, sequence, role, privilege)
+                })
+        })
     }
 
     /// Statements prepared under the previous role are prepared again, because
@@ -4764,7 +4505,7 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
-    pub(crate) fn get_tx_state(&self) -> TransactionState {
+    pub fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
 
@@ -4796,7 +4537,7 @@ impl Connection {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
 
-    pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
         *self.mv_tx.read()
     }
 
@@ -4829,7 +4570,7 @@ impl Connection {
     }
 
     /// Get MVCC transaction ID and mode for a specific database.
-    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
@@ -5180,7 +4921,7 @@ impl Connection {
 
     /// Get the MvStore for a specific database.
     /// Returns None for databases without MVCC or for bootstrap connections.
-    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+    pub fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
@@ -5195,6 +4936,16 @@ impl Connection {
                     .and_then(|entry| entry.db.get_mv_store().as_ref().cloned())
             }
         }
+    }
+
+    /// Turns off the automatic checkpoint of the MVCC logical log, like
+    /// `PRAGMA mvcc_checkpoint_threshold = -1` but without running SQL, so
+    /// the role the connection's user set does not limit it. The threshold
+    /// belongs to the database, so this applies to all of its connections.
+    /// Explicit checkpoints still run. Fails when the database does not use
+    /// MVCC.
+    pub fn disable_mvcc_auto_checkpoint(&self) -> Result<()> {
+        self.set_mvcc_checkpoint_threshold(-1)
     }
 
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
@@ -5391,6 +5142,7 @@ impl SymbolTable {
 mod tests {
     use super::*;
     use crate::attach::AttachDatabaseState;
+    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::EngineDialect;
     use crate::IOResult;
@@ -5407,20 +5159,12 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap()
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
-    }
-
-    #[test]
-    fn test_the_sqlite_dialect_does_not_store_namespaces() {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(&temp_dir.path().join("main.db"));
-        assert!(conn.prepare("CREATE SCHEMA app").is_err());
-        assert!(conn.create_namespace("app").is_err());
-        assert_eq!(conn.qualifier("app"), None);
     }
 
     fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
@@ -5448,179 +5192,12 @@ mod tests {
         }
     }
 
-    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
-        let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
-    }
-
-    fn text_value(value: &Value) -> &str {
-        match value {
-            Value::Text(text) => text.as_str(),
-            other => panic!("expected text value, got {other:?}"),
-        }
-    }
-
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let index = conn.qualifiers.database_id(alias).unwrap();
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
-    }
-
-    #[test]
-    fn test_named_memory_databases_on_same_io_are_distinct() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let draft_db =
-            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(EngineDialect)).unwrap();
-        let synced_db =
-            Database::open_file(io, ":memory:sync-synced", Arc::new(EngineDialect)).unwrap();
-        assert!(!Arc::ptr_eq(&draft_db, &synced_db));
-
-        let draft = draft_db.connect(ConnectOpts::new()).unwrap();
-        let synced = synced_db.connect(ConnectOpts::new()).unwrap();
-
-        for conn in [&draft, &synced] {
-            assert_eq!(conn.get_database_canonical_path(), "");
-            assert_eq!(
-                conn.list_all_databases(),
-                vec![(MAIN_DB_ID, "main".to_string(), String::new())]
-            );
-        }
-
-        draft
-            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(11)")
-            .unwrap();
-        synced
-            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(22)")
-            .unwrap();
-
-        assert_eq!(query_single_i64(&draft, "SELECT x FROM t"), 11);
-        assert_eq!(query_single_i64(&synced, "SELECT x FROM t"), 22);
-    }
-
-    #[test]
-    fn test_named_memory_database_reopened_on_same_io_sees_same_rows() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-
-        let first_db =
-            Database::open_file(io.clone(), ":memory:reopen", Arc::new(EngineDialect)).unwrap();
-        let first = first_db.connect(ConnectOpts::new()).unwrap();
-        first
-            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
-            .unwrap();
-
-        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(EngineDialect)).unwrap();
-        let second = second_db.connect(ConnectOpts::new()).unwrap();
-        assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
-    }
-
-    #[test]
-    fn test_attach_named_memory_database_reports_empty_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
-
-        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(5)")
-            .unwrap();
-
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
-        let database_list = conn.pragma_query("database_list").unwrap();
-        let aux = database_list
-            .iter()
-            .find(|row| text_value(&row[1]) == "aux")
-            .expect("attached aux database must be listed");
-        assert_eq!(text_value(&aux[2]), "");
-    }
-
-    #[test]
-    fn test_search_path_decides_where_names_are_looked_up_and_created() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
-        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(5)")
-            .unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
-
-        conn.set_search_path(Some(vec!["main".to_string()]));
-        assert!(conn.prepare("SELECT x FROM t").is_err());
-        conn.execute("DROP TABLE IF EXISTS t").unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
-
-        conn.set_search_path(Some(vec!["missing".to_string(), "aux".to_string()]));
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
-        conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM aux.u"), 0);
-
-        conn.set_search_path(Some(vec!["missing".to_string()]));
-        let Err(LimboError::ParseError(message)) = conn.execute("CREATE TABLE v(z INTEGER)") else {
-            panic!("CREATE without a namespace needs a database in the search path");
-        };
-        assert_eq!(message, "no schema has been selected to create in");
-        conn.execute("DROP TABLE IF EXISTS t").unwrap();
-
-        conn.set_search_path(None);
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
-        conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
-    }
-
-    #[test]
-    fn test_a_database_that_does_not_store_namespaces_keeps_names_that_look_stored() {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("main.db");
-        let conn = open_connection(&path);
-        conn.execute(
-            "CREATE TABLE __turso_ns1_t(x INTEGER); INSERT INTO __turso_ns1_t VALUES(7); \
-             CREATE TABLE p(v INTEGER); CREATE INDEX __turso_ns2_i ON p(v); INSERT INTO p VALUES(1); \
-             CREATE VIEW __turso_ns3_v AS SELECT x FROM __turso_ns1_t",
-        )
-        .unwrap();
-        assert!(conn.create_namespace("app").is_err());
-        drop(conn);
-
-        let conn = open_connection(&path);
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns1_t"), 7);
-        assert_eq!(query_single_i64(&conn, "SELECT x FROM __turso_ns3_v"), 7);
-        assert!(conn.execute("DROP INDEX i").is_err());
-        conn.execute("DROP INDEX __turso_ns2_i").unwrap();
-        conn.execute("ALTER TABLE p RENAME TO __turso_ns4_p")
-            .unwrap();
-        assert_eq!(query_single_i64(&conn, "SELECT v FROM __turso_ns4_p"), 1);
-        let mut stmt = conn.prepare("PRAGMA integrity_check").unwrap();
-        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
-        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "ok");
-    }
-
-    #[test]
-    fn test_named_memory_parent_can_attach_real_file_database() {
-        let temp_dir = TempDir::new().unwrap();
-        let aux_path = temp_dir.path().join("aux.db");
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:named-main",
-            OpenFlags::default(),
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        conn.execute(format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap()))
-            .unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(7)")
-            .unwrap();
-        conn.execute("DETACH aux").unwrap();
-
-        let reopened = open_connection(&aux_path);
-        assert_eq!(query_single_i64(&reopened, "SELECT x FROM t"), 7);
     }
 
     #[test]
@@ -5698,172 +5275,18 @@ mod tests {
     }
 
     #[test]
-    fn test_temp_tables_are_connection_local_and_shadow_main() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn1 = open_connection(&db_path);
-
-        conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
-        conn1.execute("INSERT INTO main.t VALUES(1)").unwrap();
-        let conn2 = open_connection(&db_path);
-        conn1.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        conn1.execute("INSERT INTO temp.t VALUES(2)").unwrap();
-
-        assert_eq!(query_single_i64(&conn1, "SELECT x FROM t"), 2);
-        assert_eq!(query_single_i64(&conn1, "SELECT x FROM main.t"), 1);
-        assert_eq!(query_single_i64(&conn2, "SELECT x FROM t"), 1);
-
-        let err = conn2
-            .prepare("SELECT x FROM temp.t")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no such table"),
-            "expected no such table error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_reprepare_after_temp_store_reset_does_not_panic() {
+    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("main.db");
         let conn = open_connection(&db_path);
 
-        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        conn.execute("CREATE TABLE t1(a)").unwrap();
+        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
 
-        conn.execute("PRAGMA temp_store = MEMORY").unwrap();
+        conn.execute("PRAGMA automatic_index = OFF").unwrap();
+        stmt.run_collect_rows().unwrap();
 
-        let err = stmt.step().unwrap_err().to_string();
-        assert!(
-            err.contains("no such table"),
-            "expected no such table after temp reset, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_prepared_insert_checks_constraints_after_ignore_check_constraints_off() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE t1(a CHECK (a > 0))").unwrap();
-        conn.execute("PRAGMA ignore_check_constraints = ON")
-            .unwrap();
-        let mut stmt = conn.prepare("INSERT INTO t1 VALUES (-1)").unwrap();
-        conn.execute("PRAGMA ignore_check_constraints = OFF")
-            .unwrap();
-
-        let err = stmt.run_ignore_rows().unwrap_err().to_string();
-        assert!(err.contains("CHECK constraint failed"), "got: {err}");
-    }
-
-    #[test]
-    fn test_temp_trigger_abort_rolls_back_temp_writes_without_panicking() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
-             INSERT INTO u VALUES (NEW.x); \
-             SELECT RAISE(ABORT, 'boom'); \
-             END;",
-        )
-        .unwrap();
-
-        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
-        assert!(
-            err.to_string().contains("boom"),
-            "expected trigger abort error, got: {err}"
-        );
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
-    }
-
-    #[test]
-    fn test_temp_trigger_abort_rolls_back_main_and_temp_writes() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE m(x INTEGER)").unwrap();
-        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
-        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
-             INSERT INTO m VALUES (NEW.x); \
-             INSERT INTO u VALUES (NEW.x); \
-             SELECT RAISE(ABORT, 'boom'); \
-             END;",
-        )
-        .unwrap();
-
-        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
-        assert!(
-            err.to_string().contains("boom"),
-            "expected trigger abort error, got: {err}"
-        );
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.m"), 0);
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
-    }
-
-    #[test]
-    fn test_distinct_triggers_with_same_name_in_different_schemas_can_fire_nested() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE src(x INTEGER)").unwrap();
-        conn.execute("CREATE TABLE dst(y INTEGER)").unwrap();
-        conn.execute("CREATE TABLE audit(z INTEGER)").unwrap();
-        conn.execute(
-            "CREATE TRIGGER shared_name AFTER INSERT ON dst BEGIN \
-             INSERT INTO audit VALUES (NEW.y); \
-             END;",
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TEMP TRIGGER shared_name AFTER INSERT ON main.src BEGIN \
-             INSERT INTO dst VALUES (NEW.x); \
-             END;",
-        )
-        .unwrap();
-
-        conn.execute("INSERT INTO src VALUES(7)").unwrap();
-
-        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.dst"), 1);
-        assert_eq!(query_single_i64(&conn, "SELECT SUM(z) FROM main.audit"), 7);
-    }
-
-    /// A committed `setval(X, false)` stores an unconsumed sequence value.
-    /// After sequence initialization reloads persisted state, the in-memory
-    /// sequence must still represent that value as unconsumed, so the next
-    /// `nextval()` returns `X` rather than advancing past it.
-    /// Disk-only sequence design: setval(value, is_called=false) must be
-    /// observable as the next nextval() result. Previously this exercised
-    /// the in-memory-atomic reseeding path; that path no longer exists,
-    /// but the user-visible contract still holds because every nextval
-    /// reads the backing-table watermark and applies is_called semantics
-    /// in op_sequence_compute_next.
-    #[test]
-    fn test_setval_uncalled_emits_stored_value_as_next() -> Result<()> {
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("seq_init.db");
-        let conn = open_connection_with_opts(&path, DatabaseOpts::new());
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 3")?;
-        conn.execute("SELECT setval('s', 13, 0)")?;
-
-        let next_val = query_single_i64(&conn, "SELECT nextval('s')");
-        assert_eq!(
-            next_val, 13,
-            "setval(13, false) committed: next nextval must return 13"
-        );
-        Ok(())
+        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
+        assert_eq!(reprepares, 1);
     }
 }

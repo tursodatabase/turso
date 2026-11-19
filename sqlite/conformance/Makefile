@@ -1,7 +1,9 @@
 # Turso SQL conformance test Makefile
 #
 # The .sqltest corpora live here; the sqltest runner crate lives in
-# testing/sqltest. All sqltest invocations run with this directory as
+# testing/sqltest. The targets that run all tests also run
+# testing/shared-sqltests, the corpus for both the SQLite and the
+# PostgreSQL frontends. All sqltest invocations run with this directory as
 # the working directory so that relative @database paths in the corpora
 # (e.g. database/integrity_*.db) resolve against sqlite/conformance/database.
 
@@ -25,6 +27,7 @@ TEST_RUNNER := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest 
 # Test corpora (relative to this directory)
 SQLITE_TESTS := sqlite-sqltests
 TURSO_TESTS := turso-sqltests
+SHARED_TESTS := ../../testing/shared-sqltests
 
 .PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean run-js build-js-bindings
 
@@ -46,6 +49,7 @@ build-runner:
 check: build-runner
 	$(TEST_RUNNER) check $(SQLITE_TESTS)
 	$(TEST_RUNNER) check $(TURSO_TESTS)
+	$(TEST_RUNNER) check $(SHARED_TESTS)
 
 # MVCC mode flag (set MVCC=1 to enable)
 ifdef MVCC
@@ -67,17 +71,17 @@ endif
 # Run all tests with selected backend
 run: build
 	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
-	$(TEST_RUNNER) run $(TURSO_TESTS) --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run $(TURSO_TESTS) $(SHARED_TESTS) --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with CLI backend (spawns tursodb subprocess)
 run-cli: build
 	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG) $(ARGS)
-	$(TEST_RUNNER) run $(TURSO_TESTS) --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG) $(ARGS)
+	$(TEST_RUNNER) run $(TURSO_TESTS) $(SHARED_TESTS) --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG) $(ARGS)
 
 # Run tests with Rust backend (native turso bindings)
 run-rust: build-runner
 	$(TEST_RUNNER) run $(SQLITE_TESTS) --backend rust $(MVCC_FLAG) $(ARGS)
-	$(TEST_RUNNER) run $(TURSO_TESTS) --backend rust $(MVCC_FLAG) $(ARGS)
+	$(TEST_RUNNER) run $(TURSO_TESTS) $(SHARED_TESTS) --backend rust $(MVCC_FLAG) $(ARGS)
 
 # Build JavaScript bindings (requires Node.js and yarn)
 JS_DIR := $(ROOT_DIR)/bindings/javascript
@@ -87,7 +91,7 @@ build-js-bindings:
 # Run tests with JavaScript backend (Node.js + @tursodatabase/database)
 run-js: build-runner build-js-bindings
 	$(TEST_RUNNER) run $(SQLITE_TESTS) --backend js $(MVCC_FLAG)
-	$(TEST_RUNNER) run $(TURSO_TESTS) --backend js $(MVCC_FLAG)
+	$(TEST_RUNNER) run $(TURSO_TESTS) $(SHARED_TESTS) --backend js $(MVCC_FLAG)
 
 # Alias for run
 test: run
@@ -118,7 +122,7 @@ install-sqlite:
 
 # Run tests against SQLite
 test-sqlite: build-runner install-sqlite
-	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend cli --binary $(SQLITE)
+	$(TEST_RUNNER) run $(SQLITE_TESTS) $(SHARED_TESTS) --timeout 600 --backend cli --binary $(SQLITE)
 
 # Convert Tcl .test files to .sqltest format
 # Usage: make convert                    - convert all .test files in ../testing to ./converted

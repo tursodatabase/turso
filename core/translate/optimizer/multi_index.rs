@@ -12,13 +12,13 @@ use crate::stats::AnalyzeStats;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
-    choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
-    BranchReadMode, ChosenInSeekCandidate,
+    choose_best_btree_candidate, choose_best_in_seek_candidate, has_in_seek_constraint,
+    AccessMethod, AccessMethodParams, BranchReadMode, ChosenInSeekCandidate,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, can_use_partial_index, constraints_from_where_clause,
-    partial_index_predicate_terms, summarize_binary_term_for_index, Constraint, RangeConstraintRef,
-    TableConstraints,
+    analyze_binary_term_for_index, can_use_partial_index, partial_index_predicate_terms,
+    summarize_binary_term_for_index, table_constraints_from_where_clause, Constraint,
+    RangeConstraintRef, TableConstraints,
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
@@ -32,6 +32,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::Result;
+use std::cell::OnceCell;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
 use turso_parser::ast;
@@ -81,6 +82,35 @@ struct AndBranchSummary {
     table_col_pos: Option<usize>,
     index: Option<Arc<Index>>,
 }
+
+/// The parts of the multi-index planning of a table that do not depend on the
+/// tables joined before it.
+///
+/// The join order search plans the access to a table once for each set of
+/// tables that can come before it. It keeps one `MultiIndexTableWork` for each
+/// table, so that it does these parts only once for each table.
+#[derive(Default)]
+pub(crate) struct MultiIndexTableWork<'a> {
+    /// The AND terms that an intersection scan of the table can use.
+    and_terms: OnceCell<Option<AndClauseDecomposition>>,
+    /// The OR terms that a union scan of the table can use.
+    or_terms: OnceCell<Vec<UnionTerm<'a>>>,
+}
+
+/// An OR term that a union scan of a table can use.
+struct UnionTerm<'a> {
+    where_term_idx: usize,
+    /// The position of the table in `TableReferences::joined_tables()`.
+    table_idx: usize,
+    disjuncts: Vec<&'a ast::Expr>,
+    /// For each disjunct, its branch-local terms and constraints, made the
+    /// first time that the disjunct is planned.
+    branches: Vec<OnceCell<UnionBranch>>,
+}
+
+/// The branch-local terms and constraints of one disjunct of a [UnionTerm].
+/// `None` if they cannot be made.
+type UnionBranch = Option<(Vec<WhereTerm>, TableConstraints)>;
 
 /// Internal branch representation while evaluating a candidate multi-index plan.
 struct MultiIdxBranch {
@@ -148,7 +178,7 @@ fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
 ///   for global predicate consumption or join rewrites.
 ///
 /// FIXME: stop synthesizing `WhereTerm`s here just to reuse
-/// `constraints_from_where_clause()`. Branch-local planning should have a
+/// `table_constraints_from_where_clause()`. Branch-local planning should have a
 /// direct constraint-extraction path that does not fabricate top-level planner
 /// terms.
 #[expect(clippy::too_many_arguments)]
@@ -172,19 +202,18 @@ fn get_table_local_constraints_for_branch(
             consumed: false,
         })
         .collect::<Vec<_>>();
-    let table_constraints = constraints_from_where_clause(
+    let mut term_collations = vec![None; synthetic_where_terms.len()];
+    let mut table_constraints = table_constraints_from_where_clause(
+        table_reference,
         &synthetic_where_terms,
+        &mut term_collations,
         table_references,
         available_indexes,
         subqueries,
         schema,
         params,
         resolver,
-    )?
-    .into_iter()
-    .find(|constraints| constraints.table_id == table_reference.internal_id)
-    .expect("constraints_from_where_clause must return constraints for every joined table");
-    let mut table_constraints = table_constraints;
+    )?;
     // Branch-local constraints originate from synthetic `WhereTerm`s, so copy
     // out their constraining expressions while those temporary terms still
     // exist.
@@ -351,6 +380,16 @@ fn choose_multi_index_branch_access(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<Option<MultiIdxBranch>> {
+    // A branch needs an index seek or an IN seek. Without a constraint that
+    // an index can use, and without an IN constraint, it has neither.
+    if table_constraints
+        .candidates
+        .iter()
+        .all(|candidate| candidate.refs.is_empty())
+        && !has_in_seek_constraint(table_constraints)
+    {
+        return Ok(None);
+    }
     let chosen_seek = choose_best_btree_candidate(
         rhs_table,
         table_constraints,
@@ -875,10 +914,6 @@ fn analyze_and_terms_for_multi_index(
             continue;
         };
 
-        if !summary.lhs_mask.is_empty() {
-            continue;
-        }
-
         candidate_branches.push(AndBranchSummary {
             where_term_idx,
             table_col_pos: summary.table_col_pos,
@@ -989,9 +1024,9 @@ fn analyze_and_terms_for_multi_index(
 /// Returns a `MultiIndexScan` access method when every disjunct can be planned
 /// as an individual lookup branch and the combined cost beats the current best
 /// non-multi-index alternative.
-pub fn consider_multi_index_union(
+pub fn consider_multi_index_union<'a>(
     rhs_table: &JoinedTable,
-    where_clause: &[WhereTerm],
+    where_clause: &'a [WhereTerm],
     available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
@@ -1003,50 +1038,36 @@ pub fn consider_multi_index_union(
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
     resolver: &Resolver,
+    work: Option<&MultiIndexTableWork<'a>>,
 ) -> Result<Option<AccessMethod>> {
-    for (where_term_idx, term) in where_clause.iter().enumerate() {
-        if term.consumed {
-            continue;
+    let computed_or_terms;
+    let or_terms = match work {
+        Some(work) => work
+            .or_terms
+            .get_or_init(|| union_terms(rhs_table, where_clause, table_references)),
+        None => {
+            computed_or_terms = union_terms(rhs_table, where_clause, table_references);
+            &computed_or_terms
         }
-        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
-            continue;
-        };
-        if !multi_index_can_consume_term(rhs_table, term, table_references) {
-            continue;
-        }
-
-        let disjuncts = flatten_or_expr(&term.expr);
-        if disjuncts.len() < 2 {
-            continue;
-        }
-
+    };
+    for or_term in or_terms {
+        let term = &where_clause[or_term.where_term_idx];
+        let rhs_idx = or_term.table_idx;
         let mut allowed_mask = lhs_mask.try_clone()?;
-        let Some(rhs_idx) = table_references
-            .joined_tables()
-            .iter()
-            .position(|t| t.internal_id == rhs_table.internal_id)
-        else {
-            continue;
-        };
         allowed_mask.set(rhs_idx)?;
 
         // Each disjunct is replanned with branch-local `TableConstraints`, so
         // compound conjuncts can reuse the same compound-seek analysis as
         // ordinary btree access.
-        let branches = disjuncts
-            .into_iter()
-            .map(|disjunct_expr| {
-                let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
-                    return Ok(None);
-                };
-                let conjuncts = flatten_and_expr(disjunct_expr)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let Some((synthetic_where_terms, table_constraints)) =
-                    get_table_local_constraints_for_branch(
-                        &conjuncts,
-                        term.origin.join_origin(),
+        let branches = or_term
+            .disjuncts
+            .iter()
+            .zip(&or_term.branches)
+            .map(|(disjunct_expr, branch)| {
+                let branch = branch.get_or_init(|| {
+                    union_branch_constraints(
+                        disjunct_expr,
+                        term,
                         rhs_table,
                         table_references,
                         available_indexes,
@@ -1055,14 +1076,14 @@ pub fn consider_multi_index_union(
                         params,
                         resolver,
                     )
-                    .ok()
-                else {
+                });
+                let Some((synthetic_where_terms, table_constraints)) = branch else {
                     return Ok(None);
                 };
                 let Some(mut chosen) = choose_multi_index_branch_access(
                     rhs_table,
-                    &table_constraints,
-                    &synthetic_where_terms,
+                    table_constraints,
+                    synthetic_where_terms,
                     lhs_mask,
                     rhs_idx,
                     schema,
@@ -1080,7 +1101,7 @@ pub fn consider_multi_index_union(
                 // before the index seek; post-filters reference the target
                 // table and are evaluated after the seek.
                 let Some(partitioned_pre_post) = partition_residual_multi_or_exprs(
-                    &synthetic_where_terms,
+                    synthetic_where_terms,
                     &chosen.access,
                     chosen.index.as_deref(),
                     rhs_table,
@@ -1110,7 +1131,7 @@ pub fn consider_multi_index_union(
         if let Some(access_method) = evaluate_multi_index_branches(
             branches,
             SetOperation::Union,
-            where_term_idx,
+            or_term.where_term_idx,
             rhs_table,
             table_references,
             available_indexes,
@@ -1127,6 +1148,78 @@ pub fn consider_multi_index_union(
     }
 
     Ok(None)
+}
+
+/// Find the OR terms of `where_clause` that a union scan of `rhs_table` can use.
+fn union_terms<'a>(
+    rhs_table: &JoinedTable,
+    where_clause: &'a [WhereTerm],
+    table_references: &TableReferences,
+) -> Vec<UnionTerm<'a>> {
+    let Some(table_idx) = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == rhs_table.internal_id)
+    else {
+        return Vec::new();
+    };
+    let mut or_terms = Vec::new();
+    for (where_term_idx, term) in where_clause.iter().enumerate() {
+        if term.consumed {
+            continue;
+        }
+        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
+            continue;
+        };
+        if !multi_index_can_consume_term(rhs_table, term, table_references) {
+            continue;
+        }
+
+        let disjuncts = flatten_or_expr(&term.expr);
+        if disjuncts.len() < 2 {
+            continue;
+        }
+        or_terms.push(UnionTerm {
+            where_term_idx,
+            table_idx,
+            branches: disjuncts.iter().map(|_| OnceCell::new()).collect(),
+            disjuncts,
+        });
+    }
+    or_terms
+}
+
+/// Make the branch-local terms and constraints of one disjunct of the OR term
+/// `term`. Return `None` if the disjunct cannot be planned as a branch.
+#[expect(clippy::too_many_arguments)]
+fn union_branch_constraints(
+    disjunct_expr: &ast::Expr,
+    term: &WhereTerm,
+    rhs_table: &JoinedTable,
+    table_references: &TableReferences,
+    available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+    resolver: &Resolver,
+) -> Option<(Vec<WhereTerm>, TableConstraints)> {
+    let disjunct_expr = crate::translate::expr::unwrap_parens(disjunct_expr).ok()?;
+    let conjuncts = flatten_and_expr(disjunct_expr)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    get_table_local_constraints_for_branch(
+        &conjuncts,
+        term.origin.join_origin(),
+        rhs_table,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+        resolver,
+    )
+    .ok()
 }
 
 /// Analyze top-level AND terms for AND-by-intersection optimization.
@@ -1149,17 +1242,29 @@ pub fn consider_multi_index_intersection(
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
     resolver: &Resolver,
+    work: Option<&MultiIndexTableWork<'_>>,
 ) -> Result<Option<AccessMethod>> {
-    let Some(decomposition) = analyze_and_terms_for_multi_index(
-        rhs_table,
-        where_clause,
-        available_indexes,
-        table_references,
-        subqueries,
-        schema,
-        params,
-        resolver,
-    ) else {
+    let analyze = || {
+        analyze_and_terms_for_multi_index(
+            rhs_table,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            params,
+            resolver,
+        )
+    };
+    let computed_decomposition;
+    let decomposition = match work {
+        Some(work) => work.and_terms.get_or_init(analyze),
+        None => {
+            computed_decomposition = analyze();
+            &computed_decomposition
+        }
+    };
+    let Some(decomposition) = decomposition else {
         return Ok(None);
     };
 
@@ -1348,6 +1453,7 @@ mod tests {
             expression_index_usages: Vec::new(),
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         }
     }
@@ -1550,6 +1656,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
             &Resolver::empty_for_tests(),
+            None,
         )
         .unwrap();
 
@@ -1638,6 +1745,7 @@ mod tests {
             &TableMask::default(),
             &AnalyzeStats::default(),
             &Resolver::empty_for_tests(),
+            None,
         )
         .unwrap()
         .expect("rowid and secondary-index terms should be eligible for intersection");
@@ -1814,6 +1922,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
             &Resolver::empty_for_tests(),
+            None,
         )
         .unwrap()
         .expect("compound OR branches should produce a multi-index union");
@@ -1954,6 +2063,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
             &Resolver::empty_for_tests(),
+            None,
         )
         .unwrap()
         .expect("plain OR branches should produce a multi-index union");
@@ -1972,6 +2082,7 @@ mod tests {
             &lhs_mask,
             &AnalyzeStats::default(),
             &Resolver::empty_for_tests(),
+            None,
         )
         .unwrap()
         .expect("residual-filtered OR branches should still produce a multi-index union");
