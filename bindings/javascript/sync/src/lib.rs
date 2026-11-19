@@ -383,6 +383,7 @@ impl SyncEngine {
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
             pull_parallel_requests: None,
             logical_mvcc_pull: self.opts.logical_mvcc_pull,
+            busy_timeout: turso_sync_engine::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
         };
 
         let io = self.io()?;

@@ -6001,6 +6001,7 @@ mod tests {
             pull_bytes_threshold: None,
             pull_parallel_requests: None,
             logical_mvcc_pull: Some(true),
+            busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
         }
     }
 

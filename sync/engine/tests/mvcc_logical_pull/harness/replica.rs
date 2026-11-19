@@ -101,6 +101,7 @@ fn replica_opts(db_opts: DatabaseOpts) -> DatabaseSyncEngineOpts {
         pull_bytes_threshold: None,
         pull_parallel_requests: None,
         logical_mvcc_pull: None,
+        busy_timeout: turso_sync_engine::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
     }
 }
 

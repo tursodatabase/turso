@@ -25,10 +25,10 @@ use crate::{
         SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
-        replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
-        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
-        DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts, DatabaseWalSession,
-        CDC_PRAGMA_NAME,
+        begin_immediate, replay_without_triggers, run_stmt_ignore_rows,
+        try_wal_watermark_read_page, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts,
+        DatabaseReplaySession, DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts,
+        DatabaseWalSession, CDC_PRAGMA_NAME,
     },
     errors::Error,
     io_operations::IoOperations,
@@ -95,7 +95,14 @@ pub struct DatabaseSyncEngineOpts {
     /// Explicit values exist for tests and as an escape hatch — users should
     /// not need to set this.
     pub logical_mvcc_pull: Option<bool>,
+    /// How long the sync engine waits for a lock held by another connection (for example the
+    /// app's write transaction) before it fails with `Busy`. Applies to the engine's own
+    /// connections and to starting WAL transactions. Checkpoints do not wait: they run behind
+    /// the SDK's sync busy gate. [`DEFAULT_SYNC_BUSY_TIMEOUT`] is a reasonable value.
+    pub busy_timeout: std::time::Duration,
 }
+
+pub const DEFAULT_SYNC_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct DataStats {
     pub written_bytes: AtomicUsize,
@@ -655,16 +662,27 @@ fn stream_kind_for_pull_updates_v1_result(result: &PullUpdatesV1Result) -> DbCha
 /// connection. A `SchemaUpdated` error in that window usually means the SQL
 /// applied or observed the new schema boundary; reparsing and retrying lets the
 /// connection converge without masking persistent SQL errors.
-#[allow(dead_code)]
-fn execute_with_schema_retry(conn: &Arc<turso_core::Connection>, sql: &str) -> Result<()> {
+///
+/// Returns control to the caller while the statement waits for IO or for the busy timeout.
+/// `Connection::execute` would block the thread for the whole wait.
+async fn execute_with_schema_retry<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+) -> Result<()> {
     for attempt in 0..=4 {
-        match conn.execute(sql) {
+        let result = async {
+            let mut stmt = conn.prepare(sql)?;
+            run_stmt_ignore_rows(coro, &mut stmt).await
+        }
+        .await;
+        match result {
             Ok(()) => return Ok(()),
-            Err(LimboError::SchemaUpdated) if attempt < 4 => {
+            Err(Error::TursoError(LimboError::SchemaUpdated)) if attempt < 4 => {
                 force_reparse_schema_with_retry(conn)?;
                 publish_schema_after_external_restore(conn, "schema retry")?;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -1237,6 +1255,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             cdc_table: None,
             cdc_mode: Some("full".to_string()),
             disable_auto_checkpoint: true,
+            busy_timeout: opts.busy_timeout,
         };
         tracing::info!("initialize database tape connection: path={}", main_db_path);
         let main_db_io = main_db.io.clone();
@@ -1512,11 +1531,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let main_wal_state;
         {
+            // Checkpoints always run behind the SDK's sync busy gate, so waiting for the app
+            // cannot succeed.
             let mut revert_session = WalSession::new(revert_conn.clone());
-            revert_session.begin()?;
+            revert_session
+                .begin(coro, std::time::Duration::ZERO)
+                .await?;
 
             let mut main_session = WalSession::new(main_conn.clone());
-            main_session.begin()?;
+            main_session.begin(coro, std::time::Duration::ZERO).await?;
 
             main_wal_state = main_conn.wal_state()?;
             tracing::info!(
@@ -1992,7 +2015,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         }
 
-        conn.execute("BEGIN IMMEDIATE")?;
+        begin_immediate(coro, &conn).await?;
         let mut logical_table_names_by_stable_id =
             self.meta().logical_table_names_by_stable_id.clone();
         let mut replay = DatabaseReplaySession::new(
@@ -2188,7 +2211,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let replace_base_pages = matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages);
 
         let mut revert_session = WalSession::new(revert_conn.clone());
-        revert_session.begin()?;
+        revert_session.begin(coro, self.opts.busy_timeout).await?;
 
         // start of the pull updates apply process
         // during this process we need to be very careful with the state of the WAL as at some points it can be not safe to read data from it
@@ -2196,7 +2219,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // 1. we are in the middle of rollback or apply from remote WAL - so DB now is in some weird state and no operations can be made safely
         // 2. after rollback or apply from remote WAL it's unsafe to prepare statements because schema cookie can go "back in time" and we first need to adjust it before executing any statement over DB
         let mut main_session = WalSession::new(main_conn.clone());
-        main_session.begin()?;
+        main_session.begin(coro, self.opts.busy_timeout).await?;
 
         // we need to make sure that updates from the session will not be commited accidentally in the middle of the pull process
         // in order to achieve that we mark current session as "nested program" which eliminates possibility that data will be actually commited without our explicit command
@@ -2499,11 +2522,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             &conn,
                             "replace-base sync table reconnect",
                         )?;
-                        execute_with_schema_retry(&conn, "BEGIN IMMEDIATE").map_err(|error| {
-                            Error::DatabaseSyncEngineError(format!(
-                                "failed to begin replace-base replay transaction: {error}",
-                            ))
-                        })?;
+                        execute_with_schema_retry(coro, &conn, "BEGIN IMMEDIATE")
+                            .await
+                            .map_err(|error| {
+                                Error::DatabaseSyncEngineError(format!(
+                                    "failed to begin replace-base replay transaction: {error}",
+                                ))
+                            })?;
                         logical_replay_conn = Some(conn);
 
                         if self.meta().logical_mvcc_pull_active() {
@@ -2639,11 +2664,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 // shared schema, so reparse it locally from the freshly replayed pages before
                 // it replays local changes.
                 refresh_schema_after_raw_wal_replay_local(&conn, "raw WAL replay replay-conn")?;
-                execute_with_schema_retry(&conn, "BEGIN IMMEDIATE").map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "failed to begin post-raw-apply replay transaction: {error}",
-                    ))
-                })?;
+                execute_with_schema_retry(coro, &conn, "BEGIN IMMEDIATE")
+                    .await
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to begin post-raw-apply replay transaction: {error}",
+                        ))
+                    })?;
                 logical_replay_conn = Some(conn);
             }
             let phase_conn = logical_replay_conn.as_ref().unwrap_or(&main_conn);
@@ -3049,9 +3076,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         self.main_db_path,
                     );
                     execute_with_schema_retry(
+                        coro,
                         &main_conn,
                         &format!("PRAGMA {CDC_PRAGMA_NAME} = 'full'"),
                     )
+                    .await
                     .map_err(|error| {
                         Error::DatabaseSyncEngineError(format!(
                             "failed to reinitialize CDC pragma after remote apply: {error}",
@@ -3766,6 +3795,7 @@ mod tests {
             pull_bytes_threshold: None,
             pull_parallel_requests: None,
             logical_mvcc_pull: Some(true),
+            busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
         }
     }
 
@@ -4184,6 +4214,7 @@ mod tests {
                 cdc_table: None,
                 cdc_mode: Some("full".to_string()),
                 disable_auto_checkpoint: true,
+                busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
             },
         );
         let sync_io = Arc::new(NoopSyncEngineIo);
@@ -4361,6 +4392,7 @@ mod tests {
                 cdc_table: None,
                 cdc_mode: Some("full".to_string()),
                 disable_auto_checkpoint: true,
+                busy_timeout: crate::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
             },
         );
         let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));

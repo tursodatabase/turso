@@ -48,6 +48,9 @@ pub struct TursoDatabaseSyncConfig {
     /// and persists it in the sync metadata; `Some(true)` forces MVCC
     /// logical-log streams; `Some(false)` forces page streams.
     pub logical_mvcc_pull: Option<bool>,
+    /// How long the sync engine waits for a lock held by another connection (for example the
+    /// app's write transaction) before failing with Busy, in milliseconds. `None` => 5000.
+    pub busy_timeout_ms: Option<u32>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -138,6 +141,7 @@ impl TursoDatabaseSyncConfig {
             } else {
                 None
             },
+            busy_timeout_ms: None,
         })
     }
 }
@@ -280,6 +284,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
             pull_parallel_requests: sync_config.pull_parallel_requests,
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
+            busy_timeout: sync_config.busy_timeout_ms.map_or(
+                turso_sync_engine::database_sync_engine::DEFAULT_SYNC_BUSY_TIMEOUT,
+                |ms| std::time::Duration::from_millis(ms as u64),
+            ),
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if let Some(io) = &db_config.io {
@@ -642,6 +650,7 @@ mod tests {
                 pull_bytes_threshold: None,
                 pull_parallel_requests: None,
                 logical_mvcc_pull: None,
+                busy_timeout_ms: None,
             },
         )
         .unwrap();

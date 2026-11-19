@@ -36,5 +36,12 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tracing-appender = { workspace = true }
 
+[dev-dependencies]
+bytes = "1.11.1"
+prost = "0.14.1"
+tempfile = { workspace = true }
+turso_core = { path = "../../core", default-features = false, features = ["baseline", "io_memory_yield"] }
+turso_sqlite = { workspace = true }
+
 [build-dependencies]
 bindgen = "0.69.5"
