@@ -6884,6 +6884,118 @@ fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
     );
 }
 
+/// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
+/// but for attached dbs
+#[test]
+fn test_cleanup_vacuum_into_rolls_back_attached_only_source_txn() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let main_path = dir.path().join("vacuum-into-cleanup-main.db");
+    let attached_path = dir.path().join("vacuum-into-cleanup-attached.db");
+    let dest_path = dir.path().join("vacuum-into-cleanup-dest.db");
+
+    let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))
+    .unwrap();
+    conn.execute("CREATE TABLE att.t(x)").unwrap();
+    conn.execute("INSERT INTO att.t VALUES (1)").unwrap();
+
+    let attached_db_id = conn.get_database_id_by_name("att").unwrap();
+    let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
+
+    let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
+    let did_interrupt = Arc::new(AtomicBool::new(false));
+    let main_held_read_lock = Arc::new(AtomicBool::new(false));
+    let attached_held_read_lock = Arc::new(AtomicBool::new(false));
+    let conn_for_progress = conn.clone();
+    let attached_pager_for_progress = attached_pager.clone();
+    let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
+    let did_interrupt_for_handler = did_interrupt.clone();
+    let main_held_read_lock_for_handler = main_held_read_lock.clone();
+    let attached_held_read_lock_for_handler = attached_held_read_lock.clone();
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || {
+            if conn_for_progress.get_auto_commit() {
+                return false;
+            }
+            let calls = source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+            let interrupt = calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst);
+            if interrupt {
+                main_held_read_lock_for_handler.store(
+                    conn_for_progress.get_pager().holds_read_lock(),
+                    Ordering::SeqCst,
+                );
+                attached_held_read_lock_for_handler.store(
+                    attached_pager_for_progress.holds_read_lock(),
+                    Ordering::SeqCst,
+                );
+            }
+            interrupt
+        })),
+    );
+
+    let mut stmt = conn
+        .prepare(format!("VACUUM att INTO '{}'", dest_path.display()))
+        .unwrap();
+    let step = stmt.step().unwrap();
+    conn.set_progress_handler(0, None);
+
+    assert!(
+        matches!(step, StepResult::Busy),
+        "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+    );
+    assert!(
+        did_interrupt.load(Ordering::SeqCst),
+        "progress handler should have interrupted VACUUM INTO exactly once"
+    );
+    assert!(
+        !main_held_read_lock.load(Ordering::SeqCst),
+        "attached-only cleanup regression requires the main pager to stay lock-free"
+    );
+    assert!(
+        attached_held_read_lock.load(Ordering::SeqCst),
+        "attached source pager should hold the pinned read snapshot"
+    );
+
+    assert!(
+        conn.get_auto_commit(),
+        "cleanup should restore auto-commit without going through SQL ROLLBACK"
+    );
+    assert!(
+        !attached_pager.holds_read_lock(),
+        "cleanup should release the attached source read snapshot"
+    );
+    drop(stmt);
+
+    conn.execute("INSERT INTO att.t VALUES (2)").unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM att.t").unwrap();
+    let mut count = 0_i64;
+    stmt.run_with_row_callback(|row| {
+        count = row.get(0)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 2);
+}
+
 #[test]
 fn test_in_place_vacuum_succeeds_and_releases_source_locks() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

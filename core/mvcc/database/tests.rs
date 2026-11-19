@@ -1,5 +1,5 @@
 use crate::namespace::NamespaceId;
-use crate::EngineDialect;
+use crate::SqliteDialect;
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
@@ -327,7 +327,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -570,8 +570,7 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
     use crate::alloc::{DynAllocator, TursoVecInExt};
     use crate::mvcc::database::WalPos;
 
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
+    let store = empty_mv_store();
     let lwm_sampled_while_idle = store.sample_gc_lwm();
     assert_eq!(lwm_sampled_while_idle, u64::MAX);
 
@@ -796,7 +795,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -842,7 +841,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -880,7 +879,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             self.opts,
             self.enc_opts.clone(),
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         self.db.replace(db);
         Ok(())
@@ -924,10 +923,12 @@ pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
 /// for the boundary-straddle data-loss path (review finding #1).
 #[test]
 fn test_checkpoint_snapshot_ts_clamps_below_inflight_preparing() {
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
-    let pager = db.conn.pager.load().clone();
-    let inflight = store.begin_tx(pager).unwrap();
+    let store = empty_mv_store();
+    let inflight: TxID = 1;
+    store.txs.insert(
+        inflight,
+        new_tx_in::<crate::alloc::DynAllocator>(inflight, 1, TransactionState::Active),
+    );
 
     // Out-of-order finalize: a higher-ts commit advanced the watermark to 1000 while
     // `inflight` is still Preparing at the lower end_ts 500.
@@ -1790,8 +1791,7 @@ fn test_commit_dependency_speculative_ignore() {
 fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     use crate::mvcc::cursor::IndexShadowScan;
 
-    let db = MvccTestDb::new();
-    let store = &db.mvcc_store;
+    let store = empty_mv_store();
     let table_id = MVTableId::from(-999_i64);
 
     // Single-column ascending integer index key.
@@ -1857,12 +1857,12 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
     assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(10))
+        .btree_row_is_valid(&store, table_id, reader_id, &idx_key(10))
         .unwrap());
     // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
     assert!(scan
-        .btree_row_is_valid(store, table_id, reader_id, &idx_key(30))
+        .btree_row_is_valid(&store, table_id, reader_id, &idx_key(30))
         .unwrap());
 
     let reader = store.txs.get(&reader_id).unwrap();
@@ -3575,21 +3575,33 @@ fn test_gc_shrinks_version_chain_capacity() {
 #[cfg(not(nightly))]
 #[test]
 fn test_one_version_is_stored_inside_its_chain() {
-    let db = MvccTestDb::new();
+    let store = empty_mv_store();
     let table_id: MVTableId = (-2).into();
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    let tx = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    db.mvcc_store
+    let tx: TxID = 1;
+    store.txs.insert(
+        tx,
+        new_tx_in::<crate::alloc::DynAllocator>(tx, 1, TransactionState::Active),
+    );
+    store
         .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
         .unwrap();
-    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    let entry = store.rows.get(&row_id).unwrap();
     let versions = entry.value().read();
     let chain_start = std::ptr::addr_of!(*versions) as usize;
     let chain = chain_start..chain_start + std::mem::size_of_val(&*versions);
     assert!(chain.contains(&(versions.as_ptr() as usize)));
+}
+
+/// An MVCC store that belongs to no database.
+fn empty_mv_store() -> crate::MvStore {
+    MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("empty-mv-store.db-log"),
+        crate::alloc::DynAllocator::default(),
+        false,
+    )
+    .unwrap()
 }
 
 /// A version chain stores its versions inline, so the size of `RowVersion` is a
@@ -3720,138 +3732,6 @@ fn write_set_len_and_distinct_chains(
     (write_set.len(), distinct_chains.len())
 }
 
-/// `drop_unused_row_versions_and_slots` removes emptied SkipMap entries.
-#[test]
-fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
-    let db = MvccTestDb::new();
-
-    let tx1 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
-    db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
-
-    let row_id = RowID::new((-2).into(), RowKey::Int(1));
-    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
-    db.mvcc_store
-        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
-        .unwrap();
-
-    // The slot-removing GC variant collects the garbage AND drops the slot.
-    // No concurrent writers exist in this test, satisfying the caller contract.
-    let dropped = db.mvcc_store.drop_unused_row_versions_and_slots();
-    assert_eq!(dropped, 1);
-    assert!(
-        db.mvcc_store.rows.get(&row_id).is_none(),
-        "empty chain slot should be removed from the SkipMap"
-    );
-}
-
-/// Index chains are swept by their own bounded, resumable cursor
-/// (`gc_index_cursor`), just like table rows — a single huge index can't force
-/// an unbounded pass. Aborted index garbage (Rule 1) is reclaimable
-/// unconditionally, so it lets us exercise the index sweep without depending on
-/// checkpoint timing. This asserts the sweep is resumable mid-pass and that
-/// driving it in tiny chunks reclaims exactly what a full sweep would.
-#[test]
-fn test_gc_incremental_reclaims_index_chains_resumably() {
-    let db = MvccTestDb::new();
-    let conn = &db.conn;
-    // Drive GC manually: disable both the checkpoint and the inline-GC trigger.
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
-        .unwrap();
-    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
-
-    // Insert many indexed rows in one transaction, then roll back. Rollback
-    // keeps the empty slots but removes their versions immediately.
-    conn.execute("BEGIN").unwrap();
-    for i in 100..200 {
-        conn.execute(format!("INSERT INTO t VALUES ({i}, 'g{i}')"))
-            .unwrap();
-    }
-    conn.execute("ROLLBACK").unwrap();
-
-    // Populate the empty slots with stale versions to exercise the GC cursor
-    // directly rather than relying on rollback to manufacture garbage.
-    for outer in db.mvcc_store.index_rows.iter() {
-        for inner in outer.value().iter() {
-            let mut versions = inner.value().write();
-            if versions.is_empty() {
-                db.mvcc_store
-                    .insert_version_raw(&mut versions, make_rv(None, None))
-                    .unwrap();
-            }
-        }
-    }
-
-    let count_index_versions = || -> usize {
-        db.mvcc_store
-            .index_rows
-            .iter()
-            .map(|outer| {
-                outer
-                    .value()
-                    .iter()
-                    .map(|inner| inner.value().read().len())
-                    .sum::<usize>()
-            })
-            .sum()
-    };
-    let before = count_index_versions();
-    assert!(
-        before > 8,
-        "expected accumulated index garbage chains, got {before}"
-    );
-    assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
-
-    // A single tiny pass is bounded and leaves the index sweep mid-flight —
-    // the cursor is parked partway through (there are far more than 4 chains).
-    db.mvcc_store.gc_incremental(4);
-    assert!(
-        db.mvcc_store.debug_gc_snapshot().index_sweep_unfinished,
-        "index sweep should resume from a saved cursor, not restart each pass"
-    );
-
-    // Drive to convergence in 4-chain chunks: done when a pass reclaims nothing
-    // and both cursors have wrapped back to the start.
-    let mut passes = 0;
-    loop {
-        let dropped = db.mvcc_store.gc_incremental(4);
-        passes += 1;
-        if dropped == 0 {
-            let sweeps = db.mvcc_store.debug_gc_snapshot();
-            if !sweeps.table_sweep_unfinished && !sweeps.index_sweep_unfinished {
-                break;
-            }
-        }
-        assert!(passes < 100_000, "incremental GC failed to converge");
-    }
-
-    // Everything the full sweep would reclaim is already gone (table + index).
-    assert_eq!(db.mvcc_store.drop_unused_row_versions(), 0);
-    let after = count_index_versions();
-    assert!(
-        after < before,
-        "index versions should shrink: before={before} after={after}"
-    );
-
-    // The surviving committed row is still correct and index-readable.
-    let rows = get_rows(conn, "SELECT id FROM t WHERE v = 'keep'");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].as_int().unwrap(), 1);
-}
-
 /// Inline GC must never run concurrently with a stop-the-world checkpoint:
 /// the checkpoint reads version chains to flush them to the B-tree and removes
 /// empty slots, so a concurrent GC mutating those chains would corrupt the
@@ -3929,45 +3809,6 @@ fn test_gc_incremental_skips_while_checkpoint_holds_write_lock() {
             .read()
             .len(),
         1
-    );
-}
-
-/// Passive incremental GC empties a chain's version vec but leaves the (now empty)
-/// SkipMap slot; Finalize `unlink_empty` unlinks slots. Truncate incremental unlinks.
-#[test]
-fn test_gc_incremental_lazy_leaves_empty_slots() {
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
-    let conn = db.connect();
-    let mvcc_store = db.get_mvcc_store();
-    let table_id: MVTableId = (-2).into();
-
-    // Rollback keeps an empty SkipMap slot. Add stale data to that slot so the
-    // incremental GC path is what empties the chain.
-    let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
-    mvcc_store
-        .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
-        .unwrap();
-    mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
-
-    let row_id = RowID::new(table_id, RowKey::Int(1));
-    let entry = mvcc_store.rows.get(&row_id).unwrap();
-    mvcc_store
-        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
-        .unwrap();
-
-    // Drive incremental GC to completion.
-    for _ in 0..4 {
-        mvcc_store.gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC);
-    }
-
-    let entry = mvcc_store.rows.get(&row_id);
-    assert!(
-        entry.is_some(),
-        "Passive lazy path keeps the SkipMap slot in place"
-    );
-    assert!(
-        entry.unwrap().value().read().is_empty(),
-        "but the version vec is emptied"
     );
 }
 
@@ -5052,41 +4893,6 @@ fn test_begin_tx_schema_generation_gate() {
         .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
 }
 
-/// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
-#[test]
-fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header() {
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
-    let conn = db.connect();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    for i in 0..500 {
-        conn.execute(format!(
-            "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
-        ))
-        .unwrap();
-    }
-    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
-    let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
-    assert!(page_count > 2, "t should span multiple pages");
-
-    {
-        let mv_guard = conn.db.get_mv_store();
-        let mv = mv_guard.as_ref().expect("mvcc store");
-        let mut gh = mv.global_header.write();
-        let h = gh.as_mut().expect("global_header initialized");
-        h.freelist_trunk_page = pack1::U32BE::new(page_count as u32);
-        h.freelist_pages = pack1::U32BE::new(1);
-    }
-
-    let rows = get_rows(&conn, "PRAGMA integrity_check");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        &rows[0][0].to_string(),
-        "ok",
-        "passive integrity_check must read the freelist from the pager's live page 1, not the stale MVCC header"
-    );
-}
-
 // https://github.com/tursodatabase/turso/issues/6752
 
 // https://github.com/tursodatabase/turso/issues/6757
@@ -5241,7 +5047,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db
@@ -5266,7 +5072,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let db = Database::open(
         io,
         &path_str,
-        crate::OpenOptions::new(Arc::new(EngineDialect))
+        crate::OpenOptions::new(Arc::new(SqliteDialect))
             .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();

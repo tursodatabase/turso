@@ -720,7 +720,7 @@ mod tests {
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
 
     #[test]
     fn view_expansion_restores_context_after_errors() {
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -777,7 +777,7 @@ mod tests {
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let cmd = crate::dialect::parse_statement(&crate::EngineDialect, "SELECT 'x' REGEXP 'y'")
+        let cmd = crate::dialect::parse_statement(&crate::SqliteDialect, "SELECT 'x' REGEXP 'y'")
             .transpose()
             .unwrap()
             .unwrap();
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn dialect_without_roles_refuses_role_owner_privilege_and_row_security_statements() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -947,7 +947,7 @@ mod tests {
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq = BTreeTable::from_stored_sql(
-            &crate::EngineDialect,
+            &crate::SqliteDialect,
             "CREATE TABLE sqlite_sequence(name)",
             seq_root_page,
             false,
@@ -963,7 +963,7 @@ mod tests {
         let syms = SymbolTable::new();
 
         let cmd =
-            crate::dialect::parse_statement(&crate::EngineDialect, "INSERT INTO t(v) VALUES('x')")
+            crate::dialect::parse_statement(&crate::SqliteDialect, "INSERT INTO t(v) VALUES('x')")
                 .transpose()
                 .unwrap()
                 .unwrap();
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -1011,7 +1011,7 @@ mod tests {
         let syms = SymbolTable::new();
 
         let cmd =
-            crate::dialect::parse_statement(&crate::EngineDialect, "INSERT INTO t(v) VALUES('x')")
+            crate::dialect::parse_statement(&crate::SqliteDialect, "INSERT INTO t(v) VALUES('x')")
                 .transpose()
                 .unwrap()
                 .unwrap();

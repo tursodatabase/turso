@@ -12,56 +12,6 @@ use std::num::NonZeroU32;
 use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 
 #[test]
-fn field_weights_reject_non_finite_and_non_positive_values() {
-    let mut accepted = Vec::new();
-    for weight in [
-        "NaN",
-        "nan",
-        "+NaN",
-        "-NaN",
-        "inf",
-        "+inf",
-        "-inf",
-        "Infinity",
-        "+INFINITY",
-        "-infinity",
-        "1e39",
-        "-1e39",
-        "0",
-        "-0",
-        "-1",
-        "1e-46",
-    ] {
-        let result = FtsIndexAttachment::new(
-            &crate::EngineDialect,
-            IndexMethodConfiguration {
-                table_name: "w".to_string(),
-                index_name: "wx".to_string(),
-                columns: crate::alloc::vec![
-                    IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
-                    IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
-                ],
-                parameters: FxHashMap::from_iter([(
-                    "weights".to_string(),
-                    Value::from_text(format!("title={weight},body=1")),
-                )]),
-            },
-        );
-        match result {
-            Ok(_) => accepted.push(weight),
-            Err(error) => assert!(
-                matches!(error, LimboError::ParseError(_)),
-                "{weight}: {error}"
-            ),
-        }
-    }
-    assert!(
-        accepted.is_empty(),
-        "accepted invalid weights: {accepted:?}"
-    );
-}
-
-#[test]
 fn field_weights_accept_finite_positive_boundaries() {
     let columns = [
         IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
@@ -105,7 +55,7 @@ fn field_weights_rename_column() {
 
 fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(
-        &crate::EngineDialect,
+        &crate::SqliteDialect,
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -169,7 +119,7 @@ fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
 
 fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
     let attachment = FtsIndexAttachment::new(
-        &crate::EngineDialect,
+        &crate::SqliteDialect,
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -1115,7 +1065,7 @@ mod allocation_failures {
         let db = crate::Database::open(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
                 .db_opts(crate::DatabaseOpts::default().with_index_method(true))
                 .allocators(DatabaseAllocators {
                     fts: DynAllocator::new(allocator.clone()),

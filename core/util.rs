@@ -2,7 +2,6 @@ use crate::dialect::Dialect;
 use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::CheckConstraint;
-use crate::schema::FromDefinitionFlags;
 use crate::security::policy::RowPolicy;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
@@ -21,7 +20,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::future::Future;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
+use turso_parser::ast::{self, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -979,21 +978,6 @@ pub(crate) fn is_rowid_alias_type(written_type: &ast::Type) -> bool {
     !written_type.is_array()
         && (written_type.name.eq_ignore_ascii_case("INTEGER")
             || written_type.name.eq_ignore_ascii_case("[INTEGER]"))
-}
-
-pub fn columns_from_create_table_body(
-    body: &turso_parser::ast::CreateTableBody,
-) -> crate::Result<Vec<Column>> {
-    let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
-        return Err(crate::LimboError::ParseError(
-            "CREATE TABLE body must contain columns and constraints".to_string(),
-        ));
-    };
-
-    columns
-        .iter()
-        .map(|column| Column::from_definition(column, FromDefinitionFlags::empty()))
-        .collect::<crate::Result<Vec<Column>>>()
 }
 
 #[derive(Debug, Default, PartialEq)]

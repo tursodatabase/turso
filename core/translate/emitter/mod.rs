@@ -386,7 +386,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::EngineDialect),
+            Arc::new(crate::SqliteDialect),
             None,
             RoleId::SUPERUSER,
         )

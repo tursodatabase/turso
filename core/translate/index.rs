@@ -1639,7 +1639,7 @@ mod tests {
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
         let stmt = match crate::dialect::parse_statement(
-            &crate::EngineDialect,
+            &crate::SqliteDialect,
             "CREATE INDEX aux.idx1 ON t1(name);",
         )
         .unwrap()

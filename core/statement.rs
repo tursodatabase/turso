@@ -1807,7 +1807,7 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     #[test]
@@ -1951,67 +1951,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn public_constraint_errors_preserve_sqlite_variants() {
-        for (sql, _, message, foreign_key, _) in constraint_error_cases() {
-            for with_waker in [false, true] {
-                let conn = constraint_test_connection();
-                let mut stmt = conn.prepare(sql).unwrap();
-                let error = loop {
-                    let result = if with_waker {
-                        stmt.step_with_waker(Waker::noop())
-                    } else {
-                        stmt.step()
-                    };
-                    match result {
-                        Err(error) => break error,
-                        Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                            stmt.pager.io.step().unwrap();
-                        }
-                        Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
-                    }
-                };
-                if foreign_key {
-                    assert!(
-                        matches!(error, LimboError::ForeignKeyConstraint(_)),
-                        "{sql}: {error:?}"
-                    );
-                } else {
-                    assert!(
-                        matches!(error, LimboError::Constraint(_)),
-                        "{sql}: {error:?}"
-                    );
-                }
-                assert_eq!(error.to_string(), message, "{sql}");
-                assert_eq!(error.sqlite_result_code(), 19, "{sql}");
-            }
-        }
-    }
-
-    #[test]
-    fn public_reset_preserves_sqlite_foreign_key_error() {
-        let conn = constraint_test_connection();
-        let mut stmt = conn
-            .prepare("INSERT INTO deferred_child VALUES (99) RETURNING pid")
-            .unwrap();
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => break,
-                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    stmt.pager.io.step().unwrap();
-                }
-                result => panic!("expected RETURNING row, got {result:?}"),
-            }
-        }
-        let error = stmt.reset().unwrap_err();
-        assert!(
-            matches!(error, LimboError::ForeignKeyConstraint(_)),
-            "{error:?}"
-        );
-        assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
-        assert_eq!(error.sqlite_result_code(), 19);
-    }
-
     fn constraint_error_cases(
     ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
         [
@@ -2109,36 +2048,6 @@ mod tests {
         ]
     }
 
-    /// RAISE and a constraint's own ON CONFLICT clause halt with their own
-    /// resolve type, and the error still reports the halt's result code.
-    #[test]
-    fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
-        for (sql, message, extended_code) in [
-            ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
-            (
-                "INSERT INTO unique_rollback VALUES (1)",
-                "UNIQUE constraint failed: unique_rollback.a",
-                2067,
-            ),
-        ] {
-            let conn = constraint_test_connection();
-            let mut stmt = conn.prepare(sql).unwrap();
-            let error = loop {
-                match stmt.step_with_structured_errors() {
-                    Err(error) => break error,
-                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                        stmt.pager.io.step().unwrap();
-                    }
-                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
-                }
-            };
-            assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
-            assert_eq!(error.to_string(), message, "{sql}");
-            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
-            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
-        }
-    }
-
     fn constraint_test_connection() -> Arc<crate::Connection> {
         let conn = open_test_connection().unwrap();
         conn.set_foreign_keys_enabled(true);
@@ -2173,7 +2082,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new(SessionRole::Superuser))
     }

@@ -5004,7 +5004,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::EngineDialect),
+            crate::sync::Arc::new(crate::SqliteDialect),
             None,
             crate::security::roles::RoleId::SUPERUSER,
         )

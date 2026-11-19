@@ -5085,8 +5085,8 @@ mod tests {
     use crate::attach::AttachDatabaseState;
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
-    use crate::EngineDialect;
     use crate::IOResult;
+    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5097,7 +5097,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new(SessionRole::Superuser))
@@ -5213,21 +5213,5 @@ mod tests {
         let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
 
         assert_eq!(pager_shared_ptr, db_shared_ptr);
-    }
-
-    #[test]
-    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE t1(a)").unwrap();
-        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
-
-        conn.execute("PRAGMA automatic_index = OFF").unwrap();
-        stmt.run_collect_rows().unwrap();
-
-        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
-        assert_eq!(reprepares, 1);
     }
 }

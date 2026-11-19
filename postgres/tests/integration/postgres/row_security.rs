@@ -436,8 +436,8 @@ impl turso_core::InternalVirtualTable for PageReader {
         }
     }
 
-    fn sql(&self) -> String {
-        format!("CREATE TABLE {}(data BLOB)", self.name())
+    fn columns(&self) -> Vec<turso_parser::ast::ColumnDefinition> {
+        vec![turso_core::vtab::column_definition("data", "BLOB")]
     }
 
     fn superuser_only(&self) -> bool {
