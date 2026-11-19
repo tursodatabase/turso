@@ -380,6 +380,46 @@ impl Statement {
         hash_builds
     }
 
+    /// Each place in the program that compares values, with the collation it
+    /// compares them with: the instructions, and the keys of the ephemeral
+    /// indexes. Functions and aggregates that never compare values carry an
+    /// unused collation, so they are left out.
+    #[cfg(feature = "test_helper")]
+    pub fn comparison_collations(&self) -> Vec<(String, crate::CollationSeq)> {
+        use vdbe::{builder::CursorType, insn::Insn};
+
+        let program = &self.program.prepared;
+        let instructions = program
+            .insns
+            .iter()
+            .filter(|(insn, _)| match insn {
+                Insn::Function { func, .. } => func.func.needs_collation(),
+                Insn::AggStep { data } => data.func.compares_values(),
+                _ => true,
+            })
+            .flat_map(|(insn, _)| {
+                insn.collations()
+                    .into_iter()
+                    .map(move |collation| (format!("{insn:?}"), collation))
+            });
+        let index_keys = program
+            .cursor_ref
+            .iter()
+            .filter_map(|(_, cursor_type)| match cursor_type {
+                CursorType::BTreeIndex(index) if index.ephemeral => Some(index),
+                _ => None,
+            })
+            .flat_map(|index| {
+                index.columns.iter().map(move |column| {
+                    (
+                        format!("key {} of index {}", column.name, index.name),
+                        column.collation,
+                    )
+                })
+            });
+        instructions.chain(index_keys).collect()
+    }
+
     pub fn get_connection(&self) -> &Arc<Connection> {
         &self.connection
     }
