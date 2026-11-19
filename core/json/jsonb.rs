@@ -3695,6 +3695,81 @@ fn validate_element(
         return Err(start + 1);
     }
 
+    validate_payload(data, start, header, header_offset, depth, strict)
+}
+
+/// Validates the payload of the element at `start`, whose header the caller
+/// has read and checked against the bounds of the element. The children of a
+/// container are validated here too, so that each header is read once.
+///
+/// This function recurses once for each level of nesting, so it holds only the
+/// container loops and the lenient checks of a scalar. The strict checks are in
+/// [validate_scalar_payload], so that their locals are not in each stack frame.
+fn validate_payload(
+    data: &[u8],
+    start: usize,
+    header: JsonbHeader,
+    header_offset: usize,
+    depth: usize,
+    strict: bool,
+) -> std::result::Result<(), usize> {
+    let payload_start = start + header_offset;
+    let payload_end = payload_start + header.payload_size();
+
+    match header.element_type() {
+        // Arrays and objects share one loop, so that the stack frame holds one
+        // inlined copy of check_child_header.
+        element_type @ (ElementType::ARRAY | ElementType::OBJECT) => {
+            let is_object = element_type == ElementType::OBJECT;
+            // In an object, the children are keys and values in turn.
+            let mut is_key = is_object;
+            let mut pos = payload_start;
+            while pos < payload_end {
+                let (child, child_header_offset, child_end) =
+                    check_child_header(data, pos, payload_end, depth + 1, strict, is_key)?;
+                validate_payload(data, pos, child, child_header_offset, depth + 1, strict)?;
+                pos = child_end;
+                is_key = is_object && !is_key;
+            }
+
+            // An object that ends after a key has a key with no value.
+            if is_object && !is_key {
+                return Err(payload_end + 1);
+            }
+            Ok(())
+        }
+        // The lenient checks of a scalar use no locals. The strict checks do,
+        // so they are out of line.
+        _ if strict => validate_scalar_payload(data, start, header, header_offset, strict),
+        ElementType::NULL | ElementType::TRUE | ElementType::FALSE
+            if header.payload_size() != 0 =>
+        {
+            Err(start + 1)
+        }
+        ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5
+            if header.payload_size() == 0 =>
+        {
+            Err(start + 1)
+        }
+        ElementType::RESERVED1 | ElementType::RESERVED2 | ElementType::RESERVED3 => Err(start + 1),
+        _ => Ok(()),
+    }
+}
+
+/// Validates the payload of the scalar element at `start`, whose header the
+/// caller has read and checked against the bounds of the element.
+#[inline(never)]
+fn validate_scalar_payload(
+    data: &[u8],
+    start: usize,
+    header: JsonbHeader,
+    header_offset: usize,
+    strict: bool,
+) -> std::result::Result<(), usize> {
+    let payload_start = start + header_offset;
+    let payload_size = header.payload_size();
+    let payload_end = payload_start + payload_size;
+
     match header.element_type() {
         ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
             if payload_size != 0 {
@@ -3782,63 +3857,52 @@ fn validate_element(
             }
             Ok(())
         }
-        ElementType::ARRAY => {
-            let mut pos = payload_start;
-            while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
-                pos = elem_end;
-            }
-            Ok(())
-        }
-        ElementType::OBJECT => {
-            let mut pos = payload_start;
-            let mut count = 0;
-            while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                if count % 2 == 0 {
-                    let Ok((elem_header, _)) = JsonbHeader::from_slice(pos, data) else {
-                        return Err(pos + 1);
-                    };
-                    if !elem_header.element_type().is_valid_key() {
-                        return Err(pos + 1);
-                    }
-                }
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
-                pos = elem_end;
-                count += 1;
-            }
-
-            if count % 2 != 0 {
-                return Err(payload_end + 1);
-            }
-            Ok(())
-        }
         _ => Err(start + 1),
     }
 }
 
-/// Reads the header of the child element at `pos` and returns where the
-/// child ends, or the 1-based offset of `pos` when the header is
-/// malformed or the child would run past `payload_end`.
-fn child_element_end(
+/// Reads the header of the child element at `pos` of a container whose payload
+/// ends at `payload_end`, and does the checks of [validate_element] on it:
+/// the header parses, the child ends inside the container, a key is text,
+/// `depth` is not too deep, and a strict check gets no wide 8-byte size.
+/// Returns the header, its length and where the child ends.
+///
+/// Each of these checks reports the 1-based offset of `pos`, so their order
+/// does not change the result.
+#[inline(always)]
+fn check_child_header(
     data: &[u8],
     pos: usize,
     payload_end: usize,
-) -> std::result::Result<usize, usize> {
-    let Ok((elem_header, elem_header_size)) = JsonbHeader::from_slice(pos, data) else {
+    depth: usize,
+    strict: bool,
+    is_key: bool,
+) -> std::result::Result<(JsonbHeader, usize, usize), usize> {
+    let Ok((header, header_offset)) = JsonbHeader::from_slice(pos, data) else {
         return Err(pos + 1);
     };
-    let Some(elem_end) = pos
-        .checked_add(elem_header_size)
-        .and_then(|end| end.checked_add(elem_header.payload_size()))
+    let Some(child_end) = pos
+        .checked_add(header_offset)
+        .and_then(|end| end.checked_add(header.payload_size()))
     else {
         return Err(pos + 1);
     };
-    if elem_end > payload_end {
+    if child_end > payload_end {
         return Err(pos + 1);
     }
-    Ok(elem_end)
+    if is_key && !header.element_type().is_valid_key() {
+        return Err(pos + 1);
+    }
+    if depth > MAX_JSON_DEPTH {
+        return Err(pos + 1);
+    }
+    if strict
+        && data[pos] >> 4 == 15
+        && (pos + 9 > data.len() || data[pos + 1..pos + 5] != [0, 0, 0, 0])
+    {
+        return Err(pos + 1);
+    }
+    Ok((header, header_offset, child_end))
 }
 
 /// Validates a text payload the way jsonbValidityCheck does. TEXTRAW
