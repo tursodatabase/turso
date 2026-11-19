@@ -607,7 +607,7 @@ test gap-b-62-tstzrange-contains {
 expect {
     t
 }
-@sqlstate 42883
+@sqlstate 0A000
 expect @tursopg error {}
 
 # B-63 (S2): json_build_object
@@ -759,17 +759,6 @@ expect {
 }
 @sqlstate 42703
 expect @tursopg error {}
-
-# B-77 (S1): now() text format has offset and micros
-test gap-b-77-now-text-format-has-offset-and-micros {
-    SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
-}
-expect {
-    t
-}
-expect @tursopg {
-    0
-}
 
 # B-78 (S1): gen_random_uuid() format
 test gap-b-78-gen-random-uuid-format {
@@ -1208,8 +1197,8 @@ test gap-b-116-to-char-timestamptz {
 expect {
     2026-10-08 12:00
 }
-expect @tursopg {
-}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # B-124 (S2): 64 nested scalar subqueries
 test gap-b-124-64-nested-scalar-subqueries {

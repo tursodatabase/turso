@@ -11786,7 +11786,7 @@ mod tests {
             panic!("Expected SELECT body");
         };
 
-        let expected = [ast::Expr::Literal(ast::Literal::CurrentTimestamp)];
+        let expected = [function_call("now", vec![])];
 
         assert_eq!(columns.len(), expected.len());
 
@@ -14060,9 +14060,17 @@ mod tests {
 
     #[test]
     fn fail_closed_current_timestamp_precision() {
-        assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
+        assert_not_supported(
+            "SELECT CURRENT_TIMESTAMP(3)",
+            "a precision on CURRENT_TIMESTAMP",
+        );
+        assert_not_supported(
+            "SELECT CURRENT_TIMESTAMP(0)",
+            "a precision on CURRENT_TIMESTAMP",
+        );
         assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
-        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        assert_not_supported("SELECT LOCALTIMESTAMP", "LOCALTIMESTAMP");
+        assert_translates("SELECT CURRENT_TIMESTAMP");
     }
 
     #[test]

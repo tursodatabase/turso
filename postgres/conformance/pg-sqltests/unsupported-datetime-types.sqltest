@@ -83,11 +83,15 @@ expect {
     ok
 }
 
-test localtimestamp-returns-timestamp {
+test localtimestamp-is-refused {
     SELECT 'ok' WHERE LOCALTIMESTAMP IS NOT NULL;
 }
 expect {
     ok
+}
+@sqlstate 0A000
+expect @tursopg error {
+    LOCALTIMESTAMP
 }
 
 test make-date-returns-date {

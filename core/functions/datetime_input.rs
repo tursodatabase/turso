@@ -691,9 +691,20 @@ fn read_offset(text: &str, input: &str, ty: TemporalType) -> Result<i64> {
 mod tests {
     use super::*;
 
+    /// The value as it is stored, or as the DECODE prints it for a timestamp
+    /// or a timestamptz.
     fn encode(input: &str, ty: &str) -> std::result::Result<String, String> {
         let value = Value::build_text(input.to_string());
-        match exec_temporal_encode(&value, &Value::build_text(ty.to_string())) {
+        let encoded = match ty {
+            "timestamp" => {
+                exec_timestamp_encode(&value).and_then(|stored| exec_timestamp_decode(&stored))
+            }
+            "timestamptz" => {
+                exec_timestamptz_encode(&value).and_then(|stored| exec_timestamptz_decode(&stored))
+            }
+            _ => exec_temporal_encode(&value, &Value::build_text(ty.to_string())),
+        };
+        match encoded {
             Ok(Value::Text(text)) => Ok(text.as_str().to_string()),
             Ok(other) => Err(format!("not text: {other:?}")),
             Err(err) => Err(err.to_string()),
@@ -714,7 +725,7 @@ mod tests {
             ("2024-01-05 10:00", "time", "10:00:00"),
             ("9:5", "time", "09:05:00"),
             ("12:30 PM", "time", "12:30:00"),
-            ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00"),
+            ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00+00"),
             ("+02 2024-01-05 10:00", "timestamp", "2024-01-05 10:00:00"),
             ("Z 2024-01-05", "timestamp", "2024-01-05 00:00:00"),
         ];
@@ -759,6 +770,92 @@ mod tests {
                 "{input} as {ty}: {:?}",
                 encode(input, ty)
             );
+        }
+    }
+
+    /// The stored values are the ones PostgreSQL 18's `timestamp_send` and
+    /// `timestamptz_send` write for the same timestamps.
+    #[test]
+    fn timestamps_are_stored_as_postgresql_stores_them() {
+        let cases = [
+            ("2000-01-01 00:00:00", 0),
+            ("0001-01-01 00:00:00", 0xff1f_e2ff_c59c_6000_u64 as i64),
+            ("9999-12-31 23:59:59.999999", 0x0380_e70b_913b_7fff),
+        ];
+        for (text, stored) in cases {
+            let timestamp = Value::build_text(text.to_string());
+            let timestamptz = Value::build_text(format!("{text}+00"));
+            let stored = Value::from_i64(stored);
+            assert_eq!(exec_timestamp_encode(&timestamp).unwrap(), stored);
+            assert_eq!(exec_timestamp_decode(&stored).unwrap(), timestamp);
+            assert_eq!(exec_timestamptz_encode(&timestamptz).unwrap(), stored);
+            assert_eq!(exec_timestamptz_decode(&stored).unwrap(), timestamptz);
+        }
+        for stored in [i64::MIN, i64::MAX, 0x0380_e70b_913b_8000] {
+            let stored = Value::from_i64(stored);
+            assert!(exec_timestamp_decode(&stored).is_err());
+            assert!(exec_timestamptz_decode(&stored).is_err());
+        }
+    }
+
+    /// An index orders the stored integers, while an expression compares the
+    /// DECODE's text, so both must give the same order for every stored value.
+    ///
+    /// A stored value is a day, a second of that day and a microsecond of that
+    /// second. The DECODE's text is the day in 10 characters, a space, the
+    /// second in 8 characters, then a suffix that depends only on the
+    /// microsecond. Because the day and the second have a fixed width, the
+    /// text compares the day first, then the second, then the suffix, as the
+    /// integer does. So the text sorts as the integer if each part sorts as
+    /// its number. The test checks every day from 0001-01-01 to 9999-12-31,
+    /// every second of a day and every microsecond of a second.
+    #[test]
+    fn decoded_text_sorts_as_the_stored_integer() {
+        const SECOND: i64 = 1_000_000;
+        const DAY: i64 = 86_400 * SECOND;
+        let first_day = 0xff1f_e2ff_c59c_6000_u64 as i64; // 0001-01-01 00:00:00
+        let last_day = 0x0380_e70b_913b_7fff - (DAY - 1); // 9999-12-31 00:00:00
+        for (decode, offset) in [
+            (exec_timestamp_decode as fn(&Value) -> Result<Value>, ""),
+            (exec_timestamptz_decode, "+00"),
+        ] {
+            let text = |stored: i64| {
+                decode(&Value::from_i64(stored))
+                    .unwrap()
+                    .to_text()
+                    .unwrap()
+                    .to_string()
+            };
+            assert!(decode(&Value::from_i64(first_day - 1)).is_err());
+            assert!(decode(&Value::from_i64(last_day + DAY)).is_err());
+
+            let mut previous = String::new();
+            for stored in (first_day..=last_day).step_by(DAY as usize) {
+                let text = text(stored);
+                assert_eq!(&text[10..], format!(" 00:00:00{offset}"), "{text}");
+                assert!(previous.as_str() < &text[..10], "{previous} then {text}");
+                previous = text[..10].to_string();
+            }
+
+            let mut previous = String::new();
+            for stored in (0..DAY).step_by(SECOND as usize) {
+                let text = text(stored);
+                assert_eq!(&text[..11], "2000-01-01 ", "{text}");
+                assert_eq!(&text[19..], offset, "{text}");
+                assert!(previous.as_str() < &text[11..19], "{previous} then {text}");
+                previous = text[11..19].to_string();
+            }
+
+            let mut previous = String::new();
+            for stored in 0..SECOND {
+                let text = text(stored);
+                assert_eq!(&text[..19], "2000-01-01 00:00:00", "{text}");
+                assert!(
+                    stored == 0 || previous.as_str() < &text[19..],
+                    "{previous} then {text}"
+                );
+                previous = text[19..].to_string();
+            }
         }
     }
 }

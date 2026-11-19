@@ -61,7 +61,7 @@ addr  opcode            p1  p2  p3  p4                                     p5  c
   26    Affinity        26   3   0                                          0  r[26..29] = C, C, C
   27    SeekGE           2  52  26                                          0  key=[26..28]
   28    String8          0  28   0  1995-01-01                              0  r[28]='1995-01-01'
-  29    Affinity        26   3   0                                          0  r[26..29] = C, C, C
+  29    Affinity        28   1   0                                          0  r[28..29] = C
   30      IdxGE          2  52  26                                          0  key=[26..28]
   31      DeferredSeek   2   1   0                                          0
   32      Integer        1  16   0                                          0  r[16]=1

@@ -331,3 +331,28 @@ test set-default-encodes-default-value {
 expect {
     8
 }
+
+# A foreign key on a timestamptz or timestamp column is not supported.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test foreign-key-on-timestamp-column-is-refused {
+    CREATE TABLE parent(k timestamptz PRIMARY KEY) STRICT;
+    CREATE TABLE child(k timestamptz REFERENCES parent(k)) STRICT;
+}
+expect error {
+    using type timestamptz in a foreign key is not supported
+}
+
+# The parent's key is checked when the foreign key is used, because the
+# parent table may not exist yet when the child table is created.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test foreign-key-referencing-timestamp-column-is-refused {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(k timestamp PRIMARY KEY) STRICT;
+    CREATE TABLE child(k integer REFERENCES parent(k)) STRICT;
+    INSERT INTO child VALUES (0);
+}
+expect error {
+    using type timestamp in a foreign key is not supported
+}

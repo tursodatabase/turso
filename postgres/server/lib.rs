@@ -1425,10 +1425,7 @@ mod tests {
         )
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
-        let handler = Arc::new(TursoPgHandler {
-            conn: conn.clone(),
-            query_parser: Arc::new(NoopQueryParser::new()),
-        });
+        let handler = Arc::new(TursoPgHandler::new(conn.clone()));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1697,6 +1694,88 @@ mod tests {
         let events = client.simple_query("COMMIT").unwrap();
         assert!(matches!(&events[0], BackendEvent::CommandComplete(tag) if tag == "COMMIT"));
         assert_row_count(&mut client, "q", "1");
+    }
+
+    const THREE_TIMES: &str = "SELECT now(), statement_timestamp(), clock_timestamp()";
+
+    fn data_rows(events: &[BackendEvent]) -> Vec<Vec<Option<String>>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BackendEvent::DataRow(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sends Parse, Bind and Execute of `sql`, without Sync.
+    fn send_extended(client: &mut PgConn, sql: &str) {
+        let mut parse = vec![0];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(b"\0\0\0");
+        client.write_message(b'P', &parse).unwrap();
+        client.write_message(b'B', b"\0\0\0\0\0\0\0\0").unwrap();
+        client.write_message(b'E', b"\0\0\0\0\0").unwrap();
+    }
+
+    fn sync_and_read(client: &mut PgConn) -> Vec<BackendEvent> {
+        client.write_message(b'S', b"").unwrap();
+        let mut events = Vec::new();
+        while !matches!(events.last(), Some(BackendEvent::ReadyForQuery(_))) {
+            events.push(client.read_event().unwrap());
+        }
+        events
+    }
+
+    #[test]
+    fn the_statements_of_one_query_message_share_now_and_statement_timestamp() {
+        let (mut client, _conn) = copy_test_client();
+        let events = client
+            .simple_query(&format!("{THREE_TIMES}; {THREE_TIMES}"))
+            .unwrap();
+        let rows = data_rows(&events);
+        let [first, second] = &rows[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(first[0], second[0], "now()");
+        assert_eq!(first[1], second[1], "statement_timestamp()");
+        assert_ne!(first[2], second[2], "clock_timestamp()");
+        // A later message is a later statement and transaction.
+        let later = data_rows(&client.simple_query(THREE_TIMES).unwrap());
+        assert_ne!(first[0], later[0][0]);
+        assert_ne!(first[1], later[0][1]);
+    }
+
+    #[test]
+    fn an_extended_batch_shares_now_until_sync() {
+        let (mut client, _conn) = copy_test_client();
+        send_extended(&mut client, THREE_TIMES);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_extended(&mut client, THREE_TIMES);
+        let rows = data_rows(&sync_and_read(&mut client));
+        let [first, second] = &rows[..] else {
+            panic!("{rows:?}");
+        };
+        assert_eq!(first[0], second[0], "now() lasts until Sync");
+        assert_ne!(first[1], second[1], "each Execute has its own time");
+        send_extended(&mut client, THREE_TIMES);
+        let after_sync = data_rows(&sync_and_read(&mut client));
+        assert_ne!(first[0], after_sync[0][0], "Sync ends the transaction");
+    }
+
+    #[test]
+    fn a_transaction_after_commit_in_an_extended_batch_has_its_own_now() {
+        let (mut client, _conn) = copy_test_client();
+        send_extended(&mut client, "BEGIN");
+        send_extended(&mut client, THREE_TIMES);
+        send_extended(&mut client, "COMMIT");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_extended(&mut client, THREE_TIMES);
+        let rows = data_rows(&sync_and_read(&mut client));
+        let [first, second] = &rows[..] else {
+            panic!("{rows:?}");
+        };
+        assert_ne!(first[0], second[0], "COMMIT ends the transaction");
     }
 
     // 3000000000 doesn't fit the int4 column, so the second row is refused

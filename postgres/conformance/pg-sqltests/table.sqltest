@@ -1086,6 +1086,17 @@ expect {
     2|c
 }
 
+test table-default-refuses-a-function-of-a-timestamptz {
+    CREATE TABLE a (i int, k int DEFAULT abs(now()));
+}
+expect error {}
+
+test table-add-column-default-refuses-a-function-of-a-timestamptz {
+    CREATE TABLE a (i int);
+    ALTER TABLE a ADD COLUMN k int DEFAULT abs(now());
+}
+expect error {}
+
 test returning-with-new-alias {
     CREATE TABLE returning_alias (a int);
     INSERT INTO returning_alias VALUES (1) RETURNING WITH (NEW AS n) n.a;

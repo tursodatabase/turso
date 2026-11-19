@@ -1,8 +1,10 @@
 @database :memory:
 
 # The built-in date, time, timestamp and timestamptz types read the input
-# forms PostgreSQL reads and store one text form with a 4-digit year.
-# Expected values are PostgreSQL 17's, with the session time zone UTC.
+# forms PostgreSQL reads. date and time store one text form with a 4-digit
+# year; timestamp and timestamptz store the microseconds since 2000-01-01, in
+# UTC for timestamptz. Expected values are PostgreSQL 18's, with the session
+# time zone UTC.
 
 @requires strict "uses STRICT tables"
 test datetime-input-postgresql-forms {
@@ -14,10 +16,10 @@ test datetime-input-postgresql-forms {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00
-    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
-    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00
-    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00
+    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00+00
+    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
+    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00+00
+    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00+00
 }
 
 @requires custom_types "date and time types are custom types"
@@ -37,9 +39,9 @@ test datetime-input-keeps-microseconds {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456
-    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5
-    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00
+    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456+00
+    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5+00
+    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -63,8 +65,8 @@ test datetime-input-offsets {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
-    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00
+    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
+    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -124,7 +126,7 @@ test datetime-input-accepts-second-60-as-next-day {
     SELECT * FROM t;
 }
 expect {
-    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00
+    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -323,7 +325,7 @@ expect {
     1|2024-01-05|2024-01-05 10:00:00
 }
 
-# The stored text sorts in time order, so a range on the column can use an
+# The stored form sorts in time order, so a range on the column can use an
 # index.
 
 @requires strict "uses STRICT tables"
@@ -383,28 +385,107 @@ expect {
     3
 }
 
-# timestamptz is stored as the UTC instant with no offset, so it equals the
-# same timestamp and SQLite's date functions can read it.
+# The row's record ends with two serial types 6, 8-byte integers, each holding
+# 0x0002B12D00EB8120: 757756800500000 microseconds since 2000-01-01, in UTC
+# for the timestamptz.
 @requires strict "uses STRICT tables"
-test datetime-timestamp-equals-timestamptz {
-    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
-    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
-    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
-    SELECT id FROM t WHERE ts = tz;
+@skip-if mvcc "in MVCC mode the row is not written to the page until a checkpoint"
+test datetime-timestamps-stored-as-microseconds-since-2000 {
+    CREATE TABLE t(ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 08:00:00.5', '2024-01-05 10:00:00.5+02');
+    SELECT substr(hex(data), -36) FROM sqlite_dbpage WHERE pgno = (SELECT rootpage FROM sqlite_schema WHERE name = 't');
 }
 expect {
-    1
+    06060002B12D00EB81200002B12D00EB8120
+}
+
+# PostgreSQL converts the timestamp to timestamptz in the session's time zone
+# first. Turso does not convert between the two.
+@requires strict "uses STRICT tables"
+test datetime-timestamp-compared-with-timestamptz-is-refused {
+    CREATE TABLE t(ts timestamp, tz timestamptz) STRICT;
+    SELECT count(*) FROM t WHERE ts = tz;
+}
+expect error {
+    comparing type timestamp with type timestamptz is not supported
+}
+
+# A timestamptz can only be stored and compared, so SQLite's date functions
+# cannot read it.
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-sqlite-date-functions-is-refused {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    SELECT datetime(tz) FROM t;
+}
+expect error {
+    using type timestamptz in function datetime\(\) is not supported
+}
+
+# These expressions are compiled without the binding that a query's
+# expressions go through, and are refused all the same.
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-generated-column-function-is-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tz timestamptz, g integer AS (abs(tz))) STRICT;
+    INSERT INTO t(id, tz) VALUES (1, '2024-01-05');
+}
+expect error {
+    using type timestamptz in function abs\(\) is not supported
 }
 
 @requires strict "uses STRICT tables"
-test datetime-timestamptz-in-sqlite-date-functions {
+test datetime-timestamptz-in-trigger-when-function-is-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tz timestamptz) STRICT;
+    CREATE TABLE log(x integer) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN length(NEW.tz) > 0 BEGIN
+        INSERT INTO log VALUES (1);
+    END;
+    INSERT INTO t VALUES (1, '2024-01-05');
+}
+expect error {
+    using type timestamptz in function length\(\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-upsert-set-function-is-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05');
+    INSERT INTO t VALUES (1, '2024-01-06') ON CONFLICT (id) DO UPDATE SET id = abs(excluded.tz);
+}
+expect error {
+    using type timestamptz in function abs\(\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-upsert-where-function-is-refused {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05');
+    INSERT INTO t VALUES (1, '2024-01-06') ON CONFLICT (id) DO UPDATE SET tz = excluded.tz WHERE length(excluded.tz) > 0;
+}
+expect error {
+    using type timestamptz in function length\(\) is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-and-integer-in-recursive-union-all-is-refused {
     CREATE TABLE t(tz timestamptz) STRICT;
-    INSERT INTO t VALUES ('2024-01-05 10:00:00'), ('2024-01-05 12:00:00+02');
-    SELECT datetime(tz), date(tz), unixepoch(tz) FROM t;
+    INSERT INTO t VALUES ('2024-01-05');
+    WITH RECURSIVE r(x) AS (SELECT tz FROM t UNION ALL SELECT 1 FROM r LIMIT 3)
+    SELECT x FROM r;
+}
+expect error {
+    comparing type timestamptz with type integer is not supported
+}
+
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-in-recursive-union-all {
+    CREATE TABLE t(tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    WITH RECURSIVE r(x, n) AS (SELECT tz, 1 FROM t UNION ALL SELECT x, n + 1 FROM r WHERE n < 2)
+    SELECT x, n FROM r;
 }
 expect {
-    2024-01-05 10:00:00|2024-01-05|1704448800
-    2024-01-05 10:00:00|2024-01-05|1704448800
+    2024-01-05 00:00:00+00|1
+    2024-01-05 00:00:00+00|2
 }
 
 # The order of the fields matters, as in PostgreSQL: `T` needs a date before
@@ -549,4 +630,16 @@ test datetime-input-rejects-order-time-after-am-pm-and-date {
 }
 expect error {
     invalid input syntax for type time: "2024-01-05 PM 10:00"
+}
+
+# The type of a VALUES column whose rows mix a timestamptz declared with a
+# type modifier and a string literal is refused.
+@requires strict "uses STRICT tables"
+test datetime-timestamptz-with-type-modifier-in-values-is-refused {
+    CREATE TABLE t(a timestamptz(3)) STRICT;
+    INSERT INTO t VALUES ('2024-01-01 00:00:00+00');
+    SELECT * FROM (VALUES ((SELECT a FROM t)), ('2024-01-02'));
+}
+expect error {
+    a type modifier on timestamptz is not supported
 }
