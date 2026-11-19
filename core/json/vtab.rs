@@ -319,7 +319,6 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
         self.push_state(iterator_state, Some(root_id), innermost_container_path);
 
-        let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
             JsonTraversalMode::Each => self.advance(),
             JsonTraversalMode::Tree => {
@@ -331,7 +330,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 } else {
                     self.columns.value_mut().copy_from(&self.json)?;
                     self.columns.set_row(
-                        key,
+                        true,
                         self.path_to_current_value.cursor(),
                         None,
                         self.path_to_current_value.cursor_before_last_element(),
@@ -353,7 +352,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 
     fn column(&self, idx: usize) -> Result<Value, LimboError> {
         Ok(match idx {
-            COL_KEY => self.columns.key(),
+            COL_KEY => self.columns.key(self.path_to_current_value.key()),
             COL_VALUE => self.columns.value()?,
             COL_TYPE => self.columns.ttype(),
             COL_ATOM => self.columns.atom()?,
@@ -408,9 +407,8 @@ impl JsonEachCursor {
                     self.push_state(it, Some(self.id), self.path_to_current_value.cursor());
                 }
 
-                let key = self.path_to_current_value.key().to_owned();
                 self.columns.set_row(
-                    key,
+                    true,
                     self.path_to_current_value.cursor(),
                     parent_id,
                     traversal_state.innermost_container_cursor,
@@ -447,7 +445,7 @@ impl JsonEachCursor {
                         });
 
                 self.columns.set_row(
-                    self.path_to_current_value.key().to_owned(),
+                    true,
                     self.path_to_current_value.cursor(),
                     parent_id,
                     traversal_state.innermost_container_cursor,
@@ -456,13 +454,12 @@ impl JsonEachCursor {
                 self.pop_path_before_advance = !recursing;
             }
             IteratorState::Primitive(jsonb) => {
-                let key = match self.traversal_mode {
-                    JsonTraversalMode::Each => Key::None,
-                    JsonTraversalMode::Tree => self.path_to_current_value.key().to_owned(),
-                };
+                // The root of json_each() has no key. The root of
+                // json_tree() has the last element of the root path.
+                let has_key = matches!(self.traversal_mode, JsonTraversalMode::Tree);
                 *self.columns.value_mut() = jsonb;
                 self.columns.set_row(
-                    key,
+                    has_key,
                     self.path_to_current_value.cursor(),
                     None,
                     traversal_state.innermost_container_cursor,
@@ -544,10 +541,6 @@ mod columns {
     }
 
     impl Key {
-        fn empty() -> Self {
-            Self::None
-        }
-
         fn key_representation(&self) -> Value {
             match self {
                 Key::Integer(ref i) => Value::from_i64(*i),
@@ -557,11 +550,13 @@ mod columns {
         }
     }
 
-    /// The columns of the current row. The fullkey and path columns are
-    /// prefixes of the path of the cursor, which stays the same until the
-    /// cursor advances, so only their lengths are kept.
+    /// The columns of the current row. The key column is the last element of
+    /// the path of the cursor, and the fullkey and path columns are prefixes
+    /// of the path. The path stays the same until the cursor advances, so
+    /// only their lengths are kept.
     pub(super) struct Columns {
-        key: Key,
+        /// False for the row of a json_each() root, which has no key.
+        has_key: bool,
         value: Jsonb,
         fullkey_len: usize,
         parent_id: Option<i64>,
@@ -571,7 +566,7 @@ mod columns {
     impl Default for Columns {
         fn default() -> Columns {
             Self {
-                key: Key::empty(),
+                has_key: false,
                 value: Jsonb::empty(),
                 fullkey_len: 0,
                 parent_id: None,
@@ -590,12 +585,12 @@ mod columns {
         /// Sets the columns of the current row other than the value.
         pub(super) fn set_row(
             &mut self,
-            key: Key,
+            has_key: bool,
             fullkey_len: usize,
             parent_id: Option<i64>,
             innermost_container_path_len: usize,
         ) {
-            self.key = key;
+            self.has_key = has_key;
             self.fullkey_len = fullkey_len;
             self.parent_id = parent_id;
             self.innermost_container_path_len = innermost_container_path_len;
@@ -615,8 +610,13 @@ mod columns {
             })
         }
 
-        pub(super) fn key(&self) -> Value {
-            self.key.key_representation()
+        /// `last_element` is the last element of the path of the cursor.
+        pub(super) fn key(&self, last_element: &Key) -> Value {
+            if self.has_key {
+                last_element.key_representation()
+            } else {
+                Value::Null
+            }
         }
 
         fn atom_from_value(value: &Jsonb) -> Result<Value, LimboError> {
@@ -748,7 +748,7 @@ impl InPlaceJsonPath {
         // A key with no escape is its own name, so it needs no JSON text.
         if let Some(payload) = key.plain_string_payload() {
             let name = jsonb::utf8_lossy(payload);
-            self.last_element = Key::String(name.to_string());
+            self.set_last_element_name(&name);
             self.push_object_name(&name);
             return Ok(());
         }
@@ -776,6 +776,18 @@ impl InPlaceJsonPath {
         };
         self.push_object_name(name);
         Ok(())
+    }
+
+    /// Makes `name` the last element. The name is written in the buffer of
+    /// the name before it, if there is one, so that the members of an
+    /// object do not allocate a name each.
+    fn set_last_element_name(&mut self, name: &str) {
+        if let Key::String(last_name) = &mut self.last_element {
+            last_name.clear();
+            last_name.push_str(name);
+        } else {
+            self.last_element = Key::String(name.to_owned());
+        }
     }
 
     fn push_object_name(&mut self, name: &str) {
