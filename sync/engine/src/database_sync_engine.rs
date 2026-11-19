@@ -773,6 +773,21 @@ fn reload_connection_after_external_restore(
     Ok(())
 }
 
+/// Publishes the schema of a pull that already committed and released the write lock. Other
+/// connections are not gated for these pulls, so one of them can commit DDL in between, and its
+/// schema must stay in the shared cache.
+fn publish_schema_after_pull_commit(
+    conn: &Arc<turso_core::Connection>,
+    context: &str,
+) -> Result<()> {
+    conn.publish_schema_after_external_restore_if_current()
+        .map_err(|error| {
+            Error::DatabaseSyncEngineError(format!(
+                "failed to publish schema after {context}: {error}",
+            ))
+        })
+}
+
 fn publish_schema_after_sync_checkpoint(conn: &Arc<turso_core::Connection>) -> Result<()> {
     conn.get_pager().clear_page_cache(true);
     match force_reparse_schema_with_retry(conn) {
@@ -3147,10 +3162,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // turso_cdc"). Publishing before the bookkeeping also lets concurrent readers adopt
             // the shared schema cheaply instead of reparsing from disk during that window.
             if raw_replay_refresh || recreate_cdc {
-                publish_schema_after_external_restore(
-                    &main_conn,
-                    "post-raw-WAL-replay schema publish",
-                )?;
+                publish_schema_after_pull_commit(&main_conn, "post-raw-WAL-replay schema publish")?;
             }
 
             let logical_table_names_by_stable_id =
@@ -4081,6 +4093,32 @@ mod tests {
 
         assert_eq!(std::fs::read(&main_path).unwrap(), b"main-new");
         assert_replace_base_backups_removed(&main_path);
+    }
+
+    /// A pull publishes its schema after it committed and released the write lock. A DDL
+    /// statement that another connection committed in between has published a newer schema, and
+    /// connections that open later must still see its table.
+    #[test]
+    fn schema_publish_after_a_pull_commit_keeps_a_newer_schema() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io, &path, Arc::new(SqliteDialect)).unwrap();
+        let connect = || {
+            db.connect(turso_core::ConnectOpts::new(
+                turso_core::SessionRole::Superuser,
+            ))
+            .unwrap()
+        };
+
+        let pull_conn = connect();
+        pull_conn.execute("CREATE TABLE t(x)").unwrap();
+        let app_conn = connect();
+        app_conn.execute("CREATE TABLE t2(y)").unwrap();
+
+        super::publish_schema_after_pull_commit(&pull_conn, "test").unwrap();
+
+        connect().execute("INSERT INTO t2 VALUES (1)").unwrap();
     }
 
     #[test]
