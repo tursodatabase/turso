@@ -79,6 +79,43 @@ impl MaterializedViewCursor {
     }
 }
 
+#[cfg(feature = "test_helper")]
+impl crate::Connection {
+    /// A read cursor over materialized view `view_name` in the main database,
+    /// the same kind of cursor a query opens on the view.
+    pub fn materialized_view_cursor_for_testing(
+        self: &Arc<Self>,
+        view_name: &str,
+    ) -> crate::Result<Box<dyn CursorTrait>> {
+        let view = self
+            .schema
+            .read()
+            .get_materialized_view(crate::NamespaceId::ROOT, view_name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("no materialized view {view_name}"))
+            })?;
+        let view = view.lock();
+        let root_page = view.get_root_page();
+        if root_page == 0 {
+            return Err(LimboError::InternalError(format!(
+                "materialized view {view_name} has no btree"
+            )));
+        }
+        let num_columns = view.column_schema.columns.len();
+        drop(view);
+
+        let pager = self.get_pager();
+        let btree_cursor = Box::new(crate::storage::btree::BTreeCursor::new(
+            pager.clone(),
+            root_page,
+            num_columns,
+        ));
+        let cursor = MaterializedViewCursor::new(btree_cursor, pager, self.clone());
+        cursor.register_with_pager();
+        Ok(Box::new(cursor))
+    }
+}
+
 /// Positioning methods first bring the view up to date; everything else is
 /// the btree cursor's own behavior. Writes go through the maintenance
 /// programs' own cursors, never through this one.

@@ -681,6 +681,43 @@ impl Default for TransactionChanges {
     }
 }
 
+#[cfg(feature = "test_helper")]
+impl crate::Connection {
+    /// Record a change of `weight` to row `rowid` of main-database table
+    /// `table_name` in this connection's transaction change log, as a write
+    /// statement would, but deliver it only to materialized view `view_name`.
+    /// The table itself is not written.
+    pub fn record_view_change_for_testing(
+        &self,
+        view_name: &str,
+        table_name: &str,
+        rowid: i64,
+        values: std::vec::Vec<Value>,
+        weight: isize,
+    ) -> Result<()> {
+        let table = self
+            .schema
+            .read()
+            .get_btree_table(NamespaceId::ROOT, table_name)
+            .ok_or_else(|| LimboError::InternalError(format!("no table {table_name}")))?;
+        let spill_started = self.transaction_changes.change(
+            &table,
+            &[view_name.to_string()],
+            rowid,
+            values.into_iter().try_collect()?,
+            weight,
+            self.get_temp_store(),
+        )?;
+        if spill_started {
+            use crate::IOExt;
+            self.get_pager()
+                .io
+                .block(|| self.transaction_changes.finish_spill().map_err(Box::new))?;
+        }
+        Ok(())
+    }
+}
+
 /// A materialized view: its defining SELECT, output schema, and storage root.
 ///
 /// Maintenance is performed by compiled VDBE programs (see
