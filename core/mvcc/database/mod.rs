@@ -1617,6 +1617,11 @@ pub struct BuildLogRecordCtx {
     /// op after both row-version passes complete (preserves on-disk
     /// order: ops first, header last).
     pub pending_header: Option<DatabaseHeader>,
+    /// Indexes of the sqlite_schema entries in the write set, found by the
+    /// first step of BuildLogRecord. The write set does not change after the
+    /// transaction leaves the Active state, so the later steps read these
+    /// entries instead of all the entries of the write set.
+    pub schema_entries: Option<Vec<usize>>,
 }
 
 /// Iteration state for the chunked `RewriteLiveVersions` step.
@@ -2094,6 +2099,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             cursor: 0,
             schema_process: true,
             pending_header,
+            schema_entries: None,
         });
         Ok(())
     }
@@ -2480,29 +2486,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
         {
             let write_set = tx.write_set.lock();
-            let frame_writes_schema = write_set
-                .entries
-                .iter()
-                .any(|(id, _)| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
+            // Each step of BuildLogRecord processes MVCC_COMMIT_BATCH_SIZE
+            // entries, and each step needs the sqlite_schema entries. A scan
+            // of the whole write set in each step made a large commit
+            // quadratic, so only the first step scans it.
+            let schema_entries = ctx.schema_entries.get_or_insert_with(|| {
+                write_set
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (id, _))| id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+                    .map(|(index, _)| index)
+                    .collect()
+            });
 
             // Decoding sqlite_schema records is only needed for DDL frames.
             // Normal DML frames do not touch sqlite_schema, so avoid parsing
             // schema records while committing the common path.
-            if frame_writes_schema {
+            if !schema_entries.is_empty() {
                 let mut schema_roots_created_and_deleted_in_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_deleted_by_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_before_tx: HashSet<i64> = HashSet::default();
                 let mut schema_roots_present_after_tx: HashSet<i64> = HashSet::default();
 
-                for (id, row_versions) in &write_set.entries {
-                    // Only sqlite_schema entries can yield a btree identity. The
-                    // common path (CREATE INDEX on a populated table, bulk DML)
-                    // has tens of thousands of write_set entries that are NOT
-                    // sqlite_schema; locking each and parsing every version was
-                    // the dominant cost of MVCC commit on this branch.
-                    if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                        continue;
-                    }
+                for &index in schema_entries.iter() {
+                    // Only sqlite_schema entries can yield a btree identity.
+                    let (id, row_versions) = &write_set.entries[index];
                     for row_version in row_versions.read().iter() {
                         let Some(identity) =
                             sqlite_schema_btree_identity(id.table_id, row_version)?
@@ -3489,6 +3498,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     cursor: 0,
                     schema_process: true,
                     pending_header,
+                    schema_entries: None,
                 });
                 return Ok(TransitionResult::Continue);
             }
