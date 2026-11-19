@@ -723,3 +723,132 @@ impl LoadStep for DialectState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
+    use crate::security::roles::SessionRole;
+    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::util::IOExt;
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
+
+    const NAMESPACE: NamespaceId = NamespaceId::new(7);
+
+    /// Reads `sqlite_schema`, then names [`NAMESPACE`] in the schema being
+    /// read. Unit tests of this crate have no SQL parser, and this read needs
+    /// none.
+    #[derive(Default)]
+    struct NamesANamespace {
+        queried: bool,
+    }
+
+    impl LoadStep for NamesANamespace {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried).then_some(LoadQuery::SchemaTableRead);
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+            load.schema_mut()?.name_namespace(NAMESPACE, "seven");
+            Ok(())
+        }
+    }
+
+    /// Reads `sqlite_schema`, and records whether the connection's schema
+    /// has the name of [`NAMESPACE`] once its statement has run.
+    struct LooksForTheNamespace {
+        conn: Arc<Connection>,
+        queried: bool,
+        found: Arc<AtomicBool>,
+    }
+
+    impl LoadStep for LooksForTheNamespace {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried).then_some(LoadQuery::SchemaTableRead);
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_of_rows(&mut self, _load: &mut SchemaLoad) -> Result<()> {
+            let found = self.conn.schema.read().namespace_name(NAMESPACE) == Some("seven");
+            self.found.store(found, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Opening a database runs the steps on a connection that is not in a
+    /// schema reparse. In MVCC mode, preparing a statement on such a
+    /// connection replaces a schema of the connection's own with the shared
+    /// schema, which would lose what the step before read.
+    #[test]
+    fn a_step_sees_what_the_step_before_read_when_the_schema_is_installed_as_shared() {
+        for mvcc in [false, true] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open(
+                io.clone(),
+                ":memory:",
+                OpenOptions::new(Arc::new(DialectThatCannotParse))
+                    .db_opts(DatabaseOpts::new().with_mvcc(mvcc)),
+            )
+            .unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            assert_eq!(conn.mvcc_enabled(), mvcc);
+            let found = Arc::new(AtomicBool::new(false));
+            let mut loader = SchemaLoader::new(
+                db.schema.lock().clone(),
+                vec![
+                    Box::new(NamesANamespace::default()),
+                    Box::new(LooksForTheNamespace {
+                        conn: conn.clone(),
+                        queried: false,
+                        found: found.clone(),
+                    }),
+                ],
+                SchemaInstall::Shared,
+            );
+
+            io.block(|| loader.run(&conn)).unwrap();
+
+            assert!(found.load(Ordering::SeqCst), "mvcc={mvcc}");
+            assert_eq!(
+                db.schema.lock().namespace_name(NAMESPACE),
+                Some("seven"),
+                "mvcc={mvcc}"
+            );
+        }
+    }
+
+    /// Most databases have no namespace names and no dialect state to read.
+    /// Opening them must not copy the schema.
+    #[test]
+    fn steps_that_change_nothing_leave_the_shared_schema_uncopied() {
+        let io = Arc::new(MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        let shared = db.schema.lock().clone();
+        let mut loader = SchemaLoader::new(
+            shared.clone(),
+            load_steps(&conn, StepsFor::Open),
+            SchemaInstall::Shared,
+        );
+
+        io.block(|| loader.run(&conn)).unwrap();
+
+        assert!(Arc::ptr_eq(&loader.into_schema(), &shared));
+    }
+}
