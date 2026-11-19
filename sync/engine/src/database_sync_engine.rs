@@ -2033,33 +2033,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<BTreeMap<u64, String>> {
         tracing::info!("apply_logical_mvcc_changes(path={})", self.main_db_path);
 
-        let conn = self.connect_for_pull(DbChangesStreamKind::Logical)?;
-        let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
-        let (local_pull_gen, local_last_change_id) =
-            read_last_change_id(coro, &conn, &self.client_unique_id).await?;
-        let mut precollected_local_changes = Vec::new();
-        if had_cdc_table {
-            let iterate_opts = DatabaseChangesIteratorOpts {
-                first_change_id: None,
-                mode: DatabaseChangesIteratorMode::Apply,
-                ignore_schema_changes: false,
-                ..Default::default()
-            };
-            let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
-            while let Some(operation) = iterator.next(coro).await? {
-                match operation {
-                    DatabaseTapeOperation::RowChange(change) => {
-                        precollected_local_changes.push(change)
-                    }
-                    DatabaseTapeOperation::Commit => continue,
-                    DatabaseTapeOperation::StmtReplay(_)
-                    | DatabaseTapeOperation::SchemaReplay(_) => {
-                        panic!("changes iterator must not use replay-only operations")
-                    }
-                }
-            }
-        }
-
+        let conn = connect_untracked(&self.main_tape)?;
+        // Read the local changes and the last synced change id after BEGIN IMMEDIATE, so no
+        // other connection can commit between reading them and committing the apply.
         begin_immediate(coro, &conn).await?;
         let mut logical_table_names_by_stable_id =
             self.meta().logical_table_names_by_stable_id.clone();
@@ -2070,6 +2046,32 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             },
         );
         let apply_result = async {
+            let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
+            let (local_pull_gen, local_last_change_id) =
+                read_last_change_id(coro, &conn, &self.client_unique_id).await?;
+            let mut precollected_local_changes = Vec::new();
+            if had_cdc_table {
+                let iterate_opts = DatabaseChangesIteratorOpts {
+                    first_change_id: None,
+                    mode: DatabaseChangesIteratorMode::Apply,
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = self.main_tape.iterate_changes_on(conn.clone(), iterate_opts);
+                while let Some(operation) = iterator.next(coro).await? {
+                    match operation {
+                        DatabaseTapeOperation::RowChange(change) => {
+                            precollected_local_changes.push(change)
+                        }
+                        DatabaseTapeOperation::Commit => continue,
+                        DatabaseTapeOperation::StmtReplay(_)
+                        | DatabaseTapeOperation::SchemaReplay(_) => {
+                            panic!("changes iterator must not use replay-only operations")
+                        }
+                    }
+                }
+            }
+
             let remote_apply_stats =
                 apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
                     coro,
