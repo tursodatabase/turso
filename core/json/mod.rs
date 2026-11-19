@@ -641,6 +641,41 @@ pub fn json_string_to_db_type(
     {
         return Ok(Value::Text(Text::new(json.scalar_string_value()?)));
     }
+    // A string with no byte that its JSON text escapes, a number with a UTF-8
+    // payload and a boolean give the same SQL value without the JSON text: the
+    // steps below would remove the quotes and the escapes that the text adds
+    // again, and read a number from its payload text.
+    if matches!(
+        flag,
+        OutputVariant::ElementType | OutputVariant::ElementTypePlain
+    ) {
+        if let Some(payload) = json.scalar_payload() {
+            match element_type {
+                ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXTRAW
+                    if payload
+                        .iter()
+                        .all(|&byte| byte > 0x1F && byte != b'"' && byte != b'\\') =>
+                {
+                    return Ok(Value::Text(Text::new(
+                        String::from_utf8_lossy(payload).into_owned(),
+                    )));
+                }
+                ElementType::INT => {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        return int_text_to_db_type(text, text);
+                    }
+                }
+                ElementType::FLOAT => {
+                    if let Ok(text) = std::str::from_utf8(payload) {
+                        return float_text_to_db_type(text);
+                    }
+                }
+                ElementType::TRUE => return Ok(Value::from_i64(1)),
+                ElementType::FALSE => return Ok(Value::from_i64(0)),
+                _ => {}
+            }
+        }
+    }
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::String) {
         return Ok(Value::Text(Text::json(json_string)));
@@ -665,32 +700,41 @@ pub fn json_string_to_db_type(
                 Ok(Value::Text(Text::new(json_string)))
             }
         }
-        ElementType::FLOAT5 | ElementType::FLOAT => {
-            // Infinity parses from its 9e999 rendering to an infinite
-            // f64, which is exactly what ->> and json_extract return.
-            match json_string.parse::<f64>() {
-                Ok(float_val) => Ok(Value::from_f64(float_val)),
-                Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
-            }
-        }
+        ElementType::FLOAT5 | ElementType::FLOAT => float_text_to_db_type(&json_string),
         ElementType::INT | ElementType::INT5 => {
-            if let Some(int) = json5_hex_literal_to_i64(&json.scalar_payload_text()?)? {
-                return Ok(Value::from_i64(int));
-            }
-            let result = i64::from_str(&json_string);
-            if let Ok(int) = result {
-                Ok(Value::from_i64(int))
-            } else {
-                let res = f64::from_str(&json_string);
-                match res {
-                    Ok(num) => Ok(Value::from_f64(num)),
-                    Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
-                }
-            }
+            int_text_to_db_type(&json_string, &json.scalar_payload_text()?)
         }
         ElementType::TRUE => Ok(Value::from_i64(1)),
         ElementType::FALSE => Ok(Value::from_i64(0)),
         _ => unreachable!(),
+    }
+}
+
+/// Converts the JSON text of a REAL element to its SQL value.
+fn float_text_to_db_type(text: &str) -> crate::Result<Value> {
+    // Infinity parses from its 9e999 rendering to an infinite
+    // f64, which is exactly what ->> and json_extract return.
+    match text.parse::<f64>() {
+        Ok(float_val) => Ok(Value::from_f64(float_val)),
+        Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
+    }
+}
+
+/// Converts the JSON text of an integer element to its SQL value. `payload`
+/// is the stored text of the element, which holds a JSON5 hex literal as is.
+fn int_text_to_db_type(text: &str, payload: &str) -> crate::Result<Value> {
+    if let Some(int) = json5_hex_literal_to_i64(payload)? {
+        return Ok(Value::from_i64(int));
+    }
+    let result = i64::from_str(text);
+    if let Ok(int) = result {
+        Ok(Value::from_i64(int))
+    } else {
+        let res = f64::from_str(text);
+        match res {
+            Ok(num) => Ok(Value::from_f64(num)),
+            Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
+        }
     }
 }
 

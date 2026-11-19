@@ -1110,6 +1110,14 @@ impl Jsonb {
         Ok(String::from_utf8_lossy(payload))
     }
 
+    /// Returns the payload of the element at the start of the document, or
+    /// None when its header is malformed or the payload runs past the end.
+    pub fn scalar_payload(&self) -> Option<&[u8]> {
+        let (JsonbHeader(_, len), header_size) = self.read_header(0).ok()?;
+        let payload_end = header_size.checked_add(len)?;
+        self.data.get(header_size..payload_end)
+    }
+
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
         let mut result = String::with_capacity(self.data.len() * 2);
         let ind = if let Some(ind) = indentation {
