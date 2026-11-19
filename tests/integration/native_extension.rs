@@ -18,7 +18,7 @@ use turso_sqlite::SqliteDialect;
 #[test]
 fn native_scalar_overloads_prefer_exact_then_finite_then_variadic() {
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect))
+        OpenOptions::new(Arc::new(SqliteDialect))
             .extension_function(
                 ExternalFunc::new_native_scalar(
                     "native_overload".into(),
@@ -70,7 +70,7 @@ fn native_scalar_overloads_prefer_exact_then_finite_then_variadic() {
 #[test]
 fn native_scalar_signature_replacement_wins_equal_specificity() {
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect))
+        OpenOptions::new(Arc::new(SqliteDialect))
             .extension_function(
                 ExternalFunc::new_native_scalar(
                     "native_replaced_overlap".into(),
