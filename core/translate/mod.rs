@@ -21,6 +21,7 @@ pub(crate) mod expr;
 pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
+pub(crate) mod foreign_key_check;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
