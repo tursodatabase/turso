@@ -415,7 +415,7 @@ mod rename_column_view {
                 where_clause,
                 group_by,
                 window_clause,
-                ..
+                distinctness,
             } => {
                 let sources = if let Some(ref mut from_clause) = from {
                     rewrite_from_clause_for_column_rename(
@@ -446,6 +446,20 @@ mod rename_column_view {
                 if let Some(ref mut where_expr) = where_clause {
                     rewrite_expr_in_scope(
                         where_expr,
+                        &sources,
+                        outer_scopes,
+                        ctx,
+                        changed,
+                        visiting_views,
+                    )?;
+                }
+
+                for expr in distinctness
+                    .iter_mut()
+                    .flat_map(|distinctness| distinctness.exprs_mut())
+                {
+                    rewrite_expr_in_scope(
+                        expr,
                         &sources,
                         outer_scopes,
                         ctx,
@@ -1541,7 +1555,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
             columns,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             if let Some(ref mut from) = from {
                 rewrite_from_clause_table_refs(from, scope);
@@ -1569,6 +1583,12 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
                     }
                     ast::ResultColumn::Star => {}
                 }
+            }
+            for expr in distinctness
+                .iter_mut()
+                .flat_map(|distinctness| distinctness.exprs_mut())
+            {
+                rewrite_expr_table_refs(expr, inner_scope);
             }
             if let Some(ref mut gb) = group_by {
                 for expr in &mut gb.exprs {

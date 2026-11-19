@@ -691,6 +691,32 @@ fn altering_the_columns_of_a_table_of_a_schema_survives_reopening(db: TempDataba
     assert_eq!(rows_of(&conn, "SELECT * FROM t"), ["5"]);
 }
 
+#[turso_macros::test]
+fn a_view_with_distinct_on_survives_a_column_rename_and_reopening(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a int, b int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5), (2, 30)")
+        .unwrap();
+    conn.execute("CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC")
+        .unwrap();
+    conn.execute("ALTER TABLE t RENAME COLUMN a TO z").unwrap();
+    assert_eq!(rows_of(&conn, "SELECT * FROM v"), ["1|20", "2|30"]);
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    assert_eq!(rows_of(&conn, "SELECT * FROM v"), ["1|20", "2|30"]);
+}
+
 fn rows_of(conn: &turso_pg::Connection, sql: &str) -> Vec<String> {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let mut values = Vec::new();

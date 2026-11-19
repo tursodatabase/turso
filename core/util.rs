@@ -1882,7 +1882,7 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             // Source order is SELECT list then FROM; name resolution is the
             // reverse, which a visitor can ask for.
@@ -1913,6 +1913,13 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
 
             for window_def in window_clause {
                 visit_window(&window_def.window, visitor)?;
+            }
+
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                visit_expr_with_subqueries(expr, visitor)?;
             }
         }
         ast::OneSelect::Values(values) => {

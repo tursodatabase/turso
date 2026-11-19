@@ -542,6 +542,82 @@ expect error {
     an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported
 }
 
+test rename-column-rewrites-the-key-in-a-view {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT DISTINCT ON (a) b FROM src ORDER BY a, b;
+    ALTER TABLE src RENAME COLUMN a TO z;
+    INSERT INTO src VALUES (1, 2), (1, 1), (2, 9);
+    SELECT * FROM v;
+    SELECT sql FROM sqlite_schema WHERE name = 'v';
+}
+expect {
+    1
+    9
+    CREATE VIEW v AS SELECT DISTINCT ON (z) b FROM src ORDER BY z, b
+}
+
+test rename-table-rewrites-the-key-in-a-view {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT DISTINCT ON (src.a) b FROM src ORDER BY src.a, b;
+    ALTER TABLE src RENAME TO renamed;
+    INSERT INTO renamed VALUES (1, 2), (1, 1), (2, 9);
+    SELECT * FROM v;
+}
+expect {
+    1
+    9
+}
+
+test drop-column-is-refused-when-a-view-key-uses-it {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT DISTINCT ON (a) b FROM src;
+    ALTER TABLE src DROP COLUMN a;
+}
+expect error {
+    cannot drop column "a": referenced in VIEW v
+}
+
+test trigger-key-reads-the-new-row {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT DISTINCT ON (a + NEW.a) b FROM src ORDER BY a + NEW.a, b DESC;
+    END;
+    INSERT INTO src VALUES (1, 2);
+    INSERT INTO src VALUES (1, 5);
+    SELECT * FROM log;
+}
+expect {
+    2
+    5
+}
+
+test rename-column-rewrites-the-key-in-a-trigger {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT DISTINCT ON (a) b FROM src ORDER BY a, b;
+    END;
+    ALTER TABLE src RENAME COLUMN a TO z;
+    INSERT INTO src VALUES (1, 2);
+    SELECT * FROM log;
+}
+expect {
+    2
+}
+
+test drop-column-is-refused-when-a-trigger-key-uses-it {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON log BEGIN
+        INSERT INTO log SELECT DISTINCT ON (a) b FROM src;
+    END;
+    ALTER TABLE src DROP COLUMN a;
+}
+expect error {
+    error in trigger tr after drop column: no such column: a
+}
+
 setup indexed_rows {
     CREATE TABLE t(a, b, c);
     CREATE INDEX t_a_b ON t(a, b);

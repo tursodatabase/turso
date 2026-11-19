@@ -1154,6 +1154,24 @@ pub enum SelectDistinctness {
     DistinctOn(Vec<Box<Expr>>),
 }
 
+impl SelectDistinctness {
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs(&self) -> &[Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &[],
+        }
+    }
+
+    /// The expressions of `DISTINCT ON`; none for `DISTINCT` and `ALL`.
+    pub fn exprs_mut(&mut self) -> &mut [Box<Expr>] {
+        match self {
+            Self::DistinctOn(exprs) => exprs,
+            Self::Distinct | Self::All => &mut [],
+        }
+    }
+}
+
 /// `SELECT` or `RETURNING` result column
 // https://sqlite.org/syntax/result-column.html
 #[derive(Clone, Debug, PartialEq, Eq)]

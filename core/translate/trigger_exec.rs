@@ -1186,8 +1186,15 @@ where
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
+            for expr in distinctness
+                .iter_mut()
+                .flat_map(|distinctness| distinctness.exprs_mut())
+            {
+                rewrite_expression_tree(expr, rewrite_expr)?;
+            }
+
             for col in columns {
                 if let ast::ResultColumn::Expr(expr, _) = col {
                     rewrite_expression_tree(expr, rewrite_expr)?;
