@@ -216,6 +216,9 @@ pub struct JsonEachCursor {
     /// the current row, which the next call of `advance` removes. It stays
     /// until then, because the fullkey and path columns read the path.
     pop_path_before_advance: bool,
+    /// The key of the current object member. It is a field so that each
+    /// member uses the same buffer.
+    key_element: Jsonb,
 }
 
 struct TraversalState {
@@ -236,6 +239,7 @@ impl JsonEachCursor {
             columns: Columns::default(),
             traversal_mode,
             pop_path_before_advance: false,
+            key_element: Jsonb::empty(),
         }
     }
 
@@ -325,9 +329,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 if matches!(state.iterator_state, IteratorState::Primitive(_)) {
                     self.advance()
                 } else {
-                    self.columns = Columns::new(
+                    self.columns.value_mut().copy_from(&self.json)?;
+                    self.columns.set_row(
                         key,
-                        self.json.clone(),
                         self.path_to_current_value.cursor(),
                         None,
                         self.path_to_current_value.cursor_before_last_element(),
@@ -378,7 +382,10 @@ impl JsonEachCursor {
         };
         match traversal_state.iterator_state {
             IteratorState::Array(state) => {
-                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state)? else {
+                let Some((idx, new_state)) = self
+                    .json
+                    .array_iterator_next(&state, self.columns.value_mut())?
+                else {
                     self.path_to_current_value.pop();
                     return self.advance();
                 };
@@ -402,9 +409,8 @@ impl JsonEachCursor {
                 }
 
                 let key = self.path_to_current_value.key().to_owned();
-                self.columns = Columns::new(
+                self.columns.set_row(
                     key,
-                    value,
                     self.path_to_current_value.cursor(),
                     parent_id,
                     traversal_state.innermost_container_cursor,
@@ -413,8 +419,11 @@ impl JsonEachCursor {
                 self.pop_path_before_advance = !recurses;
             }
             IteratorState::Object(state) => {
-                let Some(((_idx, key, value), new_state)) =
-                    self.json.object_iterator_next(&state)?
+                let Some((_idx, new_state)) = self.json.object_iterator_next(
+                    &state,
+                    &mut self.key_element,
+                    self.columns.value_mut(),
+                )?
                 else {
                     self.path_to_current_value.pop();
                     return self.advance();
@@ -426,7 +435,8 @@ impl JsonEachCursor {
                     traversal_state.parent_id,
                     self.path_to_current_value.cursor(),
                 );
-                self.path_to_current_value.push_object_key(&key)?;
+                self.path_to_current_value
+                    .push_object_key(&self.key_element)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
@@ -436,9 +446,8 @@ impl JsonEachCursor {
                             true
                         });
 
-                self.columns = Columns::new(
+                self.columns.set_row(
                     self.path_to_current_value.key().to_owned(),
-                    value,
                     self.path_to_current_value.cursor(),
                     parent_id,
                     traversal_state.innermost_container_cursor,
@@ -451,9 +460,9 @@ impl JsonEachCursor {
                     JsonTraversalMode::Each => Key::None,
                     JsonTraversalMode::Tree => self.path_to_current_value.key().to_owned(),
                 };
-                self.columns = Columns::new(
+                *self.columns.value_mut() = jsonb;
+                self.columns.set_row(
                     key,
-                    jsonb,
                     self.path_to_current_value.cursor(),
                     None,
                     traversal_state.innermost_container_cursor,
@@ -572,20 +581,24 @@ mod columns {
     }
 
     impl Columns {
-        pub(super) fn new(
+        /// The value of the current row. The cursor writes each value in
+        /// this buffer, so that the rows do not allocate a buffer each.
+        pub(super) fn value_mut(&mut self) -> &mut Jsonb {
+            &mut self.value
+        }
+
+        /// Sets the columns of the current row other than the value.
+        pub(super) fn set_row(
+            &mut self,
             key: Key,
-            value: Jsonb,
             fullkey_len: usize,
             parent_id: Option<i64>,
             innermost_container_path_len: usize,
-        ) -> Self {
-            Self {
-                key,
-                value,
-                parent_id,
-                fullkey_len,
-                innermost_container_path_len,
-            }
+        ) {
+            self.key = key;
+            self.fullkey_len = fullkey_len;
+            self.parent_id = parent_id;
+            self.innermost_container_path_len = innermost_container_path_len;
         }
 
         pub(super) fn atom(&self) -> Result<Value, LimboError> {

@@ -1046,8 +1046,8 @@ impl ObjectIteratorState {
     }
 }
 
-pub type ArrayIteratorItem = ((usize, Jsonb), ArrayIteratorState);
-pub type ObjectIteratorItem = ((usize, Jsonb, Jsonb), ObjectIteratorState);
+pub type ArrayIteratorItem = (usize, ArrayIteratorState);
+pub type ObjectIteratorItem = (usize, ObjectIteratorState);
 
 impl Jsonb {
     pub fn empty() -> Self {
@@ -2805,6 +2805,22 @@ impl Jsonb {
         })
     }
 
+    /// Makes this document a copy of `source`. The copy uses the buffer that
+    /// this document has already.
+    pub fn copy_from(&mut self, source: &Jsonb) -> std::result::Result<(), TryReserveError> {
+        self.set_data(&source.data)
+    }
+
+    /// Replaces the bytes of the document with `bytes`, in the buffer that it
+    /// has already. If the buffer cannot grow, the document does not change.
+    fn set_data(&mut self, bytes: &[u8]) -> std::result::Result<(), TryReserveError> {
+        self.data
+            .try_reserve(bytes.len().saturating_sub(self.data.len()))?;
+        self.data.clear();
+        self.data.extend_from_slice(bytes);
+        Ok(())
+    }
+
     pub fn data(self) -> ValueBlob {
         self.data
     }
@@ -3606,9 +3622,13 @@ impl Jsonb {
         }
     }
 
+    /// Copies the next element of the array into `element`, and returns its
+    /// index and the state after it. The copy uses the buffer of `element`,
+    /// so that a loop over the array does not allocate for each element.
     pub fn array_iterator_next(
         &self,
         st: &ArrayIteratorState,
+        element: &mut Jsonb,
     ) -> std::result::Result<Option<ArrayIteratorItem>, TryReserveError> {
         if st.cursor >= st.end {
             return Ok(None);
@@ -3626,14 +3646,14 @@ impl Jsonb {
             return Ok(None);
         }
 
-        let elem = Jsonb::from_raw_data(&self.data[start..stop])?;
+        element.set_data(&self.data[start..stop])?;
         let next = ArrayIteratorState {
             cursor: stop,
             end: st.end,
             index: st.index + 1,
         };
 
-        Ok(Some(((st.index, elem), next)))
+        Ok(Some((st.index, next)))
     }
 
     pub fn object_iterator(&self) -> Result<ObjectIteratorState> {
@@ -3648,9 +3668,15 @@ impl Jsonb {
         }
     }
 
+    /// Copies the key and the value of the next member of the object into
+    /// `key` and `value`, and returns its index and the state after it. As
+    /// in [Self::array_iterator_next], the copies use the buffers of `key`
+    /// and `value`.
     pub fn object_iterator_next(
         &self,
         st: &ObjectIteratorState,
+        key: &mut Jsonb,
+        value: &mut Jsonb,
     ) -> std::result::Result<Option<ObjectIteratorItem>, TryReserveError> {
         if st.cursor >= st.end {
             return Ok(None);
@@ -3683,15 +3709,15 @@ impl Jsonb {
             return Ok(None);
         }
 
-        let key = Jsonb::from_raw_data(&self.data[key_start..key_stop])?;
-        let value = Jsonb::from_raw_data(&self.data[val_start..val_stop])?;
+        key.set_data(&self.data[key_start..key_stop])?;
+        value.set_data(&self.data[val_start..val_stop])?;
         let next = ObjectIteratorState {
             cursor: val_stop,
             end: st.end,
             index: st.index + 1,
         };
 
-        Ok(Some(((st.index, key, value), next)))
+        Ok(Some((st.index, next)))
     }
 
     /// If the iterator points at a container value, return an iterator for that container.
