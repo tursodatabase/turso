@@ -22,7 +22,7 @@ use crate::{
         },
         Resolver,
     },
-    util::exprs_are_equivalent,
+    util::predicate_terms_are_equivalent,
     vdbe::affinity::Affinity,
     Result,
 };
@@ -1744,13 +1744,18 @@ pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[u
     ordered
 }
 
-fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> bool {
-    if exprs_are_equivalent(query, predicate) {
+fn query_term_implies_predicate(
+    query: &ast::Expr,
+    predicate: &ast::Expr,
+    columns: &[Column],
+) -> bool {
+    if predicate_terms_are_equivalent(query, predicate, columns) {
         return true;
     }
     match unwrap_parens(predicate).unwrap_or(predicate) {
         ast::Expr::Binary(left, ast::Operator::Or, right) => {
-            query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
+            query_term_implies_predicate(query, left, columns)
+                || query_term_implies_predicate(query, right, columns)
         }
         _ => false,
     }
@@ -1808,12 +1813,19 @@ pub(super) fn partial_index_predicate_terms(
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
         let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
+            can_use_query_term(term)
+                && query_term_implies_predicate(
+                    &term.expr,
+                    index_conjunct,
+                    table_reference.columns(),
+                )
         })?;
         // A query term that proves one branch of an OR makes the partial index
         // usable, but does not make that term true for every row in the index.
         // Keep it as a residual filter unless the whole conjunct matched.
-        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
+        if predicate_terms_are_equivalent(index_conjunct, &term.expr, table_reference.columns())
+            && !matched_terms.contains(&term_idx)
+        {
             matched_terms.push(term_idx);
         }
     }
