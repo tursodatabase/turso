@@ -367,6 +367,119 @@ fn windows_at_the_query_nesting_limit_complete() {
     run_with_stack(WORKER_STACK, (windows.build)(MAX_QUERY_DEPTH)).unwrap();
 }
 
+/// SQLite's `SQLITE_MAX_TRIGGER_DEPTH`, which Turso also uses.
+const MAX_TRIGGER_DEPTH: usize = 1000;
+
+const TRIGGER_DEPTH_ERROR: &str = "too many levels of trigger recursion";
+
+/// Statements that make a chain of `triggers` triggers: an insert into `t0`
+/// fires the first one, and each one inserts into the table of the next one.
+fn trigger_chain(triggers: usize) -> Vec<String> {
+    let tables = (0..=triggers).map(|i| format!("CREATE TABLE t{i}(x)"));
+    let chain = (0..triggers).map(|i| {
+        format!(
+            "CREATE TRIGGER tr{i} AFTER INSERT ON t{i} BEGIN INSERT INTO t{} VALUES (NEW.x); END",
+            i + 1
+        )
+    });
+    tables.chain(chain).collect()
+}
+
+/// Statements that make a table of `rows` rows, where each row is the parent of
+/// the next one, with ON DELETE CASCADE.
+fn cascade_chain(rows: usize) -> Vec<String> {
+    vec![
+        "PRAGMA foreign_keys = ON".to_string(),
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES p(id) ON DELETE CASCADE)"
+            .to_string(),
+        format!(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {rows}) \
+             INSERT INTO p SELECT i, CASE WHEN i = 1 THEN NULL ELSE i - 1 END FROM c"
+        ),
+    ]
+}
+
+// https://github.com/tursodatabase/turso/issues/9431
+#[test]
+fn trigger_chain_at_the_trigger_depth_limit_completes() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        trigger_chain(MAX_TRIGGER_DEPTH),
+        "INSERT INTO t0 VALUES (1)",
+        format!("SELECT count(*) FROM t{MAX_TRIGGER_DEPTH}"),
+    );
+    result.unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn trigger_chain_over_the_trigger_depth_limit_is_an_error_and_rolls_back() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        trigger_chain(MAX_TRIGGER_DEPTH + 1),
+        "INSERT INTO t0 VALUES (1)",
+        "SELECT count(*) FROM t0".to_string(),
+    );
+    assert_eq!(result.unwrap_err().to_string(), TRIGGER_DEPTH_ERROR);
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn cascade_at_the_trigger_depth_limit_completes() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        cascade_chain(MAX_TRIGGER_DEPTH),
+        "DELETE FROM p WHERE id = 1",
+        "SELECT count(*) FROM p".to_string(),
+    );
+    result.unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn cascade_over_the_trigger_depth_limit_is_an_error_and_rolls_back() {
+    let (result, rows) = run_then_count(
+        WORKER_STACK,
+        cascade_chain(MAX_TRIGGER_DEPTH + 1),
+        "DELETE FROM p WHERE id = 1",
+        "SELECT count(*) FROM p".to_string(),
+    );
+    assert_eq!(result.unwrap_err().to_string(), TRIGGER_DEPTH_ERROR);
+    assert_eq!(rows, (MAX_TRIGGER_DEPTH + 1) as i64);
+}
+
+/// Runs `setup`, then `statement`, then `count`, on a thread with `stack_size`
+/// bytes of stack. Returns the result of `statement`, and the integer that
+/// `count` returns after it.
+fn run_then_count(
+    stack_size: usize,
+    setup: Vec<String>,
+    statement: &'static str,
+    count: String,
+) -> (turso_core::Result<()>, i64) {
+    std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(move || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            for sql in &setup {
+                conn.execute(sql).unwrap();
+            }
+            let result = conn.execute(statement);
+            let rows = crate::common::limbo_exec_rows(&conn, &count);
+            let rusqlite::types::Value::Integer(n) = rows[0][0] else {
+                panic!("{count} did not return an integer: {rows:?}");
+            };
+            (result, n)
+        })
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked")
+}
+
 /// SQLite has no limit on the nesting of queries, and it does not count the
 /// terms of a compound whose last term is VALUES. So a database that it wrote
 /// can store views and triggers that go past the parse limits of Turso. Turso

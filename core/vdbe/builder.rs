@@ -391,6 +391,10 @@ pub struct ProgramBuilder {
     /// `PreparedProgram::has_materialized_views`), so this can't go stale
     /// while the built program runs.
     has_materialized_views: bool,
+    /// Nesting level of this program: 0 for the program of a statement, and one
+    /// more than the level of the parent program for a trigger or foreign key
+    /// action program.
+    subprogram_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -797,18 +801,23 @@ impl ProgramBuilder {
             None,
             false,
             false,
+            0,
         )
     }
     /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
     /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
     /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
     /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
+    ///
+    /// `subprogram_depth` is the nesting level of the trigger program: one more
+    /// than the level of the program that fires the trigger.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -817,6 +826,7 @@ impl ProgramBuilder {
             Some(trigger),
             true,
             mvcc_enabled,
+            subprogram_depth,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
@@ -826,11 +836,16 @@ impl ProgramBuilder {
     /// subprogram runs inside the same transaction as its parent statement, so code
     /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
     /// or MVCC-unaware path the parent takes.
+    ///
+    /// `subprogram_depth` is the nesting level of the subprogram: one more than the
+    /// level of the program that executes it, or 0 for a program that no other
+    /// program executes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -839,6 +854,7 @@ impl ProgramBuilder {
             None,
             true,
             mvcc_enabled,
+            subprogram_depth,
         )
     }
 
@@ -851,6 +867,7 @@ impl ProgramBuilder {
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
         mvcc_enabled: bool,
+        subprogram_depth: usize,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -898,6 +915,7 @@ impl ProgramBuilder {
             next_subquery_eqp_id: 1,
             target_union_type: None,
             has_materialized_views: false,
+            subprogram_depth,
         }
     }
 
@@ -1119,6 +1137,13 @@ impl ProgramBuilder {
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
         &self.capture_data_changes_info
+    }
+
+    /// Nesting level of this program: 0 for the program of a statement, and one
+    /// more than the level of the parent program for a trigger or foreign key
+    /// action program.
+    pub const fn subprogram_depth(&self) -> usize {
+        self.subprogram_depth
     }
 
     /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
@@ -1595,10 +1620,6 @@ impl ProgramBuilder {
         });
     }
 
-    // no users yet, but I want to avoid someone else in the future
-    // just adding parameters to emit_halt! If you use this, remove the
-    // clippy warning please.
-    #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
             constraint_info: None,

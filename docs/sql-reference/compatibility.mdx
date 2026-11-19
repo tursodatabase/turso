@@ -39,6 +39,7 @@ message.
 | Depth of an expression | 100 | 1000 | `Expression tree is too large (maximum depth 100)` |
 | Terms in a compound `SELECT` | 500 | 500 | `too many terms in compound SELECT` |
 | Depth of nested queries | 500 | No limit | `Query is nested too deeply (maximum depth 500)` |
+| Levels of triggers and foreign key actions | 1000 | 1000 | `too many levels of trigger recursion` |
 
 A `VALUES` list with many rows is one term. SQLite does not count the terms of
 a compound `SELECT` whose last term is `VALUES`, but Turso counts them.
@@ -48,6 +49,11 @@ expression, CTE bodies, and parenthesized `FROM` terms. It also counts each
 view or CTE that a query reads through another view or CTE, and each
 different window in a `SELECT`, because each of these adds one level of
 subquery to the plan. Sibling subqueries do not add to the depth.
+
+The levels of triggers count the trigger programs and the foreign key action
+programs that execute one inside the other, for example a chain of triggers or
+an `ON DELETE CASCADE` through a chain of rows. As in SQLite, the error occurs
+only when a statement gets to level 1001, and the statement rolls back.
 
 The limits on compound terms and on nested queries do not apply when Turso
 reads the views and triggers that a database stores, because SQLite and older
