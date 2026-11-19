@@ -1181,17 +1181,16 @@ impl Jsonb {
     /// the string is then the payload in quotes, and its decoded text is the
     /// payload.
     pub fn plain_string_payload(&self) -> Option<&[u8]> {
+        let (JsonbHeader(element_type, len), header_size) = self.read_header(0).ok()?;
         if !matches!(
-            self.element_type_at(0).ok()?,
+            element_type,
             ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXTRAW
         ) {
             return None;
         }
-        let payload = self.scalar_payload()?;
-        payload
-            .iter()
-            .all(|&byte| byte > 0x1F && byte != b'"' && byte != b'\\')
-            .then_some(payload)
+        let payload = self.data.get(header_size..header_size.checked_add(len)?)?;
+        // ESCAPED_IN_TEXT marks the control characters, `"` and `\`.
+        (!payload.iter().any(|&byte| ESCAPED_IN_TEXT[byte as usize])).then_some(payload)
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
