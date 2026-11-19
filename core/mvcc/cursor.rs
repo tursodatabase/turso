@@ -180,11 +180,11 @@ fn current_pos_is_only_row_of_seek_key(
             *current == *target
         }
         (RowKey::Record(current), SeekKey::IndexKey(target), MvccCursorType::Index(index_info)) => {
-            let target_values = target.get_values()?;
+            let target_values = target.get_values_inline()?;
             index_key_matches_at_most_one_row(&target_values, index_info)
                 && compare_immutable(
-                    target_values,
-                    current.key.get_values()?,
+                    target_values.iter(),
+                    current.key.get_values_inline()?.iter(),
                     &index_info.key_info[..target.column_count()],
                 )
                 .is_eq()
@@ -1875,16 +1875,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     else {
                                         panic!("Index cursor expected");
                                     };
-                                    let key_info: Vec<_> = index_info
-                                        .key_info
-                                        .iter()
-                                        .take(index_key.column_count())
-                                        .cloned()
-                                        .collect();
+                                    let key_len =
+                                        index_key.column_count().min(index_info.key_info.len());
                                     let cmp = compare_immutable(
-                                        index_key.get_values()?,
-                                        found_key.key.get_values()?,
-                                        &key_info,
+                                        index_key.get_values_inline()?.iter(),
+                                        found_key.key.get_values_inline()?.iter(),
+                                        &index_info.key_info[..key_len],
                                     );
                                     cmp.is_eq()
                                 }
