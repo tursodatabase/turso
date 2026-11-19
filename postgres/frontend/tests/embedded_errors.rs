@@ -14,12 +14,6 @@ fn pg_connection() -> (Arc<dyn turso_core::IO>, Connection) {
     (io, conn)
 }
 
-fn pg_connection_with_fk() -> (Arc<dyn turso_core::IO>, Connection) {
-    let (io, conn) = pg_connection();
-    conn.inner().set_foreign_keys_enabled(true);
-    (io, conn)
-}
-
 fn exec_err(conn: &Connection, sql: &str) -> Error {
     conn.execute(sql)
         .expect_err(&format!("statement must fail: {sql}"))
@@ -187,7 +181,7 @@ fn unnamed_unique_violation_reports_generated_constraint_name() {
 
 #[test]
 fn foreign_key_violation_reports_structured_fields() {
-    let (_io, conn) = pg_connection_with_fk();
+    let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE t_parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE t_child (id INT PRIMARY KEY, pid INT REFERENCES t_parent(id))")
@@ -452,7 +446,7 @@ fn text_primary_key_reports_pkey_name() {
 
 #[test]
 fn named_foreign_key_reports_declared_name() {
-    let (_io, conn) = pg_connection_with_fk();
+    let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE child (pid INT CONSTRAINT custom_fk REFERENCES parent(id))")
@@ -478,7 +472,7 @@ fn unnamed_check_reports_generated_name() {
 
 #[test]
 fn table_constraints_report_declared_names() {
-    let (_io, conn) = pg_connection_with_fk();
+    let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE t (id INT, pid INT, x INT, CONSTRAINT named_pk PRIMARY KEY (id), CONSTRAINT named_fk FOREIGN KEY (pid) REFERENCES parent(id), CONSTRAINT named_check CHECK (x > 0))").unwrap();
@@ -543,7 +537,7 @@ fn upsert_do_update_unique_violation_reports_structured_fields() {
 
 #[test]
 fn foreign_key_update_keeps_key_values_when_later_rows_reuse_registers() {
-    let (_io, conn) = pg_connection_with_fk();
+    let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE parent (a INT, b TEXT, PRIMARY KEY (a, b))")
         .unwrap();
     conn.execute("CREATE TABLE child (id INT PRIMARY KEY, a INT, b TEXT, CONSTRAINT child_fk FOREIGN KEY (a, b) REFERENCES parent(a, b))").unwrap();
@@ -567,7 +561,7 @@ fn foreign_key_update_keeps_key_values_when_later_rows_reuse_registers() {
 
 #[test]
 fn foreign_key_update_reports_structured_fields() {
-    let (_io, conn) = pg_connection_with_fk();
+    let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))")
@@ -659,7 +653,7 @@ fn constraint_details_show_custom_type_values_as_the_user_wrote_them() {
 
 #[test]
 fn foreign_key_details_show_custom_type_values_as_the_user_wrote_them() {
-    let (_io, conn) = pg_connection_with_fk();
+    let (_io, conn) = pg_connection();
     for sql in [
         "CREATE TABLE parent (id uuid PRIMARY KEY)",
         "CREATE TABLE child (id INT PRIMARY KEY, pid uuid REFERENCES parent(id))",
@@ -713,7 +707,7 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
         "INSERT OR ROLLBACK INTO child VALUES (2, 99)",
         "INSERT OR FAIL INTO child VALUES (2, 1), (3, 99)",
     ] {
-        let (_pg_io, pg) = pg_connection_with_fk();
+        let (_pg_io, pg) = pg_connection();
         let (_sqlite_io, sqlite) = sqlite_connection();
         let mut outcomes = Vec::new();
         for (dialect, conn) in [("sqlite", &sqlite), ("postgres", pg.inner())] {
@@ -1682,7 +1676,6 @@ fn session_statements_clean_up_when_abandoned() {
                 )
                 .unwrap();
                 let conn = Connection::connect(&db).unwrap();
-                conn.inner().set_foreign_keys_enabled(true);
                 conn.execute("SET search_path TO public; CREATE TABLE kept (v INT)")
                     .unwrap();
                 let create = "CREATE SCHEMA work CREATE TABLE t (id SERIAL PRIMARY KEY, payload INT) CREATE TABLE u (id INT REFERENCES work.t(id))";
@@ -2163,4 +2156,164 @@ fn command_result_kind_preserves_effects_errors_and_completion() {
     schema.reset().unwrap();
     assert_eq!(schema.result_kind(), Command);
     assert!(schema.run_ignore_rows().is_err());
+}
+
+/// A statement prepared before the referencing table exists is compiled again
+/// when it runs, and the new program must still refuse to remove the
+/// referenced table instead of running the ON DELETE CASCADE of the new table.
+#[test]
+fn removal_prepared_before_the_referencing_table_exists_is_rejected() {
+    for (sql, sqlstate) in [("DROP TABLE p", "2BP01"), ("TRUNCATE p", "0A000")] {
+        let (_io, conn) = pg_connection();
+        conn.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+        conn.execute("INSERT INTO p VALUES (1)").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        conn.execute("CREATE TABLE c (pid INT REFERENCES p (id) ON DELETE CASCADE)")
+            .unwrap();
+        conn.execute("INSERT INTO c VALUES (1)").unwrap();
+
+        let error = stmt
+            .run_ignore_rows()
+            .expect_err(&format!("{sql} must fail"));
+        assert_eq!(error.sqlstate, sqlstate, "{sql}: {error:?}");
+
+        let rows = conn
+            .prepare("SELECT count(*) FROM c")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows[0][0], Value::from_i64(1), "{sql}");
+    }
+}
+
+#[test]
+fn foreign_key_delete_of_referenced_parent_reports_structured_fields() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child (pid INT REFERENCES parent(id))")
+        .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (1)").unwrap();
+    let e = exec_err(&conn, "DELETE FROM parent");
+    assert_eq!(e.sqlstate, "23503");
+    let cv = constraint_violation(&e);
+    assert_eq!(cv.table_name.as_deref(), Some("child"));
+    assert_eq!(cv.constraint_name.as_deref(), Some("child_pid_fkey"));
+    assert_eq!(
+        e.message,
+        "update or delete on table \"parent\" violates foreign key constraint \"child_pid_fkey\" on table \"child\""
+    );
+    assert_eq!(
+        cv.detail.as_deref(),
+        Some("Key (id)=(1) is still referenced from table \"child\".")
+    );
+}
+
+#[test]
+fn foreign_key_update_of_referenced_parent_reports_the_old_key() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE parent (a INT, b TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
+    conn.execute("CREATE TABLE child (a INT, b TEXT, CONSTRAINT child_fk FOREIGN KEY (a, b) REFERENCES parent(a, b))").unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 'x')").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 'x')").unwrap();
+    let e = exec_err(&conn, "UPDATE parent SET a = 2");
+    assert_eq!(e.sqlstate, "23503");
+    let cv = constraint_violation(&e);
+    assert_eq!(cv.constraint_name.as_deref(), Some("child_fk"));
+    assert_eq!(
+        cv.detail.as_deref(),
+        Some("Key (a, b)=(1, x) is still referenced from table \"child\".")
+    );
+}
+
+#[test]
+fn foreign_key_restrict_reports_restrict_violation() {
+    for sql in ["DELETE FROM parent", "UPDATE parent SET id = 2"] {
+        let (_io, conn) = pg_connection();
+        conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (pid INT REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+        conn.execute("INSERT INTO child VALUES (1)").unwrap();
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "23001", "{sql}");
+        let cv = constraint_violation(&e);
+        assert_eq!(
+            e.message,
+            "update or delete on table \"parent\" violates RESTRICT setting of foreign key constraint \"child_pid_fkey\" on table \"child\"",
+            "{sql}"
+        );
+        assert_eq!(
+            cv.detail.as_deref(),
+            Some("Key (id)=(1) is referenced from table \"child\"."),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn foreign_key_violation_of_a_multi_row_insert_reports_structured_fields() {
+    for sql in [
+        "INSERT INTO child VALUES (1), (99)",
+        "INSERT INTO child SELECT 99",
+    ] {
+        let (_io, conn) = pg_connection();
+        conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE child (pid INT REFERENCES parent(id))")
+            .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "23503", "{sql}");
+        let cv = constraint_violation(&e);
+        assert_eq!(
+            cv.constraint_name.as_deref(),
+            Some("child_pid_fkey"),
+            "{sql}"
+        );
+        assert_eq!(
+            e.message,
+            "insert or update on table \"child\" violates foreign key constraint \"child_pid_fkey\"",
+            "{sql}"
+        );
+        assert_eq!(
+            cv.detail.as_deref(),
+            Some("Key (pid)=(99) is not present in table \"parent\"."),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn removal_of_referenced_table_reports_the_referencing_foreign_key() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child (pid INT REFERENCES parent(id))")
+        .unwrap();
+    let e = exec_err(&conn, "DROP TABLE parent");
+    assert_eq!(e.sqlstate, "2BP01");
+    assert_eq!(
+        e.message,
+        "cannot drop table parent because other objects depend on it"
+    );
+    assert_eq!(
+        e.detail.as_deref(),
+        Some("constraint child_pid_fkey on table child depends on table parent")
+    );
+    let e = exec_err(&conn, "TRUNCATE parent");
+    assert_eq!(e.sqlstate, "0A000");
+    assert_eq!(
+        e.message,
+        "cannot truncate a table referenced in a foreign key constraint"
+    );
+    assert_eq!(
+        e.detail.as_deref(),
+        Some("Table \"child\" references \"parent\".")
+    );
 }

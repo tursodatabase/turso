@@ -575,7 +575,6 @@ fn gap_d_43_statement_after_error_in_tx_25p02(db: TempDatabase) {
 fn gap_d_50_tursopg_returns_wrong_result_prepared_statement_with_two_commands(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT 1; SELECT 2",
-        fk_off: true,
         ..GapCase::default()
     }
     .run(db);
@@ -646,7 +645,6 @@ fn gap_e_75_in_memory_schema_stays_in_memory(db: TempDatabase) {
         reopen: true,
         reopen_setup: &["CREATE SCHEMA api"],
         memory: true,
-        fk_off: true,
         ..GapCase::default()
     }
     .run(db);
@@ -676,7 +674,6 @@ fn gap_e_77_ddl_in_a_schema_right_after_create_schema_mvcc(db: TempDatabase) {
         setup: &["CREATE SCHEMA IF NOT EXISTS auth"],
         sql: "CREATE TABLE auth.users (id uuid PRIMARY KEY)",
         mvcc: true,
-        fk_off: true,
         ..GapCase::default()
     }
     .run(db);
@@ -772,8 +769,6 @@ struct GapCase {
     memory: bool,
     /// `PRAGMA journal_mode = 'mvcc'` right after open.
     mvcc: bool,
-    /// Leave foreign keys off.
-    fk_off: bool,
 }
 
 impl GapCase {
@@ -813,9 +808,6 @@ impl GapCase {
             conn.inner()
                 .pragma_update("journal_mode", "'mvcc'")
                 .unwrap();
-        }
-        if !self.fk_off {
-            conn.inner().set_foreign_keys_enabled(true);
         }
         conn
     }

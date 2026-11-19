@@ -42,6 +42,23 @@ pub struct ConstraintViolation {
     pub values: Vec<crate::Value>,
     pub row_values: bool,
     pub parent_table: Option<String>,
+    /// For a DELETE or UPDATE of a parent row, the foreign key that still
+    /// references the removed key. `table_name`, `column_names` and `values`
+    /// then describe the parent key.
+    pub referencing: Option<ParentKeyReference>,
+}
+
+/// A foreign key that still references a parent key that a DELETE or UPDATE
+/// removes.
+#[derive(Debug, Clone)]
+pub struct ParentKeyReference {
+    /// The table that has the foreign key.
+    pub table: String,
+    /// The foreign key columns of `table`.
+    pub columns: Vec<String>,
+    /// Whether the foreign key is ON DELETE or ON UPDATE RESTRICT, which
+    /// fails at once instead of at the end of the statement.
+    pub restrict: bool,
 }
 
 impl ConstraintViolation {
@@ -56,6 +73,7 @@ impl ConstraintViolation {
             values: Vec::new(),
             row_values: false,
             parent_table: None,
+            referencing: None,
         }
     }
 }
@@ -66,6 +84,8 @@ impl ConstraintViolation {
 pub struct DialectError {
     pub code: &'static str,
     pub message: String,
+    /// More about the error, in a sentence of its own.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]

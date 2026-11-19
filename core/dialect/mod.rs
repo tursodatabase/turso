@@ -562,6 +562,84 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    /// Whether new connections enforce foreign keys.
+    ///
+    /// PostgreSQL always enforces them. SQLite enforces them only after
+    /// `PRAGMA foreign_keys = ON`.
+    fn enforces_foreign_keys_by_default(&self) -> bool {
+        false
+    }
+
+    /// The error for removing table `table` with `removal` while another
+    /// table has the foreign key `referencing` to it.
+    ///
+    /// PostgreSQL refuses both DROP TABLE and TRUNCATE. SQLite drops the
+    /// table after deleting its rows, which runs the ON DELETE actions of
+    /// the referencing table, so the default is `None`.
+    fn referenced_table_removal_error(
+        &self,
+        _removal: TableRemoval,
+        _table: &str,
+        _referencing: ReferencingForeignKey<'_>,
+    ) -> Option<crate::LimboError> {
+        None
+    }
+
+    /// The error for CREATE TABLE when a foreign key of the new table has
+    /// `problem` with the table or columns it references.
+    ///
+    /// PostgreSQL refuses such a foreign key. SQLite accepts it and reports
+    /// "foreign key mismatch" when a statement that writes the table runs
+    /// with foreign keys on, so the default is `None`.
+    fn foreign_key_target_error(
+        &self,
+        _problem: ForeignKeyTargetProblem<'_>,
+    ) -> Option<crate::LimboError> {
+        None
+    }
+}
+
+/// A statement that removes all rows of a table at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRemoval {
+    DropTable,
+    Truncate,
+}
+
+/// A foreign key of another table that references the table an error is
+/// about.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferencingForeignKey<'a> {
+    /// The table that has the foreign key.
+    pub table: &'a str,
+    /// The name the foreign key was declared with, if any.
+    pub constraint_name: Option<&'a str>,
+    /// The foreign key columns of `table`.
+    pub columns: &'a [String],
+}
+
+/// What is wrong with the table or columns that a foreign key references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignKeyTargetProblem<'a> {
+    /// The referenced table does not exist.
+    MissingTable(&'a str),
+    /// The referenced relation is a view, not a table.
+    NotATable(&'a str),
+    /// The foreign key names no referenced columns, and the referenced
+    /// table has no primary key.
+    NoPrimaryKey(&'a str),
+    /// A referenced column does not exist.
+    MissingColumn(&'a str),
+    /// The foreign key has a different number of columns than it references.
+    ColumnCountMismatch,
+    /// No primary key or unique constraint of the referenced table has
+    /// exactly the referenced columns.
+    NoUniqueConstraint(&'a str),
+    /// A primary key or unique constraint of the referenced table has the
+    /// referenced columns, but only in another order, which foreign key
+    /// enforcement cannot use.
+    ColumnsInOtherOrder(&'a str),
 }
 
 /// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that

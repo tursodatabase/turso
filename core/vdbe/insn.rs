@@ -474,6 +474,7 @@ pub struct ConstraintInfo {
     pub violation_regs: Vec<usize>,
     pub row_col_names: Vec<String>,
     pub parent_table: Option<String>,
+    pub referencing: Option<crate::ParentKeyReference>,
 }
 
 impl ConstraintInfo {
@@ -492,6 +493,7 @@ impl ConstraintInfo {
             violation_regs: regs,
             row_col_names: vec![],
             parent_table: None,
+            referencing: None,
         }
     }
 
@@ -510,6 +512,7 @@ impl ConstraintInfo {
             violation_regs: regs,
             row_col_names: vec![],
             parent_table: None,
+            referencing: None,
         }
     }
 
@@ -523,6 +526,7 @@ impl ConstraintInfo {
             violation_regs: vec![],
             row_col_names: vec![],
             parent_table: None,
+            referencing: None,
         }
     }
 
@@ -541,6 +545,7 @@ impl ConstraintInfo {
             violation_regs: regs,
             row_col_names: row_names,
             parent_table: None,
+            referencing: None,
         }
     }
 
@@ -560,6 +565,30 @@ impl ConstraintInfo {
             violation_regs: regs,
             row_col_names: vec![],
             parent_table: Some(parent_table),
+            referencing: None,
+        }
+    }
+
+    /// A DELETE or UPDATE of the parent table `parent_table` removes the key
+    /// on `parent_cols`, held in `regs`, which the foreign key `name` of
+    /// `referencing.table` still references.
+    pub fn fk_parent(
+        parent_table: &str,
+        name: Option<String>,
+        parent_cols: Vec<String>,
+        regs: Vec<usize>,
+        referencing: crate::ParentKeyReference,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::ForeignKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: parent_table.to_string(),
+            column_names: parent_cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+            referencing: Some(referencing),
         }
     }
 }

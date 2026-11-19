@@ -8,116 +8,12 @@
 
 @database :memory:
 
-setup parent_id_child_id_pid_with_rows {
-    CREATE TABLE parent (id int PRIMARY KEY);
-    CREATE TABLE child (id int PRIMARY KEY, pid int CONSTRAINT child_pid_fkey REFERENCES parent(id));
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
-}
-
 setup t_n {
     CREATE TABLE t (n int);
 }
 
 setup t_id {
     CREATE TABLE t (id int);
-}
-
-# D-01 (S1): FK not enforced by default
-# D-02 had the same SQL. This test covers it.
-@setup parent_id_child_id_pid_with_rows
-test gap-d-01-fk-not-enforced-by-default {
-    INSERT INTO child VALUES (2, 99);
-}
-@sqlstate 23503
-expect error {}
-expect @tursopg {
-}
-
-# D-03 (S1): FK violation on update child
-# Fails while foreign keys are off, see D-01.
-@setup parent_id_child_id_pid_with_rows
-test gap-d-03-fk-violation-on-update-child {
-    UPDATE child SET pid = 99 WHERE id = 1;
-}
-@sqlstate 23503
-expect error {}
-expect @tursopg {
-}
-
-# D-04 (S1): FK violation on delete parent
-# Fails while foreign keys are off, see D-01.
-@setup parent_id_child_id_pid_with_rows
-test gap-d-04-fk-violation-on-delete-parent {
-    DELETE FROM parent WHERE id = 1;
-}
-@sqlstate 23503
-expect error {}
-expect @tursopg {
-}
-
-# D-05 (S1): ON DELETE CASCADE
-# Fails while foreign keys are off, see D-01.
-test gap-d-05-on-delete-cascade {
-    CREATE TABLE parent (id int PRIMARY KEY);
-    CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE CASCADE);
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
-    DELETE FROM parent WHERE id = 1;
-    SELECT count(*) FROM child;
-}
-expect {
-    0
-}
-expect @tursopg {
-    1
-}
-
-# D-06 (S1): ON DELETE SET NULL
-# Fails while foreign keys are off, see D-01.
-test gap-d-06-on-delete-set-null {
-    CREATE TABLE parent (id int PRIMARY KEY);
-    CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE SET NULL);
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
-    DELETE FROM parent WHERE id = 1;
-    SELECT id, pid FROM child;
-}
-expect {
-    1|
-}
-expect @tursopg {
-    1|1
-}
-
-# D-07 (S1): ON UPDATE CASCADE
-# Fails while foreign keys are off, see D-01.
-test gap-d-07-on-update-cascade {
-    CREATE TABLE parent (id int PRIMARY KEY);
-    CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON UPDATE CASCADE);
-    INSERT INTO parent VALUES (1);
-    INSERT INTO child VALUES (1, 1);
-    UPDATE parent SET id = 2;
-    SELECT pid FROM child;
-}
-expect {
-    2
-}
-expect @tursopg {
-    1
-}
-
-# D-08 (S1): FK to non-PK unique column
-# Fails while foreign keys are off, see D-01.
-test gap-d-08-fk-to-non-pk-unique-column {
-    CREATE TABLE parent (id int PRIMARY KEY, code text UNIQUE);
-    CREATE TABLE child (id int PRIMARY KEY, code text REFERENCES parent(code));
-    INSERT INTO parent VALUES (1, 'x');
-    INSERT INTO child VALUES (1, 'nope');
-}
-@sqlstate 23503
-expect error {}
-expect @tursopg {
 }
 
 # D-09: PK duplicate

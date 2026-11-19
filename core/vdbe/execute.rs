@@ -3972,6 +3972,7 @@ fn build_constraint_violation_error(
             violation.row_values = !info.row_col_names.is_empty();
         }
         violation.parent_table.clone_from(&info.parent_table);
+        violation.referencing.clone_from(&info.referencing);
     }
     LimboError::ConstraintViolation(Box::new(violation))
 }
