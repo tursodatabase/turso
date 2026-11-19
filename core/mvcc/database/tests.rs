@@ -1,10 +1,9 @@
-use crate::SqliteDialect;
+use crate::dialect::cannot_parse::DialectThatCannotParse;
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::database::remove_file_from_database_registry;
-use crate::io::{PlatformIO, IO};
+use crate::io::IO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::CommitYieldPoint;
@@ -25,8 +24,6 @@ use std::sync::Arc;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
-    // Stored mainly to not drop the temp dir before the test is done.
-    _temp_dir: Option<tempfile::TempDir>,
 }
 pub(crate) struct MvccTestDb {
     pub(crate) mvcc_store: Arc<crate::MvStore>,
@@ -324,7 +321,7 @@ impl MvccTestDb {
         let db = Database::open(
             io,
             ":memory:",
-            crate::OpenOptions::new(Arc::new(SqliteDialect))
+            crate::OpenOptions::new(Arc::new(DialectThatCannotParse))
                 .db_opts(DatabaseOpts::new().with_mvcc(true)),
         )
         .unwrap();
@@ -536,43 +533,10 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
-        Self {
-            db: Some(db),
-            _temp_dir: None,
-        }
-    }
-
-    /// Opens a database with a file
-    pub fn new_with_random_db() -> Self {
-        Self::new_with_random_db_with_opts(DatabaseOpts::new())
-    }
-
-    /// Opens a database with a file and the requested options.
-    pub fn new_with_random_db_with_opts(opts: DatabaseOpts) -> Self {
-        let opts = opts.with_mvcc(true);
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir
-            .path()
-            .join(format!("test_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let io = Arc::new(PlatformIO::new().unwrap());
-        println!("path: {}", path.as_os_str().to_str().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path.as_os_str().to_str().unwrap(),
-            OpenFlags::default(),
-            opts,
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        Self {
-            db: Some(db),
-            _temp_dir: Some(temp_dir),
-        }
+        Self { db: Some(db) }
     }
 
     /// Asumes there is a database open
@@ -1233,7 +1197,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
 #[test]
 fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
 
@@ -1561,7 +1525,7 @@ fn test_commit_dependency_multiple_reads_dedup() {
 ///   5. Reader commit → CommitDependencyAborted
 #[test]
 fn test_commit_dep_threaded_abort_cascades() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
     commit_dep_insert_initial_row(&db);
 
@@ -1644,7 +1608,7 @@ fn test_commit_dep_threaded_abort_cascades() {
 /// all cascade-abort when the writer aborts.
 #[test]
 fn test_commit_dep_threaded_multiple_dependents_abort() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
     commit_dep_insert_initial_row(&db);
 
@@ -1721,7 +1685,7 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
 /// reader's CommitDepCounter is decremented and the reader can proceed.
 #[test]
 fn test_commit_dep_threaded_commit_resolves() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
     commit_dep_insert_initial_row(&db);
 
@@ -1794,7 +1758,7 @@ fn test_commit_dep_threaded_commit_resolves() {
 /// speculatively read from a Preparing writer must still honour AbortNow.
 #[test]
 fn test_commit_dep_threaded_readonly_abort_cascades() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
     commit_dep_insert_initial_row(&db);
 
@@ -1994,7 +1958,7 @@ fn test_update_fails_when_speculatively_read_writer_aborts() {
 /// from acquire_exclusive_tx.
 #[test]
 fn test_commit_dep_readonly_does_not_advance_timestamp() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
     commit_dep_insert_initial_row(&db);
 
@@ -2051,7 +2015,7 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
 /// return Busy for transactions that started before the read.
 #[test]
 fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
-    let db = MvccTestDbNoConn::new_with_random_db();
+    let db = MvccTestDbNoConn::new();
     let mvcc_store = db.get_mvcc_store();
     commit_dep_insert_initial_row(&db);
 
@@ -3893,29 +3857,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         }
     }
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let path = temp_dir
-        .path()
-        .join(format!("test_{}.db", rand::random::<u64>()));
-    let path_str = path.to_str().unwrap().to_string();
-    {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let _db = Database::open_file_with_flags(
-            io,
-            &path_str,
-            OpenFlags::default(),
-            DatabaseOpts::new().with_mvcc(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        remove_file_from_database_registry(&path_str);
-    }
-
-    let log_path = path.with_extension("db-log");
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let log_file = io
-        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .open_file("test.db-log", OpenFlags::default(), false)
         .unwrap();
     let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
         log_file,
@@ -3925,8 +3869,9 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let observe = ObserveCheckpointEndStorage::new(inner_storage);
     let db = Database::open(
         io,
-        &path_str,
-        crate::OpenOptions::new(Arc::new(SqliteDialect))
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(DialectThatCannotParse))
+            .db_opts(DatabaseOpts::new().with_mvcc(true))
             .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
@@ -3937,9 +3882,11 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    let tx_id = mv_store.begin_tx(conn.pager.load().clone()).unwrap();
+    let tx_id = mv_store
+        .begin_exclusive_tx(conn.pager.load().clone(), None, &conn, None)
+        .unwrap();
     mv_store
-        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "a"))
+        .with_header_mut(|header| header.user_version = 1.into(), Some(&tx_id))
         .unwrap();
     commit_tx(mv_store.clone(), &conn, tx_id).unwrap();
     conn.checkpoint(CheckpointMode::Truncate {
