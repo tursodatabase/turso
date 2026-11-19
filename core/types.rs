@@ -190,6 +190,32 @@ impl Text {
     pub fn as_str(&self) -> &str {
         &self.value
     }
+
+    /// Replaces the text with `lhs` followed by `rhs`, in the same buffer
+    /// when the buffer is large enough. The subtype becomes TEXT, as for
+    /// [Text::new]. An allocation failure leaves the text as it was.
+    pub(crate) fn replace_with_concat(&mut self, lhs: &str, rhs: &str) -> Result<()> {
+        let needed = lhs.len() + rhs.len();
+        match &mut self.value {
+            Cow::Owned(string) => {
+                if string.capacity() < needed {
+                    string.try_reserve(needed - string.len())?;
+                }
+                string.clear();
+                string.push_str(lhs);
+                string.push_str(rhs);
+            }
+            Cow::Borrowed(_) => {
+                let mut string = String::new();
+                string.try_reserve(needed)?;
+                string.push_str(lhs);
+                string.push_str(rhs);
+                self.value = Cow::Owned(string);
+            }
+        }
+        self.subtype = TextSubtype::Text;
+        Ok(())
+    }
 }
 
 /// UTF-8 validation tuned for record decoding. TEXT values are usually short

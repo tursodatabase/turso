@@ -16013,6 +16013,20 @@ pub fn op_concat(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
+    // A destination register that holds TEXT, as it does from the second
+    // row of a loop on, gets the result in its buffer. A new value for each
+    // row costs an allocation and a free.
+    if let Ok([lhs_reg, rhs_reg, Register::Value(Value::Text(dest_text))]) =
+        state.registers.get_disjoint_mut([*lhs, *rhs, *dest])
+    {
+        if lhs_reg
+            .get_value()
+            .exec_concat_into(rhs_reg.get_value(), dest_text)?
+        {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let value = state.registers[*lhs]
         .get_value()
         .exec_concat(state.registers[*rhs].get_value())?;
