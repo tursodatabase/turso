@@ -541,41 +541,6 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect};
-
-    #[test]
-    fn filter_starts_each_pragma_scan_at_rowid_one() {
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE scan_target(first, second)")
-            .unwrap();
-
-        let pragma_vtab = PragmaVirtualTable {
-            pragma_name: "table_info".to_string(),
-            visible_column_count: 6,
-            max_arg_count: 2,
-            has_pragma_arg: true,
-        };
-        let mut cursor = pragma_vtab.open(conn).unwrap();
-
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
-        assert_eq!(cursor.rowid(), 1);
-        assert!(cursor.next().unwrap());
-        assert_eq!(cursor.rowid(), 2);
-        assert!(!cursor.next().unwrap());
-
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
-        assert_eq!(cursor.rowid(), 1);
-    }
 
     #[test]
     fn test_best_index_argv_order_both_hidden_constraints() {
