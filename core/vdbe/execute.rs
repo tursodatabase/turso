@@ -7776,23 +7776,12 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            if matches!(arg, Value::Null) {
-                return Ok(());
-            }
-            if matches!(payload[0], Value::Null) {
-                payload[0].try_clone_from(arg)?;
-                return Ok(());
-            }
-            use std::cmp::Ordering;
-            let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
-            let should_update = match func {
-                AggFunc::Max => cmp == Ordering::Greater,
-                AggFunc::Min => cmp == Ordering::Less,
-                _ => false,
-            };
-            if should_update {
-                payload[0].try_clone_from(arg)?;
-            }
+            step_min_max(
+                matches!(func, AggFunc::Max),
+                arg,
+                &mut payload[0],
+                collation,
+            )?;
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
@@ -9592,31 +9581,77 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max if matches!(data.collation, CollationSeq::Text(_)) => {
-                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
-                    state.registers[data.col]
-                {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) =
-                        &mut state.registers[data.acc_reg]
-                    {
-                        if let Some(Value::Numeric(Numeric::Integer(best))) = payload.first_mut() {
-                            let better = match agg {
-                                AggFunc::Max => arg > *best,
-                                _ => arg < *best,
-                            };
-                            if better {
-                                *best = arg;
-                            }
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
-                        }
-                    }
-                }
+            AggFunc::Min | AggFunc::Max => {
+                return op_agg_step_min_max(state, data, connection, matches!(agg, AggFunc::Max));
             }
             _ => {}
         }
     }
     op_agg_step_slow(state, data, connection)
+}
+
+/// The fast path of AggStep for MIN (`is_max` false) and MAX (`is_max`
+/// true): the step of update_agg_payload for a value against an accumulator
+/// that exists, without the work of the slow path. It is out of line: inside
+/// op_agg_step, the registers and the stack that the step of a TEXT or BLOB
+/// value needs were saved and restored on each call, also for COUNT, SUM and
+/// AVG.
+#[inline(never)]
+fn op_agg_step_min_max(
+    state: &mut ProgramState,
+    data: &AggStepData,
+    connection: &Connection,
+    is_max: bool,
+) -> InsnResult {
+    if let Ok([Register::Value(arg), Register::Aggregate(AggContext::Builtin(payload))]) =
+        state.registers.get_disjoint_mut([data.col, data.acc_reg])
+    {
+        if let Some(best) = payload.first_mut() {
+            step_min_max(is_max, arg, best, data.collation)?;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+    op_agg_step_slow(state, data, connection)
+}
+
+/// One step of MIN (`is_max` false) or MAX (`is_max` true): `best` takes a
+/// copy of `arg` when `arg` is not NULL and `best` is NULL, or when `arg`
+/// orders strictly after (MAX) or before (MIN) `best` under `collation`.
+#[inline(always)]
+fn step_min_max(
+    is_max: bool,
+    arg: &Value,
+    best: &mut Value,
+    collation: CollationSeq,
+) -> Result<()> {
+    // Two integers under a text collation compare as integers, and the copy
+    // of an integer does not allocate.
+    if let (Value::Numeric(Numeric::Integer(arg)), Value::Numeric(Numeric::Integer(best))) =
+        (arg, &mut *best)
+    {
+        if matches!(collation, CollationSeq::Text(_)) {
+            if (is_max && *arg > *best) || (!is_max && *arg < *best) {
+                *best = *arg;
+            }
+            return Ok(());
+        }
+    }
+    if matches!(arg, Value::Null) {
+        return Ok(());
+    }
+    let better = matches!(best, Value::Null) || {
+        let order = collation.compare(arg.as_ref(), best.as_ref());
+        if is_max {
+            order.is_gt()
+        } else {
+            order.is_lt()
+        }
+    };
+    if better {
+        best.try_clone_from(arg)?;
+    }
+    Ok(())
 }
 
 #[inline(never)]
