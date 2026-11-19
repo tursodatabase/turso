@@ -229,15 +229,15 @@ pub struct DropSequence<'a> {
     pub name: &'a str,
 }
 
-/// A table that the statement drops, with its indexes and the sequences
-/// that its columns own, before the statement destroys their B-trees.
+/// A table that the statement drops, with its indexes, before the
+/// statement destroys their B-trees. A sequence that a column of the table
+/// owns gets a [`DropSequence`] of its own.
 #[derive(Debug, Clone, Copy)]
 pub struct DropTable<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
     pub is_virtual: bool,
     pub indexes: &'a [&'a str],
-    pub owned_sequences: &'a [String],
 }
 
 /// A new view.

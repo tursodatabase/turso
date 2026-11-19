@@ -506,13 +506,9 @@ impl Catalog for PostgresCatalog {
                 if table.is_virtual {
                     return Ok(());
                 }
-                // The class rows that go away with the table: those of the
-                // sequences that its columns own, its own and those of its
-                // indexes.
+                // The class rows that go away with the table: its own and
+                // those of its indexes.
                 if let Some(rows) = ClassRowWriter::open(program, ctx, false)? {
-                    for sequence in table.owned_sequences {
-                        rows.dropped_relation(program, table.namespace, sequence);
-                    }
                     rows.dropped_relation(program, table.namespace, table.name);
                     for index in table.indexes {
                         rows.dropped_relation(program, table.namespace, index);

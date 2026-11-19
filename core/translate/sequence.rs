@@ -1267,7 +1267,7 @@ pub fn translate_drop_sequence(
 }
 
 /// Emits the removal of sequence `seq_name` of `namespace` from the schema
-/// and from the dialect's schema state. Returns false, emitting nothing,
+/// and from the dialect's catalog. Returns false, emitting nothing,
 /// when the sequence does not exist.
 pub(crate) fn emit_drop_sequence(
     program: &mut ProgramBuilder,

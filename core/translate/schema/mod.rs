@@ -2091,7 +2091,6 @@ pub fn translate_drop_table(
             name: &normalized_name,
             is_virtual: table.btree().is_none(),
             indexes: &index_names,
-            owned_sequences: &owned_sequences,
         }),
     )?;
     for index in &indices {
@@ -2511,8 +2510,8 @@ pub fn translate_drop_table(
     }
 
     for sequence in &owned_sequences {
-        crate::translate::sequence::emit_drop_sequence_cleanup(
-            program, resolver, namespace, sequence,
+        crate::translate::sequence::emit_drop_sequence(
+            program, resolver, connection, namespace, sequence,
         )?;
     }
 
