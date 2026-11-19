@@ -2767,6 +2767,16 @@ impl Jsonb {
         Ok(jsonb)
     }
 
+    /// Makes the element for `text`, the JSON text of a number, as the parser
+    /// makes it. A JSON number with a fraction or an exponent, the text of
+    /// most REAL values, is a FLOAT element with `text` as its payload, so it
+    /// does not need the parser.
+    pub fn from_number_text(text: &str) -> PResult<Self> {
+        let mut jsonb = Self::empty();
+        append_number_text(&mut jsonb.data, text)?;
+        Ok(jsonb)
+    }
+
     /// Appends the element for the SQL value `val` to the end of the
     /// document, as [super::append_dbtype_as_jsonb] writes it.
     pub(crate) fn append_sql_value(&mut self, val: ValueRef<'_>, strict: Conv) -> Result<()> {
@@ -3843,6 +3853,67 @@ pub(crate) fn append_i64(
     }
     data.extend_from_slice(digits);
     Ok(())
+}
+
+/// Appends to `data` the element for `text`, as [Jsonb::from_number_text]
+/// makes it.
+#[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbConstruction)]
+pub(crate) fn append_number_text(data: &mut ValueBlob, text: &str) -> PResult<()> {
+    if !is_json_float(text.as_bytes()) {
+        let json = Jsonb::from_str(text)?;
+        data.try_reserve(json.data.len())
+            .map_err(|_| PError::OutOfMemory)?;
+        data.extend_from_slice(&json.data);
+        return Ok(());
+    }
+    let header = JsonbHeader::new(ElementType::FLOAT, text.len()).into_bytes();
+    let header = header.as_bytes();
+    data.try_reserve(header.len() + text.len())
+        .map_err(|_| PError::OutOfMemory)?;
+    data.extend_from_slice(header);
+    data.extend_from_slice(text.as_bytes());
+    Ok(())
+}
+
+/// Whether `text` is a JSON number with a fraction or an exponent:
+/// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` with at least one of the
+/// optional parts. The parser makes a FLOAT element for such text, with the
+/// text as its payload.
+fn is_json_float(text: &[u8]) -> bool {
+    fn digits(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+    }
+    let rest = text.strip_prefix(b"-").unwrap_or(text);
+    let int_len = digits(rest);
+    if int_len == 0 || (int_len > 1 && rest[0] == b'0') {
+        return false;
+    }
+    let mut rest = &rest[int_len..];
+    let mut has_fraction_or_exponent = false;
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let fraction_len = digits(fraction);
+        if fraction_len == 0 {
+            return false;
+        }
+        rest = &fraction[fraction_len..];
+        has_fraction_or_exponent = true;
+    }
+    if let Some(exponent) = rest.strip_prefix(b"e").or_else(|| rest.strip_prefix(b"E")) {
+        let exponent = exponent
+            .strip_prefix(b"+")
+            .or_else(|| exponent.strip_prefix(b"-"))
+            .unwrap_or(exponent);
+        let exponent_len = digits(exponent);
+        if exponent_len == 0 {
+            return false;
+        }
+        rest = &exponent[exponent_len..];
+        has_fraction_or_exponent = true;
+    }
+    has_fraction_or_exponent && rest.is_empty()
 }
 
 /// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the
@@ -5052,6 +5123,63 @@ mod tests {
             assert!(jsonb.data[header.len()..]
                 .chunks(4)
                 .all(|member| member == [0x17, b'k', 0x13, b'1']));
+        }
+    }
+
+    #[test]
+    fn number_text_is_the_element_the_parser_makes() {
+        let floats = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.5,
+            0.1,
+            1e-4,
+            1e-5,
+            123.456,
+            1e14,
+            1e15,
+            1e16,
+            1.5e300,
+            -2.5e-300,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            f64::NAN,
+        ];
+        let mut texts: Vec<String> = floats
+            .iter()
+            .map(|&float| crate::numeric::format_float(float))
+            .collect();
+        // The texts of infinite values, and texts that are not JSON floats,
+        // which go through the parser.
+        texts.extend(
+            [
+                "9e999",
+                "-9e999",
+                "9.0e+999",
+                "-9.0e+999",
+                "100",
+                "-0",
+                "1.",
+                ".5",
+                "01.5",
+                "1e",
+                "1e+",
+                "-",
+                "",
+                "1.5x",
+                "Infinity",
+                "NaN",
+            ]
+            .map(String::from),
+        );
+        for text in &texts {
+            match (Jsonb::from_number_text(text), Jsonb::from_str(text)) {
+                (Ok(direct), Ok(parsed)) => assert_eq!(direct.data, parsed.data, "{text}"),
+                (Err(_), Err(_)) => {}
+                (direct, parsed) => panic!("{text}: {direct:?} and {parsed:?}"),
+            }
         }
     }
 

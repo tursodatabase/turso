@@ -231,21 +231,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             Jsonb::from_str_with_mode(&text, strict).map_err(malformed_json_error)
         }
         ValueRef::Numeric(Numeric::Float(float)) => {
-            let float: f64 = float.into();
-            // SQLite writes an infinite REAL as 9e999 when it converts a
-            // function argument to JSON, but json_array, json_object and
-            // json_quote print it as 9.0e+999 (#4196).
-            if float.is_infinite() {
-                let json_str = match (strict, float.is_sign_negative()) {
-                    (Conv::NotStrict, false) => "9.0e+999",
-                    (Conv::NotStrict, true) => "-9.0e+999",
-                    (_, false) => "9e999",
-                    (_, true) => "-9e999",
-                };
-                Jsonb::from_str(json_str).map_err(malformed_json_error)
-            } else {
-                Jsonb::from_str(&crate::numeric::format_float(float)).map_err(malformed_json_error)
-            }
+            Jsonb::from_number_text(&float_json_text(float.into(), strict))
+                .map_err(malformed_json_error)
         }
         ValueRef::Numeric(Numeric::Integer(int)) => {
             Jsonb::from_i64(int).map_err(malformed_json_error)
@@ -271,6 +258,10 @@ pub(crate) fn append_dbtype_as_jsonb(
         ValueRef::Numeric(Numeric::Integer(int)) if !matches!(strict, Conv::ToString) => {
             jsonb::append_i64(data, int)?;
         }
+        ValueRef::Numeric(Numeric::Float(float)) if !matches!(strict, Conv::ToString) => {
+            jsonb::append_number_text(data, &float_json_text(float.into(), strict))
+                .map_err(malformed_json_error)?;
+        }
         _ => {
             let json = convert_ref_dbtype_to_jsonb(val, strict)?.data();
             data.try_reserve(json.len())?;
@@ -278,6 +269,23 @@ pub(crate) fn append_dbtype_as_jsonb(
         }
     }
     Ok(())
+}
+
+/// The JSON text of the REAL value `float`.
+fn float_json_text(float: f64, strict: Conv) -> Cow<'static, str> {
+    // SQLite writes an infinite REAL as 9e999 when it converts a
+    // function argument to JSON, but json_array, json_object and
+    // json_quote print it as 9.0e+999 (#4196).
+    if float.is_infinite() {
+        Cow::Borrowed(match (strict, float.is_sign_negative()) {
+            (Conv::NotStrict, false) => "9.0e+999",
+            (Conv::NotStrict, true) => "-9.0e+999",
+            (_, false) => "9e999",
+            (_, true) => "-9e999",
+        })
+    } else {
+        Cow::Owned(crate::numeric::format_float(float))
+    }
 }
 
 pub(crate) fn ensure_blob_arg_is_jsonb(value: ValueRef<'_>) -> crate::Result<()> {
