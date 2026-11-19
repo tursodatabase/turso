@@ -194,7 +194,7 @@ pub enum ColumnTypeKind {
 
 pub struct Statement {
     pub(crate) program: vdbe::Program,
-    state: vdbe::ProgramState,
+    state: Box<vdbe::ProgramState>,
     connection: Arc<Connection>,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
@@ -302,7 +302,7 @@ impl Statement {
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
         Self {
             program,
-            state,
+            state: Box::new(state),
             connection,
             pager,
             query_mode,
@@ -1809,6 +1809,15 @@ mod tests {
     use crate::security::roles::SessionRole;
     use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+
+    /// Callers move a `Statement` by value while they build it and wrap it,
+    /// and every copy is a stack slot in the caller's frame. Those frames stay
+    /// on the stack while statements are prepared, so a large `Statement`
+    /// overflows small coroutine stacks.
+    #[test]
+    fn statement_stays_small() {
+        assert!(std::mem::size_of::<Statement>() <= 1024);
+    }
 
     #[test]
     fn cloned_halt_retains_constraint_context() {
