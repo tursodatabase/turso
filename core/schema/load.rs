@@ -1,7 +1,7 @@
 //! Reading a schema from the database file: a list of steps, and one driver
 //! that runs the statements of each step.
 
-use crate::connection::{Connection, TransactionState};
+use crate::connection::Connection;
 use crate::namespace::NamespaceId;
 use crate::schema::{
     Schema, Sequence, SequencesByNamespace, StoredMaterializedView, TURSO_NAMESPACES_TABLE_NAME,
@@ -12,7 +12,7 @@ use crate::sync::Arc;
 use crate::types::{IOResult, IOResultOr};
 use crate::util::UnparsedFromSqlIndex;
 use crate::vdbe::Row;
-use crate::{turso_assert, LimboError, Result, Statement, Value};
+use crate::{turso_assert, LimboError, Result, Statement};
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::VecDeque;
 
@@ -285,7 +285,6 @@ pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box
         steps.push(Box::new(CustomTypes::new(conn.clone())));
         steps.push(Box::new(ViewsAndIndexes::new(conn.clone())));
     }
-    steps.push(Box::new(DialectState::new(conn.clone())));
     steps.extend(conn.db.dialect().catalog().load_steps());
     steps
 }
@@ -666,69 +665,6 @@ impl LoadStep for ViewsAndIndexes {
 
     fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
         unreachable!("building views and indexes has no statement")
-    }
-}
-
-/// Reads the dialect's own schema state, such as the PostgreSQL frontend's
-/// relation catalog, with the statements of
-/// [`Dialect::schema_state_queries`](crate::dialect::Dialect::schema_state_queries),
-/// and builds it with
-/// [`Dialect::build_schema_state`](crate::dialect::Dialect::build_schema_state).
-pub(crate) struct DialectState {
-    conn: Arc<Connection>,
-    /// The statements not started yet, or None before the first call of
-    /// `next_query`.
-    queries: Option<VecDeque<String>>,
-    /// The rows so far of the statement being read.
-    rows: Vec<Vec<Value>>,
-    /// The rows of each finished statement.
-    results: Vec<Vec<Vec<Value>>>,
-}
-
-impl DialectState {
-    pub(crate) fn new(conn: Arc<Connection>) -> Self {
-        Self {
-            conn,
-            queries: None,
-            rows: Vec::new(),
-            results: Vec::new(),
-        }
-    }
-}
-
-impl LoadStep for DialectState {
-    fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
-        let queries = self.queries.get_or_insert_with(|| {
-            self.conn
-                .db
-                .dialect()
-                .schema_state_queries(load.schema())
-                .into()
-        });
-        Ok(queries.pop_front().map(LoadQuery::engine_metadata_read))
-    }
-
-    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> Result<()> {
-        turso_assert!(
-            !matches!(self.conn.get_tx_state(), TransactionState::None),
-            "dialect schema state must be read in a transaction"
-        );
-        self.rows.push(row.get_values().cloned().collect());
-        Ok(())
-    }
-
-    fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
-        self.results.push(std::mem::take(&mut self.rows));
-        let queries = self.queries.as_ref().expect("set by next_query");
-        if queries.is_empty() {
-            let state = self
-                .conn
-                .db
-                .dialect()
-                .build_schema_state(load.schema(), &self.results)?;
-            load.schema_mut()?.dialect_schema = Some(state);
-        }
-        Ok(())
     }
 }
 
