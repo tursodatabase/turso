@@ -130,7 +130,7 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let zero_pos = first_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     // Like CAST(blob AS TEXT), bytes that are not UTF-8 become U+FFFD.
-    let str = String::from_utf8_lossy(truncated);
+    let str = utf8_lossy(truncated);
     Jsonb::from_str_with_mode(&str, mode).map_err(malformed_json_error)
 }
 
@@ -140,7 +140,7 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
 fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
     let zero_pos = first_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
-    let str = String::from_utf8_lossy(truncated);
+    let str = utf8_lossy(truncated);
     Jsonb::from_str_tracking(&str).map_err(Into::into)
 }
 
