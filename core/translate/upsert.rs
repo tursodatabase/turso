@@ -7,7 +7,8 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::{
-    compute_generated_columns, compute_virtual_columns, sets_custom_type_column,
+    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
+    sets_custom_type_column,
 };
 use super::insert::column_default_expr;
 use crate::alloc::{TryClone, TursoIteratorExt};
@@ -530,20 +531,10 @@ pub fn emit_upsert(
         .expect("upsert must have a target table")
         .internal_id;
     let current_start = program.alloc_registers(num_cols);
-    for i in 0..num_cols {
-        let col = &table.columns()[i];
-        let reg = layout.to_register(current_start, i);
-        emit_table_column(
-            program,
-            ctx.cursor_id,
-            table_ref_id,
-            table_references,
-            col,
-            i,
-            reg,
-            resolver,
-        )?;
-    }
+    let current_regs: Vec<usize> = (0..num_cols)
+        .map(|i| layout.to_register(current_start, i))
+        .collect();
+    emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &current_regs, resolver)?;
 
     // BEFORE for index maintenance / CDC
     let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
@@ -1029,18 +1020,10 @@ pub fn emit_upsert(
             // index deletion must use the row as it is on disk now, or the
             // trigger's index entries are left behind (#8744).
             if let Some(before) = before_start {
-                for (i, column) in table.columns().iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        ctx.cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column,
-                        i,
-                        layout.to_register(before, i),
-                        resolver,
-                    )?;
-                }
+                let before_regs: Vec<usize> = (0..num_cols)
+                    .map(|i| layout.to_register(before, i))
+                    .collect();
+                emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &before_regs, resolver)?;
             }
 
             // Same for the NEW image: like SQLite, columns not in the SET list
@@ -1676,7 +1659,8 @@ pub fn emit_upsert(
                 bt.name.as_str(),
                 ctx.conflict_rowid_reg, // old_rowid_reg
                 current_start,          // old_values_start
-                new_start,              // new_values_start
+                &layout,
+                new_start,                                       // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
                 upsert_namespace,
@@ -1730,19 +1714,6 @@ pub fn emit_upsert(
             }
             program.preassign_label_to_next_insn(after_trigger_done);
         }
-    }
-
-    // Compute the generated columns of the NEW image for RETURNING
-    if !returning.is_empty() {
-        compute_new_row_generated_columns(
-            program,
-            ctx,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            &layout,
-            DmlRowForm::Stored,
-            resolver,
-        )?;
     }
 
     // RETURNING from NEW image + final rowid

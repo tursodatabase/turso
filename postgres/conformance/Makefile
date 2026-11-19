@@ -36,7 +36,7 @@ SHARED_TESTS := ../../testing/shared-sqltests
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-embedded run-one-embedded run-postgres run-one-postgres run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
 
 # Build everything
 all: build
@@ -66,6 +66,16 @@ test: run
 # Run a single test file: make run-one FILE=pg-sqltests/select.sqltest
 run-one: build
 	$(SQLTEST) run $(FILE) --backend tursopg --binary $(TURSOPG)
+
+# Run all tests against turso_pg in the test runner process, without the
+# pgwire server.
+run-embedded: build-runner
+	$(SQLTEST) run $(PG_TESTS) $(SHARED_TESTS) --timeout 600 --backend tursopg-embedded
+
+# Run a single test file against turso_pg without the pgwire server:
+# make run-one-embedded FILE=pg-sqltests/select.sqltest
+run-one-embedded: build-runner
+	$(SQLTEST) run $(FILE) --backend tursopg-embedded
 
 # Run all tests against a real PostgreSQL server. Uses the server at PG_DSN,
 # or starts a throwaway Docker container (see with-postgres.sh).

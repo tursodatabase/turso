@@ -17,11 +17,15 @@
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
 //! [`Dialect::parse_internal`] of the database's dialect.
 
+pub mod catalog;
 #[cfg(test)]
 mod engine;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
+};
+pub use catalog::{
+    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
 };
 
 #[cfg(test)]
@@ -30,119 +34,17 @@ pub(crate) use engine::EngineDialect;
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
-    schema::{BTreeTable, RelationKind, Schema, SchemaBuilder},
+    schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
-use turso_parser::ast::{
-    self, Cmd, CreateTableBody, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec, Stmt,
-};
+use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
-
-/// A change a statement makes to the dialect's catalog of the main
-/// database: to a relation, or to the roles. Translation tells the dialect
-/// about it through
-/// [`Dialect::translate_catalog_changes`], and the dialect's own bytecode
-/// tells it back through [`Dialect::apply_catalog_change`] once the change
-/// is written.
-#[derive(Debug, Clone)]
-pub enum CatalogChange {
-    Create {
-        namespace: NamespaceId,
-        name: String,
-        kind: RelationKind,
-        /// For an index, the table it is on, in the same namespace. Its
-        /// owner owns the index.
-        table: Option<String>,
-    },
-    Drop {
-        namespace: NamespaceId,
-        name: String,
-    },
-    Rename {
-        namespace: NamespaceId,
-        old_name: String,
-        new_name: String,
-    },
-    /// Whom the relation belongs to from now on.
-    ChangeOwner {
-        namespace: NamespaceId,
-        name: String,
-        owner: NewOwner,
-    },
-    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
-    RenameColumn {
-        namespace: NamespaceId,
-        table: String,
-        old_name: String,
-        new_name: String,
-    },
-    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
-    /// relation FROM grantees` when `revoke` is set.
-    Grant {
-        revoke: bool,
-        namespace: NamespaceId,
-        name: String,
-        privileges: Vec<Privilege>,
-        grantees: Vec<Grantee>,
-    },
-    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
-    /// `enabled` is false.
-    SetRowSecurity {
-        namespace: NamespaceId,
-        name: String,
-        enabled: bool,
-    },
-    /// `CREATE POLICY` on table `name`. Its expressions refer to the
-    /// table's columns by their unqualified names.
-    CreatePolicy {
-        namespace: NamespaceId,
-        name: String,
-        policy: Box<ast::CreatePolicy>,
-    },
-    /// `DROP POLICY policy_name ON name`.
-    DropPolicy {
-        namespace: NamespaceId,
-        name: String,
-        policy_name: String,
-        if_exists: bool,
-    },
-    /// `CREATE ROLE name`: a role that is not a superuser and cannot log in.
-    CreateRole {
-        name: String,
-        options: ast::RoleOptions,
-    },
-    /// `GRANT roles TO grantees`, which makes each grantee a member of each
-    /// role, or `REVOKE roles FROM grantees` when `revoke` is set.
-    GrantRole {
-        revoke: bool,
-        roles: Vec<String>,
-        grantees: Vec<Grantee>,
-    },
-}
-
-/// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
-#[derive(Debug, Clone)]
-pub enum NewOwner {
-    /// A column of a table of the same namespace, as `ALTER SEQUENCE ...
-    /// OWNED BY table.column` names one for a sequence, or no column. What a
-    /// table owns changes owner with it, and not on its own.
-    Column(Option<OwnerColumn>),
-    /// A role, as `ALTER ... OWNER TO` names one.
-    Role(RoleSpec),
-}
-
-/// The column that owns a sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerColumn {
-    pub table: String,
-    pub column: String,
-}
 
 /// What a built-in scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
@@ -369,6 +271,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether the arguments of a table function can only name columns of the
+    /// tables listed before it in FROM.
+    ///
+    /// SQLite looks in every table of the query, so `json_each(value)` reads
+    /// `json_each.value` and `json_each(t.x), t` is accepted. PostgreSQL only
+    /// lets a function in FROM read the tables to its left.
+    fn table_function_arguments_read_only_earlier_tables(&self) -> bool {
+        false
+    }
+
     /// Whether a sequence named without a schema in an expression stored in
     /// the schema is bound to the schema it is found in when the expression
     /// is created.
@@ -419,83 +331,37 @@ pub trait Dialect: Send + Sync + 'static {
         ))
     }
 
-    /// Translates `changes`, which the statement being compiled makes, into
-    /// the bytecode that records them in the dialect's own schema state, in
-    /// the same transaction as the statement's `sqlite_schema` rows. A table
-    /// comes with its automatic indexes in one call. Does nothing for a
-    /// dialect without schema state of its own, except that such a dialect
-    /// has no roles, ownership, privileges or row-level security and refuses
-    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
-    /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_catalog_changes(
+    /// Translates `changes`, which the statement being compiled makes to
+    /// relations, into the bytecode that records them in the dialect's own
+    /// schema state, in the same transaction as the statement's
+    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
+    /// call. Does nothing for a dialect without schema state of its own.
+    fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[CatalogChange],
+        changes: &[RelationChange<'_>],
     ) -> Result<()> {
-        let _ = (program, schema, connection);
-        for change in changes {
-            match change {
-                CatalogChange::ChangeOwner {
-                    owner: NewOwner::Role(_),
-                    ..
-                } => {
-                    return Err(LimboError::ParseError(
-                        "ALTER ... OWNER TO is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::ChangeOwner {
-                    owner: NewOwner::Column(_),
-                    ..
-                } => {
-                    return Err(LimboError::ParseError(
-                        "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::Grant { revoke, .. } => {
-                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                    return Err(LimboError::ParseError(format!(
-                        "{statement} is not supported"
-                    )));
-                }
-                CatalogChange::SetRowSecurity { .. }
-                | CatalogChange::CreatePolicy { .. }
-                | CatalogChange::DropPolicy { .. } => {
-                    return Err(LimboError::ParseError(
-                        "row-level security is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::CreateRole { .. } => {
-                    return Err(LimboError::ParseError(
-                        "CREATE ROLE is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::GrantRole { revoke, .. } => {
-                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                    return Err(LimboError::ParseError(format!(
-                        "{statement} of role membership is not supported"
-                    )));
-                }
-                _ => {}
-            }
-        }
+        let _ = (program, schema, connection, changes);
         Ok(())
     }
 
-    /// Applies `change`, which the running statement wrote to the dialect's
-    /// schema state, to the in-memory copy in `schema`. `values` are the
-    /// registers the dialect named when it emitted the instruction, such as
-    /// the id its state gave a created relation.
-    fn apply_catalog_change(
+    /// Translates `statement` into the bytecode that changes the roles,
+    /// owners, privileges or policies the dialect stores. A dialect that
+    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
+    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
+    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
+    /// `CREATE POLICY` and `DROP POLICY`.
+    fn translate_access_statement(
         &self,
-        schema: &mut Schema,
-        change: &CatalogChange,
-        values: &[Value],
+        program: &mut ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        statement: &AccessStatement<'_>,
     ) -> Result<()> {
-        let _ = (schema, change, values);
-        Ok(())
+        let _ = (program, schema, connection);
+        Err(statement.not_supported())
     }
 
     /// Whether relations can be created, renamed or dropped in an attached

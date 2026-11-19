@@ -1,4 +1,12 @@
-use crate::dialect::CatalogChange;
+mod sqlite_schema_rows;
+
+pub(crate) use sqlite_schema_rows::{
+    emit_create_internal_table, emit_delete_index_row, emit_delete_rows_of_table,
+    emit_delete_temp_triggers_on_table, emit_drop_view_row, emit_schema_entry,
+    open_sqlite_schema_for_write, SchemaEntryType,
+};
+
+use crate::dialect::RelationChange;
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -19,10 +27,7 @@ use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
-use crate::translate::emitter::{
-    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-    OperationMode, Resolver,
-};
+use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
     base_value_type, decode_type, iif_values, value_type, ExprType,
 };
@@ -41,7 +46,7 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
-use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
+use crate::{bail_parse_error, turso_assert, turso_assert_eq, Result};
 use crate::{Connection, Value, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
@@ -1340,17 +1345,7 @@ pub fn translate_create_table(
             s.get_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
                 .is_none()
         }) {
-        let schema_master_table = resolver
-            .schema()
-            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap();
-        let sqlite_schema_cursor_id =
-            program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: sqlite_schema_cursor_id,
-            root_page: 1i64.into(),
-            db: database_id,
-        });
+        let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
         let seq_table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
@@ -1453,16 +1448,7 @@ pub fn translate_create_table(
         }
     }
 
-    let table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -1507,21 +1493,21 @@ pub fn translate_create_table(
     }
 
     if dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![CatalogChange::Create {
+        let mut changes = vec![RelationChange::Created {
             namespace: namespace.id,
-            name: normalized_tbl_name.clone(),
+            name: &normalized_tbl_name,
             kind: RelationKind::Table,
             table: None,
         }];
-        for index_name in autoindex_names {
-            changes.push(CatalogChange::Create {
+        for index_name in &autoindex_names {
+            changes.push(RelationChange::Created {
                 namespace: namespace.id,
                 name: index_name,
                 kind: RelationKind::Index,
-                table: Some(normalized_tbl_name.clone()),
+                table: Some(&normalized_tbl_name),
             });
         }
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
@@ -1813,108 +1799,7 @@ fn emit_namespace_row(program: &mut ProgramBuilder, cursor_id: usize, id: Namesp
     });
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum SchemaEntryType {
-    Table,
-    Index,
-    View,
-    Trigger,
-}
-
-impl SchemaEntryType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            SchemaEntryType::Table => "table",
-            SchemaEntryType::Index => "index",
-            SchemaEntryType::View => "view",
-            SchemaEntryType::Trigger => "trigger",
-        }
-    }
-}
 pub const SQLITE_TABLEID: &str = "sqlite_schema";
-
-#[allow(clippy::too_many_arguments)]
-pub fn emit_schema_entry(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    sqlite_schema_cursor_id: usize,
-    cdc_table_cursor_id: Option<usize>,
-    entry_type: SchemaEntryType,
-    name: &str,
-    tbl_name: &str,
-    root_page_reg: usize,
-    sql: Option<String>,
-) -> Result<()> {
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: sqlite_schema_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-
-    let type_reg = program.emit_string8_new_reg(entry_type.as_str().to_string());
-    program.emit_string8_new_reg(name.to_string());
-    program.emit_string8_new_reg(tbl_name.to_string());
-
-    let table_root_reg = program.alloc_register();
-    if root_page_reg == 0 {
-        program.emit_insn(Insn::Integer {
-            dest: table_root_reg,
-            value: 0, // virtual tables in sqlite always have rootpage=0
-        });
-    } else {
-        program.emit_insn(Insn::Copy {
-            src_reg: root_page_reg,
-            dst_reg: table_root_reg,
-            extra_amount: 0,
-        });
-    }
-
-    let sql_reg = program.alloc_register();
-    if let Some(sql) = sql {
-        program.emit_string8(sql, sql_reg);
-    } else {
-        program.emit_null(sql_reg, None);
-    }
-
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(type_reg),
-        count: to_u32(5),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-
-    program.emit_insn(Insn::Insert {
-        cursor: sqlite_schema_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: tbl_name.to_string(),
-    });
-
-    if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
-        let after_record_reg = if program.capture_data_changes_info().has_after() {
-            Some(record_reg)
-        } else {
-            None
-        };
-        emit_cdc_insns(
-            program,
-            resolver,
-            OperationMode::INSERT,
-            cdc_table_cursor_id,
-            rowid_reg,
-            None,
-            after_record_reg,
-            None,
-            SQLITE_TABLEID,
-        )?;
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_table_cursor_id))?;
-    }
-    Ok(())
-}
 
 /// Check if an automatic PRIMARY KEY index is required for the table.
 /// If so, create a register for the index root page and return it.
@@ -2092,16 +1977,8 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: crate::MAIN_DB_ID,
-    });
+    let sqlite_schema_cursor_id =
+        open_sqlite_schema_for_write(program, resolver, crate::MAIN_DB_ID);
 
     let cdc_table = prepare_cdc_if_necessary(
         program,
@@ -2132,7 +2009,7 @@ pub fn translate_create_virtual_table(
     let parse_schema_where_clause =
         format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: crate::MAIN_DB_ID,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
     });
@@ -2241,233 +2118,18 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
-    let cdc_table = prepare_cdc_if_necessary(
+    // r1 and r2. The delete loop overwrites both. r2 then gets the root page
+    // that `Destroy` moved, as in SQLite's bytecode.
+    let scratch_reg = program.alloc_register();
+    let table_name_and_root_page_register = program.alloc_register();
+    emit_delete_rows_of_table(
         program,
-        resolver.schema(),
+        resolver,
         database_id,
-        Some(SQLITE_TABLEID),
+        mangled_name.clone(),
+        [scratch_reg, table_name_and_root_page_register],
     )?;
-
-    let null_reg = program.alloc_register(); //  r1
-    program.emit_null(null_reg, None);
-    let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(mangled_name.clone()); //  r3
-    program.mark_last_insn_constant();
-    let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
-    program.mark_last_insn_constant();
-    let row_id_reg = program.alloc_register(); //  r5
-
-    let schema_table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
-        //  cursor 0
-        CursorType::BTreeTable(schema_table.clone()),
-    );
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id_0,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
-
-    //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
-    //  loop to beginning of schema table
-    let end_metadata_label = program.allocate_label();
-    let metadata_loop = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id_0,
-        pc_if_empty: end_metadata_label,
-    });
-    program.preassign_label_to_next_insn(metadata_loop);
-
-    // start loop on schema table
-    program.emit_column_or_rowid(
-        sqlite_schema_cursor_id_0,
-        2,
-        table_name_and_root_page_register,
-    );
-    let next_label = program.allocate_label();
-    program.emit_insn(Insn::Ne {
-        lhs: table_name_and_root_page_register,
-        rhs: table_reg,
-        target_pc: next_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::NOCASE,
-    });
-    program.emit_insn(Insn::RowId {
-        cursor_id: sqlite_schema_cursor_id_0,
-        dest: row_id_reg,
-    });
-    if let Some((cdc_cursor_id, _)) = cdc_table {
-        let table_type = program.emit_string8_new_reg("table".to_string()); // r4
-        program.mark_last_insn_constant();
-
-        let skip_cdc_label = program.allocate_label();
-
-        let entry_type_reg = program.alloc_register();
-        program.emit_column_or_rowid(sqlite_schema_cursor_id_0, 0, entry_type_reg);
-        program.emit_insn(Insn::Ne {
-            lhs: entry_type_reg,
-            rhs: table_type,
-            target_pc: skip_cdc_label,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::for_internal_values(),
-        });
-        let before_record_reg = if program.capture_data_changes_info().has_before() {
-            Some(emit_cdc_full_record(
-                program,
-                resolver,
-                schema_table.columns(),
-                sqlite_schema_cursor_id_0,
-                row_id_reg,
-            )?)
-        } else {
-            None
-        };
-        emit_cdc_insns(
-            program,
-            resolver,
-            OperationMode::DELETE,
-            cdc_cursor_id,
-            row_id_reg,
-            before_record_reg,
-            None,
-            None,
-            SQLITE_TABLEID,
-        )?;
-        program.preassign_label_to_next_insn(skip_cdc_label);
-    }
-    program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id_0,
-        table_name: SQLITE_TABLEID.to_string(),
-        is_part_of_update: false,
-    });
-
-    program.preassign_label_to_next_insn(next_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id_0,
-        pc_if_next: metadata_loop,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(end_metadata_label);
-    // end of loop on schema table
-    if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
-    }
-
-    // SQLite removes temp triggers targeting the dropped table.
-    // Enumerate the temp schema triggers at translate time (which is
-    // safe because a concurrent DDL would bump the schema cookie and
-    // force a reprepare) and emit per-trigger bytecode to delete only
-    // the rows that should be removed. Filtering in the bytecode by
-    // `tbl_name` alone is not enough: two triggers with the same
-    // unqualified table name can live in the temp schema but point to
-    // different databases (e.g. one on `main.t`, one on `temp.t` when a
-    // shadow table exists). We must key on trigger name.
-    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
-        // A temp schema trigger targets the dropped db iff:
-        //   - it explicitly qualifies with the dropped db, or
-        //   - it is unqualified AND dropping from main AND temp has no
-        //     shadow table of the same name (in which case the
-        //     unqualified reference resolves to main).
-        let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(NamespaceId::ROOT, tbl_name.name.as_str())
-                .is_some()
-        });
-        let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(NamespaceId::ROOT, tbl_name.name.as_str())
-                .filter(|trigger| match trigger.target_database_id {
-                    Some(db_id) => db_id == database_id,
-                    None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
-                })
-                .map(|trigger| trigger.name.clone())
-                .collect()
-        });
-
-        if !trigger_names_to_drop.is_empty() {
-            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-            program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie)?;
-            let temp_schema_table = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-                s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            });
-            if let Some(temp_schema_table) = temp_schema_table {
-                let temp_cursor =
-                    program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
-                program.emit_insn(Insn::OpenWrite {
-                    cursor_id: temp_cursor,
-                    root_page: 1i64.into(),
-                    db: crate::TEMP_DB_ID,
-                });
-                // Hoist the literal trigger names + `"trigger"` type
-                // string into constant registers before the loop.
-                let trigger_type_reg = program.emit_string8_new_reg("trigger".to_string());
-                program.mark_last_insn_constant();
-                let name_regs: Vec<usize> = trigger_names_to_drop
-                    .iter()
-                    .map(|name| {
-                        let reg = program.emit_string8_new_reg(name.clone());
-                        program.mark_last_insn_constant();
-                        reg
-                    })
-                    .collect();
-
-                let temp_end_label = program.allocate_label();
-                let temp_loop_label = program.allocate_label();
-                program.emit_insn(Insn::Rewind {
-                    cursor_id: temp_cursor,
-                    pc_if_empty: temp_end_label,
-                });
-                program.preassign_label_to_next_insn(temp_loop_label);
-                let temp_next_label = program.allocate_label();
-                let temp_delete_label = program.allocate_label();
-
-                // Skip non-trigger rows (column 0 = type).
-                let temp_type_reg = program.alloc_register();
-                program.emit_column_or_rowid(temp_cursor, 0, temp_type_reg);
-                program.emit_insn(Insn::Ne {
-                    lhs: temp_type_reg,
-                    rhs: trigger_type_reg,
-                    target_pc: temp_next_label,
-                    flags: CmpInsFlags::default(),
-                    collation: CollationSeq::for_internal_values(),
-                });
-
-                // Cascade-check name (column 1) against each trigger we
-                // want to drop. First match jumps to the delete label.
-                let temp_name_reg = program.alloc_register();
-                program.emit_column_or_rowid(temp_cursor, 1, temp_name_reg);
-                for name_reg in &name_regs {
-                    program.emit_insn(Insn::Eq {
-                        lhs: temp_name_reg,
-                        rhs: *name_reg,
-                        target_pc: temp_delete_label,
-                        flags: CmpInsFlags::default(),
-                        collation: CollationSeq::for_internal_values(),
-                    });
-                }
-                // No name matched — skip the delete.
-                program.emit_insn(Insn::Goto {
-                    target_pc: temp_next_label,
-                });
-                program.preassign_label_to_next_insn(temp_delete_label);
-                program.emit_insn(Insn::Delete {
-                    cursor_id: temp_cursor,
-                    table_name: SQLITE_TABLEID.to_string(),
-                    is_part_of_update: false,
-                });
-                program.preassign_label_to_next_insn(temp_next_label);
-                program.emit_insn(Insn::Next {
-                    cursor_id: temp_cursor,
-                    pc_if_next: temp_loop_label,
-                    fullscan: false,
-                    is_index: false,
-                });
-                program.preassign_label_to_next_insn(temp_end_label);
-            }
-        }
-    }
+    emit_delete_temp_triggers_on_table(program, resolver, database_id, tbl_name.name.as_str())?;
 
     //  2. Destroy the indices within a loop
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -2480,22 +2142,23 @@ pub fn translate_drop_table(
     // Dropping a table also drops its indexes, the automatic ones among
     // them, so the dialect hears about all of them.
     if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
+        let table_name = normalize_ident(name);
         let mut changes: Vec<_> = owned_sequences
             .iter()
-            .map(|sequence| CatalogChange::Drop {
+            .map(|sequence| RelationChange::Dropped {
                 namespace: namespace.id,
-                name: sequence.clone(),
+                name: sequence,
             })
             .collect();
-        changes.push(CatalogChange::Drop {
+        changes.push(RelationChange::Dropped {
             namespace: namespace.id,
-            name: normalize_ident(name),
+            name: &table_name,
         });
-        changes.extend(indices.iter().map(|index| CatalogChange::Drop {
+        changes.extend(indices.iter().map(|index| RelationChange::Dropped {
             namespace: namespace.id,
-            name: index.name.clone(),
+            name: &index.name,
         }));
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
@@ -2561,8 +2224,12 @@ pub fn translate_drop_table(
         // 4. Open an ephemeral table, and read over the entry from the schema table whose root page was moved in the destroy operation
 
         // cursor id 1
+        let schema_table = resolver
+            .schema()
+            .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap();
         let sqlite_schema_cursor_id_1 =
-            program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
+            program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
         let columns = crate::alloc::try_vec![Column::new(
             Some("rowid".to_string()),
             "INTEGER".to_string(),
@@ -3163,73 +2830,6 @@ fn persist_type_definition(
     }
 
     Ok(())
-}
-
-/// Creates one of the engine's own tables in the main database the first
-/// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
-/// in the in-memory schema. Returns the table and the root page that the new
-/// B-tree will have.
-///
-/// `SetCookie` is what marks the transaction as having changed the schema,
-/// so that a rollback restores the connection schema (see
-/// `Pager::rollback`). It has to precede `ParseSchema`: if a later
-/// instruction fails, the schema would otherwise keep the table while the
-/// rollback removed its page.
-pub(crate) fn emit_create_internal_table(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_name: &str,
-    create_sql: &str,
-) -> Result<InternalTable> {
-    let root_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: MAIN_DB_ID,
-        root: root_reg,
-        flags: CreateBTreeFlags::new_table(),
-    });
-    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .expect("every database has sqlite_schema")
-    });
-    let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: schema_cursor_id,
-        root_page: 1i64.into(),
-        db: MAIN_DB_ID,
-    });
-    emit_schema_entry(
-        program,
-        resolver,
-        schema_cursor_id,
-        None,
-        SchemaEntryType::Table,
-        table_name,
-        table_name,
-        root_reg,
-        Some(create_sql.to_string()),
-    )?;
-    let table = Arc::new(BTreeTable::from_stored_sql(
-        resolver.catalog.dialect.as_ref(),
-        create_sql,
-        0,
-        false,
-    )?);
-    emit_schema_cookie(resolver, program);
-    program.emit_insn(Insn::ParseSchema {
-        db: MAIN_DB_ID,
-        where_clause: Some(format!("tbl_name = '{table_name}' AND type != 'trigger'")),
-        trigger_target_database_id: None,
-    });
-    Ok(InternalTable {
-        table,
-        root_page: RegisterOrLiteral::Register(root_reg),
-    })
-}
-
-/// A table that [`emit_create_internal_table`] creates.
-pub(crate) struct InternalTable {
-    pub(crate) table: Arc<BTreeTable>,
-    pub(crate) root_page: RegisterOrLiteral<i64>,
 }
 
 /// Marks the transaction as having changed the schema, so that a rollback restores the connection

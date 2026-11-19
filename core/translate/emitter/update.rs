@@ -1,4 +1,7 @@
-use super::gencol::{compute_generated_columns, compute_virtual_columns, sets_custom_type_column};
+use super::gencol::{
+    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
+    sets_custom_type_column,
+};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -1424,21 +1427,18 @@ fn emit_update_insns<'a>(
             // Only read OLD row values when triggers or FK cascades need them
             let columns = target_table.table.columns();
             let old_registers: Option<Vec<usize>> = if needs_old_registers {
-                let mut regs = Vec::with_capacity(col_len + 1);
-                for (i, column) in columns.iter().enumerate() {
-                    let reg = program.alloc_register();
-                    emit_table_column(
-                        program,
-                        target_table_cursor_id,
-                        internal_id,
-                        table_references,
-                        column,
-                        i,
-                        reg,
-                        &t_ctx.resolver,
-                    )?;
-                    regs.push(reg);
-                }
+                // A virtual column allocates more registers to compute its value, so
+                // allocate the registers of all columns first. The foreign key actions
+                // read the OLD row as one register for each column, in declaration order.
+                let first_reg = program.alloc_registers(col_len);
+                let mut regs: Vec<usize> = (first_reg..first_reg + col_len).collect();
+                emit_row_from_cursor(
+                    program,
+                    &btree_table,
+                    target_table_cursor_id,
+                    &regs,
+                    &t_ctx.resolver,
+                )?;
                 regs.push(beg);
                 Some(regs)
             } else {
@@ -2661,7 +2661,6 @@ fn emit_update_insns<'a>(
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
             // This ensures the new parent key exists when cascade actions update child rows
             if has_parent_fk_actions {
-                // OLD column values are stored in preserved_old_registers (contiguous registers)
                 let old_values_start = preserved_old_registers
                     .as_ref()
                     .expect("FK check requires OLD values")[0];
@@ -2671,6 +2670,9 @@ fn emit_update_insns<'a>(
                     table_name,
                     beg, // old_rowid_reg
                     old_values_start,
+                    &ColumnLayout::Identity {
+                        column_count: col_len,
+                    },
                     start, // new_values_start
                     effective_rowid_reg,
                     connection,

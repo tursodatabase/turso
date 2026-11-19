@@ -16,11 +16,10 @@ use turso_core::{
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
-    SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -144,9 +143,6 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
-        "pg_generate_series_ordinality"(FunctionArity::Exact(3), true) => {
-            exec_generate_series_ordinality(int_arg(args, 0, 0), int_arg(args, 1, 0), int_arg(args, 2, 1))?
-        },
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -612,19 +608,6 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         ));
     }
     Ok(Some(value))
-}
-
-/// The position of `value` in the series that starts at `start` and moves by `step`.
-fn exec_generate_series_ordinality(value: i64, start: i64, step: i64) -> Result<i64> {
-    if step == 0 {
-        return Err(sqlstate_error(
-            SQLSTATE_INVALID_PARAMETER_VALUE,
-            "step size cannot equal zero",
-        ));
-    }
-    let steps_from_start = (i128::from(value) - i128::from(start)) / i128::from(step);
-    i64::try_from(steps_from_start + 1)
-        .map_err(|_| sqlstate_error(SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {

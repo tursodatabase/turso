@@ -840,9 +840,11 @@ fn policies_take_oids_from_the_relation_oid_counter_and_keep_them_across_a_reope
 /// table.
 fn stored_policy_oids(conn: &Arc<Connection>, relname: &str) -> Vec<(String, i64)> {
     conn.prepare(format!(
-        "SELECT json_extract(p.value, '$.polname'), json_extract(p.value, '$.oid') \
-         FROM __turso_internal_classes c, json_each(c.relpolicies) p \
-         WHERE c.relname = '{relname}' ORDER BY p.key"
+        "SELECT json_extract(c.relpolicies, '$[' || p.i || '].polname'), \
+                json_extract(c.relpolicies, '$[' || p.i || '].oid') \
+         FROM __turso_internal_classes c, \
+              generate_series(0, json_array_length(c.relpolicies) - 1) AS p(i) \
+         WHERE c.relname = '{relname}' ORDER BY p.i"
     ))
     .unwrap()
     .run_collect_rows()

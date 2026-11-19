@@ -11,7 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{CatalogChange, NewOwner, OwnerColumn};
+use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -25,7 +25,8 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::schema;
+use crate::translate::schema::{emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -723,7 +724,7 @@ pub(crate) fn emit_backing_table_compaction(
 ///
 /// Returns `Ok(false)` and emits nothing if the `sqlite_sequence`
 /// table does not exist in this database — the schema-bootstrap path
-/// in `translate/schema.rs` creates it lazily on first need; until
+/// in `translate/schema/mod.rs` creates it lazily on first need; until
 /// then no AUTOINCREMENT activity is possible so there is nothing to
 /// sync.
 pub(crate) fn emit_sqlite_sequence_sync(
@@ -1045,17 +1046,7 @@ pub fn translate_create_sequence(
         cycle,
     )?;
 
-    // Open cursor to sqlite_schema (in the target database)
-    let table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     emit_sequence_backing_table(
         program,
@@ -1073,13 +1064,13 @@ pub fn translate_create_sequence(
     // The sequence is a relation of the dialect's; its backing table is an
     // engine object and is not.
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_name.clone(),
+                name: &normalized_name,
                 kind: crate::schema::RelationKind::Sequence,
                 table: None,
             }],
@@ -1141,17 +1132,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
         return Ok(false);
     };
 
-    // Open sqlite_schema for writing (in the target database)
-    let schema_table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let seq_name_reg = program.alloc_register();
     let type_str_reg = program.alloc_register();
@@ -1286,13 +1267,13 @@ pub(crate) fn emit_drop_sequence(
         return Ok(false);
     }
     if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Drop {
+            &[RelationChange::Dropped {
                 namespace: namespace.id,
-                name: seq_name.to_string(),
+                name: seq_name,
             }],
         )?;
     }
@@ -1562,15 +1543,15 @@ pub fn translate_alter_sequence_owned_by(
     }
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_catalog_changes(
+    resolver.catalog.dialect.translate_access_statement(
         program,
         resolver.schema(),
         connection,
-        &[CatalogChange::ChangeOwner {
+        &AccessStatement::ChangeOwner {
             namespace: namespace.id,
-            name: normalized_name,
-            owner: NewOwner::Column(owner_column),
-        }],
+            name: &normalized_name,
+            owner: &NewOwner::Column(owner_column),
+        },
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())

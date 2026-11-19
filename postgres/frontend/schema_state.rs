@@ -8,7 +8,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use turso_core::schema::Schema;
-use turso_core::{CatalogChange, LimboError, Value};
+use turso_core::{CatalogApply, Insn, LimboError, ProgramBuilder, Value, MAIN_DB_ID};
 
 use crate::auth_members;
 use crate::classes::{self, ClassCatalog};
@@ -68,13 +68,12 @@ pub(crate) fn build_schema_state(
     }))
 }
 
-/// [`turso_core::Dialect::apply_catalog_change`] for the PostgreSQL
-/// frontend: keeps the in-memory state in step with the stored rows the
-/// running statement wrote.
-pub(crate) fn apply_catalog_change(
+/// Changes the frontend's schema state in `schema` with `change`, so that
+/// it follows the stored rows the running statement wrote. Does nothing when
+/// the state is not loaded.
+pub(crate) fn change_schema_state(
     schema: &mut Schema,
-    change: &CatalogChange,
-    values: &[Value],
+    change: impl FnOnce(&mut SchemaState) -> turso_core::Result<()>,
 ) -> turso_core::Result<()> {
     let Some(state) = schema.dialect_schema.take() else {
         return Ok(());
@@ -82,16 +81,21 @@ pub(crate) fn apply_catalog_change(
     let mut state: Arc<SchemaState> = state.downcast().map_err(|_| {
         LimboError::InternalError("the dialect schema state is not the frontend's".into())
     })?;
-    let state_mut = Arc::make_mut(&mut state);
-    let result = match change {
-        CatalogChange::CreateRole { name, options } => {
-            Arc::make_mut(&mut state_mut.roles).apply_create_role(name, options, values)
-        }
-        CatalogChange::GrantRole { revoke, .. } => {
-            Arc::make_mut(&mut state_mut.roles).apply_grant_role(*revoke, values)
-        }
-        _ => Arc::make_mut(&mut state_mut.classes).apply(change, values),
-    };
+    let result = change(Arc::make_mut(&mut state));
     schema.dialect_schema = Some(state);
     result
+}
+
+/// Emits the instruction that makes the change `apply` to the in-memory
+/// schema state of the main database, with the values of `value_regs`.
+pub(crate) fn emit_catalog_apply(
+    program: &mut ProgramBuilder,
+    apply: impl CatalogApply + 'static,
+    value_regs: Vec<usize>,
+) {
+    program.emit_insn(Insn::CatalogApply {
+        db: MAIN_DB_ID,
+        apply: Arc::new(apply),
+        value_regs,
+    });
 }

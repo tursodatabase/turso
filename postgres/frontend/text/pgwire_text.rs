@@ -2,20 +2,21 @@
 // src/types/to_sql_text.rs (bool, i64, &[u8])
 // src/types/format/float_digits.rs (ExtraFloatDigits::format_f64)
 // Copyright (c) 2018 Ning Sun. See licenses/pgwire-mit-license.md.
-// Adaptations: Vec<u8> instead of BytesMut; only the default hex bytea and
-// shortest float formats; an array flag instead of postgres_types::Type;
-// infallible functions instead of the ToSqlText trait and IsNull results.
+// Adaptations: functions return the text instead of writing it to a BytesMut;
+// only the default hex bytea and shortest float formats; an array flag instead
+// of postgres_types::Type; infallible functions instead of the ToSqlText trait
+// and IsNull results.
 
-pub(super) fn encode_bool(value: bool, out: &mut Vec<u8>) {
+pub(super) fn encode_bool(value: bool) -> &'static str {
     if value {
-        out.extend_from_slice(b"t");
+        "t"
     } else {
-        out.extend_from_slice(b"f");
+        "f"
     }
 }
 
-pub(super) fn encode_integer(value: i64, out: &mut Vec<u8>) {
-    out.extend_from_slice(value.to_string().as_bytes());
+pub(super) fn encode_integer(value: i64) -> String {
+    value.to_string()
 }
 
 pub(super) fn format_f64(value: f64) -> String {
@@ -38,17 +39,19 @@ pub(super) fn format_f64(value: f64) -> String {
     buffer.format(value).to_string()
 }
 
-pub(super) fn encode_bytea(value: &[u8], array: bool, out: &mut Vec<u8>) {
+pub(super) fn encode_bytea(value: &[u8], array: bool) -> String {
+    let mut out = String::new();
     // for a bytea_array, the bytes are enclosed in quotes,
     // and \x is escaped
     if array {
-        out.extend_from_slice(b"\"\\");
+        out.push_str("\"\\");
     }
 
-    out.extend_from_slice(b"\\x");
-    out.extend_from_slice(hex::encode(value).as_bytes());
+    out.push_str("\\x");
+    out.push_str(&hex::encode(value));
 
     if array {
-        out.extend_from_slice(b"\"");
+        out.push('"');
     }
+    out
 }
