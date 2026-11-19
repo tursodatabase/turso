@@ -2624,8 +2624,11 @@ impl StreamingLogicalLogReader {
                         )
                         .into());
                     }
-                    let mut payload = payload;
-                    let record_bytes = payload.split_off(rowid_len);
+                    // The payload is a buffer of its own, so the rowid bytes
+                    // are removed in place instead of copying the record into
+                    // a new buffer.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
                     ParsedOp::UpsertTable {
                         table_id,
@@ -2650,8 +2653,9 @@ impl StreamingLogicalLogReader {
                         .into());
                     }
                     let rowid_i64 = rowid_u64 as i64;
-                    let mut payload = payload;
-                    let mut record_bytes = payload.split_off(rowid_len);
+                    // See OP_UPSERT_TABLE: the rowid bytes are removed in place.
+                    let mut record_bytes = payload;
+                    record_bytes.drain(..rowid_len);
                     let mut pk_record_bytes = crate::alloc::vec![];
                     if !portable_extension.is_empty() {
                         let decoded = decode_delete_portable_extension(&portable_extension)?;
