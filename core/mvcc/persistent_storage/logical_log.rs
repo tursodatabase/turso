@@ -464,7 +464,7 @@ pub struct LogHeader {
 
 impl LogHeader {
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
-        Self::new_with_version(io, LOG_VERSION_V2)
+        Self::new_with_version(io, LOG_VERSION)
     }
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
@@ -717,16 +717,11 @@ impl LogicalLog {
         let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
-        // Non-portable logs remain LML2 so a deployment that does not enable
-        // portable extensions can still roll back to readers that only know LML2.
+        // New logs are always LML3, so a later portable frame never needs the
+        // header rewritten in place.
         let is_first_write = self.offset == 0;
         if is_first_write && self.header.is_none() {
-            let version = if portable_changes_enabled {
-                LOG_VERSION
-            } else {
-                LOG_VERSION_V2
-            };
-            let header = LogHeader::new_with_version(&self.io, version);
+            let header = LogHeader::new(&self.io);
             self.running_crc = derive_initial_crc(header.salt);
             self.header = Some(header);
         }
@@ -5608,7 +5603,7 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         // Verify the on-disk CRC matches a fresh computation over the header bytes
         let encoded = header.encode();
         let mut check_buf = [0u8; LOG_HDR_SIZE];
@@ -5625,7 +5620,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let header = LogHeader::new(&io);
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
@@ -6841,15 +6836,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_first_write_uses_lml2_header_and_v2_frame() {
+    fn test_non_portable_first_write_uses_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file(
-                "non-portable-first-write-lml2.db-log",
-                OpenFlags::Create,
-                false,
-            )
+            .open_file("non-portable-first-write.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -6863,7 +6854,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -6871,11 +6862,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_appends_keep_lml2_header_and_v2_frames() {
+    fn test_non_portable_appends_keep_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file("non-portable-appends-lml2.db-log", OpenFlags::Create, false)
+            .open_file("non-portable-appends.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -6896,7 +6887,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -6919,6 +6910,17 @@ mod tests {
         );
     }
 
+    /// A log whose first write will use a version 2 (LML2) header, as logs
+    /// created by older versions do.
+    #[cfg(feature = "conn_raw_api")]
+    fn lml2_logical_log(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> LogicalLog {
+        let mut log = LogicalLog::new(file, io.clone(), None);
+        let header = LogHeader::new_with_version(io, LOG_VERSION_V2);
+        log.running_crc = derive_initial_crc(header.salt);
+        log.header = Some(header);
+        log
+    }
+
     #[cfg(feature = "conn_raw_api")]
     #[test]
     fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
@@ -6931,7 +6933,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
@@ -6994,7 +6996,7 @@ mod tests {
             inner: inner.clone(),
             fail_header_write: std::sync::atomic::AtomicBool::new(false),
         });
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
