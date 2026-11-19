@@ -80,7 +80,9 @@ pub(crate) enum QueryFailure {
 
 /// A schema that is being read.
 pub(crate) struct SchemaLoad {
-    pub(crate) schema: Schema,
+    /// The connection or the database may share this schema. A step that
+    /// changes it then changes a copy, which [`Schema::try_make_mut`] makes.
+    schema: Arc<Schema>,
     /// Indexes and materialized views of the schema rows. They are built
     /// after the types are loaded, and None after that.
     unbuilt: Option<UnbuiltViewsAndIndexes>,
@@ -97,12 +99,20 @@ struct UnbuiltViewsAndIndexes {
 }
 
 impl SchemaLoad {
-    pub(crate) fn new(schema: Schema) -> Self {
+    pub(crate) fn new(schema: Arc<Schema>) -> Self {
         Self {
             schema,
             unbuilt: Some(UnbuiltViewsAndIndexes::new()),
             type_sqls: Vec::new(),
         }
+    }
+
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    pub(crate) fn schema_mut(&mut self) -> Result<&mut Schema> {
+        Ok(Schema::try_make_mut(&mut self.schema)?)
     }
 }
 
@@ -135,7 +145,7 @@ pub(crate) struct SchemaLoader {
 }
 
 impl SchemaLoader {
-    pub(crate) fn new(schema: Schema, steps: Vec<Box<dyn LoadStep>>) -> Self {
+    pub(crate) fn new(schema: Arc<Schema>, steps: Vec<Box<dyn LoadStep>>) -> Self {
         Self {
             load: SchemaLoad::new(schema),
             steps: steps.into(),
@@ -199,7 +209,7 @@ impl SchemaLoader {
         }
     }
 
-    pub(crate) fn into_schema(self) -> Schema {
+    pub(crate) fn into_schema(self) -> Arc<Schema> {
         self.load.schema
     }
 }
@@ -246,7 +256,7 @@ impl LoadStep for SchemaRows {
         let table_name = row.get::<&str>(2)?;
         let root_page = row.get::<i64>(3)?;
         let sql = row.get::<&str>(4).ok();
-        load.schema.handle_schema_row(
+        Schema::try_make_mut(&mut load.schema)?.handle_schema_row(
             ty,
             name,
             table_name,
@@ -289,16 +299,16 @@ impl LoadStep for NamespaceNames {
         self.queried = true;
         // Under a dialect without namespaces, a table of that name is an
         // ordinary table.
-        if load.schema.supports_namespaces()
+        if load.schema().supports_namespaces()
             && load
-                .schema
+                .schema()
                 .has_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
         {
             return Ok(Some(LoadQuery::internal_helper(format!(
                 "SELECT id, name FROM {TURSO_NAMESPACES_TABLE_NAME}"
             ))));
         }
-        load.schema
+        load.schema_mut()?
             .load_namespace_names(self.conn.db.dialect().as_ref(), &[])?;
         Ok(None)
     }
@@ -310,7 +320,7 @@ impl LoadStep for NamespaceNames {
     }
 
     fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
-        load.schema
+        load.schema_mut()?
             .load_namespace_names(self.conn.db.dialect().as_ref(), &self.rows)
     }
 }
@@ -372,10 +382,10 @@ impl LoadStep for Sequences {
     fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
         if self.backing_tables.is_none() {
             if let Some(sequences) = self.preserved.take() {
-                load.schema.set_sequences_by_namespace(sequences);
+                load.schema_mut()?.set_sequences_by_namespace(sequences);
                 self.backing_tables = Some(crate::alloc::vec![]);
             } else {
-                self.backing_tables = Some(load.schema.sequence_backing_table_names());
+                self.backing_tables = Some(load.schema().sequence_backing_table_names());
             }
         }
         let backing_tables = self.backing_tables.as_ref().expect("set above");
@@ -399,8 +409,8 @@ impl LoadStep for Sequences {
         );
         while let Some((backing_table_name, mangled_name)) = backing_tables.get(self.current) {
             let normalized = crate::util::normalize_ident(mangled_name);
-            let (namespace, sequence_name) = load.schema.demangle_name(&normalized);
-            if load.schema.has_sequence(namespace, sequence_name) {
+            let (namespace, sequence_name) = load.schema().demangle_name(&normalized);
+            if load.schema().has_sequence(namespace, sequence_name) {
                 self.current += 1;
                 continue;
             }
@@ -436,7 +446,7 @@ impl LoadStep for Sequences {
         let normalized = crate::util::normalize_ident(mangled_name);
         match std::mem::replace(&mut self.read, SequenceRead::NotStarted) {
             SequenceRead::Descriptor { row } => {
-                let (_, sequence_name) = load.schema.demangle_name(&normalized);
+                let (_, sequence_name) = load.schema().demangle_name(&normalized);
                 let sequence = Connection::sequence_from_descriptor_meta(
                     sequence_name,
                     backing_table_name,
@@ -450,7 +460,7 @@ impl LoadStep for Sequences {
                 if let Some(mv_store) = self.conn.db.get_mv_store().as_ref() {
                     mv_store.set_sequence_watermark(&normalized, watermark);
                 }
-                load.schema
+                load.schema_mut()?
                     .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
                 self.current += 1;
             }
@@ -527,7 +537,7 @@ impl LoadStep for CustomTypes {
         self.queried = true;
         if self.conn.experimental_custom_types_enabled()
             && load
-                .schema
+                .schema()
                 .has_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
         {
             return Ok(Some(LoadQuery::internal_helper(format!(
@@ -562,7 +572,7 @@ impl LoadStep for ViewsAndIndexes {
             .unbuilt
             .take()
             .expect("views and indexes are built once");
-        load.schema.populate_types_views_then_indices(
+        Schema::try_make_mut(&mut load.schema)?.populate_types_views_then_indices(
             self.conn.db.dialect().as_ref(),
             &self.conn.syms.read(),
             &load.type_sqls,
@@ -614,7 +624,7 @@ impl LoadStep for DialectState {
             self.conn
                 .db
                 .dialect()
-                .schema_state_queries(&load.schema)
+                .schema_state_queries(load.schema())
                 .into()
         });
         Ok(queries.pop_front().map(LoadQuery::engine_metadata_read))
@@ -633,12 +643,12 @@ impl LoadStep for DialectState {
         self.results.push(std::mem::take(&mut self.rows));
         let queries = self.queries.as_ref().expect("set by next_query");
         if queries.is_empty() {
-            load.schema.dialect_schema = Some(
-                self.conn
-                    .db
-                    .dialect()
-                    .build_schema_state(&load.schema, &self.results)?,
-            );
+            let state = self
+                .conn
+                .db
+                .dialect()
+                .build_schema_state(load.schema(), &self.results)?;
+            load.schema_mut()?.dialect_schema = Some(state);
         }
         Ok(())
     }
