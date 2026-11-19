@@ -850,11 +850,32 @@ impl JsonbHeader {
     /// Reads the header at `cursor` and returns it with the header length.
     ///
     /// Every read of a JSONB document goes through here, once per element, so
-    /// the headers with the payload size in the header byte or in one more byte
-    /// are decoded inline. The longer size encodings are rare and are decoded by
-    /// [Self::from_slice_with_wide_size].
+    /// a valid header with the payload size in the header byte or in one more
+    /// byte is decoded in each caller, with no error path. The other headers
+    /// and the errors are handled by [Self::from_slice_slow].
     #[inline]
     pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
+        if let Some(&header_byte) = slice.get(cursor) {
+            if let Some(element_type) = ELEMENT_TYPE_BY_CODE[(header_byte & 15) as usize] {
+                match header_byte >> 4 {
+                    size @ 0..=11 => return Ok((Self(element_type, size as usize), 1)),
+                    12 => {
+                        if let Some(&size) = slice.get(cursor + 1) {
+                            return Ok((Self(element_type, size as usize), 2));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self::from_slice_slow(cursor, slice)
+    }
+
+    /// Decodes the header at `cursor` like [Self::from_slice], for the headers
+    /// that it does not decode itself: a 2-, 4- or 8-byte payload size, or a
+    /// malformed header.
+    #[inline(never)]
+    fn from_slice_slow(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
         let Some(&header_byte) = slice.get(cursor) else {
             bail_parse_error!("Failed to read header byte");
         };
