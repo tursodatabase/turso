@@ -1097,6 +1097,16 @@ fn op_comparison_slow(
         };
     }
 
+    // Two numbers, such as a REAL column and an integer constant, compare by
+    // their numeric order. Only TEXT affinity converts a number, and a type's
+    // order can place numbers differently. Otherwise the general comparison
+    // below converts nothing and gives this order too.
+    if let (Value::Numeric(l), Value::Numeric(r)) = (lhs_value, rhs_value) {
+        if affinity != Affinity::Text && matches!(collation, CollationSeq::Text(_)) {
+            take_jump_if!(comparison_matches_order(op, l.cmp(r)));
+        }
+    }
+
     match (lhs_value, rhs_value) {
         (Value::Null, _) | (_, Value::Null) => {
             let should_jump = if null_eq {
