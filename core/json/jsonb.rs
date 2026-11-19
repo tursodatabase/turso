@@ -1728,17 +1728,11 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
-            return Err(PError::Message {
-                msg: "Too deep".to_string(),
-                location: Some(pos),
-            });
+            return Err(parse_error("Too deep", pos));
         }
 
         if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(value_start),
-            });
+            return Err(parse_error("Unexpected end of input", value_start));
         }
 
         match input[pos] {
@@ -1771,16 +1765,10 @@ impl Jsonb {
                 pos = self.deserialize_number(input, pos, info)?;
             }
             b'}' | b']' | b',' | b':' if depth > 0 => {
-                return Err(PError::Message {
-                    msg: "Missing value".to_string(),
-                    location: Some(value_start),
-                });
+                return Err(parse_error("Missing value", value_start));
             }
             _ => {
-                return Err(PError::Message {
-                    msg: "Unexpected character".to_string(),
-                    location: Some(pos),
-                });
+                return Err(parse_error("Unexpected character", pos));
             }
         }
 
@@ -1795,37 +1783,25 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
-            return Err(PError::Message {
-                msg: "Too deep".to_string(),
-                location: Some(pos),
-            });
+            return Err(parse_error("Too deep", pos));
         }
         if self.data.capacity() - self.data.len() < 50 {
             self.data.reserve(self.data.capacity());
         }
         if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
+            return Err(parse_error("Unexpected end of input", pos));
         }
 
-        let header_pos =
-            self.start_container(ElementType::OBJECT)
-                .map_err(|_| PError::Message {
-                    msg: "Failed to write header".to_string(),
-                    location: Some(pos),
-                })?;
+        let header_pos = self
+            .start_container(ElementType::OBJECT)
+            .map_err(|_| parse_error("Failed to write header", pos))?;
         let mut first = true;
 
         loop {
             let key_start = pos;
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
-                return Err(PError::Message {
-                    msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
-                });
+                return Err(parse_error("Unexpected end of input", pos));
             }
             let c = input[pos];
             if c == b'}' {
@@ -1837,25 +1813,16 @@ impl Jsonb {
             if c == b'"' || c == b'\'' || c == b'\\' || is_json5_id_char(c, true) {
                 pos = self.deserialize_string(input, pos, info)?;
             } else if matches!(c, b']' | b',' | b':') {
-                return Err(PError::Message {
-                    msg: "Missing object key".to_string(),
-                    location: Some(pos),
-                });
+                return Err(parse_error("Missing object key", pos));
             } else {
                 self.deserialize_value(input, key_start, pos, depth + 1, info)?;
-                return Err(PError::Message {
-                    msg: "Object key must be a string".to_string(),
-                    location: Some(key_start),
-                });
+                return Err(parse_error("Object key must be a string", key_start));
             }
 
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() || input[pos] != b':' {
                 self.deserialize_value(input, pos, pos, depth + 1, info)?;
-                return Err(PError::Message {
-                    msg: "Expected : after object key".to_string(),
-                    location: Some(pos),
-                });
+                return Err(parse_error("Expected : after object key", pos));
             }
             pos += 1; // consume ':'
 
@@ -1866,29 +1833,20 @@ impl Jsonb {
 
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
-                return Err(PError::Message {
-                    msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
-                });
+                return Err(parse_error("Unexpected end of input", pos));
             }
             match input[pos] {
                 b',' => pos += 1,
                 b'}' => break,
                 _ => {
-                    return Err(PError::Message {
-                        msg: "Should be , or }".to_string(),
-                        location: Some(pos),
-                    });
+                    return Err(parse_error("Should be , or }", pos));
                 }
             }
         }
 
         pos += 1; // consume '}'
         self.finish_container(header_pos, ElementType::OBJECT)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
+            .map_err(|_| parse_error("Failed to write header", pos))?;
         Ok(pos)
     }
 
@@ -1900,18 +1858,12 @@ impl Jsonb {
         info: &mut ParseInfo,
     ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
-            return Err(PError::Message {
-                msg: "Too deep".to_string(),
-                location: Some(pos),
-            });
+            return Err(parse_error("Too deep", pos));
         }
 
         let header_pos = self
             .start_container(ElementType::ARRAY)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
+            .map_err(|_| parse_error("Failed to write header", pos))?;
         let mut first = true;
 
         loop {
@@ -1928,29 +1880,20 @@ impl Jsonb {
 
             pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
-                return Err(PError::Message {
-                    msg: "Unexpected end of input".to_string(),
-                    location: Some(pos),
-                });
+                return Err(parse_error("Unexpected end of input", pos));
             }
             match input[pos] {
                 b',' => pos += 1,
                 b']' => break,
                 _ => {
-                    return Err(PError::Message {
-                        msg: "Should be , or ]".to_string(),
-                        location: Some(pos),
-                    });
+                    return Err(parse_error("Should be , or ]", pos));
                 }
             }
         }
 
         pos += 1; // consume ']'
         self.finish_container(header_pos, ElementType::ARRAY)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
+            .map_err(|_| parse_error("Failed to write header", pos))?;
         Ok(pos)
     }
 
@@ -3783,6 +3726,19 @@ impl std::str::FromStr for Jsonb {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::from_str(s)
+    }
+}
+
+/// Makes the parse error `msg` at `location`, for the recursive parser
+/// functions. The error is built out of line, so that these functions keep
+/// smaller stack frames: in a debug build, each error that a function builds
+/// inline has stack slots of its own.
+#[cold]
+#[inline(never)]
+fn parse_error(msg: &str, location: usize) -> PError {
+    PError::Message {
+        msg: msg.to_string(),
+        location: Some(location),
     }
 }
 
