@@ -1809,6 +1809,29 @@ expect {
     {"y":2}|"z"
 }
 
+test json-to-record-reads-the-last-of-two-equal-keys {
+    SELECT * FROM json_to_record('{"a":1,"a":2}') AS _(a int);
+    SELECT * FROM jsonb_to_record('{"a":1,"a":2}'::jsonb) AS _(a int);
+    SELECT * FROM json_to_record('{"t":"x","t":"y","j":{"c":1},"j":[2]}') AS _(t text, j json);
+    SELECT * FROM json_to_recordset('[{"a":1,"a":3},{"a":2}]') AS _(a int);
+}
+expect {
+    2
+    2
+    y|[2]
+    3
+    2
+}
+
+# SQLite accepts JSON5, such as a key without quotes. PostgreSQL does not.
+test json-to-record-of-json5-errors {
+    SELECT * FROM json_to_record('{a:1}') AS _(a int);
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type json
+}
+
 test function-whose-name-starts-with-a-bracket-does-not-exist {
     SELECT "[x"();
 }
