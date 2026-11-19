@@ -961,7 +961,7 @@ fn test_pg_timestamp_text_parameters(db: TempDatabase) {
     .unwrap_err()
     .to_string();
     assert!(
-        error.contains(r#"invalid input syntax for type timestamp with time zone: "x""#),
+        error.contains(r#"invalid or unsupported input for type timestamp with time zone: "x""#),
         "{error}"
     );
 }

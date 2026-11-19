@@ -1410,7 +1410,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    this form of timestamp with time zone input is not supported: "2024-01-05 10:00 America/New_York"
+    invalid or unsupported input for type timestamp with time zone: "2024-01-05 10:00 America/New_York"
 }
 
 test datetime-input-time-zone-abbreviation-is-not-supported {
@@ -1421,7 +1421,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    this form of timestamp with time zone input is not supported: "2024-01-05 10:00 EST"
+    invalid or unsupported input for type timestamp with time zone: "2024-01-05 10:00 EST"
 }
 
 test datetime-input-day-name-is-not-supported {
@@ -1432,7 +1432,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    this form of timestamp input is not supported: "Fri Jan 5 2024"
+    invalid or unsupported input for type timestamp: "Fri Jan 5 2024"
 }
 
 test datetime-input-month-day-year-is-not-supported {
@@ -1443,7 +1443,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    this form of timestamp input is not supported: "01/05/2024"
+    invalid or unsupported input for type timestamp: "01/05/2024"
 }
 
 test datetime-input-bc-is-not-supported {
@@ -1498,7 +1498,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    this form of timestamp input is not supported: "2024-01-05 10:00.5"
+    invalid or unsupported input for type timestamp: "2024-01-05 10:00.5"
 }
 
 test datetime-input-pg-input-is-valid-of-special-value-is-not-supported {

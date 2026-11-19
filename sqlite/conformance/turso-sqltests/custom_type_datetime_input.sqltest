@@ -196,7 +196,7 @@ test datetime-time-input-rejects-date-form-1 {
     INSERT INTO t VALUES ('Jan 5 2024 10:00');
 }
 expect error {
-    invalid input syntax for type time: "Jan 5 2024 10:00"
+    invalid or unsupported input for type time: "Jan 5 2024 10:00"
 }
 
 @requires strict "uses STRICT tables"
@@ -205,7 +205,7 @@ test datetime-time-input-rejects-date-form-2 {
     INSERT INTO t VALUES ('10:00 Jan 5 2024');
 }
 expect error {
-    invalid input syntax for type time: "10:00 Jan 5 2024"
+    invalid or unsupported input for type time: "10:00 Jan 5 2024"
 }
 
 @requires strict "uses STRICT tables"
@@ -232,7 +232,7 @@ test datetime-time-input-rejects-date-form-5 {
     INSERT INTO t VALUES ('20240105 10:00');
 }
 expect error {
-    invalid input syntax for type time: "20240105 10:00"
+    invalid or unsupported input for type time: "20240105 10:00"
 }
 
 # PostgreSQL accepts the values below, but their stored text would not sort in
@@ -593,7 +593,7 @@ test datetime-input-rejects-order-5-2024-jan {
     INSERT INTO t VALUES ('5 2024 Jan');
 }
 expect error {
-    invalid input syntax for type timestamp: "5 2024 Jan"
+    invalid or unsupported input for type timestamp: "5 2024 Jan"
 }
 
 @requires strict "uses STRICT tables"

@@ -381,7 +381,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    this form of date input is not supported: "zzz"
+    invalid or unsupported input for type date: "zzz"
 }
 
 test pg-input-error-info-timestamp-bad-syntax {

@@ -552,7 +552,7 @@ test select-cast-invalid-text-to-timestamp {
 expect error {}
 @sqlstate 0A000
 expect @tursopg error {
-    this form of timestamp input is not supported: "hello"
+    invalid or unsupported input for type timestamp: "hello"
 }
 
 test select-cast-int8-accepts-its-smallest-and-largest-values {

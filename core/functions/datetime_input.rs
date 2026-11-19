@@ -173,7 +173,7 @@ fn syntax_error(input: &str, ty: TemporalType) -> LimboError {
 /// SQLSTATE 0A000, not 22007, because PostgreSQL may return a value for it.
 fn unsupported_form(input: &str, ty: TemporalType) -> LimboError {
     not_supported(format!(
-        "this form of {} input is not supported: \"{input}\"",
+        "invalid or unsupported input for type {}: \"{input}\"",
         ty.name()
     ))
 }

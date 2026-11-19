@@ -4123,7 +4123,7 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
 
     // date: invalid
     let mut rows = conn
-        .query("SELECT message, sql_error_code FROM pg_input_error_info('not-a-date', 'date')")
+        .query("SELECT message, sql_error_code FROM pg_input_error_info('2024-01-05 2024-01-06', 'date')")
         .unwrap()
         .unwrap();
     let StepResult::Row = rows.step().unwrap() else {
@@ -4132,7 +4132,7 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     let row = rows.row().unwrap();
     assert_eq!(
         row.get_value(0).to_string(),
-        "invalid input syntax for type date: \"not-a-date\""
+        "invalid input syntax for type date: \"2024-01-05 2024-01-06\""
     );
     assert_eq!(row.get_value(1).to_string(), "22007");
     drop(rows);
@@ -4151,7 +4151,7 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     // timestamp: invalid
     let mut rows = conn
         .query(
-            "SELECT message, sql_error_code FROM pg_input_error_info('not-a-timestamp', 'timestamp')",
+            "SELECT message, sql_error_code FROM pg_input_error_info('2024-01-05 2024-01-06', 'timestamp')",
         )
         .unwrap()
         .unwrap();
@@ -4161,7 +4161,7 @@ fn test_pg_input_error_info_extended_types(db: TempDatabase) {
     let row = rows.row().unwrap();
     assert_eq!(
         row.get_value(0).to_string(),
-        "invalid input syntax for type timestamp: \"not-a-timestamp\""
+        "invalid input syntax for type timestamp: \"2024-01-05 2024-01-06\""
     );
     assert_eq!(row.get_value(1).to_string(), "22007");
     drop(rows);
