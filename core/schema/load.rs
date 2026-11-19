@@ -738,6 +738,7 @@ mod tests {
     use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
     use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sync::Mutex;
     use crate::util::IOExt;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
 
@@ -858,5 +859,105 @@ mod tests {
         io.block(|| loader.run(&conn)).unwrap();
 
         assert!(Arc::ptr_eq(&loader.into_schema(), &shared));
+    }
+
+    /// A step that reads `sqlite_schema` and then stores `state` as the
+    /// dialect's state in the schema being loaded.
+    struct StoresADialectSchema {
+        queried: bool,
+        state: &'static str,
+    }
+
+    impl LoadStep for StoresADialectSchema {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried).then(LoadQuery::schema_table_read);
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_of_rows(&mut self, load: &mut SchemaLoad) -> Result<()> {
+            load.schema_mut()?.dialect_schema = Some(Arc::new(self.state));
+            Ok(())
+        }
+    }
+
+    /// A step that reads `sqlite_schema` and then notes which dialect state
+    /// the connection's schema has at that moment.
+    struct LooksAtTheDialectSchema {
+        conn: Arc<Connection>,
+        queried: bool,
+        seen: Arc<Mutex<Option<&'static str>>>,
+    }
+
+    impl LoadStep for LooksAtTheDialectSchema {
+        fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
+            let query = (!self.queried).then(LoadQuery::schema_table_read);
+            self.queried = true;
+            Ok(query)
+        }
+
+        fn row(&mut self, _load: &mut SchemaLoad, _row: &Row) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_of_rows(&mut self, _load: &mut SchemaLoad) -> Result<()> {
+            *self.seen.lock() = dialect_schema_text(&self.conn.schema.read());
+            Ok(())
+        }
+    }
+
+    fn dialect_schema_text(schema: &Schema) -> Option<&'static str> {
+        schema.dialect_schema.as_ref()?.downcast_ref().copied()
+    }
+
+    /// During a reload, one step can store a half-finished dialect state.
+    /// Statements that run later in the same reload must not see it. They
+    /// must still see the state from before the reload.
+    #[test]
+    fn a_statement_of_a_reload_sees_the_dialect_schema_loaded_before_the_reload() {
+        let io = Arc::new(MemoryIO::new());
+        let db =
+            Database::open_file(io.clone(), ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.with_schema_mut(|schema| {
+            schema.dialect_schema = Some(Arc::new("loaded before the reload"));
+        })
+        .unwrap();
+        let mut fresh = crate::schema::builtin::schema_builder(false)
+            .unwrap()
+            .build();
+        fresh.schema_version = conn.schema.read().schema_version;
+        let seen = Arc::new(Mutex::new(None));
+        let mut loader = SchemaLoader::new(
+            Arc::new(fresh),
+            vec![
+                Box::new(StoresADialectSchema {
+                    queried: false,
+                    state: "read in part",
+                }),
+                Box::new(LooksAtTheDialectSchema {
+                    conn: conn.clone(),
+                    queried: false,
+                    seen: seen.clone(),
+                }),
+            ],
+            SchemaInstall::ConnectionCopy,
+        );
+
+        // This database has no MVCC, so the connection keeps its own copy
+        // of the schema even though no reparse is running.
+        io.block(|| loader.run(&conn)).unwrap();
+
+        assert_eq!(*seen.lock(), Some("loaded before the reload"));
+        assert_eq!(
+            dialect_schema_text(&loader.into_schema()),
+            Some("read in part")
+        );
     }
 }
