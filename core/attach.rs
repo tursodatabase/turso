@@ -204,7 +204,7 @@ pub(crate) enum AttachDatabaseState {
 
 #[cfg(feature = "fs")]
 #[derive(Default)]
-pub(crate) enum AttachDatabaseState {
+pub enum AttachDatabaseState {
     #[default]
     Start,
     Init(Box<AttachDatabaseInitState>),
@@ -219,7 +219,7 @@ pub(crate) enum AttachDatabaseState {
 }
 
 #[cfg(feature = "fs")]
-pub(crate) struct AttachDatabaseInitState {
+pub struct AttachDatabaseInitState {
     alias: String,
     reserved_space: Option<u8>,
     db: Arc<Database>,
@@ -230,7 +230,7 @@ pub(crate) struct AttachDatabaseInitState {
 }
 
 #[cfg(feature = "fs")]
-pub(crate) struct AttachDatabaseBootstrapState {
+pub struct AttachDatabaseBootstrapState {
     readonly: bool,
     alias: String,
     db: Arc<Database>,
@@ -417,7 +417,7 @@ impl Connection {
 
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
-    pub(crate) fn attach_database(
+    pub fn attach_database(
         &self,
         path: &str,
         alias: &str,

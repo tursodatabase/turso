@@ -1,5 +1,9 @@
 use crate::common::{rusqlite_integrity_check, ExecRows, TempDatabase};
+use crate::queued_io::QueuedIo;
 use asserting::prelude::*;
+use std::sync::Arc;
+use turso_core::{ConnectOpts, Database, LimboError, SessionRole, StepResult, IO};
+use turso_sqlite::SqliteDialect;
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_indexed_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -489,6 +493,326 @@ fn test_drop_sqlite_created_mixed_case_autoincrement_table() -> anyhow::Result<(
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t1");
     assert_eq!(rows, vec![(1,)]);
     Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_drop_fails_while_another_statement_is_reading(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x, b BLOB)")?;
+    conn.execute("CREATE INDEX ux ON u(x)")?;
+    for id in 1..=32 {
+        conn.execute(format!("INSERT INTO u VALUES({id}, {id}, zeroblob(60))"))?;
+    }
+
+    for (select_sql, drop_sql) in [
+        ("SELECT id FROM u", "DROP TABLE u"),
+        ("SELECT x FROM u INDEXED BY ux WHERE x > 0", "DROP INDEX ux"),
+        // SQLite refuses any DROP while another statement is reading,
+        // even one on a table that statement does not read.
+        ("SELECT id FROM u", "DROP TABLE other"),
+    ] {
+        conn.execute("CREATE TABLE IF NOT EXISTS other(a)")?;
+        for in_transaction in [false, true] {
+            if in_transaction {
+                conn.execute("BEGIN")?;
+            }
+            let mut select = conn.prepare(select_sql)?;
+            let mut ids = vec![next_int(&mut select)?.unwrap()];
+
+            let err = conn.execute(drop_sql).unwrap_err();
+            assert!(
+                matches!(err, LimboError::TableLocked),
+                "{drop_sql} during {select_sql}: {err:?}"
+            );
+            conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
+            conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+
+            while let Some(id) = next_int(&mut select)? {
+                ids.push(id);
+            }
+            assert_eq!(ids, (1..=32).collect::<Vec<_>>(), "{select_sql}");
+            drop(select);
+            conn.execute("DROP TABLE reuse")?;
+            if in_transaction {
+                conn.execute("COMMIT")?;
+            }
+
+            let objects: Vec<(String,)> = conn.exec_rows(
+                "SELECT name FROM sqlite_schema WHERE name NOT LIKE '__turso%' ORDER BY name",
+            );
+            assert_eq!(
+                objects,
+                vec![
+                    ("other".to_string(),),
+                    ("u".to_string(),),
+                    ("ux".to_string(),)
+                ],
+                "{drop_sql} in_transaction={in_transaction}"
+            );
+            let count: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM u");
+            assert_eq!(count, vec![(32,)]);
+        }
+    }
+
+    conn.execute("DROP INDEX ux")?;
+    conn.execute("DROP TABLE u")?;
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_drop_runs_while_a_statement_that_reads_no_table_is_active(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    // Like SQLite, only statements that read a database file block a DROP.
+    for sql in [
+        "VALUES(1),(2),(3)",
+        "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
+    ] {
+        for drop_sql in ["DROP INDEX oi", "DROP TABLE o"] {
+            conn.execute("CREATE TABLE IF NOT EXISTS o(a)")?;
+            conn.execute("CREATE INDEX IF NOT EXISTS oi ON o(a)")?;
+            let mut stmt = conn.prepare(sql)?;
+            let mut values = vec![next_int(&mut stmt)?.unwrap()];
+            conn.execute(drop_sql)?;
+            while let Some(value) = next_int(&mut stmt)? {
+                values.push(value);
+            }
+            assert_eq!(values, vec![1, 2, 3], "{sql} with {drop_sql}");
+        }
+        let objects: Vec<(String,)> = conn.exec_rows(
+            "SELECT name FROM sqlite_schema WHERE name NOT LIKE '__turso%' ORDER BY name",
+        );
+        assert!(objects.is_empty(), "{sql}: {objects:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_select_fails_while_drop_waits_for_io() -> anyhow::Result<()> {
+    // A DROP prepared before its table exists is reprepared on its first
+    // step, and must be refused the same way once it is running.
+    for (drop_sql, prepare_before_create) in [
+        ("DROP TABLE u", false),
+        ("DROP INDEX ux", false),
+        ("DROP TABLE IF EXISTS u", true),
+        ("DROP INDEX IF EXISTS ux", true),
+    ] {
+        let io = Arc::new(QueuedIo::new());
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("select-during-drop-io.db");
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        conn.execute("PRAGMA page_size=512")?;
+        conn.execute("PRAGMA cache_size=9")?;
+        conn.execute("PRAGMA journal_mode='wal'")?;
+        let early_drop_stmt = if prepare_before_create {
+            Some(conn.prepare(drop_sql)?)
+        } else {
+            None
+        };
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x, b BLOB)")?;
+        conn.execute("CREATE INDEX ux ON u(x)")?;
+        conn.execute("CREATE TABLE other(a)")?;
+        for id in 1..=300 {
+            conn.execute(format!("INSERT INTO u VALUES({id}, {id}, zeroblob(300))"))?;
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        let mut drop_stmt = match early_drop_stmt {
+            Some(stmt) => stmt,
+            None => conn.prepare(drop_sql)?,
+        };
+        for _ in 0..6 {
+            assert!(matches!(drop_stmt.step()?, StepResult::IO), "{drop_sql}");
+            io.step()?;
+        }
+        // Both a reader of the dropped b-tree and a reader of another table
+        // are refused, as a DROP refuses to start while any statement reads.
+        for select_sql in [
+            "SELECT count(*), sum(length(b)) FROM u",
+            "SELECT count(*), sum(x) FROM u INDEXED BY ux WHERE x > 0",
+            "SELECT count(*) FROM other",
+        ] {
+            let err = conn.prepare(select_sql)?.step().unwrap_err();
+            assert!(
+                matches!(err, LimboError::TableLocked),
+                "{select_sql} during {drop_sql}: {err:?}"
+            );
+        }
+        loop {
+            match drop_stmt.step()? {
+                StepResult::IO => io.step()?,
+                StepResult::Done => break,
+                r => panic!("unexpected step result: {r:?}"),
+            }
+        }
+        drop(drop_stmt);
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)], "{drop_sql}");
+        let count: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM other");
+        assert_eq!(count, vec![(0,)]);
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_unstarted_drop_does_not_block_readers(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x)")?;
+    conn.execute("CREATE INDEX ux ON u(x)")?;
+    conn.execute("CREATE TABLE other(a)")?;
+    for id in 1..=32 {
+        conn.execute(format!("INSERT INTO u VALUES({id}, {id})"))?;
+    }
+
+    // EXPLAIN lists the program of a DROP without running it.
+    for explain_sql in ["EXPLAIN DROP TABLE other", "EXPLAIN DROP INDEX ux"] {
+        let mut explain = conn.prepare(explain_sql)?;
+        assert!(matches!(explain.step()?, StepResult::Row), "{explain_sql}");
+        let count: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM u");
+        assert_eq!(count, vec![(32,)], "{explain_sql}");
+        conn.execute("INSERT INTO other VALUES(1)")?;
+    }
+
+    // A DROP that returned busy before starting its transaction has freed
+    // nothing, and a reader may run while the caller holds it.
+    let writer = tmp_db.connect_limbo();
+    writer.execute("BEGIN IMMEDIATE")?;
+    writer.execute("INSERT INTO other VALUES(9)")?;
+    let mut drop_stmt = conn.prepare("DROP TABLE other")?;
+    assert!(matches!(drop_stmt.step()?, StepResult::Busy));
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM u");
+    assert_eq!(count, vec![(32,)]);
+    writer.execute("COMMIT")?;
+    drop_stmt.reset()?;
+    loop {
+        match drop_stmt.step()? {
+            StepResult::IO => drop_stmt._io().step()?,
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    drop(drop_stmt);
+    let objects: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE name = 'other'");
+    assert!(objects.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_drop_fails_while_select_waits_for_its_first_page() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("drop-during-select-io.db");
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA cache_size=9")?;
+    conn.execute("PRAGMA cache_spill=ON")?;
+    conn.execute("PRAGMA journal_mode='wal'")?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, b BLOB)")?;
+    for id in 1..=32 {
+        conn.execute(format!("INSERT INTO u VALUES({id}, zeroblob(60))"))?;
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let mut select = conn.prepare("SELECT id, length(b) FROM u WHERE id = 16")?;
+    assert!(matches!(select.step()?, StepResult::IO));
+    select._io().step()?;
+
+    let err = conn.execute("DROP TABLE u").unwrap_err();
+    assert!(matches!(err, LimboError::TableLocked), "{err:?}");
+    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+
+    let mut rows = Vec::new();
+    loop {
+        match select.step()? {
+            StepResult::Row => {
+                let row = select.row().unwrap();
+                rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+            }
+            StepResult::IO => select._io().step()?,
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert_eq!(rows, vec![(16, 60)]);
+    drop(select);
+    conn.execute("DROP TABLE u")?;
+    Ok(())
+}
+
+#[test]
+fn test_drop_fails_while_insert_waits_for_io_after_abandoned_delete() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("drop-during-insert-io.db");
+    let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA cache_size=9")?;
+    conn.execute("PRAGMA cache_spill=ON")?;
+    conn.execute("PRAGMA journal_mode='wal'")?;
+    conn.execute("CREATE TABLE seed(id INTEGER PRIMARY KEY, x, b BLOB)")?;
+    conn.execute("CREATE INDEX seed_x ON seed(x)")?;
+    for id in 1..=10 {
+        conn.execute(format!(
+            "INSERT INTO seed VALUES({id}, {id}, zeroblob(20000))"
+        ))?;
+    }
+    conn.execute("DELETE FROM seed WHERE id=1")?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO u VALUES(1, zeroblob(60))")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("BEGIN")?;
+
+    let mut delete = conn.prepare("DELETE FROM seed WHERE id IN (2,3)")?;
+    for _ in 0..9 {
+        assert!(matches!(delete.step()?, StepResult::IO));
+        io.step()?;
+    }
+    drop(delete);
+
+    let mut insert = conn.prepare("INSERT INTO u VALUES(101, zeroblob(800))")?;
+    let mut insert_io = 0;
+    loop {
+        match insert.step()? {
+            StepResult::IO => {
+                insert_io += 1;
+                io.step()?;
+                if insert_io == 2 {
+                    assert!(conn.execute("DROP TABLE u").is_err());
+                }
+            }
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert!(insert_io >= 2, "INSERT finished before its second I/O");
+    drop(insert);
+    conn.execute("ROLLBACK")?;
+
+    let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM u");
+    assert_eq!(ids, vec![(1,)]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+    Ok(())
+}
+
+fn next_int(stmt: &mut turso_core::Statement) -> anyhow::Result<Option<i64>> {
+    loop {
+        match stmt.step()? {
+            StepResult::Row => return Ok(Some(stmt.row().unwrap().get(0)?)),
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Done => return Ok(None),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
 }
 
 fn create_database_with_sqlite(

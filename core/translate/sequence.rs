@@ -11,7 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{NewOwner, RelationChange};
+use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -25,7 +25,8 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::schema;
+use crate::translate::schema::{emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -97,7 +98,12 @@ pub fn emit_sequence_backing_table(
     )?;
 
     // Open the newly-created table by its root page register and insert the initial row.
-    let seq_btree = Arc::new(BTreeTable::from_sql(&sql, 0)?);
+    let seq_btree = Arc::new(BTreeTable::from_stored_sql(
+        resolver.catalog.dialect.as_ref(),
+        &sql,
+        0,
+        false,
+    )?);
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: seq_cursor_id,
@@ -718,7 +724,7 @@ pub(crate) fn emit_backing_table_compaction(
 ///
 /// Returns `Ok(false)` and emits nothing if the `sqlite_sequence`
 /// table does not exist in this database — the schema-bootstrap path
-/// in `translate/schema.rs` creates it lazily on first need; until
+/// in `translate/schema/mod.rs` creates it lazily on first need; until
 /// then no AUTOINCREMENT activity is possible so there is nothing to
 /// sync.
 pub(crate) fn emit_sqlite_sequence_sync(
@@ -1040,17 +1046,7 @@ pub fn translate_create_sequence(
         cycle,
     )?;
 
-    // Open cursor to sqlite_schema (in the target database)
-    let table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     emit_sequence_backing_table(
         program,
@@ -1072,9 +1068,9 @@ pub fn translate_create_sequence(
             program,
             resolver.schema(),
             connection,
-            &[RelationChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_name.clone(),
+                name: &normalized_name,
                 kind: crate::schema::RelationKind::Sequence,
                 table: None,
             }],
@@ -1136,17 +1132,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
         return Ok(false);
     };
 
-    // Open sqlite_schema for writing (in the target database)
-    let schema_table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     let seq_name_reg = program.alloc_register();
     let type_str_reg = program.alloc_register();
@@ -1233,28 +1219,27 @@ pub fn translate_drop_sequence(
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
     };
+    if let Some(usage) = schema::find_object_using_sequence(
+        resolver,
+        connection,
+        namespace,
+        std::slice::from_ref(&normalized_name),
+        schema::DroppedWithSequences::Nothing,
+    )? {
+        bail_parse_error!(
+            "cannot drop sequence {normalized_name} because other objects depend on it: {usage}"
+        );
+    }
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let dropped = emit_drop_sequence_cleanup(program, resolver, namespace, &normalized_name)?;
+    let dropped = emit_drop_sequence(program, resolver, connection, namespace, &normalized_name)?;
     if !dropped {
         if if_exists {
             return Ok(());
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
-    }
-
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Drop {
-                namespace: namespace.id,
-                name: normalized_name.clone(),
-            }],
-        )?;
     }
 
     // Bump schema version so other connections detect the change
@@ -1268,27 +1253,181 @@ pub fn translate_drop_sequence(
     Ok(())
 }
 
-/// Qualifies each sequence named without a schema in `expr` with the schema
-/// it resolves to now, so the expression keeps that sequence after the
-/// search path changes. Returns whether a name was qualified.
-pub(crate) fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool> {
+/// Emits the removal of sequence `seq_name` of `namespace` from the schema
+/// and from the dialect's schema state. Returns false, emitting nothing,
+/// when the sequence does not exist.
+pub(crate) fn emit_drop_sequence(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: NamespaceRef,
+    seq_name: &str,
+) -> Result<bool> {
+    if !emit_drop_sequence_cleanup(program, resolver, namespace, seq_name)? {
+        return Ok(false);
+    }
+    if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
+        resolver.catalog.dialect.translate_relation_changes(
+            program,
+            resolver.schema(),
+            connection,
+            &[RelationChange::Dropped {
+                namespace: namespace.id,
+                name: seq_name,
+            }],
+        )?;
+    }
+    Ok(true)
+}
+
+/// Qualifies each sequence named without a schema in the expressions that
+/// `stmt` stores in the schema with the schema it resolves to now, so the
+/// expressions keep that sequence after the search path changes. Returns
+/// whether a name was qualified.
+pub(crate) fn bind_sequence_names_in_stored_expressions(
+    stmt: &mut ast::Stmt,
+    resolver: &Resolver,
+) -> Result<bool> {
+    match stmt {
+        ast::Stmt::CreateTable { body, .. } => bind_sequence_names_in_table_body(body, resolver),
+        ast::Stmt::AlterTable(alter) => match &mut alter.body {
+            ast::AlterTableBody::AddColumn(column)
+            | ast::AlterTableBody::AlterColumn { new: column, .. } => {
+                bind_sequence_names_in_column_constraints(&mut column.constraints, resolver)
+            }
+            ast::AlterTableBody::RenameTo(_)
+            | ast::AlterTableBody::RenameColumn { .. }
+            | ast::AlterTableBody::DropColumn(_)
+            | ast::AlterTableBody::OwnerTo { .. }
+            | ast::AlterTableBody::EnableRowSecurity
+            | ast::AlterTableBody::DisableRowSecurity => Ok(false),
+        },
+        ast::Stmt::CreateView { select, .. } | ast::Stmt::CreateMaterializedView { select, .. } => {
+            bind_sequence_names_in_select(select, resolver)
+        }
+        ast::Stmt::CreatePolicy(policy) => {
+            let mut bound = false;
+            for expr in [&mut policy.using_expr, &mut policy.check_expr]
+                .into_iter()
+                .flatten()
+            {
+                bound |= bind_sequence_names(expr, resolver)?;
+            }
+            Ok(bound)
+        }
+        ast::Stmt::Analyze { .. }
+        | ast::Stmt::Attach { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateIndex { .. }
+        | ast::Stmt::CreateTrigger { .. }
+        | ast::Stmt::CreateVirtualTable(_)
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::Grant(_)
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Detach { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Pragma { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Select(_)
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Vacuum { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::AlterSequenceOwnedBy { .. }
+        | ast::Stmt::CreateSchema { .. }
+        | ast::Stmt::DropSchema { .. }
+        | ast::Stmt::DropPolicy { .. } => Ok(false),
+    }
+}
+
+fn bind_sequence_names_in_table_body(
+    body: &mut ast::CreateTableBody,
+    resolver: &Resolver,
+) -> Result<bool> {
+    match body {
+        ast::CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            ..
+        } => {
+            let mut bound = false;
+            for column in columns {
+                bound |=
+                    bind_sequence_names_in_column_constraints(&mut column.constraints, resolver)?;
+            }
+            for constraint in constraints {
+                match &mut constraint.constraint {
+                    ast::TableConstraint::Check { expr, .. } => {
+                        bound |= bind_sequence_names(expr, resolver)?;
+                    }
+                    ast::TableConstraint::PrimaryKey { .. }
+                    | ast::TableConstraint::Unique { .. }
+                    | ast::TableConstraint::ForeignKey { .. } => {}
+                }
+            }
+            Ok(bound)
+        }
+        ast::CreateTableBody::AsSelect(_) => Ok(false),
+    }
+}
+
+fn bind_sequence_names_in_column_constraints(
+    constraints: &mut [ast::NamedColumnConstraint],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut bound = false;
+    for constraint in constraints {
+        match &mut constraint.constraint {
+            ast::ColumnConstraint::Default(expr) | ast::ColumnConstraint::Check { expr, .. } => {
+                bound |= bind_sequence_names(expr, resolver)?;
+            }
+            ast::ColumnConstraint::PrimaryKey { .. }
+            | ast::ColumnConstraint::NotNull { .. }
+            | ast::ColumnConstraint::Unique(_)
+            | ast::ColumnConstraint::Collate { .. }
+            | ast::ColumnConstraint::ForeignKey { .. }
+            | ast::ColumnConstraint::Generated { .. }
+            | ast::ColumnConstraint::Identity(_) => {}
+        }
+    }
+    Ok(bound)
+}
+
+fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool> {
     let mut bound = false;
     walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
         bound |= bind_sequence_call(expr, resolver);
+        if let ast::Expr::Subquery(select)
+        | ast::Expr::Exists(select)
+        | ast::Expr::InSelect { rhs: select, .. } = expr
+        {
+            bound |= bind_sequence_names_in_select(select, resolver)?;
+        }
         Ok(WalkControl::Continue)
     })?;
     Ok(bound)
 }
 
-/// [`bind_sequence_names`] for every expression of a SELECT.
-pub(crate) fn bind_sequence_names_in_select(
-    select: &mut ast::Select,
-    resolver: &Resolver,
-) -> Result<()> {
+fn bind_sequence_names_in_select(select: &mut ast::Select, resolver: &Resolver) -> Result<bool> {
+    let mut bound = false;
     rewrite_select_expressions(select, &mut |expr: &mut ast::Expr| {
-        bind_sequence_call(expr, resolver);
+        bound |= bind_sequence_call(expr, resolver);
         Ok(())
-    })
+    })?;
+    Ok(bound)
 }
 
 fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
@@ -1350,7 +1489,10 @@ pub fn translate_alter_sequence_owned_by(
     let Some(namespace) = sequence_namespace(seq_name, resolver)? else {
         bail_parse_error!("sequence \"{normalized_name}\" does not exist");
     };
-    let table = match owner {
+    if is_identity_sequence(resolver, namespace, &normalized_name) {
+        bail_parse_error!("cannot change ownership of identity sequence");
+    }
+    let owner_column = match owner {
         Some((table_name, column)) => {
             let normalized_table = normalize_ident(table_name.name.as_str());
             // The lookup names a namespace even when no table has the name,
@@ -1369,13 +1511,15 @@ pub fn translate_alter_sequence_owned_by(
             {
                 bail_parse_error!("sequence must be in same schema as table it is linked to");
             }
-            let has_column = table.get_column(column.as_str()).is_some();
-            if !has_column {
+            let Some(column_name) = table
+                .get_column(column.as_str())
+                .and_then(|(_, column)| column.name.clone())
+            else {
                 bail_parse_error!(
                     "column \"{}\" of relation \"{normalized_table}\" does not exist",
                     column.as_str()
                 );
-            }
+            };
             let dialect = &resolver.catalog.dialect;
             let (sequence_owner, table_owner) =
                 resolver.with_schema(namespace.database_id, |schema| {
@@ -1387,7 +1531,10 @@ pub fn translate_alter_sequence_owned_by(
             if sequence_owner.is_some() && table_owner.is_some() && sequence_owner != table_owner {
                 bail_parse_error!("sequence must have same owner as table it is linked to");
             }
-            Some(normalized_table)
+            Some(OwnerColumn {
+                table: normalized_table,
+                column: column_name,
+            })
         }
         None => None,
     };
@@ -1396,18 +1543,43 @@ pub fn translate_alter_sequence_owned_by(
     }
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_relation_changes(
+    resolver.catalog.dialect.translate_access_statement(
         program,
         resolver.schema(),
         connection,
-        &[RelationChange::ChangeOwner {
+        &AccessStatement::ChangeOwner {
             namespace: namespace.id,
-            name: normalized_name,
-            owner: NewOwner::Table(table),
-        }],
+            name: &normalized_name,
+            owner: &NewOwner::Column(owner_column),
+        },
     )?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
+}
+
+fn is_identity_sequence(resolver: &Resolver, namespace: NamespaceRef, sequence: &str) -> bool {
+    let dialect = &resolver.catalog.dialect;
+    resolver.with_schema(namespace.database_id, |schema| {
+        schema
+            .tables(namespace.id)
+            .filter_map(|table| table.btree())
+            .any(|table| {
+                table.columns().iter().any(|column| {
+                    column.identity.is_some()
+                        && column.name.as_deref().is_some_and(|column_name| {
+                            dialect
+                                .owned_sequences(
+                                    schema,
+                                    namespace.id,
+                                    table.name.as_str(),
+                                    Some(column_name),
+                                )
+                                .iter()
+                                .any(|owned| owned == sequence)
+                        })
+                })
+            })
+    })
 }
 
 /// The namespace and bare name of the sequence `name` names: `schema.name`,
@@ -1430,6 +1602,24 @@ pub(crate) fn resolve_sequence_name(
     resolver
         .sequence_of_mangled_name(&bare_name)
         .or_else(|| Some((resolver.find_existing_sequence(&bare_name)?, bare_name)))
+}
+
+/// The namespace and bare name of the sequence that `expr` calls `nextval`,
+/// `currval` or `setval` on, when that sequence exists.
+pub(crate) fn sequence_called_by(
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> Option<(NamespaceRef, String)> {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return None;
+    };
+    if !is_sequence_function(name.as_str()) {
+        return None;
+    }
+    let ast::Expr::Literal(ast::Literal::String(text)) = args.first()?.as_ref() else {
+        return None;
+    };
+    resolve_sequence_name(&crate::util::dequote(text), resolver)
 }
 
 pub(crate) fn is_sequence_function(name: &str) -> bool {

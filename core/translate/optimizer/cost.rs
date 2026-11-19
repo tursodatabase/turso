@@ -472,12 +472,12 @@ pub fn estimate_cost_for_scan_or_seek(
 ) -> Cost {
     let base_row_count = *base_row_count;
 
-    let tree_depth = estimate_btree_depth(base_row_count, params.rows_per_table_page);
-
     let Some(index_info) = index_info else {
         // Full table scan (no index)
         return estimate_scan_cost(base_row_count, input_cardinality, params);
     };
+
+    let tree_depth = estimate_btree_depth(base_row_count, params.rows_per_table_page);
 
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
         // Unique point lookup: 1 seek per input row, 1 row returned per seek

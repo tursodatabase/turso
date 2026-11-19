@@ -54,7 +54,9 @@ fn fixture(path: String) -> Arc<CountingIO> {
         fail: AtomicBool::new(false),
     });
     let db = Database::open_file(io.clone(), &io.path, Arc::new(EngineDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x); INSERT INTO t VALUES(7)")
         .unwrap();
     drop(conn);
@@ -91,7 +93,7 @@ fn async_default_storage_is_opened_once_across_real_read_yields() {
         "the backend must force real read completion yields"
     );
     assert_eq!(io.opens.load(Ordering::SeqCst), 1);
-    db.connect(ConnectOpts::new())
+    db.connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap()
         .execute("SELECT * FROM t")
         .unwrap();
@@ -130,7 +132,7 @@ fn async_default_resolver_error_and_cancellation_release_reservation() {
     completion.wait(&*io).unwrap();
     let reopened = Database::open(io.clone(), &io.path, options).unwrap();
     reopened
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap()
         .execute("SELECT * FROM t")
         .unwrap();

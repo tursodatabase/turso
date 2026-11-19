@@ -223,6 +223,7 @@ pub fn py_turso_sync_new(
         remote_encryption_key: sync_config.remote_encryption_key.clone(),
         push_operations_threshold: sync_config.push_operations_threshold,
         pull_bytes_threshold: sync_config.pull_bytes_threshold,
+        pull_parallel_requests: None,
         logical_mvcc_pull: sync_config.logical_mvcc_pull,
     };
     let database =

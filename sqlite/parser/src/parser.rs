@@ -1283,13 +1283,15 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         let start = self.offset();
-        let first_word = match token_type.fallback_id_if_ok() {
+        let is_struct_or_union =
+            |word: &str| word.eq_ignore_ascii_case("STRUCT") || word.eq_ignore_ascii_case("UNION");
+        let first_word_is_struct_or_union = match token_type.fallback_id_if_ok() {
             TK_ID | TK_STRING => {
                 let tok = eat_assert!(self, TK_ID, TK_STRING);
-                from_bytes(tok.as_bytes())
+                is_struct_or_union(from_bytes_as_str(tok.as_bytes()))
             }
             TK_LBRACKET if !self.peeked_empty_brackets() => {
-                self.parse_bracket_quoted_name()?.as_str().to_owned()
+                is_struct_or_union(self.parse_bracket_quoted_name()?.as_str())
             }
             _ => return Ok(None),
         };
@@ -1298,9 +1300,7 @@ impl<'a> Parser<'a> {
         // Inline STRUCT/UNION types (e.g. `col STRUCT(x INT)`) are only valid
         // inside CREATE TYPE field lists (tracked by type_nesting_depth > 0).
         // In column definitions and CAST expressions, reject them.
-        let is_struct = first_word.eq_ignore_ascii_case("STRUCT");
-        let is_union = first_word.eq_ignore_ascii_case("UNION");
-        if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+        if first_word_is_struct_or_union && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
             if self.type_nesting_depth == 0 {
                 return Err(Error::ParseError(
                     "inline STRUCT/UNION column types are not supported; \
@@ -3847,6 +3847,16 @@ impl<'a> Parser<'a> {
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 Ok(Box::new(Expr::Name(self.parse_nm()?)))
             }
+            // SQLite's pragma value grammar does not accept NULL
+            TK_NULL => {
+                let offset = self.offset();
+                let token = self.peek_no_eof()?;
+                Err(unexpected_token_error(
+                    token,
+                    offset,
+                    &[TK_ID, TK_STRING, TK_INTEGER, TK_FLOAT],
+                ))
+            }
             tt if tt
                 .as_str()
                 .is_some_and(|s| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())) =>
@@ -4892,6 +4902,7 @@ impl<'a> Parser<'a> {
             indexed,
             where_clause,
             returning,
+            truncate: false,
         })
     }
 
@@ -5491,6 +5502,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Stmt::Insert {
+            overriding_system_value: false,
             with,
             or_conflict: resolve_type,
             tbl_name,
@@ -12909,6 +12921,7 @@ mod tests {
                     indexed: None,
                     where_clause: None,
                     returning: vec![],
+                    truncate: false,
                 })],
             ),
             (
@@ -12956,6 +12969,7 @@ mod tests {
                             None,
                         ),
                     ],
+                    truncate: false,
                 })],
             ),
             // parse drop index
@@ -13054,6 +13068,7 @@ mod tests {
             (
                 b"INSERT INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: None,
                     tbl_name: QualifiedName {
@@ -13082,6 +13097,7 @@ mod tests {
             (
                 b"REPLACE INTO foo VALUES (1, 2)".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: None,
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
@@ -13110,6 +13126,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) INSERT INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13158,6 +13175,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) REPLACE INTO foo DEFAULT VALUES RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Insert {
+                    overriding_system_value: false,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![
@@ -13430,6 +13448,17 @@ mod tests {
             b"DELETE FROM t ORDER BY x LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 LIMIT 1".as_slice(),
             b"UPDATE t SET x = 1 ORDER BY x LIMIT 1".as_slice(),
+        ] {
+            let result = Parser::new(sql).next().unwrap();
+            assert!(result.is_err(), "expected parse error for {sql:?}");
+        }
+    }
+
+    #[test]
+    fn test_pragma_value_rejects_null() {
+        for sql in [
+            b"PRAGMA foreign_keys = NULL".as_slice(),
+            b"PRAGMA foreign_keys(NULL)".as_slice(),
         ] {
             let result = Parser::new(sql).next().unwrap();
             assert!(result.is_err(), "expected parse error for {sql:?}");

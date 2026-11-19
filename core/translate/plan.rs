@@ -715,6 +715,9 @@ pub enum QueryDestination {
         result_reg_start: usize,
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
+        /// The register that counts the stored rows, when a second row is an
+        /// error (see [ast::SubqueryType::RowValue]).
+        row_count_reg: Option<usize>,
     },
     /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
     /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.
@@ -874,7 +877,9 @@ pub struct SelectPlan {
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
+    // The parser gives these expressions boxed. Unboxing them copies each one.
+    #[allow(clippy::vec_box)]
+    pub values: Vec<Vec<Box<Expr>>>,
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
     pub window: Option<Window>,
@@ -1076,6 +1081,8 @@ pub struct UpdatePlan {
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+    /// The checks of row-level security that each new row must pass.
+    pub(crate) row_checks: Vec<crate::translate::row_security::RowCheck>,
 }
 
 impl UpdatePlan {
@@ -1579,20 +1586,32 @@ pub fn resolve_unqualified_column(
     tables: &[JoinedTable],
     column_name: &str,
 ) -> Result<Option<ResolvedColumn>> {
+    resolve_unqualified_column_except(tables, column_name, &[])
+}
+
+/// Like [resolve_unqualified_column], but the tables in `excluded` have no columns.
+pub fn resolve_unqualified_column_except(
+    tables: &[JoinedTable],
+    column_name: &str,
+    excluded: &[TableInternalId],
+) -> Result<Option<ResolvedColumn>> {
+    let lookup = |table: &JoinedTable, include_rowid_names: bool| {
+        if excluded.contains(&table.internal_id) {
+            return ColumnLookup::Missing;
+        }
+        lookup_unqualified_column(&table.table, column_name, include_rowid_names)
+    };
     let has_declared_column = crate::translate::planner::ROWID_STRS
         .iter()
         .any(|name| name.eq_ignore_ascii_case(column_name))
-        && tables.iter().any(|table| {
-            !matches!(
-                lookup_unqualified_column(&table.table, column_name, false),
-                ColumnLookup::Missing
-            )
-        });
+        && tables
+            .iter()
+            .any(|table| !matches!(lookup(table, false), ColumnLookup::Missing));
     let found = unqualified_column_sources(
         tables,
         column_name,
         |table| table.join_info.as_ref(),
-        |table| lookup_unqualified_column(&table.table, column_name, !has_declared_column),
+        |table| lookup(table, !has_declared_column),
     );
     if found.ambiguous {
         crate::bail_parse_error!("ambiguous column name: {}", column_name);
@@ -1826,6 +1845,10 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
     pub plan_estimate: Option<TablePlanEstimate>,
+    /// The condition that row-level security puts on the rows of the table.
+    /// It is checked as soon as the loop reads a row, before any other
+    /// condition, so no expression of the query sees a row it fails.
+    pub row_filter: Option<ast::Expr>,
 }
 
 /// Cost and row estimates for one table in a selected join plan.
@@ -2241,13 +2264,18 @@ impl TableReferences {
             .find(|t| t.identifier == identifier)
     }
 
+    /// Returns the CTE with the given name from the nearest enclosing scope.
+    /// Within one scope, a query's own WITH clause comes after the references
+    /// it inherits, so the last match wins.
     pub fn find_cte_outer_query_ref_by_identifier(
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .rev()
+            .filter(|t| t.identifier == identifier && t.is_cte_name_in_scope())
+            .min_by_key(|t| t.scope_depth)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -2623,20 +2651,27 @@ impl<T: From<usize>> BitSet<T>
 where
     usize: From<T>,
 {
+    #[inline]
     pub fn set(&mut self, index: T) -> Result<(), alloc::TryReserveError> {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
-        } else {
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if overflow_idx >= overflow.len() {
-                overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
-                overflow.resize(overflow_idx + 1, 0);
-            }
-            overflow[overflow_idx] |= 1 << bit;
+            return Ok(());
         }
+        self.set_overflow_bit(index)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn set_overflow_bit(&mut self, index: usize) -> Result<(), alloc::TryReserveError> {
+        let overflow_idx = (index - Self::INLINE_BITS) / 64;
+        let bit = (index - Self::INLINE_BITS) % 64;
+        let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if overflow_idx >= overflow.len() {
+            overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
+            overflow.resize(overflow_idx + 1, 0);
+        }
+        overflow[overflow_idx] |= 1 << bit;
         Ok(())
     }
 
@@ -2734,17 +2769,25 @@ where
         }
     }
 
+    #[inline]
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
-        if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if self_ov.len() < other_ov.len() {
-                self_ov.try_reserve(other_ov.len() - self_ov.len())?;
-                self_ov.resize(other_ov.len(), 0);
-            }
-            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
-                *s |= o;
-            }
+        match &other.overflow {
+            None => Ok(()),
+            Some(other_ov) => self.union_overflow_with(other_ov),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn union_overflow_with(&mut self, other_ov: &[u64]) -> Result<(), alloc::TryReserveError> {
+        let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
+        if self_ov.len() < other_ov.len() {
+            self_ov.try_reserve(other_ov.len() - self_ov.len())?;
+            self_ov.resize(other_ov.len(), 0);
+        }
+        for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+            *s |= o;
         }
         Ok(())
     }
@@ -3319,6 +3362,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3372,6 +3416,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 
@@ -3410,6 +3455,7 @@ impl JoinedTable {
             namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
+            row_filter: None,
         })
     }
 

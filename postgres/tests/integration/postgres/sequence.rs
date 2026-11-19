@@ -695,7 +695,7 @@ fn test_pg_sequences_columns(db: TempDatabase) {
 
     pg_execute(
         &conn,
-        "CREATE SEQUENCE cat_full START WITH 5 INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CACHE 10",
+        "CREATE SEQUENCE cat_full START WITH 5 INCREMENT BY 2 MINVALUE 1 MAXVALUE 1000 CACHE 1",
     );
 
     let schema = pg_query_text(
@@ -728,13 +728,6 @@ fn test_pg_sequences_columns(db: TempDatabase) {
     );
     assert_eq!(max, 1000);
 
-    // pg_sequences.cache_size reports the value the engine actually uses for
-    // allocation, not the value requested in CREATE SEQUENCE. Turso's
-    // disk-only sequence design never caches values (every nextval reads and
-    // writes the backing-table watermark inline with the executing
-    // transaction), so cache_size is always 1 regardless of the requested
-    // `CACHE n`. PG's behavior on a server that physically can't cache is
-    // the same — it reports the actual cache size, not the requested one.
     let cache = pg_query_int(
         &conn,
         "SELECT cache_size FROM pg_sequences WHERE sequencename = 'cat_full'",

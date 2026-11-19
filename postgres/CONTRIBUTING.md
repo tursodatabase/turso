@@ -16,7 +16,10 @@ Three things keep that work honest:
 - **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
   that CI runs against the front-end and against a real PostgreSQL server
   (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
-  behavior have `@skip-if postgres "reason"`.
+  behavior have `@skip-if postgres "reason"`. Tests for SQL that the SQLite
+  frontend also runs are in
+  [`testing/shared-sqltests/`](../testing/shared-sqltests/), which CI runs on
+  every backend.
 
 ## Verification workflow
 
@@ -25,8 +28,9 @@ When changing the parser, translator, or query behavior:
 1. Check the relevant page of the PostgreSQL documentation.
 2. Confirm the behavior against a real PostgreSQL server.
 3. Encode the observed behavior in a test — an upstream regression script that
-   now passes, a `.sqltest` in `conformance/pg-sqltests/`, or a Rust test (see
-   below) — so it can't regress.
+   now passes, a `.sqltest` in `conformance/pg-sqltests/` (or in
+   `testing/shared-sqltests/` when the SQLite frontend must give the same
+   result), or a Rust test (see below) — so it can't regress.
 
 If Turso intentionally diverges from PostgreSQL, document that in
 [`COMPAT.md`](COMPAT.md). Pay particular attention to clauses that parse but
@@ -63,8 +67,9 @@ into fresh PostgreSQL and Turso databases, and compare their `pg_dump` output.
 It compares PostgreSQL ASTs and decoded COPY rows rather than dump bytes.
 
 Install PostgreSQL clients that support `pg_dump --restrict-key`. Use Docker,
-or set `PG_DSN` to a disposable PostgreSQL 18 server using a `turso` role with
-LOGIN and CREATEDB. Matching role names avoids default-privilege differences:
+or set `PG_DSN` to a disposable PostgreSQL 18 server (the version in
+`postgres/version`), using a `turso` role with LOGIN and CREATEDB. Matching
+role names avoids default-privilege differences:
 
 ```bash
 make -C postgres/conformance test-pgdump

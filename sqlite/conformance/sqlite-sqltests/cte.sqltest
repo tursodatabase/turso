@@ -1416,6 +1416,50 @@ expect {
     inner
 }
 
+# The subquery inside the CTE body reads the inner CTE, not the outer one
+test cte-shadow-read-by-subquery-in-cte-body {
+    WITH t AS (WITH t AS (SELECT 7) SELECT * FROM (SELECT * FROM t))
+    SELECT * FROM (SELECT * FROM t);
+}
+expect {
+    7
+}
+
+@setup cte_shadow_table
+test cte-shadow-table-of-outer-query-in-from-subquery {
+    SELECT (WITH t AS (SELECT 'from_cte') SELECT * FROM (SELECT * FROM t)) FROM t;
+}
+expect {
+    from_cte
+}
+
+test cte-shadow-outer-cte-in-from-subquery {
+    WITH t AS (SELECT 'outer')
+    SELECT (WITH t AS (SELECT 'inner') SELECT * FROM (SELECT * FROM t)) FROM t;
+}
+expect {
+    inner
+}
+
+test cte-shadow-outer-cte-in-scalar-and-in-subquery {
+    WITH t AS (SELECT 5)
+    SELECT (WITH t AS (SELECT 7) SELECT (SELECT * FROM t)),
+           (WITH t AS (SELECT 7) SELECT 7 IN (SELECT * FROM t))
+    FROM t;
+}
+expect {
+    7|1
+}
+
+test cte-shadow-read-by-scalar-and-exists-subquery-in-cte-body {
+    WITH t AS (WITH t AS (SELECT 7) SELECT (SELECT * FROM t)),
+         u AS (WITH u AS (SELECT 8) SELECT 1 WHERE EXISTS (SELECT * FROM u))
+    SELECT * FROM t, u;
+}
+expect {
+    7|1
+}
+
 # Inner CTE shadows outer, outer CTE is unused
 test cte-shadow-outer-unused {
     WITH cte AS (SELECT 1 AS a)

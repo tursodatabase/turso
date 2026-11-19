@@ -2,7 +2,7 @@
 pub(crate) use shuttle_adapter::*;
 
 #[cfg(not(shuttle))]
-pub(crate) use std_adapter::*;
+pub use std_adapter::*;
 
 #[cfg(shuttle)]
 mod shuttle_adapter {

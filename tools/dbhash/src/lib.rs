@@ -17,6 +17,7 @@ use turso_core::{
 };
 
 pub use encoder::encode_value;
+use turso_core::SessionRole;
 
 #[derive(Debug, Clone, Default)]
 pub struct DbHashOptions {
@@ -84,7 +85,8 @@ pub fn hash_database_with_database_opts(
         .as_ref()
         .map(|encryption| EncryptionKey::from_hex_string(&encryption.hexkey))
         .transpose()?;
-    let conn = db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?;
+    let conn =
+        db.connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key))?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;
