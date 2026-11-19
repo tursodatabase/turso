@@ -54,8 +54,7 @@ fn field_weights_rename_column() {
 }
 
 fn test_attachment() -> FtsIndexAttachment {
-    FtsIndexAttachment::new(
-        &crate::SqliteDialect,
+    FtsIndexAttachment::with_patterns(
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -65,6 +64,7 @@ fn test_attachment() -> FtsIndexAttachment {
             ],
             parameters: FxHashMap::<String, Value>::default(),
         },
+        Vec::new(),
     )
     .unwrap()
 }
@@ -72,15 +72,22 @@ fn test_attachment() -> FtsIndexAttachment {
 #[test]
 fn score_result_uses_the_fields_selected_by_the_query() {
     let attachment = test_attachment();
-    let pattern = &attachment.patterns[FTS_PATTERN_COMBINED as usize];
-    let ast::OneSelect::Select { columns, .. } = &pattern.body.select else {
-        panic!("expected a SELECT pattern");
-    };
-    let ast::ResultColumn::Expr(score, _) = &columns[0] else {
-        panic!("expected a score result");
-    };
-    let ast::Expr::FunctionCall { args, .. } = score.as_ref() else {
-        panic!("expected a score function");
+    // The score expression of the query patterns: fts_score(title, body, ?1).
+    let args: Vec<Box<Expr>> = vec![
+        Box::new(Expr::Id(Name::exact("title".to_string()))),
+        Box::new(Expr::Id(Name::exact("body".to_string()))),
+        Box::new(Expr::Variable(Variable::indexed(NonZeroU32::MIN))),
+    ];
+    let score = Expr::FunctionCall {
+        name: Name::exact("fts_score".to_string()),
+        distinctness: None,
+        args: args.clone(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
     };
 
     for (fields, expected_columns) in [("1", &[1][..]), ("0", &[0][..]), ("0,1", &[0, 1][..])] {
@@ -91,7 +98,7 @@ fn score_result_uses_the_fields_selected_by_the_query() {
                 Expr::Literal(Literal::String(format!("'{fields}'"))),
             ),
         ]);
-        let result = attachment.result_column(score, &parameters).unwrap();
+        let result = attachment.result_column(&score, &parameters).unwrap();
         let Expr::FunctionCall {
             args: result_args, ..
         } = result.as_ref()
@@ -118,8 +125,7 @@ fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
 }
 
 fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
-    let attachment = FtsIndexAttachment::new(
-        &crate::SqliteDialect,
+    let attachment = FtsIndexAttachment::with_patterns(
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -130,6 +136,7 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
             )],
             parameters: FxHashMap::<String, Value>::default(),
         },
+        Vec::new(),
     )
     .unwrap();
     let cursor = attachment.init().unwrap();
