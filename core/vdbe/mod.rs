@@ -1145,6 +1145,8 @@ pub struct ProgramState {
     /// The time "now" means for the date and time functions during the
     /// current step. See `StatementClock`.
     pub(crate) current_time: Option<crate::WallClockInstant>,
+    /// See `ScalarFuncContext::statement_times`.
+    pub(crate) statement_times: Option<crate::dialect::StatementTimes>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -1310,6 +1312,7 @@ impl ProgramState {
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
             current_time: None,
+            statement_times: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -1480,6 +1483,7 @@ impl ProgramState {
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
         self.current_time = None;
+        self.statement_times = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
