@@ -540,11 +540,26 @@ pub struct ConnectAsyncState {
     conn: Option<Arc<Connection>>,
     /// The in-flight `sqlite_stat1` scan.
     refresh: RefreshAnalyzeStatsState,
+    /// The in-flight pager init (database header and page 1 reads) of the
+    /// connection.
+    init: InitState,
 }
 
 impl ConnectAsyncState {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Drop for ConnectAsyncState {
+    /// A caller that gives up on the connect while page 1 is being read must
+    /// not keep the read transaction open, or it blocks checkpoints forever.
+    fn drop(&mut self) {
+        if let InitState::ReadPage1 { pager } = &self.init {
+            if pager.holds_read_lock() {
+                pager.end_read_tx();
+            }
+        }
     }
 }
 
@@ -1655,8 +1670,25 @@ impl Database {
                     }
                     let _ = &mut db;
 
-                    // Wrap db in Arc before connecting
-                    let db = Arc::new(db);
+                    state.db = Some(Arc::new(db));
+                    state.pager = Some(pager);
+                    state.phase = OpenDbAsyncPhase::ReadingHeader;
+                }
+
+                OpenDbAsyncPhase::ReadingHeader => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
+                    // Attaching the WAL cleared the page cache. Reading page 1
+                    // here, where the open can yield, means `_connect` finds it
+                    // cached and does not block on it.
+                    let header_schema_cookie =
+                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
                     let conn = db._connect(
@@ -1671,38 +1703,20 @@ impl Database {
                         StatsRefresh::Blocking,
                     )?;
 
-                    // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
+                    // Acquire schema lock and hold it through the LoadingSchema phase
                     // to ensure schema_version and make_from_btree are atomic
-                    let guard = db.schema.lock_arc();
-
-                    state.db = Some(db);
-                    state.pager = Some(pager);
-                    state.conn = Some(conn);
-                    state.schema_guard = Some(guard);
-
-                    state.phase = OpenDbAsyncPhase::ReadingHeader;
-                }
-
-                OpenDbAsyncPhase::ReadingHeader => {
-                    let pager = state
-                        .pager
-                        .as_ref()
-                        .expect("pager must be initialized in Init phase");
-                    let header_schema_cookie =
-                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
-                    let guard = state
-                        .schema_guard
-                        .as_mut()
-                        .expect("schema_guard must be acquired in Init phase");
+                    let mut guard = db.schema.lock_arc();
                     // We logically exclusively own schema via the Opening sentinel in the
                     // registry which prevents concurrent opens of the same path.
                     // At this point we already created a connection which cloned the schema
                     // internally, so we can't use get_mut here.
                     //
                     // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
-                    let schema = Schema::try_make_mut(guard)?;
+                    let schema = Schema::try_make_mut(&mut guard)?;
                     schema.schema_version = header_schema_cookie;
 
+                    state.conn = Some(conn);
+                    state.schema_guard = Some(guard);
                     state.phase = OpenDbAsyncPhase::LoadingSchema;
                 }
 
@@ -1926,6 +1940,21 @@ impl Database {
                 "built-in encryption cannot be combined with an external page codec".to_string(),
             )
             .into());
+        }
+        if self.page_codec_id.is_some() && page_codec.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "database requires an external page codec".to_string(),
+            )
+            .into());
+        }
+        if self.page_codec_id.is_none() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "database was opened without an external page codec".to_string(),
+            )
+            .into());
+        }
+        if let Some(page_codec) = page_codec {
+            self.validate_page_codec(Some(page_codec.as_ref()))?;
         }
         loop {
             match st {
@@ -2602,16 +2631,17 @@ impl Database {
 
     /// Non-blocking [`Self::connect`].
     ///
-    /// Creating the connection itself never waits, but the connect-time
-    /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
-    /// statement can have to wait: on page I/O, or on another transaction
-    /// (a read that speculatively saw a version whose writer is still
-    /// preparing waits for that writer at its own commit). `connect` pumps
-    /// `io.step()` until the statement finishes, which is only correct when
-    /// the other transaction can make progress on its own. In a host that
-    /// schedules every connection cooperatively on one thread it cannot:
-    /// the wait is an explicit yield asking the host to run *other*
-    /// connections, and `io.step()` never does that, so `connect` spins.
+    /// Creating the connection waits on reading the database header and
+    /// page 1. The connect-time ANALYZE stats refresh runs a `SELECT` over
+    /// `sqlite_stat1`, and that statement can have to wait: on page I/O, or
+    /// on another transaction (a read that speculatively saw a version whose
+    /// writer is still preparing waits for that writer at its own commit).
+    /// `connect` pumps `io.step()` until the statement finishes, which is
+    /// only correct when the other transaction can make progress on its own.
+    /// In a host that schedules every connection cooperatively on one thread
+    /// it cannot: the wait is an explicit yield asking the host to run
+    /// *other* connections, and `io.step()` never does that, so `connect`
+    /// spins.
     ///
     /// This variant hands every wait back to the caller as
     /// `IOResult::IO(..)`. Drive it like `open_async`: on `IO`, run the host
@@ -2620,8 +2650,8 @@ impl Database {
     /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
     /// logged and the connection is returned without stats.
     ///
-    /// Only the first call, which creates the connection, uses `opts`; later
-    /// calls with the same `state` only resume the stats refresh.
+    /// Only the calls until the connection is created use `opts`; later calls
+    /// with the same `state` only resume the stats refresh.
     pub fn connect_async(
         self: &Arc<Database>,
         opts: ConnectOpts,
@@ -2630,11 +2660,16 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
+                let pager = return_if_io!(self._init_nonblock(
+                    &mut state.init,
+                    opts.encryption_key.as_ref(),
+                    opts.page_codec.as_ref(),
+                ));
                 let conn = self._connect(
                     opts,
                     ConnectionContext::default(),
                     false,
-                    None,
+                    Some(Arc::new(pager)),
                     StatsRefresh::Deferred,
                 )?;
                 state.conn = Some(conn.clone());
@@ -2667,19 +2702,6 @@ impl Database {
             page_codec,
             ..
         } = opts;
-        if self.page_codec_id.is_some() && page_codec.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "database requires an external page codec".to_string(),
-            ));
-        }
-        if self.page_codec_id.is_none() && page_codec.is_some() {
-            return Err(LimboError::InvalidArgument(
-                "database was opened without an external page codec".to_string(),
-            ));
-        }
-        if let Some(page_codec) = page_codec.as_deref() {
-            self.validate_page_codec(Some(page_codec))?;
-        }
         let pager = if let Some(pager) = pager {
             pager
         } else {

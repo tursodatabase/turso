@@ -1,3 +1,4 @@
+use crate::queued_io::QueuedIo;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -5,6 +6,7 @@ use std::sync::Arc;
 use turso_core::security::roles::SessionRole;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::CompletionError;
+use turso_core::ConnectAsyncState;
 use turso_core::ConnectOpts;
 use turso_core::Connection;
 use turso_core::Database;
@@ -23,6 +25,8 @@ use turso_core::PageCodecHeaderInfo;
 use turso_core::PageCodecId;
 use turso_core::PageLocation;
 use turso_core::PlatformIO;
+use turso_core::StepResult;
+use turso_core::Value;
 use turso_core::IO;
 use turso_sqlite::SqliteDialect;
 
@@ -1393,4 +1397,90 @@ fn page_codec_rejects_page_size_incompatible_with_reserved_space() {
         .connect(ConnectOpts::new(SessionRole::Superuser).with_page_codec(codec))
         .unwrap();
     assert_eq!(count_test_rows(&conn), 1);
+}
+
+/// A host that completes I/O only between calls into the database cannot
+/// pump `IO::step`, so reopening a database with `open_async` and
+/// `connect_async` must hand every page read back to the caller.
+#[test]
+fn reopen_with_open_async_and_connect_async_without_io_step() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "reopen-without-io-step.db";
+    {
+        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect))?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+        conn.execute("CREATE TABLE t1(a)")?;
+        conn.execute("INSERT INTO t1 VALUES (1)")?;
+        conn.close()?;
+    }
+
+    io.disable_step();
+    let file = io.open_file(path, OpenFlags::None, false)?;
+    let options =
+        OpenOptions::new(Arc::new(SqliteDialect)).storage(Arc::new(DatabaseFile::new(file)));
+    let mut open_state = OpenDbAsyncState::new();
+    let db = loop {
+        match Database::open_async(&mut open_state, io.clone(), path, &options)? {
+            IOResult::Done(db) => break db,
+            IOResult::IO(_) => {
+                io.step_one()?;
+            }
+        }
+    };
+    let mut connect_state = ConnectAsyncState::new();
+    let conn = loop {
+        match db.connect_async(ConnectOpts::new(SessionRole::Superuser), &mut connect_state)? {
+            IOResult::Done(conn) => break conn,
+            IOResult::IO(_) => {
+                io.step_one()?;
+            }
+        }
+    };
+    let mut stmt = conn.prepare("SELECT a FROM t1")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => rows.push(stmt.row().unwrap().get::<i64>(0)?),
+            StepResult::IO => {
+                io.step_one()?;
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    assert_eq!(rows, vec![1]);
+    Ok(())
+}
+
+/// `connect_async` holds a WAL read lock while it waits for page 1. Dropping
+/// its state at that point must release the lock, or every TRUNCATE
+/// checkpoint after it is busy.
+#[test]
+fn dropping_connect_async_state_while_reading_page_1_releases_read_lock() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io.clone(), "connect-async-drop.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    conn.execute("CREATE TABLE t1(a)")?;
+    conn.execute("INSERT INTO t1 VALUES (1)")?;
+    let checkpoint_busy = || -> anyhow::Result<Value> {
+        let rows = conn
+            .prepare("PRAGMA wal_checkpoint(TRUNCATE)")?
+            .run_collect_rows()?;
+        Ok(rows[0][0].clone())
+    };
+
+    // The first call waits for the database header, the second for page 1.
+    let mut state = ConnectAsyncState::new();
+    for _ in 0..2 {
+        match db.connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state)? {
+            IOResult::Done(_) => panic!("connect_async must wait for the header and page 1"),
+            IOResult::IO(_) => {
+                io.step_one()?;
+            }
+        }
+    }
+    assert_eq!(checkpoint_busy()?, Value::from_i64(1));
+    drop(state);
+    assert_eq!(checkpoint_busy()?, Value::from_i64(0));
+    Ok(())
 }
