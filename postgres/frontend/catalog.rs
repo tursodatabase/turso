@@ -7,7 +7,8 @@ use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
-        identity_table_sql_marker, split_identity_table_sql_marker, POSTGRES_TABLE_SQL_PREFIX,
+        identity_table_sql_marker, split_identity_table_sql_marker, SortTermMatching,
+        POSTGRES_TABLE_SQL_PREFIX,
     },
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
@@ -389,6 +390,10 @@ impl Dialect for PostgresDialect {
 
     fn errors_on_zero_divisor(&self) -> bool {
         true
+    }
+
+    fn sort_term_matching(&self) -> SortTermMatching {
+        SortTermMatching::Sql92
     }
 
     fn constraint_errors_show_values(&self) -> bool {

@@ -5,6 +5,7 @@ use super::plan::{
     NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
     Window,
 };
+use crate::dialect::SortTermMatching;
 use crate::schema::Table;
 use crate::security::policy::Command;
 use crate::stack::trace_stack;
@@ -719,12 +720,14 @@ fn prepare_one_select_plan(
                     "ORDER BY",
                 )?;
 
+                check_sort_name_is_one_output_column(&o.expr, "ORDER BY", &plan, resolver)?;
+                let binding = sort_expr_binding(&o.expr, resolver);
                 bind_and_rewrite_expr(
                     &mut o.expr,
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     resolver,
-                    BindingBehavior::TryResultColumnsFirst,
+                    binding,
                 )?;
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
             }
@@ -1250,6 +1253,49 @@ fn add_vtab_predicates_to_where_clause(
         &mut plan.where_clause,
         resolver,
     )
+}
+
+fn check_sort_name_is_one_output_column(
+    expr: &ast::Expr,
+    clause: &str,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if resolver.catalog.dialect.sort_term_matching() == SortTermMatching::Sqlite {
+        return Ok(());
+    }
+    let Some(name) = bare_name(expr) else {
+        return Ok(());
+    };
+    let name = normalize_ident(name.as_str());
+    let mut columns_with_name = plan
+        .result_columns
+        .iter()
+        .filter(|column| column.name(&plan.table_references) == Some(name.as_str()));
+    if let Some(first) = columns_with_name.next() {
+        if columns_with_name.any(|other| !exprs_are_equivalent(&first.expr, &other.expr)) {
+            crate::bail_parse_error!("{clause} \"{name}\" is ambiguous");
+        }
+    }
+    Ok(())
+}
+
+fn sort_expr_binding(expr: &ast::Expr, resolver: &Resolver) -> BindingBehavior {
+    if bare_name(expr).is_some()
+        || resolver.catalog.dialect.sort_term_matching() == SortTermMatching::Sqlite
+    {
+        BindingBehavior::TryResultColumnsFirst
+    } else {
+        BindingBehavior::ResultColumnsNotAllowed
+    }
+}
+
+fn bare_name(expr: &ast::Expr) -> Option<&ast::Name> {
+    match expr {
+        ast::Expr::Id(name) => Some(name),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => bare_name(&exprs[0]),
+        _ => None,
+    }
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.

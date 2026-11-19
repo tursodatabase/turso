@@ -235,6 +235,7 @@ return date, time, timetz or interval, such as `age` and `make_date`.
 | ORDER BY / LIMIT on a standalone VALUES list | ❌ Not supported | Rejected: "ORDER BY clause is not allowed with VALUES clause" |
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
 | ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; without it, NULLs sort last for ASC and first for DESC, as in PostgreSQL; rejected (matching SQLite) in CREATE INDEX |
+| ORDER BY a signed integer constant | ❌ Not supported | `ORDER BY +1` and `ORDER BY -(+1)`, also as a DISTINCT ON expression, are rejected. PostgreSQL sorts by the constant, where the engine would read a position in the select list |
 | ORDER BY USING operator | 🟡 Partial | Built-in `<` and `>` (including `pg_catalog` qualification) are translated to ascending and descending order; other operators are rejected |
 | range_agg range type aggregation function | ❌ Not supported | |
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |

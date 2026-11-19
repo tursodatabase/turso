@@ -2366,7 +2366,7 @@ impl PostgreSQLTranslator {
                 select: ast::OneSelect::Values(rows),
                 compounds: vec![],
             };
-            let order_by = self.translate_order_by(&select.sort_clause)?;
+            let order_by = self.translate_select_order_by(&select.sort_clause)?;
             let limit = self.translate_select_limit(select)?;
             let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
@@ -2399,7 +2399,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let order_by = self.translate_select_order_by(&select.sort_clause)?;
 
         let distinctness = translate_distinct_clause(&select.distinct_clause)?;
 
@@ -2484,7 +2484,7 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let order_by = self.translate_select_order_by(&select.sort_clause)?;
         let limit = self.translate_select_limit(select)?;
         let with = self.translate_with_clause(&select.with_clause)?;
 
@@ -5350,6 +5350,76 @@ impl PostgreSQLTranslator {
             .map(|arg| self.translate_expr(arg).map(Box::new))
             .collect::<Result<_, _>>()?;
         Ok(ast::Expr::Parenthesized(values))
+    }
+
+    /// The ORDER BY of a SELECT, where a constant must be an integer that is a position in
+    /// the select list.
+    fn translate_select_order_by(
+        &self,
+        sort_clause: &[pg_query::protobuf::Node],
+    ) -> Result<Vec<ast::SortedColumn>, ParseError> {
+        let sort_exprs = sort_clause.iter().filter_map(|node| match &node.node {
+            Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => sort_by.node.as_deref(),
+            _ => None,
+        });
+        Self::reject_constant_that_is_not_a_position(sort_exprs, "ORDER BY")?;
+        self.translate_order_by(sort_clause)
+    }
+
+    fn reject_constant_that_is_not_a_position<'a>(
+        exprs: impl IntoIterator<Item = &'a pg_query::protobuf::Node>,
+        clause: &str,
+    ) -> Result<(), ParseError> {
+        use pg_query::protobuf::{a_const::Val, node::Node};
+
+        for expr in exprs {
+            match &expr.node {
+                Some(Node::AConst(constant)) if !matches!(constant.val, Some(Val::Ival(_))) => {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_SYNTAX_ERROR,
+                        message: format!("non-integer constant in {clause}"),
+                    });
+                }
+                Some(Node::AConst(_)) => {}
+                _ if Self::is_integer_constant_with_sign_or_collation(expr) => {
+                    return Err(ParseError::not_supported(format!(
+                        "an integer constant with a sign or a COLLATE in {clause}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the expression is an integer constant under unary `+`, unary `-` or COLLATE,
+    /// such as `+1`. The engine would read it as a position in the select list.
+    fn is_integer_constant_with_sign_or_collation(expr: &pg_query::protobuf::Node) -> bool {
+        use pg_query::protobuf::{a_const::Val, node::Node, AExprKind};
+
+        match &expr.node {
+            Some(Node::AConst(constant)) => matches!(constant.val, Some(Val::Ival(_))),
+            Some(Node::CollateClause(collate)) => collate
+                .arg
+                .as_deref()
+                .is_some_and(Self::is_integer_constant_with_sign_or_collation),
+            Some(Node::AExpr(a_expr)) => {
+                let is_sign = a_expr.kind() == AExprKind::AexprOp
+                    && a_expr.lexpr.is_none()
+                    && matches!(
+                        a_expr.name.as_slice(),
+                        [pg_query::protobuf::Node {
+                            node: Some(Node::String(name)),
+                        }] if name.sval == "+" || name.sval == "-"
+                    );
+                is_sign
+                    && a_expr
+                        .rexpr
+                        .as_deref()
+                        .is_some_and(Self::is_integer_constant_with_sign_or_collation)
+            }
+            _ => false,
+        }
     }
 
     fn translate_order_by(

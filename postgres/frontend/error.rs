@@ -328,7 +328,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
-    } else if msg.starts_with("ambiguous column name") {
+    } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
         SQLSTATE_AMBIGUOUS_COLUMN
     } else if msg.starts_with("misuse of aggregate")
         || msg.starts_with("aggregate functions are not allowed")
@@ -338,7 +338,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("window functions are not allowed")
     {
         SQLSTATE_WINDOWING_ERROR
-    } else if msg.starts_with("invalid reference to FROM-clause entry") {
+    } else if msg.starts_with("invalid reference to FROM-clause entry")
+        || msg.contains(" term out of range - should be between ")
+    {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
@@ -586,6 +588,11 @@ mod tests {
                 "role \"no such table\" already exists",
                 SQLSTATE_DUPLICATE_OBJECT,
             ),
+            (
+                "1st ORDER BY term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            ("ORDER BY \"a\" is ambiguous", SQLSTATE_AMBIGUOUS_COLUMN),
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t_x\" is an index", SQLSTATE_WRONG_OBJECT_TYPE),
