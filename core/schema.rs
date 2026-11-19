@@ -9695,7 +9695,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_no_virtual_columns() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = table_t(vec![stored_column("a"), stored_column("b")])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
         assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
@@ -9705,12 +9705,11 @@ mod tests {
 
     #[test]
     fn gencol_graph_linear_chain() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["b"]),
+        ])?;
         // affected-by({a}) = {a, b, c}
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1, 2]);
         // affected-by({b}) = {b, c} (b is virtual, but updating it still propagates through dependents)
@@ -9726,12 +9725,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_diamond() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b", "c"]),
+        ])?;
         assert_eq!(
             indices(&t.columns_affected_by_update([0])?),
             vec![0, 1, 2, 3]
@@ -9749,12 +9748,11 @@ mod tests {
 
     #[test]
     fn gencol_graph_multiple_stored_roots() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a", "b"]),
+        ])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 2]);
         assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
         assert_eq!(
@@ -9767,12 +9765,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_empty_input() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         assert!(t.columns_affected_by_update(std::iter::empty())?.is_empty());
         assert!(t.dependencies_of_columns(std::iter::empty())?.is_empty());
         Ok(())
@@ -9780,12 +9773,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_disjoint_components() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            stored_column("c"),
+            virtual_column("d", &["c"]),
+        ])?;
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1]);
         assert_eq!(indices(&t.columns_affected_by_update([2])?), vec![2, 3]);
         assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
@@ -9796,12 +9789,7 @@ mod tests {
     #[test]
     fn gencol_graph_deep_chain() -> Result<()> {
         // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..50 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
+        let t = table_t(chain(50))?;
         // affected-by({c0}) = {c0..c49}
         let affected = t.columns_affected_by_update([0])?;
         assert_eq!(affected.count(), 50);
@@ -9814,12 +9802,7 @@ mod tests {
     fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
         // Validates that the iterative Kahn's + DP don't blow the stack on
         // realistic worst-case generated-column depth.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..500 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, &sql, 0, false)?;
+        let t = table_t(chain(500))?;
         assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
         assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
         Ok(())
@@ -9827,12 +9810,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         let affected = t.columns_affected_by_update([ROWID_SENTINEL])?;
         // ROWID_SENTINEL is preserved in the mask flag but does not propagate through the graph
         // (no generated column can depend on ROWID_SENTINEL directly).
@@ -9843,12 +9821,12 @@ mod tests {
 
     #[test]
     fn gencol_graph_transpose_duality() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            virtual_column("b", &["a"]),
+            virtual_column("c", &["b"]),
+            virtual_column("d", &["a", "c"]),
+        ])?;
         let graph = t.column_graph()?;
         // j ∈ dependencies[i] iff i ∈ dependents[j]
         for i in 0..graph.dependencies.len() {
@@ -9871,12 +9849,12 @@ mod tests {
     #[test]
     fn gencol_graph_idempotence() -> Result<()> {
         // affected_by(affected_by(xs)) == affected_by(xs).
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b", "c"]),
+        ])?;
         let once = t.columns_affected_by_update([0, 1])?;
         let twice = t.columns_affected_by_update(once.iter())?;
         assert_eq!(indices(&twice), indices(&once));
@@ -9886,12 +9864,13 @@ mod tests {
     #[test]
     fn gencol_graph_union_monotonicity() -> Result<()> {
         // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
-        let t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let t = table_t(vec![
+            stored_column("a"),
+            stored_column("b"),
+            virtual_column("c", &["a"]),
+            virtual_column("d", &["b"]),
+            virtual_column("e", &["c", "d"]),
+        ])?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
         expected.union_with(&b_mask).unwrap();
@@ -9906,12 +9885,7 @@ mod tests {
         // After cloning a BTreeTable, the cache is fresh. Mutating columns on
         // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
         // rebuilds correctly.
-        let original = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let original = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         // Force the cache to be populated on the original.
         let _ = original.columns_affected_by_update([0])?;
         assert!(original.peek_column_dependencies().is_some());
@@ -9935,12 +9909,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
-        let mut t = BTreeTable::from_stored_sql(
-            &SqliteDialect,
-            "CREATE TABLE t(a, b AS (a) VIRTUAL)",
-            0,
-            false,
-        )?;
+        let mut t = table_t(vec![stored_column("a"), virtual_column("b", &["a"])])?;
         // Force the cache to be populated.
         let _ = t.columns_affected_by_update([0])?;
         assert!(t.peek_column_dependencies().is_some());
@@ -9953,7 +9922,7 @@ mod tests {
 
     #[test]
     fn gencol_graph_of_table_without_generated_columns_is_built_on_first_use() -> Result<()> {
-        let t = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 0, false)?;
+        let t = table_t(vec![stored_column("a"), stored_column("b")])?;
         assert!(t.peek_column_dependencies().is_none());
 
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
@@ -9984,6 +9953,66 @@ mod tests {
         assert_eq!(root_page(&schema), 2);
         assert_eq!(root_page(&copy), 3);
         Ok(())
+    }
+
+    /// A rowid table named `t` with the given columns, set up the way a
+    /// `CREATE TABLE` sets up its generated columns.
+    fn table_t(columns: Vec<Column>) -> Result<BTreeTable> {
+        let mut table = BTreeTable::new(
+            0,
+            "t".to_string(),
+            vec![],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        table.prepare_generated_columns()?;
+        Ok(table)
+    }
+
+    /// A column without a declared type, like `a` in `CREATE TABLE t(a)`.
+    fn stored_column(name: &str) -> Column {
+        Column::new(
+            Some(name.to_string()),
+            String::new(),
+            None,
+            None,
+            Type::Null,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    /// A virtual column that adds up the named columns, like
+    /// `c AS (a + b) VIRTUAL`.
+    fn virtual_column(name: &str, sources: &[&str]) -> Column {
+        let expr = sources
+            .iter()
+            .map(|source| Expr::Id(ast::Name::exact(source.to_string())))
+            .reduce(|sum, next| Expr::Binary(Box::new(sum), ast::Operator::Add, Box::new(next)))
+            .expect("a generated column needs at least one source column");
+        Column::new(
+            Some(name.to_string()),
+            String::new(),
+            None,
+            Some(GeneratedType::new(Box::new(expr), false)),
+            Type::Null,
+            None,
+            ColDef::default(),
+        )
+    }
+
+    /// Columns `c0` to `c{len - 1}` where `c0` is stored and each later
+    /// column is a virtual copy of the one before it.
+    fn chain(len: usize) -> Vec<Column> {
+        let mut columns = vec![stored_column("c0")];
+        for i in 1..len {
+            columns.push(virtual_column(&format!("c{i}"), &[&format!("c{}", i - 1)]));
+        }
+        columns
     }
 
     /// `install_sequence_descriptor` must surface an error when the
