@@ -869,7 +869,7 @@ expect {
     1
 }
 
-# B-88 (S2): DISTINCT ON keeps first per ORDER BY
+# B-88: DISTINCT ON keeps first per ORDER BY
 test gap-b-88-distinct-on-keeps-first-per-order-by {
     CREATE TABLE x (g int, v text);
     INSERT INTO x VALUES (1, 'b'), (1, 'a'), (2, 'c');
@@ -879,8 +879,6 @@ expect {
     1|a
     2|c
 }
-@sqlstate 0A000
-expect @tursopg error {}
 
 # B-90 (S1): count/sum/avg output
 @setup t_id_s_n_arr_ia_j_ok_with_rows

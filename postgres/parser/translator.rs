@@ -2401,7 +2401,7 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_select_order_by(&select.sort_clause)?;
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
+        let distinctness = self.translate_distinct_clause(select)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2608,7 +2608,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
+        let distinctness = self.translate_distinct_clause(select)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2622,6 +2622,39 @@ impl PostgreSQLTranslator {
             group_by,
             window_clause,
         })
+    }
+
+    /// A plain DISTINCT is a list of one empty node; DISTINCT ON is the list of its expressions.
+    fn translate_distinct_clause(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<Option<ast::SelectDistinctness>, ParseError> {
+        let distinct_clause = &select.distinct_clause;
+        if distinct_clause.is_empty() {
+            return Ok(None);
+        }
+        if distinct_clause.iter().all(|node| node.node.is_none()) {
+            return Ok(Some(ast::SelectDistinctness::Distinct));
+        }
+        // A COLLATE that names the binary collation is translated to nothing, so two
+        // expressions that PostgreSQL finds different would compare as the same.
+        let has_collate = distinct_clause
+            .iter()
+            .chain(&select.sort_clause)
+            .filter_map(|node| node.node.as_ref())
+            .flat_map(|node| node.nodes())
+            .any(|(node, ..)| matches!(node, NodeRef::CollateClause(_)));
+        if has_collate {
+            return Err(ParseError::not_supported(
+                "COLLATE in a SELECT DISTINCT ON expression or in its ORDER BY",
+            ));
+        }
+        Self::reject_constant_that_is_not_a_position(distinct_clause, "DISTINCT ON")?;
+        let exprs = distinct_clause
+            .iter()
+            .map(|node| self.translate_expr(node).map(Box::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ast::SelectDistinctness::DistinctOn(exprs)))
     }
 
     /// Translate multiple FROM items. The first becomes the primary table,
@@ -10014,18 +10047,6 @@ fn compound_operator(
     }
 }
 
-fn translate_distinct_clause(
-    distinct_clause: &[pg_query::protobuf::Node],
-) -> Result<Option<ast::SelectDistinctness>, ParseError> {
-    if distinct_clause.is_empty() {
-        return Ok(None);
-    }
-    if distinct_clause.iter().any(|n| n.node.is_some()) {
-        return Err(ParseError::not_supported("SELECT DISTINCT ON"));
-    }
-    Ok(Some(ast::SelectDistinctness::Distinct))
-}
-
 fn reject_column_aliases(
     alias: &Option<pg_query::protobuf::Alias>,
     what: &str,
@@ -13861,14 +13882,21 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_distinct_on() {
+    fn distinct_on_keeps_its_expressions() {
+        let parsed = crate::parse("SELECT DISTINCT ON (a, b + 1) a, b FROM t").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT DISTINCT ON (a, b + 1) a, b FROM t"
+        );
+        assert_translates("SELECT DISTINCT ON (a) a FROM t UNION SELECT 1");
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (a) a FROM t ORDER BY a COLLATE \"C\"",
+            "COLLATE",
         );
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a FROM t UNION SELECT 1",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (lower(a COLLATE \"C\")) a FROM t",
+            "COLLATE",
         );
         assert_translates("SELECT DISTINCT a, b FROM t");
     }

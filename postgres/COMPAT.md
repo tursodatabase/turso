@@ -224,7 +224,7 @@ return date, time, timetz or interval, such as `age` and `make_date`.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | ANY_VALUE aggregate | ❌ Not supported | |
-| DISTINCT ON | ❌ Not supported | Rejected |
+| DISTINCT ON | 🟡 Partial | Rejected: COLLATE in a DISTINCT ON expression or in its ORDER BY; a volatile function such as `nextval()` or `random()` in the select list; in a query with aggregates, an expression that reads a column outside GROUP BY (PostgreSQL accepts a column that depends on a grouped primary key); an aggregate that appears only in a DISTINCT ON expression; an expression computed on an aggregate when there is no GROUP BY |
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES rejected |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *`; on UPDATE ... FROM, `RETURNING *` is rejected (it would omit the FROM tables' columns) |
