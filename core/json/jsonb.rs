@@ -3934,7 +3934,17 @@ fn validate_payload(
             while pos < payload_end {
                 let (child, child_header_offset, child_end) =
                     check_child_header(data, pos, payload_end, depth + 1, strict, is_key)?;
-                validate_payload(data, pos, child, child_header_offset, depth + 1, strict)?;
+                // A lenient check of a scalar needs no recursive call.
+                if strict
+                    || matches!(
+                        child.element_type(),
+                        ElementType::ARRAY | ElementType::OBJECT
+                    )
+                {
+                    validate_payload(data, pos, child, child_header_offset, depth + 1, strict)?;
+                } else {
+                    check_lenient_scalar(pos, child)?;
+                }
                 pos = child_end;
                 is_key = is_object && !is_key;
             }
@@ -3948,6 +3958,15 @@ fn validate_payload(
         // The lenient checks of a scalar use no locals. The strict checks do,
         // so they are out of line.
         _ if strict => validate_scalar_payload(data, start, header, header_offset, strict),
+        _ => check_lenient_scalar(start, header),
+    }
+}
+
+/// The lenient checks of the scalar element at `start`: the payload size of
+/// NULL, TRUE and FALSE is 0, and the payload size of a number is not 0.
+#[inline(always)]
+fn check_lenient_scalar(start: usize, header: JsonbHeader) -> std::result::Result<(), usize> {
+    match header.element_type() {
         ElementType::NULL | ElementType::TRUE | ElementType::FALSE
             if header.payload_size() != 0 =>
         {
