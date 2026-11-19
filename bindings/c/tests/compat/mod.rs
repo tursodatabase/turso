@@ -196,7 +196,6 @@ extern "C" {
     fn sqlite3_value_dup(value: *mut libc::c_void) -> *mut libc::c_void;
     fn sqlite3_value_free(value: *mut libc::c_void);
     fn sqlite3_context_db_handle(context: *mut libc::c_void) -> *mut libc::c_void;
-    fn sqlite3_user_data(context: *mut libc::c_void) -> *mut libc::c_void;
 }
 
 const SQLITE_OK: i32 = 0;

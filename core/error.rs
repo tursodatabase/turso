@@ -267,6 +267,7 @@ impl LimboError {
             | Self::TxError(message)
             | Self::LockingError(message)
             | Self::InvalidDate(message)
+            | Self::DatetimeFieldOverflow(message)
             | Self::InvalidTime(message)
             | Self::InvalidModifier(message)
             | Self::InvalidArgument(message)
