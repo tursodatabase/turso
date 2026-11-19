@@ -3414,9 +3414,6 @@ impl Jsonb {
         Err(LimboError::ParseError("Not found".to_string()))
     }
 
-    /// Appends an empty `placeholder_type` container to the array at
-    /// `array_idx` and rewrites the array header to include it. Returns the
-    /// placeholder position and the number of bytes the array grew by.
     /// Returns the offset of the element that a negative array index selects
     /// (`-1` is the last element) in the array whose elements are between
     /// `first` and `end`, or None when the array has fewer elements.
@@ -3443,6 +3440,9 @@ impl Jsonb {
         Ok(Some(pos))
     }
 
+    /// Appends an empty `placeholder_type` container to the array at
+    /// `array_idx` and rewrites the array header to include it. Returns the
+    /// placeholder position and the number of bytes the array grew by.
     fn append_array_placeholder(
         &mut self,
         array_idx: usize,
@@ -3775,12 +3775,6 @@ impl std::str::FromStr for Jsonb {
     }
 }
 
-/// Reads the `len`-byte text payload that starts at `start`. The bytes may
-/// not be UTF-8.
-///
-/// JSONB documents are validated on entry, but text payloads are read from
-/// buffers that user-supplied blobs flow into, so the range may not be
-/// assumed here.
 /// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the
 /// usual case, is checked with [validate_utf8], which is faster than the
 /// byte-at-a-time decoder of the lossy conversion.
@@ -3791,6 +3785,12 @@ pub(crate) fn utf8_lossy(bytes: &[u8]) -> Cow<'_, str> {
     }
 }
 
+/// Reads the `len`-byte text payload that starts at `start`. The bytes may
+/// not be UTF-8.
+///
+/// JSONB documents are validated on entry, but text payloads are read from
+/// buffers that user-supplied blobs flow into, so the range may not be
+/// assumed here.
 fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
     let Some(end) = start.checked_add(len) else {
         bail_parse_error!("malformed JSON: text payload size overflow");
