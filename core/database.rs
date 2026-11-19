@@ -3261,6 +3261,13 @@ impl Database {
         Arc::as_ptr(&self.shared_wal) as usize
     }
 
+    /// Indexes of the WAL read-lock slots that a connection of this database
+    /// holds.
+    #[cfg(feature = "test_helper")]
+    pub fn wal_read_slots_with_readers(&self) -> Vec<usize> {
+        self.shared_wal.read().read_slots_with_readers()
+    }
+
     #[cfg(feature = "simulator")]
     pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
         #[cfg(host_shared_wal)]

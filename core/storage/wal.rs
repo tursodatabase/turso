@@ -5827,6 +5827,19 @@ impl WalFileShared {
         )
     }
 
+    /// Indexes of the read-lock slots that at least one reader holds.
+    #[cfg(feature = "test_helper")]
+    pub(crate) fn read_slots_with_readers(&self) -> Vec<usize> {
+        self.runtime
+            .read_locks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, lock)| {
+                TursoRwLock::has_readers(lock.0.load(Ordering::Acquire)).then_some(slot)
+            })
+            .collect()
+    }
+
     #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,
@@ -6163,7 +6176,6 @@ pub mod test {
     };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
-    use crate::SqliteDialect;
     use crate::{
         io::FileSyncType,
         storage::{
@@ -6222,7 +6234,7 @@ pub mod test {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         // db + tmp directory
@@ -6353,28 +6365,6 @@ pub mod test {
         );
         assert!(wal_file.size().unwrap() == WAL_HEADER_SIZE as u64);
         assert!(*done.lock());
-    }
-
-    fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
-        for _ in 0..n_txns {
-            conn.execute("begin transaction").unwrap();
-            for i in 0..rows_per_txn {
-                conn.execute(format!("insert into test(value) values ('v{i}')"))
-                    .unwrap();
-            }
-            conn.execute("commit").unwrap();
-        }
-    }
-
-    fn count_test_table(conn: &Arc<Connection>) -> i64 {
-        let mut stmt = conn.prepare("select count(*) from test").unwrap();
-        let mut count: i64 = 0;
-        stmt.run_with_row_callback(|row| {
-            count = row.get(0).unwrap();
-            Ok(())
-        })
-        .unwrap();
-        count
     }
 
     /// Commits `n_txns` write transactions of `conn` that each grow the
@@ -7475,20 +7465,6 @@ pub mod test {
     }
 
     #[cfg(test)]
-    fn read_slots_with_readers(shared: &WalFileShared) -> Vec<usize> {
-        shared
-            .runtime
-            .read_locks
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, lock)| {
-                let state = lock.0.load(Ordering::Acquire);
-                let has_readers = (state & super::TursoRwLock::READER_COUNT_MASK) != 0;
-                has_readers.then_some(slot)
-            })
-            .collect()
-    }
-
     fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
         // (checkpoint_seq, salt1, salt2, page_size)
         let shared_guard = shared.read();
@@ -10423,158 +10399,5 @@ pub mod test {
                 "RESTART checkpoint should succeed after reader releases slot 0"
             );
         }
-    }
-
-    #[test]
-    fn test_rollback_releases_shared_read_lock_slot() {
-        let (db, _path) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO t VALUES(1)").unwrap();
-
-        let locked_slots_before = {
-            let shared = db.shared_wal.read();
-            read_slots_with_readers(&shared)
-        };
-        assert_eq!(
-            locked_slots_before.len(),
-            1,
-            "expected exactly one shared read-lock slot while transaction is active"
-        );
-
-        conn.execute("ROLLBACK").unwrap();
-
-        let locked_slots_after = {
-            let shared = db.shared_wal.read();
-            read_slots_with_readers(&shared)
-        };
-        assert!(
-            locked_slots_after.is_empty(),
-            "ROLLBACK must release the shared read-lock slot"
-        );
-    }
-
-    #[test]
-    fn test_rollback_releases_slot_zero_read_lock() {
-        let (db, _path) = get_database();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute("CREATE TABLE test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn, 3, 3);
-        {
-            let pager = conn.pager.load();
-            let result = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
-            assert!(
-                result.everything_backfilled(),
-                "restart checkpoint setup must fully backfill WAL"
-            );
-        }
-
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO test(value) VALUES('slot0')")
-            .unwrap();
-
-        let locked_slots_before = {
-            let shared = db.shared_wal.read();
-            read_slots_with_readers(&shared)
-        };
-        assert_eq!(
-            locked_slots_before,
-            vec![0],
-            "writer should use slot 0 when WAL is fully checkpointed"
-        );
-
-        conn.execute("ROLLBACK").unwrap();
-
-        let locked_slots_after = {
-            let shared = db.shared_wal.read();
-            read_slots_with_readers(&shared)
-        };
-        assert!(
-            locked_slots_after.is_empty(),
-            "ROLLBACK must release slot 0 shared read-lock as well"
-        );
-    }
-
-    #[test]
-    fn test_savepoint_then_tx_rollback_allows_restart_checkpoint_from_other_connection() {
-        let (db, _path) = get_database();
-        let conn1 = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let conn2 = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn1
-            .execute("CREATE TABLE test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn1, 2, 2);
-        let count_before = count_test_table(&conn1);
-
-        conn1.execute("BEGIN").unwrap();
-        conn1
-            .execute("INSERT INTO test(id, value) VALUES(1000, 'first')")
-            .unwrap();
-        let duplicate = conn1.execute("INSERT INTO test(id, value) VALUES(1000, 'dup')");
-        assert!(duplicate.is_err(), "duplicate PK insert must fail");
-
-        {
-            let pager = conn1.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            assert!(
-                wal.holds_read_lock(),
-                "read lock must still be held after savepoint rollback"
-            );
-            assert!(
-                wal.holds_write_lock(),
-                "write lock must still be held after savepoint rollback"
-            );
-        }
-
-        conn1.execute("ROLLBACK").unwrap();
-
-        {
-            let pager = conn1.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            assert!(
-                !wal.holds_read_lock(),
-                "read lock must be released after transaction rollback"
-            );
-            assert!(
-                !wal.holds_write_lock(),
-                "write lock must be released after transaction rollback"
-            );
-        }
-
-        let locked_slots_after_rollback = {
-            let shared = db.shared_wal.read();
-            read_slots_with_readers(&shared)
-        };
-        assert!(
-            locked_slots_after_rollback.is_empty(),
-            "transaction rollback after savepoint failure must not leak shared read locks"
-        );
-        assert_eq!(
-            count_test_table(&conn1),
-            count_before,
-            "transaction rollback should remove writes made before savepoint failure"
-        );
-
-        let result = {
-            let pager = conn2.pager.load();
-            run_checkpoint_until_done(&pager, CheckpointMode::Restart)
-        };
-        assert!(
-            result.everything_backfilled(),
-            "restart checkpoint from another connection must succeed after full rollback"
-        );
     }
 }

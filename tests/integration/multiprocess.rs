@@ -1734,6 +1734,138 @@ fn write_after_full_checkpoint_restarts_wal() {
     assert_eq!(count_test_rows(&conn), 21);
 }
 
+#[test]
+fn test_rollback_releases_shared_read_lock_slot() {
+    let (db, _dir) = open_rollback_test_db();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+    let locked_slots_before = db.wal_read_slots_with_readers();
+    assert_eq!(
+        locked_slots_before.len(),
+        1,
+        "expected exactly one shared read-lock slot while transaction is active"
+    );
+
+    conn.execute("ROLLBACK").unwrap();
+
+    let locked_slots_after = db.wal_read_slots_with_readers();
+    assert!(
+        locked_slots_after.is_empty(),
+        "ROLLBACK must release the shared read-lock slot"
+    );
+}
+
+#[test]
+fn test_rollback_releases_slot_zero_read_lock() {
+    let (db, _dir) = open_rollback_test_db();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TABLE test(id integer primary key, value text)")
+        .unwrap();
+    bulk_inserts(&conn, 3, 3);
+    {
+        let result = run_checkpoint(&conn, CheckpointMode::Restart);
+        assert!(
+            result.everything_backfilled(),
+            "restart checkpoint setup must fully backfill WAL"
+        );
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO test(value) VALUES('slot0')")
+        .unwrap();
+
+    let locked_slots_before = db.wal_read_slots_with_readers();
+    assert_eq!(
+        locked_slots_before,
+        vec![0],
+        "writer should use slot 0 when WAL is fully checkpointed"
+    );
+
+    conn.execute("ROLLBACK").unwrap();
+
+    let locked_slots_after = db.wal_read_slots_with_readers();
+    assert!(
+        locked_slots_after.is_empty(),
+        "ROLLBACK must release slot 0 shared read-lock as well"
+    );
+}
+
+#[test]
+fn test_savepoint_then_tx_rollback_allows_restart_checkpoint_from_other_connection() {
+    let (db, _dir) = open_rollback_test_db();
+    let conn1 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn1
+        .execute("CREATE TABLE test(id integer primary key, value text)")
+        .unwrap();
+    bulk_inserts(&conn1, 2, 2);
+    let count_before = count_test_rows(&conn1);
+
+    conn1.execute("BEGIN").unwrap();
+    conn1
+        .execute("INSERT INTO test(id, value) VALUES(1000, 'first')")
+        .unwrap();
+    let duplicate = conn1.execute("INSERT INTO test(id, value) VALUES(1000, 'dup')");
+    assert!(duplicate.is_err(), "duplicate PK insert must fail");
+
+    {
+        let pager = conn1.get_pager();
+        assert!(
+            pager.holds_read_lock(),
+            "read lock must still be held after savepoint rollback"
+        );
+        assert!(
+            pager.holds_write_lock(),
+            "write lock must still be held after savepoint rollback"
+        );
+    }
+
+    conn1.execute("ROLLBACK").unwrap();
+
+    {
+        let pager = conn1.get_pager();
+        assert!(
+            !pager.holds_read_lock(),
+            "read lock must be released after transaction rollback"
+        );
+        assert!(
+            !pager.holds_write_lock(),
+            "write lock must be released after transaction rollback"
+        );
+    }
+
+    let locked_slots_after_rollback = db.wal_read_slots_with_readers();
+    assert!(
+        locked_slots_after_rollback.is_empty(),
+        "transaction rollback after savepoint failure must not leak shared read locks"
+    );
+    assert_eq!(
+        count_test_rows(&conn1),
+        count_before,
+        "transaction rollback should remove writes made before savepoint failure"
+    );
+
+    let result = run_checkpoint(&conn2, CheckpointMode::Restart);
+    assert!(
+        result.everything_backfilled(),
+        "restart checkpoint from another connection must succeed after full rollback"
+    );
+}
+
 fn coordination_open_mode(db: &Database) -> Option<SharedWalCoordinationOpenTelemetryMode> {
     db.shared_wal_open_telemetry()
         .unwrap()
@@ -1763,4 +1895,24 @@ fn wal_max_frame(conn: &Arc<Connection>) -> u64 {
     conn.get_pager()
         .wal_max_frame()
         .expect("wal should be present")
+}
+
+/// Opens a new database with a multiprocess WAL. The returned `TempDir`
+/// deletes the database directory when it drops.
+fn open_rollback_test_db() -> (Arc<Database>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    (db, dir)
+}
+
+fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
+    for _ in 0..n_txns {
+        conn.execute("begin transaction").unwrap();
+        for i in 0..rows_per_txn {
+            conn.execute(format!("insert into test(value) values ('v{i}')"))
+                .unwrap();
+        }
+        conn.execute("commit").unwrap();
+    }
 }
