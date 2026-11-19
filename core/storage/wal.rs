@@ -6155,6 +6155,7 @@ pub mod test {
         Wal, WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile,
         WalSnapshot, NO_LOCK_HELD,
     };
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
@@ -6170,7 +6171,11 @@ pub mod test {
             database::{DatabaseFile, DatabaseStorage},
             encryption::{CipherMode, EncryptionContext, EncryptionKey},
             page_transform::{PageCodec, PageCodecContext, PageCodecId},
-            pager::{allocate_new_page, PageRef},
+            pager::{
+                allocate_new_page,
+                test_writes::{commit_new_pages, commit_user_version},
+                PageRef,
+            },
             sqlite3_ondisk::{self, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
@@ -6372,6 +6377,24 @@ pub mod test {
         count
     }
 
+    /// Commits `n_txns` write transactions of `conn` that each grow the
+    /// database by one page.
+    fn commit_txns(conn: &Connection, n_txns: usize) {
+        for _ in 0..n_txns {
+            commit_new_pages(conn, 1);
+        }
+    }
+
+    /// The database size in pages that `pager` sees, read from page 1 after
+    /// dropping its cached pages.
+    fn database_size(pager: &crate::Pager) -> u32 {
+        pager.clear_page_cache(false);
+        pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size.get()))
+            .unwrap()
+    }
+
     fn run_checkpoint_until_done(pager: &crate::Pager, mode: CheckpointMode) -> CheckpointResult {
         // Use pager.checkpoint() instead of wal.checkpoint() directly because
         // WAL truncation (for TRUNCATE mode) now happens in pager's TruncateWalFile phase.
@@ -6388,25 +6411,23 @@ pub mod test {
         let db = Database::open_file(
             shared_wal_test_io(),
             path.to_str().unwrap(),
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         let writer = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        writer
-            .execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&writer, 20, 10);
+        commit_txns(&writer, 21);
         let reader = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        reader.execute("begin").unwrap();
-        let reader_rows = count_test_table(&reader);
+        let reader_pager = reader.pager.load();
+        reader_pager.begin_read_tx().unwrap();
+        let reader_db_size = database_size(&reader_pager);
         let pager = writer.pager.load();
         let wal = pager.wal.as_ref().unwrap();
         let held_frame = wal.get_max_frame_in_wal();
-        bulk_inserts(&writer, 20, 10);
+        commit_txns(&writer, 20);
         assert!(wal.get_max_frame_in_wal() > held_frame);
         let passive = CheckpointMode::Passive {
             upper_bound_inclusive: None,
@@ -6426,8 +6447,8 @@ pub mod test {
         assert_eq!(checkpoint.wal_total_backfilled, held_frame);
         assert_eq!(checkpoint.wal_checkpoint_backfilled, 0);
         assert_eq!(frames_compared(), 0);
-        assert_eq!(count_test_table(&reader), reader_rows);
-        reader.execute("commit").unwrap();
+        assert_eq!(database_size(&reader_pager), reader_db_size);
+        reader_pager.end_read_tx();
     }
 
     fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
@@ -9043,9 +9064,7 @@ pub mod test {
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
         conn.wal_auto_actions_disable();
-        conn.execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn, 8, 2);
+        commit_txns(&conn, 9);
 
         let pager = conn.pager.load();
         let partial = run_checkpoint_until_done(
@@ -9092,7 +9111,7 @@ pub mod test {
             "RESTART must clear the proof for the old WAL generation"
         );
 
-        bulk_inserts(&conn, 6, 2);
+        commit_txns(&conn, 6);
         let replacement = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
@@ -9133,9 +9152,7 @@ pub mod test {
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
         conn.wal_auto_actions_disable();
-        conn.execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn, 8, 2);
+        commit_txns(&conn, 9);
 
         let pager = conn.pager.load();
         let partial = run_checkpoint_until_done(
@@ -9192,7 +9209,7 @@ pub mod test {
             "TRUNCATE must leave the WAL file empty before the new generation begins"
         );
 
-        bulk_inserts(&conn, 6, 2);
+        commit_txns(&conn, 6);
         let replacement = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
@@ -10175,9 +10192,7 @@ pub mod test {
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn, 20, 3);
+        commit_txns(&conn, 21);
         let IOResult::Done(completions) = conn.pager.load().cacheflush().unwrap() else {
             panic!()
         };
@@ -10249,8 +10264,7 @@ pub mod test {
         );
 
         // Next write should start a new sequence at frame 1.
-        conn.execute("insert into test(value) values ('post_restart')")
-            .unwrap();
+        commit_user_version(&conn, 1);
         conn.pager
             .load()
             .wal
@@ -10270,9 +10284,7 @@ pub mod test {
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn, 10, 5);
+        commit_txns(&conn, 11);
         // Checkpoint with restart
         {
             let pager = conn.pager.load();
@@ -10309,9 +10321,7 @@ pub mod test {
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
-        conn.execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn, 10, 5);
+        commit_txns(&conn, 11);
 
         // get max frame before checkpoint
         let max_frame_before = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
@@ -10360,10 +10370,7 @@ pub mod test {
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
 
-        conn1
-            .execute("create table test(id integer primary key, value text)")
-            .unwrap();
-        bulk_inserts(&conn1, 5, 5);
+        commit_txns(&conn1, 6);
         // Do a full checkpoint to move all data to DB file
         {
             let pager = conn1.pager.load();
@@ -10384,10 +10391,11 @@ pub mod test {
         // should use slot 0, as everything is backfilled
         assert!(check_read_lock_slot(&conn2, 0));
         {
-            let pager = conn1.pager.load();
+            let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
             let frame = wal.find_frame(5, None);
-            // since we hold readlock0, we should ignore the db file and find_frame should return none
+            // Page 5 has a frame in the WAL, but a reader on slot 0 reads every
+            // page from the database file.
             assert!(frame.is_ok_and(|f| f.is_none()));
         }
         // Try checkpoint, should fail because reader has slot 0

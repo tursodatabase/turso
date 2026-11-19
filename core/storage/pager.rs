@@ -7430,3 +7430,45 @@ mod checkpoint_phase_tests {
         );
     }
 }
+
+/// Write transactions for unit tests that need WAL frames but cannot run SQL.
+#[cfg(test)]
+pub(crate) mod test_writes {
+    use crate::util::IOExt;
+    use crate::{Connection, Pager, SyncMode};
+
+    /// Grows the database by `count` pages in one committed write transaction
+    /// of `conn`. The transaction writes the new pages and page 1.
+    pub(crate) fn commit_new_pages(conn: &Connection, count: usize) {
+        commit_write_tx(conn, |pager| {
+            for _ in 0..count {
+                pager.io.block(|| pager.allocate_page()).unwrap();
+            }
+        });
+    }
+
+    /// Sets the user version in the database header in one committed write
+    /// transaction of `conn`. The transaction writes only page 1.
+    pub(crate) fn commit_user_version(conn: &Connection, user_version: i32) {
+        commit_write_tx(conn, |pager| {
+            pager
+                .io
+                .block(|| pager.with_header_mut(|header| header.user_version = user_version.into()))
+                .unwrap();
+        });
+    }
+
+    fn commit_write_tx(conn: &Connection, write: impl FnOnce(&Pager)) {
+        let pager = conn.pager.load();
+        pager.begin_read_tx().unwrap();
+        pager
+            .io
+            .block(|| pager.begin_write_tx(conn.wal_auto_actions()))
+            .unwrap();
+        write(&pager);
+        pager
+            .io
+            .block(|| pager.commit_tx(conn, SyncMode::Full, true))
+            .unwrap();
+    }
+}
