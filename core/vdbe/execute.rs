@@ -4260,11 +4260,12 @@ pub fn op_halt(
         insn
     );
     // If description_reg is set, read the error message from that register at runtime
-    // (used by RAISE with expression-based error messages).
+    // (used by RAISE with expression-based error messages). Each statement
+    // ends with a Halt, so the static description is borrowed, not copied.
     let desc = if let Some(reg) = description_reg {
-        state.registers[*reg].get_value().to_string()
+        std::borrow::Cow::Owned(state.registers[*reg].get_value().to_string())
     } else {
-        description.to_string()
+        std::borrow::Cow::Borrowed(description.as_str())
     };
     halt(
         program,
