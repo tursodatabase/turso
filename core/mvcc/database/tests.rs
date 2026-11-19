@@ -650,7 +650,6 @@ use crate::security::roles::SessionRole;
 use crate::types::Text;
 use crate::Database;
 use crate::MemoryIO;
-use crate::StepResult;
 use crate::Value;
 // Simple atomic clock implementation for testing
 
@@ -1237,17 +1236,24 @@ fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
-        .unwrap();
 
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
-    let tx_id = conn.get_mv_tx_id().unwrap();
+    let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
+    mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "1"))
+        .unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
         CommitYieldPoint::BeforeFinishCommittedTx.point(),
     ])));
-    let mut commit = conn.prepare("COMMIT").unwrap();
-    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+    let mut commit = mvcc_store
+        .commit_tx(tx_id, &conn, crate::MAIN_DB_ID)
+        .unwrap();
+    loop {
+        match commit.step(&mvcc_store).unwrap() {
+            IOResult::IO(io) if io.is_explicit_yield() => break,
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+            IOResult::Done(_) => panic!("commit finished without the injected yield"),
+        }
+    }
 
     let commit_ts = match mvcc_store.txs.get(&tx_id).unwrap().value().state.load() {
         TransactionState::Committed(ts) => ts,
@@ -2262,18 +2268,6 @@ fn commit_dep_read_committed(db: &MvccTestDbNoConn, ids: &[i64]) -> Vec<Option<R
         .collect();
     mvcc_store.rollback_tx(tx_id, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
     conn.close().unwrap();
-    rows
-}
-
-fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
-    let mut stmt = conn.prepare(query).unwrap();
-    let mut rows = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        rows.push(values);
-        Ok(())
-    })
-    .unwrap();
     rows
 }
 
