@@ -29,7 +29,10 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::schema;
-use crate::translate::schema::{emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType};
+use crate::translate::schema::{
+    emit_delete_sequence_backing_table_row, emit_schema_entry, open_sqlite_schema_for_write,
+    SchemaEntryType,
+};
 use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -1141,7 +1144,8 @@ pub fn translate_create_sequence(
 }
 
 /// Emit the cursor / sqlite_schema-delete / Destroy / DropSequence bytecode
-/// for removing a single sequence from `database_id`. Callers must wrap this
+/// for removing a single sequence from `database_id` whose `sqlite_schema`
+/// row the dialect's catalog does not delete. Callers must wrap this
 /// with their own `begin_write_on_database` + `SetCookie` (so that callers
 /// dropping several schema objects in one statement — e.g. `DROP TABLE` on an
 /// AUTOINCREMENT table cleaning up its implicit sequence — share a single
@@ -1156,78 +1160,50 @@ pub(crate) fn emit_drop_sequence_cleanup(
     namespace: NamespaceRef,
     seq_name: &str,
 ) -> Result<bool> {
-    let database_id = namespace.database_id;
+    let Some(root_page) = sequence_backing_table_root_page(resolver, namespace, seq_name) else {
+        return Ok(false);
+    };
+    let sqlite_schema_cursor_id =
+        open_sqlite_schema_for_write(program, resolver, namespace.database_id);
+    emit_delete_sequence_backing_table_row(
+        program,
+        sqlite_schema_cursor_id,
+        sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name)),
+    );
+    emit_destroy_sequence(program, namespace, seq_name, root_page);
+    Ok(true)
+}
+
+/// The root page of the backing table of sequence `seq_name` of
+/// `namespace`. None when the sequence or its backing table is missing.
+fn sequence_backing_table_root_page(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    seq_name: &str,
+) -> Option<i64> {
     let backing_table_name =
         sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name));
-    let root_page = resolver.with_schema(database_id, |s| {
+    resolver.with_schema(namespace.database_id, |s| {
         s.get_sequence(namespace.id, seq_name)?;
         Some(
             s.get_btree_table(NamespaceId::ROOT, &backing_table_name)?
                 .root_page,
         )
-    });
-    let Some(root_page) = root_page else {
-        return Ok(false);
-    };
+    })
+}
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    let seq_name_reg = program.alloc_register();
-    let type_str_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        dest: seq_name_reg,
-        value: backing_table_name,
-    });
-    program.emit_insn(Insn::String8 {
-        dest: type_str_reg,
-        value: "table".to_string(),
-    });
-
-    // Scan sqlite_schema for (type='table' AND name=backing_table_name) and delete the row.
-    let end_loop_label = program.allocate_label();
-    let loop_start_label = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_empty: end_loop_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-    let col0_reg = program.alloc_register();
-    let col1_reg = program.alloc_register();
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
-    let skip_delete_label = program.allocate_label();
-    program.emit_insn(Insn::Ne {
-        lhs: col0_reg,
-        rhs: type_str_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_insn(Insn::Ne {
-        lhs: col1_reg,
-        rhs: seq_name_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id,
-        table_name: "sqlite_schema".to_string(),
-        is_part_of_update: false,
-    });
-    program.preassign_label_to_next_insn(skip_delete_label);
-    program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(end_loop_label);
-
-    // Destroy the B-tree root page
+/// Destroys the B-tree of the backing table of sequence `seq_name`, whose
+/// root page is `root_page`, and removes the sequence from the schema in
+/// memory.
+fn emit_destroy_sequence(
+    program: &mut ProgramBuilder,
+    namespace: NamespaceRef,
+    seq_name: &str,
+    root_page: i64,
+) {
     let former_root_reg = program.alloc_register();
     program.emit_insn(Insn::Destroy {
-        db: database_id,
+        db: namespace.database_id,
         root: root_page,
         former_root_reg,
         is_temp: 0,
@@ -1235,11 +1211,10 @@ pub(crate) fn emit_drop_sequence_cleanup(
 
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {
-        db: database_id,
+        db: namespace.database_id,
         namespace: namespace.id,
         seq_name: seq_name.to_string(),
     });
-    Ok(true)
 }
 
 /// Translate DROP SEQUENCE into bytecode that removes the definition from sqlite_schema.
@@ -1301,9 +1276,9 @@ pub(crate) fn emit_drop_sequence(
     namespace: NamespaceRef,
     seq_name: &str,
 ) -> Result<bool> {
-    if !emit_drop_sequence_cleanup(program, resolver, namespace, seq_name)? {
+    let Some(root_page) = sequence_backing_table_root_page(resolver, namespace, seq_name) else {
         return Ok(false);
-    }
+    };
     let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1313,6 +1288,7 @@ pub(crate) fn emit_drop_sequence(
             name: seq_name,
         }),
     )?;
+    emit_destroy_sequence(program, namespace, seq_name, root_page);
     Ok(true)
 }
 

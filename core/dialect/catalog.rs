@@ -237,7 +237,7 @@ pub struct CreateSequence<'a> {
 }
 
 /// A sequence that is dropped, by `DROP SEQUENCE` or with the column that
-/// owns it.
+/// owns it, before the statement destroys the B-tree of its backing table.
 #[derive(Debug, Clone, Copy)]
 pub struct DropSequence<'a> {
     pub namespace: NamespaceId,
