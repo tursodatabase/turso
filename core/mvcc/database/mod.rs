@@ -8212,6 +8212,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.durable_txid_max.store(tx_id, Ordering::SeqCst);
     }
 
+    /// Moves `tx_id` to Preparing with a new commit timestamp, as if its
+    /// commit had started and not finished.
+    #[cfg(feature = "test_helper")]
+    pub fn start_commit_for_testing(&self, tx_id: TxID) {
+        self.get_commit_timestamp(|ts| {
+            self.txs
+                .get(&tx_id)
+                .expect("the transaction is active")
+                .value()
+                .state
+                .store(TransactionState::Preparing(ts));
+        });
+    }
+
     /// The number of entries in the write set of transaction `tx_id`, and the
     /// number of distinct version chains that they point to.
     #[cfg(feature = "test_helper")]

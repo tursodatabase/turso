@@ -1778,3 +1778,60 @@ fn test_savepoint_rollback_removes_only_the_chains_that_the_savepoint_added() {
     let rows = get_rows(&conn, "SELECT id, v FROM t");
     assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
 }
+
+/// A statement that fails with CommitDependencyAborted rolls back its whole
+/// transaction, like WriteWriteConflict: the transaction depends on an aborted
+/// one and can never commit. A single-row UPDATE has no statement savepoint, and
+/// under MVCC its Insert step can raise this error after its Delete step wrote.
+#[test]
+fn test_commit_dependency_aborted_statement_rolls_back_txn() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE hot (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO hot VALUES (1, 0)").unwrap();
+        conn.close().unwrap();
+    }
+    let mvcc_store = db.get_mvcc_store();
+
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE hot SET n = 100 WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx().unwrap().0;
+    mvcc_store.start_commit_for_testing(writer_tx_id);
+
+    let updater_conn = db.connect();
+    updater_conn.execute("BEGIN CONCURRENT").unwrap();
+    updater_conn
+        .execute("INSERT INTO hot VALUES (2, 0)")
+        .unwrap();
+    let rows = get_rows(&updater_conn, "SELECT n FROM hot WHERE id = 1");
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(100)]],
+        "the updater should read the Preparing writer's version"
+    );
+
+    mvcc_store.rollback_tx(
+        writer_tx_id,
+        writer_conn.get_pager(),
+        &writer_conn,
+        turso_core::MAIN_DB_ID,
+    );
+
+    let result = updater_conn.execute("UPDATE hot SET n = n + 1 WHERE id = 1");
+    assert!(
+        matches!(result, Err(LimboError::CommitDependencyAborted)),
+        "expected CommitDependencyAborted, got {result:?}"
+    );
+    assert!(
+        updater_conn.get_auto_commit(),
+        "the updater's transaction should be rolled back"
+    );
+
+    let rows = get_rows(&updater_conn, "SELECT id, n FROM hot ORDER BY id");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(0)]]);
+}
