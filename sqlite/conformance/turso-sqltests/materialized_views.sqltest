@@ -2795,3 +2795,11 @@ test matview-untyped-column-compares-without-affinity {
 expect {
     Y|1
 }
+
+test matview-distinct-on-is-rejected {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT DISTINCT ON (a) a, b FROM t;
+}
+expect error {
+    materialized views with DISTINCT ON are not yet supported
+}
