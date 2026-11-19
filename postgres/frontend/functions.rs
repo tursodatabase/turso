@@ -88,6 +88,12 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "json_strip_nulls"(FunctionArity::Exact(1), true) => {
             exec_json_strip_nulls(args[0].get_value())?
         },
+        "jsonb_field"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_field(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_field_text"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_field_text(args[0].get_value(), args[1].get_value())?
+        },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
@@ -733,7 +739,7 @@ pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Resul
     let mut pos = 0;
     skip_json_whitespace(bytes, &mut pos);
     match bytes[pos] {
-        b'{' => pos += 1,
+        b'{' => {}
         b'[' => {
             return Err(sqlstate_error(
                 SQLSTATE_INVALID_PARAMETER_VALUE,
@@ -749,30 +755,151 @@ pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Resul
             ))
         }
     }
-    // The walk decodes every string in a value, so a \u0000 or a lone surrogate
-    // anywhere in it errors as in PostgreSQL. Its copy of the value is not used.
+    walk_json_members(json, |key, value| {
+        let key = key.expect("every member of an object has a key");
+        rows.push([Value::build_text(key), Value::build_text(value.to_string())]);
+    })
+}
+
+/// PostgreSQL's `json -> key` and `jsonb -> key`: the JSON text of the field
+/// `key` of an object, or of the element at index `key` of an array. The
+/// translator turns the operator into this function.
+fn exec_jsonb_field(json: &Value, key: &Value) -> Result<Option<String>> {
+    find_json_field(json, key, "->")
+}
+
+/// PostgreSQL's `json ->> key` and `jsonb ->> key`: the value that `->` finds,
+/// as text. A string has no quotes and no escapes, a number is written as
+/// jsonb writes it, and a JSON null is NULL.
+fn exec_jsonb_field_text(json: &Value, key: &Value) -> Result<Option<String>> {
+    let Some(field) = find_json_field(json, key, "->>")? else {
+        return Ok(None);
+    };
+    if field.starts_with('"') {
+        return decode_json_string(&field, &mut 0).map(Some);
+    }
+    if field.starts_with(|c: char| c == '-' || c.is_ascii_digit()) {
+        // A valid JSON number fails only when it has more digits than numeric
+        // allows. PostgreSQL then fails when it makes the jsonb value.
+        return turso_core::format_numeric_text(&field)
+            .map(Some)
+            .map_err(|_| {
+                sqlstate_error(
+                    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                    "value overflows numeric format",
+                    None,
+                )
+            });
+    }
+    Ok((field != "null").then_some(field))
+}
+
+/// The field or array element that `->` and `->>` look up.
+enum JsonKey<'a> {
+    /// The field with this name of an object.
+    Field(&'a str),
+    /// The element at this index of an array. A negative index counts from
+    /// the end.
+    Index(i64),
+}
+
+/// The JSON text of the value at `key` in the JSON document `json`, or None
+/// when the document has no such value. `op` is the operator, for errors.
+fn find_json_field(json: &Value, key: &Value, op: &str) -> Result<Option<String>> {
+    // A json or jsonb column reads as text. A blob is a bytea, which has no
+    // -> in PostgreSQL.
+    let json = match json {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        Value::Numeric(_) | Value::Blob(_) => {
+            return Err(undefined_operator(
+                pg_type_name(json),
+                op,
+                pg_type_name(key),
+            ))
+        }
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let key = match key {
+        Value::Null => return Ok(None),
+        Value::Text(name) => JsonKey::Field(name.as_str()),
+        Value::Numeric(Numeric::Integer(index)) => JsonKey::Index(*index),
+        other => return Err(undefined_operator("jsonb", op, pg_type_name(other))),
+    };
+    Ok(json_field_span(json, &key)?.map(str::to_string))
+}
+
+/// The JSON text of the value at `key` in `json`, which must be valid JSON.
+/// When an object has two fields with the name, the last one counts, as in
+/// PostgreSQL.
+fn json_field_span<'a>(json: &'a str, key: &JsonKey) -> Result<Option<&'a str>> {
+    // The walk covers the whole document, also when the key cannot match, so
+    // that a bad escape or deep nesting anywhere in it errors as in PostgreSQL.
+    let mut found = None;
+    let mut elements = Vec::new();
+    walk_json_members(json, |member_key, value| match (member_key, key) {
+        (Some(name), JsonKey::Field(field)) if name == *field => found = Some(value),
+        (None, JsonKey::Index(_)) => elements.push(value),
+        // A name on an array or an index on an object.
+        _ => {}
+    })?;
+    let JsonKey::Index(index) = key else {
+        return Ok(found);
+    };
+    let index = if *index < 0 {
+        *index + elements.len() as i64
+    } else {
+        *index
+    };
+    Ok(usize::try_from(index)
+        .ok()
+        .and_then(|index| elements.get(index).copied()))
+}
+
+/// Calls `visit` with the key and the text of the value of each member of the
+/// JSON object `json`, or with None and the text of each element of the JSON
+/// array `json`. A scalar has no members. `json` must be valid JSON.
+fn walk_json_members<'a>(
+    json: &'a str,
+    mut visit: impl FnMut(Option<String>, &'a str),
+) -> Result<()> {
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    // copy_without_null_fields decodes every string of a value and counts its
+    // nesting, so a \u0000, a lone surrogate or nesting deeper than
+    // MAX_JSON_DEPTH errors as in PostgreSQL. Its copy of the value is not used.
     let mut walked_value = String::new();
+    let is_object = match bytes[pos] {
+        b'{' => true,
+        b'[' => false,
+        _ => return copy_without_null_fields(json, &mut pos, 0, &mut walked_value),
+    };
+    pos += 1;
     loop {
         skip_json_whitespace(bytes, &mut pos);
         match bytes[pos] {
-            b'}' => break,
+            b'}' | b']' => break,
             b',' => {
                 pos += 1;
                 continue;
             }
             _ => {}
         }
-        let key = decode_json_string(json, &mut pos)?;
-        skip_json_whitespace(bytes, &mut pos);
-        pos += 1; // ':'
-        skip_json_whitespace(bytes, &mut pos);
+        let key = if is_object {
+            let key = decode_json_string(json, &mut pos)?;
+            skip_json_whitespace(bytes, &mut pos);
+            pos += 1; // ':'
+            skip_json_whitespace(bytes, &mut pos);
+            Some(key)
+        } else {
+            None
+        };
         let start = pos;
         walked_value.clear();
         copy_without_null_fields(json, &mut pos, 1, &mut walked_value)?;
-        rows.push([
-            Value::build_text(key),
-            Value::build_text(json[start..pos].to_string()),
-        ]);
+        visit(key, &json[start..pos]);
     }
     Ok(())
 }
@@ -1389,6 +1516,14 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
         format!("function {name}({}) does not exist", arg_types.join(", ")),
+        None,
+    )
+}
+
+fn undefined_operator(left_type: &str, op: &str, right_type: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNDEFINED_FUNCTION,
+        format!("operator does not exist: {left_type} {op} {right_type}"),
         None,
     )
 }
