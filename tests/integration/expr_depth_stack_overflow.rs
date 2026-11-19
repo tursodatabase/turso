@@ -52,6 +52,15 @@ const GEN_EXPRS: &[GenExpr] = &[
         name: "function-call",
         build: |depth| nest("abs(", "1", ")", depth),
     },
+    // https://github.com/tursodatabase/turso/issues/4197
+    GenExpr {
+        name: "unary-plus",
+        build: |depth| nest("+", "1", "", depth),
+    },
+    GenExpr {
+        name: "unary-minus",
+        build: |depth| nest("- ", "1", "", depth),
+    },
     // A wide chain wrapped in a single node whose parse recursion is shallow: the
     // parser consumes the `OR` chain iteratively (so the recursion guard never
     // fires) and the resulting operand is not followed by another operator, so it

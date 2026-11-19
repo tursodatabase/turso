@@ -24,3 +24,31 @@ test expr_depth_or_chain_over_limit {
 expect error {
     Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
 }
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/4197:
+# the statements of the issue have 99 unary operators, one less than the limit.
+# The space comes before each "-", because the repeat macro trims spaces at its
+# end, and "--" starts a comment.
+@backend cli
+test expr_depth_unary_plus_chain_from_issue_4197 {
+    SELECT {{repeat:expr_depth_limit-1:+}}123;
+}
+expect {
+    123
+}
+
+@backend cli
+test expr_depth_unary_minus_chain_from_issue_4197 {
+    SELECT{{repeat:expr_depth_limit-1: -}} 123;
+}
+expect {
+    -123
+}
+
+@backend cli
+test expr_depth_unary_minus_chain_over_limit {
+    SELECT{{repeat:expr_depth_limit: -}} 123;
+}
+expect error {
+    Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+}
