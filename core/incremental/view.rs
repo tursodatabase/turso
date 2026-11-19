@@ -798,6 +798,7 @@ impl IncrementalView {
                 from,
                 where_clause,
                 group_by,
+                distinctness,
                 ..
             } = select
             else {
@@ -826,6 +827,12 @@ impl IncrementalView {
                 exprs.extend(group_by.exprs.iter().map(|expr| expr.as_ref()));
                 exprs.extend(group_by.having.as_deref());
             }
+            exprs.extend(
+                distinctness
+                    .iter()
+                    .flat_map(|distinctness| distinctness.exprs())
+                    .map(|expr| expr.as_ref()),
+            );
             // Subqueries in expressions read tables too: the planner may turn
             // `EXISTS (SELECT ... FROM t)` into a join with `t`.
             for expr in exprs {

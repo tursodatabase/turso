@@ -2366,7 +2366,7 @@ impl PostgreSQLTranslator {
                 select: ast::OneSelect::Values(rows),
                 compounds: vec![],
             };
-            let order_by = self.translate_order_by(&select.sort_clause)?;
+            let order_by = self.translate_select_order_by(&select.sort_clause)?;
             let limit = self.translate_select_limit(select)?;
             let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
@@ -2399,9 +2399,9 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let order_by = self.translate_select_order_by(&select.sort_clause)?;
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
+        let distinctness = self.translate_distinct_clause(select)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2484,7 +2484,7 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let order_by = self.translate_select_order_by(&select.sort_clause)?;
         let limit = self.translate_select_limit(select)?;
         let with = self.translate_with_clause(&select.with_clause)?;
 
@@ -2608,7 +2608,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
+        let distinctness = self.translate_distinct_clause(select)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2622,6 +2622,49 @@ impl PostgreSQLTranslator {
             group_by,
             window_clause,
         })
+    }
+
+    /// A plain DISTINCT is a list of one empty node; DISTINCT ON is the list of its expressions.
+    fn translate_distinct_clause(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<Option<ast::SelectDistinctness>, ParseError> {
+        let distinct_clause = &select.distinct_clause;
+        if distinct_clause.is_empty() {
+            return Ok(None);
+        }
+        // A COLLATE that names the binary collation is translated to nothing, so two
+        // expressions that PostgreSQL finds different would compare as the same.
+        if distinct_clause.iter().all(|node| node.node.is_none()) {
+            let has_order_by = !select.sort_clause.is_empty();
+            if has_order_by
+                && Self::has_collate(select.target_list.iter().chain(&select.sort_clause))
+            {
+                return Err(ParseError::not_supported(
+                    "COLLATE in a SELECT DISTINCT with ORDER BY",
+                ));
+            }
+            return Ok(Some(ast::SelectDistinctness::Distinct));
+        }
+        if Self::has_collate(distinct_clause.iter().chain(&select.sort_clause)) {
+            return Err(ParseError::not_supported(
+                "COLLATE in a SELECT DISTINCT ON expression or in its ORDER BY",
+            ));
+        }
+        Self::reject_constant_that_is_not_a_position(distinct_clause, "DISTINCT ON")?;
+        let exprs = distinct_clause
+            .iter()
+            .map(|node| self.translate_expr(node).map(Box::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ast::SelectDistinctness::DistinctOn(exprs)))
+    }
+
+    fn has_collate<'a>(exprs: impl IntoIterator<Item = &'a pg_query::protobuf::Node>) -> bool {
+        exprs
+            .into_iter()
+            .filter_map(|node| node.node.as_ref())
+            .flat_map(|node| node.nodes())
+            .any(|(node, ..)| matches!(node, NodeRef::CollateClause(_)))
     }
 
     /// Translate multiple FROM items. The first becomes the primary table,
@@ -5350,6 +5393,76 @@ impl PostgreSQLTranslator {
             .map(|arg| self.translate_expr(arg).map(Box::new))
             .collect::<Result<_, _>>()?;
         Ok(ast::Expr::Parenthesized(values))
+    }
+
+    /// The ORDER BY of a SELECT, where a constant must be an integer that is a position in
+    /// the select list.
+    fn translate_select_order_by(
+        &self,
+        sort_clause: &[pg_query::protobuf::Node],
+    ) -> Result<Vec<ast::SortedColumn>, ParseError> {
+        let sort_exprs = sort_clause.iter().filter_map(|node| match &node.node {
+            Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => sort_by.node.as_deref(),
+            _ => None,
+        });
+        Self::reject_constant_that_is_not_a_position(sort_exprs, "ORDER BY")?;
+        self.translate_order_by(sort_clause)
+    }
+
+    fn reject_constant_that_is_not_a_position<'a>(
+        exprs: impl IntoIterator<Item = &'a pg_query::protobuf::Node>,
+        clause: &str,
+    ) -> Result<(), ParseError> {
+        use pg_query::protobuf::{a_const::Val, node::Node};
+
+        for expr in exprs {
+            match &expr.node {
+                Some(Node::AConst(constant)) if !matches!(constant.val, Some(Val::Ival(_))) => {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_SYNTAX_ERROR,
+                        message: format!("non-integer constant in {clause}"),
+                    });
+                }
+                Some(Node::AConst(_)) => {}
+                _ if Self::is_integer_constant_with_sign_or_collation(expr) => {
+                    return Err(ParseError::not_supported(format!(
+                        "an integer constant with a sign or a COLLATE in {clause}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the expression is an integer constant under unary `+`, unary `-` or COLLATE,
+    /// such as `+1`. The engine would read it as a position in the select list.
+    fn is_integer_constant_with_sign_or_collation(expr: &pg_query::protobuf::Node) -> bool {
+        use pg_query::protobuf::{a_const::Val, node::Node, AExprKind};
+
+        match &expr.node {
+            Some(Node::AConst(constant)) => matches!(constant.val, Some(Val::Ival(_))),
+            Some(Node::CollateClause(collate)) => collate
+                .arg
+                .as_deref()
+                .is_some_and(Self::is_integer_constant_with_sign_or_collation),
+            Some(Node::AExpr(a_expr)) => {
+                let is_sign = a_expr.kind() == AExprKind::AexprOp
+                    && a_expr.lexpr.is_none()
+                    && matches!(
+                        a_expr.name.as_slice(),
+                        [pg_query::protobuf::Node {
+                            node: Some(Node::String(name)),
+                        }] if name.sval == "+" || name.sval == "-"
+                    );
+                is_sign
+                    && a_expr
+                        .rexpr
+                        .as_deref()
+                        .is_some_and(Self::is_integer_constant_with_sign_or_collation)
+            }
+            _ => false,
+        }
     }
 
     fn translate_order_by(
@@ -9944,18 +10057,6 @@ fn compound_operator(
     }
 }
 
-fn translate_distinct_clause(
-    distinct_clause: &[pg_query::protobuf::Node],
-) -> Result<Option<ast::Distinctness>, ParseError> {
-    if distinct_clause.is_empty() {
-        return Ok(None);
-    }
-    if distinct_clause.iter().any(|n| n.node.is_some()) {
-        return Err(ParseError::not_supported("SELECT DISTINCT ON"));
-    }
-    Ok(Some(ast::Distinctness::Distinct))
-}
-
 fn reject_column_aliases(
     alias: &Option<pg_query::protobuf::Alias>,
     what: &str,
@@ -10975,7 +11076,7 @@ mod tests {
         if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { distinctness, .. } = &select.body.select {
                 assert!(
-                    matches!(distinctness, Some(ast::Distinctness::Distinct)),
+                    matches!(distinctness, Some(ast::SelectDistinctness::Distinct)),
                     "Should have DISTINCT"
                 );
             } else {
@@ -13791,14 +13892,21 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_distinct_on() {
+    fn distinct_on_keeps_its_expressions() {
+        let parsed = crate::parse("SELECT DISTINCT ON (a, b + 1) a, b FROM t").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT DISTINCT ON (a, b + 1) a, b FROM t"
+        );
+        assert_translates("SELECT DISTINCT ON (a) a FROM t UNION SELECT 1");
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (a) a FROM t ORDER BY a COLLATE \"C\"",
+            "COLLATE",
         );
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a FROM t UNION SELECT 1",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (lower(a COLLATE \"C\")) a FROM t",
+            "COLLATE",
         );
         assert_translates("SELECT DISTINCT a, b FROM t");
     }

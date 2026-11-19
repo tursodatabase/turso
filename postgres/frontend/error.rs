@@ -328,7 +328,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
-    } else if msg.starts_with("ambiguous column name") {
+    } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
         SQLSTATE_AMBIGUOUS_COLUMN
     } else if msg.starts_with("misuse of aggregate")
         || msg.starts_with("aggregate functions are not allowed")
@@ -338,7 +338,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("window functions are not allowed")
     {
         SQLSTATE_WINDOWING_ERROR
-    } else if msg.starts_with("invalid reference to FROM-clause entry") {
+    } else if msg.starts_with("invalid reference to FROM-clause entry")
+        || msg == "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        || msg == "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        || msg.contains(" term out of range - should be between ")
+    {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
@@ -362,7 +366,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("there is no parameter $") {
         SQLSTATE_UNDEFINED_PARAMETER
-    } else if msg == "subqueries in policies are not supported" {
+    } else if msg == "subqueries in policies are not supported"
+        || (msg.contains("DISTINCT ON") && msg.ends_with(" is not supported"))
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
@@ -585,6 +591,39 @@ mod tests {
             (
                 "role \"no such table\" already exists",
                 SQLSTATE_DUPLICATE_OBJECT,
+            ),
+            (
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "1st DISTINCT ON term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "1st ORDER BY term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            ("ORDER BY \"a\" is ambiguous", SQLSTATE_AMBIGUOUS_COLUMN),
+            (
+                "SELECT DISTINCT ON with a volatile function in the select list is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "a DISTINCT ON expression that is neither a GROUP BY expression nor an aggregate is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
             ),
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),

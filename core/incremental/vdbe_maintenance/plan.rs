@@ -237,6 +237,9 @@ fn build_select_plan_dag(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> Result<dag::NodeId> {
+    if plan.distinctness.is_distinct_on() {
+        return unsupported("DISTINCT ON");
+    }
     if !plan.order_by.is_empty() {
         return unsupported("ORDER BY");
     }

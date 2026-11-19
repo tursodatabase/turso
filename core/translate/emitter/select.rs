@@ -16,10 +16,10 @@ use crate::{
         optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
-            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
-            NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
-            TableReferences,
+            BitSet, DistinctOnRegisters, Distinctness, EphemeralRowidMode, EvalAt,
+            IndexMethodQuery, JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination,
+            Scan, Search, SeekKeyComponent, SelectPlan, SimpleAggregate, SubqueryEvalPhase,
+            SubqueryOrigin, SubqueryState, TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -216,6 +216,17 @@ pub fn emit_query<'a>(
         if !ctx.is_ordered() {
             emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
         }
+    }
+
+    if let Distinctness::DistinctOn { key_count } = plan.distinctness {
+        turso_assert!(
+            plan.order_by.len() >= key_count,
+            "the DISTINCT ON keys are the first ORDER BY terms"
+        );
+    }
+    if let Distinctness::DistinctOnRowsInOrder { keys, registers } = &mut plan.distinctness {
+        *registers = Some(DistinctOnRegisters::alloc(program, keys.len()));
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::DistinctOn);
     }
 
     let end_label = program.allocate_label();

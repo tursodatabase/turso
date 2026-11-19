@@ -504,6 +504,11 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
+    fn sort_term_matching(&self) -> SortTermMatching {
+        SortTermMatching::Sqlite
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
@@ -574,6 +579,18 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+}
+
+/// How an ORDER BY or DISTINCT ON term is matched to the output columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortTermMatching {
+    /// A name anywhere in the term can be an output column name, and the first output
+    /// column with that name is used.
+    Sqlite,
+    /// Only a term that is a bare name can be an output column name, and it is an error
+    /// when output columns with different expressions share that name. Every ORDER BY
+    /// term of a SELECT DISTINCT must be an output column.
+    Sql92,
 }
 
 /// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that

@@ -19,6 +19,7 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::KeyInfo,
     types::SeekOp,
     util::exprs_are_equivalent,
     vdbe::{
@@ -771,6 +772,15 @@ pub enum Distinctness {
         /// rows already come sorted by the distinct columns
         ordered: bool,
     },
+    /// `DISTINCT ON`: of the rows that follow each other with equal values in the first
+    /// `key_count` ORDER BY terms, only the first is returned.
+    DistinctOn { key_count: usize },
+    /// `DISTINCT ON` of a query whose rows arrive in ORDER BY order without a sort: of the
+    /// rows that follow each other with equal values in `keys`, only the first is returned.
+    DistinctOnRowsInOrder {
+        keys: Vec<ast::Expr>,
+        registers: Option<DistinctOnRegisters>,
+    },
 }
 
 impl Distinctness {
@@ -785,7 +795,13 @@ impl Distinctness {
         }
     }
     pub fn is_distinct(&self) -> bool {
-        matches!(self, Distinctness::Distinct { .. })
+        !matches!(self, Distinctness::NonDistinct)
+    }
+    pub fn is_distinct_on(&self) -> bool {
+        matches!(
+            self,
+            Distinctness::DistinctOn { .. } | Distinctness::DistinctOnRowsInOrder { .. }
+        )
     }
     pub fn is_ordered(&self) -> bool {
         matches!(self, Distinctness::Distinct { ordered: true, .. })
@@ -794,6 +810,79 @@ impl Distinctness {
         if let Distinctness::Distinct { ordered, .. } = self {
             *ordered = value;
         }
+    }
+}
+
+/// Registers that DISTINCT ON uses to tell whether a row starts a new group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctOnRegisters {
+    /// The key of the last row that was returned.
+    reg_previous_key_start: usize,
+    /// The key of the current row.
+    pub reg_key_start: usize,
+    /// 0 until a row has been returned.
+    reg_has_previous_key: usize,
+    key_count: usize,
+}
+
+impl DistinctOnRegisters {
+    pub fn alloc(program: &mut ProgramBuilder, key_count: usize) -> Self {
+        let registers = Self {
+            // `Insn::Compare` needs its first run of registers to come before its second.
+            reg_previous_key_start: program.alloc_registers(key_count),
+            reg_key_start: program.alloc_registers(key_count),
+            reg_has_previous_key: program.alloc_register(),
+            key_count,
+        };
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: registers.reg_has_previous_key,
+        });
+        registers
+    }
+
+    /// Jumps to `label_skip_row` when the key at `reg_key_start` equals the key of the last
+    /// row that was returned.
+    pub fn emit_skip_unless_first_row_of_group(
+        &self,
+        program: &mut ProgramBuilder,
+        key_collations: Vec<CollationSeq>,
+        label_skip_row: BranchOffset,
+    ) {
+        let label_new_group = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: self.reg_has_previous_key,
+            target_pc: label_new_group,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::Compare {
+            start_reg_a: self.reg_previous_key_start,
+            start_reg_b: self.reg_key_start,
+            count: self.key_count,
+            key_info: key_collations
+                .into_iter()
+                .map(|collation| KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation,
+                    nulls_order: None,
+                })
+                .collect(),
+        });
+        program.emit_insn(Insn::Jump {
+            target_pc_lt: label_new_group,
+            target_pc_eq: label_skip_row,
+            target_pc_gt: label_new_group,
+        });
+        program.preassign_label_to_next_insn(label_new_group);
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: self.reg_has_previous_key,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.reg_key_start,
+            dst_reg: self.reg_previous_key_start,
+            extra_amount: self.key_count - 1,
+        });
     }
 }
 

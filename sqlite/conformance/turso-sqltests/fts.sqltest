@@ -1120,3 +1120,17 @@ test fts-column-named-like-internal-field-error {
 expect error {
     FTS cannot index a column named "rowid"
 }
+
+@backend cli
+test fts-distinct-on-score-keeps-one-row-per-score {
+    CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT);
+    CREATE INDEX fx ON d USING fts(body);
+    INSERT INTO d VALUES (1, 'hello'), (2, 'hello'), (3, 'hello');
+    SELECT count(*) FROM (
+        SELECT DISTINCT ON (fts_score(body, 'hello')) id FROM d
+        WHERE fts_match(body, 'hello') ORDER BY fts_score(body, 'hello') DESC
+    );
+}
+expect {
+    1
+}

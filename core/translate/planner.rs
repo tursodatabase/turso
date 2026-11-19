@@ -225,7 +225,7 @@ impl RecursiveRefCounter<'_> {
                 where_clause,
                 group_by,
                 window_clause,
-                ..
+                distinctness,
             } => {
                 let mut count = 0;
                 if let Some(from) = from {
@@ -255,6 +255,12 @@ impl RecursiveRefCounter<'_> {
                 }
                 for window_def in window_clause {
                     count += self.count_window(&window_def.window, scope);
+                }
+                for expr in distinctness
+                    .iter()
+                    .flat_map(|distinctness| distinctness.exprs())
+                {
+                    count += self.count_expr(expr, scope);
                 }
                 count
             }
@@ -450,6 +456,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
             where_clause,
             group_by,
             window_clause,
+            distinctness,
             ..
         } => {
             for column in columns {
@@ -469,6 +476,12 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
                 }
             }
             collect_subquery_table_refs_in_window_clause(window_clause, out);
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                collect_subquery_table_refs_in_expr(expr, out);
+            }
             if let ast::OneSelect::Select {
                 from: Some(from), ..
             } = one

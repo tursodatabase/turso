@@ -2654,3 +2654,204 @@ expect {
 expect @tursopg error {
     type "time" is not supported
 }
+
+test order-by-expression-reads-the-input-column-not-the-output-name {
+    CREATE TABLE order_names (a int, b int);
+    INSERT INTO order_names VALUES (1, 20), (2, 10);
+    SELECT b AS a FROM order_names ORDER BY a;
+    SELECT b AS a FROM order_names ORDER BY a + 0;
+    SELECT b AS a FROM order_names ORDER BY -a;
+    DROP TABLE order_names;
+}
+expect {
+    10
+    20
+    20
+    10
+    10
+    20
+}
+
+test error-order-by-expression-names-only-an-output-column {
+    SELECT 1 AS z ORDER BY z + 1;
+}
+@sqlstate 42703
+expect error {}
+
+test order-by-name-of-two-different-output-columns-is-ambiguous {
+    CREATE TABLE order_shared_names (a int, b int);
+    INSERT INTO order_shared_names VALUES (1, 10), (2, 5);
+    SELECT a, order_shared_names.a AS a FROM order_shared_names ORDER BY a;
+    SELECT b AS a, a FROM order_shared_names ORDER BY a + 0;
+    SELECT b AS a, a FROM order_shared_names ORDER BY a;
+}
+@sqlstate 42702
+expect error {}
+
+# PostgreSQL sorts by the constant. tursopg would read it as a position.
+test order-by-plus-number-is-a-constant-not-a-position {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY +1, a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test order-by-negated-plus-number-is-a-constant-not-a-position {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY -(+1), a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-order-by-number-with-a-collation {
+    SELECT a FROM (VALUES (2), (1), (3)) AS v(a) ORDER BY 1 COLLATE "C";
+}
+@sqlstate 42804
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-order-by-fractional-constant {
+    SELECT 1 AS a ORDER BY 1.5;
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-string-constant {
+    SELECT 1 AS a UNION ALL SELECT 2 ORDER BY 'k';
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-null-constant {
+    SELECT 1 AS a ORDER BY NULL;
+}
+@sqlstate 42601
+expect error {}
+
+test error-order-by-position-past-the-select-list {
+    SELECT 1 AS a ORDER BY 2;
+}
+@sqlstate 42P10
+expect error {}
+
+test error-order-by-negative-position {
+    SELECT 1 AS a ORDER BY -1;
+}
+@sqlstate 42P10
+expect error {}
+
+test error-order-by-position-past-the-select-list-of-a-union {
+    SELECT 1 AS a UNION ALL SELECT 2 ORDER BY 5;
+}
+@sqlstate 42P10
+expect error {}
+
+test order-by-constant-inside-a-window-is-not-a-position {
+    SELECT sum(x) OVER (ORDER BY 'k') FROM (VALUES (1), (2)) AS v(x);
+}
+expect {
+    3
+    3
+}
+
+setup distinct_rows {
+    CREATE TABLE distinct_rows (a int, b int, c text);
+    INSERT INTO distinct_rows VALUES (2, 10, 'x'), (1, 20, 'y'), (1, 20, 'z'), (2, 30, 'w');
+}
+
+@setup distinct_rows
+test distinct-order-by-terms-that-are-in-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a DESC;
+    SELECT DISTINCT a, b FROM distinct_rows ORDER BY 2 DESC, distinct_rows.a;
+    SELECT DISTINCT a + b AS total FROM distinct_rows ORDER BY total;
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY a + b DESC;
+    SELECT DISTINCT a AS x FROM distinct_rows ORDER BY a;
+    SELECT DISTINCT a, count(*) FROM distinct_rows GROUP BY a ORDER BY count(*), a;
+    SELECT DISTINCT * FROM distinct_rows ORDER BY b, c DESC;
+}
+expect {
+    2
+    1
+    2|30
+    1|20
+    2|10
+    12
+    21
+    32
+    32
+    21
+    12
+    1
+    2
+    1|2
+    2|2
+    2|10|x
+    1|20|z
+    1|20|y
+    2|30|w
+}
+
+@setup distinct_rows
+test error-distinct-order-by-column-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY b;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-over-a-selected-column {
+    SELECT DISTINCT a FROM distinct_rows ORDER BY a + 0;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-expression-with-operands-swapped {
+    SELECT DISTINCT a + b FROM distinct_rows ORDER BY b + a;
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-order-by-aggregate-outside-the-select-list {
+    SELECT DISTINCT a FROM distinct_rows GROUP BY a ORDER BY count(*);
+}
+@sqlstate 42P10
+expect error {}
+
+@setup distinct_rows
+test error-distinct-in-a-subquery-order-by-column-outside-the-select-list {
+    SELECT * FROM (SELECT DISTINCT a FROM distinct_rows ORDER BY b) AS s;
+}
+@sqlstate 42P10
+expect error {}
+
+# tursopg has one collation and cannot tell these expressions apart.
+@setup distinct_rows
+test error-distinct-order-by-with-another-collation {
+    SELECT DISTINCT c FROM distinct_rows ORDER BY c COLLATE "C";
+}
+@sqlstate 42P10
+expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
+
+@setup distinct_rows
+test distinct-all-rows-order-by-column-outside-the-select-list {
+    SELECT ALL a FROM distinct_rows ORDER BY b, c;
+}
+expect {
+    2
+    1
+    1
+    2
+}

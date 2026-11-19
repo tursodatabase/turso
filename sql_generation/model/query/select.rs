@@ -324,7 +324,7 @@ impl Select {
             body: ast::SelectBody {
                 select: ast::OneSelect::Select {
                     distinctness: if self.body.select.distinctness == Distinctness::Distinct {
-                        Some(ast::Distinctness::Distinct)
+                        Some(ast::SelectDistinctness::Distinct)
                     } else {
                         None
                     },
@@ -359,7 +359,10 @@ impl Select {
                             CompoundOperator::UnionAll => ast::CompoundOperator::UnionAll,
                         },
                         select: ast::OneSelect::Select {
-                            distinctness: Some(compound.select.distinctness),
+                            distinctness: Some(match compound.select.distinctness {
+                                Distinctness::Distinct => ast::SelectDistinctness::Distinct,
+                                Distinctness::All => ast::SelectDistinctness::All,
+                            }),
                             columns: compound
                                 .select
                                 .columns

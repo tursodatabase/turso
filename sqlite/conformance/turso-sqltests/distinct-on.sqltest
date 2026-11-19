@@ -1,0 +1,793 @@
+@database :memory:
+
+# SELECT DISTINCT ON, a Turso extension to SQLite that follows PostgreSQL.
+
+setup rows {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 10, 'x'), (1, 20, 'y'), (2, 30, 'z'), (2, 5, 'w'),
+                         (NULL, 1, 'n1'), (NULL, 2, 'n2'), (3, NULL, 'q'), (3, 7, 'r');
+}
+
+@setup rows
+test order-by-must-start-with-the-distinct-on-expression {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY b;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-must-keep-the-operand-order-of-the-key {
+    SELECT DISTINCT ON (a + b) a, b FROM t ORDER BY b + a;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-must-list-every-distinct-on-expression-before-another-term {
+    SELECT DISTINCT ON (a, b) a, b, c FROM t ORDER BY a, c, b;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-of-a-different-expression-over-the-same-column-does-not-match {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a + 0, b;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-with-another-collation-does-not-match {
+    SELECT DISTINCT ON (c) c FROM t ORDER BY c COLLATE NOCASE;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test integer-arithmetic-is-an-expression-and-not-a-select-list-position {
+    SELECT DISTINCT ON (1 + 0) a, b FROM t ORDER BY 1, 2;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test name-of-an-output-column-wins-over-a-table-column {
+    SELECT DISTINCT ON (b) a AS b, b AS a FROM t ORDER BY 2, 1;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test position-past-the-select-list {
+    SELECT DISTINCT ON (3) a, b FROM t;
+}
+expect error {
+    1st DISTINCT ON term out of range - should be between 1 and 2
+}
+
+@setup rows
+test position-zero {
+    SELECT DISTINCT ON (0) a, b FROM t;
+}
+expect error {
+    1st DISTINCT ON term out of range - should be between 1 and 2
+}
+
+@setup rows
+test negative-position {
+    SELECT DISTINCT ON (-1) a, b FROM t;
+}
+expect error {
+    1st DISTINCT ON term out of range - should be between 1 and 2
+}
+
+@setup rows
+test unknown-column {
+    SELECT DISTINCT ON (nosuch) a FROM t;
+}
+expect error {
+    no such column: nosuch
+}
+
+setup joined {
+    CREATE TABLE u(a, d);
+    INSERT INTO u VALUES (1, 'one'), (2, 'two'), (2, 'deux');
+}
+
+@setup rows
+test first-row-of-each-group-in-order-by-order {
+    SELECT DISTINCT ON (a) a, b, c FROM t ORDER BY a, b;
+}
+expect {
+    |1|n1
+    1|10|x
+    2|5|w
+    3||q
+}
+
+@setup rows
+test descending-term-after-the-key-picks-the-largest {
+    SELECT DISTINCT ON (a) a, b, c FROM t ORDER BY a, b DESC;
+}
+expect {
+    |2|n2
+    1|20|y
+    2|30|z
+    3|7|r
+}
+
+@setup rows
+test key-can-sort-descending {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a DESC, b;
+}
+expect {
+    3|
+    2|5
+    1|10
+    |1
+}
+
+@setup rows
+test explicit-nulls-placement {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a NULLS LAST, b DESC NULLS LAST;
+}
+expect {
+    1|20
+    2|30
+    3|7
+    |2
+}
+
+@setup rows
+test order-by-may-list-the-keys-in-another-order {
+    SELECT DISTINCT ON (a, b) a, b, c FROM t ORDER BY b, a, c;
+}
+expect {
+    3||q
+    |1|n1
+    |2|n2
+    2|5|w
+    3|7|r
+    1|10|x
+    1|20|y
+    2|30|z
+}
+
+@setup rows
+test order-by-shorter-than-the-key-list {
+    SELECT count(*) FROM (SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a);
+}
+expect {
+    8
+}
+
+@setup rows
+test no-order-by-returns-one-row-per-group {
+    SELECT count(*), count(a) FROM (SELECT DISTINCT ON (a) a, b FROM t);
+}
+expect {
+    4|3
+}
+
+@setup rows
+test key-does-not-have-to-be-selected {
+    SELECT DISTINCT ON (a) b, c FROM t ORDER BY a, b;
+}
+expect {
+    1|n1
+    10|x
+    5|w
+    |q
+}
+
+@setup rows
+test star {
+    SELECT DISTINCT ON (a) * FROM t ORDER BY a, b DESC;
+}
+expect {
+    |2|n2
+    1|20|y
+    2|30|z
+    3|7|r
+}
+
+@setup rows
+test key-by-select-list-position {
+    SELECT DISTINCT ON (1) a, b FROM t ORDER BY a, b DESC;
+}
+expect {
+    |2
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+test key-by-output-column-name {
+    SELECT DISTINCT ON (b) a AS b, b AS a FROM t ORDER BY b, a;
+}
+expect {
+    |1
+    1|10
+    2|5
+    3|
+}
+
+@setup rows
+test qualified-and-unqualified-names-match {
+    SELECT DISTINCT ON (t.a) a, b FROM t ORDER BY a, b DESC;
+}
+expect {
+    |2
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+test repeated-key {
+    SELECT DISTINCT ON (a, a) a, b FROM t ORDER BY a, b DESC;
+}
+expect {
+    |2
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+test expression-key {
+    SELECT DISTINCT ON (a IS NULL) a, b FROM t ORDER BY a IS NULL, b DESC;
+}
+expect {
+    2|30
+    |2
+}
+
+@setup rows
+test where-filters-before-the-first-row-is-chosen {
+    SELECT DISTINCT ON (a) a, b FROM t WHERE b > 5 ORDER BY a, b;
+}
+expect {
+    1|10
+    2|30
+    3|7
+}
+
+@setup rows
+test limit-and-offset-count-groups {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC LIMIT 2 OFFSET 1;
+}
+expect {
+    1|20
+    2|30
+}
+
+@setup rows
+test group-by-runs-first {
+    SELECT DISTINCT ON (a) a, b, count(*) FROM t GROUP BY a, b ORDER BY a, b DESC;
+}
+expect {
+    |2|1
+    1|20|1
+    2|30|1
+    3|7|1
+}
+
+@setup rows
+test constant-key-that-is-not-a-position-makes-one-group {
+    SELECT count(*) FROM (SELECT DISTINCT ON ('x') a FROM t);
+    SELECT count(*) FROM (SELECT DISTINCT ON (NULL) a FROM t);
+    SELECT count(*) FROM (SELECT DISTINCT ON (1.5) a FROM t);
+}
+expect {
+    1
+    1
+    1
+}
+
+@setup rows
+test plus-number-is-a-position-as-in-order-by {
+    SELECT DISTINCT ON (+1) a, b FROM t ORDER BY +1, 2;
+}
+expect {
+    |1
+    1|10
+    2|5
+    3|
+}
+
+@setup rows
+test aggregate-key {
+    SELECT DISTINCT ON (count(*)) count(*), a FROM t GROUP BY a ORDER BY 1, a DESC;
+}
+expect {
+    2|3
+}
+
+@setup rows
+test aggregate-without-group-by-has-one-row {
+    SELECT DISTINCT ON (count(*)) count(*) FROM t;
+}
+expect {
+    8
+}
+
+@setup rows
+test window-functions-run-first {
+    SELECT DISTINCT ON (a) a, b, row_number() OVER (ORDER BY b DESC) AS rn FROM t ORDER BY a, b DESC;
+}
+expect {
+    |2|6
+    1|20|2
+    2|30|1
+    3|7|4
+}
+
+@setup rows
+test window-function-key {
+    SELECT DISTINCT ON (rn) a, b, row_number() OVER (PARTITION BY a ORDER BY b DESC) AS rn
+    FROM t ORDER BY rn, a DESC;
+}
+expect {
+    3|7|1
+    3||2
+}
+
+@setup rows
+test index-on-the-order-by-columns {
+    CREATE INDEX t_a_b ON t(a, b);
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b;
+}
+expect {
+    |1
+    1|10
+    2|5
+    3|
+}
+
+test rowid-key {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, b);
+    INSERT INTO r VALUES (1, 1), (2, 1), (3, 2);
+    SELECT DISTINCT ON (id, b) id, b FROM r ORDER BY id, b;
+}
+expect {
+    1|1
+    2|1
+    3|2
+}
+
+test key-is-compared-with-its-collation {
+    CREATE TABLE s(x TEXT COLLATE NOCASE, y);
+    INSERT INTO s VALUES ('a', 1), ('A', 2), ('b', 3);
+    SELECT DISTINCT ON (x) x, y FROM s ORDER BY x, y DESC;
+}
+expect {
+    A|2
+    b|3
+}
+
+@setup rows
+@setup joined
+test join {
+    SELECT DISTINCT ON (t.a) t.a, t.b, u.d FROM t JOIN u ON t.a = u.a ORDER BY t.a, t.b DESC, u.d;
+}
+expect {
+    1|20|one
+    2|30|deux
+}
+
+@setup rows
+test outer-filter-applies-after-the-first-row-is-chosen {
+    SELECT * FROM (SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC) WHERE b > 6 ORDER BY a;
+}
+expect {
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+test common-table-expression {
+    WITH x AS (SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC) SELECT * FROM x ORDER BY a;
+}
+expect {
+    |2
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+@setup joined
+test correlated-scalar-subquery {
+    SELECT d, (SELECT DISTINCT ON (t.a) t.b FROM t WHERE t.a = u.a ORDER BY t.a, t.b DESC)
+    FROM u ORDER BY d;
+}
+expect {
+    deux|30
+    one|20
+    two|30
+}
+
+@setup rows
+@setup joined
+test lateral-subquery {
+    SELECT u.d, l.b
+    FROM u, LATERAL (SELECT DISTINCT ON (t.a) t.b FROM t WHERE t.a = u.a ORDER BY t.a, t.b) l
+    ORDER BY 1;
+}
+expect {
+    deux|5
+    one|10
+    two|5
+}
+
+@setup rows
+test in-subquery {
+    SELECT a, b FROM t WHERE (a, b) IN (SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC)
+    ORDER BY a;
+}
+expect {
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+@setup joined
+test compound-select-branch {
+    SELECT a, 0 FROM u UNION ALL SELECT DISTINCT ON (a) a, 1 FROM t ORDER BY 1, 2;
+}
+expect {
+    |1
+    1|0
+    1|1
+    2|0
+    2|0
+    2|1
+    3|1
+}
+
+@setup rows
+test insert-select {
+    CREATE TABLE picked(a, b);
+    INSERT INTO picked SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC;
+    SELECT * FROM picked ORDER BY a;
+}
+expect {
+    |2
+    1|20
+    2|30
+    3|7
+}
+
+@setup rows
+test view {
+    CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC;
+    SELECT * FROM v WHERE b < 25 ORDER BY a;
+}
+expect {
+    |2
+    1|20
+    3|7
+}
+
+@setup rows
+test exists-subquery-offset-counts-groups {
+    SELECT EXISTS (SELECT DISTINCT ON (a) a FROM t ORDER BY a LIMIT 1 OFFSET 3),
+           EXISTS (SELECT DISTINCT ON (a) a FROM t ORDER BY a LIMIT 1 OFFSET 4);
+}
+expect {
+    1|0
+}
+
+@setup rows
+@setup joined
+test correlated-exists-subquery {
+    SELECT d FROM u WHERE EXISTS (SELECT DISTINCT ON (a) a FROM t WHERE t.a = u.a) ORDER BY d;
+}
+expect {
+    deux
+    one
+    two
+}
+
+@setup rows
+test volatile-function-in-the-select-list-is-refused {
+    SELECT DISTINCT ON (a) a, random() FROM t ORDER BY a, b;
+}
+expect error {
+    SELECT DISTINCT ON with a volatile function in the select list is not supported
+}
+
+@setup rows
+test key-that-reads-a-column-outside-group-by-is-refused {
+    SELECT DISTINCT ON (b) a, count(*) FROM t GROUP BY a;
+}
+expect error {
+    a DISTINCT ON expression that is neither a GROUP BY expression nor an aggregate is not supported
+}
+
+@setup rows
+test key-computed-from-a-group-by-expression {
+    SELECT DISTINCT ON (a + 1) a, sum(b) FROM t WHERE a IS NOT NULL GROUP BY a ORDER BY a + 1;
+}
+expect {
+    1|30
+    2|35
+    3|7
+}
+
+@setup rows
+test key-computed-on-an-aggregate-without-group-by-is-refused {
+    SELECT DISTINCT ON (1 / sum(b)) count(*) FROM t;
+}
+expect error {
+    a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported
+}
+
+@setup rows
+test aggregate-only-in-the-key-is-refused {
+    SELECT DISTINCT ON (sum(b)) 42 FROM t;
+}
+expect error {
+    an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported
+}
+
+test rename-column-rewrites-the-key-in-a-view {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT DISTINCT ON (a) b FROM src ORDER BY a, b;
+    ALTER TABLE src RENAME COLUMN a TO z;
+    INSERT INTO src VALUES (1, 2), (1, 1), (2, 9);
+    SELECT * FROM v;
+    SELECT sql FROM sqlite_schema WHERE name = 'v';
+}
+expect {
+    1
+    9
+    CREATE VIEW v AS SELECT DISTINCT ON (z) b FROM src ORDER BY z, b
+}
+
+test rename-table-rewrites-the-key-in-a-view {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT DISTINCT ON (src.a) b FROM src ORDER BY src.a, b;
+    ALTER TABLE src RENAME TO renamed;
+    INSERT INTO renamed VALUES (1, 2), (1, 1), (2, 9);
+    SELECT * FROM v;
+}
+expect {
+    1
+    9
+}
+
+test drop-column-is-refused-when-a-view-key-uses-it {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT DISTINCT ON (a) b FROM src;
+    ALTER TABLE src DROP COLUMN a;
+}
+expect error {
+    cannot drop column "a": referenced in VIEW v
+}
+
+test trigger-key-reads-the-new-row {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT DISTINCT ON (a + NEW.a) b FROM src ORDER BY a + NEW.a, b DESC;
+    END;
+    INSERT INTO src VALUES (1, 2);
+    INSERT INTO src VALUES (1, 5);
+    SELECT * FROM log;
+}
+expect {
+    2
+    5
+}
+
+test rename-column-rewrites-the-key-in-a-trigger {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT DISTINCT ON (a) b FROM src ORDER BY a, b;
+    END;
+    ALTER TABLE src RENAME COLUMN a TO z;
+    INSERT INTO src VALUES (1, 2);
+    SELECT * FROM log;
+}
+expect {
+    2
+}
+
+test drop-column-is-refused-when-a-trigger-key-uses-it {
+    CREATE TABLE src(a, b);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON log BEGIN
+        INSERT INTO log SELECT DISTINCT ON (a) b FROM src;
+    END;
+    ALTER TABLE src DROP COLUMN a;
+}
+expect error {
+    error in trigger tr after drop column: no such column: a
+}
+
+setup indexed_rows {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX t_a_b ON t(a, b);
+    INSERT INTO t VALUES (1, 10, 'x'), (1, 20, 'y'), (2, 30, 'z'), (2, 5, 'w'),
+                         (NULL, 1, 'n1'), (NULL, 2, 'n2'), (3, NULL, 'q'), (3, 7, 'r');
+}
+
+@setup indexed_rows
+test index-order-needs-no-sort {
+    EXPLAIN QUERY PLAN SELECT DISTINCT ON (a) a, b, c FROM t ORDER BY a, b;
+    SELECT DISTINCT ON (a) a, b, c FROM t ORDER BY a, b;
+}
+expect {
+    1|0|0|SCAN t USING INDEX t_a_b
+    3|0|0|KEEP FIRST ROW PER DISTINCT ON KEY
+    |1|n1
+    1|10|x
+    2|5|w
+    3||q
+}
+
+@setup indexed_rows
+test index-order-descending {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a DESC, b DESC;
+}
+expect {
+    3|7
+    2|30
+    1|20
+    |2
+}
+
+@setup indexed_rows
+test index-order-limit-and-offset-count-groups {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b LIMIT 2 OFFSET 1;
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b LIMIT 0;
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b LIMIT -1 OFFSET 3;
+}
+expect {
+    1|10
+    2|5
+    3|
+}
+
+@setup indexed_rows
+test index-order-of-the-key-only-still-sorts-by-the-other-terms {
+    EXPLAIN QUERY PLAN SELECT DISTINCT ON (a) a, c FROM t ORDER BY a, c DESC;
+    SELECT DISTINCT ON (a) a, c FROM t ORDER BY a, c DESC;
+}
+expect {
+    1|0|0|SCAN t
+    10|0|0|USE SORTER FOR ORDER BY
+    13|0|0|KEEP FIRST ROW PER DISTINCT ON KEY
+    |n2
+    1|y
+    2|z
+    3|r
+}
+
+@setup indexed_rows
+test index-order-with-where-and-group-by {
+    SELECT DISTINCT ON (a) a, b FROM t WHERE b > 5 ORDER BY a, b;
+    SELECT DISTINCT ON (a) a, sum(b) FROM t GROUP BY a, b ORDER BY a, b DESC;
+}
+expect {
+    1|10
+    2|30
+    3|7
+    |2
+    1|20
+    2|30
+    3|7
+}
+
+@setup indexed_rows
+test index-order-in-a-subquery-that-runs-once-per-outer-row {
+    CREATE TABLE o(x);
+    INSERT INTO o VALUES (1), (2), (3), (4);
+    SELECT x, (SELECT count(*) FROM (SELECT DISTINCT ON (a) a FROM t WHERE a >= o.x ORDER BY a, b)) FROM o ORDER BY x;
+    SELECT x, (SELECT b FROM (SELECT DISTINCT ON (a) a, b FROM t WHERE a <= o.x ORDER BY a DESC, b DESC) LIMIT 1) FROM o ORDER BY x;
+}
+expect {
+    1|3
+    2|2
+    3|1
+    4|0
+    1|20
+    2|30
+    3|7
+    4|7
+}
+
+@setup indexed_rows
+test index-order-in-a-join-and-a-compound-select {
+    CREATE TABLE u(a, d);
+    INSERT INTO u VALUES (1, 'one'), (2, 'two'), (2, 'deux');
+    SELECT DISTINCT ON (t.a) t.a, t.b, u.d FROM t JOIN u ON u.a = t.a ORDER BY t.a, t.b, u.d;
+    SELECT a, b FROM (SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b) UNION ALL SELECT a, b FROM (SELECT DISTINCT ON (a) a, b FROM t ORDER BY a DESC, b DESC);
+}
+expect {
+    1|10|one
+    2|5|deux
+    |1
+    1|10
+    2|5
+    3|
+    3|7
+    2|30
+    1|20
+    |2
+}
+
+setup grouped_rows {
+    CREATE TABLE tg(a, b);
+    INSERT INTO tg VALUES (1, 10), (1, 20), (2, 5), (3, 7), (3, 1);
+}
+
+@setup grouped_rows
+test group-by-key-that-is-not-in-the-select-list {
+    SELECT DISTINCT ON (a) count(*) FROM tg GROUP BY a;
+    SELECT DISTINCT ON (a) b FROM tg GROUP BY a, b ORDER BY a, b;
+    SELECT DISTINCT ON (a) b FROM tg GROUP BY a, b ORDER BY a, b DESC;
+    SELECT DISTINCT ON (a + 1) count(*) FROM tg GROUP BY a ORDER BY a + 1 DESC;
+    SELECT DISTINCT ON (a) sum(b) FROM tg GROUP BY a HAVING sum(b) > 5 ORDER BY a LIMIT 1 OFFSET 1;
+}
+expect {
+    2
+    1
+    2
+    10
+    5
+    1
+    20
+    5
+    7
+    2
+    1
+    2
+    8
+}
+
+@setup grouped_rows
+test group-by-key-that-is-not-in-the-select-list-with-an-index {
+    CREATE INDEX tg_a_b ON tg(a, b);
+    SELECT DISTINCT ON (a) count(*) FROM tg GROUP BY a;
+    SELECT DISTINCT ON (a) b FROM tg GROUP BY a, b ORDER BY a, b;
+    SELECT DISTINCT ON (a) max(b) FROM tg GROUP BY a ORDER BY a DESC;
+}
+expect {
+    2
+    1
+    2
+    10
+    5
+    1
+    7
+    5
+    20
+}
+
+@setup grouped_rows
+test window-function-with-a-key-that-is-not-in-the-select-list {
+    SELECT DISTINCT ON (a) b, sum(b) OVER (ORDER BY a, b) FROM tg ORDER BY a, b;
+    SELECT DISTINCT ON (a) b, sum(b) OVER (ORDER BY a, b) FROM tg GROUP BY a, b ORDER BY a, b;
+}
+expect {
+    10|10
+    5|35
+    1|36
+    10|10
+    5|35
+    1|36
+}
