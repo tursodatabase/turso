@@ -17,6 +17,8 @@
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
 //! [`Dialect::parse_internal`] of the database's dialect.
 
+#[cfg(test)]
+pub(crate) mod cannot_parse;
 pub mod catalog;
 
 pub use crate::functions::builtin::{
