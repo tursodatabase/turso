@@ -140,11 +140,12 @@ impl IO for WindowsIO {
             GENERIC_READ | GENERIC_WRITE
         };
 
-        let creation_disposition = if flags.contains(OpenFlags::Create) {
-            OPEN_ALWAYS
-        } else {
-            OPEN_EXISTING
-        };
+        let creation_disposition =
+            if flags.contains(OpenFlags::Create) && !flags.contains(OpenFlags::ReadOnly) {
+                OPEN_ALWAYS
+            } else {
+                OPEN_EXISTING
+            };
 
         let shared_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 

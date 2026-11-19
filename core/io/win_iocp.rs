@@ -321,7 +321,9 @@ impl IO for WindowsIOCP {
             GENERIC_WRITE | GENERIC_READ
         };
 
-        creation_disposition |= if open_flags.contains(OpenFlags::Create) {
+        creation_disposition |= if open_flags.contains(OpenFlags::Create)
+            && !open_flags.contains(OpenFlags::ReadOnly)
+        {
             OPEN_ALWAYS
         } else {
             OPEN_EXISTING
