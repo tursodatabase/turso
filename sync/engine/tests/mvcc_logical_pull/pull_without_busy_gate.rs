@@ -1,7 +1,7 @@
 //! An app on a plain connection (the JS binding, which never takes the SDK's SyncBusyGate) with
-//! a transaction open while a logical MVCC pull runs. The pull needs the gate, so it does not
-//! wait for the app: the app could commit during the wait, and the pull would then lose that
-//! commit.
+//! a transaction open while a logical MVCC pull runs. A logical pull needs no gate: it reads the
+//! local changes after BEGIN IMMEDIATE, so it waits for the app's transaction and then replays
+//! whatever the app committed meanwhile.
 
 use std::sync::Arc;
 
@@ -11,9 +11,9 @@ use turso_sync_engine::Result;
 use crate::harness::Remote;
 
 /// The app commits the first time the pull returns control to its caller, which is where a
-/// pull that waits for a lock would wait. The pull must not wait: it fails with Busy without
-/// returning control, so the app's commit comes after the pull. The app's row must stay in the
-/// table and stay waiting to be pushed, and the next pull must apply the remote row.
+/// pull that waits for a lock waits. The pull must wait, so the app's commit happens while the
+/// pull is in progress, and the pull must then keep the app's row in the table and waiting to be
+/// pushed.
 #[test]
 fn app_commit_while_a_logical_pull_runs_is_not_lost() -> Result<()> {
     let remote = Remote::new(&["CREATE TABLE t(x TEXT)"])?;
@@ -31,26 +31,16 @@ fn app_commit_while_a_logical_pull_runs_is_not_lost() -> Result<()> {
         }
     });
     assert!(
-        !committed_during_pull && yields == 0,
-        "the pull waited for the app's transaction: {yields} yields, result {pull_result:?}"
+        committed_during_pull,
+        "the pull did not wait for the app's transaction: {yields} yields, result {pull_result:?}"
     );
-    let error = pull_result.expect_err("the pull must fail while the app holds its transaction");
-    assert!(
-        error.to_string().to_lowercase().contains("busy"),
-        "unexpected error: {error}"
-    );
-
-    app.execute("COMMIT")?;
-    assert_eq!(rows(&app)?, ["app"]);
+    pull_result?;
+    assert_eq!(rows(&app)?, ["app", "remote"]);
     assert_eq!(
         replica.pending_local_changes()?,
         1,
         "the app's row is not waiting to be pushed"
     );
-
-    replica.pull()?;
-    assert_eq!(rows(&app)?, ["app", "remote"]);
-    assert_eq!(replica.pending_local_changes()?, 1);
     Ok(())
 }
 

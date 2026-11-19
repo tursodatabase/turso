@@ -110,9 +110,15 @@ impl InProcessServer {
             .page_pulls
             .as_ref()
             .map(|pulls| pulls.fetch_add(1, Ordering::Relaxed) + 1);
-        if let Some(pull) = pull {
+        if let (Some(pull), false) = (pull, self.remote.mvcc) {
             let database = self.remote.checkpoint_and_read_database_file()?;
             Ok(Self::pages(&self.remote, database, revision_at(pull)))
+        } else if pull.is_some_and(|pull| pull % 2 == 0) {
+            // How the sync server answers a logical pull it cannot serve from the log. The
+            // client then pulls the log from the revision it was given.
+            let database = self.remote.checkpoint_and_read_database_file()?;
+            let log_end = self.remote.read_logical_log()?.len();
+            Self::as_replace_base(Self::pages(&self.remote, database, revision_at(log_end)))
         } else if request.client_revision.is_empty() {
             let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
             let log_end = self.bootstrap_base.read_logical_log()?.len();
@@ -151,6 +157,16 @@ impl InProcessServer {
             response.extend(page.encode_length_delimited_to_vec());
         }
         response
+    }
+
+    fn as_replace_base(response: Vec<u8>) -> Result<Vec<u8>> {
+        let mut rest = response.as_slice();
+        let mut header = PullUpdatesRespProtoBody::decode_length_delimited(&mut rest)
+            .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
+        header.apply_mode = PullUpdatesApplyMode::ReplaceBase as i32;
+        let mut replaced = header.encode_length_delimited_to_vec();
+        replaced.extend_from_slice(rest);
+        Ok(replaced)
     }
 
     fn logical_log_since(&self, offset: usize) -> Result<Vec<u8>> {
