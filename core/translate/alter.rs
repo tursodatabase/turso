@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::dialect::{
-    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, NewOwner, RenameColumn,
-    RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
+    AccessStatement, AddColumn, AlterColumn, CatalogCmd, CmdContext, DropColumn, NewOwner,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
@@ -16,9 +16,8 @@ use super::{
     planner::ROWID_STRS,
     schema::{
         self, check_column_type, validate_check_expr, validate_default_expr,
-        validate_generated_function_calls, SQLITE_TABLEID,
+        validate_generated_function_calls,
     },
-    update::translate_update_for_schema_change,
 };
 use crate::{
     schema::alter_table::{
@@ -43,10 +42,7 @@ use crate::{
         },
         trigger::create_trigger_to_sql,
     },
-    util::{
-        check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal,
-    },
+    util::{check_expr_references_column, normalize_ident, parse_numeric_literal},
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder},
@@ -86,19 +82,6 @@ fn validate(
 struct SchemaTriggerEntry {
     namespace: NamespaceRef,
     trigger: Arc<crate::schema::Trigger>,
-}
-
-pub(super) fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
-    if database_id == crate::MAIN_DB_ID {
-        SQLITE_TABLEID.to_string()
-    } else if database_id == crate::TEMP_DB_ID {
-        format!("temp.{SQLITE_TABLEID}")
-    } else {
-        let db_name = resolver
-            .namespace_name(database_id)
-            .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.{SQLITE_TABLEID}")
-    }
 }
 
 pub(super) fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -> bool {
@@ -666,9 +649,6 @@ pub fn translate_alter_table(
     program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     let mangled_table_name = resolver.mangle_name(namespace, &normalize_ident(table_name));
-    // For attached databases, qualify sqlite_schema with the database name
-    // so that the UPDATE targets the correct database's schema table.
-    let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(
         &alter_table,
@@ -970,31 +950,6 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(
-                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
-            );
-
-            let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
-            let stmt = format!(
-                r#"
-                    UPDATE {qualified_schema_table}
-                    SET sql = '{sql}'
-                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
-                "#,
-            );
-
-            let cmd = crate::dialect::parse_statement(connection.dialect().as_ref(), &stmt)
-                .map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse generated UPDATE statement: {e}"
-                    ))
-                })?;
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                return Err(LimboError::ParseError(
-                    "generated UPDATE statement did not parse as expected".to_string(),
-                ));
-            };
-
             let rewrite_rows = if !original_btree.columns()[dropped_index].is_virtual_generated() {
                 let source_column_by_schema_idx: Vec<Option<usize>> = btree
                     .columns()
@@ -1041,52 +996,49 @@ pub fn translate_alter_table(
                     table_name_norm
                 );
             }
-            let mut rewrite_rows_result = Ok(());
-            let mut owned_sequences_result = Ok(());
-            translate_update_for_schema_change(
-                update,
-                resolver,
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            resolver.catalog.dialect.catalog().emit(
                 program,
-                connection,
-                input,
-                |program| {
-                    if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
-                        rewrite_rows_result = emit_rewrite_table_rows(
-                            program,
-                            original_btree.clone(),
-                            &btree,
-                            source_column_by_schema_idx,
-                            layout,
-                            None,
-                            resolver,
-                            connection,
-                            database_id,
-                        );
-                    }
-                    owned_sequences_result = owned_sequences.iter().try_for_each(|sequence| {
-                        crate::translate::sequence::emit_drop_sequence(
-                            program, resolver, connection, namespace, sequence,
-                        )
-                        .map(|_| ())
-                    });
-
-                    program.emit_insn(Insn::SetCookie {
-                        db: database_id,
-                        cookie: Cookie::SchemaVersion,
-                        value: schema_version as i32 + 1,
-                        p5: 0,
-                    });
-
-                    program.emit_insn(Insn::DropColumn {
-                        db: database_id,
-                        namespace: namespace.id,
-                        table: btree.name.clone(),
-                        column_index: dropped_index,
-                    })
-                },
+                &cmd_context,
+                &CatalogCmd::DropColumn(DropColumn {
+                    namespace: namespace.id,
+                    name: &table_name_norm,
+                    table: &btree,
+                    statement: input,
+                }),
             )?;
-            rewrite_rows_result?;
-            owned_sequences_result?
+            if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
+                emit_rewrite_table_rows(
+                    program,
+                    original_btree.clone(),
+                    &btree,
+                    source_column_by_schema_idx,
+                    layout,
+                    None,
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
+            }
+            for sequence in &owned_sequences {
+                crate::translate::sequence::emit_drop_sequence(
+                    program, resolver, connection, namespace, sequence,
+                )?;
+            }
+
+            program.emit_insn(Insn::SetCookie {
+                db: database_id,
+                cookie: Cookie::SchemaVersion,
+                value: schema_version as i32 + 1,
+                p5: 0,
+            });
+
+            program.emit_insn(Insn::DropColumn {
+                db: database_id,
+                namespace: namespace.id,
+                table: btree.name.clone(),
+                column_index: dropped_index,
+            });
         }
         ast::AlterTableBody::AddColumn(col_def) => {
             let is_generated = col_def

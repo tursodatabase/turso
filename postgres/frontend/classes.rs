@@ -581,6 +581,9 @@ impl Catalog for PostgresCatalog {
             }
             // A new column owns no sequence, so no class row changes.
             CatalogCmd::AddColumn(_) => {}
+            // The statement drops the sequences that the column owns
+            // itself, each with its class row.
+            CatalogCmd::DropColumn(_) => {}
         }
         Ok(())
     }

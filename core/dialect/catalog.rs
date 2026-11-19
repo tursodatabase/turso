@@ -170,6 +170,7 @@ pub enum CatalogCmd<'a> {
     RenameColumn(RenameColumn<'a>),
     AlterColumn(AlterColumn<'a>),
     AddColumn(AddColumn<'a>),
+    DropColumn(DropColumn<'a>),
 }
 
 /// A new table. The statement has already emitted the creation of its
@@ -368,6 +369,15 @@ pub struct AlterColumn<'a> {
 /// A table that gets a new last column. `table` is the table with it.
 #[derive(Debug, Clone, Copy)]
 pub struct AddColumn<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub table: &'a BTreeTable,
+    pub statement: &'a str,
+}
+
+/// A table that loses a column. `table` is the table without it.
+#[derive(Debug, Clone, Copy)]
+pub struct DropColumn<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
     pub table: &'a BTreeTable,
