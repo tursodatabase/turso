@@ -6,7 +6,7 @@ use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
-use std::{borrow::Cow, collections::HashMap, fmt::Write, str::from_utf8};
+use std::{borrow::Cow, fmt::Write, str::from_utf8};
 
 use super::path::{JsonPath, PathElement};
 
@@ -2921,27 +2921,18 @@ impl Jsonb {
                             bail_parse_error!("Not found!");
                         }
                         Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
+                            let element =
+                                self.array_element_from_end(pos + root_header_size, end_pos, *idx)?;
 
                             if !mode.allows_replace() {
                                 bail_parse_error!("Not found!");
                             }
-                            if let Some(index) = idx_map.get(&real_idx) {
+                            if let Some(index) = element {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
                                     JsonLocationKind::ArrayEntry,
                                     0,
-                                    *index,
+                                    index,
                                 ));
                             } else {
                                 bail_parse_error!("Element with negative index not found")
@@ -3084,27 +3075,18 @@ impl Jsonb {
                             bail_parse_error!("Not found!");
                         }
                         Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
+                            let element =
+                                self.array_element_from_end(pos + root_header_size, end_pos, *idx)?;
 
                             if !mode.allows_replace() {
                                 bail_parse_error!("Not found!");
                             }
-                            if let Some(index) = idx_map.get(&real_idx) {
+                            if let Some(index) = element {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
                                     JsonLocationKind::DocumentRoot,
                                     0,
-                                    *index,
+                                    index,
                                 ));
                             } else {
                                 bail_parse_error!("Element with negative index not found")
@@ -3253,27 +3235,21 @@ impl Jsonb {
                             bail_parse_error!("Not found!");
                         }
                         Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = value_idx + value_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
+                            let element = self.array_element_from_end(
+                                value_idx + value_header_size,
+                                end_pos,
+                                *idx,
+                            )?;
 
                             if !mode.allows_replace() {
                                 bail_parse_error!("Not found!");
                             }
-                            if let Some(index) = idx_map.get(&real_idx) {
+                            if let Some(index) = element {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
                                     0,
-                                    *index,
+                                    index,
                                 ));
                             } else {
                                 bail_parse_error!(
@@ -3312,6 +3288,32 @@ impl Jsonb {
     /// Appends an empty `placeholder_type` container to the array at
     /// `array_idx` and rewrites the array header to include it. Returns the
     /// placeholder position and the number of bytes the array grew by.
+    /// Returns the offset of the element that a negative array index selects
+    /// (`-1` is the last element) in the array whose elements are between
+    /// `first` and `end`, or None when the array has fewer elements.
+    fn array_element_from_end(
+        &self,
+        first: usize,
+        end: usize,
+        index: i32,
+    ) -> Result<Option<usize>> {
+        let mut count = 0;
+        let mut pos = first;
+        while pos < end {
+            pos = self.skip_element(pos)?;
+            count += 1;
+        }
+        let target = count + index;
+        if target < 0 {
+            return Ok(None);
+        }
+        let mut pos = first;
+        for _ in 0..target {
+            pos = self.skip_element(pos)?;
+        }
+        Ok(Some(pos))
+    }
+
     fn append_array_placeholder(
         &mut self,
         array_idx: usize,
