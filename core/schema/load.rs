@@ -286,6 +286,7 @@ pub(crate) fn load_steps(conn: &Arc<Connection>, steps_for: StepsFor) -> Vec<Box
         steps.push(Box::new(ViewsAndIndexes::new(conn.clone())));
     }
     steps.push(Box::new(DialectState::new(conn.clone())));
+    steps.extend(conn.db.dialect().catalog().load_steps());
     steps
 }
 
