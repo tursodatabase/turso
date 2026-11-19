@@ -164,7 +164,7 @@ pub use dialect::{
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
-    SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,
+    ParentKeyReference, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,
 };
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]

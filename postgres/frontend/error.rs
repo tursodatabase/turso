@@ -1,5 +1,7 @@
 use turso_core::security::permission::{Action, Object, PermissionDenied, Reason};
-use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
+use turso_core::{
+    ConstraintKind, ConstraintViolation, DialectError, LimboError, ParentKeyReference, Value,
+};
 use turso_pg_parser::sqlstate::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -118,7 +120,9 @@ impl From<&LimboError> for ErrorReport {
             column_name: None,
         };
         if let LimboError::ConstraintViolation(violation) = error {
-            if let Some(table) = &violation.table_name {
+            if let Some(referencing) = &violation.referencing {
+                report.report_parent_key_still_referenced(violation, referencing);
+            } else if let Some(table) = &violation.table_name {
                 // Core names the table as it is stored; the user knows it by
                 // its bare name.
                 let table = turso_core::namespace::demangle_name(true, table).1;
@@ -138,6 +142,50 @@ impl From<&LimboError> for ErrorReport {
             report.detail.clone_from(&dialect_error.detail);
         }
         report
+    }
+}
+
+impl ErrorReport {
+    /// The parent side of a foreign key violation: a DELETE or UPDATE of a
+    /// parent row removes a key that `referencing` still references.
+    /// PostgreSQL names the referencing table and its foreign key.
+    fn report_parent_key_still_referenced(
+        &mut self,
+        violation: &ConstraintViolation,
+        referencing: &ParentKeyReference,
+    ) {
+        let parent = turso_core::namespace::demangle_name(
+            true,
+            violation.table_name.as_deref().unwrap_or(""),
+        )
+        .1;
+        let child = turso_core::namespace::demangle_name(true, &referencing.table).1;
+        let constraint = violation
+            .constraint_name
+            .clone()
+            .unwrap_or_else(|| foreign_key_constraint_name(child, &referencing.columns));
+        let (setting, referenced) = if referencing.restrict {
+            ("RESTRICT setting of ", "referenced")
+        } else {
+            ("", "still referenced")
+        };
+        self.message = format!(
+            "update or delete on table \"{parent}\" violates {setting}foreign key constraint \"{constraint}\" on table \"{child}\""
+        );
+        self.detail = Some(if violation.values.is_empty() {
+            format!("Key is {referenced} from table \"{child}\".")
+        } else {
+            let columns = violation.column_names.join(", ");
+            let values = violation
+                .values
+                .iter()
+                .map(format_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Key ({columns})=({values}) is {referenced} from table \"{child}\".")
+        });
+        self.table_name = Some(child.to_string());
+        self.constraint_name = Some(constraint);
     }
 }
 
@@ -253,6 +301,9 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => SQLSTATE_UNIQUE_VIOLATION,
+            ConstraintKind::ForeignKey if cv.referencing.as_ref().is_some_and(|r| r.restrict) => {
+                SQLSTATE_RESTRICT_VIOLATION
+            }
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
             ConstraintKind::NotNull => SQLSTATE_NOT_NULL_VIOLATION,
             ConstraintKind::Check => SQLSTATE_CHECK_VIOLATION,

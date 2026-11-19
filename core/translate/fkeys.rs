@@ -979,13 +979,19 @@ fn emit_fk_parent_key_probe(
             // OLD key referenced by a child: removing/changing this parent key
             // creates a violation unless a later row or statement repairs it.
             ParentProbePass::Old => {
-                if is_restrict {
-                    // RESTRICT: immediate halt
-                    emit_fk_restrict_halt(p, None)?;
-                } else {
-                    // NO ACTION: increment counter (checked at statement/transaction end)
-                    emit_fk_violation(p, &fk_ref.fk, None)?;
-                }
+                let parent_tbl = resolver
+                    .with_schema(database_id, |s| {
+                        s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+                    })
+                    .expect("parent btree");
+                emit_fk_parent_violation(
+                    p,
+                    resolver,
+                    fk_ref,
+                    &parent_tbl,
+                    (parent_key_start..parent_key_start + n_cols).collect(),
+                    is_restrict,
+                )?;
             }
 
             // NEW key referenced by a child: this parent key may repair an
@@ -1512,6 +1518,37 @@ pub(crate) fn fk_constraint_info(
     Ok(info)
 }
 
+/// Reports that a DELETE or UPDATE of a parent row removes the key in
+/// `parent_key_regs`, which a row of `fk_ref`'s child table still
+/// references: at once for RESTRICT, otherwise at the end of the statement
+/// unless a later row repairs it.
+fn emit_fk_parent_violation(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    fk_ref: &ResolvedFkRef,
+    parent_table: &BTreeTable,
+    parent_key_regs: Vec<usize>,
+    restrict: bool,
+) -> Result<()> {
+    let mut info = ConstraintInfo::fk_parent(
+        &parent_table.name,
+        fk_ref.fk.constraint_name.clone(),
+        fk_ref.parent_cols.to_vec(),
+        parent_key_regs,
+        crate::ParentKeyReference {
+            table: fk_ref.child_table.name.clone(),
+            columns: fk_ref.fk.child_columns.to_vec(),
+            restrict,
+        },
+    );
+    emit_constraint_values_decode(program, resolver, parent_table, &mut info)?;
+    if restrict {
+        emit_fk_restrict_halt(program, Some(Box::new(info)))
+    } else {
+        emit_fk_violation(program, &fk_ref.fk, Some(Box::new(info)))
+    }
+}
+
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.
 /// Raises a violation if any child row references the parent key.
 /// For RESTRICT: emits immediate HALT
@@ -1559,14 +1596,15 @@ fn emit_fk_delete_parent_existence_check_single(
         None
     };
 
-    // Closure to emit the appropriate violation based on action type
     let emit_violation = |p: &mut ProgramBuilder| -> Result<()> {
-        if is_restrict {
-            emit_fk_restrict_halt(p, None)?;
-        } else {
-            emit_fk_violation(p, &fk_ref.fk, None)?;
-        }
-        Ok(())
+        emit_fk_parent_violation(
+            p,
+            resolver,
+            fk_ref,
+            parent_bt,
+            (parent_key_start..parent_key_start + ncols).collect(),
+            is_restrict,
+        )
     };
 
     if let Some(ref idx) = child_idx {

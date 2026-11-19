@@ -9,7 +9,24 @@ test fk-insert-missing-parent {
     INSERT INTO child VALUES (42);
 }
 @sqlstate 23503
-expect error {}
+expect error {insert or update on table "child" violates foreign key constraint "child_pid_fkey"}
+
+test fk-insert-several-rows-one-missing-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1), (99);
+}
+@sqlstate 23503
+expect error {insert or update on table "child" violates foreign key constraint "child_pid_fkey"}
+
+test fk-insert-select-missing-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO child SELECT 7;
+}
+@sqlstate 23503
+expect error {insert or update on table "child" violates foreign key constraint "child_pid_fkey"}
 
 test fk-insert-existing-parent {
     CREATE TABLE parent (id int PRIMARY KEY);
@@ -40,7 +57,47 @@ test fk-delete-referenced-parent {
     DELETE FROM parent;
 }
 @sqlstate 23503
-expect error {}
+expect error {update or delete on table "parent" violates foreign key constraint "child_pid_fkey" on table "child"}
+
+test fk-update-referenced-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int CONSTRAINT child_parent REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    UPDATE parent SET id = 2;
+}
+@sqlstate 23503
+expect error {update or delete on table "parent" violates foreign key constraint "child_parent" on table "child"}
+
+test fk-delete-referenced-parent-restrict {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON DELETE RESTRICT);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    DELETE FROM parent;
+}
+@sqlstate 23001
+expect error {update or delete on table "parent" violates RESTRICT setting of foreign key constraint "child_pid_fkey" on table "child"}
+
+test fk-update-referenced-parent-restrict {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    UPDATE parent SET id = 2;
+}
+@sqlstate 23001
+expect error {update or delete on table "parent" violates RESTRICT setting of foreign key constraint "child_pid_fkey" on table "child"}
+
+test fk-delete-referenced-parent-multicolumn {
+    CREATE TABLE parent (a int, b text, PRIMARY KEY (a, b));
+    CREATE TABLE child (a int, b text, FOREIGN KEY (a, b) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES (1, 'x');
+    INSERT INTO child VALUES (1, 'x');
+    DELETE FROM parent;
+}
+@sqlstate 23503
+expect error {update or delete on table "parent" violates foreign key constraint "child_a_b_fkey" on table "child"}
 
 test fk-on-delete-cascade {
     CREATE TABLE parent (id int PRIMARY KEY);

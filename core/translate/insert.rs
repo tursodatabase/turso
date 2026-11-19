@@ -2052,6 +2052,7 @@ fn emit_notnulls(
                 violation_regs: all_regs,
                 row_col_names: all_names,
                 parent_table: None,
+                referencing: None,
             };
             // HaltIfNull runs for every row, so jump over the decode of the
             // reported row unless the value is NULL.
@@ -4257,7 +4258,7 @@ pub fn emit_fk_child_insert_checks(
             // Missing parent: counted for a deferred FK or a multi-row insert, otherwise Halt before Insert
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred || inserting_multiple_rows {
+            if fk_ref.fk.deferred {
                 emit_fk_violation(program, &fk_ref.fk, None)?;
             } else {
                 let fk_col_regs: Vec<usize> = fk_ref
@@ -4273,9 +4274,18 @@ pub fn emit_fk_child_insert_checks(
                         }
                     })
                     .collect();
-                let constraint_info =
-                    fk_constraint_info(program, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
-                emit_fk_restrict_halt(program, Some(Box::new(constraint_info)))?;
+                let constraint_info = Box::new(fk_constraint_info(
+                    program,
+                    resolver,
+                    child_tbl,
+                    &fk_ref.fk,
+                    fk_col_regs,
+                )?);
+                if inserting_multiple_rows {
+                    emit_fk_violation(program, &fk_ref.fk, Some(constraint_info))?;
+                } else {
+                    emit_fk_restrict_halt(program, Some(constraint_info))?;
+                }
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4372,7 +4382,7 @@ pub fn emit_fk_child_insert_checks(
                 |_p| Ok(()),
                 // on_not_found: counted for a deferred FK or a multi-row insert, otherwise Halt
                 |p| {
-                    if fk_ref.fk.deferred || inserting_multiple_rows {
+                    if fk_ref.fk.deferred {
                         emit_fk_violation(p, &fk_ref.fk, None)?;
                     } else {
                         let fk_col_regs: Vec<usize> = fk_ref
@@ -4388,9 +4398,18 @@ pub fn emit_fk_child_insert_checks(
                                 }
                             })
                             .collect();
-                        let constraint_info =
-                            fk_constraint_info(p, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
-                        emit_fk_restrict_halt(p, Some(Box::new(constraint_info)))?;
+                        let constraint_info = Box::new(fk_constraint_info(
+                            p,
+                            resolver,
+                            child_tbl,
+                            &fk_ref.fk,
+                            fk_col_regs,
+                        )?);
+                        if inserting_multiple_rows {
+                            emit_fk_violation(p, &fk_ref.fk, Some(constraint_info))?;
+                        } else {
+                            emit_fk_restrict_halt(p, Some(constraint_info))?;
+                        }
                     }
                     Ok(())
                 },
