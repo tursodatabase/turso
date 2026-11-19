@@ -531,7 +531,7 @@ impl EmitOrderBy {
         }
 
         // Handle SELECT DISTINCT deduplication
-        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
 
             // For distinctness checking with Insn::Found, we need a contiguous run of registers containing all the result columns.

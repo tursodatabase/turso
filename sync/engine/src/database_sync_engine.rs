@@ -2417,7 +2417,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 },
                             )?;
                             if let Some(sync) = mv_store
-                                .sync_logical_log_after_external_restore(&main_conn)
+                                .sync_logical_log(&main_conn)
                                 .map_err(|error| {
                                     Error::DatabaseSyncEngineError(format!(
                                         "failed to sync MVCC logical log after replace-base snapshot: {error}",

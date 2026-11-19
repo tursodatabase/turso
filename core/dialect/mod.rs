@@ -11,134 +11,35 @@
 //! ([`resolve_builtin_function`], [`call_builtin_scalar`]) and the catalog
 //! tables (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
 //! `btree_dump`, `sqlite_turso_types`) that
-//! [`crate::schema::builtin::schema_builder`] installs. The [`engine`]
-//! module has the parser entry points and the dialect of the statements
-//! the engine runs for itself.
+//! [`crate::schema::builtin::schema_builder`] installs.
+//!
+//! The SQL text that core keeps, such as the definitions in
+//! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
+//! [`Dialect::parse_internal`] of the database's dialect.
 
-pub mod engine;
+pub mod catalog;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
-
-pub(crate) use engine::EngineDialect;
+pub use catalog::{
+    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
+};
 
 use crate::{
     function::ScalarFunc,
     namespace::NamespaceId,
-    schema::{BTreeTable, RelationKind, Schema, SchemaBuilder},
+    schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
     vdbe::{builder::ProgramBuilder, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
 use std::{any::Any, sync::Arc};
-use turso_parser::ast::{
-    self, Cmd, CreateTableBody, Grantee, IdentityKind, Privilege, QualifiedName, RoleSpec, Stmt,
-};
+use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
-
-/// A change a statement makes to the dialect's catalog of the main
-/// database: to a relation, or to the roles. Translation tells the dialect
-/// about it through
-/// [`Dialect::translate_catalog_changes`], and the dialect's own bytecode
-/// tells it back through [`Dialect::apply_catalog_change`] once the change
-/// is written.
-#[derive(Debug, Clone)]
-pub enum CatalogChange {
-    Create {
-        namespace: NamespaceId,
-        name: String,
-        kind: RelationKind,
-        /// For an index, the table it is on, in the same namespace. Its
-        /// owner owns the index.
-        table: Option<String>,
-    },
-    Drop {
-        namespace: NamespaceId,
-        name: String,
-    },
-    Rename {
-        namespace: NamespaceId,
-        old_name: String,
-        new_name: String,
-    },
-    /// Whom the relation belongs to from now on.
-    ChangeOwner {
-        namespace: NamespaceId,
-        name: String,
-        owner: NewOwner,
-    },
-    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
-    RenameColumn {
-        namespace: NamespaceId,
-        table: String,
-        old_name: String,
-        new_name: String,
-    },
-    /// `GRANT privileges ON relation TO grantees`, or `REVOKE privileges ON
-    /// relation FROM grantees` when `revoke` is set.
-    Grant {
-        revoke: bool,
-        namespace: NamespaceId,
-        name: String,
-        privileges: Vec<Privilege>,
-        grantees: Vec<Grantee>,
-    },
-    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, or `DISABLE` when
-    /// `enabled` is false.
-    SetRowSecurity {
-        namespace: NamespaceId,
-        name: String,
-        enabled: bool,
-    },
-    /// `CREATE POLICY` on table `name`. Its expressions refer to the
-    /// table's columns by their unqualified names.
-    CreatePolicy {
-        namespace: NamespaceId,
-        name: String,
-        policy: Box<ast::CreatePolicy>,
-    },
-    /// `DROP POLICY policy_name ON name`.
-    DropPolicy {
-        namespace: NamespaceId,
-        name: String,
-        policy_name: String,
-        if_exists: bool,
-    },
-    /// `CREATE ROLE name`: a role that is not a superuser and cannot log in.
-    CreateRole {
-        name: String,
-        options: ast::RoleOptions,
-    },
-    /// `GRANT roles TO grantees`, which makes each grantee a member of each
-    /// role, or `REVOKE roles FROM grantees` when `revoke` is set.
-    GrantRole {
-        revoke: bool,
-        roles: Vec<String>,
-        grantees: Vec<Grantee>,
-    },
-}
-
-/// Whom a relation belongs to after a [`CatalogChange::ChangeOwner`].
-#[derive(Debug, Clone)]
-pub enum NewOwner {
-    /// A column of a table of the same namespace, as `ALTER SEQUENCE ...
-    /// OWNED BY table.column` names one for a sequence, or no column. What a
-    /// table owns changes owner with it, and not on its own.
-    Column(Option<OwnerColumn>),
-    /// A role, as `ALTER ... OWNER TO` names one.
-    Role(RoleSpec),
-}
-
-/// The column that owns a sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerColumn {
-    pub table: String,
-    pub column: String,
-}
 
 /// What a built-in scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
@@ -196,9 +97,26 @@ pub trait Dialect: Send + Sync + 'static {
     /// connection compilation state changes. Implementations must accept the
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
-    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-        engine::parse(sql)
-    }
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)>;
+
+    /// Parse the first statement in SQL that core keeps: the stored
+    /// definitions of tables, indexes, views, triggers and virtual tables,
+    /// the statements that `ALTER TABLE` generates, the built-in
+    /// `CREATE TYPE` text, the patterns of index methods, and the schema
+    /// writes of the engine. The text is SQLite syntax in every dialect.
+    ///
+    /// Returns the parsed command, if any, and the number of input bytes
+    /// consumed.
+    fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)>;
+
+    /// Parse the column definition that core keeps for `ALTER TABLE`, such
+    /// as `b INTEGER DEFAULT 0`. The text is SQLite syntax in every dialect.
+    fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition>;
+
+    /// The dialect for the statements that core and the frontend run for
+    /// themselves. Those statements are SQLite syntax and expect SQLite
+    /// rules in every database.
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect>;
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -208,8 +126,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// marker, so every implementation must fall back to SQLite parsing
     /// for text it does not recognize as its own.
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        engine::reject_postgres_table_sql(sql)?;
-        BTreeTable::from_sql(sql, root_page)
+        reject_postgres_table_sql(sql)?;
+        BTreeTable::from_stored_sql(self, sql, root_page, false)
     }
 
     /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
@@ -222,8 +140,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// plain SQLite text, so implementations must retain the same SQLite
     /// fallback required by [`Dialect::parse_table_sql`].
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-        engine::reject_postgres_table_sql(sql)?;
-        engine::parse_table_sql_ast(sql)
+        reject_postgres_table_sql(sql)?;
+        parse_table_sql_ast(self, sql)
     }
 
     /// Recover SQL that can be prepared to recreate a persisted table.
@@ -235,8 +153,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// internal engine tables must retain the SQLite fallback used by the
     /// schema parsing methods.
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-        engine::reject_postgres_table_sql(sql)?;
-        engine::table_sql_for_replay(sql)
+        reject_postgres_table_sql(sql)?;
+        table_sql_for_replay(self, sql)
     }
 
     /// Produce the SQL text to store in `sqlite_schema` for a
@@ -253,7 +171,7 @@ pub trait Dialect: Send + Sync + 'static {
         tbl_name: &QualifiedName,
         body: &CreateTableBody,
     ) -> Result<String> {
-        engine::format_table_sql(tbl_name, body)
+        format_table_sql(tbl_name, body)
     }
 
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
@@ -279,7 +197,7 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// [`Dialect::new_schema`] finishes the schema.
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
-        crate::schema::builtin::schema_builder(enable_custom_types)
+        crate::schema::builtin::schema_builder(self, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -348,6 +266,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether the arguments of a table function can only name columns of the
+    /// tables listed before it in FROM.
+    ///
+    /// SQLite looks in every table of the query, so `json_each(value)` reads
+    /// `json_each.value` and `json_each(t.x), t` is accepted. PostgreSQL only
+    /// lets a function in FROM read the tables to its left.
+    fn table_function_arguments_read_only_earlier_tables(&self) -> bool {
+        false
+    }
+
     /// Whether a sequence named without a schema in an expression stored in
     /// the schema is bound to the schema it is found in when the expression
     /// is created.
@@ -398,83 +326,37 @@ pub trait Dialect: Send + Sync + 'static {
         ))
     }
 
-    /// Translates `changes`, which the statement being compiled makes, into
-    /// the bytecode that records them in the dialect's own schema state, in
-    /// the same transaction as the statement's `sqlite_schema` rows. A table
-    /// comes with its automatic indexes in one call. Does nothing for a
-    /// dialect without schema state of its own, except that such a dialect
-    /// has no roles, ownership, privileges or row-level security and refuses
-    /// `CREATE ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`,
-    /// `GRANT`, `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_catalog_changes(
+    /// Translates `changes`, which the statement being compiled makes to
+    /// relations, into the bytecode that records them in the dialect's own
+    /// schema state, in the same transaction as the statement's
+    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
+    /// call. Does nothing for a dialect without schema state of its own.
+    fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
         schema: &Schema,
         connection: &Arc<Connection>,
-        changes: &[CatalogChange],
+        changes: &[RelationChange<'_>],
     ) -> Result<()> {
-        let _ = (program, schema, connection);
-        for change in changes {
-            match change {
-                CatalogChange::ChangeOwner {
-                    owner: NewOwner::Role(_),
-                    ..
-                } => {
-                    return Err(LimboError::ParseError(
-                        "ALTER ... OWNER TO is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::ChangeOwner {
-                    owner: NewOwner::Column(_),
-                    ..
-                } => {
-                    return Err(LimboError::ParseError(
-                        "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::Grant { revoke, .. } => {
-                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                    return Err(LimboError::ParseError(format!(
-                        "{statement} is not supported"
-                    )));
-                }
-                CatalogChange::SetRowSecurity { .. }
-                | CatalogChange::CreatePolicy { .. }
-                | CatalogChange::DropPolicy { .. } => {
-                    return Err(LimboError::ParseError(
-                        "row-level security is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::CreateRole { .. } => {
-                    return Err(LimboError::ParseError(
-                        "CREATE ROLE is not supported".to_string(),
-                    ));
-                }
-                CatalogChange::GrantRole { revoke, .. } => {
-                    let statement = if *revoke { "REVOKE" } else { "GRANT" };
-                    return Err(LimboError::ParseError(format!(
-                        "{statement} of role membership is not supported"
-                    )));
-                }
-                _ => {}
-            }
-        }
+        let _ = (program, schema, connection, changes);
         Ok(())
     }
 
-    /// Applies `change`, which the running statement wrote to the dialect's
-    /// schema state, to the in-memory copy in `schema`. `values` are the
-    /// registers the dialect named when it emitted the instruction, such as
-    /// the id its state gave a created relation.
-    fn apply_catalog_change(
+    /// Translates `statement` into the bytecode that changes the roles,
+    /// owners, privileges or policies the dialect stores. A dialect that
+    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
+    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
+    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
+    /// `CREATE POLICY` and `DROP POLICY`.
+    fn translate_access_statement(
         &self,
-        schema: &mut Schema,
-        change: &CatalogChange,
-        values: &[Value],
+        program: &mut ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        statement: &AccessStatement<'_>,
     ) -> Result<()> {
-        let _ = (schema, change, values);
-        Ok(())
+        let _ = (program, schema, connection);
+        Err(statement.not_supported())
     }
 
     /// Whether relations can be created, renamed or dropped in an attached
@@ -636,6 +518,18 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `sum()` and `avg()` count their infinite inputs apart from
+    /// the total of the finite ones.
+    ///
+    /// PostgreSQL does, so a moving window frame gives a finite result again
+    /// once its infinite values leave it. SQLite adds them to the total.
+    /// Removing a row from a window frame adds its negation, so once an
+    /// infinite value leaves, the total is `Inf - Inf`, which is NaN, and
+    /// the result stays NULL.
+    fn sum_counts_infinite_inputs(&self) -> bool {
+        false
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///
@@ -682,6 +576,72 @@ pub trait Dialect: Send + Sync + 'static {
     }
 }
 
+/// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that
+/// marks it is valid SQLite syntax, so without this check the SQLite parser
+/// would accept the PostgreSQL DDL with SQLite column semantics.
+pub fn reject_postgres_table_sql(sql: &str) -> Result<()> {
+    if sql.starts_with(POSTGRES_TABLE_SQL_PREFIX) {
+        return Err(LimboError::Corrupt(format!(
+            "malformed database schema: table was created by the postgres frontend: {sql}"
+        )));
+    }
+    Ok(())
+}
+
+/// Formats canonical SQLite `CREATE TABLE` text from its AST.
+pub fn format_table_sql(tbl_name: &QualifiedName, body: &CreateTableBody) -> Result<String> {
+    match body {
+        CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
+            "CREATE TABLE {} {}",
+            tbl_name.name.as_ident(),
+            body
+        )),
+        CreateTableBody::AsSelect(_) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
+    }
+}
+
+/// Recover persisted SQLite table SQL for schema replay.
+///
+/// SQLite text without a database qualifier can be replayed unchanged. A
+/// qualified name must be removed because the vacuum target only exposes its
+/// main schema.
+pub fn table_sql_for_replay(dialect: &(impl Dialect + ?Sized), sql: &str) -> Result<String> {
+    let stmt = parse_table_sql_ast(dialect, sql)?;
+    let Stmt::CreateTable {
+        mut tbl_name,
+        temporary,
+        if_not_exists,
+        body,
+    } = stmt
+    else {
+        unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+    };
+
+    if tbl_name.namespace.take().is_none() {
+        return Ok(sql.to_string());
+    }
+
+    Ok(Stmt::CreateTable {
+        tbl_name,
+        temporary,
+        if_not_exists,
+        body,
+    }
+    .to_string())
+}
+
+/// Parse persisted SQLite table SQL into a `CREATE TABLE` statement.
+pub fn parse_table_sql_ast(dialect: &(impl Dialect + ?Sized), sql: &str) -> Result<Stmt> {
+    match parse_statement(dialect, sql)? {
+        Some(Cmd::Stmt(stmt @ Stmt::CreateTable { .. })) => Ok(stmt),
+        other => Err(LimboError::Corrupt(format!(
+            "persisted table SQL is not CREATE TABLE: {other:?}"
+        ))),
+    }
+}
+
 /// Returns true if `sql` parses as a `CREATE VIRTUAL TABLE` statement.
 ///
 /// Like SQLite (whose `sqlite3InitCallback` feeds schema SQL to the real
@@ -689,11 +649,16 @@ pub trait Dialect: Send + Sync + 'static {
 /// `create_vtab` grammar rule), classification is done by parsing rather than
 /// by substring or token matching, which would misclassify regular tables
 /// whose SQL merely contains the text (e.g. in a DEFAULT literal).
-pub fn sql_is_create_virtual_table(sql: &str) -> bool {
+pub fn sql_is_create_virtual_table(dialect: &dyn Dialect, sql: &str) -> bool {
     matches!(
-        engine::parse_statement(sql),
+        parse_statement(dialect, sql),
         Ok(Some(ast::Cmd::Stmt(ast::Stmt::CreateVirtualTable(_))))
     )
+}
+
+/// Parse the first statement in SQL that core keeps, which is SQLite syntax.
+pub fn parse_statement(dialect: &(impl Dialect + ?Sized), sql: &str) -> Result<Option<Cmd>> {
+    Ok(dialect.parse_internal(sql)?.0)
 }
 
 /// The comment that marks the columns at the given positions as identity

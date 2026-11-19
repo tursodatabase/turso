@@ -1,0 +1,1301 @@
+# Known tursopg gaps against PostgreSQL: B. Operators & functions
+#
+# The default `expect` block is the PostgreSQL result. An `expect @tursopg`
+# block is the current wrong tursopg result. When you fix a gap, delete its
+# `@tursopg` block in the same change. See postgres/CONTRIBUTING.md.
+# A test without an `@tursopg` block matches PostgreSQL and guards against
+# regressions.
+
+@database :memory:
+
+setup t_id_s_n_arr_ia_j_ok_with_rows {
+    CREATE TABLE t (id int PRIMARY KEY, s text, n int, arr text[], ia int[], j jsonb, ok boolean);
+    INSERT INTO t VALUES (1, 'abc', 10, '{a,b}', '{1,2}', '{"a":{"b":1},"n":1,"tags":["x","y"]}', true), (2, 'Abd', NULL, '{c}', '{3}', '{"a":2,"n":2}', false), (3, 'a_c', 30, '{}', '{}', NULL, NULL), (4, 'a%c', 5, NULL, NULL, '[1,2]', NULL);
+}
+
+setup v_x_with_rows {
+    CREATE TABLE v (x int);
+    INSERT INTO v VALUES (1), (NULL), (2);
+}
+
+@backend postgres
+setup auth_role_from_claims_on_postgres {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.role() RETURNS text LANGUAGE sql STABLE AS $$ SELECT coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'))::text $$;
+}
+
+# B-01: = NULL yields no rows; IS NULL
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-01-null-yields-no-rows-is-null {
+    SELECT id FROM t WHERE n = NULL OR (id = 2 AND n IS NULL) ORDER BY id;
+}
+expect {
+    2
+}
+
+# B-02: IS DISTINCT FROM
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-02-is-distinct-from {
+    SELECT id FROM t WHERE n IS DISTINCT FROM 10 ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+}
+
+# B-03: IS NOT DISTINCT FROM NULL
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-03-is-not-distinct-from-null {
+    SELECT id FROM t WHERE n IS NOT DISTINCT FROM NULL;
+}
+expect {
+    2
+}
+
+# B-04 (S1): IS TRUE / IS NOT TRUE on bool col
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-04-is-true-is-not-true-on-bool-col {
+    SELECT id, ok IS TRUE, ok IS NOT TRUE FROM t ORDER BY id;
+}
+expect {
+    1|t|f
+    2|f|t
+    3|f|t
+    4|f|t
+}
+expect @tursopg {
+    1|1|0
+    2|0|1
+    3|0|1
+    4|0|1
+}
+
+# B-05: IS UNKNOWN
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-05-is-unknown {
+    SELECT id FROM t WHERE ok IS UNKNOWN ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+# B-06: LIKE is case-sensitive
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-06-like-is-case-sensitive {
+    SELECT id FROM t WHERE s LIKE 'Ab%' ORDER BY id;
+}
+expect {
+    2
+}
+
+# B-07 (S1): LIKE case-sensitive literal
+test gap-b-07-like-case-sensitive-literal {
+    SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%', 'abc' LIKE 'A%';
+}
+expect {
+    f|t|f
+}
+expect @tursopg {
+    0|1|0
+}
+
+# B-08: LIKE default escape \_
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-08-like-default-escape {
+    SELECT id FROM t WHERE s LIKE 'a\_c' ORDER BY id;
+}
+expect {
+    3
+}
+
+# B-09: LIKE default escape \%
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-09-like-default-escape {
+    SELECT id FROM t WHERE s LIKE 'a\%c' ORDER BY id;
+}
+expect {
+    4
+}
+
+# B-10: LIKE ... ESCAPE '!'
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-10-like-escape {
+    SELECT id FROM t WHERE s LIKE 'a!_c' ESCAPE '!' ORDER BY id;
+}
+expect {
+    3
+}
+
+# B-11: ILIKE
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-11-ilike {
+    SELECT id FROM t WHERE s ILIKE 'AB%' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# B-12 (S1): ILIKE non-ASCII
+test gap-b-12-ilike-non-ascii {
+    SELECT 'Ärger' ILIKE 'ä%';
+}
+expect {
+    t
+}
+expect @tursopg {
+    0
+}
+
+# B-14: NOT LIKE / NOT ILIKE
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-14-not-like-not-ilike {
+    SELECT id FROM t WHERE s NOT ILIKE 'ab%' ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+# B-15 (S2): LIKE ANY(array)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-15-like-any-array {
+    SELECT id FROM t WHERE s LIKE ANY (ARRAY['ab%','a_c']) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-16 (S2): ILIKE ALL(array)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-16-ilike-all-array {
+    SELECT id FROM t WHERE s ILIKE ALL (ARRAY['a%','%c']) ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-17: ~ regex is case-sensitive
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-17-regex-is-case-sensitive {
+    SELECT id FROM t WHERE s ~ '^a' ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+}
+
+# B-18: ~* regex is case-insensitive
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-18-regex-is-case-insensitive {
+    SELECT id FROM t WHERE s ~* '^ab' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# B-19: !~ regex
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-19-regex {
+    SELECT id FROM t WHERE s !~ '^a' ORDER BY id;
+}
+expect {
+    2
+}
+
+# B-20: !~* regex
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-20-regex {
+    SELECT id FROM t WHERE s !~* '^ab' ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+# B-21 (S1): regex classes \d and escapes
+test gap-b-21-regex-classes-d-and-escapes {
+    SELECT 'a1' ~ '^a\d$', 'a.c' ~ '^a\.c$', 'abc' ~ '^a\.c$';
+}
+expect {
+    t|t|f
+}
+expect @tursopg {
+    1|1|0
+}
+
+# B-22 (S1): SIMILAR TO
+test gap-b-22-similar-to {
+    SELECT 'abc' SIMILAR TO 'a(b|x)c', 'abc' SIMILAR TO 'b';
+}
+expect {
+    t|f
+}
+expect @tursopg {
+    1|0
+}
+
+# B-23 (S1): IN with NULL (three-valued)
+test gap-b-23-in-with-null-three-valued {
+    SELECT 1 IN (1, NULL), 2 IN (1, NULL), 2 NOT IN (1, NULL);
+}
+expect {
+    t||
+}
+expect @tursopg {
+    1||
+}
+
+# B-25 (S1): = ANY('{..}'::int[])
+test gap-b-25-any-int {
+    SELECT 1 = ANY('{1,2}'::int[]), 3 = ANY('{1,2}'::int[]);
+}
+expect {
+    t|f
+}
+expect @tursopg {
+    1|0
+}
+
+# B-26 (S2): > ALL / < ANY (non-equality)
+test gap-b-26-all-any-non-equality {
+    SELECT 3 > ALL (ARRAY[1,2]), 1 < ANY (ARRAY[0,2]);
+}
+expect {
+    t|t
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-28: = ANY(array) with NULL element
+test gap-b-28-any-array-with-null-element {
+    SELECT 3 = ANY(ARRAY[1,NULL]);
+}
+expect {
+}
+
+# B-29: text[] @> literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-29-text-literal {
+    SELECT id FROM t WHERE arr @> '{a}' ORDER BY id;
+}
+expect {
+    1
+}
+
+# B-30: text[] <@ literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-30-text-literal {
+    SELECT id FROM t WHERE arr <@ '{a,b,c}' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# B-31: text[] && literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-31-text-literal {
+    SELECT id FROM t WHERE arr && '{b,c}' ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# B-33: int[] && literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-33-int-literal {
+    SELECT id FROM t WHERE ia && '{2,3}'::int[] ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# B-34: array equality col = literal
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-34-array-equality-col-literal {
+    SELECT id FROM t WHERE ia = '{1,2}' ORDER BY id;
+}
+expect {
+    1
+}
+
+# B-35 (S1): ARRAY @> ARRAY literal
+test gap-b-35-array-array-literal {
+    SELECT ARRAY[1,2] @> ARRAY[1], ARRAY['a'] <@ ARRAY['a','b'], ARRAY[1] && ARRAY[2];
+}
+expect {
+    t|t|f
+}
+expect @tursopg {
+    1|1|0
+}
+
+# B-36: array subscript 1-based + out of range
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-36-array-subscript-1-based-out-of-range {
+    SELECT arr[1], arr[5], ia[2] FROM t WHERE id = 1;
+}
+expect {
+    a||2
+}
+
+# B-37 (S2): array_length / cardinality
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-37-array-length-cardinality {
+    SELECT array_length(arr, 1), cardinality(arr) FROM t WHERE id = 1;
+}
+expect {
+    2|2
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-38 (S2): unnest
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-38-unnest {
+    SELECT unnest(arr) FROM t WHERE id = 1;
+}
+expect {
+    a
+    b
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-39 (S1): jsonb -> key output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-39-jsonb-key-output {
+    SELECT j -> 'a' FROM t WHERE id = 1;
+}
+expect {
+    {"b": 1}
+}
+expect @tursopg {
+    {"b":1}
+}
+
+# B-40 (S1): jsonb ->> key output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-40-jsonb-key-output {
+    SELECT j ->> 'a', j ->> 'n' FROM t WHERE id = 1;
+}
+expect {
+    {"b": 1}|1
+}
+expect @tursopg {
+    {"b":1}|1
+}
+
+# B-41: jsonb -> int index
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-41-jsonb-int-index {
+    SELECT j -> 0, j ->> 1 FROM t WHERE id = 4;
+}
+expect {
+    1|2
+}
+
+# B-42 (S2): jsonb #> / #>> path
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-42-jsonb-path {
+    SELECT j #> '{a,b}', j #>> '{a,b}', j #>> '{tags,1}' FROM t WHERE id = 1;
+}
+expect {
+    1|1|y
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-43 (S1): jsonb @> filter
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-43-jsonb-filter {
+    SELECT id FROM t WHERE j @> '{"n":1}' ORDER BY id;
+}
+expect {
+    1
+}
+expect @tursopg {
+}
+
+# B-45 (S1): jsonb <@
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-45-jsonb {
+    SELECT id FROM t WHERE j <@ '{"a":2,"n":2,"z":0}' ORDER BY id;
+}
+expect {
+    2
+}
+expect @tursopg {
+}
+
+# B-46 (S2): jsonb ? key
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-46-jsonb-key {
+    SELECT id FROM t WHERE j ? 'tags' ORDER BY id;
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-47 (S2): jsonb ?| array
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-47-jsonb-array {
+    SELECT id FROM t WHERE j ?| array['tags','zzz'] ORDER BY id;
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-48 (S2): jsonb ?& array
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-48-jsonb-array {
+    SELECT id FROM t WHERE j ?& array['a','n'] ORDER BY id;
+}
+expect {
+    1
+    2
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-49 (S1): jsonb ->> compared to text
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-49-jsonb-compared-to-text {
+    SELECT id FROM t WHERE j ->> 'n' = '2';
+}
+expect {
+    2
+}
+expect @tursopg {
+}
+
+# B-50: (jsonb ->> )::int comparison
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-50-jsonb-int-comparison {
+    SELECT id FROM t WHERE (j ->> 'n')::int >= 1 ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# B-51: jsonb -> on missing key / non-object
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-51-jsonb-on-missing-key-non-object {
+    SELECT j -> 'missing', j -> 'a' -> 'b' -> 'c' FROM t WHERE id = 1;
+}
+expect {
+    |
+}
+
+# B-52 (S1): jsonb ->> object returns PG-formatted text
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-52-jsonb-object-returns-pg-formatted-text {
+    SELECT j ->> 'a' FROM t WHERE id = 1;
+}
+expect {
+    {"b": 1}
+}
+expect @tursopg {
+    {"b":1}
+}
+
+# B-53: jsonb -> array element ->> of string
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-53-jsonb-array-element-of-string {
+    SELECT j -> 'tags' ->> 0 FROM t WHERE id = 1;
+}
+expect {
+    x
+}
+
+# B-55 (S2): to_tsvector @@ plainto_tsquery
+test gap-b-55-to-tsvector-plainto-tsquery {
+    SELECT to_tsvector('english', 'The quick brown foxes') @@ plainto_tsquery('english', 'fox');
+}
+expect {
+    t
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-56 (S2): websearch_to_tsquery
+test gap-b-56-websearch-to-tsquery {
+    SELECT to_tsvector('english', 'quick brown fox') @@ websearch_to_tsquery('english', '"brown fox" -cat');
+}
+expect {
+    t
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-57 (S2): to_tsquery / phraseto_tsquery
+test gap-b-57-to-tsquery-phraseto-tsquery {
+    SELECT to_tsvector('quick brown fox') @@ to_tsquery('quick & fox'), to_tsvector('quick brown fox') @@ phraseto_tsquery('brown fox');
+}
+expect {
+    t|t
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-58 (S2): text col @@ to_tsquery
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-58-text-col-to-tsquery {
+    SELECT id FROM t WHERE to_tsvector(s) @@ to_tsquery('abc');
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-59 (S2): to_tsvector output
+test gap-b-59-to-tsvector-output {
+    SELECT to_tsvector('english', 'The quick brown foxes');
+}
+expect {
+    'brown':3 'fox':4 'quick':2
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-60 (S2): int4range @> elem
+test gap-b-60-int4range-elem {
+    SELECT int4range(1, 10) @> 5;
+}
+expect {
+    t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-61 (S2): range overlap / strictly left / adjacent
+test gap-b-61-range-overlap-strictly-left-adjacent {
+    SELECT '[1,5)'::int4range && '[4,8)'::int4range, '[1,2)'::int4range << '[3,4)'::int4range, '[1,2)'::int4range -|- '[2,3)'::int4range;
+}
+expect {
+    t|t|t
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-62 (S2): tstzrange contains
+test gap-b-62-tstzrange-contains {
+    SELECT tstzrange('2026-01-01', '2027-01-01') @> '2026-10-08'::timestamptz;
+}
+expect {
+    t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-63 (S2): json_build_object
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-63-json-build-object {
+    SELECT json_build_object('id', id, 's', s) FROM t WHERE id = 1;
+}
+expect {
+    {"id" : 1, "s" : "abc"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-64 (S2): jsonb_build_object
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-64-jsonb-build-object {
+    SELECT jsonb_build_object('id', id, 's', s) FROM t WHERE id = 1;
+}
+expect {
+    {"s": "abc", "id": 1}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-65 (S2): json_agg
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-65-json-agg {
+    SELECT json_agg(id ORDER BY id) FROM t;
+}
+expect {
+    [1, 2, 3, 4]
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-66 (S2): jsonb_agg
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-66-jsonb-agg {
+    SELECT jsonb_agg(id ORDER BY id) FROM t;
+}
+expect {
+    [1, 2, 3, 4]
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-67 (S2): to_json(scalar)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-67-to-json-scalar {
+    SELECT to_json(s), to_jsonb(n) FROM t WHERE id = 1;
+}
+expect {
+    "abc"|10
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-68 (S2): row_to_json / to_json(row)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-68-row-to-json-to-json-row {
+    SELECT row_to_json(t) FROM t WHERE id = 2;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
+}
+@sqlstate 42703
+expect @tursopg error {}
+
+# B-69 (S2): to_json(t.*) of table alias
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-69-to-json-t-of-table-alias {
+    SELECT to_json(x.*) FROM t x WHERE id = 2;
+}
+expect {
+    {"id":2,"s":"Abd","n":null,"arr":["c"],"ia":[3],"j":{"a": 2, "n": 2},"ok":false}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-70: array_to_json
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-70-array-to-json {
+    SELECT array_to_json(arr) FROM t WHERE id = 1;
+}
+expect {
+    ["a","b"]
+}
+
+# B-71 (S2): json_object_agg
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-71-json-object-agg {
+    SELECT json_object_agg(s, n ORDER BY id) FROM t WHERE id < 3;
+}
+expect {
+    { "abc" : 10, "Abd" : null }
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-72 (S2): coalesce(json_agg(...), '[]')
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-72-coalesce-json-agg {
+    SELECT coalesce(json_agg(id), '[]') FROM t WHERE id > 99;
+}
+expect {
+    []
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-73: count(*) OVER ()
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-73-count-over {
+    SELECT id, count(*) OVER () FROM t ORDER BY id LIMIT 2;
+}
+expect {
+    1|4
+    2|4
+}
+
+# B-74 (S1): string_agg ORDER BY
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-74-string-agg-order-by {
+    SELECT string_agg(s, ',' ORDER BY s DESC) FROM t;
+}
+expect {
+    a_c,a%c,Abd,abc
+}
+expect @tursopg {
+    abc,a_c,a%c,Abd
+}
+
+# B-75: array_agg ORDER BY
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-75-array-agg-order-by {
+    SELECT array_agg(id ORDER BY id DESC) FROM t;
+}
+expect {
+    {4,3,2,1}
+}
+
+# B-76 (S2): ctid
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-76-ctid {
+    SELECT ctid FROM t WHERE id = 1;
+}
+expect {
+    (0,1)
+}
+@sqlstate 42703
+expect @tursopg error {}
+
+# B-77 (S1): now() text format has offset and micros
+test gap-b-77-now-text-format-has-offset-and-micros {
+    SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
+}
+expect {
+    t
+}
+expect @tursopg {
+    0
+}
+
+# B-78 (S1): gen_random_uuid() format
+test gap-b-78-gen-random-uuid-format {
+    SELECT gen_random_uuid()::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+
+# B-79: set_config + current_setting
+test gap-b-79-set-config-current-setting {
+    SELECT set_config('request.jwt.claims', '{"sub":"u1"}', true);
+}
+expect {
+    {"sub":"u1"}
+}
+
+# B-80: current_setting missing_ok
+test gap-b-80-current-setting-missing-ok {
+    SELECT current_setting('request.jwt.claim.sub', true);
+}
+expect {
+}
+
+# B-81 (S2): pg_typeof
+test gap-b-81-pg-typeof {
+    SELECT pg_typeof(1), pg_typeof(1.5), pg_typeof('a'::text), pg_typeof(true);
+}
+expect {
+    integer|numeric|text|boolean
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-82 (S1): integer division truncates
+test gap-b-82-integer-division-truncates {
+    SELECT 5 / 2, -7 / 2, 7 % 3, 5 / 2.0;
+}
+expect {
+    2|-3|1|2.5000000000000000
+}
+expect @tursopg {
+    2|-3|1|2.5
+}
+
+# B-83 (S2): ^ is power
+test gap-b-83-is-power {
+    SELECT 2 ^ 3;
+}
+expect {
+    8
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-84: || with NULL and int
+test gap-b-84-with-null-and-int {
+    SELECT 'a' || NULL, 'a' || 1;
+}
+expect {
+    |a1
+}
+
+# B-85 (S1): float output
+test gap-b-85-float-output {
+    SELECT 0.1::float8 + 0.2::float8, 1::float8 / 3, 1e300::float8 * 10;
+}
+expect {
+    0.30000000000000004|0.3333333333333333|1e+301
+}
+expect @tursopg {
+    0.30000000000000004|0.3333333333333333|1e301
+}
+
+# B-86: default NULL ordering ASC (nulls last)
+@setup v_x_with_rows
+test gap-b-86-default-null-ordering-asc-nulls-last {
+    SELECT x FROM v ORDER BY x;
+}
+expect raw {
+1
+2
+
+}
+
+# B-87: default NULL ordering DESC (nulls first)
+@setup v_x_with_rows
+test gap-b-87-default-null-ordering-desc-nulls-first {
+    SELECT x FROM v ORDER BY x DESC;
+}
+expect {
+    
+    2
+    1
+}
+
+# B-88 (S2): DISTINCT ON keeps first per ORDER BY
+test gap-b-88-distinct-on-keeps-first-per-order-by {
+    CREATE TABLE x (g int, v text);
+    INSERT INTO x VALUES (1, 'b'), (1, 'a'), (2, 'c');
+    SELECT DISTINCT ON (g) g, v FROM x ORDER BY g, v;
+}
+expect {
+    1|a
+    2|c
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-90 (S1): count/sum/avg output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-90-count-sum-avg-output {
+    SELECT count(*), sum(n), avg(n) FROM t;
+}
+expect {
+    4|45|15.0000000000000000
+}
+expect @tursopg {
+    4|45|15.0
+}
+
+# B-91 (S1): sum(numeric) keeps scale
+test gap-b-91-sum-numeric-keeps-scale {
+    CREATE TABLE v (x numeric);
+    INSERT INTO v VALUES (1.10), (2.20);
+    SELECT sum(x) FROM v;
+}
+expect {
+    3.30
+}
+expect @tursopg {
+    3.3000000000000003
+}
+
+# B-92 (S2): date_trunc / extract
+test gap-b-92-date-trunc-extract {
+    SELECT date_trunc('day', '2026-10-08 12:34:56+00'::timestamptz), extract(year FROM '2026-10-08'::date), extract(epoch FROM '1970-01-02 00:00:00+00'::timestamptz);
+}
+expect {
+    2026-10-08 00:00:00+00|2026|86400.000000
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-93: nullif / greatest / least
+test gap-b-93-nullif-greatest-least {
+    SELECT nullif(1, 1), greatest(1, 3, 2), least('b', 'a');
+}
+expect {
+    |3|a
+}
+
+# B-94 (S1): lower/upper non-ASCII
+test gap-b-94-lower-upper-non-ascii {
+    SELECT upper('äb'), lower('ÄB');
+}
+expect {
+    ÄB|äb
+}
+expect @tursopg {
+    äB|Äb
+}
+
+# B-95 (S1): string comparison order
+test gap-b-95-string-comparison-order {
+    SELECT 'a' < 'B', 'B' < 'a';
+}
+expect {
+    t|f
+}
+expect @tursopg {
+    0|1
+}
+
+# B-96: length / char_length bytes vs chars
+test gap-b-96-length-char-length-bytes-vs-chars {
+    SELECT length('é'), octet_length('é');
+}
+expect {
+    1|2
+}
+
+# B-97 (S1): current_user / current_role
+test gap-b-97-current-user-current-role {
+    SELECT current_user = current_role;
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+
+# B-98: pg_catalog.-qualified function
+test gap-b-98-pg-catalog-qualified-function {
+    SELECT pg_catalog.lower('A');
+}
+expect {
+    a
+}
+
+# B-99 (S2): DELETE ... USING
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-99-delete-using {
+    DELETE FROM t USING t AS t2 WHERE t.id = t2.id AND t2.id = 1 RETURNING t.id;
+}
+expect {
+    1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-100 (S2): TRUNCATE a, b
+test gap-b-100-truncate-a-b {
+    CREATE TABLE a (x int);
+    CREATE TABLE b (x int);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES (1);
+    TRUNCATE a, b;
+    SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM b);
+}
+expect {
+    0|0
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-101: UPDATE ... FROM
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-101-update-from {
+    UPDATE t SET n = t2.n + 1 FROM t AS t2 WHERE t2.id = 3 AND t.id = 1 RETURNING t.id, t.n;
+}
+expect {
+    1|31
+}
+
+# B-102: INSERT ON CONFLICT DO UPDATE with EXCLUDED + WHERE
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-102-insert-on-conflict-do-update-with-excluded-where {
+    INSERT INTO t (id, s) VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET s = EXCLUDED.s WHERE t.n = 10 RETURNING id, s;
+}
+expect {
+    1|new
+}
+
+# B-103 (S2): ON CONFLICT ON CONSTRAINT name
+test gap-b-103-on-conflict-on-constraint-name {
+    CREATE TABLE u (id int, CONSTRAINT u_id_key UNIQUE (id));
+    INSERT INTO u VALUES (1);
+    INSERT INTO u VALUES (1) ON CONFLICT ON CONSTRAINT u_id_key DO NOTHING RETURNING id;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-104: INSERT DEFAULT VALUES
+test gap-b-104-insert-default-values {
+    CREATE TABLE u (id serial PRIMARY KEY, s text DEFAULT 'x');
+    INSERT INTO u DEFAULT VALUES RETURNING id, s;
+}
+expect {
+    1|x
+}
+
+# B-105: UPDATE multi-column SET (a,b) = (..)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-105-update-multi-column-set-a-b {
+    UPDATE t SET (s, n) = ('z', 0) WHERE id = 1 RETURNING s, n;
+}
+expect {
+    z|0
+}
+
+# B-106 (S1): boolean comparison output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-106-boolean-comparison-output {
+    SELECT id < 2, n IS NULL FROM t WHERE id = 1;
+}
+expect {
+    t|f
+}
+expect @tursopg {
+    1|0
+}
+
+# B-107 (S1): EXISTS subquery output
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-107-exists-subquery-output {
+    SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+
+# B-117: VALUES list with column aliases v(x)
+test gap-b-117-values-list-with-column-aliases-v-x {
+    SELECT x FROM (VALUES (1), (2)) v(x) ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+# B-120 (S2): jsonb_array_elements
+test gap-b-120-jsonb-array-elements {
+    SELECT value FROM jsonb_array_elements('[1, {"a": 2}]');
+}
+expect {
+    1
+    {"a": 2}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-121 (S2): jsonb_each
+test gap-b-121-jsonb-each {
+    SELECT key, value FROM jsonb_each('{"a": 1}');
+}
+expect {
+    a|1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-122 (S2): jsonb_set / || / - operators
+test gap-b-122-jsonb-set-operators {
+    SELECT jsonb_set('{"a":1}', '{a}', '2'), '{"a":1}'::jsonb || '{"b":2}'::jsonb, '{"a":1,"b":2}'::jsonb - 'a';
+}
+expect {
+    {"a": 2}|{"a": 1, "b": 2}|{"b": 2}
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-123 (S2): jsonb_typeof / jsonb_array_length
+test gap-b-123-jsonb-typeof-jsonb-array-length {
+    SELECT jsonb_typeof('[1]'), jsonb_array_length('[1,2]');
+}
+expect {
+    array|2
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-108: generate_series column alias
+test gap-b-108-generate-series-column-alias {
+    SELECT g.x FROM generate_series(1, 2) AS g(x);
+}
+expect {
+    1
+    2
+}
+
+# B-109 (S2): WITH ... INSERT ... RETURNING (data-modifying CTE)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-109-with-insert-returning-data-modifying-cte {
+    WITH ins AS (INSERT INTO t (id, s) VALUES (9, 'z') RETURNING id) SELECT id FROM ins;
+}
+expect {
+    9
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-110: row comparison (a,b) > (x,y) (keyset pagination)
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-110-row-comparison-a-b-x-y-keyset-pagination {
+    SELECT id FROM t WHERE (id, s) > (2, 'Abd') ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+# B-111: CASE returning bool
+test gap-b-111-case-returning-bool {
+    SELECT CASE WHEN true THEN true ELSE false END;
+}
+expect {
+    t
+}
+
+# B-112 (S2): json_agg of row subquery
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-112-json-agg-of-row-subquery {
+    SELECT coalesce(json_agg(_s), '[]') FROM (SELECT id, s FROM t WHERE id < 3 ORDER BY id) _s;
+}
+expect raw {
+[{"id":1,"s":"abc"}, 
+ {"id":2,"s":"Abd"}]
+}
+@sqlstate 42703
+expect @tursopg error {}
+
+# B-113: RETURNING with expressions
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-113-returning-with-expressions {
+    UPDATE t SET n = n + 1 WHERE id = 1 RETURNING id, n * 2 AS dbl;
+}
+expect {
+    1|22
+}
+
+# B-114: ORDER BY jsonb ->> key
+@setup t_id_s_n_arr_ia_j_ok_with_rows
+test gap-b-114-order-by-jsonb-key {
+    SELECT id FROM t WHERE j IS NOT NULL ORDER BY j ->> 'n' DESC NULLS LAST, id;
+}
+expect {
+    2
+    1
+    4
+}
+
+# B-115 (S2): text concat with typed values
+test gap-b-115-text-concat-with-typed-values {
+    SELECT 'id=' || 1::int || ' at ' || '2026-10-08'::date;
+}
+expect {
+    id=1 at 2026-10-08
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-116 (S1): to_char(timestamptz)
+test gap-b-116-to-char-timestamptz {
+    SELECT to_char('2026-10-08 12:00:00+00'::timestamptz, 'YYYY-MM-DD HH24:MI');
+}
+expect {
+    2026-10-08 12:00
+}
+expect @tursopg {
+}
+
+# B-124 (S2): 64 nested scalar subqueries
+test gap-b-124-64-nested-scalar-subqueries {
+    SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-126 (S2): auth.role() reads the role claim
+@setup auth_role_from_claims_on_postgres
+test gap-b-126-auth-role-reads-the-role-claim {
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}', false);
+    SELECT auth.role();
+}
+expect {
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"a@b.co","role":"authenticated"}
+    authenticated
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# B-127 (S1): ->> of a JSON boolean is the text true
+test gap-b-127-of-a-json-boolean-is-the-text-true {
+    SELECT '{"a": true}'::jsonb ->> 'a', '{"a": true}'::jsonb ->> 'a' <> 'true';
+}
+expect {
+    true|f
+}
+expect @tursopg {
+    1|1
+}
+
+# B-128 (S1): jsonb || concatenates two objects
+# B-122 also uses ||. After a fix, the output still differs because of A-45.
+test gap-b-128-jsonb-concatenates-two-objects {
+    SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb;
+}
+expect {
+    {"a": 1, "b": 2}
+}
+expect @tursopg {
+    {"a":1}{"b":2}
+}
+
+# B-129 (S1): jsonb - removes a key
+# B-122 also uses -. After a fix, the output still differs because of A-45.
+test gap-b-129-jsonb-removes-a-key {
+    SELECT '{"a":1,"b":2}'::jsonb - 'a';
+}
+expect {
+    {"b": 2}
+}
+expect @tursopg {
+    0
+}
+
+# B-130 (S2): 16 nested scalar subqueries
+# Same cause as B-124. tursopg accepts 15 levels, so this is the first depth that fails.
+test gap-b-130-16-nested-scalar-subqueries {
+    SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT 1))))))))))))))));
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-131 (S2): pg_options_to_table with a column alias list
+test gap-b-131-pg-options-to-table-with-a-column-alias-list {
+    SELECT o.k, o.v FROM pg_options_to_table(ARRAY['a=1']) AS o(k, v);
+}
+expect {
+    a|1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-132 (S2): pg_size_pretty
+test gap-b-132-pg-size-pretty {
+    SELECT pg_size_pretty(8192::bigint), pg_size_pretty(10485760::bigint);
+}
+expect {
+    8192 bytes|10 MB
+}
+@sqlstate 42883
+expect @tursopg error {}

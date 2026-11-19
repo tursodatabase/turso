@@ -153,11 +153,16 @@
 //! 3. checkpoint WAL pages into DB file;
 //! 4. fsync DB file (unless `SyncMode::Off`);
 //! 5. truncate logical log to 0 (regenerates salt in memory; header written with next frame);
-//! 6. fsync logical log (unless `SyncMode::Off`);
-//! 7. truncate WAL last.
+//! 6. truncate WAL last.
 //!
 //! WAL-last is intentional: if crash happens mid-checkpoint, WAL remains a safety net until
-//! logical-log cleanup is complete.
+//! the DB file is durable.
+//!
+//! The logical log needs no fsync after step 5. If a crash loses the truncation, the old
+//! frames come back, but their `commit_ts` is at or below `persistent_tx_ts_max`, so recovery
+//! skips them. A switch from MVCC to WAL mode is different: it fsyncs the log after the
+//! checkpoint, before it writes the WAL-mode header, because a database in WAL mode does not
+//! open while its logical log has frames.
 //!
 //! ### Frame Layout: Unencrypted vs Encrypted
 //!
@@ -459,7 +464,7 @@ pub struct LogHeader {
 
 impl LogHeader {
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
-        Self::new_with_version(io, LOG_VERSION_V2)
+        Self::new_with_version(io, LOG_VERSION)
     }
 
     fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
@@ -712,16 +717,11 @@ impl LogicalLog {
         let has_portable_changes = portable_changes_enabled;
 
         // 1. Ensure we have a log header object (created lazily on first write).
-        // Non-portable logs remain LML2 so a deployment that does not enable
-        // portable extensions can still roll back to readers that only know LML2.
+        // New logs are always LML3, so a later portable frame never needs the
+        // header rewritten in place.
         let is_first_write = self.offset == 0;
         if is_first_write && self.header.is_none() {
-            let version = if portable_changes_enabled {
-                LOG_VERSION
-            } else {
-                LOG_VERSION_V2
-            };
-            let header = LogHeader::new_with_version(&self.io, version);
+            let header = LogHeader::new(&self.io);
             self.running_crc = derive_initial_crc(header.salt);
             self.header = Some(header);
         }
@@ -1883,6 +1883,34 @@ impl StreamingLogicalLogReader {
     ) -> Result<Option<Vec<ParsedOp>>> {
         let io = io.clone();
         io.block(|| self.next_frame())
+    }
+
+    /// Reads the operations of every remaining transaction frame.
+    #[cfg(feature = "test_helper")]
+    pub fn read_ops_for_testing(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<Vec<LogOpForTesting>> {
+        let mut ops = Vec::new();
+        while let Some(frame) = io.block(|| self.next_frame())? {
+            ops.extend(frame.into_iter().map(|op| match op {
+                ParsedOp::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                    ..
+                } => LogOpForTesting::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                },
+                ParsedOp::UpdateHeader { .. } => LogOpForTesting::UpdateHeader,
+                ParsedOp::UpsertTable { .. }
+                | ParsedOp::UpsertIndex { .. }
+                | ParsedOp::DeleteIndex { .. } => LogOpForTesting::Other,
+            }));
+        }
+        Ok(ops)
     }
 
     /// Reads the next complete transaction frame.
@@ -3814,6 +3842,23 @@ pub(crate) enum ParsedOp {
     },
 }
 
+/// A logical log operation, as [`StreamingLogicalLogReader::read_ops_for_testing`]
+/// returns it to integration tests.
+#[cfg(feature = "test_helper")]
+#[derive(Debug)]
+pub enum LogOpForTesting {
+    DeleteTable {
+        rowid: RowID,
+        /// The deleted row's record, which a delete may leave out.
+        record_bytes: crate::ValueBlob,
+        /// A record of the deleted row's primary key values.
+        pk_record_bytes: crate::ValueBlob,
+    },
+    UpdateHeader,
+    /// Any operation that is not one of the above.
+    Other,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum IndexOpKind {
     Upsert,
@@ -5603,7 +5648,7 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         // Verify the on-disk CRC matches a fresh computation over the header bytes
         let encoded = header.encode();
         let mut check_buf = [0u8; LOG_HDR_SIZE];
@@ -5620,7 +5665,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let header = LogHeader::new(&io);
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
@@ -6836,15 +6881,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_first_write_uses_lml2_header_and_v2_frame() {
+    fn test_non_portable_first_write_uses_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file(
-                "non-portable-first-write-lml2.db-log",
-                OpenFlags::Create,
-                false,
-            )
+            .open_file("non-portable-first-write.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -6858,7 +6899,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -6866,11 +6907,11 @@ mod tests {
     }
 
     #[test]
-    fn test_non_portable_appends_keep_lml2_header_and_v2_frames() {
+    fn test_non_portable_appends_keep_lml3_header() {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let file = io
-            .open_file("non-portable-appends-lml2.db-log", OpenFlags::Create, false)
+            .open_file("non-portable-appends.db-log", OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
@@ -6891,7 +6932,7 @@ mod tests {
 
         let frame = read_file_bytes(file, &io);
         let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
-        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(header.version, LOG_VERSION);
         assert_eq!(
             u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
             FRAME_MAGIC
@@ -6914,6 +6955,17 @@ mod tests {
         );
     }
 
+    /// A log whose first write will use a version 2 (LML2) header, as logs
+    /// created by older versions do.
+    #[cfg(feature = "conn_raw_api")]
+    fn lml2_logical_log(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>) -> LogicalLog {
+        let mut log = LogicalLog::new(file, io.clone(), None);
+        let header = LogHeader::new_with_version(io, LOG_VERSION_V2);
+        log.running_crc = derive_initial_crc(header.salt);
+        log.header = Some(header);
+        log
+    }
+
     #[cfg(feature = "conn_raw_api")]
     #[test]
     fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
@@ -6926,7 +6978,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,
@@ -6989,7 +7041,7 @@ mod tests {
             inner: inner.clone(),
             fail_header_write: std::sync::atomic::AtomicBool::new(false),
         });
-        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let mut log = lml2_logical_log(file.clone(), &io);
 
         let tx = crate::mvcc::database::LogRecord::for_test(
             10,

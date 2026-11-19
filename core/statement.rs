@@ -17,7 +17,7 @@ use crate::{
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
-    turso_assert,
+    turso_assert, turso_soft_unreachable,
     vdbe::{
         self,
         explain::{
@@ -194,7 +194,8 @@ pub enum ColumnTypeKind {
 
 pub struct Statement {
     pub(crate) program: vdbe::Program,
-    state: vdbe::ProgramState,
+    state: Box<vdbe::ProgramState>,
+    connection: Arc<Connection>,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
@@ -252,7 +253,7 @@ impl Statement {
     pub(crate) fn commit_index_methods(&mut self) {
         crate::vdbe::execute::index_method_on_transaction_committed_all(
             &mut self.state,
-            &self.program.connection,
+            &self.connection,
         );
     }
 
@@ -262,12 +263,14 @@ impl Statement {
 
     pub fn new(
         program: vdbe::Program,
+        connection: Arc<Connection>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
     ) -> Self {
         Self::new_with_origin(
             program,
+            connection,
             pager,
             query_mode,
             tail_offset,
@@ -279,6 +282,7 @@ impl Statement {
     #[turso_macros::trace_stack]
     pub(crate) fn new_with_origin(
         program: vdbe::Program,
+        connection: Arc<Connection>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
@@ -298,7 +302,8 @@ impl Statement {
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
         Self {
             program,
-            state,
+            state: Box::new(state),
+            connection,
             pager,
             query_mode,
             busy: false,
@@ -342,6 +347,10 @@ impl Statement {
         &self.program
     }
 
+    pub fn get_connection(&self) -> &Arc<Connection> {
+        &self.connection
+    }
+
     pub fn get_pager(&self) -> &Arc<Pager> {
         &self.pager
     }
@@ -365,7 +374,7 @@ impl Statement {
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        self.program.connection.set_mv_tx(mv_tx);
+        self.connection.set_mv_tx(mv_tx);
     }
 
     pub fn interrupt(&mut self) {
@@ -413,7 +422,7 @@ impl Statement {
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
-        self.program.connection.mv_store()
+        self.connection.mv_store()
     }
 
     /// Take the pending IO completions from this statement.
@@ -439,7 +448,7 @@ impl Statement {
         }
         let timeout = match self.query_timeout_override {
             Some(timeout_override) => timeout_override,
-            None => match self.program.connection.get_query_timeout_ms() {
+            None => match self.connection.get_query_timeout_ms() {
                 0 => None,
                 millis => Some(Duration::from_millis(millis)),
             },
@@ -452,7 +461,7 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self, statement_failed: bool) {
         if self.counted_as_active_root {
-            let conn = &self.program.connection;
+            let conn = &self.connection;
             if let Some(hooks) = conn.hooks() {
                 hooks.root_statement_ended(conn, statement_failed);
             }
@@ -461,19 +470,17 @@ impl Statement {
             // than are really active (a stale-high read only causes a
             // spurious StatementsInProgress, never a missed one).
             if self.is_blob_handle {
-                self.program
-                    .connection
+                self.connection
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
             self.state.stop_counting_as_reader(conn);
             let previous = self
-                .program
                 .connection
                 .n_active_root_statements
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
-                self.program.connection.clear_interrupt_if_idle();
+                self.connection.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
         }
@@ -500,10 +507,12 @@ impl Statement {
         }
         let res = match self.query_mode {
             QueryMode::Normal => {
-                match self
-                    .program
-                    .normal_step(&mut self.state, &self.pager, waker)
-                {
+                match self.program.normal_step(
+                    &mut self.state,
+                    &self.connection,
+                    &self.pager,
+                    waker,
+                ) {
                     ProgramStep::Row => {
                         self.state.pending_fresh_tx = None;
                         self.busy = true;
@@ -513,9 +522,13 @@ impl Statement {
                     step => step.into(),
                 }
             }
-            _ => self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
+            _ => self.program.step(
+                &mut self.state,
+                &self.connection,
+                &self.pager,
+                self.query_mode,
+                waker,
+            ),
         };
         self.finish_step(res, waker)
     }
@@ -527,7 +540,7 @@ impl Statement {
         let Some(refresh) = self.analyze_refresh.as_mut() else {
             return Ok(StepResult::Done);
         };
-        match refresh_analyze_stats_nonblock(&self.program.connection, refresh) {
+        match refresh_analyze_stats_nonblock(&self.connection, refresh) {
             Ok(crate::IOResult::IO(io)) => {
                 self.busy = true;
                 io.set_waker(waker);
@@ -554,13 +567,12 @@ impl Statement {
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if !self.counted_as_active_root && self.origin.is_top_level() {
-            self.program.connection.start_root_statement()?;
+            self.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
             // can only read stale-high (see release_active_root_if_counted).
             if self.is_blob_handle {
-                self.program
-                    .connection
+                self.connection
                     .n_active_blob_statements
                     .fetch_add(1, Ordering::SeqCst);
             }
@@ -568,15 +580,15 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
-            if self.state.db_mv_store(&self.program.connection).is_some() {
+            if self.state.db_mv_store(&self.connection).is_some() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
-                self.program.connection.maybe_update_schema();
+                self.connection.maybe_update_schema();
             }
             if !self
                 .program
                 .prepare_context
-                .matches_connection(&self.program.connection)
+                .matches_connection(&self.connection)
             {
                 if let Err(err) = self.reprepare() {
                     self.release_active_root_if_counted(true);
@@ -613,6 +625,7 @@ impl Statement {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
+        let mut reprepares = 0;
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
             if !matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated)) {
@@ -623,9 +636,9 @@ impl Statement {
             // disk). Allow a few retries for the in-process case where reprepare
             // *can* resolve the issue, but bail early to avoid burning 50 attempts.
             if attempt >= 2
-                && !self.program.connection.get_auto_commit()
+                && !self.connection.get_auto_commit()
                 && matches!(
-                    self.program.connection.get_tx_state(),
+                    self.connection.get_tx_state(),
                     TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
                 )
             {
@@ -639,14 +652,33 @@ impl Statement {
                 self.release_active_root_if_counted(true);
                 return Err(err);
             }
-            res = self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker);
+            res = self.program.step(
+                &mut self.state,
+                &self.connection,
+                &self.pager,
+                self.query_mode,
+                waker,
+            );
+            reprepares += 1;
+        }
+        if reprepares == MAX_SCHEMA_RETRY
+            && matches!(&res, Err(err) if matches!(**err, LimboError::SchemaUpdated))
+        {
+            // This really shouldn't happen. If it does, it's likely a bug
+            // (like the one from https://github.com/tursodatabase/turso/pull/12047).
+            turso_soft_unreachable!(
+                "statement still failed with SchemaUpdated after every reprepare",
+                {
+                    "sql": self.program.sql,
+                    "auto_commit": self.connection.get_auto_commit(),
+                    "tx_state": self.connection.get_tx_state()
+                }
+            );
         }
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
-            let connection = &self.program.connection;
+            let connection = &self.connection;
             self.state
                 .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
@@ -674,7 +706,7 @@ impl Statement {
         // Handle busy result by invoking the busy handler
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.current_time_monotonic();
-            let handler = self.program.connection.get_busy_handler();
+            let handler = self.connection.get_busy_handler();
 
             // Initialize or get existing busy handler state
             let busy_state = self
@@ -740,13 +772,12 @@ impl Statement {
                 // already active" error at Insn::Transaction.
                 if self.state.is_active_write {
                     let prev = self
-                        .program
                         .connection
                         .n_active_writes
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
                 }
-                self.state.stop_counting_as_reader(&self.program.connection);
+                self.state.stop_counting_as_reader(&self.connection);
                 self.state.reset(None, None);
             }
         }
@@ -785,12 +816,18 @@ impl Statement {
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
-            .step(&mut self.state, &self.pager, self.query_mode, None)
+            .step(
+                &mut self.state,
+                &self.connection,
+                &self.pager,
+                self.query_mode,
+                None,
+            )
             .map_err(|err| *err)
     }
 
     fn format_error(&self, error: LimboError) -> LimboError {
-        self.program.connection.dialect().format_error(error)
+        self.connection.dialect().format_error(error)
     }
 
     /// Makes a trigger or foreign key action see the same current time as
@@ -806,7 +843,9 @@ impl Statement {
     }
 
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
-        let result = self.program.abort(&self.pager, err, &mut self.state, false);
+        let result = self
+            .program
+            .abort(&self.connection, &self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;
         result
     }
@@ -949,7 +988,7 @@ impl Statement {
     }
 
     fn rollback_autocommit_txn(&mut self) -> Result<()> {
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         let main_pager = conn.pager.load().clone();
 
         // SchemaUpdated bypasses the normal abort rollback path, so in
@@ -1012,16 +1051,15 @@ impl Statement {
 
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
             conn.maybe_reparse_schema()?;
         }
 
-        // Refresh from shared schema only when shared is newer; this preserves a
-        // connection-local schema that is ahead of shared. An MVCC checkpoint can
-        // publish new btree roots without bumping the schema cookie, so
-        // same-version reprepare still refreshes it.
-        conn.refresh_schema_from_shared_for_reprepare();
+        // While the connection holds a read snapshot, compile against the schema in it. Otherwise
+        // copy the shared schema cache when it is newer, or when an MVCC checkpoint changed btree
+        // roots without changing the schema version.
+        conn.refresh_schema_for_reprepare()?;
         let new_program = {
             let cmd = match &self.reprepare_cmd {
                 Some(cmd) => cmd.clone(),
@@ -1108,8 +1146,8 @@ impl Statement {
                     return Cow::Borrowed(alias);
                 }
 
-                let full = self.program.connection.get_full_column_names();
-                let short = self.program.connection.get_short_column_names();
+                let full = self.connection.get_full_column_names();
+                let short = self.connection.get_short_column_names();
 
                 // 2. For column references, apply full/short column name logic.
                 match &column.expr {
@@ -1270,7 +1308,7 @@ impl Statement {
     /// returned struct is `#[non_exhaustive]` so additional metadata can be
     /// added over time without breaking callers.
     pub fn get_column_type_info(&self, idx: usize) -> Result<Option<ColumnTypeInfo>> {
-        if !self.program.connection.experimental_custom_types_enabled() {
+        if !self.connection.experimental_custom_types_enabled() {
             return Err(LimboError::ParseError(
                 "get_column_type_info requires --experimental-custom-types".to_string(),
             ));
@@ -1427,7 +1465,7 @@ impl Statement {
         if self.has_returned_row {
             return;
         }
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         if let Some(mv_store) = conn.mv_store_for_db(db) {
             if let Some((tx_id, _)) = conn.get_mv_tx_for_db(db) {
                 mv_store.rollback_tx(tx_id, self.pager.clone(), &conn, db);
@@ -1441,7 +1479,7 @@ impl Statement {
         let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
             return;
         };
-        let conn = self.program.connection.clone();
+        let conn = self.connection.clone();
         let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
             return;
         };
@@ -1544,6 +1582,7 @@ impl Statement {
                     match vdbe::execute::halt(
                         &self.program,
                         &mut self.state,
+                        &self.connection,
                         &self.pager,
                         0,
                         "",
@@ -1594,6 +1633,7 @@ impl Statement {
                 statement_failed = !halt_completed;
                 if !halt_completed {
                     if let Err(abort_err) = self.program.abort(
+                        &self.connection,
                         &self.pager,
                         reset_error.as_ref(),
                         &mut self.state,
@@ -1613,6 +1653,7 @@ impl Statement {
                 // partial DML or silently retrying after transient errors (Busy).
                 statement_failed = self.state.is_active_write;
                 if let Err(abort_err) = self.program.abort(
+                    &self.connection,
                     &self.pager,
                     None,
                     &mut self.state,
@@ -1628,6 +1669,7 @@ impl Statement {
         } else {
             // Statement not running (Done/Failed/Init) — cleanup only.
             if let Err(abort_err) = self.program.abort(
+                &self.connection,
                 &self.pager,
                 None,
                 &mut self.state,
@@ -1645,7 +1687,6 @@ impl Statement {
         // clears the flag.
         if self.state.is_active_write {
             let previous = self
-                .program
                 .connection
                 .n_active_writes
                 .fetch_sub(1, Ordering::SeqCst);
@@ -1658,7 +1699,7 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted(statement_failed);
         }
-        self.state.stop_counting_as_reader(&self.program.connection);
+        self.state.stop_counting_as_reader(&self.connection);
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
@@ -1741,7 +1782,7 @@ impl Drop for Statement {
         // parent, so we release the nested guard only after reset completes.
         self.reset_best_effort();
         if self.nested_guard_active {
-            self.program.connection.end_nested();
+            self.connection.end_nested();
             self.nested_guard_active = false;
         }
     }
@@ -1766,8 +1807,17 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 mod tests {
     use super::*;
     use crate::security::roles::SessionRole;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+
+    /// Callers move a `Statement` by value while they build it and wrap it,
+    /// and every copy is a stack slot in the caller's frame. Those frames stay
+    /// on the stack while statements are prepared, so a large `Statement`
+    /// overflows small coroutine stacks.
+    #[test]
+    fn statement_stays_small() {
+        assert!(std::mem::size_of::<Statement>() <= 1024);
+    }
 
     #[test]
     fn cloned_halt_retains_constraint_context() {
@@ -1841,20 +1891,37 @@ mod tests {
                 .set_register(index, vdbe::Register::Value(Value::from_i64(99)));
         }
         let error = match &insn {
-            Insn::Halt { .. } => {
-                execute::op_halt(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
-                    .err()
-                    .expect("constraint error")
-            }
+            Insn::Halt { .. } => execute::op_halt(
+                &stmt.program,
+                &mut stmt.state,
+                &insn,
+                &stmt.connection,
+                &stmt.pager,
+            )
+            .err()
+            .expect("constraint error"),
             Insn::HaltIfNull { target_reg, .. } => {
                 stmt.state
                     .set_register(*target_reg, vdbe::Register::Value(Value::Null));
-                execute::op_halt_if_null(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
-                    .err()
-                    .expect("constraint error")
+                execute::op_halt_if_null(
+                    &stmt.program,
+                    &mut stmt.state,
+                    &insn,
+                    &stmt.connection,
+                    &stmt.pager,
+                )
+                .err()
+                .expect("constraint error")
             }
             Insn::FkCounter { .. } => {
-                execute::op_fk_counter(&stmt.program, &mut stmt.state, &insn, &stmt.pager).unwrap();
+                execute::op_fk_counter(
+                    &stmt.program,
+                    &mut stmt.state,
+                    &insn,
+                    &stmt.connection,
+                    &stmt.pager,
+                )
+                .unwrap();
                 Box::new(stmt.state.immediate_foreign_key_error())
             }
             _ => unreachable!(),
@@ -1891,67 +1958,6 @@ mod tests {
             assert_eq!(error.sqlite_result_code(), 19, "{sql}");
             assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
         }
-    }
-
-    #[test]
-    fn public_constraint_errors_preserve_sqlite_variants() {
-        for (sql, _, message, foreign_key, _) in constraint_error_cases() {
-            for with_waker in [false, true] {
-                let conn = constraint_test_connection();
-                let mut stmt = conn.prepare(sql).unwrap();
-                let error = loop {
-                    let result = if with_waker {
-                        stmt.step_with_waker(Waker::noop())
-                    } else {
-                        stmt.step()
-                    };
-                    match result {
-                        Err(error) => break error,
-                        Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                            stmt.pager.io.step().unwrap();
-                        }
-                        Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
-                    }
-                };
-                if foreign_key {
-                    assert!(
-                        matches!(error, LimboError::ForeignKeyConstraint(_)),
-                        "{sql}: {error:?}"
-                    );
-                } else {
-                    assert!(
-                        matches!(error, LimboError::Constraint(_)),
-                        "{sql}: {error:?}"
-                    );
-                }
-                assert_eq!(error.to_string(), message, "{sql}");
-                assert_eq!(error.sqlite_result_code(), 19, "{sql}");
-            }
-        }
-    }
-
-    #[test]
-    fn public_reset_preserves_sqlite_foreign_key_error() {
-        let conn = constraint_test_connection();
-        let mut stmt = conn
-            .prepare("INSERT INTO deferred_child VALUES (99) RETURNING pid")
-            .unwrap();
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => break,
-                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    stmt.pager.io.step().unwrap();
-                }
-                result => panic!("expected RETURNING row, got {result:?}"),
-            }
-        }
-        let error = stmt.reset().unwrap_err();
-        assert!(
-            matches!(error, LimboError::ForeignKeyConstraint(_)),
-            "{error:?}"
-        );
-        assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
-        assert_eq!(error.sqlite_result_code(), 19);
     }
 
     fn constraint_error_cases(
@@ -2051,36 +2057,6 @@ mod tests {
         ]
     }
 
-    /// RAISE and a constraint's own ON CONFLICT clause halt with their own
-    /// resolve type, and the error still reports the halt's result code.
-    #[test]
-    fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
-        for (sql, message, extended_code) in [
-            ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
-            (
-                "INSERT INTO unique_rollback VALUES (1)",
-                "UNIQUE constraint failed: unique_rollback.a",
-                2067,
-            ),
-        ] {
-            let conn = constraint_test_connection();
-            let mut stmt = conn.prepare(sql).unwrap();
-            let error = loop {
-                match stmt.step_with_structured_errors() {
-                    Err(error) => break error,
-                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                        stmt.pager.io.step().unwrap();
-                    }
-                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
-                }
-            };
-            assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
-            assert_eq!(error.to_string(), message, "{sql}");
-            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
-            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
-        }
-    }
-
     fn constraint_test_connection() -> Arc<crate::Connection> {
         let conn = open_test_connection().unwrap();
         conn.set_foreign_keys_enabled(true);
@@ -2115,7 +2091,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new(SessionRole::Superuser))
     }

@@ -52,6 +52,21 @@ fn postgres_async_open_initializes_the_postgres_catalog() {
     assert_ne!(rows[0].0, rows[1].0);
 }
 
+/// Byte 4 of the MVCC logical log header is its format version. Version 2
+/// (LML2) logs cannot hold portable logical-change frames, so a PostgreSQL
+/// log that starts as LML2 must later rewrite its header in place. A copy of
+/// the log built only from appended bytes never sees that rewrite.
+#[test]
+fn postgres_async_open_starts_the_logical_log_as_version_3() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server-open.db");
+    let db = open_like_server(path.to_str().unwrap());
+    let log_path = dir.path().join("server-open.db-log");
+    let header = std::fs::read(&log_path).unwrap();
+    assert_eq!(header[4], 3, "log header version after catalog init");
+    drop(db);
+}
+
 #[cfg(feature = "io_memory_yield")]
 #[test]
 fn postgres_async_open_initializes_catalog_across_io_yields() {
@@ -840,9 +855,11 @@ fn policies_take_oids_from_the_relation_oid_counter_and_keep_them_across_a_reope
 /// table.
 fn stored_policy_oids(conn: &Arc<Connection>, relname: &str) -> Vec<(String, i64)> {
     conn.prepare(format!(
-        "SELECT json_extract(p.value, '$.polname'), json_extract(p.value, '$.oid') \
-         FROM __turso_internal_classes c, json_each(c.relpolicies) p \
-         WHERE c.relname = '{relname}' ORDER BY p.key"
+        "SELECT json_extract(c.relpolicies, '$[' || p.i || '].polname'), \
+                json_extract(c.relpolicies, '$[' || p.i || '].oid') \
+         FROM __turso_internal_classes c, \
+              generate_series(0, json_array_length(c.relpolicies) - 1) AS p(i) \
+         WHERE c.relname = '{relname}' ORDER BY p.i"
     ))
     .unwrap()
     .run_collect_rows()

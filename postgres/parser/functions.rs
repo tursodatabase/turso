@@ -302,6 +302,30 @@ static PG_FUNCS: phf::Map<&'static str, PgFunc> = phf_map! {
     "xmlagg" => PgFunc { immutability: Immutability::Always, set_returning: false, aggregate: true },
 };
 
+/// The date or time type that the built-in function `name` returns, for
+/// functions that return the same one for every argument type. Names are
+/// matched ignoring case. The list was copied by hand from PostgreSQL 18's
+/// pg_proc; functions returning timestamp or timestamptz are left out because
+/// tursopg supports both. age() is listed although age(xid) returns an
+/// integer, because tursopg has no xid type.
+#[rustfmt::skip]
+pub fn datetime_result_type(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "date" | "date_in" | "date_larger" | "date_mii" | "date_pli" | "date_recv" | "date_smaller"
+        | "integer_pl_date" | "make_date" | "to_date" => "date",
+        "time" | "time_in" | "time_larger" | "time_mi_interval" | "time_pl_interval" | "time_recv"
+        | "time_smaller" | "interval_pl_time" | "make_time" => "time",
+        "timetz" | "timetz_in" | "timetz_larger" | "timetz_mi_interval" | "timetz_pl_interval"
+        | "timetz_recv" | "timetz_smaller" | "interval_pl_timetz" => "timetz",
+        "interval" | "interval_in" | "interval_larger" | "interval_smaller" | "interval_avg"
+        | "interval_div" | "interval_mi" | "interval_mul" | "interval_pl" | "interval_recv"
+        | "interval_sum" | "interval_um" | "justify_days" | "justify_hours" | "justify_interval"
+        | "make_interval" | "mul_d_interval" | "percentile_cont_interval_final" | "time_mi_time"
+        | "timestamp_mi" | "timestamptz_mi" | "age" => "interval",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

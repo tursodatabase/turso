@@ -17,12 +17,20 @@ expect {
     3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00+00
     4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00+00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test datetime-input-cast {
     SELECT '2024-1-5'::date, '9:30'::time, '2024-1-5 10:00'::timestamp;
 }
 expect {
     2024-01-05|09:30:00|2024-01-05 10:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test datetime-input-keeps-microseconds {
@@ -37,6 +45,10 @@ expect {
     2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5+00
     3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00+00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test datetime-input-unique-microseconds {
     CREATE TABLE u (id int, tm time UNIQUE, ts timestamp UNIQUE);
@@ -46,6 +58,10 @@ test datetime-input-unique-microseconds {
 }
 expect {
     2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 test datetime-input-offsets {
@@ -57,6 +73,19 @@ test datetime-input-offsets {
 expect {
     1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
     2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
+
+test datetime-input-timestamptz-without-offset {
+    CREATE TABLE t (tz timestamptz);
+    INSERT INTO t VALUES ('2024-01-05 10:00');
+    SELECT tz FROM t;
+}
+expect {
+    2024-01-05 10:00:00+00
 }
 
 test datetime-input-midnight-and-leap-second-carry {
@@ -71,6 +100,10 @@ expect {
     2|24:00:00|2025-01-01 00:00:00
     3|10:01:00|2024-01-05 10:01:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test datetime-input-rejects-feb-30 {
     CREATE TABLE t (d date);
@@ -78,6 +111,10 @@ test datetime-input-rejects-feb-30 {
 }
 expect error {
     date/time field value out of range: "2024-02-30"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test datetime-input-rejects-feb-29-in-non-leap-year {
@@ -104,6 +141,10 @@ test datetime-input-accepts-second-60-as-next-day {
 expect {
     1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00+00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test datetime-input-rejects-fraction-past-midnight-timestamp-23-59-60-5 {
     CREATE TABLE t(ts timestamp);
@@ -119,6 +160,10 @@ test datetime-input-rejects-fraction-past-midnight-date-23-59-60-5 {
 }
 expect error {
     date/time field value out of range: "2024-01-05 23:59:60.5"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test datetime-input-rejects-fraction-past-midnight-timestamptz-23-59-60-5 {
@@ -159,6 +204,10 @@ expect {
     3|10:00:00
     4|10:00:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test datetime-time-input-rejects-date-form-1 {
     CREATE TABLE t(tm time);
@@ -166,6 +215,10 @@ test datetime-time-input-rejects-date-form-1 {
 }
 expect error {
     invalid input syntax for type time: "Jan 5 2024 10:00"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 test datetime-time-input-rejects-date-form-2 {
@@ -175,6 +228,10 @@ test datetime-time-input-rejects-date-form-2 {
 expect error {
     invalid input syntax for type time: "10:00 Jan 5 2024"
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test datetime-time-input-rejects-date-form-3 {
     CREATE TABLE t(tm time);
@@ -182,6 +239,10 @@ test datetime-time-input-rejects-date-form-3 {
 }
 expect error {
     invalid input syntax for type time: "2024-01-05T10:00"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 test datetime-time-input-rejects-date-form-4 {
@@ -191,6 +252,10 @@ test datetime-time-input-rejects-date-form-4 {
 expect error {
     invalid input syntax for type time: "10:00 2024-01-05"
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test datetime-time-input-rejects-date-form-5 {
     CREATE TABLE t(tm time);
@@ -198,6 +263,10 @@ test datetime-time-input-rejects-date-form-5 {
 }
 expect error {
     invalid input syntax for type time: "20240105 10:00"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 # PostgreSQL accepts the values below. Turso stores these types as text that
@@ -210,6 +279,10 @@ test datetime-input-rejects-bc {
 }
 expect error {
     BC dates are not supported for type date
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 @skip-if postgres "PostgreSQL accepts years past 9999"
@@ -248,16 +321,15 @@ expect error {
 # seeks an index.
 
 setup datetime-compare-no-index {
-    CREATE TABLE c (id int, d date, ts timestamp, tz timestamptz);
-    INSERT INTO c VALUES (1, '2024-01-05', '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    CREATE TABLE c (id int, ts timestamp, tz timestamptz);
+    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
 }
 
 setup datetime-compare-index {
-    CREATE TABLE c (id int, d date, ts timestamp, tz timestamptz);
-    CREATE INDEX c_d ON c (d);
+    CREATE TABLE c (id int, ts timestamp, tz timestamptz);
     CREATE INDEX c_ts ON c (ts);
     CREATE INDEX c_tz ON c (tz);
-    INSERT INTO c VALUES (1, '2024-01-05', '2024-01-05 10:00:00', '2024-01-05 10:00:00');
+    INSERT INTO c VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
 }
 
 @setup datetime-compare-no-index
@@ -324,20 +396,31 @@ expect {
     1
 }
 
-@setup datetime-compare-no-index
 test datetime-compare-date-month-name-scan {
+    CREATE TABLE c (id int, d date);
+    INSERT INTO c VALUES (1, '2024-01-05');
     SELECT id FROM c WHERE d >= 'Jan 5 2024';
 }
 expect {
     1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
-@setup datetime-compare-index
 test datetime-compare-date-month-name-index {
+    CREATE TABLE c (id int, d date);
+    CREATE INDEX c_d ON c (d);
+    INSERT INTO c VALUES (1, '2024-01-05');
     SELECT id FROM c WHERE d >= 'Jan 5 2024';
 }
 expect {
     1
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 # With the session time zone UTC, a timestamp equals the timestamptz of the
@@ -394,6 +477,10 @@ expect {
     1|10:00:00
     2|22:00:00
     3|10:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 test datetime-input-rejects-order-2024-01-05t {
@@ -475,6 +562,10 @@ test datetime-input-rejects-order-date-after-time {
 expect error {
     invalid input syntax for type date: "10:00 2024-01-05"
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test datetime-input-rejects-order-time-after-am-pm-and-date {
     CREATE TABLE t(tm time);
@@ -482,4 +573,8 @@ test datetime-input-rejects-order-time-after-am-pm-and-date {
 }
 expect error {
     invalid input syntax for type time: "2024-01-05 PM 10:00"
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }

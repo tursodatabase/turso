@@ -6,11 +6,12 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::util::IOExt;
-use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+use crate::vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
+use turso_parser::ast;
 
 #[derive(Debug)]
 pub struct BtreeDumpTable;
@@ -32,8 +33,11 @@ impl InternalVirtualTable for BtreeDumpTable {
         "btree_dump".to_string()
     }
 
-    fn sql(&self) -> String {
-        "CREATE TABLE btree_dump(record BLOB, name TEXT HIDDEN)".to_string()
+    fn columns(&self) -> Vec<ast::ColumnDefinition> {
+        vec![
+            column_definition("record", "BLOB"),
+            column_definition("name", "TEXT HIDDEN"),
+        ]
     }
 
     fn superuser_only(&self) -> bool {

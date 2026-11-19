@@ -1,0 +1,18 @@
+@database :memory:
+
+# Each scan of a pragma table starts its rowids at 1, so the inner scan of a
+# join gives the same rowids for every outer row.
+test table-info-rowids-restart-on-every-scan {
+    CREATE TABLE scan_target(first, second);
+    CREATE TABLE outer_rows(n);
+    INSERT INTO outer_rows VALUES (1), (2);
+    SELECT o.n, p.rowid, p.name
+    FROM outer_rows o CROSS JOIN pragma_table_info('scan_target') p
+    ORDER BY o.n, p.rowid;
+}
+expect {
+    1|1|first
+    1|2|second
+    2|1|first
+    2|2|second
+}

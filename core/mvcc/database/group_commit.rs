@@ -1,7 +1,7 @@
 use super::{LogRecord, TxID};
 use crate::io::Completion;
 use crate::storage::wal::TursoRwLock;
-#[cfg(test)]
+#[cfg(any(test, feature = "test_helper"))]
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
@@ -69,9 +69,9 @@ pub(crate) struct CommitCoordinator {
     pub pager_commit_lock: Arc<TursoRwLock>,
     group_commit_enabled: AtomicBool,
     group: Mutex<GroupState>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     last_group_size: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     park_calls: AtomicUsize,
 }
 
@@ -91,9 +91,9 @@ impl CommitCoordinator {
                 abandoned: HashSet::default(),
                 parked: BTreeMap::new(),
             }),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             last_group_size: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             park_calls: AtomicUsize::new(0),
         }
     }
@@ -103,7 +103,7 @@ impl CommitCoordinator {
     /// progress, so the lock check and the registration happen under one
     /// lock and a release cannot slip in between them.
     pub(crate) fn park(&self, ticket: u64) -> Completion {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         self.park_calls.fetch_add(1, Ordering::Relaxed);
         let mut group = self.group.lock();
         let can_progress = group.durable_through >= ticket
@@ -172,7 +172,7 @@ impl CommitCoordinator {
         match group.pending.pop_front() {
             Some(writing) => {
                 let rest = std::mem::take(&mut group.pending);
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 {
                     self.last_group_size
                         .store(rest.len() + 1, Ordering::Release);
@@ -290,17 +290,17 @@ impl CommitCoordinator {
         self.group.lock().abandoned.remove(&tx_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn last_group_size(&self) -> usize {
         self.last_group_size.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn parked_tickets(&self) -> Vec<u64> {
         self.group.lock().parked.keys().copied().collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn park_calls(&self) -> usize {
         self.park_calls.load(Ordering::Relaxed)
     }

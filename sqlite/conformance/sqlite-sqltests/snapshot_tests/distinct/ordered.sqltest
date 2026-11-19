@@ -1,0 +1,90 @@
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        a INTEGER,
+        b INTEGER,
+        c TEXT COLLATE NOCASE,
+        d INTEGER
+    );
+    CREATE INDEX t_ab ON t (a, b);
+    CREATE INDEX t_c ON t (c COLLATE BINARY);
+    CREATE TABLE u (
+        id INTEGER PRIMARY KEY,
+        x INTEGER,
+        y INTEGER
+    );
+    CREATE INDEX u_xy ON u (x, y);
+}
+
+@setup schema
+snapshot ordered-one-column {
+    SELECT DISTINCT a FROM t;
+}
+
+@setup schema
+snapshot ordered-two-columns {
+    SELECT DISTINCT a, b FROM t;
+}
+
+@setup schema
+snapshot ordered-after-constant-equality {
+    SELECT DISTINCT b FROM t WHERE a = 1;
+}
+
+@setup schema
+snapshot ordered-backward-scan {
+    SELECT DISTINCT a FROM t ORDER BY a DESC;
+}
+
+@setup schema
+snapshot ordered-count-distinct {
+    SELECT count(DISTINCT a) FROM t;
+}
+
+@setup schema
+snapshot ordered-join-outer-table {
+    SELECT DISTINCT t.a FROM t LEFT JOIN u ON u.id = t.b;
+}
+
+@setup schema
+snapshot hash-different-column-sequence {
+    SELECT DISTINCT b, a FROM t;
+}
+
+@setup schema
+snapshot hash-not-index-prefix {
+    SELECT DISTINCT b FROM t;
+}
+
+@setup schema
+snapshot hash-expression {
+    SELECT DISTINCT a + 1 FROM t;
+}
+
+@setup schema
+snapshot hash-collation-differs-from-index {
+    SELECT DISTINCT c FROM t;
+}
+
+@setup schema
+snapshot hash-inner-table-column {
+    SELECT DISTINCT u.y FROM t JOIN u ON u.x = t.d;
+}
+
+@setup schema
+snapshot hash-join {
+    SELECT DISTINCT t.a FROM t JOIN u ON u.id = t.b;
+}
+
+@setup schema
+snapshot hash-left-join-inner-table {
+    SELECT DISTINCT u.x FROM t LEFT JOIN u ON u.id = t.b;
+}
+
+@setup schema
+snapshot ordered-with-order-by-sorter {
+    SELECT DISTINCT a FROM t ORDER BY b;
+}

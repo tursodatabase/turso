@@ -21,6 +21,7 @@ pub(crate) mod expr;
 pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
+pub(crate) mod foreign_key_check;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
@@ -151,7 +152,7 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
+            connection.dialect().get_internal_dialect()
         } else {
             connection.dialect()
         },
@@ -197,7 +198,7 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(connection, change_cnt_on, input)
+    program.build(&connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -720,7 +721,7 @@ mod tests {
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
 
     #[test]
     fn view_expansion_restores_context_after_errors() {
@@ -768,7 +769,7 @@ mod tests {
     #[test]
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -777,7 +778,7 @@ mod tests {
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
-        let cmd = crate::dialect::engine::parse_statement("SELECT 'x' REGEXP 'y'")
+        let cmd = crate::dialect::parse_statement(&crate::SqliteDialect, "SELECT 'x' REGEXP 'y'")
             .transpose()
             .unwrap()
             .unwrap();
@@ -803,10 +804,138 @@ mod tests {
         );
     }
 
+    /// The SQLite parser has no syntax for these statements, so the test
+    /// builds the statements a frontend with roles would build.
+    #[test]
+    fn dialect_without_roles_refuses_role_owner_privilege_and_row_security_statements() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+
+        let table = || ast::QualifiedName::single(ast::Name::exact("t".to_string()));
+        let role = || ast::RoleSpec::Name("r".to_string());
+        let alter_table = |body| {
+            ast::Stmt::AlterTable(ast::AlterTable {
+                name: table(),
+                body,
+            })
+        };
+        let grant = |revoke, objects| {
+            ast::Stmt::Grant(ast::Grant {
+                revoke,
+                objects,
+                grantees: vec![ast::Grantee::Role(role())],
+            })
+        };
+        let privileges_on_table = || ast::GrantObjects::Relations {
+            privileges: vec![ast::Privilege::Select],
+            on_sequences: false,
+            relations: vec![table()],
+        };
+        let member_roles = || ast::GrantObjects::Roles(vec!["admin".to_string()]);
+
+        let statements = [
+            (
+                grant(false, privileges_on_table()),
+                "GRANT is not supported",
+            ),
+            (
+                grant(true, privileges_on_table()),
+                "REVOKE is not supported",
+            ),
+            (
+                ast::Stmt::CreateRole {
+                    role_name: "r".to_string(),
+                    options: ast::RoleOptions::default(),
+                },
+                "CREATE ROLE is not supported",
+            ),
+            (
+                grant(false, member_roles()),
+                "GRANT of role membership is not supported",
+            ),
+            (
+                grant(true, member_roles()),
+                "REVOKE of role membership is not supported",
+            ),
+            (
+                alter_table(ast::AlterTableBody::OwnerTo {
+                    kind: ast::RelationKind::Table,
+                    role: role(),
+                    if_exists: false,
+                }),
+                "ALTER ... OWNER TO is not supported",
+            ),
+            (
+                ast::Stmt::AlterSequenceOwnedBy {
+                    seq_name: ast::QualifiedName::single(ast::Name::exact("s".to_string())),
+                    owner: Some((table(), ast::Name::exact("a".to_string()))),
+                },
+                "ALTER SEQUENCE ... OWNED BY is not supported",
+            ),
+            (
+                alter_table(ast::AlterTableBody::EnableRowSecurity),
+                "row-level security is not supported",
+            ),
+            (
+                alter_table(ast::AlterTableBody::DisableRowSecurity),
+                "row-level security is not supported",
+            ),
+            (
+                ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
+                    policy_name: ast::Name::exact("p".to_string()),
+                    tbl_name: table(),
+                    permissive: true,
+                    command: ast::PolicyCommand::All,
+                    roles: vec![ast::Grantee::Public],
+                    using_expr: None,
+                    check_expr: None,
+                    using_sql: None,
+                    check_sql: None,
+                })),
+                "row-level security is not supported",
+            ),
+            (
+                ast::Stmt::DropPolicy {
+                    if_exists: false,
+                    policy_name: ast::Name::exact("p".to_string()),
+                    tbl_name: table(),
+                },
+                "row-level security is not supported",
+            ),
+        ];
+
+        for (stmt, expected) in statements {
+            let description = format!("{stmt:?}");
+            let schema = db.schema.lock().clone();
+            let result = translate(
+                &schema,
+                stmt,
+                conn.pager.load().clone(),
+                conn.clone(),
+                &SymbolTable::new(),
+                QueryMode::Normal,
+                "",
+                crate::statement::StatementOrigin::Root,
+            );
+            match result {
+                Err(crate::LimboError::ParseError(message)) => {
+                    assert_eq!(message, expected, "{description}")
+                }
+                Err(other) => panic!("{description}: expected a parse error, got {other:?}"),
+                Ok(_) => panic!("{description}: expected an error"),
+            }
+        }
+    }
+
     #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -818,9 +947,13 @@ mod tests {
             .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
-        let malformed_seq =
-            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
-                .expect("malformed sqlite_sequence SQL should parse");
+        let malformed_seq = BTreeTable::from_stored_sql(
+            &crate::SqliteDialect,
+            "CREATE TABLE sqlite_sequence(name)",
+            seq_root_page,
+            false,
+        )
+        .expect("malformed sqlite_sequence SQL should parse");
         schema.insert_table(
             NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -830,10 +963,11 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
-            .transpose()
-            .unwrap()
-            .unwrap();
+        let cmd =
+            crate::dialect::parse_statement(&crate::SqliteDialect, "INSERT INTO t(v) VALUES('x')")
+                .transpose()
+                .unwrap()
+                .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),
@@ -864,7 +998,7 @@ mod tests {
     #[test]
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -877,10 +1011,11 @@ mod tests {
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
 
-        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
-            .transpose()
-            .unwrap()
-            .unwrap();
+        let cmd =
+            crate::dialect::parse_statement(&crate::SqliteDialect, "INSERT INTO t(v) VALUES('x')")
+                .transpose()
+                .unwrap()
+                .unwrap();
         let stmt = match cmd {
             ast::Cmd::Stmt(s) => s,
             _ => panic!("expected statement"),

@@ -485,6 +485,10 @@ test select-cast-to-domain {
 expect {
     2024-01-01
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test select-cast-to-domain-checks-constraint {
     CREATE DOMAIN short_text AS text CHECK (length(VALUE) < 3);
@@ -519,6 +523,10 @@ test select-cast-text-to-date-and-time {
 expect {
     2024-01-15|10:30:00
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test select-cast-text-to-timestamp {
     SELECT '2024-01-15T10:30:00'::timestamp;
@@ -532,6 +540,10 @@ test select-cast-invalid-text-to-date {
 }
 @sqlstate 22007
 expect error {}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
+}
 
 test select-cast-invalid-text-to-timestamp {
     SELECT 'hello'::timestamp;
@@ -865,6 +877,10 @@ test select-current-data-and-time {
 }
 expect {
     ok
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 setup comma_and_join {
@@ -2078,6 +2094,10 @@ expect {
     1
     0
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test where-in-on-indexed-columns-returns-a-row-once-for-two-spellings-of-its-value {
     CREATE TABLE in_spellings(id int, t time, tz timetz, ts timestamp, u uuid, b boolean);
@@ -2107,6 +2127,10 @@ expect {
     1
     2
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 test window-range-offset-over-bigint-and-numeric {
     CREATE TABLE range_offsets(b bigint, n numeric(10, 2));
@@ -2130,6 +2154,10 @@ test window-range-offset-over-date-is-an-error {
 }
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "date" is not supported
 }
 
 test window-range-decimal-offset-over-bigint-is-an-error {
@@ -2242,6 +2270,10 @@ expect {
     ts-lt|1
     ts-eq|2
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 # x IN (a, b) is x = a OR x = b, so a text on the left of IN is read as a time
 # when it is compared with a time: '09:45' IN (tm) is '09:45:00' = tm. That
@@ -2275,6 +2307,10 @@ expect {
     subquery-index|1
     subquery-index|2
 }
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
+}
 
 # DELETE and UPDATE find their rows with the converted text, by a scan and
 # through an index.
@@ -2300,6 +2336,10 @@ expect {
     b|3|23:59:59
     b|4|
     b|20|10:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
 
 setup scalar_subquery {
@@ -2609,4 +2649,8 @@ expect {
     lt|2
     in|1
     subquery|2
+}
+@sqlstate 0A000
+expect @tursopg error {
+    type "time" is not supported
 }
