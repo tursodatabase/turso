@@ -1644,14 +1644,7 @@ impl PostgreSQLTranslator {
                 _ => None,
             };
 
-            let nulls = match pg_query::protobuf::SortByNulls::try_from(elem.nulls_ordering) {
-                Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => {
-                    Some(ast::NullsOrder::First)
-                }
-                Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => Some(ast::NullsOrder::Last),
-                _ => None,
-            };
-
+            let nulls = Self::translate_nulls_order(elem.nulls_ordering, order);
             columns.push(ast::SortedColumn { expr, order, nulls });
         }
 
@@ -5721,20 +5714,7 @@ impl PostgreSQLTranslator {
                         _ => None, // Default or undefined
                     };
 
-                    let nulls =
-                        match pg_query::protobuf::SortByNulls::try_from(sort_by.sortby_nulls) {
-                            Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => {
-                                Some(ast::NullsOrder::First)
-                            }
-                            Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => {
-                                Some(ast::NullsOrder::Last)
-                            }
-                            _ => match order {
-                                Some(ast::SortOrder::Desc) => Some(ast::NullsOrder::First),
-                                _ => Some(ast::NullsOrder::Last),
-                            },
-                        };
-
+                    let nulls = Self::translate_nulls_order(sort_by.sortby_nulls, order);
                     sorted_columns.push(ast::SortedColumn { expr, order, nulls });
                 }
                 _ => {
@@ -5746,6 +5726,26 @@ impl PostgreSQLTranslator {
             }
         }
         Ok(sorted_columns)
+    }
+
+    /// The NULL order of a sort key. A key written without NULLS FIRST or NULLS LAST gets
+    /// PostgreSQL's default: NULLs last for ASC and first for DESC.
+    fn translate_nulls_order(nulls: i32, order: Option<ast::SortOrder>) -> Option<ast::NullsOrder> {
+        match pg_query::protobuf::SortByNulls::try_from(nulls) {
+            Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => Some(ast::NullsOrder::First),
+            Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => Some(ast::NullsOrder::Last),
+            _ => Some(Self::postgres_default_nulls_order(
+                order.unwrap_or(ast::SortOrder::Asc),
+            )),
+        }
+    }
+
+    /// Where PostgreSQL puts the NULLs of an index column that names no NULL order.
+    pub fn postgres_default_nulls_order(order: ast::SortOrder) -> ast::NullsOrder {
+        match order {
+            ast::SortOrder::Asc => ast::NullsOrder::Last,
+            ast::SortOrder::Desc => ast::NullsOrder::First,
+        }
     }
 
     fn translate_bool_expr(
@@ -13259,6 +13259,51 @@ mod tests {
             }
         } else {
             panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_create_index_nulls_ordering() {
+        let translator = PostgreSQLTranslator::new();
+
+        let cases = [
+            ("CREATE INDEX i ON t (a)", Some(ast::NullsOrder::Last)),
+            (
+                "CREATE INDEX i ON t (a NULLS FIRST)",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "CREATE INDEX i ON t (a NULLS LAST)",
+                Some(ast::NullsOrder::Last),
+            ),
+            ("CREATE INDEX i ON t (a ASC)", Some(ast::NullsOrder::Last)),
+            (
+                "CREATE INDEX i ON t (a ASC NULLS FIRST)",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "CREATE INDEX i ON t (a ASC NULLS LAST)",
+                Some(ast::NullsOrder::Last),
+            ),
+            ("CREATE INDEX i ON t (a DESC)", Some(ast::NullsOrder::First)),
+            (
+                "CREATE INDEX i ON t (a DESC NULLS FIRST)",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "CREATE INDEX i ON t (a DESC NULLS LAST)",
+                Some(ast::NullsOrder::Last),
+            ),
+        ];
+
+        for (sql, expected_nulls) in cases {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            let ast::Stmt::CreateIndex { columns, .. } = translated else {
+                panic!("expected CREATE INDEX statement for {sql}");
+            };
+            assert_eq!(columns.len(), 1, "for {sql}");
+            assert_eq!(columns[0].nulls, expected_nulls, "for {sql}");
         }
     }
 

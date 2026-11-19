@@ -1309,6 +1309,44 @@ expect {
     1
 }
 
+# max() of an indexed column reads the index from the end that has the largest
+# values. PostgreSQL's NULL order puts the NULLs at that end too.
+@setup null_order
+test max-of-an-indexed-column-skips-nulls {
+    CREATE INDEX vx ON v (x);
+    SELECT max(x) FROM v;
+    SELECT min(x) FROM v;
+}
+expect {
+    2
+    1
+}
+
+@setup null_order
+test max-of-a-column-with-a-descending-index-skips-nulls {
+    CREATE INDEX vx ON v (x DESC);
+    SELECT max(x) FROM v;
+    SELECT min(x) FROM v;
+}
+expect {
+    2
+    1
+}
+
+test max-after-an-equality-on-the-first-index-column-skips-nulls {
+    CREATE TABLE w (a int, b int);
+    INSERT INTO w VALUES (1, 1), (1, 7), (1, NULL), (2, NULL);
+    CREATE INDEX wab ON w (a, b);
+    SELECT max(b) FROM w WHERE a = 1;
+    SELECT (SELECT max(b) FROM w WHERE a = 1);
+    SELECT coalesce((SELECT max(b) FROM w WHERE a = 2)::text, 'N');
+}
+expect {
+    7
+    7
+    N
+}
+
 @setup null_order
 test order-by-after-union-puts-nulls-last {
     SELECT coalesce(x::text, 'N') FROM (SELECT x FROM v UNION SELECT 3 ORDER BY x) AS u;

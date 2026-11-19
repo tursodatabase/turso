@@ -106,6 +106,20 @@ expect {
     1|0|0|SCAN k3 USING COVERING INDEX k3_code
 }
 
+test explain-default-order-by-uses-index-on-nullable-column {
+    CREATE TABLE t (id int PRIMARY KEY, a int);
+    CREATE INDEX t_a ON t (a);
+    EXPLAIN SELECT id, a FROM t ORDER BY a LIMIT 3;
+    EXPLAIN SELECT id, a FROM t ORDER BY a DESC LIMIT 3;
+    EXPLAIN SELECT id, a FROM t ORDER BY a NULLS FIRST LIMIT 3;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX t_a
+    1|0|0|SCAN t USING COVERING INDEX t_a
+    1|0|0|SCAN t
+    12|0|0|USE SORTER FOR ORDER BY
+}
+
 # The parts of a row-level security policy are conditions the optimizer can
 # use, so a role reads its rows through the index on the column the policy
 # compares with the role.
