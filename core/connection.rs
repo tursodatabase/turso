@@ -1427,6 +1427,22 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)
     }
 
+    /// Prepares `SELECT * FROM sqlite_schema` as an engine metadata read
+    /// (see [`Self::prepare_engine_metadata_read`]). It is built as a
+    /// statement so that reading the schema parses no SQL.
+    pub(crate) fn prepare_schema_table_read(self: &Arc<Connection>) -> Result<Statement> {
+        let stmt = select_all_from(crate::schema::SCHEMA_TABLE_NAME);
+        let sql = stmt.to_string();
+        let cmd = ast::Cmd::Stmt(stmt);
+        let mut statement = self.prepare_cmd_with_input_and_origin(
+            cmd.clone(),
+            &sql,
+            StatementOrigin::EngineMetadataRead,
+        )?;
+        statement.reprepare_from(cmd);
+        Ok(statement)
+    }
+
     /// Prepares a schema statement of the engine's own: SQLite text whatever
     /// the database's dialect, allowed to name the engine's reserved objects,
     /// and run as an ordinary top-level statement with its own transaction
@@ -2707,7 +2723,7 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
+            let mut rows = self.prepare_schema_table_read()?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -5119,6 +5135,33 @@ impl SymbolTable {
             self.index_methods.insert(name.clone(), module.clone());
         }
     }
+}
+
+/// `SELECT * FROM <table>`.
+fn select_all_from(table: &str) -> ast::Stmt {
+    ast::Stmt::Select(ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Star],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::single(ast::Name::exact(table.to_string())),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    })
 }
 
 #[cfg(all(test, feature = "fs"))]
