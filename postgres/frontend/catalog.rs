@@ -264,10 +264,6 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        false
-    }
-
     fn supports_capture_data_changes(&self) -> bool {
         false
     }
@@ -284,39 +280,8 @@ impl Dialect for PostgresDialect {
         crate::schema_state::build_schema_state(schema, results)
     }
 
-    fn translate_relation_changes(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[turso_core::RelationChange<'_>],
-    ) -> turso_core::Result<()> {
-        crate::classes::translate_relation_changes(program, schema, connection, changes)
-    }
-
-    fn translate_access_statement(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &turso_core::AccessStatement<'_>,
-    ) -> turso_core::Result<()> {
-        match statement {
-            turso_core::AccessStatement::CreateRole { name, options } => {
-                crate::roles::translate_create_role(program, schema, name, options)
-            }
-            turso_core::AccessStatement::DropRole { if_exists, roles } => {
-                crate::roles::translate_drop_role(program, schema, connection, *if_exists, roles)
-            }
-            turso_core::AccessStatement::GrantRole {
-                revoke,
-                roles,
-                grantees,
-            } => crate::auth_members::translate_grant_role(
-                program, schema, connection, *revoke, roles, grantees,
-            ),
-            _ => crate::classes::translate_access_statement(program, schema, connection, statement),
-        }
+    fn catalog(&self) -> &dyn turso_core::Catalog {
+        &crate::classes::PostgresCatalog
     }
 
     /// The built-in superuser is found by its name, `postgres`, too.

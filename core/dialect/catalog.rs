@@ -1,51 +1,221 @@
-//! What translation tells the dialect about a statement that changes the
-//! dialect's catalog of the main database, and what the dialect's bytecode
-//! tells the in-memory schema once the change is written.
+//! How a dialect stores the objects of a database: the [`Catalog`] that DDL
+//! translation writes through, and what the dialect's bytecode tells the
+//! in-memory schema once the command is stored.
 
 use crate::{
     namespace::NamespaceId,
-    schema::{RelationKind, Schema},
-    LimboError, Result, Value,
+    schema::{Index, Schema},
+    translate::emitter::Resolver,
+    util::renamed_automatic_index_name,
+    vdbe::builder::ProgramBuilder,
+    Connection, LimboError, Result, Value,
 };
-use std::borrow::Cow;
+use std::sync::Arc;
 use turso_parser::ast::{self, Grantee, Privilege, RoleSpec};
 
-/// A relation that a statement created, dropped or renamed. The engine makes
-/// the change itself; the dialect records it in its own catalog through
-/// [`Dialect::translate_relation_changes`](super::Dialect::translate_relation_changes).
-#[derive(Debug, Clone)]
-pub enum RelationChange<'a> {
-    Created {
-        namespace: NamespaceId,
-        name: &'a str,
-        kind: RelationKind,
-        /// For an index, the table it is on, in the same namespace. Its
-        /// owner owns the index.
-        table: Option<&'a str>,
-    },
-    Dropped {
-        namespace: NamespaceId,
-        name: &'a str,
-    },
-    Renamed {
-        namespace: NamespaceId,
-        old_name: &'a str,
-        /// Owned when the statement had to build the name, as for an
-        /// automatic index that is renamed with its table.
-        new_name: Cow<'a, str>,
-    },
-    /// `ALTER TABLE table RENAME COLUMN old_name TO new_name`.
-    ColumnRenamed {
-        namespace: NamespaceId,
-        table: &'a str,
-        old_name: &'a str,
-        new_name: &'a str,
-    },
+/// Where a dialect stores the objects of a database. DDL translation
+/// creates and fills the B-trees; the catalog stores what describes them.
+pub trait Catalog: Send + Sync {
+    /// Emits the bytecode that stores `cmd`, in the transaction of the
+    /// statement being compiled.
+    fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'_>,
+        cmd: &CatalogCmd<'_>,
+    ) -> Result<()>;
+
+    /// Emits the bytecode that stores what `statement` changes: roles,
+    /// owners, privileges or policies. A catalog that stores none refuses
+    /// `CREATE ROLE`, `DROP ROLE`, `GRANT role TO role`, `ALTER ... OWNER TO`,
+    /// `ALTER SEQUENCE ... OWNED BY`, `GRANT`, `REVOKE`,
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY` and
+    /// `DROP POLICY`.
+    fn emit_access(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'_>,
+        statement: &AccessStatement<'_>,
+    ) -> Result<()> {
+        let _ = (program, ctx);
+        Err(statement.not_supported())
+    }
+}
+
+/// The statement that a [`Catalog`] emits bytecode for. `schema` is the schema of
+/// the main database, and `database_id` the database the statement changes.
+pub struct CmdContext<'a> {
+    pub connection: &'a Arc<Connection>,
+    pub schema: &'a Schema,
+    pub database_id: usize,
+    pub origin: CmdOrigin,
+}
+
+impl<'a> CmdContext<'a> {
+    pub(crate) fn new(
+        connection: &'a Arc<Connection>,
+        resolver: &'a Resolver<'a>,
+        database_id: usize,
+    ) -> Self {
+        let origin = if connection.is_nested_stmt() || connection.is_mvcc_bootstrap_connection() {
+            CmdOrigin::Engine
+        } else {
+            CmdOrigin::User
+        };
+        Self {
+            connection,
+            schema: resolver.schema(),
+            database_id,
+            origin,
+        }
+    }
+}
+
+/// Whether a user runs the statement, or the engine for itself: a frontend
+/// creating its own tables, VACUUM, the MVCC bootstrap connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdOrigin {
+    User,
+    Engine,
+}
+
+/// What a DDL statement asks the catalog to store.
+#[derive(Debug, Clone, Copy)]
+pub enum CatalogCmd<'a> {
+    CreateTable(CreateTable<'a>),
+    CreateIndex(CreateIndex<'a>),
+    DropIndex(DropIndex<'a>),
+    CreateSequence(CreateSequence<'a>),
+    DropSequence(DropSequence<'a>),
+    DropTable(DropTable<'a>),
+    CreateView(CreateView<'a>),
+    CreateMaterializedView(CreateMaterializedView<'a>),
+    DropView(DropView<'a>),
+    RenameTable(RenameTable<'a>),
+    RenameColumn(RenameColumn<'a>),
+    AlterColumn(AlterColumn<'a>),
+}
+
+/// A new table. The statement has already emitted the creation of its
+/// B-tree and of the B-trees of its automatic indexes.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateTable<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub automatic_indexes: &'a [String],
+}
+
+/// A new index. The statement has already emitted the creation of its
+/// storage.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateIndex<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub table: &'a str,
+}
+
+/// An index that the statement drops.
+#[derive(Debug, Clone, Copy)]
+pub struct DropIndex<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A new sequence. The statement creates its backing table itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateSequence<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A sequence that is dropped, by `DROP SEQUENCE` or with the column that
+/// owns it.
+#[derive(Debug, Clone, Copy)]
+pub struct DropSequence<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A table that the statement drops, with its indexes and the sequences
+/// that its columns own, before the statement destroys their B-trees.
+#[derive(Debug, Clone, Copy)]
+pub struct DropTable<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+    pub is_virtual: bool,
+    pub indexes: &'a [&'a str],
+    pub owned_sequences: &'a [String],
+}
+
+/// A new view.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateView<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A new materialized view. The statement writes the engine tables that
+/// hold the state of its maintenance itself.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateMaterializedView<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A view or materialized view that the statement drops.
+#[derive(Debug, Clone, Copy)]
+pub struct DropView<'a> {
+    pub namespace: NamespaceId,
+    pub name: &'a str,
+}
+
+/// A table that gets a new name in the same namespace. The `stored_` names
+/// are the names in the table's schema rows.
+#[derive(Debug, Clone, Copy)]
+pub struct RenameTable<'a> {
+    pub namespace: NamespaceId,
+    pub old_name: &'a str,
+    pub new_name: &'a str,
+    pub(crate) indexes: &'a [Arc<Index>],
+    pub(crate) stored_old_name: &'a str,
+    pub(crate) stored_new_name: &'a str,
+}
+
+impl<'a> RenameTable<'a> {
+    /// The old and the new name of each automatic index of the table.
+    pub fn renamed_automatic_indexes(&self) -> impl Iterator<Item = (&'a str, String)> + '_ {
+        self.indexes.iter().filter_map(|index| {
+            let new_name = renamed_automatic_index_name(
+                &index.name,
+                self.stored_old_name,
+                self.stored_new_name,
+            )?;
+            Some((index.name.as_str(), new_name))
+        })
+    }
+}
+
+/// A column that gets a new name.
+#[derive(Debug, Clone, Copy)]
+pub struct RenameColumn<'a> {
+    pub namespace: NamespaceId,
+    pub table: &'a str,
+    pub old_name: &'a str,
+    pub new_name: &'a ast::Name,
+}
+
+/// A column that gets a new definition, and with it possibly a new name.
+#[derive(Debug, Clone, Copy)]
+pub struct AlterColumn<'a> {
+    pub namespace: NamespaceId,
+    pub table: &'a str,
+    pub old_name: &'a str,
+    pub definition: &'a ast::ColumnDefinition,
 }
 
 /// A statement about roles, ownership, privileges or row-level security.
-/// The engine stores none of these; the dialect does all of the work in
-/// [`Dialect::translate_access_statement`](super::Dialect::translate_access_statement).
+/// The engine stores none of these; the dialect's catalog does all of the
+/// work in [`Catalog::emit_access`].
 #[derive(Debug, Clone, Copy)]
 pub enum AccessStatement<'a> {
     /// Whom the relation belongs to from now on.

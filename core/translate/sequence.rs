@@ -11,7 +11,10 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
-use crate::dialect::{AccessStatement, NewOwner, OwnerColumn, RelationChange};
+use crate::dialect::{
+    AccessStatement, CatalogCmd, CmdContext, CmdOrigin, CreateSequence, DropSequence, NewOwner,
+    OwnerColumn,
+};
 use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
@@ -1061,21 +1064,15 @@ pub fn translate_create_sequence(
         seq.cycle,
     )?;
 
-    // The sequence is a relation of the dialect's; its backing table is an
-    // engine object and is not.
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_name,
-                kind: crate::schema::RelationKind::Sequence,
-                table: None,
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateSequence(CreateSequence {
+            namespace: namespace.id,
+            name: &normalized_name,
+        }),
+    )?;
 
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
@@ -1266,17 +1263,15 @@ pub(crate) fn emit_drop_sequence(
     if !emit_drop_sequence_cleanup(program, resolver, namespace, seq_name)? {
         return Ok(false);
     }
-    if schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: seq_name,
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropSequence(DropSequence {
+            namespace: namespace.id,
+            name: seq_name,
+        }),
+    )?;
     Ok(true)
 }
 
@@ -1539,21 +1534,24 @@ pub fn translate_alter_sequence_owned_by(
         }
         None => None,
     };
-    if !schema::dialect_relation_hooks_apply(connection, namespace.database_id)? {
-        return Ok(());
-    }
-    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
-    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_access_statement(
+    let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
+    resolver.catalog.dialect.catalog().emit_access(
         program,
-        resolver.schema(),
-        connection,
+        &cmd_context,
         &AccessStatement::ChangeOwner {
             namespace: namespace.id,
             name: &normalized_name,
             owner: &NewOwner::Column(owner_column),
         },
     )?;
+    // A catalog stores the owner column only for a user's statement about
+    // a sequence of the main database. Any other statement stored nothing,
+    // so it changes no schema.
+    if cmd_context.origin == CmdOrigin::Engine || namespace.database_id != crate::MAIN_DB_ID {
+        return Ok(());
+    }
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
 }

@@ -146,8 +146,10 @@ pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{
-    AccessStatement, CatalogApply, Dialect, NewOwner, OwnerColumn, RelationChange, RelationName,
-    StatementTimes,
+    AccessStatement, AlterColumn, Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin,
+    CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView, Dialect,
+    DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn, RelationName,
+    RenameColumn, RenameTable, SqliteCatalog, StatementTimes,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,

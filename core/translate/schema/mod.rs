@@ -1,12 +1,13 @@
 mod sqlite_schema_rows;
 
+pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
     emit_create_internal_table, emit_delete_index_row, emit_delete_rows_of_table,
     emit_delete_temp_triggers_on_table, emit_drop_view_row, emit_schema_entry,
     open_sqlite_schema_for_write, SchemaEntryType,
 };
 
-use crate::dialect::RelationChange;
+use crate::dialect::{CatalogCmd, CmdContext, CreateTable, DropTable};
 use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
@@ -16,7 +17,6 @@ use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 
-use crate::schema::RelationKind;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
@@ -1492,28 +1492,16 @@ pub fn translate_create_table(
         }
     }
 
-    if dialect_relation_hooks_apply(connection, database_id)? {
-        let mut changes = vec![RelationChange::Created {
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateTable(CreateTable {
             namespace: namespace.id,
             name: &normalized_tbl_name,
-            kind: RelationKind::Table,
-            table: None,
-        }];
-        for index_name in &autoindex_names {
-            changes.push(RelationChange::Created {
-                namespace: namespace.id,
-                name: index_name,
-                kind: RelationKind::Index,
-                table: Some(&normalized_tbl_name),
-            });
-        }
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &changes,
-        )?;
-    }
+            automatic_indexes: &autoindex_names,
+        }),
+    )?;
 
     // Create the backing table for the hidden AUTOINCREMENT sequence. The
     // `__turso_internal_autoincrement_` prefix identifies the sequence object;
@@ -2139,32 +2127,20 @@ pub fn translate_drop_table(
             .collect()
     });
 
-    // Dropping a table also drops its indexes, the automatic ones among
-    // them, so the dialect hears about all of them.
-    if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
-        let table_name = normalize_ident(name);
-        let mut changes: Vec<_> = owned_sequences
-            .iter()
-            .map(|sequence| RelationChange::Dropped {
-                namespace: namespace.id,
-                name: sequence,
-            })
-            .collect();
-        changes.push(RelationChange::Dropped {
+    let normalized_name = normalize_ident(name);
+    let index_names: Vec<&str> = indices.iter().map(|index| index.name.as_str()).collect();
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropTable(DropTable {
             namespace: namespace.id,
-            name: &table_name,
-        });
-        changes.extend(indices.iter().map(|index| RelationChange::Dropped {
-            namespace: namespace.id,
-            name: &index.name,
-        }));
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &changes,
-        )?;
-    }
+            name: &normalized_name,
+            is_virtual: table.btree().is_none(),
+            indexes: &index_names,
+            owned_sequences: &owned_sequences,
+        }),
+    )?;
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -2841,34 +2817,6 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
-}
-
-/// Whether the statement tells the dialect about the relations it creates,
-/// renames or drops, through the [`crate::Dialect`] relation hooks. Only new
-/// DDL of a user against the main database does: a nested statement replays
-/// stored schema text, as VACUUM does when it copies a database, and the
-/// MVCC bootstrap connection replays log entries; both carry the dialect's
-/// schema state as data already. Relations of other databases, temp among
-/// them, have no dialect schema state. Fails for DDL of a user against an
-/// attached database when the dialect does not allow it.
-pub(crate) fn dialect_relation_hooks_apply(
-    connection: &Arc<Connection>,
-    database_id: usize,
-) -> Result<bool> {
-    if connection.is_nested_stmt() || connection.is_mvcc_bootstrap_connection() {
-        return Ok(false);
-    }
-    if crate::is_attached_db(database_id)
-        && !connection
-            .db
-            .dialect()
-            .supports_relation_ddl_in_attached_databases()
-    {
-        bail_parse_error!(
-            "creating, renaming or dropping relations in an attached database is not supported"
-        );
-    }
-    Ok(database_id == MAIN_DB_ID)
 }
 
 /// Whether a relation of `namespace` already has `name`, in a dialect whose
