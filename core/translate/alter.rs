@@ -1,12 +1,11 @@
 use crate::alloc::TursoIteratorExt;
 use crate::dialect::{
     AccessStatement, AlterColumn, CatalogCmd, CmdContext, NewOwner, RenameColumn, RenameTable,
-    TempTriggerOfRenamedTable,
+    RewrittenTrigger, RewrittenView, TempTriggerOfRenamedTable,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
 use crate::translate::row_security;
 use crate::types::StrictType;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
@@ -16,13 +15,13 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        self, check_column_type, open_sqlite_schema_for_write, validate_check_expr,
+        self, check_column_type, emit_rewrite_of_every_row, validate_check_expr,
         validate_default_expr, validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
 use crate::{
-    function::{AlterTableFunc, Func},
+    function::AlterTableFunc,
     schema::alter_table::{
         rename_identifiers, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
         rewrite_view_sql_for_column_rename,
@@ -1820,7 +1819,7 @@ pub fn translate_alter_table(
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(NamespaceRef, String, String)> = Vec::new();
-            let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
+            let mut views_to_rewrite: Vec<RewrittenView> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
@@ -1902,11 +1901,11 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((
-                                database_id,
-                                resolver.mangle_name(namespace, view_name),
-                                rewritten.sql,
-                            ));
+                            rewrites.push(RewrittenView {
+                                namespace,
+                                name: view_name.to_string(),
+                                sql: rewritten.sql,
+                            });
                         }
                     }
                     Ok(rewrites)
@@ -1928,11 +1927,11 @@ pub fn translate_alter_table(
                                     from,
                                     col_name,
                                 )? {
-                                    rewrites.push((
-                                        crate::TEMP_DB_ID,
-                                        view_name.to_string(),
-                                        rewritten.sql,
-                                    ));
+                                    rewrites.push(RewrittenView {
+                                        namespace: NamespaceRef::root_of(crate::TEMP_DB_ID),
+                                        name: view_name.to_string(),
+                                        sql: rewritten.sql,
+                                    });
                                 }
                             }
                             Ok(rewrites)
@@ -1945,7 +1944,7 @@ pub fn translate_alter_table(
                 .any(|(namespace, _, _)| namespace.database_id == crate::TEMP_DB_ID)
                 || views_to_rewrite
                     .iter()
-                    .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
+                    .any(|view| view.namespace.database_id == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
@@ -1954,153 +1953,39 @@ pub fn translate_alter_table(
                 None
             };
 
-            let sqlite_schema = resolver
-                .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-                })
-                .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
-                })?;
-
-            let cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-            program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns().len();
-                turso_assert_eq!(sqlite_schema_column_len, 5);
-
-                let first_column = program.alloc_registers(sqlite_schema_column_len);
-
-                for i in 0..sqlite_schema_column_len {
-                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
-                }
-
-                program.emit_string8_new_reg(mangled_table_name.clone());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(from.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(definition.to_string());
-                program.mark_last_insn_constant();
-
-                let out = program.alloc_registers(sqlite_schema_column_len);
-
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: first_column,
-                    dest: out,
-                    func: crate::function::FuncCtx {
-                        func: Func::AlterTable(if rename {
-                            AlterTableFunc::RenameColumn
-                        } else {
-                            AlterTableFunc::AlterColumn
-                        }),
-                        arg_count: 8,
-                        collation: CollationSeq::BINARY,
-                    },
-                });
-
-                let record = program.alloc_register();
-
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(out),
-                    count: to_u32(sqlite_schema_column_len),
-                    dest_reg: to_u32(record),
-                    index_name: None,
-                    affinity_str: None,
-                });
-
-                // In MVCC mode, we need to delete before insert to properly
-                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if database_uses_mvcc(connection, database_id) {
-                    program.emit_insn(Insn::Delete {
-                        cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
-                        is_part_of_update: true,
-                    });
-                }
-
-                program.emit_insn(Insn::Insert {
-                    cursor: cursor_id,
-                    key_reg: rowid,
-                    record_reg: record,
-                    flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
-                });
-            });
-
-            // Update trigger SQL for renamed columns
-            for (trigger_namespace, trigger_name, new_sql) in triggers_to_rewrite.clone() {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let escaped_trigger_name = escape_sql_string_literal(
-                    &resolver.mangle_name(trigger_namespace, &trigger_name),
-                );
-                let qualified_schema_table =
-                    schema_table_name_for_db(resolver, trigger_namespace.database_id);
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {qualified_schema_table}
-                        SET sql = '{escaped_sql}'
-                        WHERE name = '{escaped_trigger_name}' COLLATE NOCASE AND type = 'trigger'
-                    "#,
-                );
-
-                let cmd =
-                    crate::dialect::parse_statement(connection.dialect().as_ref(), &update_stmt)
-                        .map_err(|e| {
-                            LimboError::ParseError(format!(
-                                "failed to parse trigger update SQL for {trigger_name}: {e}"
-                            ))
-                        })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse trigger update SQL for {trigger_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            if rename {
+                let rewritten_triggers: Vec<RewrittenTrigger> = triggers_to_rewrite
+                    .iter()
+                    .map(|(namespace, name, sql)| RewrittenTrigger {
+                        namespace: *namespace,
+                        name: name.clone(),
+                        sql: sql.clone(),
+                    })
+                    .collect();
+                resolver.catalog.dialect.catalog().emit(
                     program,
-                    connection,
-                    input,
-                    |_program| {},
+                    &cmd_context,
+                    &CatalogCmd::RenameColumn(RenameColumn {
+                        namespace: namespace.id,
+                        table: &normalize_ident(table_name),
+                        written_table_name: table_name,
+                        old_name: old_column_name,
+                        written_old_name: from,
+                        new_name: &definition.col_name,
+                        triggers: &rewritten_triggers,
+                        views: &views_to_rewrite,
+                        statement: input,
+                    }),
                 )?;
-            }
-
-            // Update view SQL for renamed columns
-            for (view_database_id, view_name, new_sql) in views_to_rewrite {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {view_schema_table}
-                        SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
-                    "#,
-                );
-
-                let cmd =
-                    crate::dialect::parse_statement(connection.dialect().as_ref(), &update_stmt)
-                        .map_err(|e| {
-                            LimboError::ParseError(format!(
-                                "failed to parse view update SQL for {view_name}: {e}"
-                            ))
-                        })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
+            } else {
+                emit_rewrite_of_every_row(
                     program,
-                    connection,
-                    input,
-                    |_program| {},
-                )?;
+                    &cmd_context,
+                    AlterTableFunc::AlterColumn,
+                    &[mangled_table_name, from.to_string(), definition.to_string()],
+                    table_name,
+                );
             }
 
             if let Some(temp_schema_version) = temp_schema_version {
@@ -2175,28 +2060,18 @@ pub fn translate_alter_table(
                 )?;
             }
 
-            let cmd_context = CmdContext::new(connection, resolver, database_id);
-            let normalized_table_name = normalize_ident(table_name);
-            let catalog_cmd = if rename {
-                CatalogCmd::RenameColumn(RenameColumn {
-                    namespace: namespace.id,
-                    table: &normalized_table_name,
-                    old_name: old_column_name,
-                    new_name: &definition.col_name,
-                })
-            } else {
-                CatalogCmd::AlterColumn(AlterColumn {
-                    namespace: namespace.id,
-                    table: &normalized_table_name,
-                    old_name: old_column_name,
-                    definition: &definition,
-                })
-            };
-            resolver
-                .catalog
-                .dialect
-                .catalog()
-                .emit(program, &cmd_context, &catalog_cmd)?;
+            if !rename {
+                resolver.catalog.dialect.catalog().emit(
+                    program,
+                    &cmd_context,
+                    &CatalogCmd::AlterColumn(AlterColumn {
+                        namespace: namespace.id,
+                        table: &normalize_ident(table_name),
+                        old_name: old_column_name,
+                        definition: &definition,
+                    }),
+                )?;
+            }
 
             program.emit_insn(Insn::SetCookie {
                 db: database_id,

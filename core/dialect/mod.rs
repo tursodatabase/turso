@@ -27,7 +27,8 @@ pub use catalog::{
     AccessStatement, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd, CmdContext,
     CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView,
     DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn, RelationName,
-    RenameColumn, RenameTable, TableText, TempTriggerOfRenamedTable,
+    RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable,
 };
 
 use crate::{
