@@ -131,8 +131,6 @@ pub fn create_dbsp_state_index(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TableChangeId {
     RootPage(i64),
-    #[cfg(test)]
-    Name(String),
 }
 
 #[derive(Debug, Clone)]
@@ -180,14 +178,6 @@ impl CapturedDelta {
             tail: Arc::new(Vec::new()),
             table_id: None,
         }
-    }
-
-    #[cfg(test)]
-    fn contains_table(&self, table_id: &TableChangeId) -> bool {
-        self.spilled
-            .iter()
-            .any(|segment| segment.rows > 0 && segment.table_ids.contains(table_id))
-            || self.tail.iter().any(|event| &event.table_id == table_id)
     }
 }
 
@@ -455,8 +445,6 @@ fn serialize_change_events(events: &[ChangeEvent]) -> Result<std::vec::Vec<u8>> 
 fn table_id_value(table_id: &TableChangeId) -> Value {
     match table_id {
         TableChangeId::RootPage(root_page) => Value::from_i64(*root_page),
-        #[cfg(test)]
-        TableChangeId::Name(name) => Value::Text(crate::types::Text::new(name.clone())),
     }
 }
 
@@ -475,50 +463,11 @@ impl ViewChangeSubscription {
         }
     }
 
-    #[cfg(test)]
-    pub fn insert(&self, table_name: &str, key: i64, values: crate::alloc::Vec<Value>) {
-        let table_id = TableChangeId::Name(table_name.to_string());
-        self.change_log
-            .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
-        let mut changes = self.change_log.changes.lock();
-        Arc::make_mut(&mut changes.tail).push(ChangeEvent {
-            table_id,
-            rowid: key,
-            values,
-            weight: 1,
-        });
-        self.change_log.event_appended();
-    }
-
-    #[cfg(test)]
-    pub fn delete(&self, table_name: &str, key: i64, values: crate::alloc::Vec<Value>) {
-        let table_id = TableChangeId::Name(table_name.to_string());
-        self.change_log
-            .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
-        let mut changes = self.change_log.changes.lock();
-        Arc::make_mut(&mut changes.tail).push(ChangeEvent {
-            table_id,
-            rowid: key,
-            values,
-            weight: -1,
-        });
-        self.change_log.event_appended();
-    }
-
     /// Clone only the requested table's stream, rather than every delta
     /// captured for the view.
     pub(crate) fn table_delta(&self, table: &BTreeTable) -> CapturedDelta {
-        let root_id = TableChangeId::RootPage(table.root_page);
-        let captured = self.change_log.snapshot(&root_id);
-        #[cfg(test)]
-        {
-            if !captured.contains_table(&root_id) {
-                return self
-                    .change_log
-                    .snapshot(&TableChangeId::Name(table.name.clone()));
-            }
-        }
-        captured
+        self.change_log
+            .snapshot(&TableChangeId::RootPage(table.root_page))
     }
 
     pub fn is_empty(&self) -> bool {
