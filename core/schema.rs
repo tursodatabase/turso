@@ -4708,6 +4708,29 @@ impl Schema {
         Ok(out)
     }
 
+    /// Resolves the foreign key `fk` declared on `child` in `child_namespace`.
+    /// Returns `Ok(None)` if the parent table does not exist, and an error if
+    /// the parent key is not backed by a UNIQUE index.
+    pub fn resolve_child_fk(
+        &self,
+        child_namespace: NamespaceId,
+        fk: &Arc<ForeignKey>,
+        child: &Arc<BTreeTable>,
+    ) -> Result<Option<ResolvedFkRef>> {
+        let parent_name = normalize_ident(&fk.parent_table);
+        let Some(parent_tbl) = self.get_btree_table(fk.parent_namespace, &parent_name) else {
+            return Ok(None);
+        };
+        self.resolve_fk(
+            child_namespace,
+            fk,
+            child,
+            &parent_tbl,
+            /*require_unique=*/ true,
+        )
+        .map(Some)
+    }
+
     /// Resolve a single FK declared on `child` referencing `parent_tbl`.
     /// When `require_unique` is set, a non-rowid parent key must be backed by
     /// a non-partial UNIQUE index on exactly those columns.
@@ -7991,6 +8014,15 @@ pub struct ResolvedFkRef {
 }
 
 impl ResolvedFkRef {
+    /// Whether the foreign key points from a table to itself.
+    pub fn is_self_reference(&self) -> bool {
+        self.child_namespace == self.fk.parent_namespace
+            && self
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&self.fk.parent_table)
+    }
+
     /// Returns if any referenced parent column can change when these column positions are updated.
     pub fn parent_key_may_change(
         &self,

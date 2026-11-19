@@ -4955,3 +4955,505 @@ test fk-deferred-upsert-rowid-alias-child-change-creates-violation {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# A row whose parent is deleted earlier in the same statement is not an
+# orphan when the statement deletes that row too.
+@cross-check-integrity
+test fk-self-reference-delete-all-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-reference-unique-key-delete-all-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INT PRIMARY KEY, parent INT REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-reference-update-moves-parent-and-child-keys {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
+
+@cross-check-integrity
+test fk-self-reference-drop-table-with-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-reference-drop-table-still-checks-other-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    CREATE TABLE c(tid REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    INSERT INTO c VALUES (2);
+    DROP TABLE t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# A parent key that moves away is replaced by another row moving into it in
+# the same statement.
+@cross-check-integrity
+test fk-update-swaps-referenced-rowid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id));
+    INSERT INTO p VALUES (1), (7);
+    INSERT INTO c VALUES (1);
+    UPDATE p SET id = CASE id WHEN 1 THEN 5 ELSE 1 END;
+    SELECT * FROM p ORDER BY id;
+}
+expect {
+    1
+    5
+}
+
+@cross-check-integrity
+test fk-update-swaps-referenced-unique-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u INT UNIQUE);
+    CREATE TABLE c(pu REFERENCES p(u));
+    INSERT INTO p VALUES (1, 10), (2, 20);
+    INSERT INTO c VALUES (10);
+    UPDATE p SET u = CASE u WHEN 10 THEN 30 ELSE 10 END;
+    SELECT * FROM p ORDER BY id;
+}
+expect {
+    1|30
+    2|10
+}
+
+@cross-check-integrity
+test fk-update-moves-referenced-key-away {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid REFERENCES p(id));
+    INSERT INTO p VALUES (1), (7);
+    INSERT INTO c VALUES (1);
+    UPDATE p SET id = id + 100;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# A cascade does not count a violation for the child rows it deletes, so
+# deleting them must not cancel the violation of a grandchild row that the
+# cascade leaves without a parent.
+@cross-check-integrity
+test fk-cascade-delete-orphans-grandchild {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE ab(a PRIMARY KEY, b);
+    CREATE TABLE cd(c PRIMARY KEY REFERENCES ab ON DELETE CASCADE, d);
+    CREATE TABLE ef(e REFERENCES cd, f);
+    INSERT INTO ab VALUES (1, 'b');
+    INSERT INTO cd VALUES (1, 'd');
+    INSERT INTO ef VALUES (1, 'f');
+    DELETE FROM ab;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-cascade-delete-of-two-children-orphans-grandchild {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE ab(a PRIMARY KEY);
+    CREATE TABLE cd(d PRIMARY KEY, c REFERENCES ab ON DELETE CASCADE);
+    CREATE TABLE ef(e REFERENCES cd(d));
+    INSERT INTO ab VALUES (1);
+    INSERT INTO cd VALUES (1, 1), (2, 1);
+    INSERT INTO ef VALUES (1);
+    DELETE FROM ab;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-set-null-orphans-grandchild {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE ab(a PRIMARY KEY);
+    CREATE TABLE cd(c PRIMARY KEY REFERENCES ab ON DELETE SET NULL, d);
+    CREATE TABLE ef(e REFERENCES cd, f);
+    INSERT INTO ab VALUES (1);
+    INSERT INTO cd VALUES (1, 'd');
+    INSERT INTO ef VALUES (1, 'f');
+    DELETE FROM ab;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-update-cascade-orphans-grandchild {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE ab(a PRIMARY KEY);
+    CREATE TABLE cd(c PRIMARY KEY REFERENCES ab ON UPDATE CASCADE, d);
+    CREATE TABLE ef(e REFERENCES cd, f);
+    INSERT INTO ab VALUES (1);
+    INSERT INTO cd VALUES (1, 'd');
+    INSERT INTO ef VALUES (1, 'f');
+    UPDATE ab SET a = 2;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# A child row already missing its parent before the statement must not
+# cancel a violation the same statement causes.
+@cross-check-integrity
+test fk-update-of-orphan-row-checks-new-key {
+    CREATE TABLE p1(id INTEGER PRIMARY KEY);
+    CREATE TABLE p2(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(a REFERENCES p1(id), b REFERENCES p2(id));
+    INSERT INTO p1 VALUES (1);
+    INSERT INTO p2 VALUES (1);
+    INSERT INTO c VALUES (1, 99);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET a = 999, b = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-delete-of-orphan-row-checks-its-children {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (5, 99), (6, 5);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id = 5;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Row 4 is missing its parent before the statement. Moving its key away
+# from the row that references it counts a violation, and the stale OLD
+# key must not cancel it. Checked by sqlite3 before the parent-side checks.
+@cross-check-integrity
+test fk-update-of-orphan-row-checks-its-children {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (22, 4), (4, 2);
+    PRAGMA foreign_keys=ON;
+    UPDATE t SET id = id + 10, parent = parent + 10;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# DROP TABLE skips the checks of a table's references to itself, but not
+# their actions: the actions and the triggers they fire are visible outside
+# the dropped table.
+@cross-check-integrity
+test fk-drop-table-self-ref-set-null-fires-trigger {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE u(id INTEGER PRIMARY KEY, parent REFERENCES u ON DELETE SET NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER UPDATE ON u BEGIN INSERT INTO log VALUES(old.id); END;
+    INSERT INTO u VALUES (1, NULL), (2, 1), (3, 1);
+    DROP TABLE u;
+    SELECT x FROM log ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+@cross-check-integrity
+test fk-drop-table-self-ref-cascade-fires-trigger {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE u(id INTEGER PRIMARY KEY, parent REFERENCES u ON DELETE CASCADE);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER DELETE ON u BEGIN INSERT INTO log VALUES(old.id); END;
+    INSERT INTO u VALUES (1, NULL), (2, 1), (3, 2);
+    DROP TABLE u;
+    SELECT x FROM log ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+# An UPDATE checks a self-reference before it rewrites the row, so the probes
+# can still see the row's OLD key. Row 4 becomes (3,4): its NEW child key 4 is
+# its own OLD key, which no row has after the update.
+@cross-check-integrity
+test fk-self-reference-update-child-key-to-own-old-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t);
+    INSERT INTO t VALUES (1, NULL), (3, 1), (4, 3);
+    UPDATE t SET id = id - 1, par = par + 1 WHERE id >= 3;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-reference-unique-key-update-child-key-to-own-old-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(k INT UNIQUE, par REFERENCES t(k));
+    INSERT INTO t VALUES (1, NULL), (3, 1), (4, 3);
+    UPDATE t SET k = k - 1, par = par + 1 WHERE k >= 3;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-self-reference-deferred-update-child-key-to-own-old-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES (1, NULL), (3, 1), (4, 3);
+    BEGIN;
+    UPDATE t SET id = id - 1, par = par + 1 WHERE id >= 3;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# SQLite drops a table by deleting its rows in rowid order, and an ON DELETE
+# RESTRICT reference to the table itself fails when a row that is not deleted
+# yet references the deleted row.
+@cross-check-integrity
+test fk-drop-table-self-ref-restrict-later-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-table-self-ref-restrict-earlier-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, 2), (2, NULL), (3, 3);
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# Dropping a table removes the deferred violations of its rows.
+@cross-check-integrity
+test fk-drop-table-removes-deferred-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES (99);
+    DROP TABLE c;
+    COMMIT;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    p
+}
+
+@cross-check-integrity
+test fk-drop-table-self-ref-removes-deferred-violations {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x REFERENCES c DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES (1, 99), (2, 1);
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-drop-table-keeps-deferred-violations-of-other-tables {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE d(x REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES (99);
+    INSERT INTO d VALUES (98);
+    DROP TABLE c;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Like SQLite, an UPDATE of a self-referencing table's parent key checks the
+# row's own child key too, also when the UPDATE does not change it.
+@cross-check-integrity
+test fk-self-reference-update-parent-key-of-row-missing-its-parent {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t);
+    INSERT INTO t VALUES (5, 9);
+    PRAGMA foreign_keys=ON;
+    UPDATE t SET id = 6;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Row (1,9) becomes (2,9) and orphans (3,1). REPLACE then deletes (2,9), whose
+# parent was missing before the statement, which must not cancel the orphan.
+@cross-check-integrity
+test fk-self-reference-update-or-replace-deletes-row-missing-its-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INT PRIMARY KEY, p INT REFERENCES t(id));
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO t VALUES (1, 9), (3, 1);
+    PRAGMA foreign_keys=ON;
+    UPDATE OR REPLACE t SET id = 2;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# An ON UPDATE action rewrites the child key that references the row's OLD
+# parent key, so the row may set its child key to its own OLD parent key.
+@cross-check-integrity
+test fk-self-reference-on-update-cascade-child-key-to-own-old-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INT UNIQUE, p INT REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES (1, NULL);
+    UPDATE t SET id = 6, p = 1;
+    SELECT * FROM t;
+}
+expect {
+    6|6
+}
+
+@cross-check-integrity
+test fk-self-reference-rowid-on-update-cascade-moves-own-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t ON UPDATE CASCADE);
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET id = id + 4, par = par;
+    SELECT * FROM t;
+}
+expect {
+    5|5
+}
+
+@cross-check-integrity
+test fk-self-reference-rowid-on-update-set-null-moves-own-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, par REFERENCES t ON UPDATE SET NULL);
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET id = id + 4, par = par;
+    SELECT id, par IS NULL FROM t;
+}
+expect {
+    5|1
+}
+
+# DROP TABLE skips a foreign key of the dropped table whose parent table is
+# gone or whose parent key has no UNIQUE index.
+@cross-check-integrity
+test fk-drop-table-whose-parent-table-is-gone {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE u(k INT UNIQUE);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, q INT REFERENCES u(k));
+    DROP TABLE u;
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-drop-table-whose-deferred-parent-key-is-not-unique {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE u(k INT);
+    CREATE TABLE t(q INT REFERENCES u(k) DEFERRABLE INITIALLY DEFERRED);
+    DROP TABLE t;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    u
+}
+
+# Dropping the parent of a deferred foreign key leaves the child rows without
+# a parent until COMMIT, so a later statement can repair them.
+@cross-check-integrity
+test fk-drop-parent-of-deferred-child-fails-at-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1);
+    BEGIN;
+    INSERT INTO c VALUES (1);
+    DROP TABLE p;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-of-deferred-child-repaired-before-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1);
+    BEGIN;
+    INSERT INTO c VALUES (1);
+    DROP TABLE p;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    INSERT INTO p VALUES (1);
+    COMMIT;
+    SELECT x FROM c;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-drop-deferred-child-after-its-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1);
+    BEGIN;
+    INSERT INTO c VALUES (1);
+    DROP TABLE p;
+    DROP TABLE c;
+    COMMIT;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
