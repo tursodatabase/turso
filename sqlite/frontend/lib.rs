@@ -4,13 +4,11 @@
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
 
-use turso_core::dialect::engine;
-use turso_core::schema::{BTreeTable, Schema};
-use turso_core::Dialect;
-use turso_core::Func;
-use turso_parser::ast;
+use std::sync::Arc;
+use turso_core::{Dialect, Result};
+use turso_parser::{ast, parser::Parser};
 
-pub use turso_core::dialect::engine::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
+pub use turso_core::dialect::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
 
 /// The SQLite dialect.
 pub struct SqliteDialect;
@@ -20,43 +18,21 @@ impl Dialect for SqliteDialect {
         "sqlite"
     }
 
-    fn parse(&self, sql: &str) -> turso_core::Result<(Option<ast::Cmd>, usize)> {
-        engine::parse(sql)
+    fn parse(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
+        self.parse_internal(sql)
     }
 
-    fn parse_table_sql(&self, sql: &str, root_page: i64) -> turso_core::Result<BTreeTable> {
-        engine::reject_postgres_table_sql(sql)?;
-        BTreeTable::from_sql(sql, root_page)
+    fn parse_internal(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        Ok((cmd, parser.offset()))
     }
 
-    fn parse_table_sql_ast(&self, sql: &str) -> turso_core::Result<ast::Stmt> {
-        engine::reject_postgres_table_sql(sql)?;
-        engine::parse_table_sql_ast(sql)
+    fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition> {
+        Ok(Parser::new(sql.as_bytes()).parse_column_definition(true)?)
     }
 
-    fn table_sql_for_replay(&self, sql: &str) -> turso_core::Result<String> {
-        engine::reject_postgres_table_sql(sql)?;
-        engine::table_sql_for_replay(sql)
-    }
-
-    fn format_table_sql(
-        &self,
-        _input: &str,
-        tbl_name: &ast::QualifiedName,
-        body: &ast::CreateTableBody,
-    ) -> turso_core::Result<String> {
-        engine::format_table_sql(tbl_name, body)
-    }
-
-    fn register_catalog(
-        &self,
-        schema: &mut Schema,
-        enable_custom_types: bool,
-    ) -> turso_core::Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
-    }
-
-    fn resolve_function(&self, name: &str, arg_count: usize) -> turso_core::Result<Option<Func>> {
-        engine::resolve_builtin_function(name, arg_count)
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
     }
 }

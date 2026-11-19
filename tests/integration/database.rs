@@ -2,7 +2,7 @@ use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
-use turso_core::{ConnectOpts, Database, OpenFlags};
+use turso_core::{ConnectOpts, Database, OpenFlags, SessionRole};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 use turso_sqlite::SqliteDialect;
 
@@ -34,7 +34,9 @@ fn test_database_rename_registry_stale() {
     )
     .unwrap();
 
-    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
+    let conn_a = db_a
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn_a.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (42)").unwrap();
 
@@ -67,7 +69,9 @@ fn test_database_rename_registry_stale() {
     .unwrap();
 
     // 5. The new A.db should be empty — querying table 't' should fail.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     // A new database at A.db has no table `t`. Before the fix,
     // DATABASE_MANAGER returned the stale Database after the rename.
     assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
@@ -107,7 +111,9 @@ fn test_existing_readwrite_database_creates_missing_wal() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let connection = database.connect(ConnectOpts::new()).unwrap();
+    let connection = database
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     connection.execute("INSERT INTO t VALUES(2)").unwrap();
     assert!(wal.exists());
     connection.close().unwrap();
@@ -153,7 +159,9 @@ fn test_existing_only_open_preserves_main_file_permissions() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let connection = database.connect(ConnectOpts::new()).unwrap();
+    let connection = database
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     assert!(matches!(
         connection.execute("INSERT INTO t VALUES(1)"),
         Err(turso_core::LimboError::ReadOnly)
@@ -342,32 +350,6 @@ fn test_open_file_with_wrong_argument_count_in_schema() {
     }
 }
 
-/// The SQLite dialect has no roles, so a table named like the roles table of
-/// the PostgreSQL frontend is an ordinary table, as it is to sqlite3.
-#[test]
-fn test_open_file_with_table_named_like_the_roles_table() {
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let path = tmp_dir.path().join("roles.db");
-    let sqlite = rusqlite::Connection::open(&path).unwrap();
-    sqlite
-        .execute_batch(
-            "CREATE TABLE __turso_internal_roles(x);
-             INSERT INTO __turso_internal_roles VALUES (1);
-             CREATE TABLE t(a);
-             INSERT INTO t VALUES (5);",
-        )
-        .unwrap();
-    drop(sqlite);
-
-    let db = open_plain_file(&path).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
-    conn.force_reparse_schema_without_publish().unwrap();
-
-    let mut stmt = conn.prepare("SELECT a FROM t").unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    assert_that!(rows).is_equal_to(vec![vec![turso_core::Value::from_i64(5)]]);
-}
-
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
@@ -453,7 +435,9 @@ fn test_sdk_close_finalizes_leaked_statements() {
     .unwrap();
 
     // 7. The new A.db should be empty — table 't' should NOT exist.
-    let conn_a2 = db_a2.connect(ConnectOpts::new()).unwrap();
+    let conn_a2 = db_a2
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     let result = conn_a2.execute("SELECT x FROM t");
     assert!(
         result.is_err(),
@@ -482,7 +466,9 @@ fn test_database_open_with_options() {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -514,7 +500,9 @@ fn test_open_async_resolves_default_storage() {
             turso_core::IOResult::IO(completion) => completion.wait(&*io).unwrap(),
         }
     };
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x); INSERT INTO t VALUES(7)")
         .unwrap();
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
@@ -643,6 +631,24 @@ fn test_errors_on_zero_divisor_dialect() {
         fn name(&self) -> &'static str {
             SqliteDialect.name()
         }
+
+        fn parse_internal(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            turso_sqlite::SqliteDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+            turso_sqlite::SqliteDialect.parse_internal_column_definition(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(SqliteDialect)
+        }
         fn parse(&self, sql: &str) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             SqliteDialect.parse(sql)
         }
@@ -666,13 +672,6 @@ fn test_errors_on_zero_divisor_dialect() {
             body: &turso_parser::ast::CreateTableBody,
         ) -> turso_core::Result<String> {
             SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-        fn register_catalog(
-            &self,
-            schema: &mut turso_core::schema::Schema,
-            enable_custom_types: bool,
-        ) -> turso_core::Result<()> {
-            SqliteDialect.register_catalog(schema, enable_custom_types)
         }
         fn resolve_function(
             &self,

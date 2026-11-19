@@ -64,7 +64,7 @@ pub trait TableUpdate: Send + Sync {
     fn step(&mut self) -> IOResultOr<Option<i64>>;
 }
 
-pub(crate) trait ModuleFactory: Debug + Send + Sync {
+pub trait ModuleFactory: Debug + Send + Sync {
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<NativeTable>;
     fn innocuous(&self) -> bool;
@@ -87,7 +87,7 @@ impl<M: VirtualTableModule> ModuleFactory for M {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeTable(Arc<RwLock<Box<dyn TableInstance>>>);
+pub struct NativeTable(Arc<RwLock<Box<dyn TableInstance>>>);
 
 impl NativeTable {
     pub(crate) fn readonly(&self) -> bool {

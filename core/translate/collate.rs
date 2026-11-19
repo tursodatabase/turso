@@ -1614,6 +1614,7 @@ mod tests {
             join_info: None,
             table,
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
         });
 
@@ -1650,6 +1651,7 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             plan_estimate: None,
+            row_filter: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "t1".to_string(),
@@ -1688,6 +1690,7 @@ mod tests {
             internal_id: TableInternalId::from(2),
             join_info: None,
             plan_estimate: None,
+            row_filter: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
                 "t2".to_string(),
@@ -1736,6 +1739,7 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             plan_estimate: None,
+            row_filter: None,
             indexed: None,
             table: Table::BTree(Arc::new(BTreeTable::new(
                 0,
@@ -1760,6 +1764,7 @@ mod tests {
 #[cfg(test)]
 mod typed_value_order_tests {
     use super::CollationSeq;
+    use crate::security::roles::SessionRole;
     use crate::sync::Arc;
     use crate::vdbe::{builder::CursorType, insn::Insn};
     use crate::{
@@ -1908,7 +1913,9 @@ mod typed_value_order_tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
             .unwrap();
         conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")

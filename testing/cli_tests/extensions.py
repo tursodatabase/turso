@@ -427,6 +427,8 @@ def _test_series(limbo: TestTursoShell):
 def test_kv():
     _test_kv(exec_name=None, ext_path=f"{DEBUG_DIR}/libturso_ext_tests")
     _test_kv(exec_name="sqlite3", ext_path=f"{DEBUG_DIR}/liblimbo_sqlite_test_ext")
+    _test_kv_change_counts(exec_name=None, ext_path=f"{DEBUG_DIR}/libturso_ext_tests")
+    _test_kv_change_counts(exec_name="sqlite3", ext_path=f"{DEBUG_DIR}/liblimbo_sqlite_test_ext")
 
 
 def _test_kv(exec_name, ext_path):
@@ -537,6 +539,45 @@ def _test_kv(exec_name, ext_path):
         "select sql from sqlite_schema where name = 'renamed';",
         lambda res: 'CREATE VIRTUAL TABLE "renamed" USING kv_store',
         "renamed table shows up in sqlite_schema",
+    )
+    turso.quit()
+
+
+def _test_kv_change_counts(exec_name, ext_path):
+    """Writes to a virtual table count in changes() and total_changes() like
+    writes to a table, and an INSERT sets last_insert_rowid() to the new row."""
+    console.info(f"Running test_kv_change_counts for {ext_path} in {exec_name}")
+
+    # Skip the default setup, which inserts rows and so adds to total_changes().
+    turso = TestTursoShell(init_commands=".nullvalue TURSO", exec_name=exec_name)
+    turso.execute_dot(f".load {ext_path}")
+    turso.execute_dot("CREATE TABLE other(x);")
+    turso.execute_dot("INSERT INTO other(rowid, x) VALUES (100, 1);")
+    turso.execute_dot("CREATE VIRTUAL TABLE t USING kv_store;")
+    turso.execute_dot("INSERT INTO t(key, value) VALUES ('k1', 'x');")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes(), last_insert_rowid() = (SELECT rowid FROM t WHERE key = 'k1');",
+        lambda res: res == "1|2|1",
+        "virtual table INSERT counts a change and sets last_insert_rowid()",
+    )
+    turso.execute_dot("UPDATE t SET value = 'y';")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes();",
+        lambda res: res == "1|3",
+        "virtual table UPDATE counts a change",
+    )
+    turso.execute_dot("INSERT INTO t(key, value) VALUES ('k2', 'z');")
+    turso.execute_dot("UPDATE t SET value = 'w';")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes();",
+        lambda res: res == "2|6",
+        "virtual table UPDATE counts each row",
+    )
+    turso.execute_dot("DELETE FROM t WHERE key = 'k1';")
+    turso.run_test_fn(
+        "SELECT changes(), total_changes();",
+        lambda res: res == "1|7",
+        "virtual table DELETE counts a change",
     )
     turso.quit()
 

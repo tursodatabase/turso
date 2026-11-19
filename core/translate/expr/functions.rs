@@ -1,5 +1,6 @@
 use super::*;
 use crate::namespace::NamespaceId;
+use crate::translate::roles;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, InsertFlags, RegisterOrLiteral};
@@ -202,7 +203,7 @@ pub(super) fn translate_sequence_function(
         crate::translate::sequence::resolve_sequence_name(&seq_name_raw, resolver).ok_or_else(
             || LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist")),
         )?;
-    crate::translate::roles::check_sequence_change(resolver, &normalized_name)?;
+    roles::check_sequence_change(resolver, namespace, &normalized_name, is_nextval)?;
     let database_id = namespace.database_id;
     let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
     let runtime_args = qualify_sequence_argument(args, resolver);

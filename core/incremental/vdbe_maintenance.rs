@@ -30,6 +30,7 @@ use turso_parser::ast;
 
 use crate::incremental::dag;
 use crate::schema::Schema;
+use crate::security::roles::RoleId;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -144,7 +145,7 @@ pub(crate) fn compile_maintenance_program(
         input,
     };
     if let Some(prepared) = connection.maintenance_program_cache.get(&key, connection) {
-        return Ok(prepared.bind(connection.clone()));
+        return Ok(Program::from_prepared(prepared));
     }
     let plan = build_plan_for_connection(view_name, select, schema, connection)?;
     let program = compile_maintenance_plan(
@@ -195,11 +196,7 @@ fn compile_maintenance_plan(
         connection,
     )?;
     program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view DAG maintenance",
-    )
+    program.build(connection, false, "materialized view DAG maintenance")
 }
 
 #[cfg(feature = "test_helper")]
@@ -254,8 +251,9 @@ fn build_plan_for_connection(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::EngineDialect),
+        connection.dialect().get_internal_dialect(),
         None,
+        RoleId::SUPERUSER,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
     // names the same way CREATE did: within the view's own database, never

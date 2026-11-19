@@ -164,10 +164,10 @@ expect {
 }
 
 test format-char-empty-string {
-    SELECT format('character: %c', '');
+    SELECT hex(format('character: %c', ''));
 }
-expect raw {
-character: 
+expect {
+    6368617261637465723A2000
 }
 
 test format-char-from-integer {

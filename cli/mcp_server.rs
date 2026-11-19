@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, Value as DbValue,
+    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SessionRole,
+    Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
@@ -87,6 +88,8 @@ impl StmtClass {
             | Stmt::CreateSequence { .. }
             | Stmt::CreateSchema { .. }
             | Stmt::DropSchema { .. }
+            | Stmt::CreatePolicy(_)
+            | Stmt::DropPolicy { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }
             | Stmt::DropTrigger { .. }
@@ -583,7 +586,7 @@ impl TursoMcpServer {
                 None,
                 Arc::new(SqliteDialect),
             ) {
-                Ok((_io, db)) => match db.connect(ConnectOpts::new()) {
+                Ok((_io, db)) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
                     Ok(c) => c,
                     Err(e) => return Err(format!("Failed to connect to database '{path}': {e}")),
                 },

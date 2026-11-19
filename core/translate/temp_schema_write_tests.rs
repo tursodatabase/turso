@@ -1,5 +1,7 @@
 use crate::sync::Arc;
-use crate::{ConnectOpts, Connection, Database, EngineDialect, OpenFlags, OpenOptions, IO};
+use crate::{
+    ConnectOpts, Connection, Database, EngineDialect, OpenFlags, OpenOptions, SessionRole, IO,
+};
 
 fn fixture(readonly: bool) -> (tempfile::TempDir, Arc<Connection>, String) {
     let directory = tempfile::tempdir().unwrap();
@@ -11,7 +13,9 @@ fn fixture(readonly: bool) -> (tempfile::TempDir, Arc<Connection>, String) {
     let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
     {
         let database = Database::open_file(io.clone(), &path, Arc::new(EngineDialect)).unwrap();
-        let connection = database.connect(ConnectOpts::new()).unwrap();
+        let connection = database
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
         connection
             .execute("CREATE TABLE test(value); INSERT INTO test VALUES(1)")
             .unwrap();
@@ -30,7 +34,9 @@ fn fixture(readonly: bool) -> (tempfile::TempDir, Arc<Connection>, String) {
         OpenOptions::new(Arc::new(EngineDialect)).flags(flags),
     )
     .unwrap();
-    let connection = database.connect(ConnectOpts::new()).unwrap();
+    let connection = database
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     connection
         .execute("CREATE TEMP TABLE scratch(a); INSERT INTO scratch VALUES(1)")
         .unwrap();

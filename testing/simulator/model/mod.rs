@@ -592,6 +592,7 @@ impl Shadow for Query {
             Query::Pragma(
                 Pragma::AutoVacuumMode(_)
                 | Pragma::ForeignKeyList(_)
+                | Pragma::AutomaticIndex(_)
                 | Pragma::WalCheckpoint { .. },
             ) => Ok(vec![]),
         }

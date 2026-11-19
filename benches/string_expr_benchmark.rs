@@ -5,7 +5,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use std::sync::Arc;
 use std::time::Duration;
-use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, SessionRole, Statement, StepResult};
 use turso_sqlite::SqliteDialect;
 
 #[cfg(not(target_family = "wasm"))]
@@ -57,7 +57,9 @@ fn bench_string_expr(criterion: &mut Criterion) {
 
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     seed(&conn);
 
     for (label, sql) in QUERIES {

@@ -44,7 +44,7 @@
 //!
 //! ```text
 //! - core/translate/index.rs                CREATE INDEX (index_* forms)
-//! - core/translate/schema.rs               UNIQUE and PRIMARY KEY in CREATE TABLE
+//! - core/translate/schema/mod.rs           UNIQUE and PRIMARY KEY in CREATE TABLE
 //!                                          (col_*, tbl_* forms)
 //! - core/schema.rs                         automatic_from_primary_key/unique, and
 //!                                          loading an index from the schema table
@@ -87,7 +87,8 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenFlags, Value, IO,
+    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenFlags, SessionRole,
+    Value, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -1087,7 +1088,9 @@ fn open() -> Db {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     Db { _db: db, conn }
 }
 

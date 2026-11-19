@@ -210,7 +210,8 @@ expect error {
 @requires strict "uses STRICT tables"
 test decode-kind-true-or-false-is-integer {
     -- Like a comparison, these give 1, 0 or NULL, so they compare as
-    -- integers: 1 < '09' as numbers, although the text '1' > '09'.
+    -- integers: 1 < '09' as numbers, although the text '1' > '09'. The text
+    -- is built with || because a literal would be read as a value of the type.
     CREATE TYPE bt(value any) BASE integer ENCODE value DECODE value BETWEEN 1 AND 5;
     CREATE TYPE il(value any) BASE integer ENCODE value DECODE value IN (1, 2);
     CREATE TYPE lk(value any) BASE text ENCODE value DECODE value LIKE 'a%';
@@ -219,7 +220,7 @@ test decode-kind-true-or-false-is-integer {
     CREATE TYPE nn(value any) BASE text ENCODE value DECODE value NOT NULL;
     CREATE TABLE t(a bt, b il, c lk, d gb, e rx, f nn) STRICT;
     INSERT INTO t VALUES (3, 1, 'abc', 'abc', 'abc', 'abc');
-    SELECT a < '09', b < '09', c < '09', d < '09', e < '09', f < '09' FROM t;
+    SELECT a < '0' || '9', b < '0' || '9', c < '0' || '9', d < '0' || '9', e < '0' || '9', f < '0' || '9' FROM t;
 }
 expect {
     1|1|1|1|1|1
@@ -243,8 +244,8 @@ expect {
 @requires strict "uses STRICT tables"
 test decode-kind-cast-to-blob-type-compares-as-blob {
     -- bytea is stored as a blob, so CAST to it gives a blob, and c compares
-    -- like a plain BLOB column: equal only to the blob x'3132', not to 12
-    -- or '12'.
+    -- like a plain BLOB column: equal to the blob x'3132', not to 12. The
+    -- literal '12' is read as a value of b, which is that blob too.
     CREATE TYPE b(value any) BASE text DECODE CAST(value AS bytea);
     CREATE TABLE t(id INTEGER PRIMARY KEY, c b) STRICT;
     CREATE TABLE p(id INTEGER PRIMARY KEY, c BLOB) STRICT;
@@ -254,7 +255,7 @@ test decode-kind-cast-to-blob-type-compares-as-blob {
     SELECT 'p', typeof(c), c = x'3132', c = 12, c = '12' FROM p;
 }
 expect {
-    t|blob|1|0|0
+    t|blob|1|0|1
     p|blob|1|0|0
 }
 

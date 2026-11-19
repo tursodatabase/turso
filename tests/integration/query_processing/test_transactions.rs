@@ -2065,6 +2065,42 @@ fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+/// The rows that INSERT OR FAIL and UPDATE OR FAIL keep count in both changes()
+/// and total_changes(), in autocommit mode and inside a transaction.
+fn test_or_fail_counts_kept_rows_in_total_changes(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let counts = |conn: &Arc<Connection>| -> Vec<(i64, i64)> {
+        conn.exec_rows("SELECT changes(), total_changes()")
+    };
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+
+    let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'third'), (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert_eq!(counts(&conn), vec![(1, 3)]);
+
+    conn.execute("BEGIN").unwrap();
+    let result =
+        conn.execute("INSERT OR FAIL INTO t VALUES (4, 'fourth'), (5, 'fifth'), (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert_eq!(counts(&conn), vec![(2, 5)]);
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let result = conn.execute("UPDATE OR FAIL u SET val = 40 WHERE id IN (1, 3)");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert_eq!(counts(&conn), vec![(1, 9)]);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[turso_macros::test]
 /// INSERT OR ABORT (default) should rollback all changes from the statement on error.
 fn test_insert_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();

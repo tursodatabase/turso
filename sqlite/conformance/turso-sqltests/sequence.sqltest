@@ -392,3 +392,87 @@ test nextval-of-a-sequence-whose-name-has-a-quote {
 expect {
     1
 }
+
+test drop-sequence-refuses-a-sequence-a-default-uses {
+    CREATE SEQUENCE ds_seq;
+    CREATE TABLE ds_tbl(a INTEGER DEFAULT (nextval('ds_seq')), b);
+    DROP SEQUENCE ds_seq;
+}
+expect error {
+    cannot drop sequence ds_seq because other objects depend on it: the default of column a in table ds_tbl depends on sequence ds_seq
+}
+
+test drop-sequence-refuses-a-sequence-a-check-constraint-uses {
+    CREATE SEQUENCE dc_seq;
+    CREATE TABLE dc_tbl(a, CHECK (a < nextval('dc_seq') + 100));
+    DROP SEQUENCE dc_seq;
+}
+expect error {
+    cannot drop sequence dc_seq because other objects depend on it
+}
+
+test drop-sequence-refuses-a-sequence-a-view-uses {
+    CREATE SEQUENCE dv_seq;
+    CREATE TABLE dv_tbl(a);
+    CREATE VIEW dv_view AS SELECT nextval('dv_seq') AS n FROM dv_tbl;
+    DROP SEQUENCE dv_seq;
+}
+expect error {
+    cannot drop sequence dv_seq because other objects depend on it: view dv_view depends on sequence dv_seq
+}
+
+test drop-sequence-refuses-a-sequence-a-trigger-uses {
+    CREATE SEQUENCE dt_seq;
+    CREATE TABLE dt_tbl(a);
+    CREATE TABLE dt_log(a);
+    CREATE TRIGGER dt_trg AFTER INSERT ON dt_tbl BEGIN
+        INSERT INTO dt_log VALUES (nextval('dt_seq'));
+    END;
+    DROP SEQUENCE dt_seq;
+}
+expect error {
+    cannot drop sequence dt_seq because other objects depend on it: trigger dt_trg depends on sequence dt_seq
+}
+
+test drop-sequence-refuses-a-sequence-a-temporary-table-uses {
+    CREATE SEQUENCE dm_seq;
+    CREATE TEMP TABLE dm_tbl(a INTEGER DEFAULT (nextval('dm_seq')), b);
+    DROP SEQUENCE dm_seq;
+}
+expect error {
+    cannot drop sequence dm_seq because other objects depend on it: the default of column a in table dm_tbl depends on sequence dm_seq
+}
+
+test drop-sequence-succeeds-after-the-table-that-uses-it-is-dropped {
+    CREATE SEQUENCE da_seq;
+    CREATE TABLE da_tbl(a INTEGER DEFAULT (nextval('da_seq')), b);
+    INSERT INTO da_tbl(b) VALUES ('x');
+    DROP TABLE da_tbl;
+    DROP SEQUENCE da_seq;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '%da_seq%';
+}
+expect {
+    0
+}
+
+test drop-sequence-succeeds-after-the-column-that-uses-it-is-dropped {
+    CREATE SEQUENCE dl_seq;
+    CREATE TABLE dl_tbl(a INTEGER DEFAULT (nextval('dl_seq')), b);
+    ALTER TABLE dl_tbl DROP COLUMN a;
+    DROP SEQUENCE dl_seq;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '%dl_seq%';
+}
+expect {
+    0
+}
+
+test drop-table-leaves-a-sequence-its-default-uses {
+    CREATE SEQUENCE dk_seq;
+    CREATE TABLE dk_tbl(a INTEGER DEFAULT (nextval('dk_seq')), b);
+    INSERT INTO dk_tbl(b) VALUES ('x');
+    DROP TABLE dk_tbl;
+    SELECT nextval('dk_seq');
+}
+expect {
+    2
+}

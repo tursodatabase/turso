@@ -17,6 +17,16 @@ expect {
     3|test|0
 }
 
+# A CAST of NULL to a type is NULL without running the type's ENCODE, as an
+# INSERT of NULL into a column of the type is.
+test custom-type-cast-null-skips-encode {
+    CREATE TYPE ct_positive BASE integer ENCODE (CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'not positive') END) DECODE (value);
+    SELECT CAST(NULL AS ct_positive) IS NULL;
+}
+expect {
+    1
+}
+
 test custom-type-alter-table-default-works {
     CREATE TYPE ct_lower2 BASE text ENCODE (lower(value)) DECODE (value);
     CREATE TABLE t2(id INT PRIMARY KEY, c0 TEXT) STRICT;

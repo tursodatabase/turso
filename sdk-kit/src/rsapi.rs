@@ -67,6 +67,7 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+use turso_core::SessionRole;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -1076,7 +1077,7 @@ impl TursoDatabase {
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
             db.connect(
-                ConnectOpts::new()
+                ConnectOpts::new(SessionRole::Superuser)
                     .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly))
                     .with_page_codec(page_codec.clone()),
             )?
@@ -1089,7 +1090,7 @@ impl TursoDatabase {
                 None
             };
             db.connect(
-                ConnectOpts::new()
+                ConnectOpts::new(SessionRole::Superuser)
                     .with_readonly(self.config.open_flags.contains(OpenFlags::ReadOnly))
                     .with_encryption_key(encryption_key),
             )?
@@ -1187,6 +1188,16 @@ impl TursoConnection {
     /// active the request is ignored.
     pub fn interrupt(&self) {
         self.connection.interrupt();
+    }
+    /// Invoke `handler` approximately every `ops` virtual machine instructions
+    /// while a statement runs on this connection. A handler that returns
+    /// `true` interrupts the statement. `None` or `ops == 0` removes it.
+    pub fn set_progress_handler(
+        &self,
+        ops: u64,
+        handler: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    ) {
+        self.connection.set_progress_handler(ops, handler);
     }
     /// Set the maximum wall-clock duration a single statement is allowed to run
     /// before it is interrupted. `Duration::ZERO` disables the timeout.
@@ -1355,12 +1366,14 @@ impl TursoConnection {
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
             if cached.program.is_compatible_with(&self.connection) {
-                let program = turso_core::Program::from_prepared(
-                    cached.program.clone(),
+                let program = turso_core::Program::from_prepared(cached.program.clone());
+                let statement = Statement::new(
+                    program,
                     self.connection.clone(),
+                    self.connection.get_pager(),
+                    cached.query_mode,
+                    0,
                 );
-                let statement =
-                    Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {
@@ -1658,7 +1671,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), &stmt.get_program().connection) {
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
             return Err(sync_busy_error());
         }
         step_inner(stmt, self.async_io, waker)
@@ -1675,7 +1688,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), &stmt.get_program().connection) {
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
             return Err(sync_busy_error());
         }
 
@@ -1716,7 +1729,7 @@ impl TursoStatement {
         let stmt = handle
             .as_ref()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        if sync_operation_active(self.sync_busy.as_ref(), &stmt.get_program().connection) {
+        if sync_operation_active(self.sync_busy.as_ref(), stmt.get_connection()) {
             return Err(sync_busy_error());
         }
         let Some(row) = stmt.row() else {
