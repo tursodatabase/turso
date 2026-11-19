@@ -1861,7 +1861,39 @@ impl Connection {
         Ok(Some(generation))
     }
 
-    pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+    pub(crate) fn refresh_schema_for_reprepare(self: &Arc<Self>) -> Result<()> {
+        let in_snapshot_without_ddl = matches!(
+            self.get_tx_state(),
+            TransactionState::Read
+                | TransactionState::Write {
+                    schema_did_change: false
+                }
+        );
+        if self.mv_store().is_none() && in_snapshot_without_ddl {
+            // Compile against the schema cookie in this connection's read snapshot. The schema
+            // cache shared by all connections can be older (a writer's commit is visible before
+            // it calls `publish_schema_if_newer`) or newer (another connection committed after
+            // this snapshot was taken).
+            let cookie = match self.read_current_schema_cookie() {
+                Ok(cookie) => cookie,
+                // An empty database has no page 1 yet, and its schema cookie is 0.
+                Err(LimboError::Page1NotAlloc) => 0,
+                Err(err) => return Err(err),
+            };
+            if self.schema.read().schema_version == cookie {
+                return Ok(());
+            }
+            // Copy the shared schema when it matches the snapshot. Reparse only if neither the
+            // connection's schema nor the shared one does.
+            let shared_schema = self.db.schema.lock().clone();
+            if shared_schema.schema_version == cookie {
+                *self.schema.write() = shared_schema;
+            } else {
+                self.reparse_schema()?;
+            }
+            self.bump_prepare_context_generation();
+            return Ok(());
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
@@ -1872,6 +1904,7 @@ impl Connection {
             *self.schema.write() = schema;
             self.bump_prepare_context_generation();
         }
+        Ok(())
     }
 
     /// Read schema version at current transaction

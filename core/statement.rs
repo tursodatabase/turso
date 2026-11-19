@@ -1056,11 +1056,10 @@ impl Statement {
             conn.maybe_reparse_schema()?;
         }
 
-        // Refresh from shared schema only when shared is newer; this preserves a
-        // connection-local schema that is ahead of shared. An MVCC checkpoint can
-        // publish new btree roots without bumping the schema cookie, so
-        // same-version reprepare still refreshes it.
-        conn.refresh_schema_from_shared_for_reprepare();
+        // While the connection holds a read snapshot, compile against the schema in it. Otherwise
+        // copy the shared schema cache when it is newer, or when an MVCC checkpoint changed btree
+        // roots without changing the schema version.
+        conn.refresh_schema_for_reprepare()?;
         let new_program = {
             let cmd = match &self.reprepare_cmd {
                 Some(cmd) => cmd.clone(),
