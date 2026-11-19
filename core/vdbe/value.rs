@@ -1099,8 +1099,8 @@ impl Value {
             return Ok(Value::Null);
         }
 
-        let source = text_of_cast(source);
-        let pattern = text_of_cast(pattern);
+        let source = source.cast_text_ref().expect("a NULL value returns above");
+        let pattern = pattern.cast_text_ref().expect("a NULL value returns above");
         if pattern.is_empty() || pattern.starts_with('\0') {
             return Ok(Value::build_text(source.into_owned()));
         }
@@ -1108,7 +1108,9 @@ impl Value {
         if matches!(replacement, Value::Null) {
             return Ok(Value::Null);
         }
-        let replacement = text_of_cast(replacement);
+        let replacement = replacement
+            .cast_text_ref()
+            .expect("a NULL value returns above");
         Ok(Value::build_text(replace_all(
             &source,
             &pattern,
@@ -1773,15 +1775,6 @@ fn text_of_operand<'a>(
             Some(Cow::Borrowed(integer.insert(IntegerText::new(*i)).as_str()))
         }
         value => value.cast_text_ref(),
-    }
-}
-
-/// The text of `CAST(value AS TEXT)`, which is the text of `value.to_string()`.
-/// A TEXT value is borrowed, not copied.
-fn text_of_cast(value: &Value) -> Cow<'_, str> {
-    match value {
-        Value::Text(text) => Cow::Borrowed(text.as_str()),
-        value => Cow::Owned(value.to_string()),
     }
 }
 
@@ -4115,6 +4108,55 @@ mod tests {
     fn hex_upper_matches_hex_crate() {
         let bytes: Vec<u8> = (0..=255).collect();
         assert_eq!(super::hex_upper(&bytes), hex::encode_upper(&bytes));
+    }
+
+    #[test]
+    fn replace_reads_numbers_and_blobs_as_their_text() {
+        let cases = [
+            (
+                Value::from_i64(12345),
+                Value::from_i64(3),
+                Value::from_i64(9),
+                Value::build_text("12945"),
+            ),
+            (
+                Value::from_f64(2.5),
+                Value::build_text("."),
+                Value::build_text(","),
+                Value::build_text("2,5"),
+            ),
+            (
+                blob(b"abc"),
+                Value::build_text("b"),
+                blob(b"x"),
+                Value::build_text("axc"),
+            ),
+            (
+                Value::build_text("abc"),
+                Value::build_text(""),
+                Value::Null,
+                Value::build_text("abc"),
+            ),
+            (
+                Value::Null,
+                Value::build_text("a"),
+                Value::build_text("b"),
+                Value::Null,
+            ),
+            (
+                Value::build_text("abc"),
+                Value::build_text("a"),
+                Value::Null,
+                Value::Null,
+            ),
+        ];
+        for (source, pattern, replacement, expected) in cases {
+            assert_eq!(
+                allocated(Value::exec_replace(&source, &pattern, &replacement)),
+                expected,
+                "{source:?} {pattern:?} {replacement:?}"
+            );
+        }
     }
 
     #[test]
