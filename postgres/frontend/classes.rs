@@ -28,7 +28,7 @@
 //! policies take their oids from the same counter.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::{
@@ -39,8 +39,9 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
-    Connection, CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn,
-    ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
+    Connection, CursorType, InsertFlags, Insn, LimboError, LoadQuery, LoadStep, NewOwner, Numeric,
+    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, Row, SchemaLoad, SqliteCatalog,
+    Value,
 };
 use turso_parser::ast;
 
@@ -61,7 +62,7 @@ use crate::policies::{self, TablePolicies};
 use crate::roles::{
     schema_roles, AUTHID_TABLE_NAME, CREATE_AUTHID_NAME_INDEX_SQL, CREATE_AUTHID_TABLE_SQL,
 };
-use crate::schema_state::{change_schema_state, emit_catalog_apply, schema_state};
+use crate::schema_state::{change_schema_state, emit_catalog_apply, schema_state, SchemaStateRead};
 use crate::unique_index::emit_unique_index_insert;
 use turso_core::security::policy::RowPolicy;
 
@@ -330,8 +331,46 @@ pub(crate) fn class_catalog(schema: &Schema) -> Option<&ClassCatalog> {
     schema_state(schema).map(|state| state.classes.as_ref())
 }
 
-/// The query of the relation catalog for
-/// [`turso_core::Dialect::schema_state_queries`].
+/// Reads the relation catalog from [`CLASSES_TABLE_NAME`].
+pub(crate) struct ClassRows {
+    read: Arc<Mutex<SchemaStateRead>>,
+    queried: bool,
+    rows: Vec<Vec<Value>>,
+}
+
+impl ClassRows {
+    pub(crate) fn new(read: Arc<Mutex<SchemaStateRead>>) -> Self {
+        Self {
+            read,
+            queried: false,
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl LoadStep for ClassRows {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> turso_core::Result<Option<LoadQuery>> {
+        if self.queried {
+            return Ok(None);
+        }
+        self.queried = true;
+        Ok(schema_state_query(load.schema()).map(LoadQuery::engine_metadata_read))
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> turso_core::Result<()> {
+        self.rows.push(row.get_values().cloned().collect());
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, load: &mut SchemaLoad) -> turso_core::Result<()> {
+        let classes = ClassCatalog::build(load.schema(), &self.rows)?;
+        self.read.lock().unwrap().classes = Some(classes);
+        Ok(())
+    }
+}
+
+/// The query that reads the relation catalog for the frontend's schema
+/// state, or None when the database has no classes table.
 pub(crate) fn schema_state_query(schema: &Schema) -> Option<String> {
     schema.get_btree_table(NamespaceId::ROOT, CLASSES_TABLE_NAME)?;
     Some(format!(
@@ -613,6 +652,10 @@ impl Catalog for PostgresCatalog {
             } if !writes_class_rows(ctx)? => Ok(()),
             _ => translate_access_statement(program, ctx.schema, ctx.connection, statement),
         }
+    }
+
+    fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+        crate::schema_state::load_steps()
     }
 }
 

@@ -19,21 +19,21 @@
 //! so that other connections load the change.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use turso_core::namespace::NamespaceId;
 use turso_core::schema::Schema;
 use turso_core::security::roles::RoleId;
 use turso_core::{
-    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, Numeric,
-    ProgramBuilder, RegisterOrLiteral, Value, MAIN_DB_ID,
+    to_u32, CatalogApply, Connection, CursorType, InsertFlags, Insn, LimboError, LoadQuery,
+    LoadStep, Numeric, ProgramBuilder, RegisterOrLiteral, Row, SchemaLoad, Value, MAIN_DB_ID,
 };
 use turso_parser::ast::RoleOptions;
 use turso_pg_parser::sqlstate::SQLSTATE_DUPLICATE_OBJECT;
 
 use crate::auth_members::Memberships;
 use crate::error::sqlstate_error;
-use crate::schema_state::{change_schema_state, emit_catalog_apply};
+use crate::schema_state::{change_schema_state, emit_catalog_apply, SchemaStateRead};
 use crate::unique_index::emit_unique_index_insert;
 
 /// The table that stores the roles created with `CREATE ROLE`.
@@ -56,6 +56,45 @@ pub(crate) const CREATE_AUTHID_NAME_INDEX_SQL: &str =
 
 /// The number of columns of [`AUTHID_TABLE_NAME`].
 const AUTHID_COLUMN_COUNT: usize = 5;
+
+/// Reads the roles from [`AUTHID_TABLE_NAME`]. A database without the
+/// relation catalog has no schema state, so its roles are not read.
+pub(crate) struct RoleRows {
+    read: Arc<Mutex<SchemaStateRead>>,
+    queried: bool,
+    rows: Vec<Vec<Value>>,
+}
+
+impl RoleRows {
+    pub(crate) fn new(read: Arc<Mutex<SchemaStateRead>>) -> Self {
+        Self {
+            read,
+            queried: false,
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl LoadStep for RoleRows {
+    fn next_query(&mut self, load: &mut SchemaLoad) -> turso_core::Result<Option<LoadQuery>> {
+        if self.queried || self.read.lock().unwrap().classes.is_none() {
+            return Ok(None);
+        }
+        self.queried = true;
+        Ok(schema_state_query(load.schema()).map(LoadQuery::engine_metadata_read))
+    }
+
+    fn row(&mut self, _load: &mut SchemaLoad, row: &Row) -> turso_core::Result<()> {
+        self.rows.push(row.get_values().cloned().collect());
+        Ok(())
+    }
+
+    fn end_of_rows(&mut self, _load: &mut SchemaLoad) -> turso_core::Result<()> {
+        let roles = RoleCatalog::without_memberships(&self.rows)?;
+        self.read.lock().unwrap().roles = Some(roles);
+        Ok(())
+    }
+}
 
 /// The query that reads the roles for the frontend's schema state, or None
 /// when the database has no roles table, as in a read-only open of an empty
@@ -114,10 +153,19 @@ impl RoleCatalog {
     /// membership table. Each role row is `(id, rolname, rolsuper,
     /// rolinherit, rolbypassrls)`; the membership rows are those of
     /// [`crate::auth_members::schema_state_query`].
+    #[cfg(test)]
     pub(crate) fn new(
         rows: &[Vec<Value>],
         membership_rows: &[Vec<Value>],
     ) -> turso_core::Result<Self> {
+        let mut catalog = Self::without_memberships(rows)?;
+        catalog.set_memberships(Memberships::new(membership_rows)?)?;
+        Ok(catalog)
+    }
+
+    /// Returns a catalog of the rows read from the roles table, with no
+    /// memberships.
+    pub(crate) fn without_memberships(rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
             let role = role_from_row(row)?;
@@ -129,16 +177,22 @@ impl RoleCatalog {
             }
             catalog.add(role);
         }
-        catalog.memberships = Memberships::new(membership_rows)?;
-        let exists = |id| id == RoleId::SUPERUSER || catalog.roles.contains_key(&id);
-        if let Some(membership) = catalog.memberships.iter().find(|membership| {
+        Ok(catalog)
+    }
+
+    /// Replaces the memberships with `memberships`, after checking that
+    /// each one names roles of this catalog.
+    pub(crate) fn set_memberships(&mut self, memberships: Memberships) -> turso_core::Result<()> {
+        let exists = |id| id == RoleId::SUPERUSER || self.roles.contains_key(&id);
+        if let Some(membership) = memberships.iter().find(|membership| {
             !exists(membership.role) || !exists(membership.member) || !exists(membership.grantor)
         }) {
             return Err(LimboError::Corrupt(format!(
                 "a role membership names a role that does not exist: {membership:?}"
             )));
         }
-        Ok(catalog)
+        self.memberships = memberships;
+        Ok(())
     }
 
     /// The stored role with id `id`. None for a built-in id.
