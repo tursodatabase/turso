@@ -1079,7 +1079,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
 fn external_aggregates_preserve_outer_subquery_ownership() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(EngineDialect)).extension_function(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
             ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
