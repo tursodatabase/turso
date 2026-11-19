@@ -1,7 +1,8 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::{
-    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateTable, DropIndex, DropTable, TableText,
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateTable, CreateView, DropIndex, DropTable,
+    TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -22,8 +23,8 @@ use turso_parser::ast;
 
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
 /// the SQL text that creates it. So far it stores `CREATE TABLE`, `CREATE
-/// INDEX`, `DROP INDEX` and `DROP TABLE`; every other statement writes its
-/// `sqlite_schema` rows itself.
+/// INDEX`, `DROP INDEX`, `DROP TABLE` and `CREATE VIEW`; every other statement
+/// writes its `sqlite_schema` rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
 
@@ -43,8 +44,8 @@ impl Catalog for SqliteCatalog {
             // statement writes and deletes as an engine table.
             CatalogCmd::CreateSequence(_) | CatalogCmd::DropSequence(_) => Ok(()),
             CatalogCmd::DropTable(table) => emit_drop_table_rows(program, ctx, table),
-            CatalogCmd::CreateView(_)
-            | CatalogCmd::CreateMaterializedView(_)
+            CatalogCmd::CreateView(view) => emit_create_view_row(program, ctx, view),
+            CatalogCmd::CreateMaterializedView(_)
             | CatalogCmd::DropView(_)
             | CatalogCmd::RenameTable(_)
             | CatalogCmd::RenameColumn(_)
@@ -546,6 +547,44 @@ fn emit_delete_temp_triggers_on_table(
     Ok(())
 }
 
+/// Writes the row of a new view.
+fn emit_create_view_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    view: &CreateView<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: view.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, view.name);
+    let sql = create_view_sql(
+        "VIEW",
+        &resolver
+            .name_in_sql(namespace, view.written_name)
+            .as_ident(),
+        view.columns,
+        view.select,
+    );
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::View,
+        &stored_name,
+        &stored_name,
+        // A view has no B-tree.
+        0,
+        Some(sql),
+    )?;
+
+    Ok(())
+}
+
 /// Deletes the row of a view or materialized view. Returns the register
 /// with the rowid of the deleted row.
 pub(crate) fn emit_drop_view_row(
@@ -622,6 +661,24 @@ pub(crate) fn emit_drop_view_row(
     program.preassign_label_to_next_insn(end_loop_label);
 
     Ok(rowid_reg)
+}
+
+/// The SQL text to store for a new view or materialized view.
+pub(crate) fn create_view_sql(
+    view_kind: &str,
+    view_name: &str,
+    columns: &[ast::IndexedColumn],
+    select_stmt: &ast::Select,
+) -> String {
+    let columns_str = columns
+        .iter()
+        .map(|col| col.col_name.as_ident())
+        .collect::<Vec<String>>()
+        .join(", ");
+    if !columns_str.is_empty() {
+        return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
+    }
+    format!("CREATE {view_kind} {view_name} AS {select_stmt}")
 }
 
 /// Creates one of the engine's own tables in the main database the first

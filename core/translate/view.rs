@@ -9,7 +9,8 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
     schema::{
-        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
+        self, create_view_sql, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write,
+        SchemaEntryType,
     },
 };
 use crate::util::{
@@ -152,7 +153,7 @@ pub fn translate_create_materialized_view(
         .collect::<Vec<_>>();
 
     // Reconstruct the SQL string for storage
-    let sql = create_view_to_str(
+    let sql = create_view_sql(
         "MATERIALIZED VIEW",
         &view_name.name.as_ident(),
         columns,
@@ -430,29 +431,6 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
-    let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
-    let sql = create_view_to_str(
-        "VIEW",
-        &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
-        columns,
-        select_stmt,
-    );
-
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    // Add the view entry to sqlite_schema
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for views
-        SchemaEntryType::View,
-        &stored_view_name,
-        &stored_view_name,
-        0, // Regular views don't have a btree
-        Some(sql),
-    )?;
-
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -460,11 +438,15 @@ pub fn translate_create_view(
         &CatalogCmd::CreateView(CreateView {
             namespace: namespace.id,
             name: &normalized_view_name,
+            written_name: &view_name.name,
+            columns,
+            select: select_stmt,
         }),
     )?;
 
     // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&stored_view_name);
+    let escaped_view_name =
+        escape_sql_string_literal(&resolver.mangle_name(namespace, &normalized_view_name));
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
@@ -480,23 +462,6 @@ pub fn translate_create_view(
     });
 
     Ok(())
-}
-
-fn create_view_to_str(
-    view_kind: &str,
-    view_name: &str,
-    columns: &[ast::IndexedColumn],
-    select_stmt: &ast::Select,
-) -> String {
-    let columns_str = columns
-        .iter()
-        .map(|col| col.col_name.as_ident())
-        .collect::<Vec<String>>()
-        .join(", ");
-    if !columns_str.is_empty() {
-        return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
-    }
-    format!("CREATE {view_kind} {view_name} AS {select_stmt}")
 }
 
 pub fn translate_drop_view(

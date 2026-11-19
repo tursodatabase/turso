@@ -246,6 +246,9 @@ pub struct DropTable<'a> {
 pub struct CreateView<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
+    pub written_name: &'a ast::Name,
+    pub columns: &'a [ast::IndexedColumn],
+    pub select: &'a ast::Select,
 }
 
 /// A new materialized view. The statement writes the engine tables that
