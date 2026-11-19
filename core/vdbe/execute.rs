@@ -6310,7 +6310,12 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest].set_text(Text::new(value.clone()))?;
+    // A register that holds text keeps its buffer: copy the string into it,
+    // without first copying the string into a String that is then freed.
+    match &mut state.registers[*dest] {
+        Register::Value(Value::Text(existing)) => existing.do_extend(&value.as_str())?,
+        register => register.set_text(Text::new(value.clone()))?,
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
