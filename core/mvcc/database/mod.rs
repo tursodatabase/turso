@@ -27,7 +27,9 @@ use crate::sync::atomic::{fence, AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::types::cmp_in_column;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -57,6 +59,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use turso_parser::ast::SortOrder;
 
 pub mod checkpoint;
 #[cfg(not(nightly))]
@@ -223,14 +226,33 @@ impl SortableIndexKey {
         let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
+            // Two integers compare by value under every text collation, so
+            // they need no ValueRef. The skip list compares keys many times
+            // for each insert and seek. Other values, and a corrupt record,
+            // take the general path below.
+            if let Some(key_info) = self.metadata.key_info.get(i) {
+                if matches!(key_info.collation, CollationSeq::Text(_)) {
+                    if let (Some((lhs_int, lhs_size)), Some((rhs_int, rhs_size))) =
+                        (lhs.peek_integer(), rhs.peek_integer())
+                    {
+                        lhs.skip_integer(lhs_size);
+                        rhs.skip_integer(rhs_size);
+                        let cmp = match key_info.sort_order {
+                            SortOrder::Asc => lhs_int.cmp(&rhs_int),
+                            SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let lhs_value = lhs.next().expect("we already checked length")?;
             let rhs_value = rhs.next().expect("we already checked length")?;
 
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = cmp_in_column(&lhs_value, &rhs_value, &self.metadata.key_info[i]);
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(cmp);

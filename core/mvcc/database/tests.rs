@@ -259,6 +259,103 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     assert_eq!(key.key.get_payload(), record.get_payload());
 }
 
+/// `SortableIndexKey` compares two integers without decoding them into
+/// values. The order must be the order of `compare_immutable` on the decoded
+/// values, for integers of every serial type, for integers against other
+/// kinds of values, for both sort orders and for keys of different lengths.
+#[test]
+fn index_key_order_matches_compare_immutable() {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::SortOrder;
+
+    let integers = [
+        0,
+        1,
+        -1,
+        2,
+        127,
+        -128,
+        128,
+        32_767,
+        -32_768,
+        32_768,
+        8_388_607,
+        -8_388_608,
+        8_388_608,
+        2_147_483_647,
+        -2_147_483_648,
+        2_147_483_648,
+        140_737_488_355_327,
+        -140_737_488_355_328,
+        140_737_488_355_328,
+        i64::MAX,
+        i64::MIN,
+    ];
+    let mut values: Vec<Value> = integers.iter().map(|&i| Value::from_i64(i)).collect();
+    values.extend([
+        Value::Null,
+        Value::from_f64(-0.5),
+        Value::from_f64(1.0),
+        Value::from_f64(1.5),
+        Value::from_f64(9.3e18),
+        Value::build_text("1"),
+        Value::build_text("a"),
+        Value::from_slice(b"1").unwrap(),
+    ]);
+
+    let index_info = |sort_orders: &[SortOrder], num_cols: usize| {
+        Arc::new(
+            IndexInfo::new(
+                sort_orders.iter().map(|&sort_order| crate::types::KeyInfo {
+                    sort_order,
+                    collation: CollationSeq::BINARY,
+                    nulls_order: None,
+                }),
+                true,
+                num_cols,
+                false,
+            )
+            .unwrap(),
+        )
+    };
+    let key = |values: &[Value], info: &Arc<IndexInfo>| {
+        let record = ImmutableRecord::from_values(values, values.len()).unwrap();
+        SortableIndexKey::new_from_payload_in(&record, info.clone(), TursoAllocator).unwrap()
+    };
+    let expected = |lhs: &SortableIndexKey, rhs: &SortableIndexKey| {
+        let num_cols = lhs.metadata.num_cols.min(rhs.metadata.num_cols);
+        let lhs_values = lhs.key.get_values().unwrap();
+        let rhs_values = rhs.key.get_values().unwrap();
+        compare_immutable(
+            &lhs_values[..num_cols],
+            &rhs_values[..num_cols],
+            &lhs.metadata.key_info[..num_cols],
+        )
+    };
+
+    for first_order in [SortOrder::Asc, SortOrder::Desc] {
+        for second_order in [SortOrder::Asc, SortOrder::Desc] {
+            let sort_orders = [first_order, second_order];
+            let full = index_info(&sort_orders, 2);
+            let prefix = index_info(&sort_orders, 1);
+            for a in &values {
+                for b in &values {
+                    for (a_second, b_second) in [(1, 1), (1, 2), (3, 2)] {
+                        let lhs = key(&[a.clone(), Value::from_i64(a_second)], &full);
+                        let rhs = key(&[b.clone(), Value::from_i64(b_second)], &full);
+                        assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
+                        assert_eq!(lhs == rhs, expected(&lhs, &rhs).is_eq());
+                    }
+                    let lhs = key(&[a.clone()], &prefix);
+                    let rhs = key(&[b.clone(), Value::build_text("x")], &full);
+                    assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
+                    assert_eq!(rhs.cmp(&lhs), expected(&rhs, &lhs), "{a:?} {b:?}");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(nightly)]
 #[test]
 #[should_panic(expected = "empty tombstone row")]

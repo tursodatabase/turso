@@ -15,7 +15,8 @@ use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
-    read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
+    read_integer, read_value, read_value_serial_type, read_varint, try_read_integer, varint_len,
+    write_varint,
 };
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -2237,6 +2238,24 @@ impl<'a> ValueIterator<'a> {
     #[inline(always)]
     pub fn set_data_section(&self, data: &'a [u8]) {
         self.data_section.set(data);
+    }
+
+    /// The next value and its number of data bytes, if the value is an
+    /// integer and all of its bytes are in the record. Else None, also for a
+    /// corrupt record: [Iterator::next] then gives the error. The iterator
+    /// does not move. [Self::skip_integer] moves it past the integer.
+    #[inline(always)]
+    pub fn peek_integer(&self) -> Option<(i64, usize)> {
+        let &serial_type = self.header_section.get().first()?;
+        try_read_integer(self.data_section.get(), serial_type)
+    }
+
+    /// Moves the iterator past the integer that [Self::peek_integer] gave,
+    /// which has `size` data bytes.
+    #[inline(always)]
+    pub fn skip_integer(&self, size: usize) {
+        self.header_section.set(&self.header_section.get()[1..]);
+        self.data_section.set(&self.data_section.get()[size..]);
     }
 }
 
