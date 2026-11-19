@@ -541,18 +541,54 @@ fn classify_type(type_name: &TypeName) -> Result<TypeClass, ParseError> {
         schema: schema.cloned(),
         name: name.clone(),
     };
+    // `_int4` is how the catalog names the array type of `int4`. An array has
+    // no array type, so `_int4[]` doesn't exist.
+    let element_of_array = name.strip_prefix('_').filter(|element| {
+        class.is_none()
+            && is_built_in_schema
+            && type_name.array_bounds.is_empty()
+            && has_array_type(element)
+    });
+    if let Some(element) = element_of_array {
+        return Ok(if element == "record" {
+            // The one array that is a pseudo-type. PostgreSQL writes it
+            // `record[]` in its errors.
+            TypeClass::Pseudo("record[]".to_string())
+        } else {
+            TypeClass::Array(type_name_text(type_name)?)
+        });
+    }
     if type_name.array_bounds.is_empty() {
         return Ok(class.unwrap_or(not_built_in));
     }
-    // PostgreSQL has arrays of base types and of some pseudo-types, such as
-    // record[], but not of polymorphic types.
+    // PostgreSQL has arrays of most base types and of two pseudo-types:
+    // record[], itself a pseudo-type, and cstring[], an ordinary array type.
+    // `void[]` doesn't exist.
     Ok(match class {
-        Some(TypeClass::Base) => TypeClass::Array(type_name_text(type_name)?),
-        Some(TypeClass::Pseudo(name)) => {
-            TypeClass::Pseudo(name + &"[]".repeat(type_name.array_bounds.len()))
+        Some(TypeClass::Pseudo(pseudo)) if name == "record" => {
+            TypeClass::Pseudo(pseudo + &"[]".repeat(type_name.array_bounds.len()))
+        }
+        Some(TypeClass::Base | TypeClass::Pseudo(_)) if has_array_type(name) => {
+            TypeClass::Array(type_name_text(type_name)?)
         }
         _ => not_built_in,
     })
+}
+
+/// Whether PostgreSQL has an array type of the built-in type `name`: of every
+/// base type but a few internal ones, and of the pseudo-types only `record`
+/// and `cstring`.
+fn has_array_type(name: &str) -> bool {
+    const BASE_TYPES_WITHOUT_ARRAYS: &[&str] = &[
+        "pg_brin_bloom_summary",
+        "pg_brin_minmax_multi_summary",
+        "pg_dependencies",
+        "pg_mcv_list",
+        "pg_ndistinct",
+        "pg_node_tree",
+    ];
+    (BASE_TYPES.contains(&name) && !BASE_TYPES_WITHOUT_ARRAYS.contains(&name))
+        || matches!(name, "record" | "cstring")
 }
 
 /// The type name as PostgreSQL writes it in an error about a type that does
@@ -566,8 +602,9 @@ fn type_name_text(type_name: &TypeName) -> Result<String, ParseError> {
 }
 
 /// The name PostgreSQL's errors give `type_name` if it is a built-in type:
-/// a base, pseudo or polymorphic type, or an array of a base or pseudo type,
-/// written `int4[]` or `_int4`. `None` for any other type.
+/// a base, pseudo or polymorphic type, or an array PostgreSQL has of one,
+/// written `int4[]` or `_int4` (as `classify_type` decides). `None` for any
+/// other type.
 pub(crate) fn builtin_type_name(type_name: &TypeName) -> Result<Option<String>, ParseError> {
     Ok(match classify_type(type_name)? {
         TypeClass::Base => Some(
@@ -576,18 +613,6 @@ pub(crate) fn builtin_type_name(type_name: &TypeName) -> Result<Option<String>, 
                 .unwrap_or_default(),
         ),
         TypeClass::Polymorphic(name) | TypeClass::Pseudo(name) | TypeClass::Array(name) => {
-            Some(name)
-        }
-        // `_int4` is how the catalog names the array type of `int4`.
-        TypeClass::NotBuiltIn { schema, name }
-            if schema
-                .as_deref()
-                .is_none_or(|schema| schema == "pg_catalog")
-                && type_name.array_bounds.is_empty()
-                && name.strip_prefix('_').is_some_and(|element| {
-                    BASE_TYPES.contains(&element) || PSEUDO_TYPES.contains(&element)
-                }) =>
-        {
             Some(name)
         }
         TypeClass::NotBuiltIn { .. } | TypeClass::ColumnType => None,

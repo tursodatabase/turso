@@ -1662,6 +1662,22 @@ impl PostgreSQLTranslator {
                     });
                 }
                 if !tn.array_bounds.is_empty() {
+                    // A built-in type without an array type, such as `void[]`.
+                    let element = pg_query::protobuf::TypeName {
+                        array_bounds: Vec::new(),
+                        ..tn.clone()
+                    };
+                    // With IF EXISTS PostgreSQL skips it, but the engine would
+                    // drop a custom type named `"void[]"`, so it is refused below.
+                    if !drop.missing_ok
+                        && crate::create_function::builtin_type_name(&element)?.is_some()
+                    {
+                        let names = extract_key_columns(&tn.names)?.join(".");
+                        return Err(type_does_not_exist(&format!(
+                            "{names}{}",
+                            "[]".repeat(tn.array_bounds.len())
+                        )));
+                    }
                     return Err(ParseError::not_supported(format!(
                         "DROP {} of an array type",
                         drop_object_type_name(remove_type)

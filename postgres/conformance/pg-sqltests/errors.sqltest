@@ -184,3 +184,64 @@ test error-drop-array-of-custom-type {
 }
 @sqlstate 0A000
 expect error {}
+
+# PostgreSQL has no array type of void, any or pg_node_tree, so these don't
+# exist; record and cstring have one.
+test error-drop-array-of-type-without-arrays {
+    DROP TYPE _void;
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-bracketed-array-of-type-without-arrays {
+    DROP TYPE void[];
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-domain-bracketed-array-of-type-without-arrays {
+    DROP DOMAIN void[];
+}
+@sqlstate 42704
+expect error {}
+
+# PostgreSQL skips it; tursopg refuses it, as it refuses every array type,
+# rather than drop a custom type named "void[]".
+test drop-if-exists-bracketed-array-of-type-without-arrays {
+    DROP TYPE IF EXISTS void[];
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+test error-drop-bracketed-array-of-base-type-without-arrays {
+    DROP TYPE pg_node_tree[];
+}
+@sqlstate 42704
+expect error {}
+
+# An array type has no array type of its own.
+test error-drop-array-of-array-type {
+    DROP TYPE _int4[];
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-domain-array-of-type-without-arrays {
+    DROP DOMAIN _void;
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-array-of-base-type-without-arrays {
+    DROP TYPE _pg_node_tree;
+}
+@sqlstate 42704
+expect error {}
+
+test error-drop-builtin-cstring-array-type {
+    DROP TYPE _cstring;
+}
+@sqlstate 2BP01
+expect error {}
