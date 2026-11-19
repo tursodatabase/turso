@@ -779,3 +779,12 @@ test('atomic batch attaches a rollback failure to the primary error', async () =
     expect(error.rollbackError).toBeInstanceOf(Error);
     expect(error.rollbackError.message).toBe("rollback failed");
 })
+
+test('a whole number binds as INTEGER only inside the int64 range', async () => {
+    const db = await connect(":memory:");
+    const stmt = await db.prepare("SELECT typeof(?1) AS type, ?1 > 9223372036854775807 AS above_max");
+    expect(await stmt.get(2 ** 63)).toEqual({ type: "real", above_max: 1 });
+    expect(await stmt.get(2 ** 64)).toEqual({ type: "real", above_max: 1 });
+    expect(await stmt.get(2 ** 63 - 1024)).toEqual({ type: "integer", above_max: 0 });
+    expect(await stmt.get(-(2 ** 63))).toEqual({ type: "integer", above_max: 0 });
+})

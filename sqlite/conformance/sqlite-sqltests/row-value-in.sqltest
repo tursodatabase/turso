@@ -288,3 +288,17 @@ test row-value-null-in-both-lhs-rhs-in {
 expect {
     1
 }
+# The left row is checked for NULLs only after all of its columns are loaded:
+# (NULL, 1) differs from (1, 2) in its second column, so it is not in the set.
+test row-value-null-column-in-subquery {
+    CREATE TABLE nulls(a INT, b INT);
+    INSERT INTO nulls VALUES (NULL, 1), (1, NULL), (1, 2);
+    SELECT a, b, (a, b) IN (SELECT 1, 2), (a, b) NOT IN (SELECT 1, 2) FROM nulls;
+    SELECT count(*) FROM nulls WHERE (a, b) NOT IN (SELECT 1, 2);
+}
+expect {
+    |1|0|1
+    1|||
+    1|2|1|0
+    1
+}

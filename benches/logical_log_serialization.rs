@@ -1,5 +1,6 @@
-use divan::{black_box, AllocProfiler, Bencher};
+use divan::{black_box, AllocProfiler};
 use mimalloc::MiMalloc;
+use turso_benches::Bencher;
 use turso_core::mvcc::database::{MVTableId, Row, RowID, RowKey, RowVersion, TxTimestampOrID};
 use turso_core::mvcc::persistent_storage::logical_log::benchmark_serialize_op_entry;
 

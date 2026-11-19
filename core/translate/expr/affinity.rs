@@ -85,6 +85,7 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
                 ast::SubqueryType::RowValue {
                     result_reg_start,
                     num_regs: 1,
+                    ..
                 },
             ..
         } => metadata

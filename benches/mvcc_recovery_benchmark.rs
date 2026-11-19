@@ -13,7 +13,7 @@ use codspeed_criterion_compat::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
 
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SessionRole};
 
 /// A prepared, file-backed MVCC database whose logical log holds the frames to
 /// be replayed.
@@ -58,7 +58,9 @@ fn build_mvcc_db_with_log(populate: impl FnOnce(&Arc<turso_core::Connection>)) -
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
         .unwrap();

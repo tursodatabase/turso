@@ -177,13 +177,25 @@ pub const fn is_identifier_start(b: u8) -> bool {
 
 #[inline(always)]
 pub const fn is_identifier_continue(b: u8) -> bool {
-    b == b'$'
-        || b.is_ascii_digit()
-        || b.is_ascii_uppercase()
-        || b == b'_'
-        || b.is_ascii_lowercase()
-        || b > b'\x7F'
+    IDENTIFIER_CONTINUE[b as usize]
 }
+
+/// For each byte, whether it can continue an identifier.
+const IDENTIFIER_CONTINUE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let b = i as u8;
+        table[i] = b == b'$'
+            || b.is_ascii_digit()
+            || b.is_ascii_uppercase()
+            || b == b'_'
+            || b.is_ascii_lowercase()
+            || b > b'\x7F';
+        i += 1;
+    }
+    table
+};
 
 #[derive(Clone, PartialEq, Eq, Debug)] // do not derive Copy for Token, just use .clone() when needed
 pub struct Token<'a> {
@@ -384,19 +396,8 @@ impl<'a> Lexer<'a> {
     where
         F: Fn(u8) -> bool,
     {
-        loop {
-            if let Some(b) = self.peek() {
-                if !f(b) {
-                    cold();
-                    return;
-                }
-            } else {
-                cold();
-                return;
-            }
-
-            self.eat();
-        }
+        let rest = &self.input[self.offset..];
+        self.offset += rest.iter().position(|&b| !f(b)).unwrap_or(rest.len());
     }
 
     fn eat_while_number_digit(&mut self) -> Result<()> {
@@ -986,6 +987,19 @@ impl<'a> Lexer<'a> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn identifier_continue_table_follows_the_identifier_rule() {
+        for b in 0..=u8::MAX {
+            let expected = b == b'$'
+                || b.is_ascii_digit()
+                || b.is_ascii_uppercase()
+                || b == b'_'
+                || b.is_ascii_lowercase()
+                || b > b'\x7F';
+            assert_eq!(is_identifier_continue(b), expected, "byte {b}");
+        }
+    }
 
     #[test]
     fn test_lexer_one_tok() {

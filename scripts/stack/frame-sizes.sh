@@ -72,10 +72,14 @@ frame_sizes() {
       }
       return v
     }
+    # The number after the first match of prefix, e.g. 0x88 in "sub $0x88,%rsp".
+    # It is read from the end of the match: prefix is a regex, so its length
+    # is not always the length of the text it matches ("\\$" matches "$").
     function imm(line, prefix,   m) {
       if (!match(line, prefix "(0x[0-9a-fA-F]+|[0-9]+)")) return 0
-      m = substr(line, RSTART + length(prefix), RLENGTH - length(prefix))
-      return num(m)
+      m = substr(line, RSTART, RLENGTH)
+      match(m, /(0x[0-9a-fA-F]+|[0-9]+)$/)
+      return num(substr(m, RSTART, RLENGTH))
     }
     function shifted(line, v) {
       return line ~ /lsl #12/ ? v * 4096 : v
@@ -103,16 +107,18 @@ frame_sizes() {
       if (line ~ /mov[ \t]+sp, x9/) { total += probe; in_probe_loop = 0; next }
       # aarch64: sub sp, sp, #0x1, lsl #12
       if (line ~ /sub[ \t]+sp, sp, #/) { if (!in_probe_loop) total += shifted(line, imm(line, "#")); next }
+      # x86_64 operands have a space after the comma in llvm-objdump output
+      # ("subq $0x88, %rsp"), and no space in GNU objdump output.
       # x86_64: push %rbp
       if (line ~ /push[q]?[ \t]+%r/) { total += 8; next }
       # x86_64: probe loop, e.g. mov %rsp,%r11 / sub $0x10000,%r11
-      if (line ~ /sub[q]?[ \t]+\$[0-9a-fx]+,%r11/) { probe = imm(line, "\\$"); in_probe_loop = 1; next }
-      if (line ~ /cmp[q]?[ \t]+%r11,%rsp/) { total += probe; in_probe_loop = 0; next }
+      if (line ~ /sub[q]?[ \t]+\$[0-9a-fx]+, ?%r11/) { probe = imm(line, "\\$"); in_probe_loop = 1; next }
+      if (line ~ /cmp[q]?[ \t]+%r11, ?%rsp/) { total += probe; in_probe_loop = 0; next }
       # x86_64: probe function call, e.g. mov $0x2000,%eax / call __rust_probestack / sub %rax,%rsp
-      if (line ~ /mov[l]?[ \t]+\$[0-9a-fx]+,%eax/) { probe_call_size = imm(line, "\\$"); next }
-      if (line ~ /sub[q]?[ \t]+%rax,%rsp/) { total += probe_call_size; next }
+      if (line ~ /mov[l]?[ \t]+\$[0-9a-fx]+, ?%eax/) { probe_call_size = imm(line, "\\$"); next }
+      if (line ~ /sub[q]?[ \t]+%rax, ?%rsp/) { total += probe_call_size; next }
       # x86_64: sub $0x88,%rsp
-      if (line ~ /sub[q]?[ \t]+\$[0-9a-fx]+,%rsp/) { if (!in_probe_loop) total += imm(line, "\\$"); next }
+      if (line ~ /sub[q]?[ \t]+\$[0-9a-fx]+, ?%rsp/) { if (!in_probe_loop) total += imm(line, "\\$"); next }
     }
     END { flush() }
   ' | awk -F'\t' '$1 > 0' | demangle_rust | largest_per_name

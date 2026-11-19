@@ -577,8 +577,12 @@ impl TryFrom<Vec<u8>> for Time {
             | (value[10] as u32) << 16
             | (value[9] as u32) << 24;
 
+        let seconds = seconds
+            .checked_sub(3600 * 24 * DAYS_BEFORE_EPOCH)
+            .ok_or(TimeError::InvalidFormat)?;
+
         Ok(Self {
-            inner: DateTime::from_timestamp(seconds - (3600 * 24 * DAYS_BEFORE_EPOCH), nanoseconds)
+            inner: DateTime::from_timestamp(seconds, nanoseconds)
                 .ok_or(TimeError::InvalidFormat)?
                 .to_utc(),
         })

@@ -40,6 +40,9 @@ pub struct TursoDatabaseSyncConfig {
     /// `None` => single-request bootstrap. No-op when partial-sync uses the
     /// query bootstrap strategy.
     pub pull_bytes_threshold: Option<usize>,
+    /// Maximum number of bootstrap chunk requests in flight when
+    /// `pull_bytes_threshold` splits the bootstrap. `None` => 1.
+    pub pull_parallel_requests: Option<usize>,
     /// Sync-protocol override for incremental V1 pulls. `None` (default)
     /// auto-detects the remote protocol from the first pull-updates response
     /// and persists it in the sync metadata; `Some(true)` forces MVCC
@@ -126,6 +129,7 @@ impl TursoDatabaseSyncConfig {
             } else {
                 Some(config.pull_bytes_threshold)
             },
+            pull_parallel_requests: None,
             // The C ABI has no tri-state: `true` forces MVCC logical pulls,
             // `false` means auto-detect (which behaves identically to page
             // pulls against page-protocol remotes).
@@ -274,6 +278,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                 .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
+            pull_parallel_requests: sync_config.pull_parallel_requests,
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
@@ -635,6 +640,7 @@ mod tests {
                 remote_encryption_key: None,
                 push_operations_threshold: None,
                 pull_bytes_threshold: None,
+                pull_parallel_requests: None,
                 logical_mvcc_pull: None,
             },
         )

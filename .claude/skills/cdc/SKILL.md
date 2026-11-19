@@ -251,10 +251,10 @@ This ensures multi-row statements like `INSERT INTO t VALUES (1),(2),(3)` produc
 - **Per-row:** `emit_cdc_insns()` for all three cases: pure insert, update after conflict, replace
 - No end-of-statement COMMIT — upsert shares INSERT's epilogue
 
-### Schema Changes (DDL) — `core/translate/schema.rs`
+### Schema Changes (DDL) — `core/translate/schema/mod.rs`
 - **CREATE TABLE:** `emit_cdc_insns()` (insert into `sqlite_schema`) + `emit_cdc_autocommit_commit()`
 - **DROP TABLE:** `emit_cdc_insns()` per-row in metadata loop + `emit_cdc_autocommit_commit()` after loop
-- **CREATE INDEX:** `emit_cdc_insns()` + `emit_cdc_autocommit_commit()` (`core/translate/schema.rs`)
+- **CREATE INDEX:** `emit_cdc_insns()` + `emit_cdc_autocommit_commit()` (`core/translate/schema/mod.rs`)
 - **DROP INDEX:** `emit_cdc_insns()` per-row + `emit_cdc_autocommit_commit()` after loop (`core/translate/index.rs`)
 
 DDL in explicit transactions (`BEGIN; CREATE TABLE t(x); COMMIT`) does NOT emit per-statement COMMIT — the autocommit check prevents it.

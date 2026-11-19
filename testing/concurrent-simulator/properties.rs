@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail};
 use turso_core::{LimboError, Value};
 
 use crate::elle::{ElleEventType, ElleOp};
-use crate::operations::{OpResult, Operation};
+use crate::operations::{OpResult, Operation, TxMode};
 use crate::{AUTOINC_TABLE_NAME, PersistedSequenceState, SequenceParams};
 
 /// A property that can be validated during simulation.
@@ -947,7 +947,8 @@ pub struct SequenceCorrectnessProperty {
     ///     the engine's disk state will reflect exactly V (plus any
     ///     subsequent nextval advances from V).
     ///
-    /// Rolled-back nextval/setval values are deliberately NOT included.
+    /// Rolled-back nextval/setval values are deliberately NOT included,
+    /// except nextval values from BEGIN CONCURRENT (see `concurrent_txns`).
     /// The engine bundles the sequence backing-table write with the user's
     /// tx (see core/schema.rs Sequence design block for the rationale), so
     /// a rolled-back op is reverted from disk and may legitimately be
@@ -1064,6 +1065,11 @@ pub struct SequenceCorrectnessProperty {
     /// scoped to fresh emissions because CYCLE re-emission is allowed
     /// and `all_values` is wrap-aware.
     seqs_with_seq_default_ever: HashSet<String>,
+    /// Transactions opened with BEGIN CONCURRENT. Under MVCC, nextval inside
+    /// such a transaction writes the sequence in its own inner transaction
+    /// that commits before nextval returns, so the value stays used even if
+    /// the outer transaction rolls back (see `create-sequence.mdx`).
+    concurrent_txns: HashSet<u64>,
 }
 
 impl Default for SequenceCorrectnessProperty {
@@ -1117,6 +1123,7 @@ impl SequenceCorrectnessProperty {
             seqs_with_seq_default_ever: HashSet::new(),
             pending_setval_re_emission: HashMap::new(),
             seq_default_tables: HashMap::new(),
+            concurrent_txns: HashSet::new(),
         }
     }
 
@@ -1329,6 +1336,13 @@ impl Property for SequenceCorrectnessProperty {
         };
 
         match op {
+            Operation::Begin {
+                mode: TxMode::Concurrent,
+            } => {
+                if let Some(txn_id) = txn_id {
+                    self.concurrent_txns.insert(txn_id);
+                }
+            }
             Operation::CreateSequence {
                 seq_name,
                 start,
@@ -1464,6 +1478,11 @@ impl Property for SequenceCorrectnessProperty {
                 let Some(params) = self.params.get(seq_name) else {
                     return Ok(());
                 };
+                // Outside a transaction and inside BEGIN CONCURRENT, the
+                // value is committed before nextval returns. Inside other
+                // transactions it is committed only by COMMIT.
+                let committed_at_emit =
+                    txn_id.is_none_or(|txn_id| self.concurrent_txns.contains(&txn_id));
 
                 if value < params.min_value || value > params.max_value {
                     bail!(
@@ -1516,8 +1535,8 @@ impl Property for SequenceCorrectnessProperty {
                     setval_overlapped || any_pending_setval || in_flight_setval_overlapped;
 
                 // Duplicate-value check: only run against the committed
-                // emission set when this nextval is autocommitted. Values
-                // emitted inside an explicit transaction sit in
+                // emission set when this nextval's value is already
+                // committed. Values emitted inside other transactions sit in
                 // `pending_txn_values` until that transaction commits;
                 // they are checked against `all_values` at Commit time
                 // (see `Operation::Commit` branch). Two concurrent
@@ -1528,7 +1547,7 @@ impl Property for SequenceCorrectnessProperty {
                 // Flagging the second emission at observation time
                 // misreports a transient state that the engine will
                 // resolve correctly.
-                if txn_id.is_none() {
+                if committed_at_emit {
                     // The pending re-emission allowance: a setval that
                     // touched this seq recorded one or more target
                     // values the next observed nextvals may emit
@@ -1683,7 +1702,7 @@ impl Property for SequenceCorrectnessProperty {
                 // so post-setval duplicates still fire there.
                 let skip_monotonicity = self.seqs_with_setval_ever.contains(seq_name)
                     || self.seqs_with_seq_default_ever.contains(seq_name);
-                if txn_id.is_none() && !setval_could_have_raced && !skip_monotonicity {
+                if committed_at_emit && !setval_could_have_raced && !skip_monotonicity {
                     if let Some(&(wm, wm_eid)) = self.watermark.get(seq_name) {
                         if wm_eid < start_exec_id && !is_cycle_wrap(params, value, wm) {
                             if params.increment > 0 && value <= wm {
@@ -1707,8 +1726,8 @@ impl Property for SequenceCorrectnessProperty {
                         }
                     }
                 }
-                // Only autocommit emissions update the cross-fiber
-                // watermark immediately. In-tx emissions defer their
+                // Only already-committed emissions update the cross-fiber
+                // watermark immediately. Other in-tx emissions defer their
                 // watermark update to the Operation::Commit branch —
                 // until that point we cannot tell whether the emission
                 // will actually survive (it may be aborted by an MVCC
@@ -1716,7 +1735,7 @@ impl Property for SequenceCorrectnessProperty {
                 // and polluting the shared watermark with a possibly-
                 // dead emission causes spurious wrong-direction failures
                 // in the OTHER racing tx.
-                if txn_id.is_none() {
+                if committed_at_emit {
                     self.watermark
                         .insert(seq_name.clone(), (value, end_exec_id));
                 }
@@ -1752,18 +1771,21 @@ impl Property for SequenceCorrectnessProperty {
                     .in_flight_nextval_baselines
                     .remove(&(fiber_id, seq_name.clone()))
                     .unwrap_or_else(|| self.committed_watermark.get(seq_name).copied());
-                if let Some(txn_id) = txn_id {
-                    // Defer committed_watermark update until COMMIT — see
-                    // the field doc on committed_watermark for why we never
-                    // promote rolled-back values.
-                    self.pending_txn_values.entry(txn_id).or_default().push((
-                        seq_name.clone(),
-                        value,
-                        baseline,
-                    ));
-                } else {
-                    // Autocommit succeeded — value is durable on disk.
-                    self.promote_committed(seq_name, value);
+                match txn_id {
+                    Some(txn_id) if !committed_at_emit => {
+                        // Defer committed_watermark update until COMMIT — see
+                        // the field doc on committed_watermark for why we never
+                        // promote rolled-back values.
+                        self.pending_txn_values.entry(txn_id).or_default().push((
+                            seq_name.clone(),
+                            value,
+                            baseline,
+                        ));
+                    }
+                    _ => {
+                        // The value is already committed and durable on disk.
+                        self.promote_committed(seq_name, value);
+                    }
                 }
             }
             Operation::CreateTableWithSeqDefault {
@@ -1789,6 +1811,7 @@ impl Property for SequenceCorrectnessProperty {
             }
             Operation::Rollback => {
                 if let Some(txn_id) = txn_id {
+                    self.concurrent_txns.remove(&txn_id);
                     // Pending values were never promoted into `all_values`
                     // (the duplicate check is deferred to Commit). Just
                     // drop them from the pending map; nothing else to undo.
@@ -1805,6 +1828,7 @@ impl Property for SequenceCorrectnessProperty {
             }
             Operation::Commit => {
                 if let Some(txn_id) = txn_id {
+                    self.concurrent_txns.remove(&txn_id);
                     // Promote each nextval value made in this tx into
                     // committed_watermark — they're now durable on disk.
                     // Deferred duplicate check: only at commit time can we
@@ -1955,6 +1979,7 @@ impl Property for SequenceCorrectnessProperty {
 
     fn abort_fiber(&mut self, fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
         if let Some(txn_id) = txn_id {
+            self.concurrent_txns.remove(&txn_id);
             // Pending values were never promoted into `all_values` (the
             // duplicate check is deferred to Commit). Just drop them.
             self.pending_txn_values.remove(&txn_id);
@@ -1995,6 +2020,7 @@ impl Property for SequenceCorrectnessProperty {
         // Drop any nextval values left in pending_txn_values — they were
         // emitted by txs that never committed before the restart.
         self.pending_txn_values.clear();
+        self.concurrent_txns.clear();
         self.fiber_last_nextval.clear();
         self.last_setval_exec_id.clear();
         self.pending_setval_watermarks.clear();
@@ -2315,6 +2341,98 @@ mod tests {
             ElleEventType::Invoke
         ));
         assert!(matches!(recorder.events[1].event_type, ElleEventType::Info));
+    }
+
+    #[test]
+    fn sequence_values_from_rolled_back_concurrent_tx_stay_used() {
+        // MAXVALUE 16 with INCREMENT 5 allows 1, 6, 11, 16 before wrapping.
+        let mut tester = SequenceTester::new(16);
+        for value in [1, 6, 11] {
+            tester.nextval(None, value).unwrap();
+        }
+        tester.begin(TxMode::Concurrent, 1);
+        // Wraps from 16 back to 1 inside the transaction.
+        tester.nextval(Some(1), 16).unwrap();
+        tester.nextval(Some(1), 1).unwrap();
+        tester.rollback(1);
+        // The values above stay used, so the next value continues after the
+        // wrap and is lower than 11.
+        tester.nextval(None, 6).unwrap();
+    }
+
+    #[test]
+    fn sequence_values_from_rolled_back_immediate_tx_can_be_reused() {
+        let mut tester = SequenceTester::new(76);
+        tester.begin(TxMode::Immediate, 1);
+        tester.nextval(Some(1), 1).unwrap();
+        tester.nextval(Some(1), 6).unwrap();
+        tester.rollback(1);
+        tester.nextval(None, 1).unwrap();
+        tester.nextval(None, 6).unwrap();
+        assert!(tester.nextval(None, 6).is_err());
+    }
+
+    /// Feeds operations on the sequence `s` (START 1, INCREMENT 5, CYCLE)
+    /// to a `SequenceCorrectnessProperty`, all on fiber 0.
+    struct SequenceTester {
+        property: SequenceCorrectnessProperty,
+        exec_id: u64,
+    }
+
+    impl SequenceTester {
+        fn new(max_value: i64) -> Self {
+            let mut tester = Self {
+                property: SequenceCorrectnessProperty::new(),
+                exec_id: 0,
+            };
+            tester
+                .run(
+                    None,
+                    Operation::CreateSequence {
+                        seq_name: "s".to_string(),
+                        start: 1,
+                        increment: 5,
+                        min_value: 1,
+                        max_value,
+                        cycle: true,
+                    },
+                    vec![],
+                )
+                .unwrap();
+            tester
+        }
+
+        fn begin(&mut self, mode: TxMode, txn_id: u64) {
+            self.run(Some(txn_id), Operation::Begin { mode }, vec![])
+                .unwrap();
+        }
+
+        fn rollback(&mut self, txn_id: u64) {
+            self.run(Some(txn_id), Operation::Rollback, vec![]).unwrap();
+        }
+
+        fn nextval(&mut self, txn_id: Option<u64>, value: i64) -> anyhow::Result<()> {
+            self.run(
+                txn_id,
+                Operation::NextVal {
+                    seq_name: "s".to_string(),
+                },
+                vec![vec![Value::from_i64(value)]],
+            )
+        }
+
+        fn run(
+            &mut self,
+            txn_id: Option<u64>,
+            op: Operation,
+            rows: Vec<Vec<Value>>,
+        ) -> anyhow::Result<()> {
+            self.exec_id += 1;
+            let exec_id = self.exec_id;
+            self.property.init_op(0, 0, txn_id, exec_id, &op)?;
+            self.property
+                .finish_op(0, 0, txn_id, exec_id, exec_id, &op, &Ok(rows))
+        }
     }
 }
 

@@ -820,7 +820,7 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
         }
     }
 
-    let mut digits = u64::from(d).to_string().into_bytes();
+    let mut digits = decimal_digits(u64::from(d));
     let mut decimal_pos = digits.len() as i32 + exp;
 
     'out: {
@@ -854,6 +854,16 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
     }
 }
 
+/// The decimal digits of `n` as ASCII bytes, with no leading zeros.
+fn decimal_digits(n: u64) -> Vec<u8> {
+    let mut buf = [0u8; 20];
+    let written = write_decimal_digits(&mut buf, n);
+    // One more byte for the carry digit of a rounding.
+    let mut digits = Vec::with_capacity(written.len() + 1);
+    digits.extend_from_slice(written);
+    digits
+}
+
 fn format_float_scientific(v: f64, precision: usize) -> String {
     match decompose_float(v, precision) {
         FloatParts::Special(s) => s,
@@ -861,23 +871,7 @@ fn format_float_scientific(v: f64, precision: usize) -> String {
             negative,
             digits,
             exp,
-        } => {
-            let first = digits.first().cloned().unwrap_or(b'0') as char;
-            let rest = digits
-                .get(1..)
-                .filter(|v| !v.is_empty())
-                .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0");
-            format!(
-                "{}{}.{}e{}{:0width$}",
-                if negative { "-" } else { "" },
-                first,
-                rest,
-                if exp >= 0 { "+" } else { "-" },
-                exp.abs(),
-                width = if exp.abs() > 99 { 3 } else { 2 }
-            )
-        }
+        } => format_scientific(negative, &digits, exp),
     }
 }
 
@@ -889,33 +883,113 @@ pub fn format_float(v: f64) -> String {
             digits,
             exp,
         } => {
-            let decimal_pos = exp + 1;
             if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
+                format_decimal(negative, &digits, exp)
             } else {
-                format_float_scientific(v, 15)
+                format_scientific(negative, &digits, exp)
             }
         }
     }
+}
+
+/// Format `0.d1d2d3... * 10^(exp + 1)`, where `digits` are d1, d2, d3 and so
+/// on, as `[-]i.f`. Both `i` and `f` have at least one digit.
+fn format_decimal(negative: bool, digits: &[u8], exp: i32) -> String {
+    let decimal_pos = exp + 1;
+    let mut out = String::with_capacity(digits.len() + 24);
+    if negative {
+        out.push('-');
+    }
+    if decimal_pos > 0 {
+        let int_len = (decimal_pos as usize).min(digits.len());
+        push_ascii_digits(&mut out, &digits[..int_len]);
+        for _ in int_len..decimal_pos as usize {
+            out.push('0');
+        }
+    } else {
+        out.push('0');
+    }
+    out.push('.');
+    for _ in 0..decimal_pos.min(0).unsigned_abs() {
+        out.push('0');
+    }
+    match digits.get(decimal_pos.max(0) as usize..) {
+        Some(frac) if !frac.is_empty() => push_ascii_digits(&mut out, frac),
+        _ => out.push('0'),
+    }
+    out
+}
+
+/// Format the same value as [format_decimal] as `[-]d.ddde[+-]xx`. The
+/// exponent has at least two digits, and three when it is more than 99.
+fn format_scientific(negative: bool, digits: &[u8], exp: i32) -> String {
+    let mut out = String::with_capacity(digits.len() + 10);
+    if negative {
+        out.push('-');
+    }
+    out.push(digits.first().copied().unwrap_or(b'0') as char);
+    out.push('.');
+    match digits.get(1..) {
+        Some(rest) if !rest.is_empty() => push_ascii_digits(&mut out, rest),
+        _ => out.push('0'),
+    }
+    out.push('e');
+    out.push(if exp >= 0 { '+' } else { '-' });
+    let mut buf = [0u8; 20];
+    let exp_digits = write_decimal_digits(&mut buf, u64::from(exp.unsigned_abs()));
+    let width = if exp.unsigned_abs() > 99 { 3 } else { 2 };
+    for _ in exp_digits.len()..width {
+        out.push('0');
+    }
+    push_ascii_digits(&mut out, exp_digits);
+    out
+}
+
+fn push_ascii_digits(out: &mut String, digits: &[u8]) {
+    // SAFETY: `digits` holds only the ASCII bytes b'0'..=b'9'.
+    out.push_str(unsafe { str::from_utf8_unchecked(digits) });
+}
+
+/// The decimal text of an `i64`, the same text as `i64::to_string()`, in a
+/// stack buffer.
+pub(crate) struct IntegerText {
+    buf: [u8; 20],
+    start: usize,
+}
+
+impl IntegerText {
+    pub(crate) fn new(value: i64) -> Self {
+        let mut buf = [0u8; 20];
+        let digits = write_decimal_digits(&mut buf, value.unsigned_abs()).len();
+        let mut start = buf.len() - digits;
+        if value < 0 {
+            start -= 1;
+            buf[start] = b'-';
+        }
+        Self { buf, start }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: the text is ASCII digits, after a minus sign when negative.
+        unsafe { str::from_utf8_unchecked(&self.buf[self.start..]) }
+    }
+}
+
+/// Write the decimal digits of `n` at the end of `buf`, and return them.
+// Without inline(always), the date and time functions in another module
+// call this function, and the call costs more than the loop.
+#[inline(always)]
+pub(crate) fn write_decimal_digits(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    &buf[start..]
 }
 
 pub fn format_float_for_quote(v: f64) -> String {
@@ -945,6 +1019,22 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn integer_text_matches_to_string() {
+    for value in (-100_000i64..100_000).chain([
+        i64::MIN,
+        i64::MIN + 1,
+        i64::MAX,
+        i64::MAX - 1,
+        i64::from(i32::MIN),
+        i64::from(u32::MAX),
+        10_i64.pow(18),
+        -(10_i64.pow(18)),
+    ]) {
+        assert_eq!(IntegerText::new(value).as_str(), value.to_string());
+    }
 }
 
 #[test]

@@ -23,7 +23,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use differential_fuzzer::memory::MemorySimIO;
-use turso_core::{ConnectOpts, Database};
+use turso_core::{ConnectOpts, Database, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 // ---------------------------------------------------------------------------
@@ -4023,7 +4023,7 @@ fn main() -> Result<()> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = turso_db.connect(ConnectOpts::new())?;
+    let conn = turso_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
     let panic_context: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut executed_sql: Vec<String> = Vec::new();
