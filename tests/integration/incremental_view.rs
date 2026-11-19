@@ -1,5 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::security::roles::SessionRole;
 use turso_core::storage::CursorTrait;
+use turso_core::storage::{BTreeWriteYieldPoint, BTREE_WRITE_YIELD_FAMILY};
 use turso_core::sync::Arc;
 use turso_core::types::{IOResultOr, SeekKey, SeekOp, SeekResult};
 use turso_core::ConnectOpts;
@@ -1559,4 +1563,98 @@ fn test_rewind_after_failed_seek() -> Result<()> {
     assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
     Ok(())
+}
+
+#[test]
+fn maintenance_insert_resumes_after_overflow_cell_yield() {
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "ivm-maintenance-overflow-yield.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_views(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
+        .unwrap();
+    for id in 1..260 {
+        conn.execute(format!(
+            "INSERT INTO overflow_base VALUES ({id}, zeroblob(3600))"
+        ))
+        .unwrap();
+    }
+    conn.execute("CREATE MATERIALIZED VIEW overflow_view AS SELECT id, payload FROM overflow_base")
+        .unwrap();
+
+    let view_root_page = {
+        let mut query = conn
+            .prepare("SELECT rootpage FROM sqlite_schema WHERE name = 'overflow_view'")
+            .unwrap();
+        assert!(matches!(query.step().unwrap(), StepResult::Row));
+        query.row().unwrap().get::<i64>(0).unwrap()
+    };
+    let injector = OneShotYieldInjector::new(
+        BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+        BTREE_WRITE_YIELD_FAMILY ^ view_root_page as u64,
+    );
+    conn.set_yield_injector(Some(injector.clone()));
+
+    let mut stmt = conn
+        .prepare("INSERT INTO overflow_base VALUES (926, zeroblob(7200))")
+        .unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+    assert!(injector.fired(), "targeted view B-tree yield did not fire");
+    assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+    drop(stmt);
+    conn.set_yield_injector(None);
+
+    let mut query = conn
+        .prepare("SELECT count(*), max(length(payload)) FROM overflow_view WHERE id = 926")
+        .unwrap();
+    assert!(matches!(query.step().unwrap(), StepResult::Row));
+    let row = query.row().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert_eq!(row.get::<i64>(1).unwrap(), 7200);
+    drop(query);
+
+    let mut integrity = conn.prepare("PRAGMA integrity_check").unwrap();
+    assert!(matches!(integrity.step().unwrap(), StepResult::Row));
+    assert_eq!(integrity.row().unwrap().get::<String>(0).unwrap(), "ok");
+}
+
+/// Fires the requested yield point exactly once, for the btree whose write
+/// selection key matches.
+#[derive(Debug)]
+struct OneShotYieldInjector {
+    point: YieldPoint,
+    selection_key: u64,
+    fired: AtomicBool,
+}
+
+impl OneShotYieldInjector {
+    fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            selection_key,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl YieldInjector for OneShotYieldInjector {
+    fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+        point == self.point
+            && selection_key == self.selection_key
+            && !self.fired.swap(true, Ordering::AcqRel)
+    }
 }
