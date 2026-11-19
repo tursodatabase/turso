@@ -1824,72 +1824,38 @@ const LIKE_INFO: PatternInfo = PatternInfo {
 /// `%` any run of bytes, letters compare without case. Same answers as
 /// `pattern_compare` with `LIKE_INFO` for every ASCII input (see the tests).
 fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
-    wildcard_ascii::<b'%', b'_', true>(pattern, text)
+    wildcard_ascii::<b'%', b'_', true, false>(pattern, text, 0)
 }
 
 /// LIKE over ASCII bytes with the escape character `escape`, which is not `%`
-/// or `_`. The escape makes the next pattern byte a literal, which compares
-/// without case as the other letters do, and a pattern that ends with the
-/// escape matches nothing. Same answers as `pattern_compare` with `LIKE_INFO`
-/// for every ASCII input (see the tests). Out of line, so that the usual
-/// matcher without an escape character stays small.
+/// or `_`. Same answers as `pattern_compare` with `LIKE_INFO` for every ASCII
+/// input (see the tests). Out of line, so that the usual matcher without an
+/// escape character stays small.
 #[inline(never)]
 fn like_ascii_escaped(pattern: &[u8], text: &[u8], escape: u8) -> bool {
-    let (mut p, mut t) = (0, 0);
-    let mut backtrack: Option<(usize, usize)> = None;
-    while t < text.len() {
-        let matched = match pattern.get(p) {
-            Some(b'%') => {
-                backtrack = Some((p, t));
-                p += 1;
-                continue;
-            }
-            Some(&c) if c == escape => match pattern.get(p + 1) {
-                Some(literal) if literal.eq_ignore_ascii_case(&text[t]) => {
-                    p += 2;
-                    true
-                }
-                Some(_) => false,
-                None => return false,
-            },
-            Some(&c) if c == b'_' || c.eq_ignore_ascii_case(&text[t]) => {
-                p += 1;
-                true
-            }
-            _ => false,
-        };
-        if matched {
-            t += 1;
-            continue;
-        }
-        match backtrack {
-            Some((star_p, star_t)) => {
-                p = star_p + 1;
-                t = star_t + 1;
-                backtrack = Some((star_p, t));
-            }
-            None => return false,
-        }
-    }
-    pattern[p..].iter().all(|&c| c == b'%')
+    wildcard_ascii::<b'%', b'_', true, true>(pattern, text, escape)
 }
 
 /// GLOB without a set over ASCII bytes: `?` matches one byte, `*` any run of
 /// bytes, letters compare with case. Same answers as `pattern_compare` with
 /// `GLOB_INFO` for every ASCII input (see the tests).
 fn glob_ascii(pattern: &[u8], text: &[u8]) -> bool {
-    wildcard_ascii::<b'*', b'?', false>(pattern, text)
+    wildcard_ascii::<b'*', b'?', false, false>(pattern, text, 0)
 }
 
 /// Match ASCII bytes with a pattern in which `ANY` matches any run of bytes
 /// and `ONE` matches one byte. With `NO_CASE`, letters compare without case.
-/// The last `ANY` seen is the only backtrack point, as in the classic
+/// With `HAS_ESCAPE`, the byte `escape`, which is not `ANY` or `ONE`, makes
+/// the next pattern byte a literal, and a pattern that ends with it matches
+/// nothing. The last `ANY` seen is the only backtrack point, as in the classic
 /// wildcard match: when the bytes after it stop matching, the run it covers
 /// grows by one and the match resumes after it.
-fn wildcard_ascii<const ANY: u8, const ONE: u8, const NO_CASE: bool>(
+fn wildcard_ascii<const ANY: u8, const ONE: u8, const NO_CASE: bool, const HAS_ESCAPE: bool>(
     pattern: &[u8],
     text: &[u8],
+    escape: u8,
 ) -> bool {
+    let same = |p: u8, t: u8| p == t || (NO_CASE && p.eq_ignore_ascii_case(&t));
     let (mut p, mut t) = (0, 0);
     let mut backtrack: Option<(usize, usize)> = None;
     while t < text.len() {
@@ -1898,10 +1864,16 @@ fn wildcard_ascii<const ANY: u8, const ONE: u8, const NO_CASE: bool>(
                 backtrack = Some((p, t));
                 p += 1;
             }
+            Some(&c) if HAS_ESCAPE && c == escape && p + 1 == pattern.len() => return false,
+            Some(&c) if HAS_ESCAPE && c == escape && same(pattern[p + 1], text[t]) => {
+                p += 2;
+                t += 1;
+            }
             // The equal-bytes test comes first: most pattern bytes match the
             // text exactly, and folding both sides costs four times as much.
             Some(&c)
-                if c == text[t] || c == ONE || (NO_CASE && c.eq_ignore_ascii_case(&text[t])) =>
+                if !(HAS_ESCAPE && c == escape)
+                    && (c == text[t] || c == ONE || same(c, text[t])) =>
             {
                 p += 1;
                 t += 1;
