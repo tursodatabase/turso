@@ -1,4 +1,4 @@
-use crate::{types::AsValueRef, Value, ValueRef};
+use crate::{turso_debug_assert, types::AsValueRef, Value, ValueRef};
 
 pub mod decimal;
 pub mod nonnan;
@@ -587,14 +587,28 @@ impl From<StrToF64> for f64 {
 }
 
 pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
-    let mut input = input
+    // Every character that the parser looks for is ASCII, so it reads bytes.
+    // A byte of a character that is not ASCII matches nothing, as the
+    // character does, so the parser stops at the same place.
+    let input = input
         .as_ref()
         .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB)
-        .chars()
-        .peekable();
+        .as_bytes();
+    let digit_at = |pos: usize| match input.get(pos) {
+        Some(&byte @ b'0'..=b'9') => Some(byte - b'0'),
+        _ => None,
+    };
+    let mut pos = 0;
 
-    let sign = match input.next_if(|ch| matches!(ch, '-' | '+')) {
-        Some('-') => -1.0,
+    let sign = match input.first() {
+        Some(b'-') => {
+            pos += 1;
+            -1.0
+        }
+        Some(b'+') => {
+            pos += 1;
+            1.0
+        }
         _ => 1.0,
     };
 
@@ -604,60 +618,72 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     let mut significant: u64 = 0;
 
     // Copy as many significant digits as we can
-    while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
+    while let Some(digit) = digit_at(pos) {
         had_digits = true;
 
         match significant
             .checked_mul(10)
-            .and_then(|v| v.checked_add(digit as u64))
+            .and_then(|v| v.checked_add(u64::from(digit)))
         {
             Some(new) => significant = new,
             None => break,
         }
 
-        input.next();
+        pos += 1;
     }
 
     let mut exponent = 0;
 
     // Increment the exponent for every non significant digit we skipped
-    while input.next_if(char::is_ascii_digit).is_some() {
-        exponent += 1
+    while digit_at(pos).is_some() {
+        exponent += 1;
+        pos += 1;
     }
 
-    if input.next_if(|ch| matches!(ch, '.')).is_some() {
+    if input.get(pos) == Some(&b'.') {
+        pos += 1;
+
         if had_digits {
             is_fractional = true;
         }
 
-        if input.peek().is_some_and(char::is_ascii_digit) {
+        if digit_at(pos).is_some() {
             is_fractional = true;
         }
 
-        while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
+        while let Some(digit) = digit_at(pos) {
             if significant < (u64::MAX - 9) / 10 {
-                significant = significant * 10 + digit as u64;
+                significant = significant * 10 + u64::from(digit);
                 exponent -= 1;
             }
 
-            input.next();
+            pos += 1;
         }
     };
 
     let mut valid_exponent = true;
 
-    if (had_digits || is_fractional) && input.next_if(|ch| matches!(ch, 'e' | 'E')).is_some() {
-        let sign = match input.next_if(|ch| matches!(ch, '-' | '+')) {
-            Some('-') => -1,
+    if (had_digits || is_fractional) && matches!(input.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        let sign = match input.get(pos) {
+            Some(b'-') => {
+                pos += 1;
+                -1
+            }
+            Some(b'+') => {
+                pos += 1;
+                1
+            }
             _ => 1,
         };
 
-        if input.peek().is_some_and(char::is_ascii_digit) {
+        if digit_at(pos).is_some() {
             is_fractional = true;
             let mut e = 0;
 
-            while let Some(ch) = input.next_if(char::is_ascii_digit) {
-                e = (e * 10 + ch.to_digit(10).unwrap() as i32).min(1000);
+            while let Some(digit) = digit_at(pos) {
+                e = (e * 10 + i32::from(digit)).min(1000);
+                pos += 1;
             }
 
             exponent += sign * e;
@@ -713,7 +739,7 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     let result = NonNan::new(f64::from(result) * sign)
         .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
 
-    if !valid_exponent || input.count() > 0 {
+    if !valid_exponent || pos < input.len() {
         if is_fractional {
             return Some(StrToF64::FractionalPrefix(result));
         } else {
@@ -770,7 +796,7 @@ enum FloatParts {
     Special(String),
     Normal {
         negative: bool,
-        digits: Vec<u8>,
+        digits: DecimalDigits,
         exp: i32,
     },
 }
@@ -820,7 +846,7 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
         }
     }
 
-    let mut digits = decimal_digits(u64::from(d));
+    let mut digits = DecimalDigits::new(u64::from(d));
     let mut decimal_pos = digits.len() as i32 + exp;
 
     'out: {
@@ -837,7 +863,7 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
                     digits[i] = b'0';
                 }
 
-                digits.insert(0, b'1');
+                digits.push_carry(b'1');
                 decimal_pos += 1;
             }
         }
@@ -854,14 +880,59 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
     }
 }
 
-/// The decimal digits of `n` as ASCII bytes, with no leading zeros.
-fn decimal_digits(n: u64) -> Vec<u8> {
-    let mut buf = [0u8; 20];
-    let written = write_decimal_digits(&mut buf, n);
-    // One more byte for the carry digit of a rounding.
-    let mut digits = Vec::with_capacity(written.len() + 1);
-    digits.extend_from_slice(written);
-    digits
+/// The decimal digits of a float as ASCII bytes, in `buf[start..end]`. A
+/// `u64` has at most 20 digits, which go after the first byte of `buf`. The
+/// first byte stays free for the carry digit of a rounding.
+struct DecimalDigits {
+    buf: [u8; 21],
+    start: usize,
+    end: usize,
+}
+
+impl DecimalDigits {
+    /// The decimal digits of `n`, with no leading zeros.
+    fn new(n: u64) -> Self {
+        let mut buf = [0u8; 21];
+        let after_carry: &mut [u8; 20] = (&mut buf[1..])
+            .try_into()
+            .expect("the buffer has 20 bytes after the carry byte");
+        let len = write_decimal_digits(after_carry, n).len();
+        Self {
+            buf,
+            start: 21 - len,
+            end: 21,
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.end = self.end.min(self.start + len);
+    }
+
+    /// Put `digit` before the other digits.
+    fn push_carry(&mut self, digit: u8) {
+        turso_debug_assert!(self.start > 0, "a rounding adds only one carry digit");
+        self.start -= 1;
+        self.buf[self.start] = digit;
+    }
+
+    fn pop(&mut self) {
+        turso_debug_assert!(self.end > self.start);
+        self.end -= 1;
+    }
+}
+
+impl std::ops::Deref for DecimalDigits {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+}
+
+impl std::ops::DerefMut for DecimalDigits {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..self.end]
+    }
 }
 
 fn format_float_scientific(v: f64, precision: usize) -> String {
@@ -1019,6 +1090,8 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+    // The rounding carries into a new leading digit.
+    assert_eq!(format_float(9.999999999999998), "10.0");
 }
 
 #[test]
@@ -1055,4 +1128,45 @@ fn test_round_half_away_from_zero_tie() {
     assert_eq!(round_half_away_from_zero_tie(2.35, 1), None);
     assert_eq!(round_half_away_from_zero_tie(1.005, 2), None);
     assert_eq!(round_half_away_from_zero_tie(5e-320, 10), None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn str_to_f64_reads_the_number_at_the_start_of_the_text() {
+        let parts = |text: &str| {
+            str_to_f64(text).map(|result| match result {
+                StrToF64::Decimal(v) => ("Decimal", f64::from(v)),
+                StrToF64::Fractional(v) => ("Fractional", f64::from(v)),
+                StrToF64::DecimalPrefix(v) => ("DecimalPrefix", f64::from(v)),
+                StrToF64::FractionalPrefix(v) => ("FractionalPrefix", f64::from(v)),
+            })
+        };
+        let cases = [
+            ("12", Some(("Decimal", 12.0))),
+            (" +12.5e+3 ", Some(("Fractional", 12500.0))),
+            ("-0.25", Some(("Fractional", -0.25))),
+            ("12.5e", Some(("FractionalPrefix", 12.5))),
+            ("12.5e+", Some(("FractionalPrefix", 12.5))),
+            ("1\u{e9}", Some(("DecimalPrefix", 1.0))),
+            ("\u{e9}1", None),
+            (".e1", None),
+            ("1.e1", Some(("Fractional", 10.0))),
+            ("0x10", Some(("DecimalPrefix", 0.0))),
+            (
+                "18446744073709551616",
+                Some(("Decimal", 1.8446744073709552e19)),
+            ),
+            ("1e400", Some(("Fractional", f64::INFINITY))),
+            ("\u{b}7\u{b}", Some(("Decimal", 7.0))),
+            ("", None),
+            ("-", None),
+            (".", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parts(text), expected, "{text:?}");
+        }
+    }
 }

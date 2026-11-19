@@ -184,26 +184,45 @@ impl Affinity {
     /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
     #[expect(clippy::self_named_constructors)]
     pub fn affinity(datatype: &str) -> Self {
-        let datatype = datatype.as_bytes();
-        let contains = |needle: &[u8]| contains_ignore_ascii_case(datatype, needle);
+        const INT: u32 = u32::from_be_bytes([0, b'I', b'N', b'T']);
+        const CHAR: u32 = u32::from_be_bytes(*b"CHAR");
+        const CLOB: u32 = u32::from_be_bytes(*b"CLOB");
+        const TEXT: u32 = u32::from_be_bytes(*b"TEXT");
+        const BLOB: u32 = u32::from_be_bytes(*b"BLOB");
+        const REAL: u32 = u32::from_be_bytes(*b"REAL");
+        const FLOA: u32 = u32::from_be_bytes(*b"FLOA");
+        const DOUB: u32 = u32::from_be_bytes(*b"DOUB");
 
-        // Rule 1: INT -> INTEGER affinity
-        if contains(b"INT") {
-            return Affinity::Integer;
+        // One pass finds all the keywords of the rules, as SQLite does: `window`
+        // holds the last four bytes in upper case.
+        let mut window: u32 = 0;
+        let (mut has_text_keyword, mut has_blob, mut has_real_keyword) = (false, false, false);
+        for &byte in datatype.as_bytes() {
+            window = (window << 8) | u32::from(byte.to_ascii_uppercase());
+            // Rule 1: INT -> INTEGER affinity
+            if window & 0x00FF_FFFF == INT {
+                return Affinity::Integer;
+            }
+            match window {
+                CHAR | CLOB | TEXT => has_text_keyword = true,
+                BLOB => has_blob = true,
+                REAL | FLOA | DOUB => has_real_keyword = true,
+                _ => {}
+            }
         }
 
         // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
-        if contains(b"CHAR") || contains(b"CLOB") || contains(b"TEXT") {
+        if has_text_keyword {
             return Affinity::Text;
         }
 
         // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-        if contains(b"BLOB") || datatype.is_empty() {
+        if has_blob || datatype.is_empty() {
             return Affinity::Blob;
         }
 
         // Rule 4: REAL/FLOA/DOUB -> REAL affinity
-        if contains(b"REAL") || contains(b"FLOA") || contains(b"DOUB") {
+        if has_real_keyword {
             return Affinity::Real;
         }
 
@@ -359,15 +378,6 @@ impl Affinity {
             _ => false,
         }
     }
-}
-
-/// Whether `haystack` contains `needle`, an upper-case ASCII string, when
-/// ASCII letters are compared without case. This is the same as
-/// `haystack.to_ascii_uppercase().contains(needle)`, without the copy.
-fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[derive(Debug, PartialEq)]
@@ -795,6 +805,23 @@ mod tests {
             assert_eq!(
                 Affinity::affinity(datatype),
                 old_affinity(datatype),
+                "{datatype:?}"
+            );
+        }
+        // Short names made of the letters of the keywords, in all their combinations.
+        let letters: Vec<char> = "INTCHARLOBEXFDU iz\u{e9}".chars().collect();
+        let mut state: u64 = 1;
+        for _ in 0..100_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (state >> 60) as usize % 9;
+            let datatype: String = (0..len)
+                .map(|i| letters[(state >> (i * 6)) as usize % letters.len()])
+                .collect();
+            assert_eq!(
+                Affinity::affinity(&datatype),
+                old_affinity(&datatype),
                 "{datatype:?}"
             );
         }
