@@ -1326,9 +1326,9 @@ pub struct Schema {
     pending_materialized_views: Option<PendingMaterializedViews>,
 
     /// Schema state of the database's dialect, opaque to core: what the
-    /// dialect's [`crate::Dialect::build_schema_state`] built from its own
-    /// schema table, such as the PostgreSQL frontend's relation catalog.
-    /// None when the dialect keeps none. Copies of the schema share it.
+    /// steps of [`crate::Catalog::load_steps`] read from the dialect's own
+    /// tables, such as the PostgreSQL frontend's relation catalog. None
+    /// when the dialect keeps none. Copies of the schema share it.
     pub dialect_schema: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
