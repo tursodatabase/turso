@@ -2,11 +2,11 @@ use super::{
     emitter::Resolver,
     expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
-        JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
-        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
-        TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan, WhereTerm,
-        WhereTermOrigin,
+        DeletePlan, Distinctness, GroupBy, InSeekSource, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation,
+        SimpleAggregate, TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan,
+        WhereTerm, WhereTermOrigin,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -69,8 +69,8 @@ use join::{
 };
 use lift_common_subexpressions::rewrite_or_terms;
 use order::{
-    compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
-    EliminatesSortBy, OrderTargetPurpose,
+    compute_order_target, plan_groups_equal_keys, plan_satisfies_order_target,
+    simple_aggregate_order_target, EliminatesSortBy, OrderTargetPurpose,
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -1357,6 +1357,7 @@ fn apply_select_table_plan(
     let Some(table_plan) = table_plan else {
         return Ok(());
     };
+    mark_distinct_ordered(plan, &table_plan, resolver)?;
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1365,6 +1366,37 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    Ok(())
+}
+
+fn mark_distinct_ordered(
+    plan: &mut SelectPlan,
+    table_plan: &TableAccessPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if plan.group_by.is_some() {
+        return Ok(());
+    }
+    let (exprs, distinctness): (Vec<&ast::Expr>, &mut Distinctness) =
+        match plan.aggregates.as_mut_slice() {
+            [] if plan.distinctness.is_distinct() => (
+                plan.result_columns.iter().map(|col| &col.expr).collect(),
+                &mut plan.distinctness,
+            ),
+            [agg] if agg.is_distinct() => (agg.args.iter().collect(), &mut agg.distinctness),
+            _ => return Ok(()),
+        };
+    let ordered = plan_groups_equal_keys(
+        &table_plan.join,
+        &table_plan.access_methods,
+        plan.table_references.joined_tables(),
+        &table_plan.constraints,
+        &exprs,
+        &plan.table_references,
+        resolver,
+        resolver.schema(),
+    )?;
+    distinctness.set_ordered(ordered);
     Ok(())
 }
 
@@ -3235,7 +3267,7 @@ fn apply_table_access_plan(
                 }
                 order_by.clear();
             }
-            OrderTargetPurpose::Extremum => {}
+            OrderTargetPurpose::Extremum | OrderTargetPurpose::Distinct => {}
         }
     }
 

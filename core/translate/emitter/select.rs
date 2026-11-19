@@ -208,14 +208,14 @@ pub fn emit_query<'a>(
     } else {
         None
     };
-    if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
-    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
-        program.emit_insn(Insn::HashClear {
-            hash_table_id: ctx.hash_table_id,
-        });
-        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+    if let Distinctness::Distinct { ctx: Some(ctx), .. } = &plan.distinctness {
+        ctx.emit_reset(program);
+        if !ctx.is_ordered() {
+            emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
+        }
     }
 
     let end_label = program.allocate_label();
@@ -258,7 +258,7 @@ pub fn emit_query<'a>(
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::Count))
         && emit_simple_count(program, t_ctx, plan)?
     {
-        if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
             program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
         }

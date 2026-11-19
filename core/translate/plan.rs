@@ -24,7 +24,7 @@ use crate::{
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
-        insn::{HashDistinctData, Insn},
+        insn::{CmpInsFlags, HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable, MAIN_DB_ID, TEMP_DB_ID,
@@ -766,13 +766,20 @@ pub enum Distinctness {
     NonDistinct,
     /// The column is a DISTINCT column,
     /// and includes a translation context for handling duplicates.
-    Distinct { ctx: Option<DistinctCtx> },
+    Distinct {
+        ctx: Option<DistinctCtx>,
+        /// rows already come sorted by the distinct columns
+        ordered: bool,
+    },
 }
 
 impl Distinctness {
     pub fn from_ast(distinctness: Option<&ast::Distinctness>) -> Self {
         match distinctness {
-            Some(ast::Distinctness::Distinct) => Self::Distinct { ctx: None },
+            Some(ast::Distinctness::Distinct) => Self::Distinct {
+                ctx: None,
+                ordered: false,
+            },
             Some(ast::Distinctness::All) => Self::NonDistinct,
             None => Self::NonDistinct,
         }
@@ -780,13 +787,31 @@ impl Distinctness {
     pub fn is_distinct(&self) -> bool {
         matches!(self, Distinctness::Distinct { .. })
     }
+    pub fn is_ordered(&self) -> bool {
+        matches!(self, Distinctness::Distinct { ordered: true, .. })
+    }
+    pub fn set_ordered(&mut self, value: bool) {
+        if let Distinctness::Distinct { ordered, .. } = self {
+            *ordered = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DistinctMethod {
+    Hash {
+        hash_table_id: usize,
+    },
+    Ordered {
+        previous_key_reg: usize,
+        has_previous_reg: usize,
+    },
 }
 
 /// Translation context for handling DISTINCT columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistinctCtx {
-    /// Hash table id used to deduplicate results.
-    pub hash_table_id: usize,
+    pub method: DistinctMethod,
     /// Collations for each distinct key column.
     pub collations: Vec<CollationSeq>,
     /// The label for the on conflict branch.
@@ -795,17 +820,52 @@ pub struct DistinctCtx {
 }
 
 impl DistinctCtx {
-    /// A DISTINCT that finds duplicates with a hash table. The values are
-    /// compared with `collations`, so each must be one that can be hashed.
-    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+    pub fn new(
+        program: &mut ProgramBuilder,
+        collations: Vec<CollationSeq>,
+        ordered: bool,
+    ) -> Result<Self> {
         if let Some(collation) = collations.iter().find(|collation| !collation.can_hash()) {
             crate::bail_parse_error!("DISTINCT does not support the custom collation {collation}");
         }
+        let method = if ordered {
+            DistinctMethod::Ordered {
+                previous_key_reg: program.alloc_registers(collations.len()),
+                has_previous_reg: program.alloc_register(),
+            }
+        } else {
+            DistinctMethod::Hash {
+                hash_table_id: program.alloc_hash_table_id(),
+            }
+        };
         Ok(Self {
-            hash_table_id: program.alloc_hash_table_id(),
+            method,
             collations,
             label_on_conflict: program.allocate_label(),
         })
+    }
+
+    pub fn is_ordered(&self) -> bool {
+        matches!(self.method, DistinctMethod::Ordered { .. })
+    }
+
+    // a subquery can run many times, so we reset every time
+    pub fn emit_reset(&self, program: &mut ProgramBuilder) {
+        match &self.method {
+            DistinctMethod::Hash { hash_table_id } => {
+                program.emit_insn(Insn::HashClear {
+                    hash_table_id: *hash_table_id,
+                });
+            }
+            DistinctMethod::Ordered {
+                has_previous_reg, ..
+            } => {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: *has_previous_reg,
+                });
+            }
+        }
     }
 
     pub fn emit_deduplication_insns(
@@ -814,15 +874,52 @@ impl DistinctCtx {
         num_regs: usize,
         start_reg: usize,
     ) {
-        program.emit_insn(Insn::HashDistinct {
-            data: Box::new(HashDistinctData {
-                hash_table_id: self.hash_table_id,
-                key_start_reg: start_reg,
-                num_keys: num_regs,
-                collations: self.collations.clone(),
-                target_pc: self.label_on_conflict,
-            }),
-        });
+        match &self.method {
+            DistinctMethod::Hash { hash_table_id } => {
+                program.emit_insn(Insn::HashDistinct {
+                    data: Box::new(HashDistinctData {
+                        hash_table_id: *hash_table_id,
+                        key_start_reg: start_reg,
+                        num_keys: num_regs,
+                        collations: self.collations.clone(),
+                        target_pc: self.label_on_conflict,
+                    }),
+                });
+            }
+            DistinctMethod::Ordered {
+                previous_key_reg,
+                has_previous_reg,
+            } => {
+                let new_key = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: *has_previous_reg,
+                    target_pc: new_key,
+                    jump_if_null: true,
+                });
+                for (i, collation) in self.collations.iter().enumerate() {
+                    program.emit_insn(Insn::Ne {
+                        lhs: previous_key_reg + i,
+                        rhs: start_reg + i,
+                        target_pc: new_key,
+                        flags: CmpInsFlags::default().null_eq(),
+                        collation: *collation,
+                    });
+                }
+                program.emit_insn(Insn::Goto {
+                    target_pc: self.label_on_conflict,
+                });
+                program.preassign_label_to_next_insn(new_key);
+                program.emit_insn(Insn::Copy {
+                    src_reg: start_reg,
+                    dst_reg: *previous_key_reg,
+                    extra_amount: num_regs - 1,
+                });
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: *has_previous_reg,
+                });
+            }
+        }
     }
 }
 
