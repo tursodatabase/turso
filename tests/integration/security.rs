@@ -141,3 +141,124 @@ fn enabling_row_security_fails_under_a_dialect_without_it() {
         "{error}"
     );
 }
+
+/// The SQLite parser has no syntax for these statements, so the test
+/// builds the statements a frontend with roles would build.
+#[test]
+fn dialect_without_roles_refuses_role_owner_privilege_and_row_security_statements() {
+    let db = Database::open_file(
+        Arc::new(MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+
+    let table = || ast::QualifiedName::single(ast::Name::exact("t".to_string()));
+    let role = || ast::RoleSpec::Name("r".to_string());
+    let alter_table = |body| {
+        ast::Stmt::AlterTable(ast::AlterTable {
+            name: table(),
+            body,
+        })
+    };
+    let grant = |revoke, objects| {
+        ast::Stmt::Grant(ast::Grant {
+            revoke,
+            objects,
+            grantees: vec![ast::Grantee::Role(role())],
+        })
+    };
+    let privileges_on_table = || ast::GrantObjects::Relations {
+        privileges: vec![ast::Privilege::Select],
+        on_sequences: false,
+        relations: vec![table()],
+    };
+    let member_roles = || ast::GrantObjects::Roles(vec!["admin".to_string()]);
+
+    let statements = [
+        (
+            grant(false, privileges_on_table()),
+            "GRANT is not supported",
+        ),
+        (
+            grant(true, privileges_on_table()),
+            "REVOKE is not supported",
+        ),
+        (
+            ast::Stmt::CreateRole {
+                role_name: "r".to_string(),
+                options: ast::RoleOptions::default(),
+            },
+            "CREATE ROLE is not supported",
+        ),
+        (
+            grant(false, member_roles()),
+            "GRANT of role membership is not supported",
+        ),
+        (
+            grant(true, member_roles()),
+            "REVOKE of role membership is not supported",
+        ),
+        (
+            alter_table(ast::AlterTableBody::OwnerTo {
+                kind: ast::RelationKind::Table,
+                role: role(),
+                if_exists: false,
+            }),
+            "ALTER ... OWNER TO is not supported",
+        ),
+        (
+            ast::Stmt::AlterSequenceOwnedBy {
+                seq_name: ast::QualifiedName::single(ast::Name::exact("s".to_string())),
+                owner: Some((table(), ast::Name::exact("a".to_string()))),
+            },
+            "ALTER SEQUENCE ... OWNED BY is not supported",
+        ),
+        (
+            alter_table(ast::AlterTableBody::EnableRowSecurity),
+            "row-level security is not supported",
+        ),
+        (
+            alter_table(ast::AlterTableBody::DisableRowSecurity),
+            "row-level security is not supported",
+        ),
+        (
+            ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
+                policy_name: ast::Name::exact("p".to_string()),
+                tbl_name: table(),
+                permissive: true,
+                command: ast::PolicyCommand::All,
+                roles: vec![ast::Grantee::Public],
+                using_expr: None,
+                check_expr: None,
+                using_sql: None,
+                check_sql: None,
+            })),
+            "row-level security is not supported",
+        ),
+        (
+            ast::Stmt::DropPolicy {
+                if_exists: false,
+                policy_name: ast::Name::exact("p".to_string()),
+                tbl_name: table(),
+            },
+            "row-level security is not supported",
+        ),
+    ];
+
+    for (stmt, expected) in statements {
+        let description = format!("{stmt:?}");
+        match conn.prepare_ast_stmt(stmt) {
+            Err(turso_core::LimboError::ParseError(message)) => {
+                assert_eq!(message, expected, "{description}")
+            }
+            Err(other) => panic!("{description}: expected a parse error, got {other:?}"),
+            Ok(_) => panic!("{description}: expected an error"),
+        }
+    }
+}
