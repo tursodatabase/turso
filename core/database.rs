@@ -3687,6 +3687,20 @@ impl Database {
     pub fn get_pending_byte() -> u32 {
         Pager::get_pending_byte()
     }
+
+    /// Whether a reader could take WAL read lock 0 now, which is the lock
+    /// that readers take when every WAL frame is backfilled into the database
+    /// file. A checkpoint holds it exclusively while it backfills.
+    #[cfg(feature = "test_helper")]
+    pub fn wal_read_lock_0_is_free_for_testing(&self) -> bool {
+        let shared = self.shared_wal.read();
+        let lock = &shared.runtime.read_locks[0];
+        let taken = lock.read();
+        if taken {
+            lock.unlock();
+        }
+        taken
+    }
 }
 
 pub(crate) struct AttachedDatabase {

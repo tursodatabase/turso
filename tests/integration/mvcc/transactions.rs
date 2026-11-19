@@ -1718,3 +1718,63 @@ fn test_committed_update_version_conflict() {
          Td's committed update must be detected via Td's new version."
     );
 }
+
+/// A transaction adds a version chain to its write set only on its first write
+/// to the chain. Later writes to the same table row or index key find a version
+/// of the transaction in the chain and add nothing.
+#[test]
+fn test_write_set_has_one_entry_for_each_written_chain() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_id = conn.get_mv_tx().map(|(tx_id, _)| tx_id).unwrap();
+    // The table row 1 and the index keys 'a' and 'b'.
+    assert_eq!(mvcc_store.write_set_counts_for_testing(tx_id), (3, 3));
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
+}
+
+/// A rollback to a savepoint removes the chains that the savepoint added to the
+/// write set. A chain that the transaction wrote before the savepoint stays,
+/// also when the savepoint wrote to it again. A second rollback to the same
+/// savepoint removes the chains that were added after the first rollback.
+#[test]
+fn test_savepoint_rollback_removes_only_the_chains_that_the_savepoint_added() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_id = conn.get_mv_tx().map(|(tx_id, _)| tx_id).unwrap();
+    assert_eq!(mvcc_store.write_set_counts_for_testing(tx_id), (2, 2));
+
+    conn.execute("SAVEPOINT sp").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'c')").unwrap();
+    assert_eq!(mvcc_store.write_set_counts_for_testing(tx_id), (5, 5));
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_eq!(mvcc_store.write_set_counts_for_testing(tx_id), (2, 2));
+
+    conn.execute("INSERT INTO t VALUES (3, 'd')").unwrap();
+    assert_eq!(mvcc_store.write_set_counts_for_testing(tx_id), (4, 4));
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_eq!(mvcc_store.write_set_counts_for_testing(tx_id), (2, 2));
+
+    conn.execute("RELEASE sp").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
+}

@@ -4929,6 +4929,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Runs [`Self::reset_after_vacuum`] while holding the vacuum gate, as
+    /// VACUUM does.
+    #[cfg(feature = "test_helper")]
+    pub fn reset_after_vacuum_for_testing(&self, header: DatabaseHeader, schema: &Schema) {
+        self.try_begin_vacuum_gate()
+            .expect("no transaction should be active");
+        self.reset_after_vacuum(header, schema);
+        self.release_vacuum_gate();
+    }
+
     /// VACUUM copies the physical DB image, so any transaction frames in the
     /// MVCC logical log must be checkpointed first.
     ///
@@ -8162,9 +8172,57 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.group_commit_enabled()
     }
 
-    #[cfg(test)]
+    /// Number of commit records that the last group commit wrote together.
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn last_group_commit_size(&self) -> usize {
         self.commit_coordinator.last_group_size()
+    }
+
+    /// Takes the lock that a commit holds while it writes the logical log, so
+    /// that commits started meanwhile wait for it. Returns false if it is
+    /// already held.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn lock_commits_for_testing(&self) -> bool {
+        self.commit_coordinator.pager_commit_lock.write()
+    }
+
+    /// Releases the lock taken by [`Self::lock_commits_for_testing`] and wakes
+    /// the commits that wait for it.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn unlock_commits_for_testing(&self) {
+        self.commit_coordinator.unlock_pager_commit_lock();
+    }
+
+    /// Number of commits that wait for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn waiting_commit_count_for_testing(&self) -> usize {
+        self.commit_coordinator.parked_tickets().len()
+    }
+
+    /// Number of times commits ran the step that waits for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn commit_wait_count_for_testing(&self) -> usize {
+        self.commit_coordinator.park_calls()
+    }
+
+    /// Makes GC treat every transaction up to `tx_id` as written to the WAL by
+    /// a checkpoint, whether a checkpoint wrote it or not.
+    #[cfg(feature = "test_helper")]
+    pub fn set_durable_txid_max_for_testing(&self, tx_id: u64) {
+        self.durable_txid_max.store(tx_id, Ordering::SeqCst);
+    }
+
+    /// The number of entries in the write set of transaction `tx_id`, and the
+    /// number of distinct version chains that they point to.
+    #[cfg(feature = "test_helper")]
+    pub fn write_set_counts_for_testing(&self, tx_id: TxID) -> (usize, usize) {
+        let tx = self.txs.get(&tx_id).expect("transaction should exist");
+        let write_set = tx.value().write_set.lock();
+        let distinct_chains: HashSet<usize> = write_set
+            .iter()
+            .map(|(_, row_versions)| Arc::as_ptr(row_versions) as usize)
+            .collect();
+        (write_set.len(), distinct_chains.len())
     }
 
     /// Whether an incremental GC pass should run now: inline GC is enabled
@@ -10796,6 +10854,12 @@ impl RowVersion {
     /// ([`WalPos::ORIGIN`] = not materialized). See the field doc.
     #[inline]
     pub(crate) fn materialized_at(&self) -> WalPos {
+        self.materialized_at
+    }
+
+    /// [`Self::materialized_at`] for integration tests.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_at_for_testing(&self) -> WalPos {
         self.materialized_at
     }
 
