@@ -11,6 +11,14 @@ This implementation provides SQLite3 API compatibility for Turso, allowing exist
 3. Maps SQLite operations to equivalent Turso operations
 4. Maintains API compatibility with SQLite
 
+## Application functions
+
+`sqlite3_create_function_v2` supports scalar callbacks. C aggregate callbacks
+(`xStep` and `xFinal`) are not implemented: a valid aggregate registration returns
+`SQLITE_ERROR` with `sqlite3_errmsg` reporting that C aggregate callbacks are not
+supported. Incomplete or mixed scalar/aggregate callback combinations return
+`SQLITE_MISUSE`. Rejected registrations invoke `xDestroy` once when supplied.
+
 ## Testing Strategy
 
 We employ a dual-testing approach to ensure complete compatibility with SQLite:
@@ -102,4 +110,4 @@ When adding new features or fixing bugs:
 
 ## Status
 
-This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status. 
+This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status.

@@ -182,9 +182,7 @@ unsafe fn add_scalar_function(
     };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms)
-            .functions
-            .insert(name_str, Arc::new(function));
+        (*ext_ctx.syms).insert_function(name_str, Arc::new(function));
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
@@ -250,9 +248,7 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms)
-            .functions
-            .insert(name_str, Arc::new(function));
+        (*ext_ctx.syms).insert_function(name_str, Arc::new(function));
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
