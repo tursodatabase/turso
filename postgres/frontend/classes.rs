@@ -6,16 +6,21 @@
 //! stable `oid` that survives creating and dropping other relations, the
 //! owning role, the privileges `GRANT` gave, and row-level security with
 //! its policies. The columns use
-//! PostgreSQL's `pg_class` names and value conventions, because when
-//! `sqlite_schema` itself moves behind the engine's dialect hooks, this
-//! table becomes `pg_class`, by renaming and adding columns.
+//! PostgreSQL's `pg_class` names and value conventions, because when the
+//! PostgreSQL frontend stops storing `sqlite_schema` rows, this table
+//! becomes `pg_class`, by renaming and adding columns.
 //!
-//! Core knows nothing of this table. [`crate::catalog::PostgresDialect`]
-//! maintains it through the engine's catalog hooks: every statement that
-//! adds, renames or removes a relation calls back here to write the matching
-//! row in the same transaction as its `sqlite_schema` rows, so the two can
-//! never disagree after a crash, and the engine loads the rows back with
-//! the rest of the frontend's schema state, see [`crate::schema_state`],
+//! Core knows nothing of this table. [`PostgresCatalog`], which is the
+//! [`turso_core::Catalog`] of [`crate::catalog::PostgresDialect`],
+//! maintains it. Every statement that adds, renames or removes a relation
+//! calls [`PostgresCatalog::emit`](turso_core::Catalog::emit), which has
+//! the engine's [`SqliteCatalog`] write the `sqlite_schema` rows and writes
+//! the matching class row in the same transaction, so the two can never
+//! disagree after a crash. Statements about owners, privileges and
+//! row-level security call
+//! [`PostgresCatalog::emit_access`](turso_core::Catalog::emit_access),
+//! which changes only class rows. The engine loads the rows back with the
+//! rest of the frontend's schema state, see [`crate::schema_state`],
 //! whenever it loads the schema.
 //!
 //! The PostgreSQL opening functions create these tables before

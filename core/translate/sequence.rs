@@ -1498,8 +1498,8 @@ pub(crate) fn sequence_namespace(
 }
 
 /// Translates `ALTER SEQUENCE name OWNED BY table.column`, or `OWNED BY
-/// NONE`: the dialect records which table the sequence belongs to in its
-/// own schema state, as PostgreSQL does for a `serial` column's sequence.
+/// NONE`: the dialect's catalog records which column the sequence belongs
+/// to, as PostgreSQL does for a `serial` column's sequence.
 /// The table must be in the sequence's namespace, have the column, and have
 /// the sequence's owner.
 pub fn translate_alter_sequence_owned_by(

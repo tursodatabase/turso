@@ -578,10 +578,10 @@ fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
-/// `GRANT` and `REVOKE`. Of privileges on relations, the dialect changes
-/// the privileges it stores with each relation, through its relation hooks,
-/// as it stores ownership. Of roles, the dialect stores the membership,
-/// through the same hook as its other catalog changes.
+/// `GRANT` and `REVOKE`. Of privileges on relations, the dialect's catalog
+/// changes the privileges it stores with each relation, as it stores
+/// ownership. Of roles, the catalog stores the membership. Both go through
+/// [`crate::Catalog::emit_access`].
 pub fn translate_grant(
     grant: &ast::Grant,
     resolver: &Resolver,
@@ -644,8 +644,8 @@ pub fn translate_grant(
     translate_access_statement(&statement, resolver, program, connection)
 }
 
-/// `CREATE ROLE`: the dialect stores the role, through the same hook as its
-/// other catalog changes.
+/// `CREATE ROLE`: the dialect's catalog stores the role, through
+/// [`crate::Catalog::emit_access`].
 pub fn translate_create_role(
     role_name: String,
     options: ast::RoleOptions,
