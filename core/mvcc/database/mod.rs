@@ -21,7 +21,7 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::sqlite3_ondisk::{try_read_integer, DatabaseHeader};
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{fence, AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -217,7 +217,63 @@ impl SortableIndexKey {
         })
     }
 
+    /// Always inlined, so that the skip list loops compare two keys whose
+    /// first columns are different integers without a call.
+    #[inline(always)]
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        if let Some(ordering) = self.compare_first_integers(other) {
+            return Ok(ordering);
+        }
+        self.compare_columns(other)
+    }
+
+    /// The order of the two keys when their first columns are integers that
+    /// differ, under a text collation. This is the result of
+    /// [Self::compare_columns] for such keys. Else None.
+    #[inline(always)]
+    fn compare_first_integers(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // The values come before the metadata: for a key whose first value
+        // is not an integer, as in an index on a TEXT column, this returns
+        // after a few instructions.
+        let lhs = Self::first_integer(self.key.get_payload())?;
+        let rhs = Self::first_integer(other.key.get_payload())?;
+        let key_info = self.metadata.key_info.first()?;
+        if self.metadata.num_cols.min(other.metadata.num_cols) == 0
+            || !matches!(key_info.collation, CollationSeq::Text(_))
+        {
+            return None;
+        }
+        match lhs.cmp(&rhs) {
+            std::cmp::Ordering::Equal => None,
+            ordering => Some(match key_info.sort_order {
+                SortOrder::Asc => ordering,
+                SortOrder::Desc => ordering.reverse(),
+            }),
+        }
+    }
+
+    /// The first value of a record if it is an integer, and the header size
+    /// and the first serial type take one byte each, as in most index keys.
+    /// Else None, also for a record that is not valid: the general
+    /// comparison then gives the order or the error. This function makes no
+    /// error value, because an error value adds code to each inlined copy
+    /// of [Self::compare].
+    #[inline(always)]
+    fn first_integer(payload: &[u8]) -> Option<i64> {
+        let &[header_size, serial_type, ..] = payload else {
+            return None;
+        };
+        // A header size of 0x80 or more takes more than one byte, and a
+        // header of fewer than two bytes has no serial type.
+        if !(2..0x80).contains(&header_size) {
+            return None;
+        }
+        let data = payload.get(usize::from(header_size)..)?;
+        try_read_integer(data, serial_type).map(|(value, _)| value)
+    }
+
+    #[inline(never)]
+    fn compare_columns(&self, other: &Self) -> Result<std::cmp::Ordering> {
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
@@ -226,20 +282,39 @@ impl SortableIndexKey {
         let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
-            // Two integers compare by value under every text collation, so
-            // they need no ValueRef. The skip list compares keys many times
-            // for each insert and seek. Other values, and a corrupt record,
-            // take the general path below.
+            // Two integers compare by value under every text collation, and
+            // two texts compare byte by byte under BINARY, so they need no
+            // ValueRef. The skip list compares keys many times for each
+            // insert and seek. Other values, and a corrupt record, take the
+            // general path below.
             if let Some(key_info) = self.metadata.key_info.get(i) {
                 if matches!(key_info.collation, CollationSeq::Text(_)) {
                     if let (Some((lhs_int, lhs_size)), Some((rhs_int, rhs_size))) =
                         (lhs.peek_integer(), rhs.peek_integer())
                     {
-                        lhs.skip_integer(lhs_size);
-                        rhs.skip_integer(rhs_size);
+                        lhs.skip_value(1, lhs_size);
+                        rhs.skip_value(1, rhs_size);
                         let cmp = match key_info.sort_order {
                             SortOrder::Asc => lhs_int.cmp(&rhs_int),
                             SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return Ok(cmp);
+                        }
+                        continue;
+                    }
+                }
+                if key_info.collation == CollationSeq::BINARY {
+                    if let (
+                        Some((lhs_text, lhs_header_len, lhs_size)),
+                        Some((rhs_text, rhs_header_len, rhs_size)),
+                    ) = (lhs.peek_text(), rhs.peek_text())
+                    {
+                        lhs.skip_value(lhs_header_len, lhs_size);
+                        rhs.skip_value(rhs_header_len, rhs_size);
+                        let cmp = match key_info.sort_order {
+                            SortOrder::Asc => lhs_text.cmp(rhs_text),
+                            SortOrder::Desc => lhs_text.cmp(rhs_text).reverse(),
                         };
                         if cmp != std::cmp::Ordering::Equal {
                             return Ok(cmp);

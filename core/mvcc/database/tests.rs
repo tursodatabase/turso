@@ -259,10 +259,12 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     assert_eq!(key.key.get_payload(), record.get_payload());
 }
 
-/// `SortableIndexKey` compares two integers without decoding them into
-/// values. The order must be the order of `compare_immutable` on the decoded
-/// values, for integers of every serial type, for integers against other
-/// kinds of values, for both sort orders and for keys of different lengths.
+/// `SortableIndexKey` compares two integers, and two texts under BINARY,
+/// without decoding them into values. The order must be the order of
+/// `compare_immutable` on the decoded values, for integers of every serial
+/// type, for texts of one-byte and two-byte serial types, for values of
+/// different kinds, for both sort orders, for another collation and for
+/// keys of different lengths.
 #[test]
 fn index_key_order_matches_compare_immutable() {
     use crate::translate::collate::CollationSeq;
@@ -300,15 +302,23 @@ fn index_key_order_matches_compare_immutable() {
         Value::from_f64(9.3e18),
         Value::build_text("1"),
         Value::build_text("a"),
+        Value::build_text("A"),
+        Value::build_text(""),
+        Value::build_text("ab"),
+        Value::build_text("b"),
+        Value::build_text("é"),
+        // Longer than 57 bytes, so the serial type takes two bytes.
+        Value::build_text("x".repeat(100)),
+        Value::build_text(format!("{}y", "x".repeat(99))),
         Value::from_slice(b"1").unwrap(),
     ]);
 
-    let index_info = |sort_orders: &[SortOrder], num_cols: usize| {
+    let index_info = |sort_orders: &[SortOrder], collation: CollationSeq, num_cols: usize| {
         Arc::new(
             IndexInfo::new(
                 sort_orders.iter().map(|&sort_order| crate::types::KeyInfo {
                     sort_order,
-                    collation: CollationSeq::BINARY,
+                    collation,
                     nulls_order: None,
                 }),
                 true,
@@ -333,26 +343,78 @@ fn index_key_order_matches_compare_immutable() {
         )
     };
 
-    for first_order in [SortOrder::Asc, SortOrder::Desc] {
-        for second_order in [SortOrder::Asc, SortOrder::Desc] {
-            let sort_orders = [first_order, second_order];
-            let full = index_info(&sort_orders, 2);
-            let prefix = index_info(&sort_orders, 1);
-            for a in &values {
-                for b in &values {
-                    for (a_second, b_second) in [(1, 1), (1, 2), (3, 2)] {
-                        let lhs = key(&[a.clone(), Value::from_i64(a_second)], &full);
-                        let rhs = key(&[b.clone(), Value::from_i64(b_second)], &full);
-                        assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
-                        assert_eq!(lhs == rhs, expected(&lhs, &rhs).is_eq());
-                    }
-                    let lhs = key(&[a.clone()], &prefix);
-                    let rhs = key(&[b.clone(), Value::build_text("x")], &full);
+    for (first_order, second_order, collation) in [
+        (SortOrder::Asc, SortOrder::Asc, CollationSeq::BINARY),
+        (SortOrder::Asc, SortOrder::Desc, CollationSeq::BINARY),
+        (SortOrder::Desc, SortOrder::Asc, CollationSeq::BINARY),
+        (SortOrder::Desc, SortOrder::Desc, CollationSeq::BINARY),
+        (SortOrder::Asc, SortOrder::Asc, CollationSeq::NOCASE),
+        (SortOrder::Desc, SortOrder::Asc, CollationSeq::NOCASE),
+    ] {
+        let sort_orders = [first_order, second_order];
+        let full = index_info(&sort_orders, collation, 2);
+        let prefix = index_info(&sort_orders, collation, 1);
+        for a in &values {
+            for b in &values {
+                for (a_second, b_second) in [(1, 1), (1, 2), (3, 2)] {
+                    let lhs = key(&[a.clone(), Value::from_i64(a_second)], &full);
+                    let rhs = key(&[b.clone(), Value::from_i64(b_second)], &full);
                     assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
-                    assert_eq!(rhs.cmp(&lhs), expected(&rhs, &lhs), "{a:?} {b:?}");
+                    assert_eq!(lhs == rhs, expected(&lhs, &rhs).is_eq());
                 }
+                let lhs = key(&[a.clone()], &prefix);
+                let rhs = key(&[b.clone(), Value::build_text("x")], &full);
+                assert_eq!(lhs.cmp(&rhs), expected(&lhs, &rhs), "{a:?} {b:?}");
+                assert_eq!(rhs.cmp(&lhs), expected(&rhs, &lhs), "{a:?} {b:?}");
             }
         }
+    }
+}
+
+/// A TEXT that is not valid UTF-8 and an integer with missing bytes do not
+/// take the fast paths of `SortableIndexKey::compare`: the comparison gives
+/// the error of the general path, from both sides.
+#[test]
+fn index_key_compare_reports_corrupt_values() {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::SortOrder;
+
+    let info = Arc::new(
+        IndexInfo::new(
+            [crate::types::KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::BINARY,
+                nulls_order: None,
+            }],
+            false,
+            1,
+            false,
+        )
+        .unwrap(),
+    );
+    let key = |payload: &[u8]| {
+        SortableIndexKey::new_from_payload_in(payload, info.clone(), TursoAllocator).unwrap()
+    };
+    // Header size 2, then the serial type of a 2-byte TEXT, then 0xff 0xfe.
+    let invalid_text = key(&[2, 17, 0xff, 0xfe]);
+    // Header size 2, then the serial type of an 8-byte integer, then 3 bytes.
+    let truncated_integer = key(&[2, 6, 0, 0, 1]);
+    let text_record = ImmutableRecord::from_values(&[Value::build_text("ab")], 1).unwrap();
+    let text = key(text_record.get_payload());
+    let integer_record = ImmutableRecord::from_values(&[Value::from_i64(i64::MAX)], 1).unwrap();
+    let integer = key(integer_record.get_payload());
+
+    for (lhs, rhs) in [
+        (&invalid_text, &text),
+        (&text, &invalid_text),
+        (&truncated_integer, &integer),
+        (&integer, &truncated_integer),
+    ] {
+        assert!(
+            matches!(lhs.compare(rhs), Err(LimboError::Corrupt(_))),
+            "{:?}",
+            lhs.compare(rhs)
+        );
     }
 }
 

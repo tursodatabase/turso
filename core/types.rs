@@ -2243,19 +2243,36 @@ impl<'a> ValueIterator<'a> {
     /// The next value and its number of data bytes, if the value is an
     /// integer and all of its bytes are in the record. Else None, also for a
     /// corrupt record: [Iterator::next] then gives the error. The iterator
-    /// does not move. [Self::skip_integer] moves it past the integer.
+    /// does not move. [Self::skip_value] moves it past the integer.
     #[inline(always)]
     pub fn peek_integer(&self) -> Option<(i64, usize)> {
         let &serial_type = self.header_section.get().first()?;
         try_read_integer(self.data_section.get(), serial_type)
     }
 
-    /// Moves the iterator past the integer that [Self::peek_integer] gave,
-    /// which has `size` data bytes.
+    /// The next value, its number of serial type bytes and its number of
+    /// data bytes, if the value is a TEXT whose bytes are all in the record
+    /// and are valid UTF-8. Else None, also for a corrupt record:
+    /// [Iterator::next] then gives the error. The iterator does not move.
     #[inline(always)]
-    pub fn skip_integer(&self, size: usize) {
-        self.header_section.set(&self.header_section.get()[1..]);
-        self.data_section.set(&self.data_section.get()[size..]);
+    pub fn peek_text(&self) -> Option<(&'a str, usize, usize)> {
+        let (serial_type, header_len) = read_varint(self.header_section.get()).ok()?;
+        if serial_type < 13 || serial_type % 2 == 0 {
+            return None;
+        }
+        let size = usize::try_from((serial_type - 13) / 2).ok()?;
+        let text = validate_utf8(self.data_section.get().get(..size)?)?;
+        Some((text, header_len, size))
+    }
+
+    /// Moves the iterator past a value that [Self::peek_integer] or
+    /// [Self::peek_text] gave, which has `header_len` serial type bytes and
+    /// `data_len` data bytes.
+    #[inline(always)]
+    pub fn skip_value(&self, header_len: usize, data_len: usize) {
+        self.header_section
+            .set(&self.header_section.get()[header_len..]);
+        self.data_section.set(&self.data_section.get()[data_len..]);
     }
 }
 
