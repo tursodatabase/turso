@@ -3268,6 +3268,36 @@ impl Database {
         self.shared_wal.read().read_slots_with_readers()
     }
 
+    /// The oldest WAL frame that a reader in any process holds, or `None` if
+    /// no reader holds a WAL frame.
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    pub fn shared_wal_min_active_reader_frame(&self) -> Option<u64> {
+        self.shared_wal_coordination_for_tests()
+            .min_active_reader_frame()
+    }
+
+    /// Whether a reader in any process reads only the database file.
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    pub fn shared_wal_has_active_db_file_reader(&self) -> bool {
+        self.shared_wal_coordination_for_tests()
+            .has_active_db_file_reader()
+    }
+
+    /// The number of shared WAL frame index blocks that page lookups scanned
+    /// since the previous call.
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    pub fn take_shared_wal_frame_index_blocks_scanned(&self) -> u64 {
+        self.shared_wal_coordination_for_tests()
+            .take_frame_index_blocks_scanned_for_tests()
+    }
+
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    fn shared_wal_coordination_for_tests(&self) -> Arc<MappedSharedWalCoordination> {
+        self.shared_wal_coordination()
+            .unwrap()
+            .expect("the database must use shared WAL coordination")
+    }
+
     #[cfg(feature = "simulator")]
     pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
         #[cfg(host_shared_wal)]

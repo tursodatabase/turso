@@ -686,7 +686,7 @@ pub(crate) struct MappedSharedWalCoordination {
     sanitized_backfill_proof_on_open: bool,
     /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     frame_index_blocks_scanned: AtomicU64,
 }
 
@@ -812,7 +812,7 @@ impl MappedSharedWalCoordination {
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             frame_index_blocks_scanned: AtomicU64::new(0),
         }
     }
@@ -921,7 +921,7 @@ impl MappedSharedWalCoordination {
             .store(1, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     pub(crate) fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
         self.frame_index_blocks_scanned.swap(0, Ordering::Relaxed)
     }
@@ -2487,7 +2487,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
@@ -2544,7 +2544,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
