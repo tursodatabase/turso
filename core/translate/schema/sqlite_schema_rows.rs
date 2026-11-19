@@ -1,7 +1,8 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::{
-    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateSequence, CreateTable, DropIndex, TableText,
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateSequence, CreateTable, DropIndex,
+    DropSequence, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -23,8 +24,8 @@ use turso_parser::ast;
 
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
 /// the SQL text that creates it. So far it stores `CREATE TABLE`, `CREATE
-/// INDEX`, `DROP INDEX` and `CREATE SEQUENCE`; every other statement writes
-/// its `sqlite_schema` rows itself.
+/// INDEX`, `DROP INDEX`, `CREATE SEQUENCE` and the drop of a sequence; every
+/// other statement writes its `sqlite_schema` rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
 
@@ -42,8 +43,8 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateSequence(sequence) => {
                 emit_create_sequence_row(program, ctx, sequence)
             }
-            CatalogCmd::DropSequence(_)
-            | CatalogCmd::DropTable(_)
+            CatalogCmd::DropSequence(sequence) => emit_delete_sequence_row(program, ctx, sequence),
+            CatalogCmd::DropTable(_)
             | CatalogCmd::CreateView(_)
             | CatalogCmd::CreateMaterializedView(_)
             | CatalogCmd::DropView(_)
@@ -197,6 +198,87 @@ fn emit_create_sequence_row(
         sequence.root_reg,
         Some(sequence_backing_table_sql(&stored_name)),
     )
+}
+
+/// Deletes the row of a sequence that is dropped, which is the row of its
+/// backing table.
+fn emit_delete_sequence_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    sequence: &DropSequence<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: sequence.namespace,
+    };
+    let stored_name = ctx.resolver.mangle_name(namespace, sequence.name);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_delete_sequence_backing_table_row(
+        program,
+        sqlite_schema_cursor_id,
+        sequence_backing_table_name(&stored_name),
+    );
+    Ok(())
+}
+
+/// Deletes the `sqlite_schema` row of the table `backing_table_name` of a
+/// sequence, with a scan of the open cursor `sqlite_schema_cursor_id`.
+pub(crate) fn emit_delete_sequence_backing_table_row(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    backing_table_name: String,
+) {
+    let seq_name_reg = program.alloc_register();
+    let type_str_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: seq_name_reg,
+        value: backing_table_name,
+    });
+    program.emit_insn(Insn::String8 {
+        dest: type_str_reg,
+        value: "table".to_string(),
+    });
+
+    // Scan sqlite_schema for (type='table' AND name=backing_table_name) and delete the row.
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+    let skip_delete_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: type_str_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col1_reg,
+        rhs: seq_name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+    program.preassign_label_to_next_insn(skip_delete_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(end_loop_label);
 }
 
 /// Deletes the row of an index.
