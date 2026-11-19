@@ -2839,9 +2839,20 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(NamespaceId::ROOT, &trigger_table_name)
+    // A TEMP trigger can be on a table in another database (`ON main.t`, or an
+    // unqualified name that is not a temp table), so look the table up where
+    // the trigger's table lives, not in the trigger's own schema.
+    let trigger_table_namespace = trigger_table_namespace(
+        resolver,
+        trigger_database_id,
+        &trigger_table_name,
+        tbl_name.namespace.as_ref().map(|db| db.as_str()),
+    );
+    let trigger_table = trigger_table_namespace
+        .and_then(|namespace| {
+            resolver.with_schema(namespace.database_id, |schema| {
+                schema.get_btree_table(namespace.id, &trigger_table_name)
+            })
         })
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
@@ -2862,7 +2873,8 @@ fn rewrite_trigger_sql_for_column_rename(
     }
 
     // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
-    let is_renaming_trigger_table = trigger_table_name == target_table_name;
+    let is_renaming_trigger_table = trigger_table_name == target_table_name
+        && trigger_table_namespace.is_some_and(|ns| ns.database_id == target_database_id);
     let new_event = if is_renaming_trigger_table {
         match event {
             ast::TriggerEvent::UpdateOf(mut cols) => {
