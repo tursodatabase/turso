@@ -470,6 +470,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
                 let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
+                // A TRUNCATE checkpoint fails with Busy while any other connection reads or
+                // writes, so the app's statements fail with "database is locked" until it ends.
                 let _sync_busy = SyncBusyGuard::new(sync_busy);
                 sync_engine.checkpoint(&coro).await?;
                 Ok(None)
@@ -514,7 +516,9 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             Box::pin(async move {
                 let (sync_engine, _operation) = start_operation(&sync_engine, operation_gate)?;
                 let changes = changes.changes;
-                let _sync_busy = SyncBusyGuard::new(sync_busy);
+                let _sync_busy = sync_engine
+                    .apply_needs_sync_busy_gate(&changes)
+                    .then(|| SyncBusyGuard::new(sync_busy));
                 sync_engine
                     .apply_changes_from_remote(&coro, changes)
                     .await?;

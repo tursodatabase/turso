@@ -163,6 +163,9 @@ impl DatabaseTape {
             busy_timeout: opts.busy_timeout,
         }
     }
+    pub(crate) fn mvcc_enabled(&self) -> bool {
+        self.inner.mvcc_enabled()
+    }
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self
             .inner

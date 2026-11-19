@@ -97,8 +97,9 @@ pub struct DatabaseSyncEngineOpts {
     pub logical_mvcc_pull: Option<bool>,
     /// How long the sync engine waits for a lock held by another connection (for example the
     /// app's write transaction) before it fails with `Busy`. Applies to the engine's own
-    /// connections and to starting WAL transactions. Checkpoints do not wait: they run behind
-    /// the SDK's sync busy gate. [`DEFAULT_SYNC_BUSY_TIMEOUT`] is a reasonable value.
+    /// connections and to starting WAL transactions. Pulls on MVCC databases, logical and
+    /// replace-base pulls, and checkpoints do not wait: they need the SDK's sync busy gate (see `apply_needs_sync_busy_gate`).
+    /// [`DEFAULT_SYNC_BUSY_TIMEOUT`] is a reasonable value.
     pub busy_timeout: std::time::Duration,
 }
 
@@ -1920,6 +1921,34 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         })
     }
 
+    /// True when applying `changes` must fail other connections' statements with Busy while it
+    /// runs (the SDK's `SyncBusyGate`). Checkpoints always need the gate, whatever this
+    /// returns.
+    ///
+    /// The answer follows the stream being applied, not only the local journal mode: a pull can
+    /// return a logical or a replace-base stream for a WAL database.
+    pub fn apply_needs_sync_busy_gate(&self, changes: &DbChangesStatus) -> bool {
+        !changes.is_empty() && self.stream_needs_sync_busy_gate(changes.stream_kind)
+    }
+
+    /// The rule behind `apply_needs_sync_busy_gate` and `pull_busy_timeout`.
+    ///
+    /// Every pull on an MVCC database needs the gate. A logical apply reads the local changes
+    /// before it begins its write transaction, so a change committed in between is missing
+    /// after the pull. A replace-base apply commits the remote pages first and replays the
+    /// local changes in a later commit, so a statement that runs between the two commits reads
+    /// the database without the local changes. These two stream kinds have those problems on a
+    /// WAL database too. Other pulls on a WAL database apply the remote pages and replay the
+    /// local changes in one commit, so other connections run during them.
+    fn stream_needs_sync_busy_gate(&self, stream_kind: DbChangesStreamKind) -> bool {
+        // No wildcard arm: a new stream kind must state whether its apply code needs the gate.
+        let stream_needs_gate = match stream_kind {
+            DbChangesStreamKind::Logical | DbChangesStreamKind::ReplaceBasePages => true,
+            DbChangesStreamKind::LegacyPages | DbChangesStreamKind::Pages => false,
+        };
+        self.main_tape.mvcc_enabled() || stream_needs_gate
+    }
+
     /// Sync all new changes from remote DB and apply them locally
     /// This method will **not** send local changed to the remote
     /// This method will block writes for the period of pull
@@ -2004,7 +2033,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<BTreeMap<u64, String>> {
         tracing::info!("apply_logical_mvcc_changes(path={})", self.main_db_path);
 
-        let conn = connect_untracked(&self.main_tape)?;
+        let conn = self.connect_for_pull(DbChangesStreamKind::Logical)?;
         let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
         let (local_pull_gen, local_last_change_id) =
             read_last_change_id(coro, &conn, &self.client_unique_id).await?;
@@ -2188,6 +2217,30 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         apply_result
     }
 
+    /// Opens a connection for a pull's apply code, with the pull's busy timeout.
+    fn connect_for_pull(
+        &self,
+        stream_kind: DbChangesStreamKind,
+    ) -> Result<Arc<turso_core::Connection>> {
+        let conn = connect_untracked(&self.main_tape)?;
+        conn.set_busy_timeout(self.pull_busy_timeout(stream_kind));
+        Ok(conn)
+    }
+
+    /// How long a pull waits for other connections' transactions before it fails with Busy.
+    ///
+    /// A pull that needs the SDK's sync busy gate does not wait. The gate fails the app's
+    /// statements while the pull runs, so the app cannot commit to end the wait. An app
+    /// without the gate could commit during the wait, and the apply code of those pulls is
+    /// not safe against that (see `apply_needs_sync_busy_gate`).
+    fn pull_busy_timeout(&self, stream_kind: DbChangesStreamKind) -> std::time::Duration {
+        if self.stream_needs_sync_busy_gate(stream_kind) {
+            std::time::Duration::ZERO
+        } else {
+            self.opts.busy_timeout
+        }
+    }
+
     #[allow(dead_code)]
     async fn reject_replace_base_pages_apply_until_wired<Ctx>(
         &self,
@@ -2227,7 +2280,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let replace_base_pages = matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages);
 
         let mut revert_session = WalSession::new(revert_conn.clone());
-        revert_session.begin(coro, self.opts.busy_timeout).await?;
+        revert_session
+            .begin(coro, self.pull_busy_timeout(stream_kind))
+            .await?;
 
         // start of the pull updates apply process
         // during this process we need to be very careful with the state of the WAL as at some points it can be not safe to read data from it
@@ -2235,7 +2290,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // 1. we are in the middle of rollback or apply from remote WAL - so DB now is in some weird state and no operations can be made safely
         // 2. after rollback or apply from remote WAL it's unsafe to prepare statements because schema cookie can go "back in time" and we first need to adjust it before executing any statement over DB
         let mut main_session = WalSession::new(main_conn.clone());
-        main_session.begin(coro, self.opts.busy_timeout).await?;
+        main_session
+            .begin(coro, self.pull_busy_timeout(stream_kind))
+            .await?;
 
         // we need to make sure that updates from the session will not be commited accidentally in the middle of the pull process
         // in order to achieve that we mark current session as "nested program" which eliminates possibility that data will be actually commited without our explicit command
@@ -2477,7 +2534,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             "replace-base snapshot",
                         )?;
 
-                        let mut conn = match connect_untracked(&self.main_tape) {
+                        let mut conn = match self.connect_for_pull(stream_kind) {
                             Ok(conn) => conn,
                             Err(Error::TursoError(LimboError::SchemaUpdated)) => {
                                 force_reparse_schema_with_retry(&main_conn).map_err(|error| {
@@ -2485,7 +2542,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         "failed to refresh schema after replace-base reconnect schema update: {error}",
                                     ))
                                 })?;
-                                connect_untracked(&self.main_tape).map_err(|error| {
+                                self.connect_for_pull(stream_kind).map_err(|error| {
                                     Error::DatabaseSyncEngineError(format!(
                                         "failed to reconnect after replace-base schema refresh: {error}",
                                     ))
@@ -2508,7 +2565,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             &conn,
                             "replace-base sync table initialization",
                         )?;
-                        conn = match connect_untracked(&self.main_tape) {
+                        conn = match self.connect_for_pull(stream_kind) {
                             Ok(conn) => conn,
                             Err(Error::TursoError(LimboError::SchemaUpdated)) => {
                                 force_reparse_schema_with_retry(&main_conn).map_err(|error| {
@@ -2516,7 +2573,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         "failed to refresh schema after replace-base sync table initialization: {error}",
                                     ))
                                 })?;
-                                connect_untracked(&self.main_tape).map_err(|error| {
+                                self.connect_for_pull(stream_kind).map_err(|error| {
                                     Error::DatabaseSyncEngineError(format!(
                                         "failed to reconnect after replace-base sync table initialization: {error}",
                                     ))
@@ -2666,7 +2723,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 // once, at the end of apply, after the replay connection recreates turso_cdc.
                 refresh_schema_after_raw_wal_replay_local(&main_conn, "raw WAL replay")?;
 
-                let conn = connect_untracked(&self.main_tape).map_err(|error| {
+                let conn = self.connect_for_pull(stream_kind).map_err(|error| {
                     Error::DatabaseSyncEngineError(format!(
                         "failed to open post-raw-apply replay connection: {error}",
                     ))
