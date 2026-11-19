@@ -85,6 +85,55 @@ test('no-native-call-overlap-with-worker-tasks', async () => {
     expect(overlaps).toBe(0);
 })
 
+test.each(['connected', 'lazy'])('preparing SQL waits for an in-flight sync worker (%s)', async preparation => {
+    const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 10 });
+    const deferred = preparation === 'lazy' ? await db.prepare('SELECT 42 AS answer') : undefined;
+    await db.connect();
+    let enteredWorker: () => void;
+    let releaseWorker: () => void;
+    const entered = new Promise<void>(resolve => { enteredWorker = resolve; });
+    const release = new Promise<void>(resolve => { releaseWorker = resolve; });
+    const originalResume = (GeneratorHolder as any).prototype.resumeAsync;
+    const originalPrepare = (NativeDatabase as any).prototype.prepare;
+    let paused = false;
+    let firstResume = true;
+    let overlaps = 0;
+    (GeneratorHolder as any).prototype.resumeAsync = async function (...args: any[]) {
+        const result = await originalResume.apply(this, args);
+        if (firstResume) {
+            firstResume = false;
+            paused = true;
+            enteredWorker();
+            await release;
+            paused = false;
+        }
+        return result;
+    };
+    (NativeDatabase as any).prototype.prepare = function (...args: any[]) {
+        if (paused) overlaps += 1;
+        return originalPrepare.apply(this, args);
+    };
+    let pull: Promise<boolean> | undefined;
+    let query: Promise<any> | undefined;
+    try {
+        pull = db.pull();
+        await entered;
+        query = deferred ? deferred.get() : db.prepare('SELECT 42 AS answer').then(statement => statement.get());
+        await Promise.resolve();
+        releaseWorker();
+        const result = await query;
+        await pull;
+        expect(result).toEqual({ answer: 42 });
+        expect(overlaps).toBe(0);
+    } finally {
+        releaseWorker();
+        await Promise.allSettled([pull, query]);
+        (GeneratorHolder as any).prototype.resumeAsync = originalResume;
+        (NativeDatabase as any).prototype.prepare = originalPrepare;
+        await db.close();
+    }
+});
+
 test('open non-sync db', async () => {
     const db = await connect({ path: 'local.db' });
     await db.exec("CREATE TABLE t(x)");
