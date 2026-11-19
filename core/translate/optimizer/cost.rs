@@ -2,7 +2,7 @@ use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::optimizer::constraints::RangeConstraintRef;
+use crate::translate::optimizer::constraints::{EqConstraintRef, RangeConstraintRef};
 use crate::translate::plan::JoinedTable;
 use turso_parser::ast;
 
@@ -384,6 +384,61 @@ pub(crate) fn estimate_rows_per_seek(
         .product();
 
     (selectivity_multiplier * *base_row_count).max(1.0) * join_probe_constant_selectivity
+}
+
+/// Estimate how many rows one value of an IN seek matches.
+///
+/// `eq_prefix` holds the equalities on the index columns before the one the
+/// IN constrains, which is the constraint at `in_constraint_pos`.
+pub(crate) fn estimate_rows_per_in_seek_value(
+    index_info: IndexInfo,
+    constraints: &[Constraint],
+    eq_prefix: &[RangeConstraintRef],
+    in_constraint_pos: usize,
+    base_row_count: RowCountEstimate,
+    analyze_ctx: Option<&AnalyzeCtx>,
+    params: &CostModelParams,
+) -> f64 {
+    // The IN column completes the key of a unique index.
+    if index_info.unique && eq_prefix.len() + 1 >= index_info.column_count {
+        return 1.0;
+    }
+    let base = *base_row_count;
+    if eq_prefix.is_empty() {
+        return (base * params.sel_eq_indexed).sqrt().max(1.0);
+    }
+    if let Some(ctx) = analyze_ctx {
+        let mut refs = eq_prefix.to_vec();
+        refs.push(RangeConstraintRef {
+            table_col_pos: constraints[in_constraint_pos].table_col_pos,
+            index_col_pos: eq_prefix.len(),
+            sort_order: ast::SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
+            eq: Some(EqConstraintRef {
+                constraint_pos: in_constraint_pos,
+                is_const: false,
+                null_matching: false,
+            }),
+            lower_bound: None,
+            upper_bound: None,
+        });
+        if let Some(rows) = estimate_rows_from_analyze_stats(ctx, &refs) {
+            return rows.max(1.0);
+        }
+    }
+    let prefix_selectivity: f64 = eq_prefix
+        .iter()
+        .map(|cref| {
+            // `in_seek_eq_prefix` only returns references that have an equality.
+            let eq = cref
+                .eq
+                .as_ref()
+                .expect("an IN seek prefix column has an equality");
+            constraints[eq.constraint_pos].selectivity
+        })
+        .product();
+    let rows_per_prefix = (prefix_selectivity * base).max(1.0);
+    (rows_per_prefix * params.sel_eq_indexed).sqrt().max(1.0)
 }
 
 fn join_probe_constant_selectivity(

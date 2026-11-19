@@ -55,14 +55,25 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN part
-|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
-|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
-|--CORRELATED SCALAR SUBQUERY 1
-|  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
-|  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
-|  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|  `--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+|--MATERIALIZE hash build input for nation
+|  |--HASH JOIN nation
+|  |--SCAN supplier
+|  `--SCAN region
+|--MATERIALIZE hash build input for supplier
+|  |--HASH JOIN supplier
+|  `--SCAN region
+|--HASH JOIN partsupp
+|--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH scalar_subquery_t6 USING INDEX ephemeral_subquery_t6 (correlation_key_0=?)
+|  |--MATERIALIZE hash build input for nation
+|  |  |--HASH JOIN nation
+|  |  |--SCAN supplier
+|  |  `--SCAN region
+|  |--MATERIALIZE hash build input for supplier
+|  |  |--HASH JOIN supplier
+|  |  `--SCAN region
+|  |--HASH JOIN partsupp
+|  |--SCAN region
+|  `--USE SORTER FOR GROUP BY
+|--SCAN region
 `--USE SORTER FOR ORDER BY

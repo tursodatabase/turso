@@ -408,8 +408,16 @@ fn estimate_selectivity(
 
     match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
-            let is_pk_or_rowid_alias =
-                is_rowid || column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+            // A column of a composite PRIMARY KEY is not unique on its own, so
+            // it is costed like a column of a composite UNIQUE index (below).
+            // Equalities on every PK column are a unique point lookup, which
+            // `is_unique_point_lookup` recognizes.
+            let in_composite_pk = table_reference
+                .btree()
+                .is_some_and(|t| t.primary_key_columns.len() > 1);
+            let is_pk_or_rowid_alias = is_rowid
+                || column
+                    .is_some_and(|c| c.is_rowid_alias() || (c.primary_key() && !in_composite_pk));
 
             let selectivity_when_unique = if row_count > 0 {
                 1.0 / row_count as f64

@@ -49,6 +49,15 @@ pub(crate) fn seek_constraint_annotation(
     }
 }
 
+fn in_seek_constraint_annotation(index: &crate::schema::Index, prefix_len: usize) -> String {
+    let parts = super::eqp::in_seek_constraint_parts(Some(index), prefix_len);
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(" AND "))
+    }
+}
+
 impl Display for Aggregate {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let args_str = self
@@ -193,13 +202,11 @@ impl Display for SelectPlan {
                             )?;
                         }
                         Search::InSeek {
-                            index: Some(index), ..
+                            index: Some(index),
+                            prefix,
+                            ..
                         } => {
-                            let constraint = if let Some(col) = index.columns.first() {
-                                format!(" ({}=?)", col.name)
-                            } else {
-                                String::new()
-                            };
+                            let constraint = in_seek_constraint_annotation(index, prefix.len());
                             let covering = if reference.utilizes_covering_index() {
                                 "COVERING "
                             } else {
@@ -307,13 +314,11 @@ impl Display for DeletePlan {
                         )?;
                     }
                     Search::InSeek {
-                        index: Some(index), ..
+                        index: Some(index),
+                        prefix,
+                        ..
                     } => {
-                        let constraint = if let Some(col) = index.columns.first() {
-                            format!(" ({}=?)", col.name)
-                        } else {
-                            String::new()
-                        };
+                        let constraint = in_seek_constraint_annotation(index, prefix.len());
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}{constraint}",
@@ -427,13 +432,11 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                     Search::InSeek {
-                        index: Some(index), ..
+                        index: Some(index),
+                        prefix,
+                        ..
                     } => {
-                        let constraint = if let Some(col) = index.columns.first() {
-                            format!(" ({}=?)", col.name)
-                        } else {
-                            String::new()
-                        };
+                        let constraint = in_seek_constraint_annotation(index, prefix.len());
                         writeln!(
                             f,
                             "{}SEARCH {} USING INDEX {}{constraint}",
