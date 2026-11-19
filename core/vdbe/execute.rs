@@ -9060,10 +9060,10 @@ fn op_window_inverse(
 }
 
 pub fn op_agg_inverse(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
@@ -9094,7 +9094,7 @@ pub fn op_agg_inverse(
     };
     let payload = agg.payload_mut();
     let counts_infinite_inputs = matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-        && program.connection.dialect().sum_counts_infinite_inputs();
+        && connection.dialect().sum_counts_infinite_inputs();
     inverse_agg_payload(func, arg, payload, counts_infinite_inputs)?;
 
     state.pc += 1;
@@ -9447,10 +9447,10 @@ fn sum_of_infinite_inputs(pos_inf: &Value, neg_inf: &Value) -> Option<Value> {
 }
 
 pub fn op_agg_step(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
@@ -9586,11 +9586,15 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(program, state, data)
+    op_agg_step_slow(state, data, connection)
 }
 
 #[inline(never)]
-fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+fn op_agg_step_slow(
+    state: &mut ProgramState,
+    data: &AggStepData,
+    connection: &Connection,
+) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -9688,7 +9692,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
             let payload = agg.payload_vec_mut();
             let counts_infinite_inputs =
                 matches!(func, AggFunc::Sum | AggFunc::Total | AggFunc::Avg)
-                    && program.connection.dialect().sum_counts_infinite_inputs();
+                    && connection.dialect().sum_counts_infinite_inputs();
             update_agg_payload(
                 func,
                 arg,
