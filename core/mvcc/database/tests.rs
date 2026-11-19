@@ -19,7 +19,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Completion, ConnectOpts, DatabaseOpts, EncryptionKey, LimboError, Numeric, OpenFlags};
+use crate::{Completion, ConnectOpts, DatabaseOpts, LimboError, OpenFlags};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::SeedableRng;
@@ -28,9 +28,6 @@ use std::sync::Arc;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
-    path: Option<String>,
-    opts: DatabaseOpts,
-    enc_opts: Option<crate::EncryptionOpts>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -806,9 +803,6 @@ impl MvccTestDbNoConn {
         conn.close().unwrap();
         Self {
             db: Some(db),
-            path: None,
-            opts,
-            enc_opts: None,
             _temp_dir: None,
         }
     }
@@ -852,37 +846,8 @@ impl MvccTestDbNoConn {
         conn.close().unwrap();
         Self {
             db: Some(db),
-            path: Some(path.to_str().unwrap().to_string()),
-            opts,
-            enc_opts: None,
             _temp_dir: Some(temp_dir),
         }
-    }
-
-    /// Restarts the database, make sure there is no connection to the database open before calling this!
-    pub fn restart(&mut self) {
-        self.restart_result().unwrap();
-    }
-
-    /// Like `restart`, but returns the error instead of panicking.
-    /// Useful for testing wrong-key scenarios.
-    pub fn restart_result(&mut self) -> crate::Result<()> {
-        // Remove this database from the database manager in order to force restart.
-        // If not, we will load the same database instance again.
-        let path = self.path.as_ref().unwrap();
-        remove_file_from_database_registry(path);
-        // Now open again.
-        let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::default(),
-            self.opts,
-            self.enc_opts.clone(),
-            Arc::new(SqliteDialect),
-        )?;
-        self.db.replace(db);
-        Ok(())
     }
 
     /// Asumes there is a database open
@@ -891,12 +856,8 @@ impl MvccTestDbNoConn {
     }
 
     pub fn connect(&self) -> Arc<Connection> {
-        let enc_key = self
-            .enc_opts
-            .as_ref()
-            .map(|e| EncryptionKey::from_hex_string(&e.hexkey).unwrap());
         self.get_db()
-            .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(enc_key))
+            .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap()
     }
 
@@ -962,9 +923,10 @@ use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::schema::IndexColumn;
 use crate::security::roles::SessionRole;
 use crate::types::Text;
+use crate::Database;
 use crate::MemoryIO;
+use crate::StepResult;
 use crate::Value;
-use crate::{Database, StepResult};
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -4569,126 +4531,6 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
 
 // ─── End-to-end GC + dual cursor tests ───────────────────────────────────
 
-/// Regression test for MVCC concurrent commit spinning inside one step.
-///
-/// A COMMIT that finds `pager_commit_lock` held parks on a completion the
-/// lock holder finishes. `step()` must return right away with IO, never
-/// spin inside a single call, or cooperative schedulers deadlock.
-///
-/// We simulate lock contention by pre-acquiring pager_commit_lock before
-/// calling COMMIT.
-#[test]
-fn test_concurrent_commit_yield_spin() {
-    let db = MvccTestDbNoConn::new();
-    let conn = db.connect();
-
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
-
-    let mv_store = db.get_mvcc_store();
-    let coordinator = &mv_store.commit_coordinator;
-    assert!(coordinator.pager_commit_lock.write(), "should acquire lock");
-
-    let mut stmt = conn.prepare("COMMIT").unwrap();
-    assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
-        "step() should park when pager_commit_lock is contended"
-    );
-    assert_eq!(coordinator.parked_tickets().len(), 1);
-
-    coordinator.unlock_pager_commit_lock();
-    loop {
-        match stmt.step().unwrap() {
-            crate::StepResult::Done => break,
-            crate::StepResult::IO => {}
-            _ => {}
-        }
-    }
-
-    // Verify the insert is visible
-    let rows = get_rows(&conn, "SELECT COUNT(*) FROM t");
-    assert_eq!(rows[0][0].as_int().unwrap(), 1);
-}
-
-fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::MvStore>) {
-    let coordinator = &mv_store.commit_coordinator;
-    assert!(
-        coordinator.pager_commit_lock.write(),
-        "should acquire commit lock"
-    );
-
-    let mut stmt = conn.prepare("COMMIT").unwrap();
-    assert!(
-        matches!(stmt.step().unwrap(), crate::StepResult::IO),
-        "COMMIT should park while the commit lock is held",
-    );
-    assert_eq!(coordinator.parked_tickets().len(), 1);
-
-    drop(stmt);
-    assert!(
-        coordinator.parked_tickets().is_empty(),
-        "dropping a parked COMMIT withdraws it from the queue"
-    );
-    coordinator.unlock_pager_commit_lock();
-    conn.close().unwrap();
-}
-
-/// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those
-/// inserted rows should not be visible
-#[test]
-fn test_abandoned_commit_rolls_back_insert() {
-    let db = MvccTestDbNoConn::new();
-    let conn = db.connect();
-
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
-
-    let mv_store = db.get_mvcc_store();
-    abandon_commit_after_first_io(&conn, &mv_store);
-
-    let observer = db.connect();
-    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 1");
-    assert!(
-        rows.is_empty(),
-        "row from abandoned INSERT commit remained visible: {rows:?}",
-    );
-    observer.close().unwrap();
-}
-
-/// if a txn deleted some existing rows, but then aborted (or abandoned due to some IO issue), then
-/// those rows should not become deleted
-#[test]
-fn test_abandoned_commit_rolls_back_delete() {
-    let db = MvccTestDbNoConn::new();
-    let conn = db.connect();
-
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
-
-    let mv_store = db.get_mvcc_store();
-    abandon_commit_after_first_io(&conn, &mv_store);
-
-    let observer = db.connect();
-    let rows = get_rows(&observer, "SELECT id, v FROM t WHERE id = 1");
-    assert_eq!(
-        rows,
-        vec![vec![
-            Value::Numeric(Numeric::Integer(1)),
-            Value::Text(Text::new("seed".to_string())),
-        ]],
-        "row disappeared after abandoned DELETE commit: {rows:?}",
-    );
-    observer.close().unwrap();
-}
-
 #[cfg(feature = "conn_raw_api")]
 fn collect_mvcc_portable_change_bytes(conn: &Arc<Connection>) -> Vec<u8> {
     let mv_store = conn
@@ -5325,9 +5167,6 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
-
-#[path = "group_commit_sync_mode_tests.rs"]
-mod group_commit_sync_mode_tests;
 
 fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(

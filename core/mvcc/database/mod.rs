@@ -8162,9 +8162,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.commit_coordinator.group_commit_enabled()
     }
 
-    #[cfg(test)]
+    /// Number of commit records that the last group commit wrote together.
+    #[cfg(any(test, feature = "test_helper"))]
     pub fn last_group_commit_size(&self) -> usize {
         self.commit_coordinator.last_group_size()
+    }
+
+    /// Takes the lock that a commit holds while it writes the logical log, so
+    /// that commits started meanwhile wait for it. Returns false if it is
+    /// already held.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn lock_commits_for_testing(&self) -> bool {
+        self.commit_coordinator.pager_commit_lock.write()
+    }
+
+    /// Releases the lock taken by [`Self::lock_commits_for_testing`] and wakes
+    /// the commits that wait for it.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn unlock_commits_for_testing(&self) {
+        self.commit_coordinator.unlock_pager_commit_lock();
+    }
+
+    /// Number of commits that wait for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn waiting_commit_count_for_testing(&self) -> usize {
+        self.commit_coordinator.parked_tickets().len()
+    }
+
+    /// Number of times commits ran the step that waits for the commit lock.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn commit_wait_count_for_testing(&self) -> usize {
+        self.commit_coordinator.park_calls()
     }
 
     /// Whether an incremental GC pass should run now: inline GC is enabled
