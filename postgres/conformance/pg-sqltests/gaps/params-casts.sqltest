@@ -542,3 +542,14 @@ expect {
     2
     1
 }
+
+# A-81: numeric(10,2) column rounds on insert
+test gap-a-81-numeric-10-2-column-rounds-on-insert {
+    CREATE TABLE t (v numeric(10,2));
+    INSERT INTO t VALUES (1.005), (1.5);
+    SELECT v FROM t;
+}
+expect {
+    1.01
+    1.50
+}

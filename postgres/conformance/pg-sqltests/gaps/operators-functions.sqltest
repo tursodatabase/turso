@@ -1244,3 +1244,58 @@ expect {
 expect @tursopg {
     1|1
 }
+
+# B-128 (S1): jsonb || concatenates two objects
+# B-122 also uses ||. After a fix, the output still differs because of A-45.
+test gap-b-128-jsonb-concatenates-two-objects {
+    SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb;
+}
+expect {
+    {"a": 1, "b": 2}
+}
+expect @tursopg {
+    {"a":1}{"b":2}
+}
+
+# B-129 (S1): jsonb - removes a key
+# B-122 also uses -. After a fix, the output still differs because of A-45.
+test gap-b-129-jsonb-removes-a-key {
+    SELECT '{"a":1,"b":2}'::jsonb - 'a';
+}
+expect {
+    {"b": 2}
+}
+expect @tursopg {
+    0
+}
+
+# B-130 (S2): 16 nested scalar subqueries
+# Same cause as B-124. tursopg accepts 15 levels, so this is the first depth that fails.
+test gap-b-130-16-nested-scalar-subqueries {
+    SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT 1))))))))))))))));
+}
+expect {
+    1
+}
+@sqlstate 42601
+expect @tursopg error {}
+
+# B-131 (S2): pg_options_to_table with a column alias list
+test gap-b-131-pg-options-to-table-with-a-column-alias-list {
+    SELECT o.k, o.v FROM pg_options_to_table(ARRAY['a=1']) AS o(k, v);
+}
+expect {
+    a|1
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# B-132 (S2): pg_size_pretty
+test gap-b-132-pg-size-pretty {
+    SELECT pg_size_pretty(8192::bigint), pg_size_pretty(10485760::bigint);
+}
+expect {
+    8192 bytes|10 MB
+}
+@sqlstate 42883
+expect @tursopg error {}
