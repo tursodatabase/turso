@@ -1,0 +1,57 @@
+# Status: prepared, not run on GitHub yet. I timed these exact commands on a
+# local machine (see PR description): about 3 minutes, with Quint 0.33.1 and
+# Temurin 21. I could not run this file on a GitHub runner, so the runner label,
+# the Apalache download and the Quint install are untested here. Look at the
+# first run of this job before you require it.
+#
+# This job checks the Quint specs only. It does not check that the Rust code
+# in core/mvcc follows the specs. The main configurations take 3.5 to 17
+# minutes, so they are not in this job. Run them by hand with `make check` in
+# quint/mvcc-passive-checkpoint.
+name: Quint Spec
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "quint/**"
+      - "core/mvcc/**"
+      - ".github/workflows/quint-spec.yml"
+  pull_request:
+    paths:
+      - "quint/**"
+      - "core/mvcc/**"
+      - ".github/workflows/quint-spec.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  quint-spec:
+    name: Typecheck and run small variants
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: quint/mvcc-passive-checkpoint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+      - name: Install Quint
+        run: npm install -g @informalsystems/quint@0.33.1
+      - name: Typecheck the specs
+        run: make typecheck
+      # Each variant below must fail the invariant that its comment names.
+      # Each one finishes in about 15 to 30 seconds.
+      - name: Run small variants
+        run: >-
+          make variants WORKERS=4
+          ONLY="noSnapshotClamp noGcWait noBackfillStop setvalRace noDeferDeletes issue11501 issue11502 issue8004"

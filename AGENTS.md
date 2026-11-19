@@ -104,6 +104,7 @@ limbo/
 - **[Storage Format](docs/agent-guides/storage-format.md)** - file format, B-trees, pages
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
 - **[MVCC](docs/agent-guides/mvcc.md)** - multi-version concurrency, snapshot isolation, checkpointing
+- **[Quint modeling](.claude/skills/quint-modeling/SKILL.md)** - model and check MVCC designs, reproduce model bugs in Rust, simplify with the same guarantees
 
 ## Commit Messages
 
