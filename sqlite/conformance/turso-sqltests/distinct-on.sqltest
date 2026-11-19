@@ -1,0 +1,97 @@
+@database :memory:
+
+# SELECT DISTINCT ON, a Turso extension to SQLite that follows PostgreSQL.
+
+setup rows {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 10, 'x'), (1, 20, 'y'), (2, 30, 'z'), (2, 5, 'w'),
+                         (NULL, 1, 'n1'), (NULL, 2, 'n2'), (3, NULL, 'q'), (3, 7, 'r');
+}
+
+@setup rows
+test order-by-must-start-with-the-distinct-on-expression {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY b;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-must-keep-the-operand-order-of-the-key {
+    SELECT DISTINCT ON (a + b) a, b FROM t ORDER BY b + a;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-must-list-every-distinct-on-expression-before-another-term {
+    SELECT DISTINCT ON (a, b) a, b, c FROM t ORDER BY a, c, b;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-of-a-different-expression-over-the-same-column-does-not-match {
+    SELECT DISTINCT ON (a) a, b FROM t ORDER BY a + 0, b;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test order-by-with-another-collation-does-not-match {
+    SELECT DISTINCT ON (c) c FROM t ORDER BY c COLLATE NOCASE;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test integer-arithmetic-is-an-expression-and-not-a-select-list-position {
+    SELECT DISTINCT ON (1 + 0) a, b FROM t ORDER BY 1, 2;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test name-of-an-output-column-wins-over-a-table-column {
+    SELECT DISTINCT ON (b) a AS b, b AS a FROM t ORDER BY 2, 1;
+}
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
+@setup rows
+test position-past-the-select-list {
+    SELECT DISTINCT ON (3) a, b FROM t;
+}
+expect error {
+    1st DISTINCT ON term out of range - should be between 1 and 2
+}
+
+@setup rows
+test position-zero {
+    SELECT DISTINCT ON (0) a, b FROM t;
+}
+expect error {
+    1st DISTINCT ON term out of range - should be between 1 and 2
+}
+
+@setup rows
+test negative-position {
+    SELECT DISTINCT ON (-1) a, b FROM t;
+}
+expect error {
+    1st DISTINCT ON term out of range - should be between 1 and 2
+}
+
+@setup rows
+test unknown-column {
+    SELECT DISTINCT ON (nosuch) a FROM t;
+}
+expect error {
+    no such column: nosuch
+}

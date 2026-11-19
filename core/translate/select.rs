@@ -31,7 +31,7 @@ use crate::translate::subquery::{
     plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
 };
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -415,15 +415,13 @@ fn prepare_one_select_plan(
                 offset: None,
                 contains_constant_false_condition: false,
                 query_destination,
-                distinctness: match distinctness {
+                distinctness: match &distinctness {
                     Some(ast::SelectDistinctness::Distinct) => Distinctness::Distinct {
                         ctx: None,
                         ordered: false,
                     },
-                    Some(ast::SelectDistinctness::All) | None => Distinctness::NonDistinct,
-                    Some(ast::SelectDistinctness::DistinctOn(_)) => {
-                        crate::bail_parse_error!("SELECT DISTINCT ON is not supported")
-                    }
+                    Some(ast::SelectDistinctness::All | ast::SelectDistinctness::DistinctOn(_))
+                    | None => Distinctness::NonDistinct,
                 },
                 values: vec![],
                 window: None,
@@ -743,6 +741,11 @@ fn prepare_one_select_plan(
                 } else {
                     i += 1;
                 }
+            }
+
+            if let Some(ast::SelectDistinctness::DistinctOn(distinct_on)) = distinctness {
+                sort_by_distinct_on_exprs(distinct_on, &mut key, &mut plan, resolver)?;
+                crate::bail_parse_error!("SELECT DISTINCT ON is not supported");
             }
 
             // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
@@ -1253,6 +1256,68 @@ fn add_vtab_predicates_to_where_clause(
         &mut plan.where_clause,
         resolver,
     )
+}
+
+/// Makes the DISTINCT ON expressions the first ORDER BY terms and returns how many there are.
+///
+/// ORDER BY terms the query wrote keep their place, so they must start with DISTINCT ON
+/// expressions.
+#[allow(clippy::vec_box)]
+fn sort_by_distinct_on_exprs(
+    distinct_on: Vec<Box<ast::Expr>>,
+    order_by: &mut Vec<(Box<ast::Expr>, ast::SortOrder, Option<ast::NullsOrder>)>,
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let mut distinct_exprs: Vec<Box<ast::Expr>> = Vec::with_capacity(distinct_on.len());
+    for mut expr in distinct_on {
+        replace_column_number_with_copy_of_column_expr(
+            &mut expr,
+            &plan.result_columns,
+            "DISTINCT ON",
+        )?;
+        check_sort_name_is_one_output_column(&expr, "DISTINCT ON", plan, resolver)?;
+        let binding = sort_expr_binding(&expr, resolver);
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(&mut plan.table_references),
+            Some(&plan.result_columns),
+            resolver,
+            binding,
+        )?;
+        if !distinct_exprs
+            .iter()
+            .any(|seen| exprs_are_equivalent_as_written(seen, &expr))
+        {
+            distinct_exprs.push(expr);
+        }
+    }
+
+    let is_distinct_expr = |expr: &ast::Expr| {
+        distinct_exprs
+            .iter()
+            .any(|distinct_expr| exprs_are_equivalent_as_written(distinct_expr, expr))
+    };
+    if !order_by
+        .iter()
+        .take(distinct_exprs.len())
+        .all(|(expr, _, _)| is_distinct_expr(expr))
+    {
+        crate::bail_parse_error!(
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        );
+    }
+
+    let distinct_expr_count = distinct_exprs.len();
+    for distinct_expr in distinct_exprs {
+        if !order_by
+            .iter()
+            .any(|(expr, _, _)| exprs_are_equivalent_as_written(expr, &distinct_expr))
+        {
+            order_by.push((distinct_expr, ast::SortOrder::Asc, None));
+        }
+    }
+    Ok(distinct_expr_count)
 }
 
 fn check_sort_name_is_one_output_column(
