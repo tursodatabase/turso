@@ -140,16 +140,27 @@ impl RoleCatalog {
             }
             catalog.add(role);
         }
-        catalog.memberships = Memberships::new(membership_rows)?;
-        let exists = |id| id == RoleId::SUPERUSER || catalog.roles.contains_key(&id);
-        if let Some(membership) = catalog.memberships.iter().find(|membership| {
+        catalog.set_memberships(membership_rows)?;
+        Ok(catalog)
+    }
+
+    /// Replaces the memberships with the rows read from the membership
+    /// table, after checking that each names roles of this catalog.
+    pub(crate) fn set_memberships(
+        &mut self,
+        membership_rows: &[Vec<Value>],
+    ) -> turso_core::Result<()> {
+        let memberships = Memberships::new(membership_rows)?;
+        let exists = |id| id == RoleId::SUPERUSER || self.roles.contains_key(&id);
+        if let Some(membership) = memberships.iter().find(|membership| {
             !exists(membership.role) || !exists(membership.member) || !exists(membership.grantor)
         }) {
             return Err(LimboError::Corrupt(format!(
                 "a role membership names a role that does not exist: {membership:?}"
             )));
         }
-        Ok(catalog)
+        self.memberships = memberships;
+        Ok(())
     }
 
     /// The stored role with id `id`. None for a built-in id.
