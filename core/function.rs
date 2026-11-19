@@ -124,6 +124,9 @@ pub enum ExtFunc {
         arity: crate::native_ext::FunctionArity,
         deterministic: bool,
         return_type: Option<crate::native_ext::ReturnType>,
+        /// Whether a call also gets the type name of each argument, such as
+        /// `boolean[]`, as one more text argument per argument, after them.
+        receives_argument_types: bool,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -156,6 +159,7 @@ impl Drop for ExternalContext {
 }
 
 impl ExtFunc {
+    #[allow(clippy::result_unit_err)]
     pub fn agg_args(&self) -> Result<i32, ()> {
         if let ExtFunc::Aggregate { argc, .. } | ExtFunc::NativeAggregate { argc, .. } = self {
             return Ok(*argc);
@@ -179,6 +183,16 @@ impl ExtFunc {
             | Self::Aggregate { argc, .. }
             | Self::NativeAggregate { argc, .. } => vec![*argc],
         }
+    }
+
+    pub fn receives_argument_types(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeScalar {
+                receives_argument_types: true,
+                ..
+            }
+        )
     }
 
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
@@ -1034,6 +1048,7 @@ pub enum ScalarFunc {
     BooleanToInt,
     IntToBoolean,
     ValidateIpAddr,
+    TemporalEncode,
     // Numeric type functions
     NumericEncode,
     NumericFit,
@@ -1163,6 +1178,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::TemporalEncode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
@@ -1293,6 +1309,7 @@ impl ScalarFunc {
             | Self::Repeat
             | Self::Lpad
             | Self::Rpad
+            | Self::TemporalEncode
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1427,6 +1444,7 @@ impl Display for ScalarFunc {
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
+            Self::TemporalEncode => "temporal_encode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
@@ -1578,7 +1596,8 @@ impl ScalarFunc {
             | Self::NumericEncode
             | Self::NumericDecode
             | Self::NumericNeg => &[1],
-            Self::NumericAdd
+            Self::TemporalEncode
+            | Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
@@ -2021,7 +2040,7 @@ impl Func {
         false
     }
     /// Resolve a built-in function name. Thin wrapper over
-    /// [`crate::dialect::engine::resolve_builtin_function_name`], where the
+    /// [`crate::functions::builtin::resolve_builtin_function_name`], where the
     /// SQLite name table lives; kept on `Func` for the engine call sites
     /// that classify translated AST.
     ///
@@ -2029,7 +2048,7 @@ impl Func {
     /// loading uses this, and a schema written by an older Turso that accepted
     /// such a call must still load. Translating the call rejects it.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        crate::dialect::engine::resolve_builtin_function_name(name, arg_count)
+        crate::functions::builtin::resolve_builtin_function_name(name, arg_count)
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.

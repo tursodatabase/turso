@@ -216,14 +216,26 @@ pub(super) fn emit_array_encode_as(
     target: ArrayEncodeTarget,
 ) -> Result<()> {
     if let Some(resolved) = resolved {
-        if resolved.has_encode_or_coerce() {
+        if resolved.has_encode_or_coerce() || resolved.is_domain() {
             emit_array_leaf_loop(
                 program,
                 reg,
                 col.array_dimensions(),
                 ArrayInput::Text(&target),
                 |program, leaf_reg| {
-                    emit_store_value(program, resolved, leaf_reg, &col.ty_params, resolver)
+                    emit_store_value(
+                        program,
+                        resolved,
+                        leaf_reg,
+                        Coerce::WithArgs(&col.ty_params),
+                        resolver,
+                    )?;
+                    if resolved.is_domain() {
+                        emit_element_domain_constraints(
+                            program, resolved, col, leaf_reg, resolver,
+                        )?;
+                    }
+                    Ok(())
                 },
             )?;
         }
@@ -252,6 +264,32 @@ pub(super) fn emit_array_encode_as(
         }),
     });
     Ok(())
+}
+
+/// Checks the stored array element in `leaf_reg` against the NOT NULL and
+/// CHECK constraints of its domain `resolved`, as a CAST to the domain does:
+/// the CHECKs see the element after DECODE. Each element of a `d[]` column is
+/// a value of domain `d`; the array itself is not, and may be NULL.
+fn emit_element_domain_constraints(
+    program: &mut ProgramBuilder,
+    resolved: &crate::schema::ResolvedType,
+    col: &Column,
+    leaf_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let element_type = ColumnCustomType {
+        type_def: Arc::clone(&resolved.chain[0]),
+        params: col.ty_params.clone(),
+    }
+    .type_name();
+    let decoded_reg = program.alloc_register();
+    program.emit_insn(Insn::Copy {
+        src_reg: leaf_reg,
+        dst_reg: decoded_reg,
+        extra_amount: 0,
+    });
+    emit_decode(program, resolved, decoded_reg, resolver)?;
+    emit_domain_cast_constraints(program, resolved, &element_type, decoded_reg, resolver)
 }
 
 /// Emit bytecode that turns the array an array column `col` stores, in `reg`,
@@ -336,23 +374,13 @@ pub(crate) fn emit_custom_type_encode_columns(
             continue;
         };
 
-        let skip_label = if !resolved.not_null() {
-            // Skip NULL values: jump over encode if NULL
-            let label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label,
-            });
-            Some(label)
-        } else {
-            None
-        };
-
-        emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
-
-        if let Some(label) = skip_label {
-            program.preassign_label_to_next_insn(label);
-        }
+        emit_store_value(
+            program,
+            &resolved,
+            reg,
+            Coerce::WithArgs(&col.ty_params),
+            resolver,
+        )?;
     }
     Ok(())
 }

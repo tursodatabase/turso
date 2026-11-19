@@ -107,6 +107,10 @@ PRAGMA user_version = 3;
 
 Returns one row for each column in the named table.
 
+The table-valued form, `pragma_table_info('table-name')`, takes the table name as
+its first argument. Constraining only its hidden `schema` column does not supply
+a table name and returns no rows.
+
 ```sql
 PRAGMA table_info(table-name);
 ```
@@ -455,6 +459,15 @@ When enabled, CHECK constraints are not enforced.
 ```sql
 PRAGMA ignore_check_constraints = 1;   -- disable CHECK constraints
 PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
+```
+
+### automatic_index
+
+Turso can by default build a temporary index for tables to join faster.
+
+```sql
+PRAGMA automatic_index = 0;   -- off
+PRAGMA automatic_index = 1;   -- on (default)
 ```
 
 ### data_sync_retry

@@ -15,7 +15,7 @@ use differential_fuzzer::printf_gen::{EDGE_CASE_BATTERY, PrintfGenerator};
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use turso_core::{ConnectOpts, Database};
+use turso_core::{ConnectOpts, Database, SessionRole};
 use turso_sqlite::SqliteDialect;
 
 #[derive(Parser, Debug)]
@@ -280,7 +280,7 @@ impl FuzzerState {
             out_dir.join("printf-test.db").to_str().unwrap(),
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect(ConnectOpts::new())?;
+        let turso_conn = turso_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         let sqlite_conn =
             rusqlite::Connection::open_in_memory().context("Failed to open SQLite database")?;

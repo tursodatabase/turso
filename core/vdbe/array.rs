@@ -37,7 +37,7 @@ pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
 
 /// [parse_text_array] for an array whose elements are texts, such as a
 /// `text[]`: an unquoted `1.0` stays the text `1.0`.
-pub(crate) fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
+pub fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
     parse_text_array_as(text, UnquotedElements::Texts)
 }
 

@@ -1,4 +1,5 @@
-use divan::{black_box, Bencher};
+use divan::black_box;
+use turso_benches::Bencher;
 use turso_core::functions::datetime::{
     exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_timediff,
     exec_unixepoch,

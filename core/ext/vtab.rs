@@ -6,13 +6,13 @@ use crate::{Connection, IOResult, LimboError, Result, Value};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 
 #[derive(Clone, Debug)]
-pub(crate) enum ModuleImplementation {
+pub enum ModuleImplementation {
     C(Arc<VTabModuleImpl>),
     Native(Arc<dyn ModuleFactory>),
 }
 
 impl ModuleImplementation {
-    pub(crate) fn create_schema(&self, args: Vec<Value>) -> Result<String> {
+    pub fn create_schema(&self, args: Vec<Value>) -> Result<String> {
         match self {
             Self::C(module) => Ok(module.create_schema(args.iter().map(Value::to_ffi).collect())?),
             Self::Native(module) => module.schema(&args),

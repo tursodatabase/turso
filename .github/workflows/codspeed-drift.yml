@@ -1,0 +1,48 @@
+name: CodSpeed drift
+
+# Once a week, open an issue listing benchmarks that got slower on main since the
+# previous issue, with the commit that made each one slower. See
+# scripts/codspeed-drift.sh.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Report benchmarks at least this much slower (0.05 = 5%)"
+        default: "0.05"
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: codspeed-drift
+
+jobs:
+  drift:
+    if: github.repository == 'tursodatabase/turso'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CODSPEED_DRIFT_THRESHOLD: ${{ inputs.threshold || '0.05' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Report slower benchmarks
+        run: |
+          # CodSpeed action v5 and the batched divan benchmarks changed every
+          # benchmark's value once, so runs from before the commit that switched
+          # to v5 are not compared with later runs.
+          CODSPEED_DRIFT_NOT_BEFORE=$(git log --first-parent --reverse --format=%H -S 'CodSpeedHQ/action@v5' \
+            origin/main -- .github/workflows/codspeed.yml | head -n 1)
+          export CODSPEED_DRIFT_NOT_BEFORE
+          scripts/codspeed-drift.sh --update-issue

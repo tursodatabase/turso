@@ -28,6 +28,7 @@ use turso_sqlite::SqliteDialect;
 
 use crate::memory::MemorySimIO;
 use crate::oracle::{DifferentialOracle, QueryResult, QueryValue};
+use turso_core::SessionRole;
 
 /// Upper bound on candidate executions per shrink, so a pathological
 /// statement cannot stall a fuzzing loop.
@@ -101,7 +102,7 @@ impl EnginePair {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso = turso_db.connect(ConnectOpts::new())?;
+        let turso = turso_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
             let stmt = stmt.trim();
