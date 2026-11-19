@@ -395,6 +395,8 @@ test datetime-input-rejects-posix-time-zone {
 expect error {
     invalid input syntax for type timestamp: "2024-01-05 z10:00"
 }
+@sqlstate 0A000
+expect @tursopg error {}
 
 # A string compared with a date or time column is read as a value of the
 # column's type, in any input form, whether the query scans the table or
@@ -1279,6 +1281,8 @@ test datetime-input-rejects-order-5-2024-jan {
 expect error {
     invalid input syntax for type timestamp: "5 2024 Jan"
 }
+@sqlstate 0A000
+expect @tursopg error {}
 
 test datetime-input-rejects-order-10-00-2024-01-05 {
     CREATE TABLE t(ts timestamp);
@@ -1384,4 +1388,143 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {
     using type timestamptz in CREATE TABLE AS is not supported
+}
+
+# PostgreSQL reads these, so Turso refuses them with 0A000, not 22007.
+test datetime-input-special-values-are-not-supported {
+    SELECT 'infinity'::timestamptz, 'epoch'::timestamptz;
+}
+expect {
+    infinity|1970-01-01 00:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the timestamp with time zone value "infinity" is not supported
+}
+
+test datetime-input-time-zone-name-is-not-supported {
+    SELECT '2024-01-05 10:00 America/New_York'::timestamptz;
+}
+expect {
+    2024-01-05 15:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp with time zone input is not supported: "2024-01-05 10:00 America/New_York"
+}
+
+test datetime-input-time-zone-abbreviation-is-not-supported {
+    SELECT '2024-01-05 10:00 EST'::timestamptz;
+}
+expect {
+    2024-01-05 15:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp with time zone input is not supported: "2024-01-05 10:00 EST"
+}
+
+test datetime-input-day-name-is-not-supported {
+    SELECT 'Fri Jan 5 2024'::timestamp;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp input is not supported: "Fri Jan 5 2024"
+}
+
+test datetime-input-month-day-year-is-not-supported {
+    SELECT '01/05/2024'::timestamp;
+}
+expect {
+    2024-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp input is not supported: "01/05/2024"
+}
+
+test datetime-input-bc-is-not-supported {
+    SELECT '2024-01-05 10:00 BC'::timestamp;
+}
+expect {
+    2024-01-05 10:00:00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    BC dates are not supported for type timestamp: "2024-01-05 10:00 BC"
+}
+
+test datetime-input-year-after-9999-is-not-supported {
+    SELECT '10000-01-05'::timestamp;
+}
+expect {
+    10000-01-05 00:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    years must be written with 4 digits, from 0001 to 9999: "10000-01-05"
+}
+
+test datetime-input-offset-into-year-0-is-not-supported {
+    SELECT '0001-01-01 00:00+01'::timestamptz;
+}
+expect {
+    0001-12-31 23:00:00+00 BC
+}
+@sqlstate 0A000
+expect @tursopg error {
+    timestamp with time zone values must be between years 0001 and 9999
+}
+
+test datetime-input-offset-into-year-10000-is-not-supported {
+    SELECT '9999-12-31 23:00-02'::timestamptz;
+}
+expect {
+    10000-01-01 01:00:00+00
+}
+@sqlstate 0A000
+expect @tursopg error {
+    timestamp with time zone values must be between years 0001 and 9999
+}
+
+test datetime-input-minutes-and-seconds-are-not-supported {
+    SELECT '2024-01-05 10:00.5'::timestamp;
+}
+expect {
+    2024-01-05 00:10:00.5
+}
+@sqlstate 0A000
+expect @tursopg error {
+    this form of timestamp input is not supported: "2024-01-05 10:00.5"
+}
+
+test datetime-input-pg-input-is-valid-of-special-value-is-not-supported {
+    SELECT pg_input_is_valid('infinity', 'timestamptz');
+}
+expect {
+    t
+}
+@sqlstate 0A000
+expect @tursopg error {
+    the timestamp with time zone value "infinity" is not supported
+}
+
+# PostgreSQL rejects these too, so Turso gives the same SQLSTATE.
+test datetime-input-two-dates-are-invalid {
+    SELECT '2024-01-05 2024-01-06'::timestamp;
+}
+@sqlstate 22007
+expect error {
+    invalid input syntax for type timestamp: "2024-01-05 2024-01-06"
+}
+
+test datetime-input-year-0-is-out-of-range {
+    SELECT '0000-01-05'::timestamp;
+}
+@sqlstate 22008
+expect error {
+    date/time field value out of range: "0000-01-05"
 }

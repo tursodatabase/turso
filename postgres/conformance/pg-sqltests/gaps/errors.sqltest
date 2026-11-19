@@ -261,6 +261,8 @@ test gap-d-24-invalid-timestamptz-into-column {
 }
 @sqlstate 22007
 expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # D-25: invalid json into jsonb column
 test gap-d-25-invalid-json-into-jsonb-column {

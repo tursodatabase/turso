@@ -102,7 +102,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             exec_to_char(args[0].get_value(), &text_arg(args, 1))
         },
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
-            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
+            exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))?
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -1294,13 +1294,13 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
+fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Result<Option<Boolean>> {
     let s = match input {
         Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return None,
+        Value::Null => return Ok(None),
         v => v.to_string(),
     };
-    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
+    Ok(Some(Boolean(validate_pg_input(&s, type_name)?.is_none())))
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {
@@ -1349,7 +1349,9 @@ fn pg_type_name(value: &Value) -> &'static str {
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
 /// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
-pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
+/// An error when Turso cannot tell whether PostgreSQL would accept the input,
+/// such as `infinity` as a timestamp.
+pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Result<Option<(String, String)>> {
     let trimmed = input.trim();
 
     // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
@@ -1363,7 +1365,20 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         None => (type_name.to_lowercase(), None),
     };
 
-    match base_type.as_str() {
+    let temporal_encode: Option<fn(&Value) -> Result<Value>> = match base_type.as_str() {
+        "date" => Some(|text| exec_temporal_encode(text, &Value::build_text("date"))),
+        "timestamp" | "timestamp without time zone" => Some(exec_timestamp_encode),
+        "timestamptz" | "timestamp with time zone" => Some(exec_timestamptz_encode),
+        "time" | "time without time zone" => {
+            Some(|text| exec_temporal_encode(text, &Value::build_text("time")))
+        }
+        _ => None,
+    };
+    if let Some(encode) = temporal_encode {
+        return check_temporal_input(input, encode);
+    }
+
+    Ok(match base_type.as_str() {
         "bool" | "boolean" => {
             if parse_pg_bool(trimmed).is_some() {
                 None
@@ -1449,10 +1464,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         "varchar" | "character varying" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
-                    return Some((
+                    return Ok(Some((
                         format!("value too long for type character varying({max_len})"),
                         "22001".to_string(),
-                    ));
+                    )));
                 }
             }
             None
@@ -1460,10 +1475,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         "char" | "character" => {
             if let Some(max_len) = type_mod {
                 if trimmed.chars().count() > max_len {
-                    return Some((
+                    return Ok(Some((
                         format!("value too long for type character({max_len})"),
                         "22001".to_string(),
-                    ));
+                    )));
                 }
             }
             None
@@ -1479,18 +1494,6 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => check_temporal_input(input, |text| {
-            exec_temporal_encode(text, &Value::build_text("date"))
-        }),
-        "timestamp" | "timestamp without time zone" => {
-            check_temporal_input(input, exec_timestamp_encode)
-        }
-        "timestamptz" | "timestamp with time zone" => {
-            check_temporal_input(input, exec_timestamptz_encode)
-        }
-        "time" | "time without time zone" => check_temporal_input(input, |text| {
-            exec_temporal_encode(text, &Value::build_text("time"))
-        }),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1529,10 +1532,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 // If there's a prefix, validate it
                 if let Some(prefix_str) = trimmed.split('/').nth(1) {
                     if prefix_str.parse::<u8>().is_err() {
-                        return Some((
+                        return Ok(Some((
                             format!("invalid input syntax for type {base_type}: \"{input}\""),
                             "22P02".to_string(),
-                        ));
+                        )));
                     }
                 }
                 None
@@ -1572,7 +1575,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
         )),
-    }
+    })
 }
 
 /// The value of a PostgreSQL boolean literal such as 'yes', 'off' or 'tr',
@@ -1595,19 +1598,24 @@ pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
 }
 
 /// Reads `input` with `encode`, the ENCODE of a date or time type, so
-/// `pg_input_is_valid` and the type agree on what is valid.
+/// `pg_input_is_valid` and the type agree on what is valid. Input that
+/// PostgreSQL reads but the ENCODE does not, such as `infinity`, is an error:
+/// PostgreSQL would call it valid.
 fn check_temporal_input(
     input: &str,
-    encode: impl Fn(&Value) -> Result<Value>,
-) -> Option<(String, String)> {
+    encode: fn(&Value) -> Result<Value>,
+) -> Result<Option<(String, String)>> {
     match encode(&Value::build_text(input.to_string())) {
-        Ok(_) => None,
-        Err(LimboError::InvalidDate(message)) => {
-            Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
-        }
-        Err(LimboError::DatetimeFieldOverflow(message)) => {
-            Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
-        }
+        Ok(_) => Ok(None),
+        Err(LimboError::InvalidDate(message)) => Ok(Some((
+            message,
+            SQLSTATE_INVALID_DATETIME_FORMAT.to_string(),
+        ))),
+        Err(LimboError::DatetimeFieldOverflow(message)) => Ok(Some((
+            message,
+            SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string(),
+        ))),
+        Err(err @ LimboError::DatetimeNotSupported(_)) => Err(err),
         Err(other) => unreachable!("the ENCODE of a date or time type failed on text with {other}"),
     }
 }

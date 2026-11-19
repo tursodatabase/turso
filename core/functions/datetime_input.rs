@@ -12,6 +12,10 @@
 //! BC, years past 9999, years not written with 4 digits and `infinity` are
 //! rejected: the text form of a date would not sort in time order, and the
 //! timestamp types read the same input as date.
+//!
+//! Input that PostgreSQL may read but this parser does not, such as those
+//! years, `infinity` or a time zone name, is an error with SQLSTATE 0A000.
+//! Only input PostgreSQL rejects too gets PostgreSQL's 22007 or 22008.
 
 use crate::numeric::Numeric;
 use crate::types::Value;
@@ -154,15 +158,22 @@ pub fn format_timestamptz(timestamp: NaiveDateTime) -> String {
     format!("{}+00", format_timestamp(timestamp))
 }
 
-/// PostgreSQL's frontend reports these as `invalid_datetime_format`. Values
-/// out of range are `DatetimeFieldOverflow` instead.
-fn error(message: String) -> LimboError {
-    LimboError::InvalidDate(message)
+/// Input that PostgreSQL rejects too. PostgreSQL's frontend reports it as
+/// `invalid_datetime_format`. Values out of range are `DatetimeFieldOverflow`
+/// instead.
+fn syntax_error(input: &str, ty: TemporalType) -> LimboError {
+    LimboError::InvalidDate(format!(
+        "invalid input syntax for type {}: \"{input}\"",
+        ty.name()
+    ))
 }
 
-fn syntax_error(input: &str, ty: TemporalType) -> LimboError {
-    error(format!(
-        "invalid input syntax for type {}: \"{input}\"",
+/// Input that PostgreSQL may read but this parser does not, such as a time
+/// zone name or a date in the order day, month, year. It is an error with
+/// SQLSTATE 0A000, not 22007, because PostgreSQL may return a value for it.
+fn unsupported_form(input: &str, ty: TemporalType) -> LimboError {
+    not_supported(format!(
+        "this form of {} input is not supported: \"{input}\"",
         ty.name()
     ))
 }
@@ -271,14 +282,14 @@ impl Fields {
             }
             word @ ("infinity" | "-infinity" | "epoch" | "now" | "today" | "tomorrow"
             | "yesterday" | "allballs") => {
-                return Err(error(format!(
+                return Err(not_supported(format!(
                     "the {} value \"{word}\" is not supported",
                     ty.name()
                 )))
             }
             _ => {}
         }
-        let fields = split_fields(input).ok_or_else(|| syntax_error(input, ty))?;
+        let fields = split_fields(input).ok_or_else(|| unsupported_form(input, ty))?;
         let mut reader = Reader {
             input,
             ty,
@@ -414,10 +425,10 @@ impl Reader<'_> {
         // A first number of 1 or 2 digits is a month or a day, in an order
         // that depends on PostgreSQL's DateStyle, which is not supported.
         let [year_text, month, day] = parts[..] else {
-            return Err(syntax_error(input, ty));
+            return Err(unsupported_form(input, ty));
         };
         if year_text.len() <= 2 {
-            return Err(syntax_error(input, ty));
+            return Err(unsupported_form(input, ty));
         }
         self.year = Some(year(year_text, input, ty)?);
         self.month = Some(two_digits(month, input, ty)?);
@@ -431,12 +442,12 @@ impl Reader<'_> {
         // `time` takes no number. After a `T`, PostgreSQL reads a number as a
         // time written as `hhmm`, which is not supported.
         if ty == TemporalType::Time || self.iso_time_pending {
-            return Err(syntax_error(input, ty));
+            return Err(unsupported_form(input, ty));
         }
         // 6 digits or more, with no date yet, are a date: `20240105`.
         if digits.len() >= 6 && self.seen & DATE == 0 {
             if digits.len() != 8 {
-                return Err(syntax_error(input, ty));
+                return Err(unsupported_form(input, ty));
             }
             self.year = Some(year(&digits[..4], input, ty)?);
             self.month = Some(two_digits(&digits[4..6], input, ty)?);
@@ -457,7 +468,7 @@ impl Reader<'_> {
                 Ok(MONTH)
             }
             // PostgreSQL reads 3 digits after the year as a day of the year.
-            (true, false, false) if is_long => Err(syntax_error(input, ty)),
+            (true, false, false) if is_long => Err(unsupported_form(input, ty)),
             (true, false, false) => {
                 self.month = Some(two_digits(digits, input, ty)?);
                 Ok(MONTH)
@@ -478,7 +489,7 @@ impl Reader<'_> {
             // A day first needs DateStyle `DMY`. A number after a whole date
             // would be a time written as `hhmm`, which is not supported.
             (false, false, true) | (true, false, true) | (true, true, true) => {
-                Err(syntax_error(input, ty))
+                Err(unsupported_form(input, ty))
             }
         }
     }
@@ -510,16 +521,19 @@ impl Reader<'_> {
                 self.offset = Some(0);
                 Ok(TIME_ZONE)
             }
-            "bc" => Err(error(format!(
+            "bc" => Err(not_supported(format!(
                 "BC dates are not supported for type {}: \"{input}\"",
                 ty.name()
             ))),
-            // `time` does not take a month name.
-            _ if ty == TemporalType::Time => Err(syntax_error(input, ty)),
+            // Any other word may be a time zone name or abbreviation, a day
+            // name or another word PostgreSQL reads, such as `EST`, `Fri` or
+            // `ago`. Telling those from a word PostgreSQL rejects, such as
+            // `hello`, needs PostgreSQL's tables of time zone names.
+            _ if ty == TemporalType::Time => Err(unsupported_form(input, ty)),
             other => {
                 let month = other
                     .parse::<Month>()
-                    .map_err(|_| syntax_error(input, ty))?
+                    .map_err(|_| unsupported_form(input, ty))?
                     .number_from_month();
                 let mut mask = MONTH;
                 // A number before the name is the day, not the month:
@@ -604,33 +618,41 @@ fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())
 }
 
-/// A field of 1 or 2 digits, such as a month, a day or an hour.
+/// A field of 1 or 2 digits, such as a month, a day or an hour. PostgreSQL
+/// reads more digits, such as the `005` of `2024-01-005`.
 fn two_digits<T: std::str::FromStr>(text: &str, input: &str, ty: TemporalType) -> Result<T> {
-    if !is_digits(text) || text.len() > 2 {
+    if !is_digits(text) {
         return Err(syntax_error(input, ty));
+    }
+    if text.len() > 2 {
+        return Err(unsupported_form(input, ty));
     }
     text.parse().map_err(|_| syntax_error(input, ty))
 }
 
 /// A year must have 4 digits, so that its text sorts in time order.
+/// PostgreSQL reads other years, such as `24` or `10000`, and rejects year 0.
 fn year(text: &str, input: &str, ty: TemporalType) -> Result<i32> {
     if !is_digits(text) {
         return Err(syntax_error(input, ty));
     }
     if text.len() != 4 {
-        return Err(error(format!(
+        return Err(not_supported(format!(
             "years must be written with 4 digits, from 0001 to 9999: \"{input}\""
         )));
     }
     let year = text.parse().map_err(|_| syntax_error(input, ty))?;
-    check_year(year, input, ty)?;
+    if year == 0 {
+        return Err(range_error(input));
+    }
     Ok(year)
 }
 
+/// PostgreSQL reads years before 0001, as BC, and after 9999.
 fn check_year(year: i32, input: &str, ty: TemporalType) -> Result<()> {
     match year {
         1..=9999 => Ok(()),
-        _ => Err(LimboError::DatetimeFieldOverflow(format!(
+        _ => Err(not_supported(format!(
             "{} values must be between years 0001 and 9999: \"{input}\"",
             ty.name()
         ))),
@@ -642,12 +664,14 @@ fn check_year(year: i32, input: &str, ty: TemporalType) -> Result<()> {
 fn read_time(text: &str, input: &str, ty: TemporalType) -> Result<(i64, i64, i64, i64)> {
     let (clock, fraction) = match text.split_once('.') {
         Some((clock, fraction)) if is_digits(fraction) => (clock, fraction),
-        Some(_) => return Err(syntax_error(input, ty)),
+        Some(_) => return Err(unsupported_form(input, ty)),
         None => (text, ""),
     };
     let parts: Vec<&str> = clock.split(':').collect();
     let (hour, minute, second) = match parts[..] {
         [hour, minute] if fraction.is_empty() => (hour, minute, "0"),
+        // PostgreSQL reads `10:00.5` as minutes and seconds.
+        [_, _] => return Err(unsupported_form(input, ty)),
         [hour, minute, second] => (hour, minute, second),
         _ => return Err(syntax_error(input, ty)),
     };

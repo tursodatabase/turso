@@ -291,6 +291,8 @@ test gap-a-35-invalid-timestamptz {
 }
 @sqlstate 22007
 expect error {}
+@sqlstate 0A000
+expect @tursopg error {}
 
 # A-36 (S1): timestamptz equality across offsets
 test gap-a-36-timestamptz-equality-across-offsets {
@@ -318,7 +320,7 @@ test gap-a-38-special-values-infinity-epoch {
 expect {
     infinity|1970-01-01 00:00:00+00
 }
-@sqlstate 22007
+@sqlstate 0A000
 expect @tursopg error {}
 
 # A-39 (S3): invalid date (Feb 30)
