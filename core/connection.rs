@@ -3203,6 +3203,41 @@ impl Connection {
         &self.attached_databases
     }
 
+    /// The database and the pager of the database attached as `alias`.
+    #[cfg(feature = "test_helper")]
+    pub fn attached_database(&self, alias: &str) -> Option<(Arc<Database>, Arc<Pager>)> {
+        let index = self.qualifiers.database_id(alias)?;
+        let catalog = self.attached_databases.read();
+        let entry = catalog.index_to_data.get(&index)?;
+        Some((entry.db.clone(), entry.pager.clone()))
+    }
+
+    /// The address of the schema the connection uses for `database`: "main",
+    /// "temp" or the alias of an attached database. It changes when the
+    /// schema is copied.
+    #[cfg(feature = "test_helper")]
+    pub fn schema_address(&self, database: &str) -> usize {
+        let database_id = self
+            .qualifier(database)
+            .expect("the database is attached")
+            .database_id();
+        match database_id {
+            crate::MAIN_DB_ID => Arc::as_ptr(&self.schema.read()) as usize,
+            crate::TEMP_DB_ID => Arc::as_ptr(
+                &self
+                    .temp
+                    .database
+                    .read()
+                    .as_ref()
+                    .expect("the temp database is open")
+                    .db
+                    .schema
+                    .lock(),
+            ) as usize,
+            _ => Arc::as_ptr(&self.database_schemas.read()[&database_id]) as usize,
+        }
+    }
+
     /// The qualifiers the connection accepts, as of the schema it has: its
     /// databases and the namespaces of its main database.
     pub(crate) fn current_qualifiers(&self) -> Qualifiers {
@@ -5192,10 +5227,10 @@ fn select_all_from(table: &str) -> ast::Stmt {
 mod tests {
     use super::*;
     use crate::attach::AttachDatabaseState;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::IOResult;
-    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5206,7 +5241,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         db.connect(ConnectOpts::new(SessionRole::Superuser))
@@ -5215,16 +5250,6 @@ mod tests {
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
-    }
-
-    fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
-        let mut state = AttachDatabaseState::default();
-        loop {
-            match conn.attach_database(path, alias, &mut state)? {
-                IOResult::Done(()) => return Ok(()),
-                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
-            }
-        }
     }
 
     fn drive_attach_with_config(
@@ -5280,109 +5305,5 @@ mod tests {
             err,
             "cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
         );
-    }
-
-    #[test]
-    fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() {
-        // this is a test to check that mvcc db on attach with a fresh db, makes the
-        // attached db also mvcc
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        assert!(attached_db.get_mv_store().as_ref().is_some());
-        assert!(pager.has_wal());
-
-        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
-        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
-    }
-
-    #[test]
-    fn test_fresh_mvcc_attach_reuses_database_shared_wal() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        let pager_shared_ptr = pager
-            .wal_shared_ptr()
-            .expect("fresh MVCC attach must expose WAL shared state in tests");
-        let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
-
-        assert_eq!(pager_shared_ptr, db_shared_ptr);
-    }
-
-    #[test]
-    fn test_ddl_in_one_transaction_changes_the_schema_in_place() {
-        fn schema_ptr(conn: &Connection, db: usize) -> *const Schema {
-            match db {
-                crate::MAIN_DB_ID => Arc::as_ptr(&conn.schema.read()),
-                crate::TEMP_DB_ID => {
-                    Arc::as_ptr(&conn.temp.database.read().as_ref().unwrap().db.schema.lock())
-                }
-                _ => Arc::as_ptr(&conn.database_schemas.read()[&db]),
-            }
-        }
-
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(&temp_dir.path().join("main.db"));
-        let aux_path = temp_dir.path().join("aux.db");
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-        let aux_id = conn.qualifier("aux").unwrap().database_id();
-
-        for (db, name) in [
-            (crate::MAIN_DB_ID, "main"),
-            (crate::TEMP_DB_ID, "temp"),
-            (aux_id, "aux"),
-        ] {
-            conn.execute("BEGIN").unwrap();
-            // The first DDL copies the schema, which the committed schema still shares.
-            conn.execute(format!("CREATE TABLE {name}.a(x)")).unwrap();
-            let private_schema = schema_ptr(&conn, db);
-            conn.execute(format!("CREATE TABLE {name}.b(x UNIQUE)"))
-                .unwrap();
-            conn.execute(format!("CREATE INDEX {name}.b_x ON b(x)"))
-                .unwrap();
-            conn.execute(format!(
-                "CREATE TRIGGER {name}.b_insert AFTER INSERT ON b BEGIN SELECT 1; END"
-            ))
-            .unwrap();
-            assert_eq!(
-                schema_ptr(&conn, db),
-                private_schema,
-                "DDL on {name} copied a schema that only this transaction uses"
-            );
-            conn.execute(format!("INSERT INTO {name}.b VALUES (1)"))
-                .unwrap();
-
-            conn.execute("SAVEPOINT sp").unwrap();
-            conn.execute(format!("CREATE TABLE {name}.c(x)")).unwrap();
-            conn.execute(format!("CREATE TABLE {name}.d(x)")).unwrap();
-            conn.execute("ROLLBACK TO sp").unwrap();
-            assert!(conn.execute(format!("SELECT * FROM {name}.c")).is_err());
-            assert!(conn.execute(format!("SELECT * FROM {name}.d")).is_err());
-            conn.execute(format!("SELECT * FROM {name}.b")).unwrap();
-
-            conn.execute("ROLLBACK").unwrap();
-            for object in ["a", "b"] {
-                assert!(
-                    conn.execute(format!("SELECT * FROM {name}.{object}"))
-                        .is_err(),
-                    "{name}.{object} survived ROLLBACK"
-                );
-            }
-        }
     }
 }

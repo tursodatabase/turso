@@ -3215,8 +3215,10 @@ impl Pager {
         self.wal.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
+    /// The address of the shared WAL state of the pager's WAL file, or None
+    /// when the pager has no WAL file.
+    #[cfg(feature = "test_helper")]
+    pub fn wal_shared_ptr(&self) -> Option<usize> {
         self.wal
             .as_ref()
             .and_then(|wal| wal.as_any().downcast_ref::<crate::storage::wal::WalFile>())

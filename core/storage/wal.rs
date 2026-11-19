@@ -628,9 +628,6 @@ trait WalCoordination: Debug + Send + Sync {
     fn backend_name(&self) -> &'static str;
 
     #[cfg(test)]
-    fn shared_ptr(&self) -> usize;
-
-    #[cfg(test)]
     fn open_mode_name(&self) -> Option<&'static str> {
         None
     }
@@ -868,7 +865,7 @@ pub trait Wal: Debug + Send + Sync {
     /// readers and writers may proceed again.
     fn release_vacuum_lock(&self);
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test_helper"))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -1427,11 +1424,6 @@ impl WalCoordination for InProcessWalCoordination {
     #[cfg(test)]
     fn backend_name(&self) -> &'static str {
         "in_process"
-    }
-
-    #[cfg(test)]
-    fn shared_ptr(&self) -> usize {
-        Arc::as_ptr(&self.shared) as usize
     }
 
     fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>> {
@@ -2492,11 +2484,6 @@ impl WalCoordination for ShmWalCoordination {
     #[cfg(test)]
     fn backend_name(&self) -> &'static str {
         "tshm"
-    }
-
-    #[cfg(test)]
-    fn shared_ptr(&self) -> usize {
-        Arc::as_ptr(&self.shared) as usize
     }
 
     #[cfg(test)]
@@ -4840,7 +4827,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test_helper"))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -4933,9 +4920,11 @@ impl WalFile {
         }
     }
 
-    #[cfg(test)]
+    /// The address of the WAL state shared by the connections of the
+    /// database.
+    #[cfg(feature = "test_helper")]
     pub(crate) fn shared_ptr(&self) -> usize {
-        self.coordination.shared_ptr()
+        Arc::as_ptr(&self.coordination.shared_wal_state()) as usize
     }
 
     #[cfg(test)]

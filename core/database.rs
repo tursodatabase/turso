@@ -3254,6 +3254,13 @@ impl Database {
         })
     }
 
+    /// The address of the WAL state that the connections of this database
+    /// share, to compare with [Pager::wal_shared_ptr].
+    #[cfg(feature = "test_helper")]
+    pub fn shared_wal_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared_wal) as usize
+    }
+
     #[cfg(feature = "simulator")]
     pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
         #[cfg(host_shared_wal)]
