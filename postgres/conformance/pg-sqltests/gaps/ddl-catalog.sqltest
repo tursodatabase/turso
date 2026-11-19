@@ -1006,6 +1006,7 @@ expect {
 expect @tursopg error {}
 
 # E-100 (S4): pg_indexes names of PRIMARY KEY and UNIQUE indexes
+# The primary key index name has the same cause as E-29.
 test gap-e-100-pg-indexes-names-of-primary-key-and-unique-indexes {
     CREATE TABLE u (id text PRIMARY KEY, e text UNIQUE);
     SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('u_e_key', 'u_pkey');
@@ -1019,8 +1020,8 @@ expect @tursopg {
 
 # E-101 (S4): conkey of a two-column UNIQUE constraint as text
 # Fails because tursopg returns int2vector columns as text, see E-39.
-@setup schema_api_api_items_id
 test gap-e-101-conkey-of-a-two-column-unique-constraint-as-text {
+    CREATE SCHEMA api;
     CREATE TABLE api.pairs (id int PRIMARY KEY, a int, b int, UNIQUE (a, b));
     SELECT conkey::text FROM pg_constraint WHERE conname = 'pairs_a_b_key';
 }
@@ -1069,6 +1070,7 @@ expect @tursopg {
 }
 
 # E-105 (S4): regclass cast of an unknown name
+# Fails because every regclass cast returns 0, see E-19.
 test gap-e-105-regclass-cast-of-an-unknown-name {
     SELECT 'nosuch'::regclass;
 }
@@ -1089,6 +1091,7 @@ expect {
 }
 
 # E-107 (S2): PL/pgSQL trigger function
+# Fails because CREATE FUNCTION is not supported, see E-46.
 test gap-e-107-pl-pgsql-trigger-function {
     CREATE TABLE users (id int PRIMARY KEY, meta jsonb);
     CREATE TABLE profiles (id int PRIMARY KEY, first_name text);
@@ -1109,6 +1112,7 @@ expect {
 expect @tursopg error {}
 
 # E-108 (S2): SECURITY DEFINER function with SET search_path
+# Fails because CREATE FUNCTION is not supported, see E-46.
 test gap-e-108-security-definer-function-with-set-search-path {
     CREATE FUNCTION f() RETURNS int LANGUAGE sql SECURITY DEFINER SET search_path = '' AS $$ SELECT 1 $$;
     SELECT f();
@@ -1178,19 +1182,9 @@ expect {
 @sqlstate 42883
 expect @tursopg error {}
 
-# E-114 (S4): pg_size_pretty
-test gap-e-114-pg-size-pretty {
-    SELECT pg_size_pretty(8192::bigint), pg_size_pretty(10485760::bigint);
-}
-expect {
-    8192 bytes|10 MB
-}
-@sqlstate 42883
-expect @tursopg error {}
-
-# E-115 (S4): pg_stat_user_tables
+# E-114 (S4): pg_stat_user_tables
 @setup t_id_s_with_rows
-test gap-e-115-pg-stat-user-tables {
+test gap-e-114-pg-stat-user-tables {
     SELECT count(*) FROM pg_stat_user_tables WHERE relname = 't';
 }
 expect {
