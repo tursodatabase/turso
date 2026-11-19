@@ -213,12 +213,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 Jsonb::from_str_with_mode(str, strict)
             } else {
                 // Handle as a string literal otherwise
-                // Escape backslashes first, then double quotes
-                let mut str = text.replace('\\', "\\\\").replace('"', "\\\"");
-                // Quote the string to make it a JSON string
-                str.insert(0, '"');
-                str.push('"');
-                Jsonb::from_str(&str)
+                Jsonb::from_string_literal(text.as_str())
             };
             res.map_err(malformed_json_error)
         }
@@ -257,7 +252,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             }
         }
         ValueRef::Numeric(Numeric::Integer(int)) => {
-            Jsonb::from_str(&int.to_string()).map_err(malformed_json_error)
+            Jsonb::from_i64(int).map_err(malformed_json_error)
         }
     }
 }

@@ -2590,14 +2590,75 @@ impl Jsonb {
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
         // Parse directly as JSON if it's already JSON subtype or strict mode is on
         if matches!(mode, Conv::ToString) {
-            // Escape backslashes first, then double quotes
-            let mut str = input.replace('\\', "\\\\").replace('"', "\\\"");
-            str.insert(0, '"');
-            str.push('"');
-            Jsonb::from_str(&str)
+            Jsonb::from_string_literal(input)
         } else {
             Jsonb::from_str(input)
         }
+    }
+
+    /// Makes the JSONB string element for `text` used as a JSON string.
+    ///
+    /// The result is the element that the parser makes for `text` with each
+    /// `\` and `"` escaped and with quotes around it, without that text: the
+    /// payload is the escaped text, and the element is TEXT5 when `text` has a
+    /// control character, TEXTJ when it has an escape, and TEXT otherwise.
+    pub fn from_string_literal(text: &str) -> PResult<Self> {
+        let bytes = text.as_bytes();
+        let mut element_type = ElementType::TEXT;
+        let mut escapes = 0;
+        for &byte in bytes {
+            if byte == b'\\' || byte == b'"' {
+                escapes += 1;
+                if element_type == ElementType::TEXT {
+                    element_type = ElementType::TEXTJ;
+                }
+            } else if byte <= 0x1F {
+                element_type = ElementType::TEXT5;
+            }
+        }
+        let payload_size = bytes.len() + escapes;
+        let header = JsonbHeader::new(element_type, payload_size).into_bytes();
+        let header = header.as_bytes();
+        let mut jsonb = Self::new(header.len() + payload_size)?;
+        jsonb.data.extend_from_slice(header);
+        if escapes == 0 {
+            jsonb.data.extend_from_slice(bytes);
+        } else {
+            for &byte in bytes {
+                if byte == b'\\' || byte == b'"' {
+                    jsonb.data.push(b'\\');
+                }
+                jsonb.data.push(byte);
+            }
+        }
+        Ok(jsonb)
+    }
+
+    /// Makes the JSONB INT element for `int`: the element that the parser makes
+    /// for the decimal text of `int`, without that text.
+    pub fn from_i64(int: i64) -> PResult<Self> {
+        let mut digits = [0u8; 20];
+        let mut start = digits.len();
+        let mut rest = int.unsigned_abs();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        let digits = &digits[start..];
+        let payload_size = digits.len() + usize::from(int < 0);
+        let header = JsonbHeader::new(ElementType::INT, payload_size).into_bytes();
+        let header = header.as_bytes();
+        let mut jsonb = Self::new(header.len() + payload_size)?;
+        jsonb.data.extend_from_slice(header);
+        if int < 0 {
+            jsonb.data.push(b'-');
+        }
+        jsonb.data.extend_from_slice(digits);
+        Ok(jsonb)
     }
 
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbCopy)]
@@ -4724,6 +4785,59 @@ mod tests {
         let blob = [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7];
         let jsonb = Jsonb::from_raw_data(&blob).unwrap();
         assert!(jsonb.scalar_string_value().is_err());
+    }
+
+    /// The element that the parser makes for `text` quoted as a JSON string.
+    fn parse_string_literal(text: &str) -> Jsonb {
+        let quoted = format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""));
+        Jsonb::from_str(&quoted).unwrap()
+    }
+
+    #[test]
+    fn string_literal_is_the_element_the_parser_makes() {
+        let long = "x".repeat(300);
+        let longer = "y\\".repeat(40_000);
+        let texts = [
+            "",
+            "a",
+            "hello world",
+            "exactly 11b",
+            "twelve bytes",
+            "say \"hi\"",
+            "C:\\dir\\file",
+            "tab\there",
+            "line\nbreak",
+            "nul\0inside",
+            "\u{1f}\"\\",
+            "\"\\\u{1}",
+            "é ü 你好 😀",
+            "\u{7f}",
+            long.as_str(),
+            longer.as_str(),
+        ];
+        for text in texts {
+            assert_eq!(
+                Jsonb::from_string_literal(text).unwrap().data,
+                parse_string_literal(text).data,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_is_the_element_the_parser_makes() {
+        let mut ints = vec![i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1];
+        for digits in 0..19 {
+            let power = 10i64.pow(digits);
+            ints.extend([power - 1, power, power + 1, -power + 1, -power, -power - 1]);
+        }
+        for int in ints {
+            assert_eq!(
+                Jsonb::from_i64(int).unwrap().data,
+                Jsonb::from_str(&int.to_string()).unwrap().data,
+                "{int}"
+            );
+        }
     }
 
     #[test]
