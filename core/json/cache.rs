@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::cell::{Cell, UnsafeCell};
 
 use crate::alloc::{TryClone, TryReserveError};
-use crate::types::AsValueRef;
+use crate::types::{AsValueRef, Text};
 use crate::{Value, ValueRef};
 
 use super::jsonb::Jsonb;
@@ -46,19 +47,33 @@ impl JsonCache {
         value: &Jsonb,
     ) -> std::result::Result<(), TryReserveError> {
         let key = key.as_value_ref();
-        let entry = (key.to_owned()?, value.try_clone()?);
-        if self.used < JSON_CACHE_SIZE {
-            self.entries[self.used] = Some(entry);
-            self.age[self.used] = self.counter;
-            self.counter += 1;
-            self.used += 1
+        let id = if self.used < JSON_CACHE_SIZE {
+            self.used
         } else {
-            let id = self.find_oldest_entry();
-
-            self.entries[id] = Some(entry);
-            self.age[id] = self.counter;
-            self.counter += 1;
+            self.find_oldest_entry()
+        };
+        let entry = &mut self.entries[id];
+        match entry {
+            // The entry that the new entry evicts, or an entry from before a
+            // clear. Its buffers usually have the capacity for the new entry,
+            // so a cache miss does not allocate.
+            Some((stored_key, stored_value)) => {
+                if let Err(err) = stored_value
+                    .copy_from(value)
+                    .and_then(|()| copy_key(stored_key, key))
+                {
+                    // Half of a new entry must not match a lookup.
+                    *entry = None;
+                    return Err(err);
+                }
+            }
+            None => *entry = Some((key.to_owned()?, value.try_clone()?)),
         }
+        if self.used < JSON_CACHE_SIZE {
+            self.used += 1;
+        }
+        self.age[id] = self.counter;
+        self.counter += 1;
         Ok(())
     }
 
@@ -85,6 +100,32 @@ impl JsonCache {
         self.counter = 0;
         self.used = 0;
     }
+}
+
+/// Makes `stored` a copy of `key`. A text or blob key is copied into the
+/// buffer of `stored` when `stored` has the same type.
+fn copy_key(stored: &mut Value, key: ValueRef) -> std::result::Result<(), TryReserveError> {
+    match (&mut *stored, key) {
+        (
+            Value::Text(Text {
+                value: Cow::Owned(stored_text),
+                subtype,
+            }),
+            ValueRef::Text(text),
+        ) => {
+            stored_text.try_reserve(text.value.len().saturating_sub(stored_text.len()))?;
+            stored_text.clear();
+            stored_text.push_str(text.value);
+            *subtype = text.subtype;
+        }
+        (Value::Blob(stored_blob), ValueRef::Blob(blob)) => {
+            stored_blob.try_reserve(blob.len().saturating_sub(stored_blob.len()))?;
+            stored_blob.clear();
+            stored_blob.extend_from_slice(blob);
+        }
+        _ => *stored = key.to_owned()?,
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -361,6 +402,53 @@ mod tests {
 
         // Now key2 should be the oldest
         assert_eq!(cache.find_oldest_entry(), 1);
+    }
+
+    #[test]
+    fn test_json_cache_reuses_evicted_entries() {
+        // Each insert evicts a key of another type, or a shorter or longer
+        // key of the same type, so the copies into the evicted buffers
+        // shrink and grow them.
+        let keys = [
+            Value::build_text("[1]"),
+            Value::from_slice(&[0x0b]).unwrap(),
+            Value::build_text("[\"a document that is longer than the others\"]"),
+            Value::from_i64(7),
+            Value::build_text("[2]"),
+            Value::from_slice(&[0x0c, 0x0d]).unwrap(),
+            Value::build_text("{}"),
+            Value::from_i64(8),
+            Value::build_text("[3]"),
+        ];
+        let values: Vec<Jsonb> = (0..keys.len())
+            .map(|i| Jsonb::from_str(&format!("[{i}, \"{}\"]", "x".repeat(i * 7))).unwrap())
+            .collect();
+
+        let mut cache = JsonCache::new();
+        for inserted in 0..keys.len() {
+            cache
+                .insert(&keys[inserted], &values[inserted])
+                .expect(crate::alloc::ALLOC_ERR_MSG);
+            // The lookups go from the oldest key to the newest, so the
+            // entries keep their order of age.
+            for (i, (key, value)) in keys.iter().zip(&values).enumerate().take(inserted + 1) {
+                let expected = (i + JSON_CACHE_SIZE > inserted).then_some(value);
+                assert_eq!(cache.lookup(key).unwrap().as_ref(), expected, "key {i}");
+            }
+        }
+
+        // After a clear, the inserts reuse the entries from before it.
+        cache.clear();
+        cache
+            .insert(&keys[0], &values[0])
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&keys[2], &values[2])
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        for (i, (key, value)) in keys.iter().zip(&values).enumerate() {
+            let expected = (i == 0 || i == 2).then_some(value);
+            assert_eq!(cache.lookup(key).unwrap().as_ref(), expected, "key {i}");
+        }
     }
 
     // Tests for JsonCacheCell
