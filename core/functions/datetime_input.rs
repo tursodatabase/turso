@@ -239,6 +239,9 @@ impl Fields {
             (_, TemporalType::Timetz) => {
                 let mut out = String::new();
                 push_time(&mut out, time);
+                if let Some(offset) = self.offset {
+                    push_offset(&mut out, offset);
+                }
                 return Ok(out);
             }
             (None, _) => return Err(syntax_error(input, ty)),
@@ -509,6 +512,18 @@ fn push_time(out: &mut String, micros: i64) {
     }
 }
 
+fn push_offset(out: &mut String, offset: i64) {
+    let sign = if offset < 0 { '-' } else { '+' };
+    let seconds = offset.abs();
+    let hours = seconds / 3600;
+    let minutes = seconds / 60 % 60;
+    out.push(sign);
+    out.push_str(&format!("{hours:02}"));
+    if minutes != 0 {
+        out.push_str(&format!(":{minutes:02}"));
+    }
+}
+
 fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())
 }
@@ -626,6 +641,13 @@ mod tests {
             ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00"),
             ("+02 2024-01-05 10:00", "timestamp", "2024-01-05 10:00:00"),
             ("Z 2024-01-05", "timestamp", "2024-01-05 00:00:00"),
+            ("2024-01-05 10:00", "timetz", "10:00:00"),
+            ("12:00:00+02", "timetz", "12:00:00+02"),
+            ("12:00:00-02", "timetz", "12:00:00-02"),
+            ("12:00:00+05:30", "timetz", "12:00:00+05:30"),
+            ("12:00:00-03:30", "timetz", "12:00:00-03:30"),
+            ("12:00:00+00", "timetz", "12:00:00+00"),
+            ("24:00:00+02", "timetz", "24:00:00+02"),
         ];
         for (input, ty, expected) in cases {
             assert_eq!(
@@ -661,6 +683,11 @@ mod tests {
             ("2024-01-05 Z10:00", "timestamp"),
             ("2024-01-05 Jan-05", "timestamp"),
             ("+02 PM 2024-01-05", "timestamp"),
+            ("12:00:00+16", "timetz"),
+            ("12:00:00-16", "timetz"),
+            ("12:00:00+05:60", "timetz"),
+            ("12:00:00+05:30:60", "timetz"),
+            ("24:00:01+02", "timetz"),
         ];
         for (input, ty) in cases {
             assert!(

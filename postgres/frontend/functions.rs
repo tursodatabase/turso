@@ -1522,21 +1522,8 @@ pub(crate) fn validate_pg_input(
                 )
             }
         }
-        "macaddr" | "macaddr8" => {
-            let parts: Vec<&str> = trimmed.split(':').collect();
-            if (parts.len() == 6 || parts.len() == 8)
-                && parts
-                    .iter()
-                    .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
-            {
-                Ok(None)
-            } else {
-                invalid(
-                    "22P02",
-                    format!("invalid input syntax for type macaddr: \"{input}\""),
-                )
-            }
-        }
+        "macaddr" => check_macaddr_input(input, 6),
+        "macaddr8" => check_macaddr_input(input, 8),
         "oid" => {
             if trimmed.parse::<u32>().is_ok() {
                 Ok(None)
@@ -1623,6 +1610,25 @@ fn check_array_input(
         }
     }
     Ok(None)
+}
+
+fn check_macaddr_input(input: &str, len: usize) -> Result<Option<(String, String)>, ParseError> {
+    let invalid = |sqlstate: &'static str, message: String| {
+        Ok::<_, ParseError>(Some((message, sqlstate.to_string())))
+    };
+    let parts: Vec<&str> = input.split(':').collect();
+    if (parts.len() == len)
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        Ok(None)
+    } else {
+        invalid(
+            "22P02",
+            format!("invalid input syntax for type macaddr: \"{input}\""),
+        )
+    }
 }
 
 // point	(1,2) or 1,2	Exactly two coordinates, x and y.
