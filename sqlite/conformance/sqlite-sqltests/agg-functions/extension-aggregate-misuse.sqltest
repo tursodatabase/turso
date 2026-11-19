@@ -105,6 +105,10 @@ expect {
     1|2.0
     2|10.0
 }
+expect @js {
+    1|2
+    2|10
+}
 
 test extension-aggregate-inside-expression {
     CREATE TABLE t(a INTEGER);
@@ -113,6 +117,9 @@ test extension-aggregate-inside-expression {
 }
 expect {
     3.0
+}
+expect @js {
+    3
 }
 
 test extension-aggregate-in-where-of-subquery {
@@ -132,6 +139,9 @@ test extension-aggregate-of-outer-column-in-subquery {
 expect {
     2.0
 }
+expect @js {
+    2
+}
 
 test extension-aggregate-of-outer-column-in-subquery-with-group-by {
     CREATE TABLE t(g INTEGER, a INTEGER);
@@ -141,4 +151,8 @@ test extension-aggregate-of-outer-column-in-subquery-with-group-by {
 expect {
     1|2.0
     2|10.0
+}
+expect @js {
+    1|2
+    2|10
 }
