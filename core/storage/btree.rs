@@ -383,12 +383,14 @@ enum WriteState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-pub(crate) enum BTreeWriteYieldPoint {
+pub enum BTreeWriteYieldPoint {
     AfterInsertOverflowCellBeforeBalance,
 }
 
 #[cfg(any(test, injected_yields))]
-pub(crate) const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
+/// The yield plan family of B-tree writes. A cursor's selection key is
+/// this family XOR its root page.
+pub const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for BTreeWriteYieldPoint {
