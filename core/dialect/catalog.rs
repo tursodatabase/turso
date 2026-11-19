@@ -4,7 +4,7 @@
 
 use crate::{
     namespace::{NamespaceId, NamespaceRef},
-    schema::{BTreeTable, Index, Schema},
+    schema::{load::LoadStep, BTreeTable, Index, Schema},
     translate::{
         emitter::Resolver,
         schema::{
@@ -45,6 +45,13 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         let _ = (program, ctx);
         Err(statement.not_supported())
+    }
+
+    /// The steps that read what this catalog stores besides the engine's own
+    /// tables. They run after the engine's steps, when a database is opened
+    /// and when a connection reads its schema again.
+    fn load_steps(&self) -> Vec<Box<dyn LoadStep>> {
+        Vec::new()
     }
 }
 
