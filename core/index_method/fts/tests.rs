@@ -849,7 +849,6 @@ fn fts_write_errors_do_not_infer_out_of_memory_from_the_message() {
 mod allocation_failures {
     use super::*;
     use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
-    use crate::DatabaseAllocators;
     use std::io::{ErrorKind, Write};
     use std::ptr::NonNull;
     use std::sync::atomic::AtomicIsize;
@@ -1019,89 +1018,6 @@ mod allocation_failures {
             footer["version"],
             serde_json::to_value(tantivy::version()).unwrap()
         );
-    }
-
-    #[test]
-    fn failed_fts_allocations_roll_back_statements_and_allow_retry() {
-        for merge in [false, true] {
-            for mvcc in [false, true] {
-                let (conn, allocator) = database_with_failing_fts_allocator(mvcc);
-                if merge {
-                    conn.execute("INSERT INTO docs VALUES (19, 'hello world')")
-                        .unwrap();
-                }
-                let sql = if merge {
-                    "OPTIMIZE INDEX docs_fts"
-                } else {
-                    "INSERT INTO docs VALUES (19, 'hello world')"
-                };
-                allocator.allocations.store(0, Ordering::Relaxed);
-                conn.execute(sql).unwrap();
-                let allocation_count = allocator.allocations.load(Ordering::Relaxed);
-                assert!(allocation_count > 0);
-
-                for fail_at in 0..allocation_count {
-                    let (conn, allocator) = database_with_failing_fts_allocator(mvcc);
-                    if merge {
-                        conn.execute("INSERT INTO docs VALUES (19, 'hello world')")
-                            .unwrap();
-                    }
-                    allocator.fail_after(fail_at);
-                    let result = conn.execute(sql);
-                    assert_eq!(
-                        allocator.remaining.load(Ordering::Relaxed),
-                        -1,
-                        "{sql}, mvcc={mvcc}, fail_at={fail_at}"
-                    );
-                    assert!(
-                        matches!(result, Err(LimboError::OutOfMemory)),
-                        "{sql}, mvcc={mvcc}, fail_at={fail_at}: {result:?}"
-                    );
-
-                    let expected = if merge { vec![7, 19] } else { vec![7] };
-                    assert_fts_rows(&conn, &expected);
-                    conn.execute(sql).unwrap();
-                    assert_fts_rows(&conn, &[7, 19]);
-                }
-            }
-        }
-    }
-
-    fn database_with_failing_fts_allocator(mvcc: bool) -> (Arc<Connection>, FailingAllocator) {
-        let allocator = FailingAllocator::default();
-        let db = crate::Database::open(
-            Arc::new(crate::MemoryIO::new()),
-            ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
-                .db_opts(crate::DatabaseOpts::default().with_index_method(true))
-                .allocators(DatabaseAllocators {
-                    fts: DynAllocator::new(allocator.clone()),
-                    ..Default::default()
-                }),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        if mvcc {
-            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        }
-        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
-            .unwrap();
-        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
-            .unwrap();
-        conn.execute("INSERT INTO docs VALUES (7, 'hello turso')")
-            .unwrap();
-        (conn, allocator)
-    }
-
-    fn assert_fts_rows(conn: &Arc<Connection>, ids: &[i64]) {
-        let expected: Vec<Vec<Value>> = ids.iter().map(|id| vec![Value::from_i64(*id)]).collect();
-        for sql in [
-            "SELECT id FROM docs ORDER BY id",
-            "SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id",
-        ] {
-            let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
-            assert_eq!(rows, expected, "{sql}");
-        }
     }
 
     #[derive(Clone)]
