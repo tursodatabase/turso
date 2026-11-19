@@ -3811,11 +3811,12 @@ mod database_tests {
     use std::sync::Arc;
 
     use super::{is_memory_like, Database, DatabaseKey, InitState, DATABASE_MANAGER};
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{PageCodec, PageCodecContext, PageCodecId};
     use crate::{
         storage::database::DatabaseFile, DatabaseStorage, IOResult, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, SqliteDialect, IO,
+        OpenOptions, PlatformIO, IO,
     };
 
     #[test]
@@ -3881,9 +3882,9 @@ mod database_tests {
         let path = path.to_str().unwrap();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), path, Arc::new(DialectThatCannotParse)).unwrap();
         let file_key = DatabaseKey::File(crate::io::get_file_id(path).unwrap());
-        let reopened = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
+        let reopened = Database::open_file(io, path, Arc::new(DialectThatCannotParse)).unwrap();
         assert!(Arc::ptr_eq(&db, &reopened));
         drop(reopened);
         assert!(DATABASE_MANAGER.lock().contains_key(&file_key));
@@ -3892,7 +3893,7 @@ mod database_tests {
 
         let name = "registry-entry-is-removed-when-last-database-reference-drops";
         let memory_key = DatabaseKey::SharedMemory(name.to_string());
-        let db = Database::open_shared_memory(name, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_shared_memory(name, Arc::new(DialectThatCannotParse)).unwrap();
         assert!(DATABASE_MANAGER.lock().contains_key(&memory_key));
         drop(db);
         assert!(!DATABASE_MANAGER.lock().contains_key(&memory_key));
@@ -3928,7 +3929,7 @@ mod database_tests {
         let file = io.open_file(path, OpenFlags::Create, true).unwrap();
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(DialectThatCannotParse))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .page_codec(codec);
