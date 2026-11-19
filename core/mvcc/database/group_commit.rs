@@ -282,6 +282,11 @@ impl CommitCoordinator {
         }
     }
 
+    /// Whether a group leader has issued the logical-log write of `tx_id`'s record.
+    pub(crate) fn is_issued(&self, tx_id: TxID) -> bool {
+        self.group.lock().issued == Some(tx_id)
+    }
+
     pub(crate) fn is_abandoned(&self, tx_id: TxID) -> bool {
         self.group.lock().abandoned.contains(&tx_id)
     }

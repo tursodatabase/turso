@@ -90,6 +90,10 @@ impl<State: StateTransition> StateMachine<State> {
         Ok(())
     }
 
+    pub(crate) fn inner(&self) -> &State {
+        &self.state
+    }
+
     pub(crate) fn inner_mut(&mut self) -> &mut State {
         &mut self.state
     }

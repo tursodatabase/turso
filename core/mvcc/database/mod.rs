@@ -1417,6 +1417,19 @@ impl AtomicTransactionState {
     }
 }
 
+/// What happens to a transaction when the statement that commits it is dropped.
+enum DroppedCommitOutcome {
+    /// Nothing of the commit is written, so the transaction is rolled back.
+    RollBack,
+    /// A group leader has issued the write of the transaction's log record. The leader finishes
+    /// or rolls back the transaction when the write completes.
+    LeaveToGroupLeader,
+    /// The log record is written, so the commit is finished with this end timestamp.
+    Finish(u64),
+    /// The transaction is no longer in `txs`, or it is aborted or terminated.
+    Gone,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     Initial,
@@ -1652,6 +1665,8 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     wrote_logical_log: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// Set by `skip_auto_checkpoint`: the commit finishes without its auto-checkpoint.
+    skip_auto_checkpoint: bool,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1766,6 +1781,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
+            skip_auto_checkpoint: false,
             _phantom: PhantomData,
         })
     }
@@ -1836,6 +1852,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         if let CommitState::AwaitGroupCommit { ticket, .. } = self.state {
             let _ = self.commit_coordinator.drop_pending(ticket);
         }
+    }
+
+    /// Whether the commit can still be undone: its logical-log record has not been written,
+    /// and no write of it has been issued. An issued write reaches the log file even when the
+    /// commit is dropped and rolled back, and recovery then replays the record.
+    pub(crate) fn can_roll_back(&self) -> bool {
+        // A group leader's issued write is checked by `dropped_commit_outcome`.
+        let own_log_write_issued =
+            self.group_batch.is_none() && self.pending_log_append_bytes.is_some();
+        !self.is_finalized
+            && !matches!(self.state, CommitState::Checkpoint { .. })
+            && !own_log_write_issued
+            && matches!(
+                self.mvcc_store
+                    .dropped_commit_outcome(self.tx_id, |tx_id| self
+                        .commit_coordinator
+                        .is_issued(tx_id)),
+                DroppedCommitOutcome::RollBack
+            )
+    }
+
+    /// Makes the commit finish without its auto-checkpoint. A checkpoint that has started is
+    /// abandoned at the next step, as when the commit is dropped.
+    pub(crate) fn skip_auto_checkpoint(&mut self) {
+        self.skip_auto_checkpoint = true;
     }
 
     fn cleanup_unfinished_commit(&mut self) {
@@ -3694,7 +3735,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                if appended_to_log && mvcc_store.storage.should_checkpoint() {
+                if appended_to_log
+                    && !self.skip_auto_checkpoint
+                    && mvcc_store.storage.should_checkpoint()
+                {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
@@ -3730,6 +3774,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
+            }
+            CommitState::Checkpoint { .. } if self.skip_auto_checkpoint => {
+                self.cleanup_mvcc_checkpoint_state();
+                self.finalize(mvcc_store)?;
+                return Ok(TransitionResult::Done(()));
             }
             CommitState::Checkpoint { state_machine } => {
                 let step_result = {
@@ -7326,28 +7375,52 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
-        let tx_state = self.txs.get(&tx_id).map(|tx| {
+    /// What `cleanup_dropped_commit` does with `tx_id`. `issued` reports whether a group leader
+    /// has issued the logical-log write of the transaction's record; it is called only for a
+    /// transaction whose record is not written yet.
+    fn dropped_commit_outcome(
+        &self,
+        tx_id: TxID,
+        issued: impl FnOnce(TxID) -> bool,
+    ) -> DroppedCommitOutcome {
+        let Some((state, log_appended)) = self.txs.get(&tx_id).map(|tx| {
             let tx = tx.value();
-            match tx.state.load() {
-                TransactionState::Preparing(end_ts) if tx.log_appended.load(Ordering::Acquire) => {
-                    tx.state.store(TransactionState::Committed(end_ts));
-                    TransactionState::Committed(end_ts)
-                }
-                state => state,
+            (tx.state.load(), tx.log_appended.load(Ordering::Acquire))
+        }) else {
+            return DroppedCommitOutcome::Gone;
+        };
+        match state {
+            TransactionState::Preparing(end_ts) if log_appended => {
+                DroppedCommitOutcome::Finish(end_ts)
             }
-        });
-        match tx_state {
-            Some(TransactionState::Active | TransactionState::Preparing(_)) => {
-                if self.commit_coordinator.abandon_if_issued(tx_id) {
-                    if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
-                        connection.set_mv_tx_for_db(db_id, None);
-                    }
-                    return;
+            TransactionState::Committed(end_ts) => DroppedCommitOutcome::Finish(end_ts),
+            TransactionState::Active | TransactionState::Preparing(_) => {
+                if issued(tx_id) {
+                    DroppedCommitOutcome::LeaveToGroupLeader
+                } else {
+                    DroppedCommitOutcome::RollBack
                 }
+            }
+            TransactionState::Aborted | TransactionState::Terminated => DroppedCommitOutcome::Gone,
+        }
+    }
+
+    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+        match self.dropped_commit_outcome(tx_id, |tx_id| {
+            self.commit_coordinator.abandon_if_issued(tx_id)
+        }) {
+            DroppedCommitOutcome::LeaveToGroupLeader => {
+                if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
+                    connection.set_mv_tx_for_db(db_id, None);
+                }
+            }
+            DroppedCommitOutcome::RollBack => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
-            Some(TransactionState::Committed(end_ts)) => {
+            DroppedCommitOutcome::Finish(end_ts) => {
+                if let Some(tx) = self.txs.get(&tx_id) {
+                    tx.value().state.store(TransactionState::Committed(end_ts));
+                }
                 // The dropped statement may have been interrupted mid
                 // `RewriteLiveVersions`, leaving live row versions (e.g. b-tree
                 // tombstones) that still reference this TxID. Finish the rewrite
@@ -7367,7 +7440,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.finish_committed_tx(tx_id, connection, db_id)
                 );
             }
-            Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
+            DroppedCommitOutcome::Gone => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
                     connection.set_mv_tx_for_db(db_id, None);
                 }
