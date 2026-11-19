@@ -638,10 +638,7 @@ mod columns {
             // The JSON text of a FLOAT element is its payload, so a UTF-8
             // payload is parsed without the text.
             if value.element_type_at(0).ok() == Some(ElementType::FLOAT) {
-                if let Some(text) = value
-                    .scalar_payload()
-                    .and_then(|payload| std::str::from_utf8(payload).ok())
-                {
+                if let Some(text) = value.scalar_payload().and_then(crate::types::validate_utf8) {
                     return Ok(Value::from_f64(text.parse::<f64>()?));
                 }
             }

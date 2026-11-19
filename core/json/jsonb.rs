@@ -4,9 +4,9 @@ use crate::alloc::{
 };
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
-use crate::types::{value_blob_from_slice, ValueBlob};
+use crate::types::{validate_utf8, value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
-use std::{borrow::Cow, fmt::Write, str::from_utf8};
+use std::{borrow::Cow, fmt::Write};
 
 use super::path::{JsonPath, PathElement};
 
@@ -1544,8 +1544,8 @@ impl Jsonb {
         if current_cursor > self.data.len() {
             bail_parse_error!("Invalid JSONB: number extends beyond data");
         }
-        let num_slice = from_utf8(&self.data[cursor..current_cursor])
-            .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
+        let num_slice = validate_utf8(&self.data[cursor..current_cursor])
+            .ok_or_else(|| LimboError::ParseError("Failed to parse integer".to_string()))?;
 
         match kind {
             ElementType::INT | ElementType::FLOAT => {
@@ -3732,12 +3732,12 @@ impl std::str::FromStr for Jsonb {
 /// buffers that user-supplied blobs flow into, so the range may not be
 /// assumed here.
 /// Returns `bytes` as text, like [String::from_utf8_lossy]. Valid UTF-8, the
-/// usual case, is checked with [std::str::from_utf8], which is faster than the
+/// usual case, is checked with [validate_utf8], which is faster than the
 /// byte-at-a-time decoder of the lossy conversion.
 pub(crate) fn utf8_lossy(bytes: &[u8]) -> Cow<'_, str> {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Cow::Borrowed(text),
-        Err(_) => String::from_utf8_lossy(bytes),
+    match validate_utf8(bytes) {
+        Some(text) => Cow::Borrowed(text),
+        None => String::from_utf8_lossy(bytes),
     }
 }
 

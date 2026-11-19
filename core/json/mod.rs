@@ -13,7 +13,7 @@ pub use crate::json::ops::{
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
-use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
+use crate::types::{validate_utf8, AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{LimboError, ValueRef};
 pub use cache::JsonCacheCell;
@@ -672,12 +672,12 @@ pub(crate) fn json_ref_to_db_type(
         if let Some(payload) = json.scalar_payload() {
             match element_type {
                 ElementType::INT => {
-                    if let Ok(text) = std::str::from_utf8(payload) {
+                    if let Some(text) = validate_utf8(payload) {
                         return int_text_to_db_type(text, text);
                     }
                 }
                 ElementType::FLOAT => {
-                    if let Ok(text) = std::str::from_utf8(payload) {
+                    if let Some(text) = validate_utf8(payload) {
                         return float_text_to_db_type(text);
                     }
                 }
