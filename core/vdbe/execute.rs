@@ -8256,7 +8256,12 @@ pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
     }
 }
 
-fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+/// The result of the aggregate `func` from its accumulator `payload`. When
+/// `take_first` is true, the caller does not use the payload again: a result
+/// that is the first payload value, as for MIN, MAX, group_concat and
+/// string_agg, moves out of the payload instead of being copied. A copy of a
+/// group_concat result copies each byte of the concatenation.
+fn finalize_agg_payload(func: &AggFunc, payload: &mut [Value], take_first: bool) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
@@ -8328,13 +8333,17 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 _ => unreachable!("Total accumulator initialized to Null/Integer/Float"),
             }
         }
-        AggFunc::Min | AggFunc::Max => payload[0].clone(),
-        AggFunc::GroupConcat | AggFunc::StringAgg => match payload {
-            [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0 => {
+        AggFunc::Min | AggFunc::Max => first_payload_value(payload, take_first),
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            if matches!(
+                &*payload,
+                [Value::Null, Value::Numeric(Numeric::Integer(count)), ..] if *count > 0
+            ) {
                 Value::build_text(String::new())
+            } else {
+                first_payload_value(payload, take_first)
             }
-            _ => payload[0].clone(),
-        },
+        }
         AggFunc::ArrayAgg => {
             // payload[0] = count, payload[1..] = accumulated values.
             // Serialize to a record blob only once at finalization.
@@ -8425,6 +8434,17 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     };
 
     Ok(val)
+}
+
+/// The first value of an aggregate payload: moved out of the payload when
+/// `take` is true, else a copy. A value over the length limit is copied, so
+/// that the length error of the caller leaves the accumulator as it was.
+fn first_payload_value(payload: &mut [Value], take: bool) -> Value {
+    if take && payload[0].check_length_limit().is_ok() {
+        std::mem::replace(&mut payload[0], Value::Null)
+    } else {
+        payload[0].clone()
+    }
 }
 
 /// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
@@ -9854,7 +9874,7 @@ pub fn op_agg_final(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    match &state.registers[acc_reg] {
+    match &mut state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
                 AggContext::External(_) | AggContext::Native(_) => {
@@ -9867,7 +9887,9 @@ pub fn op_agg_final(
                         };
                         Value::from_i64(*count)
                     }
-                    _ => finalize_agg_payload(func, payload)?,
+                    // A result that replaces the accumulator can take the
+                    // first payload value: the payload is not used again.
+                    _ => finalize_agg_payload(func, payload, acc_reg == dest_reg)?,
                 },
             };
             value.check_length_limit()?;
@@ -20642,36 +20664,36 @@ mod tests {
 
     #[test]
     fn test_finalize_count() {
-        let payload = vec![Value::from_i64(42)];
-        let result = finalize_agg_payload(&AggFunc::Count, &payload).unwrap();
+        let mut payload = vec![Value::from_i64(42)];
+        let result = finalize_agg_payload(&AggFunc::Count, &mut payload, false).unwrap();
         assert_eq!(result, Value::from_i64(42));
     }
 
     #[test]
     fn test_finalize_avg() {
         // Payload: [sum, r_err, count, pos_inf, neg_inf]
-        let payload = vec![
+        let mut payload = vec![
             Value::from_f64(30.0),
             Value::from_f64(0.0),
             Value::from_i64(3),
             Value::from_i64(0),
             Value::from_i64(0),
         ];
-        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
         assert_eq!(result, Value::from_f64(10.0));
     }
 
     #[test]
     fn test_finalize_avg_empty() {
         // Payload: [sum, r_err, count, pos_inf, neg_inf]
-        let payload = vec![
+        let mut payload = vec![
             Value::from_f64(0.0),
             Value::from_f64(0.0),
             Value::from_i64(0),
             Value::from_i64(0),
             Value::from_i64(0),
         ];
-        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -20704,7 +20726,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::Avg, &mut payload, false).unwrap();
         assert_eq!(result, Value::from_f64(0.5));
     }
 
@@ -20722,7 +20744,7 @@ mod tests {
             payload.push(Value::from_i64(i));
         }
 
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false).unwrap();
         let blob = match &result {
             Value::Blob(b) => b,
             _ => panic!("Expected Blob, got {result:?}"),
@@ -20741,7 +20763,7 @@ mod tests {
         let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
         // No values accumulated — count stays 0.
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -20749,8 +20771,8 @@ mod tests {
     fn test_array_agg_finalize_bounds_check() {
         // If payload[0] count is larger than the actual payload length,
         // finalize should return an error rather than panicking.
-        let payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
-        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload);
+        let mut payload = vec![Value::from_i64(999)]; // claims 999 elements but has none
+        let result = finalize_agg_payload(&AggFunc::ArrayAgg, &mut payload, false);
         assert!(
             result.is_err(),
             "Should error on count exceeding payload length"
