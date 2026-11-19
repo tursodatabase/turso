@@ -1,7 +1,7 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
 use crate::dialect::{
-    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateTable, DropIndex, TableText,
+    Catalog, CatalogCmd, CmdContext, CreateIndex, CreateSequence, CreateTable, DropIndex, TableText,
 };
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
@@ -14,6 +14,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::index::canonical_create_index_sql;
 use crate::translate::schema::{emit_schema_cookie, SQLITE_TABLEID};
+use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
 use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -22,8 +23,8 @@ use turso_parser::ast;
 
 /// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
 /// the SQL text that creates it. So far it stores `CREATE TABLE`, `CREATE
-/// INDEX` and `DROP INDEX`; every other statement writes its `sqlite_schema`
-/// rows itself.
+/// INDEX`, `DROP INDEX` and `CREATE SEQUENCE`; every other statement writes
+/// its `sqlite_schema` rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
 
@@ -38,8 +39,10 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateTable(table) => emit_create_table_rows(program, ctx, table),
             CatalogCmd::CreateIndex(index) => emit_create_index_row(program, ctx, index),
             CatalogCmd::DropIndex(index) => emit_delete_index_row(program, ctx, index),
-            CatalogCmd::CreateSequence(_)
-            | CatalogCmd::DropSequence(_)
+            CatalogCmd::CreateSequence(sequence) => {
+                emit_create_sequence_row(program, ctx, sequence)
+            }
+            CatalogCmd::DropSequence(_)
             | CatalogCmd::DropTable(_)
             | CatalogCmd::CreateView(_)
             | CatalogCmd::CreateMaterializedView(_)
@@ -167,6 +170,33 @@ fn emit_create_index_row(
     )?;
 
     Ok(())
+}
+
+/// Writes the row of a new sequence. The schema reads a sequence from the
+/// row of its backing table, so that row is the one written.
+fn emit_create_sequence_row(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    sequence: &CreateSequence<'_>,
+) -> Result<()> {
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: sequence.namespace,
+    };
+    let stored_name = ctx.resolver.mangle_name(namespace, sequence.name);
+    let backing_table_name = sequence_backing_table_name(&stored_name);
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    emit_schema_entry(
+        program,
+        ctx.resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::Table,
+        &backing_table_name,
+        &backing_table_name,
+        sequence.root_reg,
+        Some(sequence_backing_table_sql(&stored_name)),
+    )
 }
 
 /// Deletes the row of an index.
