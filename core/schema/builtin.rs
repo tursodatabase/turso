@@ -153,7 +153,7 @@ mod tests {
     use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
     use crate::sync::Arc;
-    use crate::{ConnectOpts, Database, MemoryIO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions};
 
     #[test]
     fn opening_a_new_database_parses_no_sql() {
@@ -163,6 +163,20 @@ mod tests {
             Arc::new(DialectThatCannotParse),
         )
         .unwrap();
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+    }
+
+    #[test]
+    fn opening_a_new_mvcc_database_parses_no_sql() {
+        let db = Database::open(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
+                .db_opts(DatabaseOpts::default().with_mvcc(true)),
+        )
+        .unwrap();
+        assert!(db.get_mv_store().is_some());
         db.connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
     }

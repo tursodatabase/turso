@@ -70,6 +70,7 @@ use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use tracing::{instrument, Level};
+use turso_parser::ast;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1779,7 +1780,7 @@ impl Database {
                                 .as_ref()
                                 .expect("conn must be initialized in Init phase");
                             state.mvcc_convert_stmt =
-                                Some(conn.prepare("PRAGMA journal_mode = 'mvcc'")?);
+                                Some(conn.prepare_ast_stmt(journal_mode_mvcc_pragma())?);
                         }
                         let stmt = state.mvcc_convert_stmt.as_mut().expect("created above");
                         return_if_io!(stmt.run_ignore_rows_nonblock());
@@ -3700,6 +3701,17 @@ impl Database {
             lock.unlock();
         }
         taken
+    }
+}
+
+/// `PRAGMA journal_mode = 'mvcc'`, which converts a database to MVCC. It is
+/// built as a statement so that opening a database parses no SQL.
+fn journal_mode_mvcc_pragma() -> ast::Stmt {
+    ast::Stmt::Pragma {
+        name: ast::QualifiedName::single(ast::Name::exact("journal_mode".to_string())),
+        body: Some(ast::PragmaBody::Equals(Box::new(ast::Expr::Name(
+            ast::Name::from_string("'mvcc'"),
+        )))),
     }
 }
 
