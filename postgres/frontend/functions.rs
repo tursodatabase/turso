@@ -1586,13 +1586,14 @@ fn check_array_input(
     let invalid = |sqlstate: &'static str, message: String| {
         Ok::<_, ParseError>(Some((message, sqlstate.to_string())))
     };
-    let elements =
-        array_values_from_any(&Value::build_text(input.to_string())).ok_or_else(|| {
-            ParseError::Sqlstate {
-                sqlstate: SQLSTATE_INVALID_TEXT_REPRESENTATION,
-                message: format!("malformed array literal: \"{input}\""),
-            }
-        })?;
+    let elements = array_values_from_any(&Value::build_text(input.to_string()));
+    let Some(elements) = elements else {
+        return invalid(
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            format!("malformed array literal: \"{input}\""),
+        );
+    };
+
     for element in elements {
         let text = match element {
             Value::Null => continue,
@@ -1657,12 +1658,9 @@ fn check_point_input(input: &str) -> Result<Option<(String, String)>, ParseError
         return invalid();
     }
     for coord in [x, y] {
-        let Ok(value) = coord.parse::<f64>() else {
+        let Ok(_) = coord.parse::<f64>() else {
             return invalid();
         };
-        if !value.is_finite() {
-            return invalid();
-        }
     }
     Ok(None)
 }
