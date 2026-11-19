@@ -78,3 +78,23 @@ test synchronous-schema-only {
 expect {
     2
 }
+
+test table-info-arg-in-list {
+    CREATE TABLE t(a, b);
+    CREATE TABLE "main"(x);
+    SELECT count(*) FROM pragma_table_info WHERE arg IN ('t', 'main');
+}
+expect {
+    3
+}
+
+test table-info-arg-in-list-names {
+    CREATE TABLE t(a, b);
+    CREATE TABLE "main"(x);
+    SELECT name FROM pragma_table_info WHERE arg IN ('t', 'main') ORDER BY name;
+}
+expect {
+    a
+    b
+    x
+}

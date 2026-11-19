@@ -356,7 +356,7 @@ impl VirtualTableCursor {
     ) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(args),
+            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(idx_num, args),
             VirtualTableCursorInner::External(cursor) => {
                 return cursor.filter(idx_num, idx_str, arg_count, args);
             }

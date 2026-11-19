@@ -328,7 +328,9 @@ impl PragmaVirtualTable {
             pos: 0,
             conn,
             stmt: None,
-            arg: None,
+            args: Vec::new(),
+            current_arg_index: 0,
+            schema: None,
             visible_column_count: self.visible_column_count,
             max_arg_count: self.max_arg_count,
             has_pragma_arg: self.has_pragma_arg,
@@ -341,11 +343,9 @@ impl PragmaVirtualTable {
     ) -> Result<IndexInfo, ResultCode> {
         let mut arg0_idx = None;
         let mut arg1_idx = None;
+        let mut is_in_list = false;
 
         for (i, c) in constraints.iter().enumerate() {
-            if c.op != ConstraintOp::Eq {
-                continue;
-            }
             let visible_count = self.visible_column_count as u32;
             if c.column_index < visible_count {
                 continue;
@@ -355,8 +355,19 @@ impl PragmaVirtualTable {
             }
             let hidden_idx = c.column_index - visible_count;
             match hidden_idx {
-                0 => arg0_idx = Some(i),
-                1 => arg1_idx = Some(i),
+                0 => {
+                    if c.op == ConstraintOp::Eq {
+                        arg0_idx = Some(i);
+                    } else if c.op == ConstraintOp::In && self.has_pragma_arg {
+                        arg0_idx = Some(i);
+                        is_in_list = true;
+                    }
+                }
+                1 => {
+                    if c.op == ConstraintOp::Eq {
+                        arg1_idx = Some(i);
+                    }
+                }
                 _ => unreachable!("Unexpected hidden column index: {}", hidden_idx),
             }
         }
@@ -388,6 +399,7 @@ impl PragmaVirtualTable {
             .collect();
 
         Ok(IndexInfo {
+            idx_num: if is_in_list { 1 } else { 0 },
             constraint_usages,
             ..Default::default()
         })
@@ -399,7 +411,9 @@ pub struct PragmaVirtualTableCursor {
     pos: usize,
     conn: Arc<Connection>,
     stmt: Option<Statement>,
-    arg: Option<String>,
+    args: Vec<String>,
+    current_arg_index: usize,
+    schema: Option<String>,
     visible_column_count: usize,
     max_arg_count: usize,
     has_pragma_arg: bool,
@@ -410,17 +424,52 @@ impl PragmaVirtualTableCursor {
         self.pos as i64
     }
 
+    fn prepare_stmt_for_arg(&mut self, arg: Option<&str>) -> crate::Result<()> {
+        let qualifier = match (&self.schema, arg) {
+            (Some(schema), _) => Some(schema.clone()),
+            (None, Some(arg)) => self.namespace_of_object(arg),
+            (None, None) => None,
+        };
+        let mut sql = String::from("PRAGMA ");
+        if let Some(qualifier) = &qualifier {
+            sql.push_str(&quote_identifier(qualifier));
+            sql.push('.');
+        }
+        sql.push_str(&self.pragma_name);
+        if let Some(arg) = arg {
+            sql.push_str(&format!("='{}'", escape_sql_string_literal(arg)));
+        }
+
+        // Table-valued pragma helpers execute inside the parent statement's VM step.
+        // For example, UPDATE ... FROM pragma_table_info('dst') runs this helper while the
+        // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
+        // The helper must stay nested so it does not disturb the parent's transaction state.
+        self.stmt = Some(self.conn.prepare_internal(sql)?);
+        Ok(())
+    }
+
     pub(crate) fn next(&mut self) -> crate::Result<bool> {
-        let stmt = self
-            .stmt
-            .as_mut()
-            .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?;
-        let result = stmt.step()?;
-        match result {
-            StepResult::Done => Ok(false),
-            _ => {
-                self.pos += 1;
-                Ok(true)
+        loop {
+            let Some(stmt) = self.stmt.as_mut() else {
+                return Ok(false);
+            };
+            let result = stmt.step()?;
+            match result {
+                StepResult::Done => {
+                    self.current_arg_index += 1;
+                    if self.current_arg_index < self.args.len() {
+                        let arg = self.args[self.current_arg_index].clone();
+                        self.prepare_stmt_for_arg(Some(&arg))?;
+                        continue;
+                    } else {
+                        self.stmt = None;
+                        return Ok(false);
+                    }
+                }
+                _ => {
+                    self.pos += 1;
+                    return Ok(true);
+                }
             }
         }
     }
@@ -439,10 +488,17 @@ impl PragmaVirtualTableCursor {
         }
 
         let value = match idx - self.visible_column_count {
-            0 => self
-                .arg
+            0 => {
+                if let Some(arg) = self.args.get(self.current_arg_index) {
+                    Value::from_text(arg.to_string())
+                } else {
+                    Value::Null
+                }
+            }
+            1 => self
+                .schema
                 .as_ref()
-                .map_or(Value::Null, |arg| Value::from_text(arg.to_string())),
+                .map_or(Value::Null, |s| Value::from_text(s.to_string())),
             _ => Value::Null,
         };
         Ok(value)
@@ -484,59 +540,59 @@ impl PragmaVirtualTableCursor {
             .map(|namespace| namespace.name)
     }
 
-    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
-        if args.len() > self.max_arg_count {
-            return Err(LimboError::ParseError(format!(
-                "Too many arguments for pragma {}: expected at most {}, got {}",
-                self.pragma_name,
-                self.max_arg_count,
-                args.len()
-            )));
-        }
-
+    pub(crate) fn filter(
+        &mut self,
+        idx_num: i32,
+        args: crate::alloc::Vec<Value>,
+    ) -> crate::Result<bool> {
         let to_text = |v: &Value| v.to_text().map(str::to_owned);
-        let (arg, schema) = match args.as_slice() {
-            [arg0] if self.has_pragma_arg => (to_text(arg0), None),
-            [arg0] => (None, to_text(arg0)),
-            [arg0, arg1] => (to_text(arg0), to_text(arg1)),
-            _ => (None, None),
+        let (args_list, schema) = if idx_num == 1 {
+            (args.iter().filter_map(to_text).collect::<Vec<_>>(), None)
+        } else {
+            if args.len() > self.max_arg_count {
+                return Err(LimboError::ParseError(format!(
+                    "Too many arguments for pragma {}: expected at most {}, got {}",
+                    self.pragma_name,
+                    self.max_arg_count,
+                    args.len()
+                )));
+            }
+            let (arg, schema) = match args.as_slice() {
+                [arg0] if self.has_pragma_arg => (to_text(arg0), None),
+                [arg0] => (None, to_text(arg0)),
+                [arg0, arg1] => (to_text(arg0), to_text(arg1)),
+                _ => (None, None),
+            };
+            (arg.into_iter().collect::<Vec<_>>(), schema)
         };
 
-        self.arg = arg;
+        self.args = args_list;
+        self.current_arg_index = 0;
+        self.schema = schema;
         // VFilter starts a new scan. Reset the position so repeated scans
         // return the same rowids, as SQLite does.
         self.pos = 0;
 
         // TODO: only synchronous supports a schema arg so far. Unblock the
         // rest one by one, then delete this check.
-        if schema.is_some() && self.pragma_name != "synchronous" {
+        if self.schema.is_some() && self.pragma_name != "synchronous" {
             return Err(LimboError::ParseError(format!(
                 "Schema argument is not supported yet (got schema: '{}')",
-                schema.unwrap()
+                self.schema.as_ref().unwrap()
             )));
         }
 
-        let qualifier = match (&schema, &self.arg) {
-            (Some(schema), _) => Some(schema.clone()),
-            (None, Some(arg)) => self.namespace_of_object(arg),
-            (None, None) => None,
-        };
-        let mut sql = String::from("PRAGMA ");
-        if let Some(qualifier) = &qualifier {
-            sql.push_str(&quote_identifier(qualifier));
-            sql.push('.');
-        }
-        sql.push_str(&self.pragma_name);
-        if let Some(arg) = &self.arg {
-            sql.push_str(&format!("='{}'", escape_sql_string_literal(arg)));
+        if self.args.is_empty() {
+            if idx_num == 1 && self.has_pragma_arg {
+                self.stmt = None;
+                return Ok(false);
+            }
+            self.prepare_stmt_for_arg(None)?;
+            return self.next();
         }
 
-        // Table-valued pragma helpers execute inside the parent statement's VM step.
-        // For example, UPDATE ... FROM pragma_table_info('dst') runs this helper while the
-        // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
-        // The helper must stay nested so it does not disturb the parent's transaction state.
-        self.stmt = Some(self.conn.prepare_internal(sql)?);
-
+        let arg = self.args.first().cloned();
+        self.prepare_stmt_for_arg(arg.as_deref())?;
         self.next()
     }
 }
@@ -567,7 +623,7 @@ mod tests {
         let mut cursor = pragma_vtab.open(conn).unwrap();
 
         assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
+            .filter(0, crate::alloc::vec![Value::from_text("scan_target")])
             .unwrap());
         assert_eq!(cursor.rowid(), 1);
         assert!(cursor.next().unwrap());
@@ -575,9 +631,51 @@ mod tests {
         assert!(!cursor.next().unwrap());
 
         assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
+            .filter(0, crate::alloc::vec![Value::from_text("scan_target")])
             .unwrap());
         assert_eq!(cursor.rowid(), 1);
+    }
+
+    #[test]
+    fn test_best_index_arg_in_operator() {
+        let pragma_vtab = PragmaVirtualTable {
+            pragma_name: "table_info".to_string(),
+            visible_column_count: 6,
+            max_arg_count: 2,
+            has_pragma_arg: true,
+        };
+
+        let constraints = vec![ConstraintInfo {
+            column_index: 6,
+            op: ConstraintOp::In,
+            usable: true,
+            index: 0,
+        }];
+
+        let index_info = pragma_vtab.best_index(&constraints).unwrap();
+        assert_eq!(index_info.idx_num, 1);
+        assert_eq!(index_info.constraint_usages[0].argv_index, Some(1));
+        assert!(index_info.constraint_usages[0].omit);
+    }
+
+    #[test]
+    fn test_pragma_table_info_arg_in_list() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db =
+            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("CREATE TABLE t(a,b); CREATE TABLE \"main\"(x);")
+            .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM pragma_table_info WHERE arg IN ('t','main');")
+            .unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected row");
+        };
+        let count = stmt.row().unwrap().get_value(0);
+        assert_eq!(count, &Value::from_i64(3));
     }
 
     #[test]
