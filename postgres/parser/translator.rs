@@ -251,6 +251,10 @@ impl PostgreSQLTranslator {
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
             NodeRef::GrantRoleStmt(grant) => translate_grant_role(grant)?,
+            NodeRef::DropRoleStmt(drop) => ast::Stmt::DropRole {
+                if_exists: drop.missing_ok,
+                roles: role_list(&drop.roles, "DROP ROLE")?,
+            },
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -12999,6 +13003,28 @@ mod tests {
                 translated.cmd
             );
         }
+    }
+
+    #[test]
+    fn drop_role_keeps_how_each_role_is_named() {
+        let parsed = crate::parse("DROP ROLE IF EXISTS r, \"R\", CURRENT_USER, public").unwrap();
+        let translated = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .unwrap();
+
+        let ast::Cmd::Stmt(ast::Stmt::DropRole { if_exists, roles }) = &translated.cmd else {
+            panic!("DROP ROLE translated to {:?}", translated.cmd);
+        };
+        assert!(*if_exists);
+        assert_eq!(
+            roles,
+            &vec![
+                ast::Grantee::Role(ast::RoleSpec::Name("r".to_string())),
+                ast::Grantee::Role(ast::RoleSpec::Name("R".to_string())),
+                ast::Grantee::Role(ast::RoleSpec::CurrentRole),
+                ast::Grantee::Public,
+            ]
+        );
     }
 
     #[test]

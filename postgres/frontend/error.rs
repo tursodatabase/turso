@@ -126,6 +126,7 @@ impl From<&LimboError> for ErrorReport {
         }
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
+            report.detail = permission_denied_detail(denial);
         }
         if let LimboError::Dialect(error) = error {
             report.detail.clone_from(&error.detail);
@@ -498,6 +499,7 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
     match (denial.action, &denial.object) {
         (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),
         (Action::Create, Object::Role(_)) => "permission denied to create role".into(),
+        (Action::Drop, Object::Role(_)) => "permission denied to drop role".into(),
         (Action::Write, Object::Setting(name)) => {
             format!("permission denied to set parameter \"{name}\"")
         }
@@ -513,6 +515,21 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
         }
         (_, Object::File(_)) => "permission denied to COPY from a file".into(),
         (_, object) => format!("permission denied for {}", object_name(object)),
+    }
+}
+
+/// The DETAIL PostgreSQL gives with a denial, for the denials that have one.
+fn permission_denied_detail(denial: &PermissionDenied) -> Option<String> {
+    match (&denial.reason, denial.action, &denial.object) {
+        (Reason::Privilege, Action::Create, Object::Role(_)) => {
+            Some("Only roles with the CREATEROLE attribute may create roles.".to_string())
+        }
+        (Reason::Privilege, Action::Drop, Object::Role(_)) => Some(
+            "Only roles with the CREATEROLE attribute and the ADMIN option on the target roles \
+             may drop roles."
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 

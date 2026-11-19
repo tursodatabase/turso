@@ -26,6 +26,33 @@ fn create_role_fails_under_a_dialect_without_roles() {
     );
 }
 
+#[test]
+fn drop_role_fails_under_a_dialect_without_roles() {
+    let db = Database::open_file(
+        Arc::new(MemoryIO::new()),
+        ":memory:",
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(turso_core::ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let drop_role = ast::Cmd::Stmt(ast::Stmt::DropRole {
+        if_exists: true,
+        roles: vec![ast::Grantee::Role(ast::RoleSpec::Name("alice".to_string()))],
+    });
+
+    let error = conn
+        .prepare_translated_cmd(drop_role, "DROP ROLE IF EXISTS alice")
+        .and_then(|mut stmt| stmt.run_ignore_rows())
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("DROP ROLE is not supported"),
+        "{error}"
+    );
+}
+
 fn create_role(conn: &Arc<Connection>, name: &str) -> turso_core::Result<()> {
     let create_role = ast::Cmd::Stmt(ast::Stmt::CreateRole {
         role_name: name.to_string(),

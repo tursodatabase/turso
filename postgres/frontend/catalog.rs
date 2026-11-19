@@ -301,6 +301,9 @@ impl Dialect for PostgresDialect {
             turso_core::AccessStatement::CreateRole { name, options } => {
                 crate::roles::translate_create_role(program, schema, name, options)
             }
+            turso_core::AccessStatement::DropRole { if_exists, roles } => {
+                crate::roles::translate_drop_role(program, schema, connection, *if_exists, roles)
+            }
             turso_core::AccessStatement::GrantRole {
                 revoke,
                 roles,

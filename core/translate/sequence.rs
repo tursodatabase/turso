@@ -1324,6 +1324,7 @@ pub(crate) fn bind_sequence_names_in_stored_expressions(
         | ast::Stmt::CreateVirtualTable(_)
         | ast::Stmt::CreateType { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::DropRole { .. }
         | ast::Stmt::Grant(_)
         | ast::Stmt::CreateDomain { .. }
         | ast::Stmt::Delete { .. }

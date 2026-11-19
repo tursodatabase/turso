@@ -849,7 +849,9 @@ pub(crate) fn translate_access_statement(
             };
             emit_class_row_set_policies(program, &cursors, *namespace, name, stored);
         }
-        AccessStatement::CreateRole { .. } | AccessStatement::GrantRole { .. } => {
+        AccessStatement::CreateRole { .. }
+        | AccessStatement::DropRole { .. }
+        | AccessStatement::GrantRole { .. } => {
             unreachable!("statements about roles do not change a class row")
         }
     }

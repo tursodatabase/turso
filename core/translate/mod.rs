@@ -245,6 +245,7 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::DropRole { .. }
             | ast::Stmt::Grant(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
@@ -446,6 +447,9 @@ fn translate_statement(
         } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
         ast::Stmt::CreateRole { role_name, options } => {
             roles::translate_create_role(role_name, options, resolver, program, connection)?
+        }
+        ast::Stmt::DropRole { if_exists, roles } => {
+            roles::translate_drop_role(if_exists, roles, resolver, program, connection)?
         }
         ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
@@ -682,6 +686,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::DropRole { .. } => "drop_role",
         ast::Stmt::Grant(_) => "grant",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
