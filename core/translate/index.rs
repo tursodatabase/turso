@@ -1,5 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
-use crate::dialect::RelationChange;
+use crate::dialect::{CatalogCmd, CmdContext, CreateIndex, DropIndex};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -358,19 +358,16 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &idx_name,
-                kind: crate::schema::RelationKind::Index,
-                table: Some(&tbl_name),
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateIndex(CreateIndex {
+            namespace: namespace.id,
+            name: &idx_name,
+            table: &tbl_name,
+        }),
+    )?;
 
     emit_refill_index(
         program,
@@ -1500,17 +1497,15 @@ pub fn translate_drop_index(
         Some(SQLITE_TABLEID),
     )?;
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: &idx_name,
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropIndex(DropIndex {
+            namespace: namespace.id,
+            name: &idx_name,
+        }),
+    )?;
 
     emit_delete_index_row(program, resolver, namespace, &idx_name, cdc_table)?;
 

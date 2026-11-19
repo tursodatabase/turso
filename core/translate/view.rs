@@ -1,4 +1,4 @@
-use crate::dialect::RelationChange;
+use crate::dialect::{CatalogCmd, CmdContext, CreateMaterializedView, CreateView, DropView};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;
@@ -237,21 +237,15 @@ pub fn translate_create_materialized_view(
         Some(sql),
     )?;
 
-    // The view is a relation of the dialect's; its hidden state tables are
-    // engine objects and are not.
-    if schema::dialect_relation_hooks_apply(&connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            &connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-                kind: crate::schema::RelationKind::MaterializedView,
-                table: None,
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(&connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateMaterializedView(CreateMaterializedView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+        }),
+    )?;
 
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
@@ -459,19 +453,15 @@ pub fn translate_create_view(
         Some(sql),
     )?;
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-                kind: crate::schema::RelationKind::View,
-                table: None,
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::CreateView(CreateView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+        }),
+    )?;
 
     // Parse schema to load the new view
     let escaped_view_name = escape_sql_string_literal(&stored_view_name);
@@ -648,17 +638,15 @@ pub fn translate_drop_view(
         }
     }
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-            }],
-        )?;
-    }
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
+        program,
+        &cmd_context,
+        &CatalogCmd::DropView(DropView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+        }),
+    )?;
 
     let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 

@@ -38,8 +38,9 @@
 //! The defaults of these methods know only [`roles::RoleId::SUPERUSER`],
 //! give every role every privilege and no table row-level security.
 //! Statements that change access control, such as `CREATE ROLE`, `GRANT` and
-//! `CREATE POLICY`, reach the dialect as a [`crate::AccessStatement`] through
-//! [`crate::Dialect::translate_access_statement`], which the default refuses.
+//! `CREATE POLICY`, reach the dialect's catalog as a
+//! [`crate::AccessStatement`] through [`crate::Catalog::emit_access`],
+//! which the default refuses.
 //!
 //! # Where checks happen
 //!

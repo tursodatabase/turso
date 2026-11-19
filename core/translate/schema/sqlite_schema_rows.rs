@@ -1,5 +1,6 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
+use crate::dialect::{Catalog, CatalogCmd, CmdContext};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::storage::pager::CreateBTreeFlags;
@@ -14,6 +15,24 @@ use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
+
+/// The catalog of a SQLite database: a row of `sqlite_schema` per object,
+/// with the SQL text that creates it. It stores no statement so far: each
+/// statement writes its `sqlite_schema` rows itself.
+#[derive(Debug)]
+pub struct SqliteCatalog;
+
+impl Catalog for SqliteCatalog {
+    fn emit(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &CmdContext<'_>,
+        cmd: &CatalogCmd<'_>,
+    ) -> Result<()> {
+        let _ = (program, ctx, cmd);
+        Ok(())
+    }
+}
 
 /// Deletes the row of an index.
 pub(crate) fn emit_delete_index_row(

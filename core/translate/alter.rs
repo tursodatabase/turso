@@ -1,14 +1,14 @@
 use crate::alloc::TursoIteratorExt;
-use crate::dialect::{AccessStatement, NewOwner, RelationChange};
+use crate::dialect::{
+    AccessStatement, AlterColumn, CatalogCmd, CmdContext, NewOwner, RenameColumn, RenameTable,
+};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::RelationKind;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::row_security;
 use crate::types::StrictType;
-use crate::util::renamed_automatic_index_name;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
-use std::borrow::Cow;
 use turso_parser::ast::{self, TableInternalId};
 
 use super::{
@@ -1777,33 +1777,19 @@ pub fn translate_alter_table(
                 );
             }
 
-            if schema::dialect_relation_hooks_apply(connection, database_id)? {
-                // Automatic indexes are renamed with the table, because
-                // their names embed it.
-                let mut changes = vec![RelationChange::Renamed {
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            resolver.catalog.dialect.catalog().emit(
+                program,
+                &cmd_context,
+                &CatalogCmd::RenameTable(RenameTable {
                     namespace: namespace.id,
                     old_name: &normalized_old_name,
-                    new_name: Cow::Borrowed(&normalized_new_name),
-                }];
-                changes.extend(table_indexes.iter().filter_map(|index| {
-                    let new_name = renamed_automatic_index_name(
-                        &index.name,
-                        &mangled_table_name,
-                        &mangled_new_name,
-                    )?;
-                    Some(RelationChange::Renamed {
-                        namespace: namespace.id,
-                        old_name: &index.name,
-                        new_name: Cow::Owned(new_name),
-                    })
-                }));
-                resolver.catalog.dialect.translate_relation_changes(
-                    program,
-                    resolver.schema(),
-                    connection,
-                    &changes,
-                )?;
-            }
+                    new_name: &normalized_new_name,
+                    indexes: &table_indexes,
+                    stored_old_name: &mangled_table_name,
+                    stored_new_name: &mangled_new_name,
+                }),
+            )?;
 
             for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
@@ -2535,21 +2521,28 @@ pub fn translate_alter_table(
                 )?;
             }
 
-            if col_name != old_column_name
-                && schema::dialect_relation_hooks_apply(connection, database_id)?
-            {
-                resolver.catalog.dialect.translate_relation_changes(
-                    program,
-                    resolver.schema(),
-                    connection,
-                    &[RelationChange::ColumnRenamed {
-                        namespace: namespace.id,
-                        table: &normalize_ident(table_name),
-                        old_name: old_column_name,
-                        new_name: col_name,
-                    }],
-                )?;
-            }
+            let cmd_context = CmdContext::new(connection, resolver, database_id);
+            let normalized_table_name = normalize_ident(table_name);
+            let catalog_cmd = if rename {
+                CatalogCmd::RenameColumn(RenameColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    old_name: old_column_name,
+                    new_name: &definition.col_name,
+                })
+            } else {
+                CatalogCmd::AlterColumn(AlterColumn {
+                    namespace: namespace.id,
+                    table: &normalized_table_name,
+                    old_name: old_column_name,
+                    definition: &definition,
+                })
+            };
+            resolver
+                .catalog
+                .dialect
+                .catalog()
+                .emit(program, &cmd_context, &catalog_cmd)?;
 
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
@@ -2626,12 +2619,12 @@ fn translate_alter_owner(
 
     let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
-    resolver.catalog.dialect.translate_access_statement(
-        program,
-        resolver.schema(),
-        connection,
-        &statement,
-    )?;
+    let cmd_context = CmdContext::new(connection, resolver, namespace.database_id);
+    resolver
+        .catalog
+        .dialect
+        .catalog()
+        .emit_access(program, &cmd_context, &statement)?;
     schema::emit_schema_cookie(resolver, program);
     Ok(())
 }
