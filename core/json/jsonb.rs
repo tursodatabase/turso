@@ -1976,7 +1976,6 @@ impl Jsonb {
         pos += 1; // consume quote
 
         let quoted = quote == b'"' || quote == b'\'';
-        let mut len = 0;
 
         if quoted {
             // Try to find the closing quote and check for simple string
@@ -2014,6 +2013,29 @@ impl Jsonb {
                 end_pos += 1;
             }
         }
+
+        self.deserialize_string_with_escapes(input, pos, string_start, quote, info)
+    }
+
+    /// Parses the rest of a string that [Self::deserialize_string] cannot copy
+    /// as it is: a string with an escape or a control character, an unclosed
+    /// string, or an unquoted JSON5 key. `pos` is the offset after `quote`,
+    /// the first byte of the string, and `string_start` is the offset of the
+    /// element in the document.
+    ///
+    /// This is a separate function so that the loop of the plain case in
+    /// [Self::deserialize_string] has few live values.
+    #[inline(never)]
+    fn deserialize_string_with_escapes(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        string_start: usize,
+        quote: u8,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
+        let quoted = quote == b'"' || quote == b'\'';
+        let mut len = 0;
 
         // Write placeholder header to be updated later
         self.write_element_header(string_start, ElementType::TEXT, 0, false)
