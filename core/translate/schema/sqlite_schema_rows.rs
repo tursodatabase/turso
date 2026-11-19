@@ -1,6 +1,6 @@
 //! Bytecode that writes rows of `sqlite_schema`.
 
-use crate::dialect::{Catalog, CatalogCmd, CmdContext};
+use crate::dialect::{Catalog, CatalogCmd, CmdContext, CreateTable, TableText};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::BTreeTable;
 use crate::storage::pager::CreateBTreeFlags;
@@ -15,9 +15,10 @@ use crate::translate::ProgramBuilder;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{CaptureDataChangesExt, Result, MAIN_DB_ID};
+use turso_parser::ast;
 
-/// The catalog of a SQLite database: a row of `sqlite_schema` per object,
-/// with the SQL text that creates it. It stores no statement so far: each
+/// The catalog of a SQLite database: a row of `sqlite_schema` per object, with
+/// the SQL text that creates it. So far it stores `CREATE TABLE`; every other
 /// statement writes its `sqlite_schema` rows itself.
 #[derive(Debug)]
 pub struct SqliteCatalog;
@@ -29,8 +30,98 @@ impl Catalog for SqliteCatalog {
         ctx: &CmdContext<'_>,
         cmd: &CatalogCmd<'_>,
     ) -> Result<()> {
-        let _ = (program, ctx, cmd);
-        Ok(())
+        match cmd {
+            CatalogCmd::CreateTable(table) => emit_create_table_rows(program, ctx, table),
+            CatalogCmd::CreateIndex(_)
+            | CatalogCmd::DropIndex(_)
+            | CatalogCmd::CreateSequence(_)
+            | CatalogCmd::DropSequence(_)
+            | CatalogCmd::DropTable(_)
+            | CatalogCmd::CreateView(_)
+            | CatalogCmd::CreateMaterializedView(_)
+            | CatalogCmd::DropView(_)
+            | CatalogCmd::RenameTable(_)
+            | CatalogCmd::RenameColumn(_)
+            | CatalogCmd::AlterColumn(_) => Ok(()),
+        }
+    }
+}
+
+/// Writes the row of a new table and a row for each of its automatic
+/// indexes.
+fn emit_create_table_rows(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    table: &CreateTable<'_>,
+) -> Result<()> {
+    let resolver = ctx.resolver;
+    let namespace = NamespaceRef {
+        database_id: ctx.database_id,
+        id: table.namespace,
+    };
+    let stored_name = resolver.mangle_name(namespace, table.name);
+    let sql = table_sql(resolver, namespace, table)?;
+
+    let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        ctx.database_id,
+        Some(SQLITE_TABLEID),
+    )?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.as_ref().map(|x| x.0),
+        SchemaEntryType::Table,
+        &stored_name,
+        &stored_name,
+        table.root_reg,
+        Some(sql),
+    )?;
+    for index in table.automatic_indexes {
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Index,
+            &index.name,
+            &stored_name,
+            index.root_reg,
+            None,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// The SQL text to store for a new table. The resolver's dialect is the
+/// one the statement was parsed with: the engine's own for an engine schema
+/// statement, which stores plain SQLite text, the connection's otherwise.
+/// The SQLite dialect renders canonical text from the AST; a frontend
+/// dialect keeps its own input text.
+fn table_sql(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table: &CreateTable<'_>,
+) -> Result<String> {
+    let dialect = &resolver.catalog.dialect;
+    let name_in_sql = ast::QualifiedName {
+        namespace: None,
+        name: resolver.name_in_sql(namespace, table.written_name),
+        alias: None,
+    };
+    match table.text {
+        TableText::FromSelect(sql) => Ok(sql.to_string()),
+        TableText::Rewritten => dialect.format_rewritten_table_sql(&ast::Stmt::CreateTable {
+            temporary: table.temporary,
+            if_not_exists: table.if_not_exists,
+            tbl_name: name_in_sql,
+            body: table.body.clone(),
+        }),
+        TableText::Statement(input) => dialect.format_table_sql(input, &name_in_sql, table.body),
     }
 }
 

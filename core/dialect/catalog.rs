@@ -5,12 +5,12 @@
 use crate::{
     namespace::NamespaceId,
     schema::{Index, Schema},
-    translate::emitter::Resolver,
+    translate::{emitter::Resolver, schema::open_sqlite_schema_for_write},
     util::renamed_automatic_index_name,
     vdbe::builder::ProgramBuilder,
     Connection, LimboError, Result, Value,
 };
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 use turso_parser::ast::{self, Grantee, Privilege, RoleSpec};
 
 /// Where a dialect stores the objects of a database. DDL translation
@@ -49,6 +49,8 @@ pub struct CmdContext<'a> {
     pub schema: &'a Schema,
     pub database_id: usize,
     pub origin: CmdOrigin,
+    pub(crate) resolver: &'a Resolver<'a>,
+    sqlite_schema_cursor: Cell<Option<usize>>,
 }
 
 impl<'a> CmdContext<'a> {
@@ -67,7 +69,20 @@ impl<'a> CmdContext<'a> {
             schema: resolver.schema(),
             database_id,
             origin,
+            resolver,
+            sqlite_schema_cursor: Cell::new(None),
         }
+    }
+
+    /// The statement's cursor for writing `sqlite_schema` of the database
+    /// it changes. The first call opens it.
+    pub(crate) fn sqlite_schema_cursor(&self, program: &mut ProgramBuilder) -> usize {
+        if let Some(cursor_id) = self.sqlite_schema_cursor.get() {
+            return cursor_id;
+        }
+        let cursor_id = open_sqlite_schema_for_write(program, self.resolver, self.database_id);
+        self.sqlite_schema_cursor.set(Some(cursor_id));
+        cursor_id
     }
 }
 
@@ -102,7 +117,30 @@ pub enum CatalogCmd<'a> {
 pub struct CreateTable<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
-    pub automatic_indexes: &'a [String],
+    pub written_name: &'a ast::Name,
+    pub temporary: bool,
+    pub if_not_exists: bool,
+    pub body: &'a ast::CreateTableBody,
+    pub text: TableText<'a>,
+    pub root_reg: usize,
+    pub automatic_indexes: &'a [AutomaticIndex],
+}
+
+/// The SQL text of a new table: the statement's, none because translation
+/// changed the table (`Rewritten`), or the engine's for `AS SELECT`.
+#[derive(Debug, Clone, Copy)]
+pub enum TableText<'a> {
+    Statement(&'a str),
+    Rewritten,
+    FromSelect(&'a str),
+}
+
+/// An index of a PRIMARY KEY or UNIQUE constraint, with the register that
+/// holds its root page.
+#[derive(Debug, Clone)]
+pub struct AutomaticIndex {
+    pub name: String,
+    pub root_reg: usize,
 }
 
 /// A new index. The statement has already emitted the creation of its
