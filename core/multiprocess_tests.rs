@@ -1,6 +1,8 @@
 use super::*;
 use crate::database::remove_file_from_database_registry;
+use crate::dialect::cannot_parse::DialectThatCannotParse;
 use crate::security::roles::SessionRole;
+use crate::storage::pager::test_writes::{commit_new_pages, commit_user_version};
 use crate::sync::atomic::Ordering;
 use std::process::Command;
 
@@ -24,44 +26,6 @@ fn multiprocess_test_io() -> Arc<dyn IO> {
     {
         Arc::new(PlatformIO::new().unwrap())
     }
-}
-
-fn count_test_rows(conn: &Arc<Connection>) -> i64 {
-    let mut stmt = conn.prepare("select count(*) from test").unwrap();
-    let mut count = 0;
-    stmt.run_with_row_callback(|row| {
-        count = row.get(0).unwrap();
-        Ok(())
-    })
-    .unwrap();
-    count
-}
-
-fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
-    for _attempt in 0..3 {
-        let mut stmt = match conn.prepare(query) {
-            Ok(s) => s,
-            Err(LimboError::SchemaUpdated) => {
-                conn.maybe_reparse_schema().unwrap();
-                continue;
-            }
-            Err(e) => panic!("prepare failed: {e}"),
-        };
-        let mut rows = Vec::new();
-        match stmt.run_with_row_callback(|row| {
-            rows.push(row.get_values().cloned().collect::<Vec<_>>());
-            Ok(())
-        }) {
-            Ok(()) => return rows,
-            Err(LimboError::SchemaUpdated) => {
-                drop(stmt);
-                conn.maybe_reparse_schema().unwrap();
-                continue;
-            }
-            Err(e) => panic!("run_with_row_callback failed: {e}"),
-        }
-    }
-    panic!("get_rows: exhausted SchemaUpdated retries for: {query}");
 }
 
 fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointResult {
@@ -103,7 +67,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(DialectThatCannotParse),
     )
 }
 
@@ -118,7 +82,7 @@ fn open_multiprocess_db_with_flags(
         flags,
         multiprocess_wal_db_opts(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(DialectThatCannotParse),
     )
 }
 
@@ -207,7 +171,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(DialectThatCannotParse)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -265,12 +229,7 @@ fn reject_live_multiprocess_probe_uses_configured_wal_path() {
 
     // Parent keeps the multiprocess database open so a second (child) opener
     // flips the authority into multiprocess mode.
-    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db
-        .connect(ConnectOpts::new(SessionRole::Superuser))
-        .unwrap();
-    conn.execute("create table test(id integer primary key, value text)")
-        .unwrap();
+    let _db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let mut child = Command::new(&current_exe)
@@ -347,19 +306,14 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let conn_a = db_a
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn_a
-        .execute("create table test(id integer primary key, value text)")
-        .unwrap();
-    conn_a
-        .execute("insert into test(value) values ('before-stale')")
-        .unwrap();
+    commit_new_pages(&conn_a, 1);
+    commit_user_version(&conn_a, 1);
 
     let authority = db_a.shared_wal_coordination().unwrap().unwrap();
     let stale_snapshot = authority.snapshot();
 
-    conn_a
-        .execute("insert into test(value) values ('after-stale')")
-        .unwrap();
+    commit_user_version(&conn_a, 2);
+    let header_before = read_header(&conn_a);
 
     authority.install_snapshot(stale_snapshot);
 
@@ -380,12 +334,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let conn_b = db_b
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    let rows = get_rows(&conn_b, "select id, value from test order by id");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0].as_int().unwrap(), 1);
-    assert_eq!(rows[0][1].to_string(), "before-stale");
-    assert_eq!(rows[1][0].as_int().unwrap(), 2);
-    assert_eq!(rows[1][1].to_string(), "after-stale");
+    assert_eq!(read_header(&conn_b), header_before);
 }
 
 #[test]
@@ -399,12 +348,10 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn.execute("create table test(id integer primary key, value text)")
-        .unwrap();
-    conn.execute("insert into test(value) values ('before-reopen')")
-        .unwrap();
-    conn.execute("insert into test(value) values ('after-reopen')")
-        .unwrap();
+    commit_new_pages(&conn, 1);
+    commit_user_version(&conn, 1);
+    commit_user_version(&conn, 2);
+    let header_before = read_header(&conn);
 
     let authority = db.shared_wal_coordination().unwrap().unwrap();
     let snapshot_before = authority.snapshot();
@@ -452,7 +399,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
     let reopened_conn = reopened
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    assert_eq!(count_test_rows(&reopened_conn), 2);
+    assert_eq!(read_header(&reopened_conn), header_before);
 }
 
 #[test]
@@ -469,14 +416,8 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.wal_auto_actions_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
-        .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
+    commit_new_pages(&conn, 32);
+    let header_before = read_header(&conn);
     assert!(
         wal_max_frame(&conn) > 1,
         "partial-checkpoint reopen coverage requires more than one WAL frame before checkpointing"
@@ -529,8 +470,8 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     assert_eq!(
-        count_test_rows(&reopened_conn),
-        32,
+        read_header(&reopened_conn),
+        header_before,
         "partial-checkpoint reopen should preserve committed rows after the conservative disk scan"
     );
 }
@@ -549,14 +490,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.wal_auto_actions_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
-        .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
+    commit_new_pages(&conn, 32);
 
     run_checkpoint(
         &conn,
@@ -576,8 +510,8 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         "stale-proof coverage requires live WAL frames beyond the backfill point"
     );
 
-    conn.execute("insert into test(value) values (randomblob(2048))")
-        .unwrap();
+    commit_new_pages(&conn, 1);
+    let header_before = read_header(&conn);
     let snapshot_after_append = authority.snapshot();
     assert!(
         snapshot_after_append.max_frame > snapshot_after_checkpoint.max_frame,
@@ -603,8 +537,8 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     assert_eq!(
-        count_test_rows(&reopened_conn),
-        33,
+        read_header(&reopened_conn),
+        header_before,
         "stale-proof reopen should preserve rows committed after the partial checkpoint"
     );
 }
@@ -623,14 +557,8 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.wal_auto_actions_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
-        .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
+    commit_new_pages(&conn, 32);
+    let header_before = read_header(&conn);
 
     run_checkpoint(
         &conn,
@@ -679,8 +607,8 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     assert_eq!(
-        count_test_rows(&reopened_conn),
-        32,
+        read_header(&reopened_conn),
+        header_before,
         "DB-header-mismatch reopen should preserve committed rows after the conservative disk scan"
     );
 }
@@ -749,14 +677,7 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.wal_auto_actions_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
-        .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
+    commit_new_pages(&conn, 32);
     assert!(
         wal_max_frame(&conn) > 0,
         "read-only reader coverage requires committed WAL frames"
@@ -845,14 +766,8 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.wal_auto_actions_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
-        .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
+    commit_new_pages(&conn, 32);
+    let header_before = read_header(&conn);
     assert!(
         wal_max_frame(&conn) > 1,
         "disk-scan read-only coverage requires more than one WAL frame before partial checkpoint"
@@ -959,8 +874,8 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
         "truncate checkpoint should succeed once the disk-scan read-only child releases its WAL snapshot"
     );
     assert_eq!(
-        count_test_rows(&reopened_conn),
-        32,
+        read_header(&reopened_conn),
+        header_before,
         "disk-scan read-only reopen should preserve committed rows"
     );
 }
@@ -977,10 +892,8 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn.execute("create table test(id integer primary key, value text)")
-        .unwrap();
-    conn.execute("insert into test(value) values ('before-reader')")
-        .unwrap();
+    commit_new_pages(&conn, 1);
+    commit_user_version(&conn, 1);
 
     let authority = db.shared_wal_coordination().unwrap().unwrap();
     assert_eq!(
@@ -1005,8 +918,8 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
         .min_active_reader_frame()
         .expect("child read transaction should publish an active shared reader slot");
 
-    conn.execute("insert into test(value) values ('after-reader')")
-        .unwrap();
+    commit_user_version(&conn, 2);
+    let header_before = read_header(&conn);
     assert!(
         wal_max_frame(&conn) > reader_frame,
         "parent should append newer WAL frames after the child pins its read snapshot"
@@ -1066,8 +979,8 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     assert_eq!(
-        count_test_rows(&reopened_conn),
-        2,
+        read_header(&reopened_conn),
+        header_before,
         "cold reopen after reader-slot reclamation should preserve committed rows"
     );
 }
@@ -1086,14 +999,8 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     conn.wal_auto_actions_disable();
-    conn.execute("create table test(id integer primary key, value blob)")
-        .unwrap();
-    conn.execute("begin immediate").unwrap();
-    for _ in 0..32 {
-        conn.execute("insert into test(value) values (randomblob(2048))")
-            .unwrap();
-    }
-    conn.execute("commit").unwrap();
+    commit_new_pages(&conn, 32);
+    let header_before = read_header(&conn);
     assert!(
         wal_max_frame(&conn) > 1,
         "disk-scan reopen coverage requires more than one WAL frame before partial checkpoint"
@@ -1167,8 +1074,8 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
     assert_eq!(
-        count_test_rows(&reopened_conn),
-        32,
+        read_header(&reopened_conn),
+        header_before,
         "reopen repair should preserve committed rows while leaving the child reader intact"
     );
 }
@@ -1186,15 +1093,10 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let conn_a = db_a
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    conn_a
-        .execute("create table test(id integer primary key, value text)")
-        .unwrap();
-    conn_a
-        .execute("insert into test(value) values ('before-overflow')")
-        .unwrap();
-    conn_a
-        .execute("insert into test(value) values ('after-overflow')")
-        .unwrap();
+    commit_new_pages(&conn_a, 1);
+    commit_user_version(&conn_a, 1);
+    commit_user_version(&conn_a, 2);
+    let header_before = read_header(&conn_a);
 
     let authority = db_a.shared_wal_coordination().unwrap().unwrap();
     let snapshot = authority.snapshot();
@@ -1252,16 +1154,13 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let conn_b = db_b
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
-    let rows = get_rows(&conn_b, "select value from test order by id");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0].to_string(), "before-overflow");
-    assert_eq!(rows[1][0].to_string(), "after-overflow");
+    assert_eq!(read_header(&conn_b), header_before);
 }
 
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(DialectThatCannotParse)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -1269,4 +1168,19 @@ fn memory_database_keeps_in_process_wal_backend() {
         .unwrap();
     let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
     assert_eq!(wal_file.coordination_backend_name(), "in_process");
+}
+
+/// The database size in pages and the user version that a new read
+/// transaction of `conn` sees.
+fn read_header(conn: &Arc<Connection>) -> (u32, i32) {
+    let pager = conn.pager.load();
+    pager.begin_read_tx().unwrap();
+    let header = pager
+        .io
+        .block(|| {
+            pager.with_header(|header| (header.database_size.get(), header.user_version.get()))
+        })
+        .unwrap();
+    pager.end_read_tx();
+    header
 }
