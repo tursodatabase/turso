@@ -1885,6 +1885,34 @@ impl StreamingLogicalLogReader {
         io.block(|| self.next_frame())
     }
 
+    /// Reads the operations of every remaining transaction frame.
+    #[cfg(feature = "test_helper")]
+    pub fn read_ops_for_testing(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<Vec<LogOpForTesting>> {
+        let mut ops = Vec::new();
+        while let Some(frame) = io.block(|| self.next_frame())? {
+            ops.extend(frame.into_iter().map(|op| match op {
+                ParsedOp::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                    ..
+                } => LogOpForTesting::DeleteTable {
+                    rowid,
+                    record_bytes,
+                    pk_record_bytes,
+                },
+                ParsedOp::UpdateHeader { .. } => LogOpForTesting::UpdateHeader,
+                ParsedOp::UpsertTable { .. }
+                | ParsedOp::UpsertIndex { .. }
+                | ParsedOp::DeleteIndex { .. } => LogOpForTesting::Other,
+            }));
+        }
+        Ok(ops)
+    }
+
     /// Reads the next complete transaction frame.
     ///
     /// Recovery needs the whole frame so it can decide which schema snapshot should decode each
@@ -3812,6 +3840,23 @@ pub(crate) enum ParsedOp {
         header: DatabaseHeader,
         commit_ts: u64,
     },
+}
+
+/// A logical log operation, as [`StreamingLogicalLogReader::read_ops_for_testing`]
+/// returns it to integration tests.
+#[cfg(feature = "test_helper")]
+#[derive(Debug)]
+pub enum LogOpForTesting {
+    DeleteTable {
+        rowid: RowID,
+        /// The deleted row's record, which a delete may leave out.
+        record_bytes: crate::ValueBlob,
+        /// A record of the deleted row's primary key values.
+        pk_record_bytes: crate::ValueBlob,
+    },
+    UpdateHeader,
+    /// Any operation that is not one of the above.
+    Other,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

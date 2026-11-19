@@ -32,7 +32,9 @@ use turso_core::mvcc::database::MvStore;
 use turso_core::mvcc::database::RowID;
 use turso_core::mvcc::database::*;
 #[cfg(feature = "conn_raw_api")]
-use turso_core::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
+use turso_core::mvcc::persistent_storage::logical_log::{
+    LogOpForTesting, StreamingLogicalLogReader,
+};
 use turso_core::mvcc::persistent_storage::logical_log::{
     LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
@@ -9281,6 +9283,122 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
         clients,
         vec!["client-a".to_string(), "client-a".to_string()]
     );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_header_only_commits() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn.execute("PRAGMA user_version = 42").unwrap();
+    db.conn.execute("PRAGMA application_id = 1337").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let recovery_ops = collect_mvcc_log_ops(&db.conn);
+
+    // Header-only commits touch no user object, but a portable-enabled writer
+    // still emits the extension block so readers can tell an empty change set
+    // apart from pre-portable history. The payload therefore carries the frame
+    // cursor and commit timestamp and nothing else.
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert_eq!(txns.len(), 2);
+    assert!(decoded_object_maps(&txns).is_empty());
+    assert!(txns.iter().all(|txn| txn.metadata.is_empty()));
+    assert_eq!(
+        recovery_ops
+            .iter()
+            .filter(|op| matches!(op, LogOpForTesting::UpdateHeader))
+            .count(),
+        2
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let recovery_ops = collect_mvcc_log_ops(&db.conn);
+
+    let delete_pk_record = recovery_ops.iter().find_map(|op| match op {
+        LogOpForTesting::DeleteTable {
+            rowid,
+            record_bytes,
+            pk_record_bytes,
+            ..
+        } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => {
+            assert!(
+                record_bytes.is_empty(),
+                "data DELETE must not duplicate the full row record"
+            );
+            Some(pk_record_bytes.clone())
+        }
+        _ => None,
+    });
+    let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let delete_pk_record = collect_mvcc_log_ops(&db.conn)
+        .into_iter()
+        .find_map(|op| match op {
+            LogOpForTesting::DeleteTable {
+                rowid,
+                pk_record_bytes,
+                ..
+            } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => Some(pk_record_bytes),
+            _ => None,
+        })
+        .expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_log_ops(conn: &Arc<Connection>) -> Vec<LogOpForTesting> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+    reader.read_ops_for_testing(&io).unwrap()
 }
 
 #[cfg(feature = "conn_raw_api")]
