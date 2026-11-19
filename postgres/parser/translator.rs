@@ -4222,8 +4222,34 @@ impl PostgreSQLTranslator {
             "/" => ast::Operator::Divide,
             "%" => ast::Operator::Modulus,
             "||" => ast::Operator::Concat,
-            "->" => ast::Operator::ArrowRight,
-            "->>" => ast::Operator::ArrowRightShift,
+            // PostgreSQL has -> and ->> only for json and jsonb, so they run the
+            // frontend's functions. SQLite's operators read a text key such as
+            // '$.a' as a JSON path, take the first of two equal keys, and give
+            // numbers and booleans as SQL values instead of text.
+            "->" | "->>" => {
+                // An index expression and a generation expression can use only
+                // core functions.
+                if self.translating_index.get() {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!("CREATE INDEX does not support the {op_name} operator"),
+                    });
+                }
+                if self.generation_expression_table.borrow().is_some() {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+                        message: format!(
+                            "a generated column does not support the {op_name} operator"
+                        ),
+                    });
+                }
+                let func_name = if op_name == "->" {
+                    "jsonb_field"
+                } else {
+                    "jsonb_field_text"
+                };
+                return Ok(function_call(func_name, vec![*left, *right]));
+            }
             "&" => ast::Operator::BitwiseAnd,
             "|" => ast::Operator::BitwiseOr,
             "<<" => ast::Operator::LeftShift,
