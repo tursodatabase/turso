@@ -12,7 +12,7 @@ use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
     collate::{key_collation, CollationSeq, TextCollation},
-    emitter::{prepare_cdc_if_necessary, Resolver},
+    emitter::Resolver,
     expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
@@ -41,7 +41,7 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{self, emit_delete_index_row, SQLITE_TABLEID};
+use super::schema;
 
 pub(super) fn canonical_create_index_sql(
     stmt: &ast::Stmt,
@@ -1456,13 +1456,6 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
-    )?;
-
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
@@ -1472,8 +1465,6 @@ pub fn translate_drop_index(
             name: &idx_name,
         }),
     )?;
-
-    emit_delete_index_row(program, resolver, namespace, &idx_name, cdc_table)?;
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {

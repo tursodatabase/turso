@@ -2,10 +2,9 @@ mod sqlite_schema_rows;
 
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
-    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_delete_index_row,
-    emit_delete_rows_of_table, emit_delete_temp_triggers_on_table, emit_drop_view_row,
-    emit_open_sqlite_schema_cursor, emit_schema_entry, open_sqlite_schema_for_write,
-    SchemaEntryType,
+    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_delete_rows_of_table,
+    emit_delete_temp_triggers_on_table, emit_drop_view_row, emit_open_sqlite_schema_cursor,
+    emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
 };
 
 use crate::dialect::{AutomaticIndex, CatalogCmd, CmdContext, CreateTable, DropTable, TableText};
