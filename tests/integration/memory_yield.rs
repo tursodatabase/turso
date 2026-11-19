@@ -189,6 +189,57 @@ fn journal_mode_mvcc_bootstrap_yields_without_internal_step() {
 }
 
 #[test]
+fn fresh_mvcc_attach_yields_without_internal_step() {
+    #[allow(clippy::arc_with_non_send_sync)]
+    let io = Arc::new(StepGuardedIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "attach_main_yield.db",
+        OpenFlags::Create,
+        turso_core::DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    let run = |sql: &str| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut io_yields = 0usize;
+        loop {
+            io.set_step_allowed(false);
+            let step = stmt.step();
+            io.set_step_allowed(true);
+
+            match step.unwrap() {
+                StepResult::IO => {
+                    io_yields += 1;
+                    io.step().unwrap();
+                }
+                StepResult::Row => {}
+                StepResult::Done => break,
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+        io_yields
+    };
+
+    run("PRAGMA journal_mode = 'mvcc'");
+    let attach_yields = run("ATTACH 'attach_aux_yield.db' AS aux");
+
+    assert!(
+        attach_yields > 0,
+        "MemoryYieldIO should force ATTACH through cooperative yields"
+    );
+    assert!(conn.get_database_id_by_name("aux").is_ok());
+    assert!(conn
+        .mv_store_for_db(conn.get_database_id_by_name("aux").unwrap())
+        .is_some());
+}
+
+#[test]
 fn pager_allocate_and_free_yield_for_header_reads_without_internal_step() {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(StepGuardedIO::new());

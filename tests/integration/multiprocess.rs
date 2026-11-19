@@ -23,6 +23,14 @@ const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess::default_locked_db_child_process";
 const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess::multiprocess_async_open_child_process";
+const MULTIPROCESS_SHM_INSERT_CHILD_TEST: &str =
+    "multiprocess::multiprocess_shm_insert_child_process";
+const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
+    "multiprocess::multiprocess_shm_insert_and_close_child_process";
+const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
+    "multiprocess::multiprocess_shm_count_child_process";
+const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
+    "multiprocess::multiprocess_shm_schema_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "win_iocp"))]
@@ -1184,4 +1192,619 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     );
 
     observer_conn.close().unwrap();
+}
+
+#[test]
+fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    {
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+    }
+
+    let readonly = Database::open_file_with_flags(
+        io,
+        db_path_str,
+        OpenFlags::ReadOnly,
+        multiprocess_wal_db_opts(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("read-only open should degrade gracefully when no .tshm exists");
+    assert!(coordination_open_mode(&readonly).is_none());
+}
+
+#[test]
+fn subprocess_database_open_selects_multiprocess_shm_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-subprocess.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    assert_eq!(
+        coordination_open_mode(&db),
+        Some(SharedWalCoordinationOpenTelemetryMode::Exclusive)
+    );
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let insert_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        insert_output.status.success(),
+        "child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&insert_output.stdout),
+        String::from_utf8_lossy(&insert_output.stderr)
+    );
+
+    let count_output = Command::new(current_exe)
+        .arg(MULTIPROCESS_SHM_COUNT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_EXPECTED_COUNT", "2")
+        .output()
+        .unwrap();
+    assert!(
+        count_output.status.success(),
+        "count child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&count_output.stdout),
+        String::from_utf8_lossy(&count_output.stderr)
+    );
+}
+
+#[test]
+fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("close-skip-shutdown-checkpoint.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    let wal_path = format!("{db_path_str}-wal");
+    let wal_len = std::fs::metadata(&wal_path)
+        .unwrap_or_else(|_| panic!("expected WAL file at {wal_path}"))
+        .len();
+    assert!(
+        wal_len > 0,
+        "child close should not run shutdown checkpoint while another process still has the DB open"
+    );
+
+    assert_eq!(
+        count_test_rows(&conn),
+        1,
+        "parent connection should still see the child commit via WAL"
+    );
+}
+
+#[test]
+fn subprocess_database_open_survives_truncate_rewrite_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-truncate-rewrite.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent-0')")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    for expected_count in [2_i64, 3_i64] {
+        let insert_output = Command::new(&current_exe)
+            .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+            .output()
+            .unwrap();
+        assert!(
+            insert_output.status.success(),
+            "child insert failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&insert_output.stdout),
+            String::from_utf8_lossy(&insert_output.stderr)
+        );
+        assert_eq!(count_test_rows(&conn), expected_count);
+
+        let checkpoint = run_checkpoint(
+            &conn,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert!(
+            checkpoint.everything_backfilled(),
+            "truncate checkpoint should fully backfill before WAL rewrite"
+        );
+
+        let count_output = Command::new(&current_exe)
+            .arg(MULTIPROCESS_SHM_COUNT_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+            .env(
+                "TURSO_MULTIPROCESS_EXPECTED_COUNT",
+                expected_count.to_string(),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            count_output.status.success(),
+            "child count after truncate failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&count_output.stdout),
+            String::from_utf8_lossy(&count_output.stderr)
+        );
+    }
+
+    assert_eq!(count_test_rows(&conn), 3);
+}
+
+#[test]
+fn multiprocess_shm_insert_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        coordination_open_mode(&db),
+        Some(SharedWalCoordinationOpenTelemetryMode::MultiProcess)
+    );
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("insert into test(value) values ('child')")
+        .unwrap();
+}
+
+#[test]
+fn multiprocess_shm_insert_and_close_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        coordination_open_mode(&db),
+        Some(SharedWalCoordinationOpenTelemetryMode::MultiProcess)
+    );
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("insert into test(value) values ('child-close')")
+        .unwrap();
+    conn.close().unwrap();
+}
+
+#[test]
+fn multiprocess_shm_count_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let expected_count = std::env::var("TURSO_MULTIPROCESS_EXPECTED_COUNT")
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        coordination_open_mode(&db),
+        Some(SharedWalCoordinationOpenTelemetryMode::MultiProcess)
+    );
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(count_test_rows(&conn), expected_count);
+}
+
+#[test]
+fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-peer-schema-refresh.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer, next_value integer)")
+        .unwrap();
+
+    let series_rows = get_rows(&conn, "select value from generate_series(1, 3)");
+    assert_eq!(series_rows.len(), 3);
+    assert_eq!(series_rows[0][0].to_string(), "1");
+    assert_eq!(series_rows[1][0].to_string(), "2");
+    assert_eq!(series_rows[2][0].to_string(), "3");
+
+    let initial_schema_rows = get_rows(
+        &conn,
+        "select name, type from sqlite_schema where name = 'child_table'",
+    );
+    assert!(
+        initial_schema_rows.is_empty(),
+        "fresh parent connection should not see child_table before child creates it"
+    );
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let schema_rows = get_rows_without_schema_retry(
+        &conn,
+        "select name, type from sqlite_schema where name = 'child_table'",
+    );
+    assert_eq!(schema_rows.len(), 1);
+    assert_eq!(schema_rows[0][0].to_string(), "child_table");
+    assert_eq!(schema_rows[0][1].to_string(), "table");
+
+    let child_rows = get_rows_without_schema_retry(&conn, "select value from child_table");
+    assert_eq!(child_rows.len(), 1);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+
+    conn.execute("insert into t select value, value + 1 from generate_series(1, 3)")
+        .unwrap();
+    let inserted_rows = get_rows(&conn, "select value, next_value from t order by value");
+    assert_eq!(inserted_rows.len(), 3);
+    assert_eq!(inserted_rows[0][0].to_string(), "1");
+    assert_eq!(inserted_rows[0][1].to_string(), "2");
+    assert_eq!(inserted_rows[2][0].to_string(), "3");
+    assert_eq!(inserted_rows[2][1].to_string(), "4");
+}
+
+#[test]
+fn subprocess_database_open_parent_directly_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-direct-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let mut stmt = conn
+        .prepare("insert into child_table(value) values ('parent-schema')")
+        .unwrap();
+    stmt.run_ignore_rows().unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
+fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-translated-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let input = "insert into child_table(value) values ('parent-schema')";
+    let (cmd, _) = Dialect::parse_internal(&SqliteDialect, input).unwrap();
+    let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
+        panic!("translated statement input did not parse as a statement");
+    };
+    conn.prepare_translated_stmt(stmt, input)
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
+fn subprocess_database_open_parent_execute_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-execute-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    conn.execute("insert into child_table(value) values ('parent-schema')")
+        .unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
+fn subprocess_idle_begin_sees_table_created_by_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-idle-begin-schema.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("begin").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stderr={}",
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let result = conn
+        .prepare("select value from child_table")
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    let rows = result.unwrap();
+    assert_eq!(rows.len(), 1);
+    conn.execute("commit").unwrap();
+}
+
+#[test]
+fn subprocess_pragma_data_version_sees_child_process_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-data-version.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    let data_version = || {
+        get_rows(&conn, "pragma data_version")[0][0]
+            .as_int()
+            .unwrap()
+    };
+    let before = data_version();
+
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+    assert_eq!(data_version(), before, "own commit changed data_version");
+
+    let current_exe = std::env::current_exe().unwrap();
+    let insert_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        insert_output.status.success(),
+        "child insert process failed: stderr={}",
+        String::from_utf8_lossy(&insert_output.stderr)
+    );
+
+    assert_ne!(
+        data_version(),
+        before,
+        "data_version did not change after the child process committed"
+    );
+}
+
+#[test]
+fn multiprocess_shm_schema_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        coordination_open_mode(&db),
+        Some(SharedWalCoordinationOpenTelemetryMode::MultiProcess)
+    );
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table child_table(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into child_table(value) values ('child-schema')")
+        .unwrap();
+}
+
+#[test]
+fn write_after_full_checkpoint_restarts_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-restart-after-checkpoint.db");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    for _ in 0..20 {
+        conn.execute("insert into test(value) values ('x')")
+            .unwrap();
+    }
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    conn.execute("insert into test(value) values ('after')")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a write that starts after a full checkpoint must restart the WAL from frame 1, \
+         but it appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    assert_eq!(count_test_rows(&conn), 21);
+}
+
+fn coordination_open_mode(db: &Database) -> Option<SharedWalCoordinationOpenTelemetryMode> {
+    db.shared_wal_open_telemetry()
+        .unwrap()
+        .coordination_open_mode
+}
+
+fn get_rows_without_schema_retry(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(query).unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
+fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointResult {
+    let pager = conn.get_pager();
+    pager
+        .io
+        .block(|| pager.checkpoint(mode, SyncMode::Full, true))
+        .unwrap()
+}
+
+fn wal_max_frame(conn: &Arc<Connection>) -> u64 {
+    conn.get_pager()
+        .wal_max_frame()
+        .expect("wal should be present")
 }

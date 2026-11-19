@@ -94,6 +94,20 @@ mod uuid;
 mod vdbe;
 pub mod vtab;
 
+// `turso_sqlite` depends on this crate, so the unit tests of this crate
+// cannot link it: its `SqliteDialect` implements the `Dialect` trait of the
+// copy of this crate built without tests. The unit tests compile the source
+// of `turso_sqlite` as a module instead, and open databases with the same
+// dialect that users do.
+#[cfg(test)]
+extern crate self as turso_core;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[path = "../sqlite/frontend/lib.rs"]
+mod turso_sqlite;
+#[cfg(test)]
+pub(crate) use turso_sqlite::SqliteDialect;
+
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};
@@ -111,7 +125,6 @@ use crate::{
     schema::Trigger,
     storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
-    translate::emitter::TransactionMode,
     vdbe::metrics::ConnectionMetrics,
 };
 pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -119,6 +132,7 @@ use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
+pub use translate::emitter::TransactionMode;
 use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd};
 
@@ -145,9 +159,9 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-#[cfg(test)]
-pub(crate) use dialect::EngineDialect;
-pub use dialect::{CatalogChange, Dialect, NewOwner, OwnerColumn};
+pub use dialect::{
+    AccessStatement, CatalogApply, Dialect, NewOwner, OwnerColumn, RelationChange, RelationName,
+};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
     SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,

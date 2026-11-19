@@ -1445,6 +1445,88 @@ expect {
     FOREIGN KEY ("Child Key") REFERENCES public."Parent"("Mixed Key") ON UPDATE CASCADE ON DELETE SET NULL
 }
 
+test pg-get-constraintdef-check-constraints {
+    CREATE TABLE checked (
+        id int, owner text, code varchar(10), price numeric(10, 2), done boolean,
+        CONSTRAINT a_positive CHECK (id > 0),
+        CONSTRAINT b_like CHECK (owner LIKE 'a%'),
+        CONSTRAINT c_text CHECK (code <> 'x'),
+        CONSTRAINT d_in CHECK (id IN (1, 2)),
+        CONSTRAINT e_numeric CHECK (price > 0),
+        CONSTRAINT f_and CHECK (id > 0 AND id < 10),
+        CONSTRAINT g_flag CHECK (done)
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((id > 0))
+    CHECK ((owner ~~ 'a%'::text))
+    CHECK (((code)::text <> 'x'::text))
+    CHECK ((id = ANY (ARRAY[1, 2])))
+    CHECK ((price > (0)::numeric))
+    CHECK (((id > 0) AND (id < 10)))
+    CHECK (done)
+}
+
+test pg-get-constraintdef-check-constraint-with-lowest-number {
+    CREATE TABLE checked (
+        id int, big bigint,
+        CONSTRAINT a_integer CHECK (id > -2147483648),
+        CONSTRAINT b_bigint CHECK (big > -9223372036854775808)
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((id > '-2147483648'::integer))
+    CHECK ((big > '-9223372036854775808'::bigint))
+}
+
+# tursopg compiles COLLATE "default" to nothing, as it leaves the collation
+# as it is, so the condition is shown without it.
+test pg-get-constraintdef-check-constraint-with-collate {
+    CREATE TABLE checked (
+        owner text, code varchar(10),
+        CONSTRAINT a_literal CHECK (owner < 'a' COLLATE "C"),
+        CONSTRAINT b_column CHECK (owner COLLATE "C" > 'b'),
+        CONSTRAINT c_varchar CHECK (code COLLATE "C" <> 'x'),
+        CONSTRAINT d_default CHECK (owner COLLATE "default" <> 'd')
+    );
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname;
+}
+expect {
+    CHECK ((owner < ('a'::text COLLATE "C")))
+    CHECK (((owner COLLATE "C") > 'b'::text))
+    CHECK ((((code)::text COLLATE "C") <> 'x'::text))
+    CHECK (((owner COLLATE "default") <> 'd'::text))
+}
+expect @tursopg {
+    CHECK ((owner < ('a'::text COLLATE "C")))
+    CHECK (((owner COLLATE "C") > 'b'::text))
+    CHECK ((((code)::text COLLATE "C") <> 'x'::text))
+    CHECK ((owner <> 'd'::text))
+}
+
+test pg-attrdef-default-with-collate {
+    CREATE TABLE defaulted (owner text DEFAULT ('x' COLLATE "C"));
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef;
+}
+expect {
+    ('x'::text COLLATE "C")
+}
+
+# tursopg does not print the casts of the || operator and shows the condition
+# as the engine stores it.
+test pg-get-constraintdef-check-constraint-with-concatenation {
+    CREATE TABLE checked (owner text CHECK (owner || 'x' <> 'ax'));
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;
+}
+expect {
+    CHECK (((owner || 'x'::text) <> 'ax'::text))
+}
+expect @tursopg {
+    CHECK ((owner || 'x') != 'ax')
+}
+
 test pg-mixed-case-names-in-separate-schemas {
     CREATE SCHEMA other;
     CREATE TABLE public."Mixed Table" ("Mixed Id" INTEGER CONSTRAINT "Inline PK" PRIMARY KEY);

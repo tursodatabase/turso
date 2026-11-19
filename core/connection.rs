@@ -1,10 +1,10 @@
+#[cfg(feature = "conn_raw_api")]
 use crate::alloc::TryClone;
 use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-use crate::schema::SequencesByNamespace;
 use crate::security::roles::RoleId;
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
@@ -44,7 +44,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::VecDeque;
 
 use crate::security::roles::SessionRole;
 use std::fmt::Display;
@@ -55,6 +54,9 @@ use std::path::Path;
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+
+mod reparse;
+pub use reparse::{ReparseSchemaInner, ReparseSchemaState};
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -193,34 +195,6 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-/// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
-/// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
-/// `Start` is the fresh state (cookie not yet read / schema build not yet
-/// begun); `Building` carries the half-built schema, captured table-valued
-/// functions, the held reparse guard, and the current sub-phase across IO
-/// yields.
-#[derive(Default)]
-pub enum ReparseSchemaState {
-    #[default]
-    Start,
-    Building(Box<ReparseSchemaInner>),
-}
-
-pub struct ReparseSchemaInner {
-    /// Held for the whole reparse so a concurrent reparse on this connection
-    /// trips the recursion assert. Dropped when the schema is finalized.
-    _guard: SchemaReparseGuard,
-    fresh: Schema,
-    /// VACUUM-supplied sequence descriptors to graft onto the rebuilt schema
-    /// instead of re-reading each backing table. `None` for a normal reparse,
-    /// which recovers descriptors from disk in the `PopulateSequences` phase.
-    preserved_sequences: Option<SequencesByNamespace>,
-    /// The `sqlite_schema` scan, which also collects the indexes and
-    /// materialized views that are built once the types are loaded.
-    parse: Box<crate::util::ParseSchemaRowsState>,
-    phase: ReparsePhase,
-}
-
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -231,74 +205,6 @@ pub enum SubqueryUnnestingMode {
     Disabled = 1,
     /// Use the rewritten plan whenever the rewrite applies.
     Forced = 2,
-}
-
-enum ReparsePhase {
-    /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
-    ParseSchema,
-    /// Loading the names of the namespaces from the namespaces table.
-    LoadNamespaces {
-        stmt: Box<Statement>,
-        rows: Vec<(i64, String)>,
-    },
-    /// Recovering sequence descriptors from each `__turso_internal_seq_*`
-    /// backing table via SQL (or grafting the VACUUM-preserved map). The
-    /// per-backing-table descriptor read yields IO, so the worklist and the
-    /// in-flight statement are carried across re-entry here.
-    PopulateSequences {
-        /// `(backing_table_name, seq_name)` worklist; `None` until lazily
-        /// computed. Left empty when preserved sequences are grafted.
-        pending: Option<crate::alloc::Vec<(String, String)>>,
-        /// Index of the backing table currently being read.
-        idx: usize,
-        /// In-flight descriptor `SELECT`, created lazily per backing table.
-        stmt: Option<Box<Statement>>,
-        /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
-        meta: Option<(i64, i64, i64, i64, bool)>,
-        /// Sequence reconstructed from `meta`, retained while the watermark
-        /// query yields IO.
-        seq: Option<crate::schema::Sequence>,
-        /// In-flight watermark `SELECT`, created after `seq` is known.
-        watermark_stmt: Option<Box<Statement>>,
-        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
-        watermark_row: Option<(i64, bool)>,
-    },
-    /// Loading custom type definitions from the internal types table.
-    LoadTypes {
-        stmt: Box<Statement>,
-        type_rows: Vec<String>,
-    },
-    /// Loading the CREATE TYPE statements `type_sqls`, then building the
-    /// materialized views and indexes collected by the `sqlite_schema` scan.
-    BuildIndexes { type_sqls: Vec<String> },
-    /// Loading the dialect's own schema state, such as the PostgreSQL
-    /// frontend's relation catalog: `stmt` reads one query into `rows`, the
-    /// rows of the queries before it are in `results`, and `queries` are
-    /// still to be read.
-    LoadDialectSchema {
-        stmt: Box<Statement>,
-        rows: Vec<Vec<Value>>,
-        results: Vec<Vec<Vec<Value>>>,
-        queries: VecDeque<String>,
-    },
-    /// Best-effort ANALYZE-stats refresh before finalizing.
-    RefreshStats {
-        stats: crate::stats::RefreshAnalyzeStatsState,
-    },
-}
-
-impl ReparsePhase {
-    fn populate_sequences() -> Self {
-        ReparsePhase::PopulateSequences {
-            pending: None,
-            idx: 0,
-            stmt: None,
-            meta: None,
-            seq: None,
-            watermark_stmt: None,
-            watermark_row: None,
-        }
-    }
 }
 
 /// Re-entrant driver state for
@@ -795,12 +701,12 @@ impl Connection {
     }
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(
-            self.db.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )
-        .expect("built-in type definitions are malformed");
+        // new_schema only fails if built-in type SQL is malformed (programmer bug).
+        let mut schema = self
+            .db
+            .dialect()
+            .new_schema(self.db.experimental_custom_types_enabled())
+            .expect("built-in type definitions are malformed");
         schema.copy_table_valued_functions(&self.db.clone_schema());
         Arc::new(schema)
     }
@@ -1235,7 +1141,7 @@ impl Connection {
                 // An engine schema statement is the engine's own SQLite text,
                 // whatever the database's dialect parses.
                 if matches!(origin, StatementOrigin::EngineSchemaWrite) {
-                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                    self.dialect().parse_internal(sql)?
                 } else {
                     self.parse_sql(sql)?
                 }
@@ -1255,6 +1161,7 @@ impl Connection {
 
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 byte_offset_end,
@@ -1311,6 +1218,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
+                self.clone(),
                 pager,
                 mode,
                 0,
@@ -1506,373 +1414,6 @@ impl Connection {
         pager.cleanup_read_tx();
     }
 
-    /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
-    /// Retained for the many synchronous callers (statement reprepare, attach,
-    /// extension load, vacuum). The genuinely non-blocking callers (MVCC
-    /// bootstrap, the open-db state machine) drive `*_nonblock` directly.
-    pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let io = self.pager.load().io.clone();
-        let mut state = ReparseSchemaState::default();
-        io.block(|| self.reparse_schema_nonblock(&mut state))
-    }
-
-    /// VACUUM-only reparse that grafts a caller-supplied sequence-
-    /// descriptor map onto the freshly parsed schema rather than re-
-    /// reading the backing tables from disk. VACUUM preserves every
-    /// sequence's definition (start/inc/min/max/cycle) — only physical
-    /// page locations change — so the source connection's pre-VACUUM
-    /// sequences map is still valid for the post-VACUUM image.
-    ///
-    /// Blocking shim: VACUUM runs through the VDBE stepping layer (which
-    /// does not thread IO out), so it drives the non-blocking reparse to
-    /// completion here, seeding the `PopulateSequences` phase with the
-    /// preserved map so it grafts rather than re-reading each backing table.
-    pub(crate) fn reparse_schema_with_cookie_keeping_sequences(
-        self: &Arc<Connection>,
-        cookie: u32,
-        sequences: SequencesByNamespace,
-    ) -> Result<()> {
-        let io = self.pager.load().io.clone();
-        let mut state = ReparseSchemaState::default();
-        // `init_reparse_building` consumes the preserved map exactly once, on
-        // the first (Start) invocation; `io.block` re-invokes the closure on
-        // every IO completion, so `take()` yields `Some` only that first time.
-        let mut preserved = Some(sequences);
-        io.block(|| {
-            if matches!(state, ReparseSchemaState::Start) {
-                state = ReparseSchemaState::Building(Box::new(
-                    self.init_reparse_building(cookie, preserved.take())?,
-                ));
-            }
-            self.drive_reparse_building(&mut state)
-        })
-    }
-
-    /// Rebuilds this connection's schema, including dialect metadata, without
-    /// blocking. Preserve `state` across I/O yields and resume on this connection.
-    /// An active schema transaction publishes the rebuilt schema when it commits.
-    pub fn reparse_schema_nonblock(
-        self: &Arc<Connection>,
-        state: &mut ReparseSchemaState,
-    ) -> crate::types::IOResultOr<()> {
-        use crate::types::IOResult;
-        if matches!(state, ReparseSchemaState::Start) {
-            // read cookie before consuming statement program - otherwise we can
-            // end up reading cookie with closed transaction state
-            let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
-            *state =
-                ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
-        }
-        self.drive_reparse_building(state)
-    }
-
-    /// Synchronous setup shared by the reparse entry points: install the cookie,
-    /// build a fresh schema, capture table-valued functions, install the empty
-    /// schema (the reprepare hack), and prepare the sqlite_schema scan.
-    /// `preserved_sequences` is `Some` only for VACUUM, which grafts the map in
-    /// the `PopulateSequences` phase instead of re-reading the backing tables.
-    fn init_reparse_building(
-        self: &Arc<Connection>,
-        cookie: u32,
-        preserved_sequences: Option<SequencesByNamespace>,
-    ) -> Result<ReparseSchemaInner> {
-        let guard = self.schema_reparse_guard();
-        self.pager.load().set_schema_cookie(Some(cookie));
-        // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(
-            self.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )?;
-        fresh.schema_version = cookie;
-
-        fresh.copy_table_valued_functions(&self.schema.read());
-
-        // TODO: this is hack to avoid a cyclical problem with schema reprepare
-        // The problem here is that we prepare a statement here, but when the statement tries
-        // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
-        // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
-        // with a new clean schema that has the same header cookie.
-        self.install_schema_keeping_dialect_schema(&fresh)?;
-
-        let stmt = self.prepare_engine_metadata_read("SELECT * FROM sqlite_schema")?;
-
-        // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
-        let mv_tx = if self.is_mvcc_bootstrap_connection() {
-            None
-        } else {
-            self.get_mv_tx()
-        };
-        Ok(ReparseSchemaInner {
-            _guard: guard,
-            fresh,
-            preserved_sequences,
-            parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
-            phase: ReparsePhase::ParseSchema,
-        })
-    }
-
-    /// Drive the schema-rebuild phases held in `state` (must be `Building`).
-    /// Yields IO; on completion installs the finished schema and resets `state`.
-    fn drive_reparse_building(
-        self: &Arc<Connection>,
-        state: &mut ReparseSchemaState,
-    ) -> crate::types::IOResultOr<()> {
-        use crate::types::IOResult;
-        loop {
-            let ReparseSchemaState::Building(inner) = state else {
-                unreachable!("drive_reparse_building requires Building state");
-            };
-            match &mut inner.phase {
-                ReparsePhase::ParseSchema => {
-                    // Resolver so attached-db qualifiers in temp triggers can be
-                    // mapped to their actual index on this connection.
-                    let attached_resolver = |name: &str| -> Option<usize> {
-                        self.qualifiers
-                            .database_id(&crate::util::normalize_ident(name))
-                    };
-                    crate::return_if_io!(crate::util::parse_schema_rows(
-                        &mut inner.parse,
-                        &mut inner.fresh,
-                        &self.syms.read(),
-                        &attached_resolver,
-                        self.db.dialect().as_ref(),
-                    ));
-
-                    // Under a dialect without namespaces, a table of that name
-                    // is an ordinary table.
-                    if inner.fresh.supports_namespaces()
-                        && inner.fresh.has_table(
-                            NamespaceId::ROOT,
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME,
-                        )
-                    {
-                        // Install the schema so the namespaces table can be read.
-                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT id, name FROM {}",
-                            crate::schema::TURSO_NAMESPACES_TABLE_NAME
-                        ))?;
-                        inner.phase = ReparsePhase::LoadNamespaces {
-                            stmt: Box::new(stmt),
-                            rows: Vec::new(),
-                        };
-                    } else {
-                        inner.fresh.load_namespace_names(&[])?;
-                        inner.phase = ReparsePhase::populate_sequences();
-                    }
-                }
-                ReparsePhase::LoadNamespaces { stmt, rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
-                        Ok(())
-                    }));
-                    inner.fresh.load_namespace_names(rows)?;
-                    // Next: recover sequence descriptors (or graft the VACUUM map).
-                    inner.phase = ReparsePhase::populate_sequences();
-                }
-                ReparsePhase::PopulateSequences {
-                    pending,
-                    idx,
-                    stmt,
-                    meta,
-                    seq,
-                    watermark_stmt,
-                    watermark_row,
-                } => {
-                    // Lazy init: graft the VACUUM-preserved descriptor map, or
-                    // compute the worklist of backing tables to read from disk.
-                    // When there is real work, install `fresh` first so the
-                    // descriptor SELECTs can resolve the backing tables.
-                    if pending.is_none() {
-                        if let Some(sequences) = inner.preserved_sequences.take() {
-                            inner.fresh.set_sequences_by_namespace(sequences);
-                            *pending = Some(crate::alloc::vec![]);
-                        } else {
-                            let work = inner.fresh.sequence_backing_table_names();
-                            if !work.is_empty() {
-                                self.install_schema_keeping_dialect_schema(&inner.fresh)?;
-                            }
-                            *pending = Some(work);
-                        }
-                    }
-
-                    // Read each remaining backing table's descriptor row. The
-                    // backing table is internal; a missing/unreadable descriptor
-                    // row is on-disk corruption (not "sequence missing"), so any
-                    // failure surfaces as `Corrupt` and fails the open rather than
-                    // silently dropping the sequence.
-                    loop {
-                        let entry = {
-                            let work = pending.as_ref().expect("pending initialized above");
-                            if *idx >= work.len() {
-                                break;
-                            }
-                            work[*idx].clone()
-                        };
-                        let (backing_table_name, seq_name) = entry;
-                        let normalized = crate::util::normalize_ident(&seq_name);
-                        let (namespace, sequence_name) = inner.fresh.demangle_name(&normalized);
-                        if inner.fresh.has_sequence(namespace, sequence_name) {
-                            *idx += 1;
-                            *stmt = None;
-                            *meta = None;
-                            *seq = None;
-                            *watermark_stmt = None;
-                            *watermark_row = None;
-                            continue;
-                        }
-                        if seq.is_none() {
-                            crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
-                                &backing_table_name,
-                                &seq_name,
-                                stmt,
-                                meta,
-                            ));
-                            *seq = Some(Self::sequence_from_descriptor_meta(
-                                sequence_name,
-                                &backing_table_name,
-                                *meta,
-                            )?);
-                            *stmt = None;
-                            *meta = None;
-                        }
-                        let sequence = seq.as_ref().expect("sequence set above");
-                        crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
-                            &backing_table_name,
-                            sequence,
-                            watermark_stmt,
-                            watermark_row,
-                        ));
-                        let watermark = Self::sequence_watermark_from_row(
-                            &backing_table_name,
-                            sequence,
-                            *watermark_row,
-                        )?;
-                        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
-                            mv_store.set_sequence_watermark(&normalized, watermark);
-                        }
-                        let sequence = seq.take().expect("sequence set above");
-                        inner
-                            .fresh
-                            .insert_sequence_under_mangled_name(&normalized, Arc::new(sequence));
-                        *idx += 1;
-                        *stmt = None;
-                        *meta = None;
-                        *watermark_stmt = None;
-                        *watermark_row = None;
-                    }
-
-                    // Decide whether to load custom types next.
-                    if self.experimental_custom_types_enabled()
-                        && inner
-                            .fresh
-                            .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
-                    {
-                        // Temporarily install the schema so we can query against it.
-                        self.install_schema_keeping_dialect_schema(&inner.fresh)?;
-                        let stmt = self.prepare_internal(format!(
-                            "SELECT name, sql FROM {}",
-                            crate::schema::TURSO_TYPES_TABLE_NAME
-                        ))?;
-                        inner.phase = ReparsePhase::LoadTypes {
-                            stmt: Box::new(stmt),
-                            type_rows: Vec::new(),
-                        };
-                    } else {
-                        inner.phase = ReparsePhase::BuildIndexes { type_sqls: vec![] };
-                    }
-                }
-                ReparsePhase::LoadTypes { stmt, type_rows } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        type_rows.push(row.get::<&str>(1)?.to_string());
-                        Ok(())
-                    }));
-                    inner.phase = ReparsePhase::BuildIndexes {
-                        type_sqls: std::mem::take(type_rows),
-                    };
-                }
-                ReparsePhase::BuildIndexes { type_sqls } => {
-                    crate::util::populate_types_views_then_indices(
-                        &mut inner.parse,
-                        &mut inner.fresh,
-                        &self.syms.read(),
-                        type_sqls,
-                    )?;
-                    inner.phase = self.load_dialect_schema_phase(&inner.fresh)?;
-                }
-                ReparsePhase::LoadDialectSchema {
-                    stmt,
-                    rows,
-                    results,
-                    queries,
-                } => {
-                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        turso_assert!(
-                            !matches!(self.get_tx_state(), TransactionState::None),
-                            "dialect schema state must be read in a transaction"
-                        );
-                        rows.push(row.get_values().cloned().collect());
-                        Ok(())
-                    }));
-                    results.push(std::mem::take(rows));
-                    if let Some(sql) = queries.pop_front() {
-                        *stmt = Box::new(self.prepare_engine_metadata_read(&sql)?);
-                        continue;
-                    }
-                    inner.fresh.dialect_schema = Some(
-                        self.db
-                            .dialect()
-                            .build_schema_state(&inner.fresh, results)?,
-                    );
-                    inner.phase = ReparsePhase::RefreshStats {
-                        stats: Default::default(),
-                    };
-                }
-                ReparsePhase::RefreshStats { stats } => {
-                    // Best-effort load stats if sqlite_stat1 is present.
-                    crate::return_if_io!(crate::stats::refresh_analyze_stats_nonblock(self, stats));
-
-                    // Finalize: install the rebuilt schema. Take ownership so the
-                    // guard drops and `state` is reusable.
-                    let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
-                        unreachable!("state is Building");
-                    };
-                    let fresh = inner.fresh;
-                    tracing::debug!(
-                        "reparse_schema: schema_version={}, tables={:?}",
-                        fresh.schema_version,
-                        fresh.table_names(NamespaceId::ROOT).collect::<Vec<_>>()
-                    );
-                    self.with_schema_mut(|schema| {
-                        *schema = fresh;
-                    })?;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
-    /// Returns the phase that loads the dialect's own schema state into
-    /// `fresh`, or the stats refresh phase if the dialect keeps none in this
-    /// database. The fresh schema is installed first, because the current
-    /// schema may not contain the dialect's tables yet.
-    fn load_dialect_schema_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        let mut queries = VecDeque::from(self.db.dialect().schema_state_queries(fresh));
-        let Some(sql) = queries.pop_front() else {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
-        };
-        self.install_schema_keeping_dialect_schema(fresh)?;
-        let stmt = self.prepare_engine_metadata_read(&sql)?;
-        Ok(ReparsePhase::LoadDialectSchema {
-            stmt: Box::new(stmt),
-            rows: Vec::new(),
-            results: Vec::new(),
-            queries,
-        })
-    }
-
     /// Prepares a read of an engine table that holds state the schema is
     /// built from: the schema table or the dialect's own schema state. The table belongs to the engine, so its name is looked up in
     /// every database, whatever the search path says, and no role's
@@ -1896,22 +1437,6 @@ impl Connection {
         let statement = self.prepare_with_origin(sql, StatementOrigin::EngineSchemaWrite);
         self.end_nested();
         statement
-    }
-
-    /// Installs a copy of `fresh` as the connection's schema while the schema
-    /// is still being read, keeping the dialect's schema state loaded before.
-    /// It is empty in `fresh` until the dialect's tables are read, and a
-    /// statement compiled in between must not see it empty: without it, no
-    /// role exists and no table has an owner, privileges or row-level
-    /// security.
-    fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
-        self.with_schema_mut(|schema| {
-            let mut installed = fresh.try_clone()?;
-            installed.dialect_schema.clone_from(&schema.dialect_schema);
-            *schema = installed;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
-        Ok(())
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1963,7 +1488,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            Statement::new(program, self.clone(), pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1985,7 +1510,7 @@ impl Connection {
             return Ok(None);
         };
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        Ok(Some(Statement::new(program, pager, mode, 0)))
+        Ok(Some(Statement::new(program, self.clone(), pager, mode, 0)))
     }
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
@@ -2005,7 +1530,7 @@ impl Connection {
             let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                Statement::new(program, self.clone(), pager.clone(), mode, 0).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -2028,7 +1553,7 @@ impl Connection {
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+        let stmt = Statement::new(program, self.clone(), pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 
@@ -2336,7 +1861,39 @@ impl Connection {
         Ok(Some(generation))
     }
 
-    pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+    pub(crate) fn refresh_schema_for_reprepare(self: &Arc<Self>) -> Result<()> {
+        let in_snapshot_without_ddl = matches!(
+            self.get_tx_state(),
+            TransactionState::Read
+                | TransactionState::Write {
+                    schema_did_change: false
+                }
+        );
+        if self.mv_store().is_none() && in_snapshot_without_ddl {
+            // Compile against the schema cookie in this connection's read snapshot. The schema
+            // cache shared by all connections can be older (a writer's commit is visible before
+            // it calls `publish_schema_if_newer`) or newer (another connection committed after
+            // this snapshot was taken).
+            let cookie = match self.read_current_schema_cookie() {
+                Ok(cookie) => cookie,
+                // An empty database has no page 1 yet, and its schema cookie is 0.
+                Err(LimboError::Page1NotAlloc) => 0,
+                Err(err) => return Err(err),
+            };
+            if self.schema.read().schema_version == cookie {
+                return Ok(());
+            }
+            // Copy the shared schema when it matches the snapshot. Reparse only if neither the
+            // connection's schema nor the shared one does.
+            let shared_schema = self.db.schema.lock().clone();
+            if shared_schema.schema_version == cookie {
+                *self.schema.write() = shared_schema;
+            } else {
+                self.reparse_schema()?;
+            }
+            self.bump_prepare_context_generation();
+            return Ok(());
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
@@ -2347,6 +1904,7 @@ impl Connection {
             *self.schema.write() = schema;
             self.bump_prepare_context_generation();
         }
+        Ok(())
     }
 
     /// Read schema version at current transaction
@@ -3204,6 +2762,7 @@ impl Connection {
 
             // The schema already holds every stored type.
             match schema.populate_types_views_then_indices(
+                self.dialect().as_ref(),
                 &syms,
                 &[],
                 materialized_view_info,
@@ -3472,7 +3031,7 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
+    pub fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
             crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
@@ -4246,13 +3805,14 @@ impl Connection {
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
-            let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
+            let sql = Self::sequence_descriptor_query(backing_table_name);
             let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
-                     \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
-                ))
+                Self::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    seq_name,
+                    "cannot prepare descriptor SELECT",
+                    &err,
+                )
             })?;
             *stmt = Some(Box::new(prepared));
             // Fresh statement → clear any descriptor captured for a prior backing
@@ -4262,21 +3822,17 @@ impl Connection {
         }
         let s = stmt.as_mut().expect("stmt set above");
         match s.run_with_row_callback_nonblock(|row| {
-            *meta = Some((
-                row.get::<i64>(0)?,
-                row.get::<i64>(1)?,
-                row.get::<i64>(2)?,
-                row.get::<i64>(3)?,
-                row.get::<i64>(4)? != 0,
-            ));
+            *meta = Some(Self::sequence_descriptor_from_row(row)?);
             Ok(())
         }) {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
-            Err(err) => Err(LimboError::Corrupt(format!(
-                "internal sequence backing table \"{backing_table_name}\" for sequence \
-                 \"{seq_name}\": descriptor row read failed: {err}"
-            ))
+            Err(err) => Err(Self::sequence_backing_table_corrupt(
+                backing_table_name,
+                seq_name,
+                "descriptor row read failed",
+                &err,
+            )
             .into()),
         }
     }
@@ -4284,7 +3840,7 @@ impl Connection {
     /// Build a `Sequence` from a descriptor row captured by
     /// [`Self::read_seq_descriptor_row_nonblock`]. An absent/invalid descriptor
     /// is on-disk corruption (see that method's doc).
-    fn sequence_from_descriptor_meta(
+    pub(crate) fn sequence_from_descriptor_meta(
         seq_name: &str,
         backing_table_name: &str,
         meta: Option<(i64, i64, i64, i64, bool)>,
@@ -4324,40 +3880,36 @@ impl Connection {
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
-            let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
-            let sql = format!(
-                "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
-            );
+            let sql = Self::sequence_watermark_query(backing_table_name, seq);
             let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
-                     \"{}\": cannot prepare watermark SELECT: {err}",
-                    seq.name
-                ))
+                Self::sequence_backing_table_corrupt(
+                    backing_table_name,
+                    &seq.name,
+                    "cannot prepare watermark SELECT",
+                    &err,
+                )
             })?;
             *stmt = Some(Box::new(prepared));
             *row = None;
         }
         let s = stmt.as_mut().expect("stmt set above");
         match s.run_with_row_callback_nonblock(|r| {
-            let value = r.get::<i64>(0)?;
-            let is_called = r.get::<i64>(1)? != 0;
-            *row = Some((value, is_called));
+            *row = Some(Self::sequence_watermark_row(r)?);
             Ok(())
         }) {
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
-            Err(err) => Err(LimboError::Corrupt(format!(
-                "internal sequence backing table \"{backing_table_name}\" for sequence \
-                 \"{}\": watermark row read failed: {err}",
-                seq.name
-            ))
+            Err(err) => Err(Self::sequence_backing_table_corrupt(
+                backing_table_name,
+                &seq.name,
+                "watermark row read failed",
+                &err,
+            )
             .into()),
         }
     }
 
-    fn sequence_watermark_from_row(
+    pub(crate) fn sequence_watermark_from_row(
         backing_table_name: &str,
         seq: &crate::schema::Sequence,
         row: Option<(i64, bool)>,
@@ -4371,6 +3923,55 @@ impl Connection {
         })?;
         Ok(crate::mvcc::database::first_unsafe_sequence_watermark(
             seq, value, is_called,
+        ))
+    }
+
+    /// The statement that reads the row `(start, inc, min, max, cycle)` of a
+    /// sequence backing table.
+    pub(crate) fn sequence_descriptor_query(backing_table_name: &str) -> String {
+        let escaped = backing_table_name.replace('"', "\"\"");
+        format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1")
+    }
+
+    /// The row of [`Self::sequence_descriptor_query`].
+    pub(crate) fn sequence_descriptor_from_row(row: &Row) -> Result<(i64, i64, i64, i64, bool)> {
+        Ok((
+            row.get::<i64>(0)?,
+            row.get::<i64>(1)?,
+            row.get::<i64>(2)?,
+            row.get::<i64>(3)?,
+            row.get::<i64>(4)? != 0,
+        ))
+    }
+
+    /// The statement that reads the row `(value, is_called)` that the
+    /// watermark of `seq` is derived from.
+    pub(crate) fn sequence_watermark_query(
+        backing_table_name: &str,
+        seq: &crate::schema::Sequence,
+    ) -> String {
+        let escaped = backing_table_name.replace('"', "\"\"");
+        let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
+        format!("SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1")
+    }
+
+    /// The row of [`Self::sequence_watermark_query`].
+    pub(crate) fn sequence_watermark_row(row: &Row) -> Result<(i64, bool)> {
+        Ok((row.get::<i64>(0)?, row.get::<i64>(1)? != 0))
+    }
+
+    /// The error for a statement on a sequence backing table that failed
+    /// with `err`. The backing table is the engine's own, so the failure
+    /// means the file is corrupt.
+    pub(crate) fn sequence_backing_table_corrupt(
+        backing_table_name: &str,
+        seq_name: &str,
+        problem: &str,
+        err: &LimboError,
+    ) -> LimboError {
+        LimboError::Corrupt(format!(
+            "internal sequence backing table \"{backing_table_name}\" for sequence \
+             \"{seq_name}\": {problem}: {err}"
         ))
     }
 
@@ -4984,7 +4585,7 @@ impl Connection {
     }
 
     /// Get MVCC transaction ID and mode for a specific database.
-    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
@@ -5335,7 +4936,7 @@ impl Connection {
 
     /// Get the MvStore for a specific database.
     /// Returns None for databases without MVCC or for bootstrap connections.
-    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+    pub fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
@@ -5526,8 +5127,8 @@ mod tests {
     use crate::attach::AttachDatabaseState;
     use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
-    use crate::EngineDialect;
     use crate::IOResult;
+    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5538,7 +5139,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new(SessionRole::Superuser))
@@ -5657,44 +5258,64 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
+    fn test_ddl_in_one_transaction_changes_the_schema_in_place() {
+        fn schema_ptr(conn: &Connection, db: usize) -> *const Schema {
+            match db {
+                crate::MAIN_DB_ID => Arc::as_ptr(&conn.schema.read()),
+                crate::TEMP_DB_ID => {
+                    Arc::as_ptr(&conn.temp.database.read().as_ref().unwrap().db.schema.lock())
+                }
+                _ => Arc::as_ptr(&conn.database_schemas.read()[&db]),
+            }
+        }
+
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
+        let conn = open_connection(&temp_dir.path().join("main.db"));
+        let aux_path = temp_dir.path().join("aux.db");
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
+        let aux_id = conn.qualifier("aux").unwrap().database_id();
 
-        conn.execute("CREATE TABLE t1(a)").unwrap();
-        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
-
-        conn.execute("PRAGMA automatic_index = OFF").unwrap();
-        stmt.run_collect_rows().unwrap();
-
-        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
-        assert_eq!(reprepares, 1);
-    }
-
-    /// The reparse of the schema installs a fresh schema before the
-    /// dialect's schema state is read, and a statement compiled meanwhile
-    /// must not see it empty.
-    #[test]
-    fn schema_installed_while_being_read_keeps_the_loaded_dialect_schema() {
-        let db = Database::open_file(
-            Arc::new(crate::MemoryIO::new()),
-            ":memory:",
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
+        for (db, name) in [
+            (crate::MAIN_DB_ID, "main"),
+            (crate::TEMP_DB_ID, "temp"),
+            (aux_id, "aux"),
+        ] {
+            conn.execute("BEGIN").unwrap();
+            // The first DDL copies the schema, which the committed schema still shares.
+            conn.execute(format!("CREATE TABLE {name}.a(x)")).unwrap();
+            let private_schema = schema_ptr(&conn, db);
+            conn.execute(format!("CREATE TABLE {name}.b(x UNIQUE)"))
+                .unwrap();
+            conn.execute(format!("CREATE INDEX {name}.b_x ON b(x)"))
+                .unwrap();
+            conn.execute(format!(
+                "CREATE TRIGGER {name}.b_insert AFTER INSERT ON b BEGIN SELECT 1; END"
+            ))
             .unwrap();
-        conn.with_schema_mut(|schema| {
-            schema.dialect_schema = Some(Arc::new(()));
-        })
-        .unwrap();
-        let fresh = Schema::with_options(false, &EngineDialect).unwrap();
-        assert!(fresh.dialect_schema.is_none());
+            assert_eq!(
+                schema_ptr(&conn, db),
+                private_schema,
+                "DDL on {name} copied a schema that only this transaction uses"
+            );
+            conn.execute(format!("INSERT INTO {name}.b VALUES (1)"))
+                .unwrap();
 
-        conn.install_schema_keeping_dialect_schema(&fresh).unwrap();
+            conn.execute("SAVEPOINT sp").unwrap();
+            conn.execute(format!("CREATE TABLE {name}.c(x)")).unwrap();
+            conn.execute(format!("CREATE TABLE {name}.d(x)")).unwrap();
+            conn.execute("ROLLBACK TO sp").unwrap();
+            assert!(conn.execute(format!("SELECT * FROM {name}.c")).is_err());
+            assert!(conn.execute(format!("SELECT * FROM {name}.d")).is_err());
+            conn.execute(format!("SELECT * FROM {name}.b")).unwrap();
 
-        assert!(conn.schema.read().dialect_schema.is_some());
+            conn.execute("ROLLBACK").unwrap();
+            for object in ["a", "b"] {
+                assert!(
+                    conn.execute(format!("SELECT * FROM {name}.{object}"))
+                        .is_err(),
+                    "{name}.{object} survived ROLLBACK"
+                );
+            }
+        }
     }
 }

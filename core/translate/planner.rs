@@ -40,7 +40,7 @@ use crate::{
 };
 use crate::{
     function::{AccumulatorFunc, AggFunc, WindowFunc},
-    translate::expr::bind_and_rewrite_expr,
+    translate::expr::{bind_and_rewrite_expr, bind_and_rewrite_expr_except},
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -1645,9 +1645,6 @@ fn parse_from_clause_table(
                 if already_visible {
                     continue;
                 }
-                let name_used_by_table_on_the_left = outer_query_refs_for_subquery
-                    .iter()
-                    .any(|reference| reference.identifier == cte_definition.name);
                 // This plan only makes the name visible. A later FROM lookup performs
                 // the real CTE use and validates its explicit column list.
                 let cte_table = plan_cte(
@@ -1671,7 +1668,7 @@ fn parse_from_clause_table(
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: name_used_by_table_on_the_left,
+                    cte_definition_only: true,
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
@@ -3328,19 +3325,29 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
+    let reads_only_earlier_tables = resolver
+        .catalog
+        .dialect
+        .table_function_arguments_read_only_earlier_tables();
     for mut expr in vtab_predicates.drain(..) {
-        bind_and_rewrite_expr(
+        let table_function = vtab_predicate_table_id(&expr)
+            .expect("a table-function argument must constrain its hidden column");
+        let hidden_tables = if reads_only_earlier_tables {
+            tables_from(table_references, table_function)
+        } else {
+            Vec::new()
+        };
+        bind_and_rewrite_expr_except(
             &mut expr,
             Some(table_references),
-            Some(result_columns),
+            (!reads_only_earlier_tables).then_some(result_columns),
             resolver,
             BindingBehavior::TryCanonicalColumnsFirst,
+            &hidden_tables,
         )?;
 
         // SQLite treats a table-function argument as an ON term for that table.
         // This keeps the term with the table when a later RIGHT JOIN adds NULL rows.
-        let table_function = vtab_predicate_table_id(&expr)
-            .expect("a table-function argument must constrain its hidden column");
         let table_reference = table_references
             .find_joined_table_by_internal_id(table_function)
             .expect("a table-function argument must have a table reference");
@@ -3358,6 +3365,16 @@ pub(crate) fn append_vtab_predicates_to_where_clause(
         });
     }
     Ok(())
+}
+
+/// The table `first` and every table listed after it.
+fn tables_from(table_references: &TableReferences, first: TableInternalId) -> Vec<TableInternalId> {
+    table_references
+        .joined_tables()
+        .iter()
+        .skip_while(|table| table.internal_id != first)
+        .map(|table| table.internal_id)
+        .collect()
 }
 
 /// Get the source table from `hidden_column = +(argument)`.

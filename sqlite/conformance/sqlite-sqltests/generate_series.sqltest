@@ -77,3 +77,43 @@ test generate-series-rowid-is-null-on-unmatched-left-join-row {
 expect {
     1|null
 }
+
+test json-each-argument-named-like-a-column-of-the-function {
+    CREATE TABLE json_args (type);
+    INSERT INTO json_args VALUES ('array');
+    SELECT 1 FROM json_each(type);
+}
+expect {
+}
+
+test table-function-argument-reads-the-function-itself {
+    SELECT 1 FROM json_each(json_each.value);
+}
+expect {
+}
+
+test json-each-argument-named-like-a-column-of-the-function-and-of-another-table-is-ambiguous {
+    CREATE TABLE json_args_ambiguous (value);
+    SELECT 1 FROM json_args_ambiguous, json_each(value);
+}
+expect error {
+    ambiguous column name: value
+}
+
+test json-each-argument-can-name-a-table-listed-after-it {
+    CREATE TABLE json_args_later (j);
+    INSERT INTO json_args_later VALUES ('[1, 2]');
+    SELECT count(*) FROM json_each(json_args_later.j), json_args_later;
+}
+expect {
+    2
+}
+
+test json-each-argument-names-the-column-of-the-function-before-it {
+    CREATE TABLE json_args_nested (j);
+    INSERT INTO json_args_nested VALUES ('{"a": {"x": 1, "y": 2}, "b": {"z": 3}}');
+    SELECT count(*) FROM json_args_nested, json_each(j) AS outer_each, json_each(outer_each.value) AS inner_each;
+}
+expect {
+    3
+}

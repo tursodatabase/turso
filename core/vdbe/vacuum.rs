@@ -2589,7 +2589,7 @@ mod tests {
     use crate::storage::pager::Page;
     use crate::util::IOExt;
     use crate::vdbe::execute::TransactionYieldPoint;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
     use crate::{
         Buffer, Clock, Completion, ConnectOpts, DatabaseOpts, File, MemoryIO, MonotonicInstant,
         OpenFlags, WallClockInstant, IO,
@@ -2906,7 +2906,7 @@ mod tests {
     #[test]
     fn replace_shared_schema_after_vacuum_replaces_wrapped_schema_cookie() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
 
         db.with_schema_mut(|schema| {
             schema.schema_version = u32::MAX;
@@ -2928,7 +2928,7 @@ mod tests {
     #[test]
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         conn.with_schema_mut(|schema| {
@@ -2963,7 +2963,7 @@ mod tests {
     #[test]
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect))?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         conn.with_schema_mut(|schema| {
@@ -3015,7 +3015,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         // Source is uninitialized so its header reserved_space isn't usable.
@@ -3092,7 +3092,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.set_sync_mode(crate::SyncMode::Off);
@@ -3140,7 +3140,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
@@ -3162,7 +3162,7 @@ mod tests {
             OpenFlags::Create,
             vacuum_target_opts_from_source(&source_db),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         mirror_symbols(&source_conn, &target_conn);
@@ -3228,7 +3228,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
@@ -3282,7 +3282,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
@@ -3338,7 +3338,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
@@ -3374,7 +3374,7 @@ mod tests {
                 cipher: CipherMode::Aes256Gcm.to_string(),
                 hexkey: key_hex.to_string(),
             }),
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let source_conn = source_db
             .connect(ConnectOpts::new(SessionRole::Superuser).with_encryption_key(Some(key)))?;
@@ -3408,7 +3408,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )?;
         let target_conn = target_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         target_conn.execute("CREATE TABLE seed(x)")?;

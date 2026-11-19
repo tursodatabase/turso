@@ -170,7 +170,39 @@ runs for each row that the policy checks, and a subquery such as
 `(SELECT auth.uid())` that reads no column of the row runs once per query,
 so writing the call as a subquery is cheaper on large tables.
 
-`pg_policy` and `pg_policies` do not show the policies yet.
+`pg_policy` lists the policies, with oids that stay the same for as long as
+the policy exists. Its `polqual` and `polwithcheck` columns hold the
+conditions as the text that `pg_get_expr(polqual, polrelid)` returns, printed
+as PostgreSQL prints them, with every operator in parentheses and casts such
+as `'x'::text` and `(1)::numeric`, rather than PostgreSQL's internal form.
+Conditions are printed this way when they use columns of type `boolean`,
+`smallint`, `integer`, `bigint`, `numeric(p, s)`, `text` or `varchar`,
+constants, comparisons, arithmetic, `AND`, `OR`, `NOT`, `IS [NOT] NULL`,
+`IN` with a list of constants, `BETWEEN`, `LIKE`, role keywords such as
+`current_user`, `lower`, `upper`, `length`, `abs`, `COALESCE` and
+`(SELECT ...)` without `FROM`; other conditions, such as ones with other
+functions, casts or `CASE`, are shown as `CREATE POLICY` wrote them, which
+PostgreSQL reads back but prints differently. `pg_policies` shows the same
+policies by schema, table and role names, with their conditions printed the
+same way.
+
+`pg_get_expr(conbin, conrelid)` prints the `CHECK` constraints in
+`pg_constraint` the same way: `CHECK (owner LIKE 'a%')` is shown as
+`(owner ~~ 'a%'::text)`, and `pg_get_constraintdef` shows it as
+`CHECK ((owner ~~ 'a%'::text))`. `pg_get_constraintdef(oid, true)` prints the
+same text, without removing parentheses as PostgreSQL's pretty printing
+does. A `CHECK` condition with a form outside that list
+is shown as the engine stores it, which PostgreSQL may not read back: `LIKE`
+with a pattern that is not a constant, for example, is shown with the
+engine's own functions and operators.
+
+`pg_get_expr(adbin, adrelid)` prints the column defaults and the expressions
+of generated columns in `pg_attrdef` the same way too. As in PostgreSQL, the
+cast of the whole default to the column's type is not printed, so
+`DEFAULT 7` in a `bigint` column is shown as `7`, and a quoted constant
+takes the type of its `text` or `varchar` column: `DEFAULT 'x'` is shown as
+`'x'::text`. A quoted constant in a column of another type, such as
+`DEFAULT '2020-01-01'` in a `date` column, is shown as the engine stores it.
 
 Materialized views store the rows of their query when they are refreshed, so
 a role that reads a materialized view built on a table with row-level

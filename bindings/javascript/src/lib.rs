@@ -878,7 +878,8 @@ impl Statement {
             ValueType::Null => turso_core::Value::Null,
             ValueType::Number => {
                 let n: f64 = unsafe { value.cast()? };
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                // `i64::MAX as f64` is 2^63, one past the largest i64, so the upper bound is exclusive.
+                if n.fract() == 0.0 && n >= i64::MIN as f64 && n < i64::MAX as f64 {
                     turso_core::Value::from_i64(n as i64)
                 } else {
                     turso_core::Value::from_f64(n)

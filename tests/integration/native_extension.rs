@@ -1,6 +1,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use turso_core::alloc::TryClone;
+use turso_core::dialect::Dialect;
 use turso_core::function::ExternalFunc;
 use turso_core::namespace::NamespaceId;
 use turso_core::native_ext::*;
@@ -1219,6 +1220,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             let table = turso_core::vtab::VirtualTable::table(
+                &SqliteDialect,
                 Some("arguments"),
                 "argument_module",
                 args,
@@ -1258,7 +1260,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
     ))
     .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    let mut schema = turso_core::schema::Schema::with_options(true, &SqliteDialect).unwrap();
+    let mut schema = <dyn Dialect>::new_schema(&SqliteDialect, true).unwrap();
     schema
         .handle_schema_row(
             "table",
@@ -1314,6 +1316,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                 }
             } else {
                 let result = turso_core::vtab::VirtualTable::table(
+                    &SqliteDialect,
                     Some("arguments"),
                     "c_arguments_module",
                     args,
@@ -1372,6 +1375,37 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
         .prepare("SELECT value FROM (SELECT 1 AS n) LEFT JOIN native_rows(18) ON 1")
         .unwrap();
     assert_eq!(collect(&mut outer, &queue), vec![vec![Value::Null]]);
+}
+
+#[test]
+fn table_function_argument_reads_a_table_listed_after_the_function() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE TABLE bounds(lower)").unwrap();
+    conn.execute("INSERT INTO bounds VALUES (8), (16)").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT bounds.lower, r.value FROM native_rows(bounds.lower) AS r, bounds \
+             ORDER BY bounds.lower, r.value",
+        )
+        .unwrap();
+    assert_eq!(
+        collect(&mut stmt, &queue),
+        vec![
+            vec![Value::from_i64(8), Value::from_i64(9)],
+            vec![Value::from_i64(8), Value::from_i64(17)],
+            vec![Value::from_i64(16), Value::from_i64(17)],
+        ]
+    );
 }
 
 #[test]

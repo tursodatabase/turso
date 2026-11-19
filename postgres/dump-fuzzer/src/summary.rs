@@ -112,7 +112,10 @@ impl Generated {
             ..Self::default()
         };
         let mut tables = BTreeMap::new();
-        for statement in pg_query::parse(sql)?.protobuf.stmts {
+        for statement in pg_query::parse(sql, pg_query::ParserOptions::DEFAULT)?
+            .protobuf
+            .stmts
+        {
             let Some(node) = statement.stmt.and_then(|s| s.node) else {
                 continue;
             };

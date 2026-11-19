@@ -9,7 +9,7 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{AggStepData, HashDistinctData, Insn},
+        insn::{AggStepData, Insn},
     },
     LimboError, Result,
 };
@@ -208,7 +208,7 @@ pub fn emit_ungrouped_aggregation<'a>(
 
     // Resolve the SELECT DISTINCT label if present
     // When a duplicate is found by the Found instruction, jump here to skip emitting the row
-    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+    if let Distinctness::Distinct { ctx, .. } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
@@ -226,22 +226,13 @@ pub fn handle_distinct(
     distinctness: &Distinctness,
     agg_arg_reg: usize,
 ) {
-    let Distinctness::Distinct { ctx } = distinctness else {
+    let Distinctness::Distinct { ctx, .. } = distinctness else {
         return;
     };
     let distinct_ctx = ctx
         .as_ref()
         .expect("distinct aggregate context not populated");
-    let num_regs = 1;
-    program.emit_insn(Insn::HashDistinct {
-        data: Box::new(HashDistinctData {
-            hash_table_id: distinct_ctx.hash_table_id,
-            key_start_reg: agg_arg_reg,
-            num_keys: num_regs,
-            collations: distinct_ctx.collations.clone(),
-            target_pc: distinct_ctx.label_on_conflict,
-        }),
-    });
+    distinct_ctx.emit_deduplication_insns(program, 1, agg_arg_reg);
 }
 
 /// Source of aggregate function arguments during bytecode emission.
@@ -436,7 +427,7 @@ pub fn emit_aggregate_final(
         let mut sorted_aggregate = aggregate.clone();
         let duplicate = if aggregate.distinct_uses_order_key() {
             let label = program.allocate_label();
-            let Distinctness::Distinct { ctx: Some(ctx) } = &mut sorted_aggregate.distinctness
+            let Distinctness::Distinct { ctx: Some(ctx), .. } = &mut sorted_aggregate.distinctness
             else {
                 unreachable!("ordered DISTINCT requires a distinct context");
             };

@@ -937,10 +937,7 @@ fn prepare_one_select_plan(
                 contains_constant_false_condition: false,
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
-                values: values
-                    .into_iter()
-                    .map(|values| values.into_iter().map(|value| *value).collect())
-                    .collect(),
+                values,
                 window: None,
                 non_from_clause_subqueries,
                 input_cardinality_hint: None,

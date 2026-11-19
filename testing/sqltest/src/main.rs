@@ -5,9 +5,9 @@ use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
     OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
     backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
-    backends::rust::RustBackend, backends::tursopg::TursopgBackend, create_output,
-    find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
-    summarize, tcl_converter,
+    backends::rust::RustBackend, backends::tursopg::TursopgBackend,
+    backends::tursopg_embedded::TursopgEmbeddedBackend, create_output, find_all_pending_snapshots,
+    generate_database, generate_integrity_fixture, load_test_files, summarize, tcl_converter,
 };
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -37,7 +37,8 @@ enum Commands {
 
         /// Backend to use: "rust" (native), "cli" (subprocess), "js" (JavaScript
         /// bindings), "tursopg" (tursopg server over the PostgreSQL wire protocol),
-        /// or "postgres" (the real PostgreSQL server at --postgres-dsn)
+        /// "tursopg-embedded" (turso_pg in this process, without a server), or
+        /// "postgres" (the real PostgreSQL server at --postgres-dsn)
         #[arg(long, default_value = "rust")]
         backend: String,
 
@@ -260,6 +261,10 @@ async fn run_tests(
         }
         _ => {}
     }
+    if mvcc && backend_type == "tursopg-embedded" {
+        eprintln!("Error: --mvcc does not work with --backend tursopg-embedded");
+        return ExitCode::from(2);
+    }
 
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -477,6 +482,20 @@ async fn run_tests(
                 })
                 .await
         }
+        "tursopg-embedded" => {
+            let mut backend =
+                TursopgEmbeddedBackend::new().with_timeout(Duration::from_secs(timeout));
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
         "postgres" => {
             let dsn = postgres_dsn.expect("--postgres-dsn is checked above");
             let backend = match PostgresBackend::connect(&dsn, Duration::from_secs(timeout)).await {
@@ -502,7 +521,7 @@ async fn run_tests(
         }
         other => {
             eprintln!(
-                "Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', 'tursopg', or 'postgres'"
+                "Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', 'tursopg', 'tursopg-embedded', or 'postgres'"
             );
             return ExitCode::from(2);
         }

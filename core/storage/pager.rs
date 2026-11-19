@@ -6608,7 +6608,7 @@ mod tests {
     fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
         let io = Arc::new(MemoryIO::new());
         let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
         let conn = db
             .connect(crate::ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
@@ -7287,7 +7287,7 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::EngineDialect;
+    use crate::SqliteDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -7322,7 +7322,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         (db, dir)

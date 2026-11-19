@@ -152,6 +152,8 @@ fn emit_values_in_subquery(
         program.reg_result_cols_start = Some(reg);
         reg
     };
+    // Each value takes at least one instruction, and each row ends with a Yield.
+    program.reserve_insns(plan.values.len() * (row_len + 1));
     for value in &plan.values {
         for (i, v) in value.iter().enumerate() {
             translate_expr_no_constant_opt(

@@ -8,7 +8,7 @@
 //!
 //! Which tables have row-level security, and their policies, are the
 //! dialect's schema state, like the owner of a table. The module compiles the
-//! statements that change them into a [`CatalogChange`] for the dialect to
+//! statements that change them into an [`AccessStatement`] for the dialect to
 //! record.
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::CatalogChange,
+    dialect::AccessStatement,
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
@@ -591,10 +591,10 @@ pub(crate) fn translate_set_row_security(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let (namespace, table) = row_security_table(qualified_name, resolver)?;
-    translate_change(
-        CatalogChange::SetRowSecurity {
+    translate_access_statement(
+        &AccessStatement::SetRowSecurity {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
+            name: &normalize_ident(&table.declared_name),
             enabled,
         },
         resolver,
@@ -641,11 +641,11 @@ pub(crate) fn translate_create_policy(
     {
         prepare_policy_expr(expr, namespace, &table, resolver)?;
     }
-    translate_change(
-        CatalogChange::CreatePolicy {
+    translate_access_statement(
+        &AccessStatement::CreatePolicy {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            policy: Box::new(stored),
+            name: &normalize_ident(&table.declared_name),
+            policy: &stored,
         },
         resolver,
         program,
@@ -676,11 +676,11 @@ pub(crate) fn translate_drop_policy(
         return Ok(());
     }
     let (namespace, table) = row_security_table(tbl_name, resolver)?;
-    translate_change(
-        CatalogChange::DropPolicy {
+    translate_access_statement(
+        &AccessStatement::DropPolicy {
             namespace: namespace.id,
-            name: normalize_ident(&table.declared_name),
-            policy_name: policy_name.as_str().to_string(),
+            name: &normalize_ident(&table.declared_name),
+            policy_name: policy_name.as_str(),
             if_exists,
         },
         resolver,
@@ -760,10 +760,10 @@ fn row_security_table(
     }
 }
 
-/// Records `change` through the dialect, in a write transaction that bumps
-/// the schema cookie so that other connections load it.
-pub(crate) fn translate_change(
-    change: CatalogChange,
+/// Has the dialect translate `statement`, in a write transaction that bumps
+/// the schema cookie so that other connections load what it stored.
+pub(crate) fn translate_access_statement(
+    statement: &AccessStatement<'_>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -773,7 +773,7 @@ pub(crate) fn translate_change(
     resolver
         .catalog
         .dialect
-        .translate_catalog_changes(program, schema, connection, &[change])?;
+        .translate_access_statement(program, schema, connection, statement)?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }
@@ -934,16 +934,17 @@ mod tests {
     use super::{
         conditions_of, policy, using_condition, with_check_condition, Command, Condition, Policy,
     };
-    use crate::dialect::{Dialect, EngineDialect};
+    use crate::dialect::Dialect;
     use crate::function::Func;
     use crate::namespace::{NamespaceId, NamespaceRef};
     use crate::schema::{BTreeTable, Schema};
     use crate::security::policy::RowPolicy;
     use crate::security::roles::RoleId;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
+    use crate::SqliteDialect;
     use crate::{DatabaseCatalog, Qualifiers, RwLock, SymbolTable};
 
-    /// The engine dialect, except that every table of a schema with dialect
+    /// The SQLite dialect, except that every table of a schema with dialect
     /// schema state has row-level security, and table `documents` has a
     /// policy that lets every role access every row.
     struct RowSecurityInSchemasWithState;
@@ -961,23 +962,38 @@ mod tests {
 
     impl Dialect for RowSecurityInSchemasWithState {
         fn name(&self) -> &'static str {
-            EngineDialect.name()
+            SqliteDialect.name()
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
-            EngineDialect.parse(sql)
+            SqliteDialect.parse(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> crate::Result<(Option<ast::Cmd>, usize)> {
+            SqliteDialect.parse_internal(sql)
+        }
+
+        fn parse_internal_column_definition(
+            &self,
+            sql: &str,
+        ) -> crate::Result<ast::ColumnDefinition> {
+            SqliteDialect.parse_internal_column_definition(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(SqliteDialect)
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            EngineDialect.parse_table_sql(sql, root_page)
+            SqliteDialect.parse_table_sql(sql, root_page)
         }
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<ast::Stmt> {
-            EngineDialect.parse_table_sql_ast(sql)
+            SqliteDialect.parse_table_sql_ast(sql)
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            EngineDialect.table_sql_for_replay(sql)
+            SqliteDialect.table_sql_for_replay(sql)
         }
 
         fn format_table_sql(
@@ -986,19 +1002,11 @@ mod tests {
             tbl_name: &ast::QualifiedName,
             body: &ast::CreateTableBody,
         ) -> crate::Result<String> {
-            EngineDialect.format_table_sql(input, tbl_name, body)
-        }
-
-        fn register_catalog(
-            &self,
-            schema: &mut Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
-            EngineDialect.register_catalog(schema, enable_custom_types)
+            SqliteDialect.format_table_sql(input, tbl_name, body)
         }
 
         fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
-            EngineDialect.resolve_function(name, arg_count)
+            SqliteDialect.resolve_function(name, arg_count)
         }
 
         fn table_rls_enabled(&self, schema: &Schema, _namespace: NamespaceId, _name: &str) -> bool {
@@ -1073,7 +1081,7 @@ mod tests {
     ) -> RowPolicy {
         let expr = |sql: &str| {
             let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
-                EngineDialect.parse(&format!("SELECT {sql}")).unwrap().0
+                SqliteDialect.parse(&format!("SELECT {sql}")).unwrap().0
             else {
                 panic!("{sql} is not an expression");
             };

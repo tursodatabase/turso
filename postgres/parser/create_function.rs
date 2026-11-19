@@ -328,7 +328,7 @@ fn function_body<'a>(
 }
 
 fn parse_body(body: &str) -> Result<pg_query::ParseResult, ParseError> {
-    pg_query::parse(body).map_err(|error| ParseError::Sqlstate {
+    pg_query::parse(body, pg_query::ParserOptions::DEFAULT).map_err(|error| ParseError::Sqlstate {
         sqlstate: SQLSTATE_SYNTAX_ERROR,
         message: match error {
             pg_query::Error::Parse(message) => message,

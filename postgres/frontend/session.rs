@@ -34,7 +34,7 @@ use turso_pg_parser::translator::{
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
     FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
     PgGrantStmt, PgGrantTables, PgGrantee, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
-    PostgreSQLTranslator, SerialSequence,
+    PostgreSQLTranslator, SerialSequence, TranslateResult,
 };
 use turso_pg_parser::ParseError;
 
@@ -64,6 +64,17 @@ pub enum TransactionState {
 const SEARCH_PATH_SETTING: &str = "search_path";
 
 pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
+
+/// The features that the tursopg CLI and its server open a database with.
+pub fn tursopg_database_opts() -> turso_core::DatabaseOpts {
+    turso_core::DatabaseOpts::new()
+        .with_views(true)
+        .with_custom_types(true)
+        .with_encryption(true)
+        .with_index_method(true)
+        .with_autovacuum(true)
+        .with_attach(true)
+}
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
@@ -384,6 +395,102 @@ fn prepare_statement_inner(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
 ) -> Result<crate::Statement> {
+    let TranslatedStatement {
+        translated,
+        sql,
+        result_kind,
+        marks_query_start,
+        enum_labels,
+    } = match translate_statement(pg_conn, sql)? {
+        Translation::Prepared(stmt) => return Ok(*stmt),
+        Translation::Translated(translated) => *translated,
+    };
+    let conn = Arc::clone(&pg_conn.conn);
+    let tx = Arc::clone(&pg_conn.tx);
+    let role = tx_role(translated.cmd.stmt());
+    let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
+
+    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
+        let stmt = pg_conn
+            .conn
+            .prepare_translated_cmd(translated.cmd, &sql)
+            .map_err(schema_error)?;
+        // Preparing CREATE TYPE refuses a taken type name, which PostgreSQL
+        // reports before bad enum labels.
+        enum_labels.map_err(|e| translation_error(&pg_conn.conn, e))?;
+        return Ok(crate::Statement::new(stmt)
+            .with_result_kind(result_kind)
+            .with_tx_tracking(conn, tx, role)
+            .with_query_start_marking(marks_query_start)
+            .with_post_run(post_run));
+    }
+
+    // Validate the prerequisites and the target command during prepare
+    // without executing any writes. What follows the command names what the
+    // command creates, so it can only be prepared once the command has run.
+    // Side-effecting prerequisites run atomically with the command only when
+    // the returned Statement is actually executed.
+    for prereq in &translated.prereqs {
+        let input = prereq.to_string();
+        let _ = pg_conn
+            .conn
+            .prepare_translated_stmt(prereq.clone(), &input)
+            .map_err(schema_error)?;
+    }
+    let cmd = translated.cmd;
+    let inner = pg_conn
+        .conn
+        .prepare_translated_cmd(cmd.clone(), &sql)
+        .map_err(schema_error)?;
+    Ok(crate::Statement::with_deferred(
+        inner,
+        DeferredExecution::new(
+            pg_conn,
+            DeferredOperation::Translated {
+                prereqs: translated.prereqs,
+                cmd: Box::new(cmd),
+                postreqs: translated.postreqs,
+                sql: sql.into_owned(),
+            },
+        ),
+    )
+    .with_result_kind(result_kind)
+    .with_tx_tracking(conn, tx, role)
+    .with_query_start_marking(marks_query_start)
+    .with_post_run(post_run))
+}
+
+/// What [`translate_statement`] returns.
+enum Translation<'a> {
+    /// A statement that the frontend prepared without translating it.
+    Prepared(Box<crate::Statement>),
+    /// A statement translated to the statements that run it, not yet prepared.
+    Translated(Box<TranslatedStatement<'a>>),
+}
+
+/// A PostgreSQL statement translated to the statements that run it.
+struct TranslatedStatement<'a> {
+    translated: TranslateResult,
+    /// The SQL text of the statement, rewritten when the frontend named
+    /// what the statement creates.
+    sql: Cow<'a, str>,
+    result_kind: StatementResultKind,
+    marks_query_start: bool,
+    /// The result of checking the labels of `CREATE TYPE ... AS ENUM`.
+    enum_labels: std::result::Result<(), ParseError>,
+}
+
+/// Parses `sql` and translates it, or prepares it when the frontend runs it
+/// without translating it.
+///
+/// Never inlined: inlined into [`prepare_statement_inner`], the stack that
+/// parsing and translating use would stay in use while the translated
+/// statement is prepared, which recurses deep into the planner.
+#[inline(never)]
+fn translate_statement<'a>(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &'a str,
+) -> Result<Translation<'a>> {
     reject_sqlite_catalog_access(sql)?;
 
     let parse_result = turso_pg_parser::parse(sql).map_err(crate::error::sql_parse_error)?;
@@ -404,13 +511,14 @@ fn prepare_statement_inner(
     };
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql, &parse_result, result_kind)? {
-        return Ok(stmt
-            .with_tx_tracking(
+        return Ok(Translation::Prepared(Box::new(
+            stmt.with_tx_tracking(
                 Arc::clone(&pg_conn.conn),
                 Arc::clone(&pg_conn.tx),
                 TxRole::Other,
             )
-            .with_query_start_marking(marks_query_start));
+            .with_query_start_marking(marks_query_start),
+        )));
     }
 
     let rewritten_sql = if let Some((location, schema)) =
@@ -485,60 +593,13 @@ fn prepare_statement_inner(
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
-
-    let conn = Arc::clone(&pg_conn.conn);
-    let tx = Arc::clone(&pg_conn.tx);
-    let role = tx_role(translated.cmd.stmt());
-    let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
-
-    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
-        let stmt = pg_conn
-            .conn
-            .prepare_translated_cmd(translated.cmd, &sql)
-            .map_err(schema_error)?;
-        // Preparing CREATE TYPE refuses a taken type name, which PostgreSQL
-        // reports before bad enum labels.
-        check_enum_labels(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?;
-        return Ok(crate::Statement::new(stmt)
-            .with_result_kind(result_kind)
-            .with_tx_tracking(conn, tx, role)
-            .with_query_start_marking(marks_query_start)
-            .with_post_run(post_run));
-    }
-
-    // Validate the prerequisites and the target command during prepare
-    // without executing any writes. What follows the command names what the
-    // command creates, so it can only be prepared once the command has run.
-    // Side-effecting prerequisites run atomically with the command only when
-    // the returned Statement is actually executed.
-    for prereq in &translated.prereqs {
-        let input = prereq.to_string();
-        let _ = pg_conn
-            .conn
-            .prepare_translated_stmt(prereq.clone(), &input)
-            .map_err(schema_error)?;
-    }
-    let cmd = translated.cmd;
-    let inner = pg_conn
-        .conn
-        .prepare_translated_cmd(cmd.clone(), &sql)
-        .map_err(schema_error)?;
-    Ok(crate::Statement::with_deferred(
-        inner,
-        DeferredExecution::new(
-            pg_conn,
-            DeferredOperation::Translated {
-                prereqs: translated.prereqs,
-                cmd: Box::new(cmd),
-                postreqs: translated.postreqs,
-                sql: sql.into_owned(),
-            },
-        ),
-    )
-    .with_result_kind(result_kind)
-    .with_tx_tracking(conn, tx, role)
-    .with_query_start_marking(marks_query_start)
-    .with_post_run(post_run))
+    Ok(Translation::Translated(Box::new(TranslatedStatement {
+        translated,
+        sql,
+        result_kind,
+        marks_query_start,
+        enum_labels: check_enum_labels(&parse_result),
+    })))
 }
 
 /// Connection and session state changes that must follow a statement's

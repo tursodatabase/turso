@@ -1,4 +1,4 @@
-use crate::dialect::CatalogChange;
+use crate::dialect::RelationChange;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;
@@ -8,14 +8,16 @@ use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
-    schema::{self, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{
+        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
+    },
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, Result};
 use turso_parser::ast;
 
 fn validate_materialized(
@@ -220,17 +222,7 @@ pub fn translate_create_materialized_view(
 
     program.preassign_label_to_next_insn(clear_done_label);
 
-    // Open cursor to sqlite_schema table
-    let table = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     // Add the materialized view entry to sqlite_schema
     emit_schema_entry(
@@ -248,13 +240,13 @@ pub fn translate_create_materialized_view(
     // The view is a relation of the dialect's; its hidden state tables are
     // engine objects and are not.
     if schema::dialect_relation_hooks_apply(&connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             &connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_view_name,
+                name: &normalized_view_name,
                 kind: crate::schema::RelationKind::MaterializedView,
                 table: None,
             }],
@@ -452,17 +444,7 @@ pub fn translate_create_view(
         select_stmt,
     );
 
-    // Open cursor to sqlite_schema table
-    let table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
     // Add the view entry to sqlite_schema
     emit_schema_entry(
@@ -478,13 +460,13 @@ pub fn translate_create_view(
     )?;
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Create {
+            &[RelationChange::Created {
                 namespace: namespace.id,
-                name: normalized_view_name,
+                name: &normalized_view_name,
                 kind: crate::schema::RelationKind::View,
                 table: None,
             }],
@@ -667,102 +649,26 @@ pub fn translate_drop_view(
     }
 
     if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_catalog_changes(
+        resolver.catalog.dialect.translate_relation_changes(
             program,
             resolver.schema(),
             connection,
-            &[CatalogChange::Drop {
+            &[RelationChange::Dropped {
                 namespace: namespace.id,
-                name: normalized_view_name.clone(),
+                name: &normalized_view_name,
             }],
         )?;
     }
 
-    // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
-        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-            .unwrap()
-    });
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
+    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
 
-    // Allocate registers for searching
-    let view_name_reg = program.alloc_register();
-    let type_reg = program.alloc_register();
-    let rowid_reg = program.alloc_register();
-
-    // Set the view name and type we're looking for
-    program.emit_insn(Insn::String8 {
-        dest: view_name_reg,
-        value: resolver.mangle_name(namespace, &normalized_view_name),
-    });
-    program.emit_insn(Insn::String8 {
-        dest: type_reg,
-        value: "view".to_string(),
-    });
-
-    // Start scanning from the beginning
-    let end_loop_label = program.allocate_label();
-    let loop_start_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_empty: end_loop_label,
-    });
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    // Check if this row should be deleted
-    // Column 0 is type, Column 1 is name, Column 2 is tbl_name
-    let col0_reg = program.alloc_register();
-    let col1_reg = program.alloc_register();
-
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
-
-    // Check if this row matches the view, DBSP table, or DBSP index
-    let skip_delete_label = program.allocate_label();
-
-    // Check if this is the view entry (type='view' and name=view_name)
-    program.emit_insn(Insn::Ne {
-        lhs: col0_reg,
-        rhs: type_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    program.emit_insn(Insn::Ne {
-        lhs: col1_reg,
-        rhs: view_name_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
-    // Matches view - delete it
-    program.emit_insn(Insn::RowId {
-        cursor_id: sqlite_schema_cursor_id,
-        dest: rowid_reg,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id,
-        table_name: "sqlite_schema".to_string(),
-        is_part_of_update: false,
-    });
-
-    program.preassign_label_to_next_insn(skip_delete_label);
-
-    // Move to next row
-    program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-
-    program.preassign_label_to_next_insn(end_loop_label);
+    let rowid_reg = emit_drop_view_row(
+        program,
+        resolver,
+        namespace,
+        &normalized_view_name,
+        sqlite_schema_cursor_id,
+    )?;
 
     // If this is a materialized view, delete internal table and index
     // entries in a second pass, one loop per internal table. We do this in
