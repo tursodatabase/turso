@@ -2,9 +2,9 @@ mod sqlite_schema_rows;
 
 pub use sqlite_schema_rows::SqliteCatalog;
 pub(crate) use sqlite_schema_rows::{
-    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_delete_rows_of_table,
-    emit_delete_temp_triggers_on_table, emit_drop_view_row, emit_open_sqlite_schema_cursor,
-    emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
+    alloc_sqlite_schema_cursor, emit_create_internal_table, emit_drop_view_row,
+    emit_open_sqlite_schema_cursor, emit_schema_entry, open_sqlite_schema_for_write,
+    SchemaEntryType,
 };
 
 use crate::dialect::{AutomaticIndex, CatalogCmd, CmdContext, CreateTable, DropTable, TableText};
@@ -2058,28 +2058,18 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, namespace)?;
     }
-    // r1 and r2. The delete loop overwrites both. r2 then gets the root page
-    // that `Destroy` moved, as in SQLite's bytecode.
+    // r1 and r2. The catalog may overwrite both while it deletes its rows.
+    // r2 then gets the root page that `Destroy` moved, as in SQLite's
+    // bytecode.
     let scratch_reg = program.alloc_register();
     let table_name_and_root_page_register = program.alloc_register();
-    emit_delete_rows_of_table(
-        program,
-        resolver,
-        database_id,
-        mangled_name.clone(),
-        [scratch_reg, table_name_and_root_page_register],
-    )?;
-    emit_delete_temp_triggers_on_table(program, resolver, database_id, tbl_name.name.as_str())?;
-
-    //  2. Destroy the indices within a loop
+    let normalized_name = normalize_ident(name);
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(namespace.id, tbl_name.name.as_str())
             .chain(s.get_unowned_backing_btrees(namespace.id, tbl_name.name.as_str()))
             .cloned()
             .collect()
     });
-
-    let normalized_name = normalize_ident(name);
     let index_names: Vec<&str> = indices.iter().map(|index| index.name.as_str()).collect();
     let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
@@ -2091,8 +2081,11 @@ pub fn translate_drop_table(
             is_virtual: table.btree().is_none(),
             indexes: &index_names,
             owned_sequences: &owned_sequences,
+            scratch_regs: [scratch_reg, table_name_and_root_page_register],
         }),
     )?;
+
+    //  2. Destroy the indices within a loop
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
