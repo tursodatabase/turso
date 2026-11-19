@@ -119,6 +119,7 @@ fn emit_generated_columns(
                 GeneratedType::Stored { .. } | GeneratedType::NotGenerated => continue,
             };
             let target_reg = dml_ctx.to_column_reg(idx);
+            crate::translate::expr::check_unbound_expr(expr, None, resolver)?;
             let stores_value = column.is_virtual_generated() && dml_ctx.holds_stored_value(idx);
             if stores_value
                 && resolver

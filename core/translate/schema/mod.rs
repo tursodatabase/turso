@@ -29,11 +29,12 @@ use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{prepare_cdc_if_necessary, Resolver};
 use crate::translate::expr::expr_type::{
-    base_value_type, decode_type, iif_values, value_type, ExprType,
+    base_value_type, decode_type, iif_values, type_of, value_type, ExprType,
 };
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr_context::ExprContext;
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination, SelectPlan};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
@@ -145,6 +146,25 @@ pub(crate) fn validate_check_expr(
         }
         Ok(WalkControl::Continue)
     })?;
+    Ok(())
+}
+
+/// Checks each column's DEFAULT as a query's expressions are checked, so
+/// `DEFAULT abs(now())` fails when the column is defined, as in PostgreSQL.
+/// A default is compiled without being bound, at each statement that writes
+/// it (INSERT, UPDATE SET DEFAULT, UPSERT, ALTER TABLE ADD COLUMN), so no
+/// later check sees it.
+pub(crate) fn check_column_defaults(
+    columns: &[ColumnDefinition],
+    resolver: &Resolver,
+) -> Result<()> {
+    for column in columns {
+        for constraint in &column.constraints {
+            if let ast::ColumnConstraint::Default(expr) = &constraint.constraint {
+                crate::translate::expr::check_unbound_expr(expr, None, resolver)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -806,6 +826,7 @@ fn validate(
             }
             table.resolve_custom_types(resolver.schema())?;
             table.check_collates_are_allowed(resolver.schema())?;
+            table.check_foreign_keys_have_no_timestamps(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
         table.check_stored_columns_have_no_custom_types(resolver.schema())?;
@@ -949,6 +970,8 @@ fn derive_ctas_schema(
         _ => None,
     };
 
+    refuse_timestamp_columns(&plan, resolver)?;
+
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns
         .iter()
@@ -1003,6 +1026,38 @@ fn derive_ctas_schema(
         schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
     };
     Ok((info, col_defs))
+}
+
+/// Fails when a result column of any arm has a type whose values can only be
+/// stored and compared, such as timestamptz. The new column would have no
+/// type, so it could not be compared with a value of that type.
+fn refuse_timestamp_columns(plan: &Plan, resolver: &Resolver) -> Result<()> {
+    let mut arms: Vec<&SelectPlan> = Vec::new();
+    match plan {
+        Plan::Select(select) => arms.push(select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            arms.extend(left.iter().map(|(select, _)| select));
+            arms.push(right_most);
+        }
+        _ => bail_parse_error!("unexpected plan type for CTAS"),
+    }
+    for arm in arms {
+        let context = ExprContext::new(Some(&arm.table_references), resolver);
+        for column in &arm.result_columns {
+            let ty = type_of(&column.expr, &context.type_env());
+            if ty
+                .only_stored_and_compared_type(resolver.schema())?
+                .is_some()
+            {
+                return Err(LimboError::DatetimeNotSupported(format!(
+                    "using type {ty} in CREATE TABLE AS is not supported"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -1271,6 +1326,9 @@ pub fn translate_create_table(
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
+    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+        check_column_defaults(columns, resolver)?;
+    }
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
         columns,
@@ -3428,6 +3486,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         accepts_collate: _,
         range_offsets: _,
         stored_form_sorts_in_value_order: _,
+        only_stored_and_compared: _,
         sql: _,
         domain_checks,
         kind,

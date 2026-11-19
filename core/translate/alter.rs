@@ -15,8 +15,9 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        self, check_column_type, open_sqlite_schema_for_write, validate_check_expr,
-        validate_default_expr, validate_generated_function_calls, SQLITE_TABLEID,
+        self, check_column_defaults, check_column_type, open_sqlite_schema_for_write,
+        validate_check_expr, validate_default_expr, validate_generated_function_calls,
+        SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
 };
@@ -1332,6 +1333,7 @@ pub fn translate_alter_table(
                     validate_default_expr(expr, &col_def)?;
                 }
             }
+            check_column_defaults(std::slice::from_ref(&col_def), resolver)?;
             let constraints = col_def.constraints.clone();
             let mut column = Column::from_definition(
                 &col_def,
@@ -1880,6 +1882,7 @@ pub fn translate_alter_table(
                 ast::AlterTableBody::AlterColumn { old, new } => {
                     from = old;
                     definition = new;
+                    check_column_defaults(std::slice::from_ref(&definition), resolver)?;
                     col_name = definition.col_name.clone();
                     rename = false;
                 }

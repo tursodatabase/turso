@@ -956,6 +956,7 @@ pub fn fire_trigger(
             }
 
             let when_reg = program.alloc_register();
+            expr::check_unbound_expr(&when_expr, None, resolver)?;
             translate_expr(program, None, &when_expr, when_reg, resolver)?;
 
             let skip_label = program.allocate_label();

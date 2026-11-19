@@ -3,18 +3,21 @@ use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, UnaryOperator};
+use turso_parser::ast::{self, Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
-    schema::Schema,
+    schema::{Schema, TypeDef},
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
         expr::{
-            expr_type::{query_column_type, type_of, type_ordering, ExprType},
-            row_value_component_expr, row_value_len,
+            expr_type::{
+                query_column_type, select_column_type, type_of, type_ordering, BuiltinType,
+                ExprType, TypeEnv,
+            },
+            is_untyped_operand, row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
@@ -511,6 +514,43 @@ pub fn comparison_collation_across_queries(
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
         return Ok(CollationSeq::Type(ordering));
     }
+    text_comparison_collation(lhs, lhs_context, rhs, rhs_context)
+}
+
+/// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
+/// right operand is column `column` of `query`. The column's type is the one
+/// [query_column_type] gives it, which in a compound SELECT comes from every
+/// SELECT and in a VALUES list from every row, not only from `rhs`. `rhs`
+/// gives only the text collation, as in SQLite.
+pub fn in_subquery_collation(
+    lhs: &Expr,
+    lhs_tables: Option<&TableReferences>,
+    query: &Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let rhs = &query.select_result_columns()[column].expr;
+    let lhs_context = ExprContext::new(lhs_tables, resolver);
+    let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
+    let types = [
+        compared_type_of(lhs, &lhs_context.type_env())?,
+        unconverted(query_column_type(query, column, resolver)),
+    ];
+    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
+    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    text_comparison_collation(lhs, &lhs_context, rhs, &rhs_context)
+}
+
+/// The text collation of a comparison whose operands' types have no order of
+/// their own, by the rules of [comparison_collation].
+fn text_comparison_collation(
+    lhs: &Expr,
+    lhs_context: &ExprContext<'_, '_>,
+    rhs: &Expr,
+    rhs_context: &ExprContext<'_, '_>,
+) -> Result<CollationSeq> {
     let catalog = lhs_context.catalog();
     let collation = if has_collate_operator(lhs) {
         expr_collation_if_any(lhs, lhs_context, catalog)?
@@ -525,32 +565,6 @@ pub fn comparison_collation_across_queries(
     Ok(CollationSeq::Text(
         collation.unwrap_or(TextCollation::Binary),
     ))
-}
-
-/// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
-/// right operand is column `column` of `query`. The column's type is the one
-/// [query_column_type] gives it, which in a compound SELECT comes from every
-/// SELECT, not only from `rhs`, the column of the rightmost SELECT. `rhs`
-/// gives the text collation, as in SQLite.
-pub fn in_subquery_collation(
-    lhs: &Expr,
-    lhs_tables: Option<&TableReferences>,
-    query: &Plan,
-    column: usize,
-    resolver: &Resolver,
-) -> Result<CollationSeq> {
-    let rhs = &query.select_result_columns()[column].expr;
-    let lhs_context = ExprContext::new(lhs_tables, resolver);
-    let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
-    let types = [
-        type_of(lhs, &lhs_context.type_env()),
-        query_column_type(query, column, resolver),
-    ];
-    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
-        return Ok(CollationSeq::Type(ordering));
-    }
-    comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
 }
 
 /// The collation that `x IN (y1, ..., yN)` compares with. When x or any item
@@ -621,6 +635,14 @@ pub fn compound_column_collation(
     column: usize,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
+    // A string literal in one SELECT is not read as the type of the column
+    // in another, so `SELECT ts FROM t UNION SELECT '2024-01-05'` compares a
+    // timestamp with text.
+    let types: SmallVec<[ExprType; 2]> = arms
+        .iter()
+        .map(|select| unconverted(select_column_type(select, column, resolver)))
+        .collect();
+    check_compared_with_own_type(&types, resolver.schema())?;
     first_collation(compound_column_exprs(arms, column, resolver))
 }
 
@@ -694,12 +716,33 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     let mut schema = None;
     for (expr, context) in exprs {
         let context: ExprContext<'c, 's> = *context.borrow();
-        types.push(type_of(expr, &context.type_env()));
+        types.push(compared_type_of(expr, &context.type_env())?);
         schema.get_or_insert(context.schema());
     }
     match schema {
         Some(schema) => common_ordering(&types, schema, has_collate),
         None => Ok(None),
+    }
+}
+
+/// The type of `expr` as a comparison reads it. A parameter takes the type of
+/// the value it is compared with, as a string literal does.
+fn compared_type_of(expr: &Expr, env: &TypeEnv) -> Result<ExprType> {
+    if is_untyped_operand(expr)? {
+        return Ok(ExprType::Untyped);
+    }
+    Ok(unconverted(type_of(expr, env)))
+}
+
+/// `ty` for a value that a comparison does not read as the type of the value
+/// it is compared with. Only a string literal or parameter that is itself an
+/// operand is read that way, so a string literal inside a subquery or a CASE
+/// stays text, as in PostgreSQL: `ts = (SELECT '2024-01-05')` compares a
+/// timestamp with text.
+pub(crate) fn unconverted(ty: ExprType) -> ExprType {
+    match ty {
+        ExprType::Untyped => ExprType::Builtin(BuiltinType::Text),
+        ty => ty,
     }
 }
 
@@ -711,6 +754,7 @@ fn common_ordering(
     schema: &Schema,
     has_collate: bool,
 ) -> Result<Option<TypeOrdering>> {
+    check_compared_with_own_type(types, schema)?;
     let mut found: Option<(TypeOrdering, &ExprType)> = None;
     let mut array_of_unknown_elements = None;
     for ty in types {
@@ -884,6 +928,94 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     Err(LimboError::ParseError(format!(
         "collations are not supported by type {ty}"
     )))
+}
+
+/// Fails when a value of a type that can only be stored and compared, such
+/// as timestamptz, is compared with a value of another type. String literals,
+/// parameters and NULL are read as the type.
+pub(crate) fn check_compared_with_own_type(types: &[ExprType], schema: &Schema) -> Result<()> {
+    let Some((own_type, own_ty)) = first_only_stored_and_compared(types, schema)? else {
+        return Ok(());
+    };
+    for ty in types {
+        let compares = match ty {
+            ExprType::Custom { type_def, .. } => schema
+                .without_domains(type_def)?
+                .is_some_and(|base| base.name == own_type.name),
+            // A subquery is checked again once it is planned.
+            ExprType::Untyped | ExprType::Null | ExprType::NotKnownYet => true,
+            ExprType::Builtin(_)
+            | ExprType::Array { .. }
+            | ExprType::Unknown
+            | ExprType::RowValue => false,
+        };
+        if !compares {
+            return Err(LimboError::DatetimeNotSupported(format!(
+                "comparing type {own_ty} with type {ty} is not supported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first of `types` that can only be stored and compared, with the type
+/// it is a domain of, if it is one.
+fn first_only_stored_and_compared<'t>(
+    types: &'t [ExprType],
+    schema: &Schema,
+) -> Result<Option<(Arc<TypeDef>, &'t ExprType)>> {
+    for ty in types {
+        if let Some(base) = ty.only_stored_and_compared_type(schema)? {
+            return Ok(Some((base, ty)));
+        }
+    }
+    Ok(None)
+}
+
+/// Gives column `column` of a VALUES list one type when a row gives it a type
+/// that can only be stored and compared, such as timestamptz: a string
+/// literal or parameter in another row is converted to that type, as in
+/// PostgreSQL, and any other type is an error.
+#[allow(clippy::vec_box)]
+pub(crate) fn convert_values_column(
+    rows: &mut [Vec<Box<Expr>>],
+    column: usize,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let env = TypeEnv::new(Some(table_references), resolver);
+    let types = rows
+        .iter()
+        .map(|row| compared_type_of(&row[column], &env))
+        .collect::<Result<Vec<_>>>()?;
+    check_compared_with_own_type(&types, resolver.schema())?;
+    let Some((_, ExprType::Custom { type_def, params })) =
+        first_only_stored_and_compared(&types, resolver.schema())?
+    else {
+        return Ok(());
+    };
+    // The SQLite frontend accepts `timestamptz(3)` in CREATE TABLE.
+    if !params.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "a type modifier on {} is not supported",
+            type_def.name
+        )));
+    }
+    for row in rows.iter_mut() {
+        let value: &mut Expr = &mut row[column];
+        if is_untyped_operand(value)? {
+            let untyped = std::mem::replace(value, Expr::Literal(ast::Literal::Null));
+            *value = Expr::Cast {
+                expr: Box::new(untyped),
+                type_name: Some(ast::Type {
+                    name: type_def.name.clone(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+        }
+    }
+    Ok(())
 }
 
 fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {

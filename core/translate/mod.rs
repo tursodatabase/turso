@@ -516,6 +516,7 @@ fn translate_statement(
                 resolver,
                 program,
                 plan::QueryDestination::ResultRows,
+                select::ValuesColumnTypes::CommonType,
                 connection,
             )?;
         }

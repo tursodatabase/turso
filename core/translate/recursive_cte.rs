@@ -1,7 +1,9 @@
 use crate::alloc::TursoVecExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
-use crate::translate::collate::{first_collation, CollationSeq};
+use crate::translate::collate::{
+    check_compared_with_own_type, first_collation, unconverted, CollationSeq,
+};
 use crate::translate::compound_select::{
     emit_program_for_compound_select, set_select_plan_destination,
 };
@@ -11,6 +13,7 @@ use crate::translate::emitter::{
     Resolver, TranslateCtx,
 };
 use crate::translate::eqp::EqpDetail;
+use crate::translate::expr::expr_type::{query_column_type, BuiltinType, ExprType};
 use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::{
     Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey, SelectPlan,
@@ -27,6 +30,9 @@ pub(crate) fn emit_recursive_cte(
     recursive_cte: &mut RecursiveCtePlan,
 ) -> Result<usize> {
     let num_result_columns = recursive_cte.initial_query.select_result_columns().len();
+    for column in 0..num_result_columns {
+        check_recursive_cte_column_type(recursive_cte, column, resolver)?;
+    }
     let input_record_reg = program.alloc_register();
     let input_cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
         CursorKey::table(recursive_cte.input_table_id),
@@ -256,6 +262,30 @@ pub(crate) fn emit_recursive_cte(
     program.result_columns = recursive_cte.initial_query.select_result_columns().to_vec();
     program.reg_result_cols_start = Some(result_row_regs);
     Ok(result_row_regs)
+}
+
+/// Fails when the recursive query gives column `column` a type that cannot
+/// be mixed with the type the initial query gives it, such as timestamptz
+/// with integer. As in PostgreSQL, a NULL or string literal in the initial
+/// query gives the column type text, so `SELECT NULL UNION ALL SELECT ts FROM
+/// t` mixes text with timestamp. A string literal or parameter in the
+/// recursive query is not converted to the column's type, so it is text, as
+/// in an arm of a compound SELECT.
+fn check_recursive_cte_column_type(
+    recursive_cte: &RecursiveCtePlan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let initial_type = match query_column_type(&recursive_cte.initial_query, column, resolver) {
+        ExprType::Null | ExprType::Untyped => ExprType::Builtin(BuiltinType::Text),
+        ty => ty,
+    };
+    let recursive_type = unconverted(query_column_type(
+        &recursive_cte.recursive_query,
+        column,
+        resolver,
+    ));
+    check_compared_with_own_type(&[initial_type, recursive_type], resolver.schema())
 }
 
 /// The collation of a result column of a recursive CTE: that of the first

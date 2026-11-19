@@ -58,6 +58,7 @@ pub(super) fn do_emit_table_column(
                 SelfTableContext::ForDML { .. } => None,
             };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
+                crate::translate::expr::check_unbound_expr(expr, referenced_tables, resolver)?;
                 if end_column_emission.is_some() {
                     translate_expr_no_constant_opt(
                         program,

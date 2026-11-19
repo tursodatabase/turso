@@ -560,8 +560,16 @@ pub struct TypeDef {
     /// values, so an index on a column of the type can serve a range or ORDER
     /// BY even though the type has no ordering of its own. True only for the
     /// built-in date and time types, which store one text form with a 4-digit
-    /// year. False for a domain, whose index then serves only `=`.
+    /// year or, for timestamp and timestamptz, an integer. False for a domain,
+    /// whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
+    /// Whether values of the type can only be stored, read back, sorted,
+    /// grouped, indexed, compared with `=`, `<`, BETWEEN or IN, tested with IS
+    /// NULL, and passed to min, max and count. Any other expression refuses
+    /// them, as in `ts + 1` or `coalesce(ts, ...)`. True for timestamp and
+    /// timestamptz, whose functions and operators Turso does not implement. False
+    /// for a domain, which takes the answer of its base type.
+    pub only_stored_and_compared: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -849,6 +857,13 @@ impl TypeDef {
                         // A user type's ENCODE may store any form.
                         TypeOrigin::User => false,
                     },
+                    only_stored_and_compared: match origin {
+                        TypeOrigin::Builtin {
+                            only_stored_and_compared,
+                            ..
+                        } => only_stored_and_compared,
+                        TypeOrigin::User => false,
+                    },
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -885,6 +900,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    only_stored_and_compared: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -920,6 +936,7 @@ impl TypeDef {
                     range_offsets: Some(RangeOffsets::None),
                     accepts_collate: Some(false),
                     stored_form_sorts_in_value_order: false,
+                    only_stored_and_compared: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -951,6 +968,7 @@ impl TypeDef {
             range_offsets: None,
             accepts_collate: None,
             stored_form_sorts_in_value_order: false,
+            only_stored_and_compared: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1534,11 +1552,13 @@ pub enum TypeOrigin {
     /// `accepts_collate` says whether values of the type take a COLLATE,
     /// `range_offsets` what kind of number they are in a RANGE frame, and
     /// `stored_form_sorts_in_value_order` whether the stored form sorts in
-    /// the same order as the values.
+    /// the same order as the values, and `only_stored_and_compared` whether
+    /// other expressions refuse the values.
     Builtin {
         accepts_collate: bool,
         range_offsets: RangeOffsets,
         stored_form_sorts_in_value_order: bool,
+        only_stored_and_compared: bool,
     },
     User,
 }
@@ -2188,7 +2208,9 @@ impl Schema {
 
     /// Fails when `element_type` is neither a STRICT type nor a custom type,
     /// or when it has its own order, as numeric does. Array elements compare
-    /// by their stored form, which does not sort in the type's order.
+    /// by their stored form, which does not sort in the type's order. Also
+    /// fails for a type whose values can only be stored and compared, such as
+    /// timestamptz, because array functions use elements in other ways.
     pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
         let Some(type_def) = self.get_type_def_unchecked(element_type) else {
             return match StrictType::named(element_type) {
@@ -2205,6 +2227,12 @@ impl Schema {
                 type_def.name,
                 type_def.name
             );
+        }
+        if self
+            .without_domains(type_def)?
+            .is_some_and(|base| base.only_stored_and_compared)
+        {
+            crate::bail_parse_error!("arrays of type {} are not supported", type_def.name);
         }
         Ok(())
     }
@@ -4758,16 +4786,35 @@ impl Schema {
             Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
-            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
-                Some((i, column)) if column.is_rowid_alias() => {
-                    (i, CollationSeq::BINARY, column.affinity())
-                }
-                Some((i, column)) => (i, column.collation(), column.affinity()),
-                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
-                    (0, CollationSeq::BINARY, Affinity::Integer)
-                }
+            let (p, collation, parent_affinity, parent_type) = match parent_tbl.get_column(pc) {
+                Some((i, column)) => (
+                    i,
+                    if column.is_rowid_alias() {
+                        CollationSeq::BINARY
+                    } else {
+                        column.collation()
+                    },
+                    column.affinity(),
+                    column_type(column, parent_tbl.is_strict, self),
+                ),
+                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => (
+                    0,
+                    CollationSeq::BINARY,
+                    Affinity::Integer,
+                    ExprType::Builtin(BuiltinType::Integer),
+                ),
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            // A foreign key action would compare and copy timestamp values in
+            // ways that the types refuse elsewhere.
+            let child_type = column_type(&child.columns[cpos], child.is_strict, self);
+            for ty in [&child_type, &parent_type] {
+                if ty.only_stored_and_compared_type(self)?.is_some() {
+                    return Err(LimboError::DatetimeNotSupported(format!(
+                        "using type {ty} in a foreign key is not supported"
+                    )));
+                }
+            }
             key_affinities
                 .push_within_capacity(crate::translate::expr::do_comparison_affinity(
                     parent_affinity,
@@ -5854,6 +5901,25 @@ impl BTreeTable {
             }
         }
         Ok(Arc::new(modified))
+    }
+
+    /// Fails when a foreign key of this table has a column of a type whose
+    /// values can only be stored and compared, such as timestamptz.
+    pub(crate) fn check_foreign_keys_have_no_timestamps(&self, schema: &Schema) -> Result<()> {
+        for fk in &self.foreign_keys {
+            for name in &fk.child_columns {
+                let Some((_, column)) = self.get_column(name) else {
+                    continue;
+                };
+                let ty = column_type(column, self.is_strict, schema);
+                if ty.only_stored_and_compared_type(schema)?.is_some() {
+                    return Err(LimboError::DatetimeNotSupported(format!(
+                        "using type {ty} in a foreign key is not supported"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
@@ -8534,7 +8600,7 @@ impl Column {
             self.override_affinity(Affinity::Blob);
             self.value_affinity = Some(Affinity::Blob);
             self.type_ordering = crate::translate::expr::expr_type::type_ordering(
-                &crate::translate::expr::expr_type::column_type(self, true, schema),
+                &column_type(self, true, schema),
                 schema,
             );
             return Ok(());

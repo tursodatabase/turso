@@ -39,7 +39,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
+use super::expr::expr_type::{query_column_type, type_ordering, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -909,6 +909,19 @@ impl SelectPlan {
 
     pub fn agg_args_count(&self) -> usize {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
+    }
+
+    /// The expressions that give column `column` of this query's rows: that
+    /// column of every row of a VALUES list, otherwise the result column.
+    pub(crate) fn column_exprs(&self, column: usize) -> impl Iterator<Item = &Expr> + Clone {
+        let result_column = self
+            .values
+            .is_empty()
+            .then(|| &self.result_columns[column].expr);
+        self.values
+            .iter()
+            .map(move |row| row[column].as_ref())
+            .chain(result_column)
     }
 
     /// Whether this query or any of its subqueries reference columns from the outer query.
@@ -3242,7 +3255,6 @@ pub(super) fn query_output_columns(
         .try_collect::<alloc::Vec<_>>()?;
 
     let context = ExprContext::new(Some(table_references), resolver);
-    let env = context.type_env();
     let mut column_types = alloc::Vec::try_with_capacity_ext(columns.len())?;
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
@@ -3250,10 +3262,7 @@ pub(super) fn query_output_columns(
         // text collation of the leftmost SELECT only, as in SQLite. The
         // compound itself removes duplicates with the collation of
         // `compound_column_collation`, which looks at every SELECT.
-        let result_type = match &compound_arms {
-            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
-            None => type_of(result_expr, &env),
-        };
+        let result_type = query_column_type(plan, column_index, resolver);
         let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
         let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {

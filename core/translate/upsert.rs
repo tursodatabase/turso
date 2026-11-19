@@ -677,6 +677,7 @@ pub fn emit_upsert(
             &layout,
         )?;
         let pr = program.alloc_register();
+        crate::translate::expr::check_unbound_expr(pred, None, resolver)?;
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
             reg: pr,
@@ -720,6 +721,7 @@ pub fn emit_upsert(
         )?;
         if *col_idx == ROWID_SENTINEL {
             let r = program.alloc_register();
+            crate::translate::expr::check_unbound_expr(expr, None, resolver)?;
             translate_expr_no_constant_opt(
                 program,
                 None,
@@ -745,6 +747,7 @@ pub fn emit_upsert(
             .cloned();
         let prev_union = program.target_union_type.take();
         program.target_union_type = union_td;
+        crate::translate::expr::check_unbound_expr(expr, None, resolver)?;
         let translate_result = translate_expr_no_constant_opt(
             program,
             None,
