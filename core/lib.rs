@@ -192,6 +192,7 @@ pub use io::{
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use schema::load::{LoadQuery, LoadStep, QueryFailure, SchemaLoad};
 pub use security::roles::SessionRole;
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
