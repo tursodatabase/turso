@@ -3157,16 +3157,22 @@ impl PostgreSQLTranslator {
                     "json" | "jsonb"
                 );
                 let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
-                let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'$.\"{}\"'",
-                    col_def
-                        .colname
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"")
-                        .replace('\'', "''")
-                ))));
-                let extract =
-                    |operator| ast::Expr::Binary(Box::new(source.clone()), operator, path.clone());
+                // jsonb_field() finds the field as -> does: of two fields with
+                // the same name, the last one counts, as in PostgreSQL. A JSON
+                // path of SQLite finds the first one. SQLite's operators then
+                // read the value of the field for the cast to the column type.
+                let field = Box::new(function_call(
+                    "jsonb_field",
+                    vec![
+                        source.clone(),
+                        ast::Expr::Literal(ast::Literal::String(format!(
+                            "'{}'",
+                            col_def.colname.replace('\'', "''")
+                        ))),
+                    ],
+                ));
+                let root = Box::new(ast::Expr::Literal(ast::Literal::String("'$'".into())));
+                let extract = |operator| ast::Expr::Binary(field.clone(), operator, root.clone());
                 let reads_json_text =
                     is_json || cast_type.as_ref().is_some_and(|t| t.name == "TEXT");
                 let value = if reads_json_text {
@@ -3181,10 +3187,7 @@ impl PostgreSQLTranslator {
                         ));
                     }
                     ast::Expr::Case {
-                        base: Some(Box::new(json_type(vec![
-                            Box::new(source.clone()),
-                            path.clone(),
-                        ]))),
+                        base: Some(Box::new(json_type(vec![field.clone()]))),
                         when_then_pairs,
                         else_expr: Some(Box::new(extract(ast::Operator::ArrowRight))),
                     }
