@@ -1157,12 +1157,11 @@ pub fn emit_program(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan),
         mut plan @ Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
         }

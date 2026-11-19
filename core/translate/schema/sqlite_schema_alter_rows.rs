@@ -558,7 +558,6 @@ fn emit_update_of_stored_sql(
         program,
         ctx.connection,
         update.statement,
-        |_program| {},
     )
 }
 
