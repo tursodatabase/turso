@@ -1,4 +1,4 @@
-use crate::error::{foreign_key_constraint_name, sqlstate_error_with_detail};
+use crate::error::{foreign_key_constraint_name, sqlstate_error, sqlstate_error_with_detail};
 use crate::functions::validate_pg_input;
 use crate::roles::{connection_roles, schema_roles, Role, RoleCatalog};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -8,8 +8,8 @@ use std::sync::Arc;
 use turso_core::schema::RelationKind;
 use turso_core::{
     dialect::{
-        identity_table_sql_marker, split_identity_table_sql_marker, ReferencingForeignKey,
-        TableRemoval, POSTGRES_TABLE_SQL_PREFIX,
+        identity_table_sql_marker, split_identity_table_sql_marker, ForeignKeyTargetProblem,
+        ReferencingForeignKey, TableRemoval, POSTGRES_TABLE_SQL_PREFIX,
     },
     namespace::{demangle_name, mangle_name},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
@@ -27,6 +27,8 @@ use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
+    SQLSTATE_INVALID_FOREIGN_KEY, SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
@@ -434,6 +436,43 @@ impl Dialect for PostgresDialect {
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 "cannot truncate a table referenced in a foreign key constraint",
                 format!("Table \"{referencing_table}\" references \"{table}\"."),
+            ),
+        })
+    }
+
+    fn foreign_key_target_error(&self, problem: ForeignKeyTargetProblem<'_>) -> Option<LimboError> {
+        Some(match problem {
+            ForeignKeyTargetProblem::MissingTable(table) => sqlstate_error(
+                SQLSTATE_UNDEFINED_TABLE,
+                format!("relation \"{table}\" does not exist"),
+            ),
+            ForeignKeyTargetProblem::NotATable(table) => sqlstate_error(
+                SQLSTATE_WRONG_OBJECT_TYPE,
+                format!("referenced relation \"{table}\" is not a table"),
+            ),
+            ForeignKeyTargetProblem::NoPrimaryKey(table) => sqlstate_error(
+                SQLSTATE_UNDEFINED_OBJECT,
+                format!("there is no primary key for referenced table \"{table}\""),
+            ),
+            ForeignKeyTargetProblem::MissingColumn(column) => sqlstate_error(
+                SQLSTATE_UNDEFINED_COLUMN,
+                format!("column \"{column}\" referenced in foreign key constraint does not exist"),
+            ),
+            ForeignKeyTargetProblem::ColumnCountMismatch => sqlstate_error(
+                SQLSTATE_INVALID_FOREIGN_KEY,
+                "number of referencing and referenced columns for foreign key disagree",
+            ),
+            ForeignKeyTargetProblem::ColumnsInOtherOrder(table) => sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "a foreign key that references the columns of a unique constraint of table \"{table}\" in another order than the constraint is not supported"
+                ),
+            ),
+            ForeignKeyTargetProblem::NoUniqueConstraint(table) => sqlstate_error(
+                SQLSTATE_INVALID_FOREIGN_KEY,
+                format!(
+                    "there is no unique constraint matching given keys for referenced table \"{table}\""
+                ),
             ),
         })
     }

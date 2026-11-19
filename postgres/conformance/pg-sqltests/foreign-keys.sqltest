@@ -99,6 +99,60 @@ test fk-delete-referenced-parent-multicolumn {
 @sqlstate 23503
 expect error {update or delete on table "parent" violates foreign key constraint "child_a_b_fkey" on table "child"}
 
+test fk-references-missing-table {
+    CREATE TABLE child (pid int REFERENCES nosuch(id));
+}
+@sqlstate 42P01
+expect error {relation "nosuch" does not exist}
+
+test fk-references-column-without-unique-constraint {
+    CREATE TABLE parent (id int PRIMARY KEY, code int);
+    CREATE TABLE child (code int REFERENCES parent(code));
+}
+@sqlstate 42830
+expect error {there is no unique constraint matching given keys for referenced table "parent"}
+
+test fk-references-missing-column {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(nosuch));
+}
+@sqlstate 42703
+expect error {column "nosuch" referenced in foreign key constraint does not exist}
+
+test fk-references-table-without-primary-key {
+    CREATE TABLE parent (id int);
+    CREATE TABLE child (pid int REFERENCES parent);
+}
+@sqlstate 42704
+expect error {there is no primary key for referenced table "parent"}
+
+test fk-references-subset-of-unique-columns {
+    CREATE TABLE parent (a int, b int, UNIQUE (a, b));
+    CREATE TABLE child (a int REFERENCES parent(a));
+}
+@sqlstate 42830
+expect error {there is no unique constraint matching given keys for referenced table "parent"}
+
+# PostgreSQL accepts the columns of a unique constraint in any order. tursopg
+# finds the parent rows only through an index with the columns in the order
+# the foreign key names them, so it refuses the foreign key.
+@skip-if postgres "PostgreSQL accepts the columns of a unique constraint in any order"
+test fk-references-unique-columns-in-other-order {
+    CREATE TABLE parent (a int, b int, UNIQUE (a, b));
+    CREATE TABLE child (a int, b int, FOREIGN KEY (b, a) REFERENCES parent(b, a));
+}
+@sqlstate 0A000
+expect error {}
+
+test fk-references-itself-in-same-create-table {
+    CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
 test fk-on-delete-cascade {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (pid int REFERENCES parent(id) ON DELETE CASCADE);

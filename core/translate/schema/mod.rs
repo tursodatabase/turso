@@ -11,7 +11,7 @@ use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
 
-use crate::dialect::TableRemoval;
+use crate::dialect::{ForeignKeyTargetProblem, TableRemoval};
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
@@ -693,6 +693,7 @@ fn can_compare(lty: &CheckExprType, rty: &CheckExprType, resolver: &CatalogConte
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
+    namespace: NamespaceId,
     resolver: &CatalogContext,
     is_nested: bool,
 ) -> Result<()> {
@@ -807,11 +808,161 @@ fn validate(
             }
             table.resolve_custom_types(resolver.schema())?;
             table.check_collates_are_allowed(resolver.schema())?;
+            check_foreign_key_targets(&table, namespace, resolver)?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
         table.check_stored_columns_have_no_custom_types(resolver.schema())?;
     }
     Ok(())
+}
+
+/// Fails with the dialect's error when a foreign key of the new table
+/// `table` references a table or columns that cannot be its parent key: a
+/// table that does not exist, a view, a column that does not exist, or
+/// columns that no primary key or unique constraint has. A foreign key may
+/// reference `table` itself.
+fn check_foreign_key_targets(
+    table: &BTreeTable,
+    namespace: NamespaceId,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    let schema = resolver.schema();
+    for fk in &table.foreign_keys {
+        let references_itself =
+            fk.parent_namespace == namespace && fk.parent_table.eq_ignore_ascii_case(&table.name);
+        let parent = if references_itself {
+            None
+        } else {
+            schema.get_btree_table(fk.parent_namespace, &fk.parent_table)
+        };
+        let parent = match &parent {
+            Some(parent) => parent.as_ref(),
+            None if references_itself => table,
+            None => {
+                let problem = if schema
+                    .get_view(fk.parent_namespace, &fk.parent_table)
+                    .is_some()
+                {
+                    ForeignKeyTargetProblem::NotATable(&fk.parent_table)
+                } else {
+                    ForeignKeyTargetProblem::MissingTable(&fk.parent_table)
+                };
+                return reject_foreign_key_target(resolver, problem);
+            }
+        };
+        let parent_columns: Vec<&str> = if fk.parent_columns.is_empty() {
+            if parent.primary_key_columns.is_empty() {
+                return reject_foreign_key_target(
+                    resolver,
+                    ForeignKeyTargetProblem::NoPrimaryKey(&fk.parent_table),
+                );
+            }
+            parent
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect()
+        } else {
+            fk.parent_columns.iter().map(String::as_str).collect()
+        };
+        if let Some(missing) = parent_columns
+            .iter()
+            .find(|name| parent.get_column(name).is_none())
+        {
+            return reject_foreign_key_target(
+                resolver,
+                ForeignKeyTargetProblem::MissingColumn(missing),
+            );
+        }
+        if parent_columns.len() != fk.child_columns.len() {
+            return reject_foreign_key_target(
+                resolver,
+                ForeignKeyTargetProblem::ColumnCountMismatch,
+            );
+        }
+        let unique_column_sets =
+            parent_unique_column_sets(parent, references_itself, schema, fk.parent_namespace);
+        if !unique_column_sets
+            .iter()
+            .any(|columns| same_column_set(columns, &parent_columns))
+        {
+            return reject_foreign_key_target(
+                resolver,
+                ForeignKeyTargetProblem::NoUniqueConstraint(&fk.parent_table),
+            );
+        }
+        if !unique_column_sets
+            .iter()
+            .any(|columns| same_columns_in_same_order(columns, &parent_columns))
+        {
+            return reject_foreign_key_target(
+                resolver,
+                ForeignKeyTargetProblem::ColumnsInOtherOrder(&fk.parent_table),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reject_foreign_key_target(
+    resolver: &CatalogContext,
+    problem: ForeignKeyTargetProblem<'_>,
+) -> Result<()> {
+    match resolver.dialect.foreign_key_target_error(problem) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The column sets of `table` that are unique on every row: its primary key
+/// and its unique constraints, and for a table that exists already, its
+/// unique indexes. A partial index or an index on an expression is not one.
+fn parent_unique_column_sets<'a>(
+    table: &'a BTreeTable,
+    is_new_table: bool,
+    schema: &'a Schema,
+    namespace: NamespaceId,
+) -> Vec<Vec<&'a str>> {
+    let mut sets = vec![];
+    if !table.primary_key_columns.is_empty() {
+        sets.push(
+            table
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect(),
+        );
+    }
+    if is_new_table {
+        sets.extend(
+            table
+                .unique_sets
+                .iter()
+                .map(|set| set.columns.iter().map(|c| c.name.as_str()).collect()),
+        );
+    } else {
+        sets.extend(
+            schema
+                .get_indices(namespace, &table.name)
+                .filter(|index| index.unique && index.where_clause.is_none())
+                .filter(|index| index.columns.iter().all(|c| c.expression().is_none()))
+                .map(|index| index.columns.iter().map(|c| c.name.as_str()).collect()),
+        );
+    }
+    sets
+}
+
+/// Whether `a` and `b` name the same columns, in any order.
+fn same_column_set(a: &[&str], b: &[&str]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .all(|x| b.iter().any(|y| x.eq_ignore_ascii_case(y)))
+        && b.iter()
+            .all(|y| a.iter().any(|x| x.eq_ignore_ascii_case(y)))
+}
+
+fn same_columns_in_same_order(a: &[&str], b: &[&str]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 /// Refuses a column type that a table cannot have. CREATE TABLE, ADD COLUMN
@@ -1269,6 +1420,7 @@ pub fn translate_create_table(
     validate(
         &body,
         &normalized_tbl_name,
+        namespace.id,
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
