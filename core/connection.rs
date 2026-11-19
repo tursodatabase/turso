@@ -3376,6 +3376,30 @@ impl Connection {
         }
     }
 
+    /// Each type of the main database as `(name, is built-in, kind of value
+    /// it is declared to read as, kind of value its DECODE gives)`, with the
+    /// kinds in their debug form.
+    #[cfg(feature = "test_helper")]
+    pub fn type_read_kinds(&self) -> std::vec::Vec<(String, bool, String, String)> {
+        let syms = self.syms.read();
+        self.with_schema(MAIN_DB_ID, |schema| {
+            schema
+                .type_registry
+                .iter()
+                .map(|(name, type_def)| {
+                    let decoded =
+                        crate::translate::expr::expr_type::value_type(type_def, schema, &syms);
+                    (
+                        name.clone(),
+                        type_def.is_builtin,
+                        format!("{:?}", Some(type_def.value_type())),
+                        format!("{decoded:?}"),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// Clone the shared schema for `database_id`, bypassing the connection-local cache.
     ///
     /// Panics if `database_id` is neither main nor an attached database.

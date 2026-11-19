@@ -8,6 +8,20 @@ mod tests {
     use turso_sqlite::SqliteDialect;
 
     #[test]
+    fn builtin_types_read_as_the_kind_their_decode_gives() {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+            .build();
+        let conn = db.connect_limbo();
+        let types = conn.type_read_kinds();
+        assert!(types.iter().any(|(name, ..)| name == "numeric"));
+        for (name, is_builtin, declared, decoded) in types {
+            assert!(is_builtin, "type {name} is not built-in");
+            assert_eq!(declared, decoded, "built-in type {name}");
+        }
+    }
+
+    #[test]
     fn test_uuid_invalid_update_and_upsert_preserve_rows() {
         for mvcc in [false, true] {
             let opts = turso_core::DatabaseOpts::new()

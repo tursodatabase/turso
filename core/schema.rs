@@ -9347,84 +9347,47 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
-
-    #[test]
-    fn builtin_types_read_as_the_kind_their_decode_gives() {
-        use crate::{
-            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts, MemoryIO,
-            OpenFlags, IO, MAIN_DB_ID,
-        };
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_custom_types(true),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let syms = conn.syms.read();
-        conn.with_schema(MAIN_DB_ID, |schema| {
-            assert!(schema.type_registry.values().all(|t| t.is_builtin));
-            for (name, type_def) in &schema.type_registry {
-                assert_eq!(
-                    Some(type_def.value_type()),
-                    value_type(type_def, schema, &syms),
-                    "built-in type {name}"
-                );
-            }
-        });
-    }
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
 
     #[test]
     #[should_panic(expected = "kinds of type price were read before they were worked out")]
     fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
-        let mut schema = Schema::new();
-        schema
-            .insert_type_from_sql(
-                &SqliteDialect,
-                "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
-            )
-            .unwrap();
-        schema.get_type_def_unchecked("price").unwrap().value_type();
+        // CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)
+        let value = || Box::new(Expr::Id(Name::exact("value".to_string())));
+        let body = ast::CreateTypeBody::CustomType {
+            params: std::vec![ast::TypeParam {
+                name: "value".to_string(),
+                ty: Some("any".to_string()),
+            }],
+            base: "text".to_string(),
+            encode: Some(value()),
+            coerce: None,
+            decode: Some(Box::new(Expr::Cast {
+                expr: value(),
+                type_name: Some(ast::Type {
+                    name: "real".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            })),
+            operators: std::vec![],
+            default: None,
+        };
+        let price =
+            TypeDef::from_create_type("price", &body, TypeOrigin::User, String::new()).unwrap();
+        price.value_type();
     }
 
     #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
-        let mut views = HashMap::default();
-        views.insert(
-            "third".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW third AS SELECT * FROM second".to_string(),
-                5,
-            ),
-        );
-        views.insert(
-            "first".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW first AS SELECT * FROM base".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "second".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW second AS SELECT * FROM first".to_string(),
-                4,
-            ),
-        );
+        let (views, dialect) = stored_views_selecting_from(&[
+            ("third", "second", 5),
+            ("first", "base", 3),
+            ("second", "first", 4),
+        ]);
 
         let ordered = Schema::new()
-            .order_persisted_materialized_views(&SqliteDialect, views)
+            .order_persisted_materialized_views(&dialect, views)
             .unwrap();
         assert_eq!(
             ordered
@@ -9437,28 +9400,103 @@ mod tests {
 
     #[test]
     fn persisted_materialized_view_cycle_is_corrupt() {
-        let mut views = HashMap::default();
-        views.insert(
-            "left_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW left_view AS SELECT * FROM right_view".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "right_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW right_view AS SELECT * FROM left_view".to_string(),
-                4,
-            ),
-        );
+        let (views, dialect) = stored_views_selecting_from(&[
+            ("left_view", "right_view", 3),
+            ("right_view", "left_view", 4),
+        ]);
 
         let error = Schema::new()
-            .order_persisted_materialized_views(&SqliteDialect, views)
+            .order_persisted_materialized_views(&dialect, views)
             .unwrap_err();
         assert!(matches!(error, LimboError::Corrupt(_)));
+    }
+
+    /// Materialized views as stored in `sqlite_schema`, given as
+    /// `(view, table it selects every row of, root page)`, and a dialect
+    /// that reads their SQL.
+    fn stored_views_selecting_from(
+        views: &[(&str, &str, i64)],
+    ) -> (HashMap<String, StoredMaterializedView>, StoredViewsDialect) {
+        let mut stored = HashMap::default();
+        let mut dialect = StoredViewsDialect { views: vec![] };
+        for &(view, table, root_page) in views {
+            let sql = format!("CREATE MATERIALIZED VIEW {view} AS SELECT * FROM {table}");
+            stored.insert(
+                view.to_string(),
+                (NamespaceId::ROOT, sql.clone(), root_page),
+            );
+            dialect
+                .views
+                .push((sql, create_materialized_view_selecting_from(view, table)));
+        }
+        (stored, dialect)
+    }
+
+    /// `CREATE MATERIALIZED VIEW <view> AS SELECT * FROM <table>`
+    fn create_materialized_view_selecting_from(view: &str, table: &str) -> Stmt {
+        let name = |name: &str| ast::QualifiedName::single(Name::exact(name.to_string()));
+        Stmt::CreateMaterializedView {
+            if_not_exists: false,
+            view_name: name(view),
+            columns: std::vec![],
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: std::vec![ResultColumn::Star],
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Table(name(table), None, None)),
+                            joins: std::vec![],
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: std::vec![],
+                    },
+                    compounds: std::vec![],
+                },
+                order_by: std::vec![],
+                limit: None,
+            },
+        }
+    }
+
+    /// A dialect that reads only the SQL of the views it holds, each given
+    /// with the statement it reads as.
+    struct StoredViewsDialect {
+        views: Vec<(String, Stmt)>,
+    }
+
+    impl crate::dialect::Dialect for StoredViewsDialect {
+        fn name(&self) -> &'static str {
+            "stored-views"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            self.parse_internal(sql)
+        }
+
+        fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+            match self.views.iter().find(|(view_sql, _)| view_sql == sql) {
+                Some((_, stmt)) => Ok((Some(Cmd::Stmt(stmt.clone())), sql.len())),
+                None => DialectThatCannotParse.parse_internal(sql),
+            }
+        }
+
+        fn parse_internal_column_definition(&self, sql: &str) -> Result<ColumnDefinition> {
+            DialectThatCannotParse.parse_internal_column_definition(sql)
+        }
+
+        fn parameter_marker_ranges(
+            &self,
+            sql: &str,
+        ) -> Result<std::vec::Vec<std::ops::Range<usize>>> {
+            DialectThatCannotParse.parameter_marker_ranges(sql)
+        }
+
+        fn get_internal_dialect(&self) -> Arc<dyn crate::dialect::Dialect> {
+            Arc::new(DialectThatCannotParse)
+        }
     }
 
     #[test]
@@ -9487,18 +9525,24 @@ mod tests {
     #[test]
     fn stateless_materialized_view_requires_current_version_marker() -> Result<()> {
         fn add_marker(schema: &mut Schema, name: &str, root_page: i64) -> Result<()> {
-            let sql = format!(
-                "CREATE TABLE {} (version INTEGER)",
-                crate::util::quote_identifier(name)
+            let version = Column::new_default_integer(
+                Some("version".to_string()),
+                "INTEGER".to_string(),
+                None,
             );
             schema.add_btree_table(
                 NamespaceId::ROOT,
-                Arc::new(BTreeTable::from_stored_sql(
-                    &SqliteDialect,
-                    &sql,
+                Arc::new(BTreeTable::new(
                     root_page,
-                    false,
-                )?),
+                    name.to_string(),
+                    vec![],
+                    vec![version],
+                    BTreeCharacteristics::HAS_ROWID,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )),
             )
         }
 
@@ -9933,7 +9977,8 @@ mod tests {
     #[test]
     fn schema_copy_shares_a_table_until_the_copy_changes_it() -> Result<()> {
         let mut schema = Schema::new();
-        let table = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 2, false)?;
+        let mut table = table_t(vec![stored_column("a"), stored_column("b")])?;
+        table.root_page = 2;
         schema.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
 
         let mut copy = schema.try_clone()?;
