@@ -1049,7 +1049,8 @@ pub fn translate_create_sequence(
         cycle,
     )?;
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
 
     emit_sequence_backing_table(
         program,
@@ -1064,7 +1065,6 @@ pub fn translate_create_sequence(
         seq.cycle,
     )?;
 
-    let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
         &cmd_context,
@@ -1251,7 +1251,7 @@ pub fn translate_drop_sequence(
 }
 
 /// Emits the removal of sequence `seq_name` of `namespace` from the schema
-/// and from the dialect's schema state. Returns false, emitting nothing,
+/// and from the dialect's catalog. Returns false, emitting nothing,
 /// when the sequence does not exist.
 pub(crate) fn emit_drop_sequence(
     program: &mut ProgramBuilder,

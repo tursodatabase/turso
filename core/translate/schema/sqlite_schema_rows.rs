@@ -38,9 +38,11 @@ impl Catalog for SqliteCatalog {
             CatalogCmd::CreateTable(table) => emit_create_table_rows(program, ctx, table),
             CatalogCmd::CreateIndex(index) => emit_create_index_row(program, ctx, index),
             CatalogCmd::DropIndex(index) => emit_delete_index_row(program, ctx, index),
-            CatalogCmd::CreateSequence(_)
-            | CatalogCmd::DropSequence(_)
-            | CatalogCmd::DropTable(_)
+            // A sequence has no `sqlite_schema` row of its own. The schema
+            // reads it from the row of its backing table, which the
+            // statement writes and deletes as an engine table.
+            CatalogCmd::CreateSequence(_) | CatalogCmd::DropSequence(_) => Ok(()),
+            CatalogCmd::DropTable(_)
             | CatalogCmd::CreateView(_)
             | CatalogCmd::CreateMaterializedView(_)
             | CatalogCmd::DropView(_)
