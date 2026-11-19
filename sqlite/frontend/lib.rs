@@ -3,11 +3,6 @@
 //! [`SqliteDialect`] is the [`Dialect`] for SQLite: statements are SQLite
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
-//!
-//! The unit tests of `turso_core` compile this file as a module of
-//! `turso_core`, because they cannot depend on this crate. So this file
-//! names items of `turso_core` by `turso_core::` paths, never by `crate::`,
-//! and uses only crates that `turso_core` depends on.
 
 use std::{ops::Range, sync::Arc};
 use turso_core::{Dialect, Result};

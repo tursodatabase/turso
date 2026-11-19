@@ -94,20 +94,6 @@ mod uuid;
 mod vdbe;
 pub mod vtab;
 
-// `turso_sqlite` depends on this crate, so the unit tests of this crate
-// cannot link it: its `SqliteDialect` implements the `Dialect` trait of the
-// copy of this crate built without tests. The unit tests compile the source
-// of `turso_sqlite` as a module instead, and open databases with the same
-// dialect that users do.
-#[cfg(test)]
-extern crate self as turso_core;
-#[cfg(test)]
-#[allow(unused_imports)]
-#[path = "../sqlite/frontend/lib.rs"]
-mod turso_sqlite;
-#[cfg(test)]
-pub(crate) use turso_sqlite::SqliteDialect;
-
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};
