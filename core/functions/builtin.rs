@@ -559,10 +559,7 @@ pub fn call_builtin_scalar(
             };
             let (namespace, sequence) = connection.find_sequence(&seq_name)?;
             roles::check_sequence_read(connection, namespace, &sequence.name)?;
-            match connection.get_sequence_currval(
-                namespace.database_id,
-                &mangle_name(namespace.id, &sequence.name),
-            ) {
+            match connection.get_sequence_currval(namespace.database_id, &sequence) {
                 Some(val) => Ok(Value::from_i64(val)),
                 None => Err(LimboError::ParseError(format!(
                     "currval of sequence \"{}\" is not yet defined in this session",

@@ -125,6 +125,98 @@ expect {
     2|b
 }
 
+test rolled-back-drop-table-keeps-the-currval-of-its-serial-sequence {
+    CREATE TABLE zz_currval_drop (id serial, label text);
+    INSERT INTO zz_currval_drop (label) VALUES ('a'), ('b');
+    BEGIN;
+    DROP TABLE zz_currval_drop;
+    CREATE TABLE zz_currval_drop (id serial, label text);
+    INSERT INTO zz_currval_drop (label) VALUES ('c');
+    ROLLBACK;
+    SELECT currval('zz_currval_drop_id_seq');
+}
+expect {
+    2
+}
+
+# The session's currval belongs to one sequence. A rollback that brings a
+# dropped sequence back brings back its currval, and the sequence created in
+# its place had its own.
+test rolled-back-drop-and-recreate-keeps-the-currval {
+    CREATE SEQUENCE zz_cv START 42;
+    SELECT nextval('zz_cv');
+    BEGIN;
+    DROP SEQUENCE zz_cv;
+    CREATE SEQUENCE zz_cv;
+    SELECT nextval('zz_cv');
+    ROLLBACK;
+    SELECT currval('zz_cv');
+    SELECT nextval('zz_cv');
+}
+expect {
+    42
+    1
+    42
+    43
+}
+
+test rolled-back-drop-and-recreate-of-an-unused-sequence-leaves-no-currval {
+    CREATE SEQUENCE zz_cv_unused START 42;
+    BEGIN;
+    DROP SEQUENCE zz_cv_unused;
+    CREATE SEQUENCE zz_cv_unused;
+    SELECT nextval('zz_cv_unused');
+    ROLLBACK;
+    SELECT currval('zz_cv_unused');
+}
+@sqlstate 55000
+expect error {
+    currval of sequence "zz_cv_unused" is not yet defined in this session
+}
+
+test drop-and-recreate-rolled-back-to-a-savepoint-keeps-the-currval {
+    CREATE SEQUENCE zz_cv_sp START 42;
+    SELECT nextval('zz_cv_sp');
+    BEGIN;
+    SAVEPOINT sp;
+    DROP SEQUENCE zz_cv_sp;
+    CREATE SEQUENCE zz_cv_sp;
+    SELECT nextval('zz_cv_sp');
+    ROLLBACK TO sp;
+    SELECT currval('zz_cv_sp');
+    COMMIT;
+}
+expect {
+    42
+    1
+    42
+}
+
+test recreated-sequence-has-no-currval-after-a-rolled-back-create {
+    BEGIN;
+    CREATE SEQUENCE zz_cv_created;
+    SELECT nextval('zz_cv_created');
+    ROLLBACK;
+    CREATE SEQUENCE zz_cv_created;
+    SELECT currval('zz_cv_created');
+}
+@sqlstate 55000
+expect error {
+    currval of sequence "zz_cv_created" is not yet defined in this session
+}
+
+test currval-set-in-a-rolled-back-transaction-is-kept {
+    CREATE SEQUENCE zz_cv_nextval START 42;
+    BEGIN;
+    SELECT nextval('zz_cv_nextval');
+    ROLLBACK;
+    SELECT currval('zz_cv_nextval');
+}
+expect {
+    42
+    42
+}
+
 test drop-table-keeps-a-sequence-it-does-not-own {
     CREATE SEQUENCE zz_keep_seq;
     CREATE TABLE zz_keep_owner (id serial, n bigint DEFAULT nextval('zz_keep_seq'));

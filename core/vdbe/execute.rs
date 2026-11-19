@@ -14187,13 +14187,6 @@ pub fn op_drop_sequence(
         }
         schema.remove_sequence(*namespace, seq_name);
     })?;
-    // Drop this connection's stale currval. Otherwise a same-session
-    // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
-    // return the prior sequence's last value instead of erroring with
-    // "not yet defined in this session" — covered by the regression
-    // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
-    // in `sequence_adversarial.sqltest`.
-    conn.clear_sequence_currval(*db, &mangle_name(*namespace, seq_name));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14414,7 +14407,12 @@ pub fn op_set_sequence_currval(
             )
         })?;
 
-    connection.set_sequence_currval(*db, &mangle_name(*namespace, seq_name), value);
+    let seq = connection
+        .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
+        .ok_or_else(|| {
+            crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
+        })?;
+    connection.set_sequence_currval(*db, &seq, value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
