@@ -10249,7 +10249,7 @@ fn parse_schema_sql_for_alter(
         }
         return Ok(Some(ast::Cmd::Stmt(stmt)));
     }
-    dialect.parse(sql).map(|(cmd, _)| cmd)
+    dialect.parse_internal(sql).map(|(cmd, _)| cmd)
 }
 
 pub fn op_function(
@@ -16923,7 +16923,7 @@ pub fn op_rename_table(
                 if !sql_might_reference_identifier(&view.sql, &normalized_from) {
                     continue;
                 }
-                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse_internal(&view.sql)?.0 else {
                     continue;
                 };
                 if let Some(rewrite) = rewrite_view_for_table_rename(

@@ -239,6 +239,14 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Makes a parser for SQL that the schema or the engine stores. SQLite and
+    /// older versions of Turso can have written this SQL without the limits that
+    /// the parser applies only to the SQL of statements, so this parser does not
+    /// apply them.
+    pub fn new_for_stored_sql(input: &'a [u8]) -> Self {
+        Self::new(input)
+    }
+
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
         debug_assert!(!token.is_empty());
         if token == b"?" {

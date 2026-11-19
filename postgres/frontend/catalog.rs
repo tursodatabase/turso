@@ -64,7 +64,7 @@ impl Dialect for PostgresDialect {
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
-            return self.parse_internal(sql);
+            return parse_first_sqlite_statement(turso_parser::parser::Parser::new(sql.as_bytes()));
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
@@ -81,14 +81,16 @@ impl Dialect for PostgresDialect {
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
-            Err(_) => self.parse_internal(sql),
+            Err(_) => {
+                parse_first_sqlite_statement(turso_parser::parser::Parser::new(sql.as_bytes()))
+            }
         }
     }
 
     fn parse_internal(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
-        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        Ok((cmd, parser.offset()))
+        parse_first_sqlite_statement(turso_parser::parser::Parser::new_for_stored_sql(
+            sql.as_bytes(),
+        ))
     }
 
     fn parse_internal_column_definition(
@@ -418,6 +420,15 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+}
+
+/// Parses the first statement of the SQLite text in the input of `parser`.
+/// Returns it with the number of input bytes that it uses.
+fn parse_first_sqlite_statement(
+    mut parser: turso_parser::parser::Parser<'_>,
+) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    let cmd = parser.next_cmd()?;
+    Ok((cmd, parser.offset()))
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

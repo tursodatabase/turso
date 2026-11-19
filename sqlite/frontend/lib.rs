@@ -24,13 +24,11 @@ impl Dialect for SqliteDialect {
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
-        self.parse_internal(sql)
+        parse_first_statement(Parser::new(sql.as_bytes()))
     }
 
     fn parse_internal(&self, sql: &str) -> Result<(Option<ast::Cmd>, usize)> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        Ok((cmd, parser.offset()))
+        parse_first_statement(Parser::new_for_stored_sql(sql.as_bytes()))
     }
 
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition> {
@@ -40,4 +38,11 @@ impl Dialect for SqliteDialect {
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
     }
+}
+
+/// Parses the first statement of the input of `parser`. Returns it with the
+/// number of input bytes that it uses.
+fn parse_first_statement(mut parser: Parser<'_>) -> Result<(Option<ast::Cmd>, usize)> {
+    let cmd = parser.next_cmd()?;
+    Ok((cmd, parser.offset()))
 }
