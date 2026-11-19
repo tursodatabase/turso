@@ -1190,3 +1190,115 @@ impl Dialect for NamespacesAndOwnBuilderDialect {
         turso_core::schema::builtin::schema_builder(self, enable_custom_types)
     }
 }
+
+/// A dialect whose catalog has one load step of its own.
+struct DialectWithACatalogStep {
+    catalog: CatalogWithAStep,
+}
+
+impl Dialect for DialectWithACatalogStep {
+    fn name(&self) -> &'static str {
+        "catalog-step-test"
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse(sql)
+    }
+
+    fn parse_internal(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> Result<turso_parser::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
+        SqliteDialect.parameter_marker_ranges(sql)
+    }
+
+    fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
+        Arc::new(SqliteDialect)
+    }
+
+    fn catalog(&self) -> &dyn turso_core::Catalog {
+        &self.catalog
+    }
+}
+
+struct CatalogWithAStep {
+    /// For each time the step ran: whether the schema being read had the
+    /// table `t`.
+    table_seen_by_each_load: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl turso_core::Catalog for CatalogWithAStep {
+    fn emit(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        ctx: &turso_core::CmdContext<'_>,
+        cmd: &turso_core::CatalogCmd<'_>,
+    ) -> Result<()> {
+        turso_core::SqliteCatalog.emit(program, ctx, cmd)
+    }
+
+    fn load_steps(&self) -> Vec<Box<dyn turso_core::LoadStep>> {
+        vec![Box::new(LooksForTheTable {
+            queried: false,
+            table_seen_by_each_load: self.table_seen_by_each_load.clone(),
+        })]
+    }
+}
+
+/// Reads one row as engine metadata, and records whether the schema being
+/// read has the table `t`.
+struct LooksForTheTable {
+    queried: bool,
+    table_seen_by_each_load: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl turso_core::LoadStep for LooksForTheTable {
+    fn next_query(
+        &mut self,
+        _load: &mut turso_core::SchemaLoad,
+    ) -> Result<Option<turso_core::LoadQuery>> {
+        let query = (!self.queried).then(|| {
+            turso_core::LoadQuery::engine_metadata_read("SELECT count(*) FROM sqlite_schema")
+        });
+        self.queried = true;
+        Ok(query)
+    }
+
+    fn row(&mut self, load: &mut turso_core::SchemaLoad, _row: &turso_core::Row) -> Result<()> {
+        self.table_seen_by_each_load
+            .lock()
+            .unwrap()
+            .push(load.schema().has_table(turso_core::NamespaceId::ROOT, "t"));
+        Ok(())
+    }
+}
+
+/// A catalog's step reads rows that the engine's steps load first, such as
+/// the tables of `sqlite_schema`.
+#[test]
+fn steps_of_the_catalog_run_after_the_engine_steps_at_open_and_at_reload() {
+    let table_seen_by_each_load = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialect = Arc::new(DialectWithACatalogStep {
+        catalog: CatalogWithAStep {
+            table_seen_by_each_load: table_seen_by_each_load.clone(),
+        },
+    });
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(*table_seen_by_each_load.lock().unwrap(), [false]);
+    conn.execute("CREATE TABLE t (x)").unwrap();
+
+    conn.force_reparse_schema_without_publish().unwrap();
+
+    assert_eq!(*table_seen_by_each_load.lock().unwrap(), [false, true]);
+}
