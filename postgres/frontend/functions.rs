@@ -10,15 +10,16 @@ use turso_core::security::roles::RoleId;
 use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value,
+    exec_temporal_encode, exec_timestamp_encode, exec_timestamptz_encode, format_timestamptz,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
+    SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -148,8 +149,20 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
             FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        ) => Timestamptz(format_timestamptz(Utc::now().naive_utc())),
+        "to_timestamp" | "make_timestamp"(FunctionArity::Variadic, false) => {
+            refuse_timestamp_function()?
+        },
     })
+}
+
+/// PostgreSQL has to_timestamp() and make_timestamp(), so tursopg refuses them
+/// as unsupported instead of reporting unknown functions.
+fn refuse_timestamp_function() -> Result<Timestamptz> {
+    Err(sqlstate_error(
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "to_timestamp() and make_timestamp() are not supported",
+    ))
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
@@ -198,7 +211,7 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     }
 }
 
-/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
+/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5+00`.
 /// Returning one gives the function the type `timestamptz`, so `now() + 1` is
 /// an error as in PostgreSQL instead of adding 1 to text.
 struct Timestamptz(String);
@@ -815,10 +828,14 @@ fn write_json_element(element: &Value, kind: JsonElement, json: &mut String) {
         (JsonElement::Timestamp, Value::Text(text)) => {
             write_json_string(&text.as_str().replacen(' ', "T", 1), json)
         }
-        (JsonElement::Timestamptz, Value::Text(text)) => write_json_string(
-            &format!("{}+00:00", text.as_str().replacen(' ', "T", 1)),
-            json,
-        ),
+        // `2024-01-05 10:00:00+00` is `"2024-01-05T10:00:00+00:00"`.
+        (JsonElement::Timestamptz, Value::Text(text)) => {
+            assert!(
+                text.as_str().ends_with("+00"),
+                "timestamptz_decode writes every timestamptz in UTC"
+            );
+            write_json_string(&format!("{}:00", text.as_str().replacen(' ', "T", 1)), json)
+        }
         (JsonElement::Text, Value::Numeric(number)) => {
             write_json_string(&Value::Numeric(*number).to_string(), json)
         }
@@ -1443,10 +1460,18 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 None
             }
         }
-        "date" => check_temporal_input(input, "date"),
-        "timestamp" | "timestamp without time zone" => check_temporal_input(input, "timestamp"),
-        "timestamptz" | "timestamp with time zone" => check_temporal_input(input, "timestamptz"),
-        "time" | "time without time zone" => check_temporal_input(input, "time"),
+        "date" => check_temporal_input(input, |text| {
+            exec_temporal_encode(text, &Value::build_text("date"))
+        }),
+        "timestamp" | "timestamp without time zone" => {
+            check_temporal_input(input, exec_timestamp_encode)
+        }
+        "timestamptz" | "timestamp with time zone" => {
+            check_temporal_input(input, exec_timestamptz_encode)
+        }
+        "time" | "time without time zone" => check_temporal_input(input, |text| {
+            exec_temporal_encode(text, &Value::build_text("time"))
+        }),
         "json" | "jsonb" => {
             if is_valid_json(trimmed) {
                 None
@@ -1550,13 +1575,13 @@ pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Reads `input` as the date or time type `type_name` does when it stores a
-/// value, so `pg_input_is_valid` and the type agree on what is valid.
-fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, String)> {
-    match exec_temporal_encode(
-        &Value::build_text(input.to_string()),
-        &Value::build_text(type_name),
-    ) {
+/// Reads `input` with `encode`, the ENCODE of a date or time type, so
+/// `pg_input_is_valid` and the type agree on what is valid.
+fn check_temporal_input(
+    input: &str,
+    encode: impl Fn(&Value) -> Result<Value>,
+) -> Option<(String, String)> {
+    match encode(&Value::build_text(input.to_string())) {
         Ok(_) => None,
         Err(LimboError::InvalidDate(message)) => {
             Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
@@ -1564,7 +1589,7 @@ fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String,
         Err(LimboError::DatetimeFieldOverflow(message)) => {
             Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
         }
-        Err(other) => unreachable!("temporal_encode of text failed with {other}"),
+        Err(other) => unreachable!("the ENCODE of a date or time type failed on text with {other}"),
     }
 }
 

@@ -648,19 +648,15 @@ pub fn compound_column_collation(
 
 /// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
 /// where `arms` are its SELECTs. The COLLATE applies to the column of every
-/// SELECT and of every row of a VALUES list, so it is an error when any of
-/// them has a type that takes none, as in a comparison.
+/// SELECT, so it is an error when any of them has a type that takes none, as
+/// in a comparison.
 pub fn compound_order_by_collation(
     arms: &[&SelectPlan],
     column: usize,
     explicit_collation: TextCollation,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    let values = arms.iter().flat_map(|select| {
-        let context = ExprContext::new(Some(&select.table_references), resolver);
-        select.column_exprs(column).map(move |expr| (expr, context))
-    });
-    common_ordering_of(values, true)?;
+    common_ordering_of(compound_column_exprs(arms, column, resolver), true)?;
     Ok(CollationSeq::Text(explicit_collation))
 }
 

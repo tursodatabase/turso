@@ -118,12 +118,9 @@ use crate::dialect::identity_table_sql_marker;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::{
-    check_compared_with_own_type, key_collation, CollationSeq, TextCollation,
-};
+use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::{
-    column_type, primitive_value_type, stored_value_type, value_type, BuiltinType,
-    ColumnCustomType, ExprType,
+    column_type, primitive_value_type, stored_value_type, value_type, BuiltinType, ExprType,
 };
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
@@ -4796,8 +4793,6 @@ impl Schema {
         let mut parent_collations: Vec<CollationSeq> =
             Vec::try_with_capacity_ext(parent_cols.len())?;
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
-        let mut parent_key_types: Vec<Option<ast::Type>> =
-            Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
             let (p, collation, parent_affinity, parent_type) = match parent_tbl.get_column(pc) {
                 Some((i, column)) => (
@@ -4818,28 +4813,14 @@ impl Schema {
                 ),
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
-            parent_key_types
-                .push_within_capacity(match &parent_type {
-                    ExprType::Custom { type_def, params } => Some(
-                        ColumnCustomType {
-                            type_def: type_def.clone(),
-                            params: params.clone(),
-                        }
-                        .type_name(),
-                    ),
-                    ExprType::Builtin(_) | ExprType::Array { .. } => None,
-                    ExprType::Untyped
-                    | ExprType::Null
-                    | ExprType::Unknown
-                    | ExprType::NotKnownYet
-                    | ExprType::RowValue => {
-                        unreachable!("a column's type is a custom, builtin or array type")
-                    }
-                })
-                .expect("FK key type vector was preallocated to parent_cols.len()");
-            // A foreign key compares the child's key with the parent's.
+            // A foreign key action would compare and copy timestamp values in
+            // ways that the types refuse elsewhere.
             let child_type = column_type(&child.columns[cpos], child.is_strict, self);
-            check_compared_with_own_type(&[child_type, parent_type], self)?;
+            for ty in [&child_type, &parent_type] {
+                if ty.only_stored_and_compared_type(self)?.is_some() {
+                    crate::bail_parse_error!("using type {ty} in a foreign key is not supported");
+                }
+            }
             key_affinities
                 .push_within_capacity(crate::translate::expr::do_comparison_affinity(
                     parent_affinity,
@@ -4903,7 +4884,6 @@ impl Schema {
             parent_pos: parent_pos.into_boxed_slice(),
             parent_collations: parent_collations.into_boxed_slice(),
             key_affinities: key_affinities.into_boxed_slice(),
-            parent_key_types: parent_key_types.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
@@ -5927,6 +5907,23 @@ impl BTreeTable {
             }
         }
         Ok(Arc::new(modified))
+    }
+
+    /// Fails when a foreign key of this table has a column of a type whose
+    /// values can only be stored and compared, such as timestamptz.
+    pub(crate) fn check_foreign_keys_have_no_timestamps(&self, schema: &Schema) -> Result<()> {
+        for fk in &self.foreign_keys {
+            for name in &fk.child_columns {
+                let Some((_, column)) = self.get_column(name) else {
+                    continue;
+                };
+                let ty = column_type(column, self.is_strict, schema);
+                if ty.only_stored_and_compared_type(schema)?.is_some() {
+                    crate::bail_parse_error!("using type {ty} in a foreign key is not supported");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
@@ -8055,10 +8052,6 @@ pub struct ResolvedFkRef {
     /// The affinity applied when a child key is compared with a parent key,
     /// as SQLite compares `parent_col = child_col`.
     pub key_affinities: BoxedSlice<Affinity>,
-    /// The custom type of each parent key column, written the way a CAST
-    /// names it, or None for a column without one and for the rowid. An
-    /// action's subprogram gives its parent key parameters these types.
-    pub parent_key_types: BoxedSlice<Option<ast::Type>>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,

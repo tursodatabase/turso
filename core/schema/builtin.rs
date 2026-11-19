@@ -53,8 +53,8 @@ fn builtin_types(
         // PostgreSQL stores it (see functions/datetime_input.rs).
         (NO_COLLATE, RangeOffsets::None, SORTS, ANY_USE, "CREATE TYPE date(value text) BASE text ENCODE temporal_encode(value, 'date') DECODE value OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::None, SORTS, ANY_USE, "CREATE TYPE time(value text) BASE text ENCODE temporal_encode(value, 'time') DECODE value OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, LIMITED, "CREATE TYPE timestamp(value text) BASE integer ENCODE timestamp_encode(value) DECODE timestamp_decode(value) OPERATOR '<'"),
-        (NO_COLLATE, RangeOffsets::None, SORTS, LIMITED, "CREATE TYPE timestamptz(value text) BASE integer ENCODE timestamptz_encode(value) DECODE timestamptz_decode(value) OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, LIMITED, "CREATE TYPE timestamp(value any) BASE integer ENCODE timestamp_encode(value) DECODE timestamp_decode(value) OPERATOR '<'"),
+        (NO_COLLATE, RangeOffsets::None, SORTS, LIMITED, "CREATE TYPE timestamptz(value any) BASE integer ENCODE timestamptz_encode(value) DECODE timestamptz_decode(value) OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::Integer, NO_SORT, ANY_USE, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
         (NO_COLLATE, RangeOffsets::Integer, NO_SORT, ANY_USE, "CREATE TYPE bigint(value integer) BASE integer"),
         (NO_COLLATE, RangeOffsets::None, NO_SORT, ANY_USE, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),

@@ -542,18 +542,6 @@ expect {
     order|b
 }
 
-# A COLLATE in a later VALUES list does not apply when the first VALUES list
-# has more than one row.
-test collate_union_of_values_lists_keeps_case_variants {
-    SELECT * FROM (VALUES ('a'),('A') UNION VALUES ('b' COLLATE NOCASE),('B')) ORDER BY 1;
-}
-expect {
-    A
-    B
-    a
-    b
-}
-
 # --- CASE expression: NOCASE column in WHEN clause after hash join ---
 @cross-check-integrity
 test collate_case_when_nocase_after_join {

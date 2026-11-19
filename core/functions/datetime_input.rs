@@ -76,14 +76,26 @@ fn encode(value: &Value, ty: TemporalType) -> Result<Value> {
     let input = match value {
         Value::Null => return Ok(Value::Null),
         Value::Text(text) => text.as_str(),
-        Value::Numeric(_) | Value::Blob(_) => {
-            return Err(error(format!(
-                "only text can be converted to {}",
+        // PostgreSQL reads only text as a date or time, so `20240105` is not
+        // 2024-01-05.
+        Value::Numeric(_) => {
+            return Err(not_supported(format!(
+                "converting a number to {} is not supported",
+                ty.name()
+            )))
+        }
+        Value::Blob(_) => {
+            return Err(not_supported(format!(
+                "converting a blob to {} is not supported",
                 ty.name()
             )))
         }
     };
     Fields::read(input, ty)?.encode(input, ty)
+}
+
+fn not_supported(message: String) -> LimboError {
+    LimboError::DatetimeNotSupported(message)
 }
 
 /// `timestamp_decode(value)`, the DECODE of timestamp: the stored

@@ -732,18 +732,17 @@ pub(crate) fn check_only_stored_and_compared(
                 .chain(else_expr.iter().map(|else_expr| else_expr.as_ref()))
                 .try_for_each(|operand| refuse(operand, &place))
         }
-        // A cast to text, as in `ts::text`, or between timestamp and
-        // timestamptz.
+        // A cast to text, as in `ts::text`, from text, or between timestamp
+        // and timestamptz.
         Expr::Cast { expr: operand, .. } => {
             let target = type_of(expr, &context.type_env());
-            let allowed = match &target {
-                ExprType::Builtin(BuiltinType::Text) => true,
-                ExprType::Custom { .. } => target
-                    .only_stored_and_compared_type(context.schema())?
-                    .is_some(),
-                _ => false,
-            };
-            if allowed {
+            if target
+                .only_stored_and_compared_type(context.schema())?
+                .is_some()
+            {
+                return check_cast_to_only_stored_and_compared(operand, &target, context);
+            }
+            if matches!(target, ExprType::Builtin(BuiltinType::Text)) {
                 return Ok(());
             }
             refuse(operand, &|| format!("a cast to {target}"))
@@ -802,6 +801,31 @@ pub(crate) fn check_only_stored_and_compared(
         | Expr::Register { .. }
         | Expr::Default => Ok(()),
     }
+}
+
+/// Fails unless `operand` is text, a string literal, a parameter, NULL or a
+/// value of a type that can only be stored and compared. PostgreSQL reads only
+/// text as a timestamp: `5::timestamptz` is an error, not 5 o'clock.
+fn check_cast_to_only_stored_and_compared(
+    operand: &ast::Expr,
+    target: &ExprType,
+    context: &ExprContext,
+) -> Result<()> {
+    if is_untyped_operand(operand)? {
+        return Ok(());
+    }
+    let ty = type_of(operand, &context.type_env());
+    let converts = match &ty {
+        ExprType::Builtin(BuiltinType::Text) | ExprType::Null => true,
+        ExprType::Custom { .. } => ty
+            .only_stored_and_compared_type(context.schema())?
+            .is_some(),
+        _ => false,
+    };
+    if !converts {
+        crate::bail_parse_error!("using type {ty} in a cast to {target} is not supported");
+    }
+    Ok(())
 }
 
 /// Fails when an operand has a type whose values can only be stored and
