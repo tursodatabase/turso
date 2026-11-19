@@ -38,15 +38,20 @@ message.
 |-------|-------|--------|-------|
 | Depth of an expression | 100 | 1000 | `Expression tree is too large (maximum depth 100)` |
 | Terms in a compound `SELECT` | 500 | 500 | `too many terms in compound SELECT` |
+| Depth of nested queries | 500 | No limit | `Query is nested too deeply (maximum depth 500)` |
 
 A `VALUES` list with many rows is one term. SQLite does not count the terms of
 a compound `SELECT` whose last term is `VALUES`, but Turso counts them.
 
-The limit on compound terms does not apply when Turso reads the views and
-triggers that a database stores, because SQLite and older versions of Turso can
-have written them without this limit. Thus such a database opens. A statement
-that uses a stored view or trigger with a compound `SELECT` of more than 500
-terms gets the error of the limit.
+The depth of nested queries counts subqueries in a `FROM` clause or in an
+expression, CTE bodies, and parenthesized `FROM` terms. Sibling subqueries do
+not add to the depth.
+
+The limits on compound terms and on nested queries do not apply when Turso
+reads the views and triggers that a database stores, because SQLite and older
+versions of Turso can have written them without these limits. Thus such a
+database opens. A statement that uses a stored view or trigger with a compound
+`SELECT` of more than 500 terms gets the error of that limit.
 
 ## PostgreSQL schema metadata
 

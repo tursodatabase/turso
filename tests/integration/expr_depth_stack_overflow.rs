@@ -2,7 +2,9 @@ use std::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
 use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole, IO};
-use turso_parser::{MAX_COMPOUND_SELECT, MAX_EXPR_DEPTH, TOO_MANY_COMPOUND_TERMS_MESSAGE};
+use turso_parser::{
+    MAX_COMPOUND_SELECT, MAX_EXPR_DEPTH, MAX_QUERY_DEPTH, TOO_MANY_COMPOUND_TERMS_MESSAGE,
+};
 
 struct GenExpr {
     name: &'static str,
@@ -189,10 +191,106 @@ fn upsert_with_a_change_check_per_column_runs_on_a_1_mib_stack() {
     run_with_stack(1 << 20, vec![create, upsert.clone(), upsert]).unwrap();
 }
 
-/// SQLite does not count the terms of a compound whose last term is VALUES. So
-/// a database that it wrote can store a view that goes past the compound limit
-/// of the Turso parser. Turso opens such a database. A statement that uses the
-/// view gets the error of the limit from the planner.
+/// A statement with `depth` levels of one kind of nested query. Each statement
+/// reads the table that [`CREATE_T`] makes.
+struct NestedQuery {
+    name: &'static str,
+    build: fn(depth: usize) -> String,
+}
+
+const CREATE_T: &str = "CREATE TABLE t(x)";
+
+const NESTED_QUERIES: &[NestedQuery] = &[
+    // https://github.com/tursodatabase/turso/issues/4900
+    NestedQuery {
+        name: "from-subquery",
+        build: |depth| {
+            format!(
+                "SELECT * FROM {}t{}",
+                "(SELECT * FROM ".repeat(depth),
+                ")".repeat(depth)
+            )
+        },
+    },
+    NestedQuery {
+        name: "from-parentheses",
+        build: |depth| format!("SELECT * FROM {}t{}", "(".repeat(depth), ")".repeat(depth)),
+    },
+    // https://github.com/tursodatabase/turso/issues/8105
+    NestedQuery {
+        name: "cte",
+        build: |depth| {
+            let mut sql = String::new();
+            for i in (1..depth).rev() {
+                sql.push_str(&format!("WITH n{i} AS ("));
+            }
+            sql.push_str("WITH n0 AS (SELECT x FROM t) SELECT * FROM n0");
+            for i in 1..depth {
+                sql.push_str(&format!(") SELECT * FROM n{i}"));
+            }
+            sql
+        },
+    },
+];
+
+fn query_nested_too_deeply() -> String {
+    format!("Query is nested too deeply (maximum depth {MAX_QUERY_DEPTH})")
+}
+
+#[test]
+fn query_nesting_over_the_limit_is_an_error() {
+    for nested in NESTED_QUERIES {
+        for depth in [MAX_QUERY_DEPTH + 1, 100_000] {
+            let err = run_with_stack(
+                WORKER_STACK,
+                vec![CREATE_T.to_string(), (nested.build)(depth)],
+            )
+            .expect_err(nested.name);
+            assert_eq!(
+                err.to_string(),
+                query_nested_too_deeply(),
+                "{} at depth {depth}: {err:?}",
+                nested.name
+            );
+        }
+    }
+}
+
+#[test]
+fn query_nesting_at_the_limit_completes() {
+    for nested in NESTED_QUERIES {
+        run_with_stack(
+            WORKER_STACK,
+            vec![CREATE_T.to_string(), (nested.build)(MAX_QUERY_DEPTH)],
+        )
+        .unwrap_or_else(|err| panic!("{}: {err:?}", nested.name));
+    }
+}
+
+#[test]
+fn view_and_trigger_over_the_query_nesting_limit_are_errors() {
+    let select = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 1);
+    for sql in [
+        format!("CREATE VIEW v AS {select}"),
+        format!("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t {select}; END"),
+    ] {
+        let err = run_with_stack(WORKER_STACK, vec![CREATE_T.to_string(), sql])
+            .expect_err("statement over the limit");
+        assert_eq!(err.to_string(), query_nested_too_deeply(), "{err:?}");
+    }
+}
+
+#[test]
+fn sibling_subqueries_do_not_count_toward_the_query_nesting_limit() {
+    let columns = vec!["(SELECT 1)"; MAX_QUERY_DEPTH + 100].join(", ");
+    run_with_stack(WORKER_STACK, vec![format!("SELECT {columns}")]).unwrap();
+}
+
+/// SQLite has no limit on the nesting of queries, and it does not count the
+/// terms of a compound whose last term is VALUES. So a database that it wrote
+/// can store views and triggers that go past the parse limits of Turso. Turso
+/// opens such a database. A statement that uses the compound view past the
+/// limit gets the error of the limit from the planner.
 #[test]
 fn stored_sql_over_the_parse_limits_still_loads() {
     on_worker_thread(|| {
@@ -204,7 +302,7 @@ fn stored_sql_over_the_parse_limits_still_loads() {
         let conn = db.connect_limbo();
         let names =
             crate::common::limbo_exec_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY name");
-        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(names.len(), 6, "{names:?}");
         let rows = crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM w");
         assert_eq!(
             rows,
@@ -232,6 +330,7 @@ fn alter_table_rewrites_stored_sql_over_the_parse_limits() {
         for sql in [
             "ALTER TABLE t RENAME TO t2",
             "ALTER TABLE t2 RENAME COLUMN x TO y",
+            "ALTER TABLE u RENAME TO u2",
         ] {
             conn.execute(sql)
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
@@ -241,14 +340,16 @@ fn alter_table_rewrites_stored_sql_over_the_parse_limits() {
             "SELECT name FROM sqlite_schema WHERE sql LIKE '%t2%' ORDER BY name",
         );
         let text = |name: &str| vec![rusqlite::types::Value::Text(name.to_string())];
-        assert_eq!(names, vec![text("t2")]);
+        assert_eq!(names, vec![text("t2"), text("tr"), text("v")]);
     });
 }
 
-/// Writes a database with SQLite. It has the table `t`, and the views `w` and
-/// `x`, which are compounds of `MAX_COMPOUND_SELECT` and `MAX_COMPOUND_SELECT + 1`
-/// terms whose last term is VALUES.
+/// Writes a database with SQLite. Its view `v` and the body of its trigger `tr`
+/// on table `u` are nested `MAX_QUERY_DEPTH + 100` levels deep, and they read
+/// table `t`. Its views `w` and `x` are compounds of `MAX_COMPOUND_SELECT` and
+/// `MAX_COMPOUND_SELECT + 1` terms whose last term is VALUES.
 fn write_database_over_the_parse_limits(path: &std::path::Path) {
+    let select = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 100);
     let compound = |terms: usize| {
         format!(
             "{} UNION ALL VALUES (2)",
@@ -261,7 +362,9 @@ fn write_database_over_the_parse_limits(path: &std::path::Path) {
     sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
     sqlite
         .execute_batch(&format!(
-            "CREATE TABLE t(x); CREATE VIEW w AS {compound_at_the_limit}; \
+            "CREATE TABLE t(x); CREATE TABLE u(x); CREATE VIEW v AS {select}; \
+             CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t {select}; END; \
+             CREATE VIEW w AS {compound_at_the_limit}; \
              CREATE VIEW x AS {compound_over_the_limit};"
         ))
         .unwrap();
