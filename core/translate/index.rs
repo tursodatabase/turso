@@ -3,7 +3,7 @@ use crate::dialect::{CatalogCmd, CmdContext, CreateIndex, DropIndex};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
-use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
+use crate::namespace::{is_reserved_object_name, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
     Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
@@ -22,6 +22,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::type_ordering::TypeOrdering;
+use crate::util::escape_sql_string_literal;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, ClearBtreeCount, Cookie};
 use crate::{bail_parse_error, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID};
@@ -31,7 +32,7 @@ use crate::{
         SchemaObjectType,
     },
     storage::pager::CreateBTreeFlags,
-    util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
+    util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral, SorterOpenData},
@@ -40,11 +41,9 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
-use super::schema::{
-    self, emit_delete_index_row, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID,
-};
+use super::schema::{self, emit_delete_index_row, SQLITE_TABLEID};
 
-fn canonical_create_index_sql(
+pub(super) fn canonical_create_index_sql(
     stmt: &ast::Stmt,
     idx_name_in_sql: ast::Name,
     tbl_name_in_sql: ast::Name,
@@ -138,11 +137,6 @@ pub fn translate_create_index(
         None => resolver.resolve_existing_table_named(original_tbl_name.as_str())?,
     };
     let database_id = namespace.database_id;
-    let sql = canonical_create_index_sql(
-        &written_stmt,
-        resolver.name_in_sql(namespace, &original_idx_name.name),
-        resolver.name_in_sql(namespace, &original_tbl_name),
-    );
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
@@ -309,12 +303,8 @@ pub fn translate_create_index(
         );
     }
 
-    let sqlite_table = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
-        .unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    cmd_context.alloc_sqlite_schema_cursor(program);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
@@ -334,38 +324,17 @@ pub fn translate_create_index(
         });
     }
 
-    // open the sqlite schema table for writing and create a new entry for the index
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
-        db: database_id,
-    });
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
-    )?;
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        cdc_table.map(|x| x.0),
-        SchemaEntryType::Index,
-        &resolver.mangle_name(namespace, &idx_name),
-        &resolver.mangle_name(namespace, &tbl_name),
-        root_page_reg,
-        Some(sql),
-    )?;
-
-    let cmd_context = CmdContext::new(connection, resolver, database_id);
     resolver.catalog.dialect.catalog().emit(
         program,
         &cmd_context,
         &CatalogCmd::CreateIndex(CreateIndex {
             namespace: namespace.id,
             name: &idx_name,
+            written_name: &original_idx_name.name,
             table: &tbl_name,
+            written_table: &original_tbl_name,
+            statement: &written_stmt,
+            root_reg: root_page_reg,
         }),
     )?;
 
@@ -395,10 +364,7 @@ pub fn translate_create_index(
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
     });
-    // Close the final sqlite_schema cursor
-    program.emit_insn(Insn::Close {
-        cursor_id: sqlite_schema_cursor_id,
-    });
+    cmd_context.close_sqlite_schema_cursor(program);
 
     Ok(())
 }

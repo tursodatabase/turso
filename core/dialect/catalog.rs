@@ -5,9 +5,15 @@
 use crate::{
     namespace::NamespaceId,
     schema::{Index, Schema},
-    translate::{emitter::Resolver, schema::open_sqlite_schema_for_write},
+    translate::{
+        emitter::Resolver,
+        schema::{
+            alloc_sqlite_schema_cursor, emit_open_sqlite_schema_cursor,
+            open_sqlite_schema_for_write,
+        },
+    },
     util::renamed_automatic_index_name,
-    vdbe::builder::ProgramBuilder,
+    vdbe::{builder::ProgramBuilder, insn::Insn},
     Connection, LimboError, Result, Value,
 };
 use std::{cell::Cell, sync::Arc};
@@ -50,7 +56,7 @@ pub struct CmdContext<'a> {
     pub database_id: usize,
     pub origin: CmdOrigin,
     pub(crate) resolver: &'a Resolver<'a>,
-    sqlite_schema_cursor: Cell<Option<usize>>,
+    sqlite_schema_cursor: Cell<SqliteSchemaCursor>,
 }
 
 impl<'a> CmdContext<'a> {
@@ -70,20 +76,61 @@ impl<'a> CmdContext<'a> {
             database_id,
             origin,
             resolver,
-            sqlite_schema_cursor: Cell::new(None),
+            sqlite_schema_cursor: Cell::new(SqliteSchemaCursor::Unallocated),
         }
     }
 
     /// The statement's cursor for writing `sqlite_schema` of the database
     /// it changes. The first call opens it.
     pub(crate) fn sqlite_schema_cursor(&self, program: &mut ProgramBuilder) -> usize {
-        if let Some(cursor_id) = self.sqlite_schema_cursor.get() {
-            return cursor_id;
-        }
-        let cursor_id = open_sqlite_schema_for_write(program, self.resolver, self.database_id);
-        self.sqlite_schema_cursor.set(Some(cursor_id));
+        let cursor_id = match self.sqlite_schema_cursor.get() {
+            SqliteSchemaCursor::Open(cursor_id) => return cursor_id,
+            SqliteSchemaCursor::Allocated(cursor_id) => {
+                emit_open_sqlite_schema_cursor(program, cursor_id, self.database_id);
+                cursor_id
+            }
+            SqliteSchemaCursor::Unallocated => {
+                open_sqlite_schema_for_write(program, self.resolver, self.database_id)
+            }
+        };
+        self.sqlite_schema_cursor
+            .set(SqliteSchemaCursor::Open(cursor_id));
         cursor_id
     }
+
+    /// Gives the statement's `sqlite_schema` cursor its number now, for a
+    /// statement whose cursor numbers depend on it, without opening it.
+    /// [`Self::sqlite_schema_cursor`] opens it on its first call.
+    pub(crate) fn alloc_sqlite_schema_cursor(&self, program: &mut ProgramBuilder) {
+        assert!(
+            self.sqlite_schema_cursor.get() == SqliteSchemaCursor::Unallocated,
+            "the statement already has a sqlite_schema cursor"
+        );
+        let cursor_id = alloc_sqlite_schema_cursor(program, self.resolver, self.database_id);
+        self.sqlite_schema_cursor
+            .set(SqliteSchemaCursor::Allocated(cursor_id));
+    }
+
+    /// Closes the statement's `sqlite_schema` cursor. Emits nothing when no
+    /// write opened it, which is the case for a catalog that stores no
+    /// `sqlite_schema` row.
+    pub(crate) fn close_sqlite_schema_cursor(&self, program: &mut ProgramBuilder) {
+        if let SqliteSchemaCursor::Open(cursor_id) = self.sqlite_schema_cursor.get() {
+            program.emit_insn(Insn::Close { cursor_id });
+            self.sqlite_schema_cursor
+                .set(SqliteSchemaCursor::Allocated(cursor_id));
+        }
+    }
+}
+
+/// The statement's `sqlite_schema` cursor. CREATE INDEX gives it its number
+/// before the index cursor and opens it after CreateBtree, so a cursor can
+/// have a number and no instruction that opens it yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqliteSchemaCursor {
+    Unallocated,
+    Allocated(usize),
+    Open(usize),
 }
 
 /// Whether a user runs the statement, or the engine for itself: a frontend
@@ -144,12 +191,17 @@ pub struct AutomaticIndex {
 }
 
 /// A new index. The statement has already emitted the creation of its
-/// storage.
+/// storage. `root_reg` has the root page of its B-tree, or 0 for an index
+/// method that stores the index elsewhere.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateIndex<'a> {
     pub namespace: NamespaceId,
     pub name: &'a str,
+    pub written_name: &'a ast::Name,
     pub table: &'a str,
+    pub written_table: &'a ast::Name,
+    pub statement: &'a ast::Stmt,
+    pub root_reg: usize,
 }
 
 /// An index that the statement drops.
