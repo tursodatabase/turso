@@ -1433,6 +1433,7 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
 
 mod immutable_record {
     use super::*;
+    use smallvec::SmallVec;
 
     /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
     /// A value in a record that has already been serialized can stay serialized and what this struct offsers
@@ -1595,6 +1596,11 @@ mod immutable_record {
         let values = iter.try_collect::<Result<_>>()??;
         Ok(values)
     }
+
+    /// The values of a record, decoded by `get_values_inline`. A record with at
+    /// most 8 values keeps them in place, without a heap allocation. A larger
+    /// inline capacity makes each move of the vector a larger copy.
+    pub type InlineValues<'a> = SmallVec<[ValueRef<'a>; 8]>;
 
     fn values_range(payload: &[u8], range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
         let mut iter = iter(payload)?;
@@ -1882,6 +1888,20 @@ mod immutable_record {
             values(self.get_payload())
         }
 
+        /// Decodes all values, like `get_values`, without a heap allocation for
+        /// a record with at most 8 values.
+        #[inline]
+        pub fn get_values_inline(&self) -> Result<InlineValues<'_>> {
+            let mut values = InlineValues::new();
+            for value in iter(self.get_payload())? {
+                let value = value?;
+                // A failed allocation for a longer record is an error, as in `values`.
+                values.try_reserve(1).map_err(|_| LimboError::OutOfMemory)?;
+                values.push(value);
+            }
+            Ok(values)
+        }
+
         pub fn get_two_values(
             &self,
             idx1: usize,
@@ -2144,7 +2164,7 @@ mod immutable_record {
     }
 }
 
-pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, RecordBuf};
+pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, InlineValues, RecordBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
@@ -4319,6 +4339,34 @@ mod tests {
         let mut iter = ValueIterator::new(&buf).unwrap();
         let _ = iter.next();
         let _ = iter.next();
+    }
+
+    #[test]
+    fn get_values_inline_matches_get_values() {
+        for count in 0..20usize {
+            let values: Vec<Value> = (0..count)
+                .map(|i| match i % 3 {
+                    0 => Value::from_i64(i as i64),
+                    1 => Value::build_text(format!("text-{i}")),
+                    _ => Value::Null,
+                })
+                .try_collect()
+                .unwrap();
+            let record = create_record(values);
+            let record_ref = ImmutableRecordRef::from_bin_record(record.get_payload());
+            let inline = record_ref.get_values_inline().unwrap();
+            assert_eq!(
+                inline.as_slice(),
+                record_ref.get_values().unwrap().as_slice()
+            );
+            assert_eq!(inline.spilled(), count > 8);
+        }
+        // The header says that the second value is a TEXT of 10 bytes, but
+        // the payload ends after 2 of them.
+        let corrupt = [3u8, 1, 33, 7, b'a', b'b'];
+        let record_ref = ImmutableRecordRef::from_bin_record(&corrupt);
+        assert!(record_ref.get_values().is_err());
+        assert!(record_ref.get_values_inline().is_err());
     }
 
     pub fn compare_immutable_for_testing(
