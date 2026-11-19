@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 
 /// One part of reading a schema from the database file. A step runs
 /// statements against the schema read so far and puts their rows into it.
-pub(crate) trait LoadStep: Send {
+pub trait LoadStep: Send {
     /// The next statement of this step, or None when the step has no more.
     /// A step without statements does its work here.
     fn next_query(&mut self, load: &mut SchemaLoad) -> Result<Option<LoadQuery>>;
@@ -41,7 +41,9 @@ pub(crate) trait LoadStep: Send {
 }
 
 /// A statement of a [`LoadStep`].
-pub(crate) enum LoadQuery {
+pub struct LoadQuery(LoadQueryKind);
+
+enum LoadQueryKind {
     /// `SELECT * FROM sqlite_schema`, as
     /// [`Connection::prepare_schema_table_read`] prepares it without parsing
     /// SQL.
@@ -53,33 +55,38 @@ pub(crate) enum LoadQuery {
 }
 
 impl LoadQuery {
+    /// Reads `sqlite_schema`. Only the engine's own step uses it.
+    pub(crate) fn schema_table_read() -> Self {
+        Self(LoadQueryKind::SchemaTableRead)
+    }
+
     /// A read of an engine table, as
     /// [`Connection::prepare_engine_metadata_read`] prepares it.
-    pub(crate) fn engine_metadata_read(sql: impl Into<String>) -> Self {
-        Self::Sql {
+    pub fn engine_metadata_read(sql: impl Into<String>) -> Self {
+        Self(LoadQueryKind::Sql {
             sql: sql.into(),
             origin: StatementOrigin::EngineMetadataRead,
-        }
+        })
     }
 
     /// A helper statement, as [`Connection::prepare_internal`] prepares it.
     pub(crate) fn internal_helper(sql: impl Into<String>) -> Self {
-        Self::Sql {
+        Self(LoadQueryKind::Sql {
             sql: sql.into(),
             origin: StatementOrigin::InternalHelper,
-        }
+        })
     }
 }
 
 /// Where a statement of a [`LoadStep`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueryFailure {
+pub enum QueryFailure {
     Prepare,
     Read,
 }
 
 /// A schema that is being read.
-pub(crate) struct SchemaLoad {
+pub struct SchemaLoad {
     /// The connection or the database may share this schema. A step that
     /// changes it then changes a copy, which [`Schema::try_make_mut`] makes.
     schema: Arc<Schema>,
@@ -107,11 +114,11 @@ impl SchemaLoad {
         }
     }
 
-    pub(crate) fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    pub(crate) fn schema_mut(&mut self) -> Result<&mut Schema> {
+    pub fn schema_mut(&mut self) -> Result<&mut Schema> {
         Ok(Schema::try_make_mut(&mut self.schema)?)
     }
 }
@@ -229,9 +236,9 @@ impl SchemaLoader {
                 }
                 self.current_step_schema_installed = true;
             }
-            let statement = match query {
-                LoadQuery::SchemaTableRead => conn.prepare_schema_table_read(),
-                LoadQuery::Sql { sql, origin } => conn.prepare_with_origin(&sql, origin),
+            let statement = match query.0 {
+                LoadQueryKind::SchemaTableRead => conn.prepare_schema_table_read(),
+                LoadQueryKind::Sql { sql, origin } => conn.prepare_with_origin(&sql, origin),
             }
             .map_err(|err| step.query_failed(QueryFailure::Prepare, err))?;
             self.statement = Some(Box::new(statement));
@@ -304,7 +311,7 @@ impl LoadStep for SchemaRows {
             return Ok(None);
         }
         self.queried = true;
-        Ok(Some(LoadQuery::SchemaTableRead))
+        Ok(Some(LoadQuery::schema_table_read()))
     }
 
     fn row(&mut self, load: &mut SchemaLoad, row: &Row) -> Result<()> {
@@ -745,7 +752,7 @@ mod tests {
 
     impl LoadStep for NamesANamespace {
         fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
-            let query = (!self.queried).then_some(LoadQuery::SchemaTableRead);
+            let query = (!self.queried).then(LoadQuery::schema_table_read);
             self.queried = true;
             Ok(query)
         }
@@ -770,7 +777,7 @@ mod tests {
 
     impl LoadStep for LooksForTheNamespace {
         fn next_query(&mut self, _load: &mut SchemaLoad) -> Result<Option<LoadQuery>> {
-            let query = (!self.queried).then_some(LoadQuery::SchemaTableRead);
+            let query = (!self.queried).then(LoadQuery::schema_table_read);
             self.queried = true;
             Ok(query)
         }
