@@ -654,63 +654,10 @@ use crate::StepResult;
 use crate::Value;
 // Simple atomic clock implementation for testing
 
-fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
-    let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE mvcc_lazy_gap_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'mvcc_lazy_gap_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let btree_root_page = root_page.abs();
-
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-
-    let test_rows = [
-        (5, "row5"),
-        (10, "row10"),
-        (15, "row15"),
-        (20, "row20"),
-        (30, "row30"),
-    ];
-
-    for (row_id, data) in test_rows.iter() {
-        let id = RowID::new(table_id, RowKey::Int(*row_id));
-        let record =
-            ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
-        let row = Row::new_table_row(id, record.as_blob()).unwrap();
-        db.mvcc_store.insert(tx_id, row).unwrap();
-    }
-
-    commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
-
-    let tx_id = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    (db, tx_id, table_id, btree_root_page)
-}
-
 fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE mvcc_lazy_basic_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'mvcc_lazy_basic_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let btree_root_page = root_page.abs();
+    let table_id = new_uncheckpointed_table_id(&db);
+    let btree_root_page = -i64::from(table_id);
 
     let tx_id = db
         .mvcc_store
@@ -737,16 +684,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 #[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let db = MvccTestDb::new();
-    db.conn
-        .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    let root_page = get_rows(
-        &db.conn,
-        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'cursor_yield_test'",
-    )[0][0]
-        .as_int()
-        .unwrap();
-    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let table_id = new_uncheckpointed_table_id(&db);
     let tx_id = db
         .mvcc_store
         .begin_tx(db.conn.pager.load().clone())
@@ -763,7 +701,7 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         MvccCursorType::Table,
         Box::new(BTreeCursor::new(
             db.conn.pager.load().clone(),
-            root_page.abs(),
+            -i64::from(table_id),
             1,
         )),
     )
@@ -780,6 +718,13 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
         saw_yield,
         "MVCC cursor should inject an explicit yield on the first next() transition",
     );
+}
+
+/// Allocates a table id the way CREATE TABLE does in MVCC mode: the table has
+/// no B-tree until a checkpoint gives it one, and its root page in
+/// sqlite_schema is the table id.
+fn new_uncheckpointed_table_id(db: &MvccTestDb) -> MVTableId {
+    MVTableId::from(db.mvcc_store.get_next_table_id())
 }
 
 pub(crate) fn commit_tx(
@@ -859,7 +804,7 @@ fn test_lazy_scan_cursor_basic() {
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
 fn test_lazy_scan_cursor_with_gaps() {
-    let (db, tx_id, table_id, btree_root_page) = setup_test_db();
+    let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[5, 10, 15, 20, 30]);
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
