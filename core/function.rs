@@ -1982,6 +1982,15 @@ impl Func {
         )
     }
 
+    /// Whether the function is an aggregate, built in or from an extension.
+    pub fn is_aggregate(&self) -> bool {
+        match self {
+            Self::Agg(_) => true,
+            Self::External(f) => f.func.is_aggregate(),
+            _ => false,
+        }
+    }
+
     pub fn supports_star_syntax(&self) -> bool {
         // Functions that need star expansion also support star syntax
         if self.needs_star_expansion() {

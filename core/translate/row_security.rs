@@ -859,7 +859,7 @@ fn policy_column(name: &ast::Name, table: &BTreeTable) -> Result<ast::Expr> {
 fn check_policy_function(name: &str, arg_count: usize, resolver: &Resolver) -> Result<()> {
     match resolver.resolve_function(name, arg_count)? {
         None => bail_parse_error!("function {name} does not exist"),
-        Some(Func::Agg(_)) => {
+        Some(func) if func.is_aggregate() => {
             bail_parse_error!("aggregate functions are not allowed in policy expressions")
         }
         Some(Func::Window(_)) => {

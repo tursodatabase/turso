@@ -2632,14 +2632,10 @@ fn outer_aggregate_read_by_subquery(
             } = e
             {
                 let is_plain_aggregate = filter_over.over_clause.is_none()
-                    && match crate::function::Func::resolve_function(name.as_str(), args.len()) {
-                        Ok(Some(crate::function::Func::Agg(_))) => true,
-                        _ => resolver
-                            .catalog
-                            .symbol_table
-                            .resolve_function(name.as_str(), args.len())
-                            .is_some_and(|f| f.func.is_aggregate()),
-                    };
+                    && matches!(
+                        resolver.resolve_function(name.as_str(), args.len()),
+                        Ok(Some(func)) if func.is_aggregate()
+                    );
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
                     found = Some(name.as_str().to_string());
                     return Ok(WalkControl::SkipChildren);

@@ -1808,6 +1808,20 @@ expect error {
     aggregate functions prohibited in DECODE expressions
 }
 
+test create-domain-aggregate-in-check-rejected {
+    CREATE DOMAIN bad_domain AS integer CHECK (sum(value) > 0);
+}
+expect error {
+    aggregate functions prohibited in domain CHECK expressions: sum
+}
+
+test create-domain-extension-aggregate-in-check-rejected {
+    CREATE DOMAIN bad_domain AS integer CHECK (median(value) > 0);
+}
+expect error {
+    aggregate functions prohibited in domain CHECK expressions: median
+}
+
 @requires strict "uses STRICT tables"
 test numeric-zero-precision-rejected {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(0,0)) STRICT;
