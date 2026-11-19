@@ -2,7 +2,7 @@ use std::sync::Arc;
 use turso_sqlite::SqliteDialect;
 
 use turso_core::{ConnectOpts, Database, MemoryIO, SessionRole, IO};
-use turso_parser::MAX_EXPR_DEPTH;
+use turso_parser::{MAX_COMPOUND_SELECT, MAX_EXPR_DEPTH, TOO_MANY_COMPOUND_TERMS_MESSAGE};
 
 struct GenExpr {
     name: &'static str,
@@ -187,4 +187,92 @@ fn upsert_with_a_change_check_per_column_runs_on_a_1_mib_stack() {
     );
 
     run_with_stack(1 << 20, vec![create, upsert.clone(), upsert]).unwrap();
+}
+
+/// SQLite does not count the terms of a compound whose last term is VALUES. So
+/// a database that it wrote can store a view that goes past the compound limit
+/// of the Turso parser. Turso opens such a database. A statement that uses the
+/// view gets the error of the limit from the planner.
+#[test]
+fn stored_sql_over_the_parse_limits_still_loads() {
+    on_worker_thread(|| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("deep.db");
+        write_database_over_the_parse_limits(&path);
+
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let names =
+            crate::common::limbo_exec_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY name");
+        assert_eq!(names.len(), 3, "{names:?}");
+        let rows = crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM w");
+        assert_eq!(
+            rows,
+            vec![vec![rusqlite::types::Value::Integer(
+                MAX_COMPOUND_SELECT as i64
+            )]]
+        );
+        let err = conn.execute("SELECT count(*) FROM x").unwrap_err();
+        assert_eq!(err.to_string(), TOO_MANY_COMPOUND_TERMS_MESSAGE);
+    });
+}
+
+/// ALTER TABLE rewrites the stored SQL that names the renamed table or column.
+/// It parses all stored SQL, also the SQL past the parse limits, as the schema
+/// loader does.
+#[test]
+fn alter_table_rewrites_stored_sql_over_the_parse_limits() {
+    on_worker_thread(|| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("deep.db");
+        write_database_over_the_parse_limits(&path);
+
+        let db = crate::common::TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        for sql in [
+            "ALTER TABLE t RENAME TO t2",
+            "ALTER TABLE t2 RENAME COLUMN x TO y",
+        ] {
+            conn.execute(sql)
+                .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        }
+        let names = crate::common::limbo_exec_rows(
+            &conn,
+            "SELECT name FROM sqlite_schema WHERE sql LIKE '%t2%' ORDER BY name",
+        );
+        let text = |name: &str| vec![rusqlite::types::Value::Text(name.to_string())];
+        assert_eq!(names, vec![text("t2")]);
+    });
+}
+
+/// Writes a database with SQLite. It has the table `t`, and the views `w` and
+/// `x`, which are compounds of `MAX_COMPOUND_SELECT` and `MAX_COMPOUND_SELECT + 1`
+/// terms whose last term is VALUES.
+fn write_database_over_the_parse_limits(path: &std::path::Path) {
+    let compound = |terms: usize| {
+        format!(
+            "{} UNION ALL VALUES (2)",
+            vec!["SELECT 1"; terms - 1].join(" UNION ALL ")
+        )
+    };
+    let compound_at_the_limit = compound(MAX_COMPOUND_SELECT);
+    let compound_over_the_limit = compound(MAX_COMPOUND_SELECT + 1);
+    let sqlite = rusqlite::Connection::open(path).unwrap();
+    sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
+    sqlite
+        .execute_batch(&format!(
+            "CREATE TABLE t(x); CREATE VIEW w AS {compound_at_the_limit}; \
+             CREATE VIEW x AS {compound_over_the_limit};"
+        ))
+        .unwrap();
+}
+
+/// Runs `f` on a thread with [WORKER_STACK] bytes of stack.
+fn on_worker_thread(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(f)
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked");
 }

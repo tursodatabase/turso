@@ -28,6 +28,26 @@ These features extend Turso beyond SQLite compatibility:
 | stddev() | Standard deviation aggregate function |
 | [DEFAULT in VALUES](/docs/sql-reference/statements/insert#default-keyword-in-values) | SQL-standard DEFAULT keyword in INSERT VALUES lists |
 
+## Limits
+
+Turso stops a statement with an error when the statement goes past one of these
+limits. Where SQLite has the same limit, Turso uses the same value and the same
+message.
+
+| Limit | Turso | SQLite | Error |
+|-------|-------|--------|-------|
+| Depth of an expression | 100 | 1000 | `Expression tree is too large (maximum depth 100)` |
+| Terms in a compound `SELECT` | 500 | 500 | `too many terms in compound SELECT` |
+
+A `VALUES` list with many rows is one term. SQLite does not count the terms of
+a compound `SELECT` whose last term is `VALUES`, but Turso counts them.
+
+The limit on compound terms does not apply when Turso reads the views and
+triggers that a database stores, because SQLite and older versions of Turso can
+have written them without this limit. Thus such a database opens. A statement
+that uses a stored view or trigger with a compound `SELECT` of more than 500
+terms gets the error of the limit.
+
 ## PostgreSQL schema metadata
 
 The PostgreSQL opening functions initialize the relation catalog before returning

@@ -108,6 +108,17 @@ fn expression_tree_too_large_error() -> Error {
     ))
 }
 
+/// The message of the error for a compound SELECT with more terms than
+/// [`MAX_COMPOUND_SELECT`]. The planner gives the same error for the stored SQL
+/// that [`Parser::new_for_stored_sql`] parses.
+pub const TOO_MANY_COMPOUND_TERMS_MESSAGE: &str = "too many terms in compound SELECT";
+
+#[cold]
+#[inline(never)]
+fn too_many_compound_terms_error() -> Error {
+    Error::ParseError(TOO_MANY_COMPOUND_TERMS_MESSAGE.to_owned())
+}
+
 #[inline(always)]
 fn from_bytes_as_str(bytes: &[u8]) -> &str {
     unsafe { str::from_utf8_unchecked(bytes) }
@@ -195,6 +206,9 @@ pub struct Parser<'a> {
     type_nesting_depth: u32,
     /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
     expr_nesting_depth: u32,
+    /// Whether the parser applies [`MAX_COMPOUND_SELECT`]. False for SQL that the
+    /// schema or the engine stores.
+    applies_statement_limits: bool,
     /// Height of the most recently parsed expression (`1 + max(child heights)`,
     /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
     last_expr_height: usize,
@@ -209,6 +223,13 @@ pub struct Parser<'a> {
 /// translator/optimizer uses larger stack frames per nesting level, so a
 /// 1000-deep tree still overflows a default 8 MiB thread stack in debug builds.
 pub const MAX_EXPR_DEPTH: usize = 100;
+
+/// Maximum number of terms in a compound SELECT, the same as SQLite's
+/// `SQLITE_MAX_COMPOUND_SELECT` (default 500). The code generator recurses one
+/// time for each term, so this limit bounds its stack use.
+/// [`Parser::new_for_stored_sql`] does not apply it, but the planner applies it
+/// to all SQL.
+pub const MAX_COMPOUND_SELECT: usize = 500;
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
@@ -234,17 +255,20 @@ impl<'a> Parser<'a> {
             named_variables: HashMap::new(),
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
+            applies_statement_limits: true,
             last_expr_height: 0,
             domain_default_ends_at_not_null: false,
         }
     }
 
     /// Makes a parser for SQL that the schema or the engine stores. SQLite and
-    /// older versions of Turso can have written this SQL without the limits that
-    /// the parser applies only to the SQL of statements, so this parser does not
-    /// apply them.
+    /// older versions of Turso can have written this SQL without the limit
+    /// [`MAX_COMPOUND_SELECT`], so this parser does not apply it. The planner
+    /// still applies this limit when a statement uses this SQL.
     pub fn new_for_stored_sql(input: &'a [u8]) -> Self {
-        Self::new(input)
+        let mut parser = Self::new(input);
+        parser.applies_statement_limits = false;
+        parser
     }
 
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
@@ -3345,6 +3369,12 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
 
+            // The first term and the terms in `compounds`, plus the one to parse.
+            // SQLite does not count a compound whose last term is VALUES. Turso
+            // counts it, because the code generator recurses for its terms too.
+            if self.applies_statement_limits && compounds.len() + 2 > MAX_COMPOUND_SELECT {
+                return Err(too_many_compound_terms_error());
+            }
             compounds.push(CompoundSelect {
                 operator: op,
                 select: self.parse_one_select()?,
