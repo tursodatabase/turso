@@ -179,7 +179,11 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-pub use numeric::{decimal::format_numeric_text, nonnan::NonNan, Numeric};
+pub use numeric::{
+    decimal::{format_numeric_text, Decimal},
+    nonnan::NonNan,
+    Numeric,
+};
 pub use schema::load::{LoadQuery, LoadStep, QueryFailure, SchemaLoad};
 pub use security::roles::SessionRole;
 pub use statement::{
