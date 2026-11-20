@@ -37,8 +37,8 @@ use crate::{
             open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
-            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
-            ResultSetColumn, TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, NonFromClauseSubquery, Operation,
+            QueryDestination, ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -1173,38 +1173,15 @@ pub fn translate_insert(
     }
 
     if !returning_subqueries.is_empty() {
-        let target_table = table_references
-            .joined_tables()
-            .first()
-            .expect("INSERT RETURNING target table must exist");
-        let cache_state = seed_returning_row_image_in_cache(
+        emit_returning_subqueries(
             program,
+            resolver,
             &table_references,
+            &mut returning_subqueries,
             insertion.first_col_register(),
             insertion.key_register(),
-            resolver,
             &btree_table.column_layout()?,
         )?;
-        let result: Result<()> = (|| {
-            for subquery in returning_subqueries
-                .iter_mut()
-                .filter(|s| !s.has_been_evaluated())
-            {
-                let rerun_for_target_scan =
-                    subquery.reads_table(target_table.namespace, target_table.table.get_name());
-                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *subquery_plan,
-                    &subquery.query_type,
-                    subquery.correlated || rerun_for_target_scan,
-                )?;
-            }
-            Ok(())
-        })();
-        restore_returning_row_image_in_cache(resolver, cache_state);
-        result?;
     }
 
     // Emit RETURNING results if specified
@@ -1276,6 +1253,51 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+/// Emits the RETURNING subqueries of an INSERT against the row whose column
+/// values start at `reg_columns_start` and whose rowid is in `rowid_reg`.
+pub(crate) fn emit_returning_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    returning_subqueries: &mut [NonFromClauseSubquery],
+    reg_columns_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    let target_table = table_references
+        .joined_tables()
+        .first()
+        .expect("INSERT RETURNING target table must exist");
+    let cache_state = seed_returning_row_image_in_cache(
+        program,
+        table_references,
+        reg_columns_start,
+        rowid_reg,
+        resolver,
+        layout,
+    )?;
+    let result: Result<()> = (|| {
+        for subquery in returning_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let rerun_for_target_scan =
+                subquery.reads_table(target_table.namespace, target_table.table.get_name());
+            let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated || rerun_for_target_scan,
+            )?;
+        }
+        Ok(())
+    })();
+    restore_returning_row_image_in_cache(resolver, cache_state);
+    result
 }
 
 pub(crate) fn emit_remember_written_rowid(
