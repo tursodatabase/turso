@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{CommandTimes, ConnectOpts, Database, Value, WallClockInstant};
+use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
     split_statements, sql_parse_error, sqlstate_error, PgConnection, StatementResultKind,
     TransactionState,
@@ -480,7 +480,7 @@ impl MessageTimes {
     /// A Query message is a whole implicit transaction.
     fn simple_query_received(&self) -> CommandTimesGuard<'_> {
         let now = self.conn.inner().current_time_wall_clock();
-        self.set(CommandTimes {
+        self.set(StatementTimes {
             statement: now,
             transaction: now,
         })
@@ -493,7 +493,7 @@ impl MessageTimes {
             .lock()
             .expect("the lock is not held across a panic")
             .get_or_insert(now);
-        self.set(CommandTimes {
+        self.set(StatementTimes {
             statement: now,
             transaction,
         })
@@ -512,7 +512,7 @@ impl MessageTimes {
             .expect("the lock is not held across a panic") = None;
     }
 
-    fn set(&self, times: CommandTimes) -> CommandTimesGuard<'_> {
+    fn set(&self, times: StatementTimes) -> CommandTimesGuard<'_> {
         self.conn.inner().set_command_times(Some(times));
         CommandTimesGuard(&self.conn)
     }

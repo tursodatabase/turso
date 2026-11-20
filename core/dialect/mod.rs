@@ -76,18 +76,10 @@ impl ScalarFuncContext<'_> {
     }
 }
 
-/// When the client command that holds the running statements was received,
-/// and when the implicit transaction around it started. A command with
+/// When a statement and its transaction started, as PostgreSQL's
+/// `statement_timestamp()` and `now()` report them. A client command with
 /// several statements, or an extended-protocol batch that ends at Sync, is
 /// one transaction in autocommit mode, so its statements share these times.
-#[derive(Debug, Clone, Copy)]
-pub struct CommandTimes {
-    pub statement: WallClockInstant,
-    pub transaction: WallClockInstant,
-}
-
-/// When a statement and its transaction started, as PostgreSQL's
-/// `statement_timestamp()` and `now()` report them.
 #[derive(Debug, Clone, Copy)]
 pub struct StatementTimes {
     pub statement: WallClockInstant,

@@ -388,7 +388,7 @@ pub struct Connection {
     pub(super) explicit_transaction_start: RwLock<Option<WallClockInstant>>,
     /// The times of the client command being executed, set by a server that
     /// receives commands. See `Connection::set_command_times`.
-    pub(super) command_times: RwLock<Option<crate::dialect::CommandTimes>>,
+    pub(super) command_times: RwLock<Option<crate::dialect::StatementTimes>>,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
@@ -2699,12 +2699,12 @@ impl Connection {
     /// reports `times.transaction` as the start of its transaction, instead
     /// of the time at which the statement starts. A server calls this when
     /// it receives a command message that holds several statements.
-    pub fn set_command_times(&self, times: Option<crate::dialect::CommandTimes>) {
+    pub fn set_command_times(&self, times: Option<crate::dialect::StatementTimes>) {
         *self.command_times.write() = times;
     }
 
     /// The times set by `set_command_times`.
-    pub(crate) fn command_times(&self) -> Option<crate::dialect::CommandTimes> {
+    pub(crate) fn command_times(&self) -> Option<crate::dialect::StatementTimes> {
         *self.command_times.read()
     }
 
