@@ -2,11 +2,14 @@ use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use turso_core::io::{FileId, FileSyncType};
 use turso_core::{
-    Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, Row, SessionRole, IO,
+    Buffer, Clock, Completion, ConnectOpts, Connection, Database, Dialect, File, FromValueRow,
+    MemoryIO, MonotonicInstant, OpenFlags, Row, SessionRole, WallClockInstant, IO,
 };
 use turso_sqlite::SqliteDialect;
 
@@ -714,6 +717,137 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4);
 impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5);
 impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6);
 impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncCounts {
+    pub db: usize,
+    pub wal: usize,
+}
+
+/// Memory IO that counts the fsyncs of one database file and of its WAL.
+pub struct SyncCountingIo {
+    inner: Arc<MemoryIO>,
+    tracked_db_path: String,
+    tracked_wal_path: String,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl SyncCountingIo {
+    pub fn new(tracked_db_path: &str) -> Self {
+        Self {
+            inner: Arc::new(MemoryIO::new()),
+            tracked_db_path: tracked_db_path.to_string(),
+            tracked_wal_path: format!("{tracked_db_path}-wal"),
+            db_syncs: Arc::new(AtomicUsize::new(0)),
+            wal_syncs: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn counts(&self) -> SyncCounts {
+        SyncCounts {
+            db: self.db_syncs.load(StdOrdering::SeqCst),
+            wal: self.wal_syncs.load(StdOrdering::SeqCst),
+        }
+    }
+}
+
+impl Clock for SyncCountingIo {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for SyncCountingIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        let inner = self.inner.open_file(path, flags, direct)?;
+        Ok(Arc::new(SyncCountingFile {
+            inner,
+            count_as_db_sync: path == self.tracked_db_path,
+            count_as_wal_sync: path == self.tracked_wal_path,
+            db_syncs: self.db_syncs.clone(),
+            wal_syncs: self.wal_syncs.clone(),
+        }))
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.drain_completions(completions)
+    }
+
+    fn cancel(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.inner.cancel(completions)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+struct SyncCountingFile {
+    inner: Arc<dyn File>,
+    count_as_db_sync: bool,
+    count_as_wal_sync: bool,
+    db_syncs: Arc<AtomicUsize>,
+    wal_syncs: Arc<AtomicUsize>,
+}
+
+impl File for SyncCountingFile {
+    fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.pread(pos, c)
+    }
+
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> turso_core::Result<Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if self.count_as_db_sync {
+            self.db_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        if self.count_as_wal_sync {
+            self.wal_syncs.fetch_add(1, StdOrdering::SeqCst);
+        }
+        self.inner.sync(c, sync_type)
+    }
+
+    fn size(&self) -> turso_core::Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.truncate(len, c)
+    }
+}
 
 #[cfg(test)]
 mod tests {

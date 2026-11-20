@@ -11,7 +11,7 @@
 //! one fail there, to get a particular interleaving.
 
 use super::test_db::MvccTestDbNoConn;
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{ExecRows, SyncCountingIo, TempDatabase};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -5953,4 +5953,67 @@ unsafe impl turso_core::alloc::ApiAllocator for OneShotFaultAlloc {
             )
         }
     }
+}
+
+#[test]
+fn close_of_last_connection_does_not_fsync_wal() {
+    let io = Arc::new(SyncCountingIo::new("close-sync-count.db"));
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "close-sync-count.db",
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    let before = io.counts();
+    conn.close().unwrap();
+    assert_eq!(io.counts(), before);
+}
+
+#[test]
+fn close_of_last_connection_fsyncs_wal_with_frames_not_in_db_file() {
+    let io = Arc::new(SyncCountingIo::new("close-sync-count-passive.db"));
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "close-sync-count-passive.db",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let writer = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    writer.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    let reader = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    reader.execute("BEGIN").unwrap();
+    reader.execute("SELECT * FROM t").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    let rows: Vec<(i64, i64, i64)> = writer.exec_rows("PRAGMA wal_checkpoint(PASSIVE)");
+    let [(_, frames_in_wal, frames_in_db_file)] = rows[..] else {
+        panic!("PRAGMA wal_checkpoint returned {rows:?}");
+    };
+    assert!(
+        frames_in_wal > frames_in_db_file,
+        "the open read transaction should have kept the passive checkpoint from backfilling"
+    );
+    writer.close().unwrap();
+    reader.execute("COMMIT").unwrap();
+    let before = io.counts();
+    reader.close().unwrap();
+    assert_eq!(io.counts().wal - before.wal, 1);
 }
