@@ -601,6 +601,15 @@ expect {
 expect @tursopg error {}
 
 # B-62 (S2): tstzrange contains
+test gap-b-62-tstzrange-contains {
+    SELECT tstzrange('2026-01-01', '2027-01-01') @> '2026-10-08'::timestamptz;
+}
+expect {
+    t
+}
+@sqlstate 42883
+expect @tursopg error {}
+
 # B-63 (S2): json_build_object
 @setup t_id_s_n_arr_ia_j_ok_with_rows
 test gap-b-63-json-build-object {
@@ -750,6 +759,14 @@ expect {
 }
 @sqlstate 42703
 expect @tursopg error {}
+
+# B-77 (S1): now() text format has offset and micros
+test gap-b-77-now-text-format-has-offset-and-micros {
+    SELECT now()::text LIKE '____-__-__ __:__:__.%+00';
+}
+expect {
+    t
+}
 
 # B-78 (S1): gen_random_uuid() format
 test gap-b-78-gen-random-uuid-format {
@@ -1180,6 +1197,15 @@ expect {
 expect @tursopg error {}
 
 # B-116 (S1): to_char(timestamptz)
+test gap-b-116-to-char-timestamptz {
+    SELECT to_char('2026-10-08 12:00:00+00'::timestamptz, 'YYYY-MM-DD HH24:MI');
+}
+expect {
+    2026-10-08 12:00
+}
+expect @tursopg {
+}
+
 # B-124 (S2): 64 nested scalar subqueries
 test gap-b-124-64-nested-scalar-subqueries {
     SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT (SELECT 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))));
