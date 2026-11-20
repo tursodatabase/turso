@@ -62,6 +62,126 @@ struct Case {
     tail: bool,
 }
 
+fn run_case(case: Case) -> Result<()> {
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+    let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let rounds = setting("PULL_MATRIX_ROUNDS", 3);
+    assert!(rounds > 0);
+    eprintln!(
+        "setting up {}: fixture={fixture}, rows={}, updates={}",
+        case.name, case.rows, case.updates
+    );
+    let setup = schema(case);
+    let remote = Remote::new(&setup.iter().map(String::as_str).collect::<Vec<_>>())?;
+    seed(&remote, case)?;
+    // Bootstrap both before writing changes: the transport serves one remote
+    // log generation, and bootstrap checkpoints that remote.
+    let directories = [
+        Arc::new(tempfile::tempdir()?),
+        Arc::new(tempfile::tempdir()?),
+    ];
+    for directory in &directories {
+        let replica = Replica::open(
+            directory,
+            InProcessServer::new(remote.clone()),
+            database_opts(),
+        )?;
+        replica.pull()?;
+        replica.checkpoint()?;
+    }
+    for round in 1..=rounds {
+        let first = if case.tail {
+            case.rows - case.updates + 1
+        } else {
+            1
+        };
+        let last = first + case.updates - 1;
+        let value = json_value(
+            &format!("row_number + {round} * {}", case.rows),
+            case.update_column,
+            case.mixed_json,
+        );
+        let start = Instant::now();
+        remote.execute_transaction(&[&format!(
+            "UPDATE items SET c{} = {value}, modified_at = {round} WHERE rowid BETWEEN {first} AND {last}",
+            case.update_column,
+        )])?;
+        let remote_seconds = start.elapsed().as_secs_f64();
+        for order in 0..directories.len() {
+            // Alternate policy order, keeping identical remote writes for both.
+            let policy = (round - 1 + order) % directories.len();
+            let directory = &directories[policy];
+            let start = Instant::now();
+            let replica = Replica::open_existing(
+                directory,
+                InProcessServer::new(remote.clone()),
+                database_opts(),
+            )?;
+            let connect_seconds = start.elapsed().as_secs_f64();
+            let log_before = replica.logical_log_bytes()?;
+            let start = Instant::now();
+            replica.pull()?;
+            let pull_seconds = start.elapsed().as_secs_f64();
+            let log_after = replica.logical_log_bytes()?;
+            let start = Instant::now();
+            replica.pull()?;
+            let empty_seconds = start.elapsed().as_secs_f64();
+            let checkpoint_seconds = if policy == 1 {
+                let start = Instant::now();
+                replica.checkpoint()?;
+                start.elapsed().as_secs_f64()
+            } else {
+                0.0
+            };
+            let log_checkpoint = replica.logical_log_bytes()?;
+            let stage = if round == 1 {
+                "first_after_bootstrap"
+            } else {
+                "subsequent"
+            };
+            let policy_name = if policy == 0 {
+                "automatic"
+            } else {
+                "after_pull"
+            };
+            let cycle_seconds = pull_seconds + checkpoint_seconds;
+            eprintln!("{fixture},{},{:?},{:?},{},{},{},{round},{stage},{policy_name},{remote_seconds:.6},{connect_seconds:.6},{pull_seconds:.6},{empty_seconds:.6},{checkpoint_seconds:.6},{cycle_seconds:.6},{log_before},{log_after},{log_checkpoint}", case.name, case.key, case.layout, case.rows, case.updates, case.columns);
+        }
+    }
+    let expected = remote.snapshot()?;
+    for directory in &directories {
+        let replica = Replica::open_existing(
+            directory,
+            InProcessServer::new(remote.clone()),
+            database_opts(),
+        )?;
+        assert_eq!(
+            replica.snapshot()?,
+            expected,
+            "{} before checkpoint",
+            case.name
+        );
+        replica.checkpoint()?;
+        drop(replica);
+        let reopened = Replica::open_existing(
+            directory,
+            InProcessServer::new(remote.clone()),
+            database_opts(),
+        )?;
+        assert_eq!(
+            reopened.snapshot()?,
+            expected,
+            "{} after checkpoint and reopen",
+            case.name
+        );
+    }
+    eprintln!(
+        "verified {}: both checkpoint policies match all remote rows and schema",
+        case.name
+    );
+    Ok(())
+}
+
 fn schema(case: Case) -> Vec<String> {
     let mut columns = vec![match case.key {
         Key::Integer => "id INTEGER PRIMARY KEY",
