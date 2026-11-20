@@ -64,23 +64,63 @@ impl Default for QueryProfile {
     }
 }
 
+/// Each statement weight of a `QueryProfile`, with its field name without the
+/// `_weight` suffix. `$profile` is a `&QueryProfile` or a `&mut QueryProfile`,
+/// and each weight is a `&u32` or a `&mut u32` to match. Thus one list serves
+/// `weights` and `weights_mut`. The destructuring has no `..`, so a new field
+/// does not compile until it is added here.
+macro_rules! named_weights {
+    ($profile:expr) => {{
+        let QueryProfile {
+            gen_opts: _,
+            check_after_dml: _,
+            select_weight,
+            create_table_weight,
+            create_index_weight,
+            insert_weight,
+            update_weight,
+            delete_weight,
+            drop_table_weight,
+            alter_table_weight,
+            drop_index,
+            pragma_weight,
+            create_sequence_weight,
+            drop_sequence_weight,
+            nextval_weight,
+            setval_weight,
+        } = $profile;
+        [
+            ("select", select_weight),
+            ("create_table", create_table_weight),
+            ("create_index", create_index_weight),
+            ("insert", insert_weight),
+            ("update", update_weight),
+            ("delete", delete_weight),
+            ("drop_table", drop_table_weight),
+            ("alter_table", alter_table_weight),
+            ("drop_index", drop_index),
+            ("pragma", pragma_weight),
+            ("create_sequence", create_sequence_weight),
+            ("drop_sequence", drop_sequence_weight),
+            ("nextval", nextval_weight),
+            ("setval", setval_weight),
+        ]
+    }};
+}
+
 impl QueryProfile {
-    /// Attention: edit this function when another weight is added
     pub fn total_weight(&self) -> u32 {
-        self.select_weight
-            + self.create_table_weight
-            + self.create_index_weight
-            + self.insert_weight
-            + self.update_weight
-            + self.delete_weight
-            + self.drop_table_weight
-            + self.alter_table_weight
-            + self.drop_index
-            + self.pragma_weight
-            + self.create_sequence_weight
-            + self.drop_sequence_weight
-            + self.nextval_weight
-            + self.setval_weight
+        self.weights().iter().map(|(_, weight)| weight).sum()
+    }
+
+    /// Each statement weight with its field name without the `_weight` suffix.
+    pub fn weights(&self) -> [(&'static str, u32); 14] {
+        named_weights!(self).map(|(name, weight)| (name, *weight))
+    }
+
+    /// The list of [`Self::weights`], with weights that the caller can change.
+    pub fn weights_mut(&mut self) -> [(&'static str, &mut u32); 14] {
+        named_weights!(self)
     }
 }
 
