@@ -20,6 +20,29 @@ impl SyncEncryption {
         Ok(config)
     }
 
+    pub fn from_options(
+        remote_cipher: Option<&str>,
+        local_options: Option<&EncryptionOpts>,
+    ) -> Result<Option<Self>> {
+        let local = local_options.map(Self::from_local_options).transpose()?;
+        // Remote-only encryption may use a cipher that native core does not support.
+        let cipher = match remote_cipher.map(CipherMode::try_from) {
+            Some(Ok(cipher)) => Some(cipher),
+            Some(Err(error)) if local.is_some() => return Err(error.into()),
+            _ => None,
+        };
+        match (local, cipher) {
+            (Some(local), Some(cipher)) if local.cipher != cipher => {
+                Err(Error::DatabaseSyncEngineError(
+                    "sync uses a single cipher for both local and cloud encryption".into(),
+                ))
+            }
+            (Some(local), _) => Ok(Some(local)),
+            (None, Some(cipher)) => Self::new(cipher, None).map(Some),
+            (None, None) => Ok(None),
+        }
+    }
+
     pub fn from_local_options(options: &EncryptionOpts) -> Result<Self> {
         Self::new(
             CipherMode::try_from(options.cipher.as_str())?,
