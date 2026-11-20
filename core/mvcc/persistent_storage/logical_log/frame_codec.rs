@@ -7,9 +7,8 @@
 use super::{
     build_encrypted_chunk_aad, derive_initial_crc, encrypted_payload_blob_size,
     encrypted_payload_chunk_count, EncryptionContext, LogHeader, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
-    END_MAGIC, EXTENSION_RECORD_HEADER_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
-    LOG_VERSION, TX_EXT_HEADER_SIZE, TX_FRAME_FLAG_HAS_EXTENSION_BLOCK, TX_HEADER_SIZE,
-    TX_TRAILER_SIZE,
+    END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE, LOG_VERSION_V2, TX_EXT_HEADER_SIZE,
+    TX_HEADER_SIZE, TX_TRAILER_SIZE,
 };
 use crate::{LimboError, Result};
 
@@ -133,10 +132,7 @@ pub fn inspect_frame_prefix_with_overhead(
             .map_err(|_| corrupt("logical log extension size overflow"))?;
         let count = u32_at(bytes, 32);
         let flags = u32_at(bytes, 36);
-        if flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0
-            || (size > 0) != (flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0)
-            || (size == 0) != (count == 0)
-        {
+        if !super::valid_extension_header(size as u64, count, flags) || (size > 0 && count == 0) {
             return Err(corrupt("invalid logical log extension flags or count"));
         }
         (size, count)
@@ -223,7 +219,7 @@ pub fn validate_frame_into<'a>(
     if source_start < LOG_HDR_SIZE as u64 {
         return Err(corrupt("logical log frame overlaps file header"));
     }
-    if log.version() != LOG_VERSION && layout.header_size == TX_EXT_HEADER_SIZE {
+    if log.version() == LOG_VERSION_V2 && layout.header_size == TX_EXT_HEADER_SIZE {
         return Err(corrupt("extension frame requires logical log version 3"));
     }
     let source_end = source_start
@@ -270,9 +266,11 @@ pub fn validate_frame_into<'a>(
     } else {
         output.extend_from_slice(stored_body);
     }
-    if let Err(error) =
-        validate_extensions(&output[..layout.extension_size], layout.extension_records)
-    {
+    if let Err(error) = super::find_extension_payload(
+        &output[..layout.extension_size],
+        layout.extension_records,
+        None,
+    ) {
         output.clear();
         return Err(error);
     }
@@ -313,28 +311,6 @@ pub fn plaintext_wire_parts<'a>(
         trailer,
         next_crc,
     }
-}
-
-fn validate_extensions(mut bytes: &[u8], count: u32) -> Result<()> {
-    for _ in 0..count {
-        if bytes.len() < EXTENSION_RECORD_HEADER_SIZE {
-            return Err(corrupt("truncated logical log extension header"));
-        }
-        if bytes[2..4] != [0, 0] {
-            return Err(corrupt("unsupported logical log extension flags"));
-        }
-        let size = u32_at(bytes, 4) as usize;
-        bytes = bytes
-            .get(EXTENSION_RECORD_HEADER_SIZE..)
-            .and_then(|bytes| bytes.get(size..))
-            .ok_or_else(|| corrupt("truncated logical log extension body"))?;
-    }
-    if !bytes.is_empty() {
-        return Err(corrupt(
-            "logical log extension count does not match its size",
-        ));
-    }
-    Ok(())
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
