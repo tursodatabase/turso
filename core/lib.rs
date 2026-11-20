@@ -95,6 +95,17 @@ mod uuid;
 mod vdbe;
 pub mod vtab;
 
+// Cursor unit tests need SQL fixtures and access to private B-tree cursors.
+// Include the frontend as a module so its Dialect uses this test crate's types.
+#[cfg(test)]
+extern crate self as turso_core;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[path = "../sqlite/frontend/lib.rs"]
+mod turso_sqlite;
+#[cfg(test)]
+pub(crate) use turso_sqlite::SqliteDialect;
+
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};

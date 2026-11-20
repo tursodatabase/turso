@@ -3,7 +3,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::io::IO;
+use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::CommitYieldPoint;
@@ -15,7 +15,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::{Completion, ConnectOpts, DatabaseOpts, LimboError, OpenFlags};
+use crate::{Completion, ConnectOpts, DatabaseOpts, LimboError, OpenFlags, SqliteDialect};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::SeedableRng;
@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
+    _temp_dir: Option<tempfile::TempDir>,
 }
 pub(crate) struct MvccTestDb {
     pub(crate) mvcc_store: Arc<crate::MvStore>,
@@ -710,7 +711,10 @@ impl MvccTestDbNoConn {
             Arc::new(DialectThatCannotParse),
         )
         .unwrap();
-        Self { db: Some(db) }
+        Self {
+            db: Some(db),
+            _temp_dir: None,
+        }
     }
 
     /// Asumes there is a database open
@@ -5221,4 +5225,44 @@ impl YieldInjector for YieldAtEveryCursorPoint {
         *last_yield = Some(point);
         true
     }
+}
+
+// These low-level cursor cases need SQL to prepare the two storage sources,
+// but also exercise private engine cursors that integration tests cannot open.
+impl MvccTestDbNoConn {
+    fn new_with_random_db() -> Self {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join(format!("test_{}", rand::random::<u64>()));
+        let db = Database::open_file_with_flags(
+            Arc::new(PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Self {
+            db: Some(db),
+            _temp_dir: Some(temp_dir),
+        }
+    }
+}
+
+fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(query).unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect());
+        Ok(())
+    })
+    .unwrap();
+    rows
 }
