@@ -157,12 +157,15 @@ class Database {
 
     const db = this;
     const wrapTxn = (mode) => {
-      return (...bindParameters) => {
+      return function (...bindParameters) {
         // Called inside a transaction, run as a savepoint, as better-sqlite3 does.
         const nested = db.inTransaction;
         db.exec(nested ? "SAVEPOINT turso_compat_txn" : "BEGIN " + mode);
         try {
-          const result = fn(...bindParameters);
+          const result = fn.apply(this, bindParameters);
+          if (result && typeof result.then === "function") {
+            throw new TypeError("Transaction function cannot return a promise");
+          }
           db.exec(nested ? "RELEASE turso_compat_txn" : "COMMIT");
           return result;
         } catch (err) {

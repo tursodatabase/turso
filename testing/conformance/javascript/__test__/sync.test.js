@@ -210,6 +210,71 @@ test.serial("Database.transaction().immediate()", async (t) => {
   t.is(db.inTransaction, false);
 });
 
+test.serial("Database.transaction() called inside another runs as a savepoint", async (t) => {
+  const db = t.context.db;
+  db.exec("CREATE TABLE t (x INTEGER)");
+  const insert = db.prepare("INSERT INTO t VALUES (?)");
+  const inner = db.transaction((x) => {
+    insert.run(x);
+    if (x === 2) throw new Error("inner failed");
+  });
+  const outer = db.transaction(() => {
+    inner(1);
+    t.throws(() => inner(2), { message: "inner failed" });
+    t.is(db.inTransaction, true);
+    insert.run(3);
+  });
+  outer();
+  t.is(db.inTransaction, false);
+  t.deepEqual(db.prepare("SELECT x FROM t ORDER BY x").all(), [{ x: 1 }, { x: 3 }]);
+
+  // A failing outer call rolls back the work its nested calls released.
+  const failingOuter = db.transaction(() => {
+    inner(4);
+    throw new Error("outer failed");
+  });
+  t.throws(() => failingOuter(), { message: "outer failed" });
+  t.is(db.inTransaction, false);
+  t.deepEqual(db.prepare("SELECT x FROM t ORDER BY x").all(), [{ x: 1 }, { x: 3 }]);
+
+  // A transaction function called inside a raw BEGIN also uses a savepoint.
+  db.exec("BEGIN");
+  t.throws(() => inner(2), { message: "inner failed" });
+  t.is(db.inTransaction, true);
+  db.exec("COMMIT");
+  t.deepEqual(db.prepare("SELECT x FROM t ORDER BY x").all(), [{ x: 1 }, { x: 3 }]);
+});
+
+test.serial("Database.transaction() rethrows the error of a function that ended the transaction", async (t) => {
+  const db = t.context.db;
+  const txn = db.transaction(() => {
+    db.exec("ROLLBACK");
+    throw new Error("after rollback");
+  });
+  t.throws(() => txn(), { message: "after rollback" });
+  t.is(db.inTransaction, false);
+});
+
+test.serial("Database.transaction() rejects a function that returns a promise", async (t) => {
+  const db = t.context.db;
+  const txn = db.transaction(async () => {
+    db.exec("INSERT INTO users (id, name, email) VALUES (3, 'Carol', 'carol@example.org')");
+  });
+  t.throws(() => txn(), {
+    instanceOf: TypeError,
+    message: "Transaction function cannot return a promise",
+  });
+  t.is(db.inTransaction, false);
+  t.is(db.prepare("SELECT count(*) AS n FROM users").get().n, 2);
+});
+
+test.serial("Database.transaction() passes its this value to the function", async (t) => {
+  const db = t.context.db;
+  const txn = db.transaction(function () { return this; });
+  const receiver = { txn };
+  t.is(receiver.txn(), receiver);
+});
+
 // ==========================================================================
 // Database.batch()
 // ==========================================================================
