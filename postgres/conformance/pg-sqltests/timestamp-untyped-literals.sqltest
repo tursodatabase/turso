@@ -95,28 +95,39 @@ expect {
 }
 
 @setup tslit
-test ts-lit-in-subquery-literal {
+test ts-lit-in-subquery-literal-errors {
     SELECT id FROM m WHERE ts IN (SELECT '2024-01-02T09:00') ORDER BY id;
 }
-expect {
-    2
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
 }
 
 @setup tslit
-test ts-lit-in-subquery-literal-timestamptz {
+test ts-lit-in-subquery-literal-timestamptz-errors {
     SELECT id FROM m WHERE tz IN (SELECT '2024-01-01T10:00') ORDER BY id;
 }
-expect {
-    1
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
 }
 
 @setup tslit
-test ts-lit-in-subquery-union-of-literals {
+test ts-lit-in-subquery-union-of-literals-errors {
     SELECT id FROM m WHERE ts IN (SELECT '2024-01-01T10:00' UNION SELECT '2024-01-02 09:00') ORDER BY id;
 }
-expect {
-    1
-    2
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp without time zone = text
+}
+expect @tursopg error {
+    operator does not exist: timestamp and text
 }
 
 @setup tslit

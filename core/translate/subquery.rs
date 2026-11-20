@@ -1246,11 +1246,11 @@ fn get_subquery_parser<'a>(
 
 /// Compares each left-hand column of `x IN (SELECT ...)` with the subquery's
 /// column as `x = y` does when one of them is a timestamp or timestamptz. A
-/// string literal or parameter among the subquery's results is read as that
-/// type, as PostgreSQL reads `ts IN (SELECT '2024-01-01')`. Any other value
-/// that is known not to be a timestamp is an error, as PostgreSQL has no
-/// operator `timestamp = text`: the ephemeral index orders its keys as
-/// timestamps and cannot order it.
+/// string literal or parameter among the subquery's results is text, because
+/// PostgreSQL types it so in a select list: `ts IN (SELECT '2024-01-01')` is
+/// an error there. So is any other value that is known not to be a timestamp,
+/// as PostgreSQL has no operator `timestamp = text`. The ephemeral index orders
+/// its keys as timestamps and cannot order such a value.
 fn read_in_subquery_columns_as_timestamps(
     lhs: &ast::Expr,
     plan: &mut Plan,
@@ -1261,7 +1261,6 @@ fn read_in_subquery_columns_as_timestamps(
         is_type_named, name_without_domains, query_column_type, ExprType,
     };
     use crate::translate::expr::{cannot_meet_timestamp, is_untyped_operand};
-    use crate::translate::select::cast_result_column;
     let schema = resolver.schema();
     if schema.type_registry.is_empty() {
         return Ok(());
@@ -1279,41 +1278,37 @@ fn read_in_subquery_columns_as_timestamps(
     };
     for (column, lhs_column) in lhs_columns.into_iter().enumerate() {
         let lhs_type = type_of(lhs_column, &TypeEnv::new(Some(referenced_tables), resolver));
-        if is_timestamp(&lhs_type) {
-            let target = if is_type_named(&lhs_type, "timestamptz", schema) {
-                "timestamptz"
-            } else {
-                "timestamp"
-            };
-            let convert = |arm: &mut SelectPlan| -> Result<()> {
-                if is_untyped_operand(&arm.result_columns[column].expr)? {
-                    cast_result_column(arm, column, target);
-                }
-                Ok(())
-            };
-            match plan {
-                Plan::Select(select) => convert(select)?,
-                Plan::CompoundSelect {
-                    left, right_most, ..
-                } => {
-                    for (select, _) in left.iter_mut() {
-                        convert(select)?;
-                    }
-                    convert(right_most)?;
-                }
-                Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
-            }
-        }
         let rhs_type = query_column_type(plan, column, resolver);
         let other = match (is_timestamp(&lhs_type), is_timestamp(&rhs_type)) {
             (true, false) => rhs_type,
             (false, true) => lhs_type,
             _ => continue,
         };
-        if cannot_meet_timestamp(&other, schema) {
+        let mut has_untyped = false;
+        let mut check_arm = |arm: &SelectPlan| -> Result<()> {
+            has_untyped |= is_untyped_operand(&arm.result_columns[column].expr)?;
+            Ok(())
+        };
+        match &*plan {
+            Plan::Select(select) => check_arm(select)?,
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select, _) in left.iter() {
+                    check_arm(select)?;
+                }
+                check_arm(right_most)?;
+            }
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => {}
+        }
+        if has_untyped || cannot_meet_timestamp(&other, schema) {
             crate::bail_parse_error!(
                 "operator does not exist: timestamp and {}",
-                name_without_domains(other, schema)
+                if has_untyped {
+                    "text".to_string()
+                } else {
+                    name_without_domains(other, schema)
+                }
             );
         }
     }
