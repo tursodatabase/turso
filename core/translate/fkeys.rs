@@ -3013,9 +3013,6 @@ pub fn emit_fk_drop_table_check(
     if action_fk_refs.is_empty() && check_fk_refs.is_empty() {
         return Ok(());
     }
-    // RESTRICT is never deferred.
-    let counts_deferred =
-        |fk_ref: &ResolvedFkRef| fk_ref.fk.deferred && fk_ref.fk.on_delete == RefAct::NoAction;
 
     // Collect all parent rowids into a RowSet
     // r[rowset_reg] = NULL (initializes RowSet)
@@ -3083,6 +3080,24 @@ pub fn emit_fk_drop_table_check(
         target_pc: skip_row,
     });
 
+    // Like DELETE, check RESTRICT before the actions run, so that a CASCADE
+    // cannot delete the row that RESTRICT fails on.
+    for fk_ref in check_fk_refs
+        .iter()
+        .filter(|fk_ref| fk_ref.fk.on_delete == RefAct::Restrict)
+    {
+        emit_fk_drop_table_child_scan(
+            program,
+            resolver,
+            fk_ref,
+            &parent_tbl,
+            parent_write_cur,
+            current_rowid_reg,
+            database_id,
+            |p| emit_fk_restrict_halt(p, None),
+        )?;
+    }
+
     // Fire FK actions for CASCADE, SET NULL, SET DEFAULT
     for fk_ref in &action_fk_refs {
         let parent_cols: &[String] = &fk_ref.parent_cols;
@@ -3121,42 +3136,25 @@ pub fn emit_fk_drop_table_check(
         }
     }
 
-    // For RESTRICT/NO ACTION FKs, scan child table for matching rows and count violations
-    for fk_ref in &check_fk_refs {
-        // Determine which parent columns are referenced
-        let parent_cols: &[String] = &fk_ref.parent_cols;
-        let ncols = parent_cols.len();
-
-        // Build the parent key vector from the current parent row
-        let parent_key_start = program.alloc_registers(ncols);
-        build_parent_key(
+    // NO ACTION is checked after the actions, which may delete or change the
+    // child rows.
+    for fk_ref in check_fk_refs
+        .iter()
+        .filter(|fk_ref| fk_ref.fk.on_delete == RefAct::NoAction)
+    {
+        emit_fk_drop_table_child_scan(
             program,
+            resolver,
+            fk_ref,
             &parent_tbl,
-            parent_cols,
             parent_write_cur,
             current_rowid_reg,
-            parent_key_start,
-            resolver,
-        )?;
-
-        // SQLite deletes the rows in rowid order and a RESTRICT reference
-        // fails only if the referencing row is not deleted yet. For a
-        // reference to the table itself, that is a row with a larger rowid.
-        let ignored_rows = (matches!(fk_ref.fk.on_delete, RefAct::Restrict)
-            && fk_ref.is_self_reference())
-        .then_some(IgnoredChildRows::UpToRow(current_rowid_reg));
-        table_scan_match_any(
-            program,
-            fk_ref,
-            parent_key_start,
-            ignored_rows,
             database_id,
-            resolver,
             |p| {
                 p.emit_insn(Insn::FkCounter {
                     constraint_info: None,
                     increment_value: 1,
-                    deferred: counts_deferred(fk_ref),
+                    deferred: fk_ref.fk.deferred,
                 });
                 Ok(())
             },
@@ -3178,7 +3176,10 @@ pub fn emit_fk_drop_table_check(
 
     // A deferred NO ACTION violation is checked at COMMIT. The others fail
     // the drop.
-    if check_fk_refs.iter().any(|fk_ref| !counts_deferred(fk_ref)) {
+    if check_fk_refs
+        .iter()
+        .any(|fk_ref| fk_ref.fk.on_delete == RefAct::NoAction && !fk_ref.fk.deferred)
+    {
         // FkIfZero: if counter == 0, skip the halt
         let no_violations = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {
@@ -3192,6 +3193,51 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+/// For a row of a table that DROP TABLE removes, emits `on_match` if a child
+/// row still references the row's key through `fk_ref`.
+#[allow(clippy::too_many_arguments)]
+fn emit_fk_drop_table_child_scan<F>(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    fk_ref: &ResolvedFkRef,
+    parent_tbl: &BTreeTable,
+    parent_cursor: usize,
+    current_rowid_reg: usize,
+    database_id: usize,
+    on_match: F,
+) -> Result<()>
+where
+    F: FnMut(&mut ProgramBuilder) -> Result<()>,
+{
+    let parent_cols: &[String] = &fk_ref.parent_cols;
+    let parent_key_start = program.alloc_registers(parent_cols.len());
+    build_parent_key(
+        program,
+        parent_tbl,
+        parent_cols,
+        parent_cursor,
+        current_rowid_reg,
+        parent_key_start,
+        resolver,
+    )?;
+
+    // SQLite deletes the rows in rowid order and a RESTRICT reference
+    // fails only if the referencing row is not deleted yet. For a
+    // reference to the table itself, that is a row with a larger rowid.
+    let ignored_rows = (matches!(fk_ref.fk.on_delete, RefAct::Restrict)
+        && fk_ref.is_self_reference())
+    .then_some(IgnoredChildRows::UpToRow(current_rowid_reg));
+    table_scan_match_any(
+        program,
+        fk_ref,
+        parent_key_start,
+        ignored_rows,
+        database_id,
+        resolver,
+        on_match,
+    )
 }
 
 /// Before DROP TABLE, cancels the deferred violations of the table's own rows:

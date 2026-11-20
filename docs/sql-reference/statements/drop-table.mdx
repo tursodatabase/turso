@@ -32,7 +32,8 @@ DROP TABLE [IF EXISTS] [schema-name.]table-name;
 - All indexes built on the table are removed.
 - All triggers associated with the table are removed.
 - The table entry is removed from the `sqlite_schema` system table.
-- If foreign key constraints reference the dropped table, those references become invalid. Turso does not prevent dropping a table that is referenced by foreign keys in other tables.
+- With `PRAGMA foreign_keys = OFF` (the default), foreign keys that reference the dropped table are not checked and become invalid.
+- With `PRAGMA foreign_keys = ON`, `DROP TABLE` deletes the rows first, as `DELETE FROM table-name` does, so the `ON DELETE` actions of foreign keys that reference the table run. It fails with `FOREIGN KEY constraint failed` if a row of another table still references a dropped row through an immediate foreign key, or through an `ON DELETE RESTRICT` key. A reference that a deferred foreign key leaves is checked at `COMMIT`. References between rows of the dropped table itself do not count, unless the key is `ON DELETE RESTRICT` and the referencing row comes later in rowid order.
 - `DROP TABLE` fails with `database table is locked` while any other statement on the same connection that reads the database is running, even one that reads a different table. Finish or reset that statement first. While `DROP TABLE` waits for I/O, a statement that starts reading the database on the same connection fails with the same error.
 
 ## Examples

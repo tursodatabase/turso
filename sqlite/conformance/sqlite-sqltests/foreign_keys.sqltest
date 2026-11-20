@@ -5515,3 +5515,45 @@ test fk-self-reference-unique-key-deferred-on-update-restrict-fails-at-once {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+# Like DELETE, DROP TABLE checks ON DELETE RESTRICT before an ON DELETE
+# CASCADE of another foreign key deletes the referencing row.
+@cross-check-integrity
+test fk-drop-table-self-ref-restrict-row-also-deleted-by-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, p INT REFERENCES t(id) ON DELETE CASCADE, q INT REFERENCES t(u) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (2, 1, NULL, NULL);
+    INSERT INTO t VALUES (4, NULL, 2, 1);
+    DROP TABLE t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-restrict-child-row-also-deleted-by-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u INT UNIQUE);
+    CREATE TABLE c(a INT REFERENCES p(id) ON DELETE CASCADE, b INT REFERENCES p(u) ON DELETE RESTRICT);
+    INSERT INTO p VALUES (2, 1);
+    INSERT INTO c VALUES (2, 1);
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# NO ACTION is checked after the CASCADE has deleted the referencing row.
+@cross-check-integrity
+test fk-drop-parent-no-action-child-row-deleted-by-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u INT UNIQUE);
+    CREATE TABLE c(a INT REFERENCES p(id) ON DELETE CASCADE, b INT REFERENCES p(u));
+    INSERT INTO p VALUES (2, 1);
+    INSERT INTO c VALUES (2, 1);
+    DROP TABLE p;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    c
+}
