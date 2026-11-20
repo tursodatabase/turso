@@ -1,5 +1,5 @@
 use crate::assert::assert_send_sync;
-use crate::database::EncryptionValidationState;
+use crate::database::AuthenticatedHeader;
 #[cfg(target_vendor = "apple")]
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
@@ -1633,8 +1633,16 @@ impl SharedPagerState {
         self.encryption_cipher
     }
 
-    pub(crate) fn encryption_verifier(&self) -> Option<&[u8]> {
-        self.encryption_verifier.as_deref()
+    pub(crate) fn verify_encryption_key(&self, key: &EncryptionKey) -> Result<EncryptionContext> {
+        let sample = self
+            .encryption_verifier
+            .as_deref()
+            .expect("encrypted database has a verifier");
+        let context = EncryptionContext::new(self.encryption_cipher, key, sample.len())?;
+        context.decrypt_page(sample, 1).map_err(|_| {
+            LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
+        })?;
+        Ok(context)
     }
 
     pub(crate) fn page_size(&self) -> Option<PageSize> {
@@ -1714,7 +1722,6 @@ pub struct Pager {
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
-    staged_page_size: AtomicU32,
     encryption_verified: AtomicBool,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
@@ -2027,7 +2034,6 @@ impl Pager {
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
             io_ctx: RwLock::new(IOContext::default()),
-            staged_page_size: AtomicU32::new(0),
             encryption_verified: AtomicBool::new(false),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
@@ -3265,12 +3271,7 @@ impl Pager {
 
     /// Get the current page size. Returns None if not set yet.
     pub fn get_page_size(&self) -> Option<PageSize> {
-        let value = self.staged_page_size.load(Ordering::SeqCst);
-        let value = if value == 0 {
-            self.shared.page_size.load(Ordering::SeqCst)
-        } else {
-            value
-        };
+        let value = self.shared.page_size.load(Ordering::SeqCst);
         if value == 0 {
             None
         } else {
@@ -3310,11 +3311,6 @@ impl Pager {
             "encrypted database page size must remain unchanged"
         );
         self.shared.page_size.store(size.get(), Ordering::SeqCst);
-        self.staged_page_size.store(0, Ordering::SeqCst);
-    }
-
-    pub(crate) fn stage_page_size(&self, size: PageSize) {
-        self.staged_page_size.store(size.get(), Ordering::SeqCst);
     }
 
     /// Get the current reserved space. Returns None if not set yet.
@@ -6380,97 +6376,6 @@ impl Pager {
         self.shared.encryption_cipher()
     }
 
-    pub(crate) fn validate_encryption(
-        &self,
-        state: &mut EncryptionValidationState,
-    ) -> IOResultOr<()> {
-        if self.shared.encryption_cipher() != CipherMode::None {
-            self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
-        }
-        if self.is_authenticated() {
-            return Ok(IOResult::Done(()));
-        }
-        if !self.is_encryption_ctx_set() {
-            return Err(LimboError::InvalidArgument(
-                "encrypted database requires an encryption key".to_string(),
-            )
-            .into());
-        }
-        {
-            let _lock = self.shared.init_lock.lock();
-            if !self.db_initialized() {
-                let encrypted = self
-                    .shared
-                    .encryption_verifier()
-                    .expect("encrypted database has a verifier");
-                let mut context = self
-                    .io_ctx
-                    .read()
-                    .encryption_context()
-                    .expect("encryption context was checked above")
-                    .clone();
-                context.set_page_size(
-                    PageSize::new(encrypted.len() as u32)
-                        .expect("encryption verifier has a valid page size"),
-                );
-                context.decrypt_page(encrypted, 1).map_err(|_| {
-                    LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
-                })?;
-                self.encryption_verified.store(true, Ordering::Release);
-                return Ok(IOResult::Done(()));
-            }
-        }
-        loop {
-            match state {
-                EncryptionValidationState::Start => {
-                    self.reset_page_size_in_encryption_ctx(self.get_page_size_unchecked());
-                    let end_read_tx = !self.holds_read_lock();
-                    if end_read_tx {
-                        self.begin_read_tx()?;
-                    }
-                    let (page, completion) = match self.read_page_no_cache(1, None, false, None) {
-                        Ok(read) => read,
-                        Err(err) => {
-                            if end_read_tx {
-                                self.end_read_tx();
-                            }
-                            return Err(err.into());
-                        }
-                    };
-                    *state = EncryptionValidationState::Reading {
-                        page,
-                        completion,
-                        end_read_tx,
-                    };
-                }
-                EncryptionValidationState::Reading {
-                    page,
-                    completion,
-                    end_read_tx,
-                } => {
-                    if let Some(err) = completion.get_error() {
-                        if *end_read_tx {
-                            self.end_read_tx();
-                        }
-                        *state = EncryptionValidationState::Start;
-                        return Err(err.into());
-                    }
-                    if !completion.succeeded() {
-                        io_yield_one!(completion.clone());
-                    }
-                    turso_assert!(page.is_loaded());
-                    let end_read_tx = *end_read_tx;
-                    *state = EncryptionValidationState::Start;
-                    self.encryption_verified.store(true, Ordering::Release);
-                    if end_read_tx {
-                        self.end_read_tx();
-                    }
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
     pub(crate) fn has_external_page_codec(&self) -> bool {
         self.io_ctx.read().has_external_page_codec()
     }
@@ -6483,83 +6388,17 @@ impl Pager {
         self.enable_encryption.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn set_encryption_context(
-        &self,
-        cipher_mode: CipherMode,
-        key: &EncryptionKey,
-    ) -> Result<()> {
-        // we will set the encryption context only if the encryption is opted-in.
-        if !self.enable_encryption.load(Ordering::SeqCst) {
-            return Err(LimboError::InvalidArgument(
-                "encryption is an opt in feature".into(),
-            ));
+    pub(crate) fn set_authenticated_header(&mut self, header: AuthenticatedHeader) -> Result<()> {
+        let (page_size, reserved_space, io_ctx) = header.into_parts(&self.shared)?;
+        self.set_page_size(page_size);
+        if let Some(reserved_space) = reserved_space {
+            self.set_reserved_space(reserved_space);
         }
-        if self.has_external_page_codec() {
-            return Err(LimboError::InvalidArgument(
-                "cannot configure built-in encryption while an external page codec is installed"
-                    .into(),
-            ));
-        }
-        if cipher_mode == CipherMode::None || cipher_mode != self.encryption_cipher() {
-            return Err(LimboError::InvalidArgument(
-                "encryption cipher does not match the database".into(),
-            ));
-        }
-        let mut io_ctx = self.io_ctx.write();
-        if io_ctx.encryption_context().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "encryption context is already set".into(),
-            ));
-        }
-        let context = EncryptionContext::new(
-            cipher_mode,
-            key,
-            self.get_page_size_unchecked().get() as usize,
-        )?;
-        io_ctx.set_encryption(context);
+        *self.io_ctx.write() = io_ctx.clone();
         if let Some(wal) = self.wal.as_ref() {
-            wal.set_io_context(io_ctx.clone());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn set_page_codec(&self, codec: Arc<dyn PageCodec>) -> Result<()> {
-        if self.is_encryption_ctx_set() || self.shared.encryption_cipher() != CipherMode::None {
-            return Err(LimboError::InvalidArgument(
-                "cannot install an external page codec while built-in encryption is configured"
-                    .into(),
-            ));
-        }
-        let required_reserved_space = codec.required_reserved_bytes();
-        if let Some(reserved_space) = self.get_reserved_space() {
-            if reserved_space != required_reserved_space {
-                return Err(LimboError::InvalidArgument(format!(
-                    "page codec requires exactly {required_reserved_space} reserved bytes, but database provides {reserved_space}"
-                )));
-            }
-        } else {
-            if let Some(page_size) = self.get_page_size() {
-                if !page_size.has_valid_reserved_space(required_reserved_space) {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "page codec requires {} reserved bytes, which leaves less than {} usable bytes for page size {}",
-                        required_reserved_space,
-                        PageSize::MIN_USABLE_SPACE,
-                        page_size.get()
-                    )));
-                }
-            }
-            self.set_reserved_space(required_reserved_space);
-        }
-        {
-            let mut io_ctx = self.io_ctx.write();
-            io_ctx.set_page_codec(codec);
-        }
-        if let Some(wal) = self.wal.as_ref() {
-            let io_ctx = self.io_ctx.read().clone();
             wal.set_io_context(io_ctx);
         }
-        self.clear_page_cache(false);
-        self.set_schema_cookie(None);
+        self.encryption_verified.store(true, Ordering::Release);
         Ok(())
     }
 

@@ -32,6 +32,7 @@ use crate::{
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
+        database::IOContext,
         encryption::{EncryptionContext, SQLITE_HEADER, TURSO_HEADER_PREFIX},
         journal_mode,
         page_cache::PageCache,
@@ -401,7 +402,7 @@ impl DbHeaderRead {
 
 /// Sub state machine for [`Database::read_db_header_buf`], the non-blocking
 /// read of the 512-byte database header. Not an open phase: it is driven
-/// from connect-time pager init ([`Database::_init`] via `init_pager`), which
+/// from connect-time pager init ([`Database::_init`]), which
 /// runs outside the open state machine.
 #[derive(Default)]
 pub(crate) enum DbHeaderReadState {
@@ -416,17 +417,18 @@ pub(crate) enum DbHeaderReadState {
 /// Resumable pager initialization for opens, connections, and attachments.
 /// Reads the page layout, authenticates encryption, and reads the autovacuum
 /// mode while holding a read transaction.
-#[derive(Default)]
 pub(crate) enum InitState {
-    #[default]
-    Start,
-    /// Driving `init_pager` (its only IO is the DB-header read).
-    InitPager(DbHeaderReadState),
+    AuthenticateHeader(HeaderAuthenticationState),
     /// Pager built and read-tx open; reading page 1 for the autovacuum mode.
     ReadPage1 {
         pager: Box<Pager>,
-        encryption_validation: EncryptionValidationState,
     },
+}
+
+impl Default for InitState {
+    fn default() -> Self {
+        Self::AuthenticateHeader(HeaderAuthenticationState::default())
+    }
 }
 
 impl InitState {
@@ -438,15 +440,41 @@ impl InitState {
     }
 }
 
-#[derive(Default)]
-pub(crate) enum EncryptionValidationState {
-    #[default]
-    Start,
-    Reading {
-        page: PageRef,
+pub(crate) enum HeaderAuthenticationState {
+    ReadHeader(DbHeaderReadState),
+    ReadPage1 {
+        database: Arc<SharedPagerState>,
+        buf: Arc<Buffer>,
         completion: Completion,
-        end_read_tx: bool,
+        io_ctx: IOContext,
     },
+}
+
+impl Default for HeaderAuthenticationState {
+    fn default() -> Self {
+        Self::ReadHeader(DbHeaderReadState::default())
+    }
+}
+
+pub(crate) struct AuthenticatedHeader {
+    database: Arc<SharedPagerState>,
+    page_size: PageSize,
+    reserved_space: Option<u8>,
+    io_ctx: IOContext,
+}
+
+impl AuthenticatedHeader {
+    pub(crate) fn into_parts(
+        self,
+        database: &Arc<SharedPagerState>,
+    ) -> Result<(PageSize, Option<u8>, IOContext)> {
+        if !Arc::ptr_eq(&self.database, database) {
+            return Err(LimboError::InvalidArgument(
+                "authenticated header belongs to another database".into(),
+            ));
+        }
+        Ok((self.page_size, self.reserved_space, self.io_ctx))
+    }
 }
 
 /// Sub state machine for [`Database::header_validation`], driven from
@@ -1267,14 +1295,7 @@ impl Database {
                         "encryption cipher does not match the database".into(),
                     ));
                 }
-                let encoded = self
-                    .pager_state
-                    .encryption_verifier()
-                    .expect("authenticated encrypted database has a verifier");
-                let context = EncryptionContext::new(cipher, &key, encoded.len())?;
-                context.decrypt_page(encoded, 1).map_err(|_| {
-                    LimboError::CompletionError(CompletionError::DecryptionError { page_idx: 1 })
-                })?;
+                self.pager_state.verify_encryption_key(&key)?;
                 Ok(())
             }
             None if self.pager_state.encryption_cipher() != CipherMode::None => {
@@ -2051,54 +2072,23 @@ impl Database {
 
     /// Necessary Pager initialization, so that we are prepared to read from
     /// Page 1. For encrypted databases, the encryption key must be provided to
-    /// properly decrypt page 1. Non-blocking: drives `init_pager` (DB-header
-    /// read) and the page-1 autovacuum read through their IO.
+    /// properly decrypt page 1. Non-blocking: drives header authentication
+    /// and the page-1 autovacuum read through their IO.
     pub(crate) fn _init_nonblock(
         &self,
         st: &mut InitState,
         encryption_key: Option<&EncryptionKey>,
         page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> IOResultOr<Pager> {
-        if encryption_key.is_some() && page_codec.is_some() {
-            return Err(LimboError::InvalidArgument(
-                "built-in encryption cannot be combined with an external page codec".to_string(),
-            )
-            .into());
-        }
-        if self.pager_state.encryption_cipher() == CipherMode::None && encryption_key.is_some() {
-            return Err(LimboError::InvalidArgument(
-                "database was opened without encryption".into(),
-            )
-            .into());
-        }
-        if self.pager_state.encryption_cipher() != CipherMode::None && encryption_key.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "encrypted database requires an encryption key".into(),
-            )
-            .into());
-        }
         loop {
             match st {
-                InitState::Start => {
-                    *st = InitState::InitPager(DbHeaderReadState::default());
-                }
-                InitState::InitPager(hdr_st) => {
-                    let pager =
-                        return_if_io!(self.init_pager(None, hdr_st, encryption_key, page_codec));
-                    pager.enable_encryption(self.opts.enable_encryption);
-
-                    // Set up encryption context BEFORE reading the header page.
-                    // For encrypted databases, page 1 has:
-                    // - Bytes 0-15: Turso magic header (replaces SQLite magic)
-                    // - Bytes 16-100: Unencrypted header metadata
-                    // - Bytes 100+: Encrypted content
-                    // The encryption context is needed to properly decrypt page 1 when reopening.
-                    if let Some(key) = encryption_key {
-                        let cipher_mode = self.pager_state.encryption_cipher();
-                        pager.set_encryption_context(cipher_mode, key)?;
-                    } else if let Some(codec) = page_codec {
-                        pager.set_page_codec(codec.clone())?;
-                    }
+                InitState::AuthenticateHeader(header_st) => {
+                    let header = return_if_io!(self.read_authenticated_header(
+                        header_st,
+                        encryption_key,
+                        page_codec
+                    ));
+                    let pager = self.init_pager(header)?;
 
                     // Start a read transaction before reading page 1 to prevent a concurrent
                     // checkpoint from truncating the WAL underneath bootstrap. Under heavy
@@ -2122,22 +2112,9 @@ impl Database {
 
                     *st = InitState::ReadPage1 {
                         pager: Box::new(pager),
-                        encryption_validation: EncryptionValidationState::default(),
                     };
                 }
-                InitState::ReadPage1 {
-                    pager,
-                    encryption_validation,
-                } => {
-                    match pager.validate_encryption(encryption_validation) {
-                        Ok(IOResult::Done(())) => {}
-                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                        Err(err) => {
-                            pager.end_read_tx();
-                            return Err(err);
-                        }
-                    }
-                    pager.set_page_size(pager.get_page_size_unchecked());
+                InitState::ReadPage1 { pager } => {
                     // Read page 1 within the read transaction to determine the
                     // autovacuum mode. The read tx stays open across an IO
                     // yield here (re-entry resumes the read); we only end it
@@ -2239,7 +2216,6 @@ impl Database {
                     // `is_readonly` across the `_init` yields is stable.
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
-                    self.buffer_pool = pager.buffer_pool.clone();
                     let log_exists =
                         journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
@@ -3613,134 +3589,201 @@ impl Database {
         )))
     }
 
-    fn init_pager(
-        &self,
-        requested_page_size: Option<usize>,
-        hdr_st: &mut DbHeaderReadState,
-        encryption_key: Option<&EncryptionKey>,
-        page_codec: Option<&Arc<dyn PageCodec>>,
-    ) -> IOResultOr<Pager> {
-        let cipher = self.pager_state.encryption_cipher();
-        let encrypted = encryption_key.is_some() || !matches!(cipher, CipherMode::None);
-
-        // For an existing (initialized) database, read the 512-byte header
-        // once (non-blocking) and recover both the reserved-space byte and the
-        // on-disk page size from it.
-        let frozen_size = self.pager_state.page_size();
-        let (header_reserved_bytes, header_page_size) =
-            if cipher != CipherMode::None && frozen_size.is_some() {
-                (Some(cipher.metadata_size() as u8), frozen_size)
-            } else if self.initialized() {
-                let header = return_if_io!(self.read_db_header_buf(hdr_st));
-                if let Some(codec) = page_codec {
-                    // A codec may transform the magic bytes, so a short codec
-                    // file cannot be judged here.
-                    if let Some(err) = header.short_read() {
-                        return Err(err.into());
-                    }
-                    let header_info = codec.bootstrap_page_info(header.bytes())?;
-                    let page_size_u32 = u32::try_from(header_info.page_size).map_err(|_| {
-                        LimboError::InvalidArgument(format!(
-                            "page codec reported invalid page size {}",
-                            header_info.page_size
-                        ))
-                    })?;
-                    let Some(page_size) = PageSize::new(page_size_u32) else {
-                        return Err(LimboError::InvalidArgument(format!(
-                            "page codec reported invalid page size {}",
-                            header_info.page_size
-                        ))
-                        .into());
-                    };
-                    if !page_size.has_valid_reserved_space(header_info.reserved_space) {
-                        return Err(LimboError::InvalidArgument(format!(
-                            "page codec reported invalid reserved space {} for page size {}",
-                            header_info.reserved_space,
-                            page_size.get()
-                        ))
-                        .into());
-                    }
-                    (Some(header_info.reserved_space), Some(page_size))
-                } else {
-                    let (reserved, page_size) = Self::plain_header_page_info(&header, encrypted)?;
-                    (Some(reserved), Some(page_size))
-                }
-            } else {
-                (None, None)
-            };
-        if let (Some(codec), Some(reserved_bytes)) = (page_codec, header_reserved_bytes) {
-            let required_reserved_bytes = codec.required_reserved_bytes();
-            if reserved_bytes != required_reserved_bytes {
-                return Err(LimboError::InvalidArgument(format!(
-                    "page codec requires exactly {required_reserved_bytes} reserved bytes, but database provides {reserved_bytes}"
-                )).into());
-            }
-        }
-
-        let reserved_bytes = header_reserved_bytes.or_else(|| {
-            if !matches!(cipher, CipherMode::None) {
-                // For encryption, use the cipher's metadata size
-                Some(cipher.metadata_size() as u8)
-            } else {
-                None
-            }
-        });
-        let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
-            // if the required reserved bytes for checksums is not present, disable checksums
-            reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
-        } else {
-            false
-        };
-        // Check if WAL is enabled
+    fn init_pager(&self, header: AuthenticatedHeader) -> Result<Pager> {
         let shared_wal = self.shared_wal.read();
-
-        let page_size =
-            self.determine_actual_page_size(&shared_wal, requested_page_size, header_page_size)?;
-
-        let buffer_pool =
-            if cipher != CipherMode::None && self.initialized() && frozen_size.is_none() {
-                BufferPool::begin_init(&self.io, BufferPool::DEFAULT_ARENA_SIZE)
-            } else {
-                self.buffer_pool.clone()
-            };
-        if self.initialized() {
-            buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
-        }
-
         let wal_enabled = shared_wal.metadata.enabled.load(Ordering::SeqCst);
         let last_checksum_and_max_frame = shared_wal.last_checksum_and_max_frame();
         drop(shared_wal);
-        let pager_wal: Option<Arc<dyn Wal>> = if wal_enabled {
-            Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
+        let pager_wal = if wal_enabled {
+            Some(self.build_wal(last_checksum_and_max_frame, self.buffer_pool.clone())?)
         } else {
             None
         };
-
-        let pager = Pager::new(
+        let mut pager = Pager::new(
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
             PageCache::default(),
-            buffer_pool,
+            self.buffer_pool.clone(),
             self.pager_state.clone(),
         )?;
+        pager.set_authenticated_header(header)?;
+        pager.enable_encryption(self.opts.enable_encryption);
         if self.initialized() {
-            pager.stage_page_size(page_size);
+            self.buffer_pool
+                .finalize_with_page_size(pager.get_page_size_unchecked().get() as usize)?;
         }
-        if let Some(reserved_bytes) = reserved_bytes {
-            if cipher != CipherMode::None && reserved_bytes as usize != cipher.metadata_size() {
-                return Err(LimboError::InvalidArgument(
-                    "encryption cipher does not match the database reserved bytes".into(),
-                )
-                .into());
-            }
-            pager.set_reserved_space_bytes(reserved_bytes);
-        }
-        if disable_checksums {
-            pager.reset_checksum_context();
-        }
+        Ok(pager)
+    }
 
-        Ok(IOResult::Done(pager))
+    fn read_authenticated_header(
+        &self,
+        st: &mut HeaderAuthenticationState,
+        encryption_key: Option<&EncryptionKey>,
+        page_codec: Option<&Arc<dyn PageCodec>>,
+    ) -> IOResultOr<AuthenticatedHeader> {
+        if encryption_key.is_some() && page_codec.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "built-in encryption cannot be combined with an external page codec".to_string(),
+            )
+            .into());
+        }
+        let cipher = self.pager_state.encryption_cipher();
+        if cipher == CipherMode::None && encryption_key.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "database was opened without encryption".into(),
+            )
+            .into());
+        }
+        if cipher != CipherMode::None && encryption_key.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database requires an encryption key".into(),
+            )
+            .into());
+        }
+        if encryption_key.is_some() && !self.opts.enable_encryption {
+            return Err(
+                LimboError::InvalidArgument("encryption is an opt in feature".into()).into(),
+            );
+        }
+        loop {
+            match st {
+                HeaderAuthenticationState::ReadHeader(hdr_st) => {
+                    if let Some(key) = encryption_key {
+                        if let Some(page_size) = self.pager_state.page_size() {
+                            let mut context = self.pager_state.verify_encryption_key(key)?;
+                            context.set_page_size(page_size);
+                            let mut io_ctx = IOContext::default();
+                            io_ctx.set_encryption(context);
+                            return Ok(IOResult::Done(AuthenticatedHeader {
+                                database: self.pager_state.clone(),
+                                page_size,
+                                reserved_space: Some(cipher.metadata_size() as u8),
+                                io_ctx,
+                            }));
+                        }
+
+                        let header = return_if_io!(self.read_db_header_buf(hdr_st));
+                        let (reserved_space, page_size) =
+                            Self::plain_header_page_info(&header, true)?;
+                        if reserved_space as usize != cipher.metadata_size() {
+                            return Err(LimboError::InvalidArgument(
+                                "encryption cipher does not match the database reserved bytes"
+                                    .into(),
+                            )
+                            .into());
+                        }
+                        let mut io_ctx = IOContext::default();
+                        io_ctx.set_encryption(EncryptionContext::new(
+                            cipher,
+                            key,
+                            page_size.get() as usize,
+                        )?);
+                        let buf = Arc::new(Buffer::new_temporary(page_size.get() as usize));
+                        let completion = new_header_read_completion(buf.clone());
+                        let completion = self.db_file.read_page(1, &io_ctx, completion)?;
+                        *st = HeaderAuthenticationState::ReadPage1 {
+                            database: self.pager_state.clone(),
+                            buf,
+                            completion,
+                            io_ctx,
+                        };
+                        continue;
+                    }
+
+                    let (mut reserved_space, header_page_size) = if self.initialized() {
+                        let header = return_if_io!(self.read_db_header_buf(hdr_st));
+                        if let Some(codec) = page_codec {
+                            if let Some(err) = header.short_read() {
+                                return Err(err.into());
+                            }
+                            let info = codec.bootstrap_page_info(header.bytes())?;
+                            let page_size = u32::try_from(info.page_size)
+                                .ok()
+                                .and_then(PageSize::new)
+                                .ok_or_else(|| {
+                                    LimboError::InvalidArgument(format!(
+                                        "page codec reported invalid page size {}",
+                                        info.page_size
+                                    ))
+                                })?;
+                            if !page_size.has_valid_reserved_space(info.reserved_space) {
+                                return Err(LimboError::InvalidArgument(format!(
+                                    "page codec reported invalid reserved space {} for page size {}",
+                                    info.reserved_space,
+                                    page_size.get()
+                                )).into());
+                            }
+                            (Some(info.reserved_space), Some(page_size))
+                        } else {
+                            let (reserved, size) = Self::plain_header_page_info(&header, false)?;
+                            (Some(reserved), Some(size))
+                        }
+                    } else {
+                        (None, self.pager_state.page_size())
+                    };
+                    let page_size = self.determine_actual_page_size(
+                        &self.shared_wal.read(),
+                        None,
+                        header_page_size,
+                    )?;
+                    let mut io_ctx = IOContext::default();
+                    if reserved_space.is_some_and(|space| space != CHECKSUM_REQUIRED_RESERVED_BYTES)
+                    {
+                        io_ctx.reset_checksum();
+                    }
+                    if let Some(codec) = page_codec {
+                        let required = codec.required_reserved_bytes();
+                        if let Some(reserved) = reserved_space {
+                            if reserved != required {
+                                return Err(LimboError::InvalidArgument(format!(
+                                    "page codec requires exactly {required} reserved bytes, but database provides {reserved}"
+                                )).into());
+                            }
+                        } else if !page_size.has_valid_reserved_space(required) {
+                            return Err(LimboError::InvalidArgument(format!(
+                                "page codec requires {} reserved bytes, which leaves less than {} usable bytes for page size {}",
+                                required, PageSize::MIN_USABLE_SPACE, page_size.get()
+                            )).into());
+                        }
+                        io_ctx.set_page_codec(codec.clone());
+                        reserved_space = Some(required);
+                    }
+                    return Ok(IOResult::Done(AuthenticatedHeader {
+                        database: self.pager_state.clone(),
+                        page_size,
+                        reserved_space,
+                        io_ctx,
+                    }));
+                }
+                HeaderAuthenticationState::ReadPage1 { completion, .. } => {
+                    if let Some(err) = completion.get_error() {
+                        return Err(err.into());
+                    }
+                    if !completion.succeeded() {
+                        io_yield_one!(completion.clone());
+                    }
+                    let HeaderAuthenticationState::ReadPage1 {
+                        database,
+                        buf,
+                        io_ctx,
+                        ..
+                    } = std::mem::take(st)
+                    else {
+                        unreachable!("state is ReadPage1");
+                    };
+                    let header = bytemuck::from_bytes::<DatabaseHeader>(
+                        &buf.as_slice()[..DatabaseHeader::SIZE],
+                    );
+                    return Ok(IOResult::Done(AuthenticatedHeader {
+                        database,
+                        page_size: header.page_size,
+                        reserved_space: Some(header.reserved_space),
+                        io_ctx,
+                    }));
+                }
+            }
+        }
     }
 
     /// Recovers the page size and reserved-space byte from a database header
