@@ -1993,6 +1993,52 @@ expect {
     CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
 }
 
+test pg-indexdef-shows-null-order-only-when-not-default {
+    CREATE TABLE t (id int PRIMARY KEY, a int);
+    CREATE INDEX i_default ON t (a);
+    CREATE INDEX i_nulls_first ON t (a NULLS FIRST);
+    CREATE INDEX i_nulls_last ON t (a NULLS LAST);
+    CREATE INDEX i_asc ON t (a ASC);
+    CREATE INDEX i_asc_nulls_first ON t (a ASC NULLS FIRST);
+    CREATE INDEX i_asc_nulls_last ON t (a ASC NULLS LAST);
+    CREATE INDEX i_desc ON t (a DESC);
+    CREATE INDEX i_desc_nulls_first ON t (a DESC NULLS FIRST);
+    CREATE INDEX i_desc_nulls_last ON t (a DESC NULLS LAST);
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_default';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_nulls_first';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_nulls_last';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_asc';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_asc_nulls_first';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_asc_nulls_last';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_desc';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_desc_nulls_first';
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'i_desc_nulls_last';
+}
+expect {
+    CREATE INDEX i_default ON public.t USING btree (a)
+    CREATE INDEX i_nulls_first ON public.t USING btree (a NULLS FIRST)
+    CREATE INDEX i_nulls_last ON public.t USING btree (a)
+    CREATE INDEX i_asc ON public.t USING btree (a)
+    CREATE INDEX i_asc_nulls_first ON public.t USING btree (a NULLS FIRST)
+    CREATE INDEX i_asc_nulls_last ON public.t USING btree (a)
+    CREATE INDEX i_desc ON public.t USING btree (a DESC)
+    CREATE INDEX i_desc_nulls_first ON public.t USING btree (a DESC)
+    CREATE INDEX i_desc_nulls_last ON public.t USING btree (a DESC NULLS LAST)
+}
+
+# tursopg builds the index of a PRIMARY KEY or UNIQUE constraint with NULLs
+# first, where PostgreSQL puts them last. Its definition does not show that
+# yet: it shows no NULL order, as PostgreSQL does.
+test pg-indexdef-of-a-constraint-index-shows-no-null-order {
+    CREATE TABLE t (a int PRIMARY KEY, b int UNIQUE, c int NOT NULL UNIQUE);
+    SELECT substr(indexdef, strpos(indexdef, ' ON ') + 4) FROM pg_indexes WHERE tablename = 't' ORDER BY 1;
+}
+expect {
+    public.t USING btree (a)
+    public.t USING btree (b)
+    public.t USING btree (c)
+}
+
 # A relation's oid is stable: it comes from a stored catalog row, not from
 # the relation's position among sorted names. Raw oid values differ between
 # engines, so the tests compare through joins.

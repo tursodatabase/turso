@@ -478,3 +478,102 @@ fn a_schema_a_role_and_a_table_are_present_after_open() {
         conn.execute("INSERT INTO app.docs VALUES (1)").unwrap();
     }
 }
+
+/// Before CREATE INDEX got PostgreSQL's default NULL order, tursopg stored index SQL without one
+/// and built the index with SQLite's default: NULLs first for ASC. Such an index keeps that order
+/// and its definition says so.
+#[test]
+fn index_stored_without_a_null_order_keeps_sqlite_null_order_after_reopen() {
+    let db = TempDatabase::builder().build();
+    {
+        let conn = db.connect_postgres();
+        conn.execute("CREATE TABLE t (id int PRIMARY KEY, a int)")
+            .unwrap();
+        conn.execute("CREATE INDEX i ON t (a NULLS FIRST)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 1)").unwrap();
+
+        // Store the index SQL that an older tursopg wrote for `CREATE INDEX i ON t (a)`. The index
+        // itself is built with NULLs first, as that version built it.
+        conn.inner()
+            .prepare_engine_schema_statement(
+                "UPDATE sqlite_schema SET sql = 'CREATE INDEX __turso_ns1_i ON __turso_ns1_t (a)' WHERE name = '__turso_ns1_i'",
+            )
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+    }
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    let rows = conn
+        .inner()
+        .prepare_engine_schema_statement(
+            "SELECT sql FROM sqlite_schema WHERE name = '__turso_ns1_i'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::build_text(
+            "CREATE INDEX __turso_ns1_i ON __turso_ns1_t (a)"
+        )]]
+    );
+
+    let rows = conn
+        .prepare("SELECT indexdef FROM pg_indexes WHERE indexname = 'i'")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Value::build_text(
+            "CREATE INDEX i ON public.t USING btree (a NULLS FIRST)"
+        )]]
+    );
+
+    let rows = conn
+        .prepare("SELECT a FROM t ORDER BY a NULLS FIRST")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Null],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(5)],
+        ]
+    );
+
+    let rows = conn
+        .prepare("EXPLAIN SELECT a FROM t ORDER BY a NULLS FIRST")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::build_text("SCAN t USING COVERING INDEX i"),
+        ]]
+    );
+
+    let rows = conn
+        .prepare("SELECT a FROM t ORDER BY a")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(5)],
+            vec![Value::Null],
+        ]
+    );
+}
