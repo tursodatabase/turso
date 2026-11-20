@@ -1545,19 +1545,6 @@ expect {
     a schema
 }
 
-test comment-on-view-is-stored-and-dropped-with-the-view {
-    CREATE TABLE commented_view_base (a int);
-    CREATE VIEW commented_view AS SELECT a FROM commented_view_base;
-    COMMENT ON VIEW commented_view IS 'a commented view';
-    SELECT objsubid, description FROM pg_description WHERE description = 'a commented view';
-    DROP VIEW commented_view;
-    SELECT count(*) FROM pg_description WHERE description = 'a commented view';
-}
-expect {
-    0|a commented view
-    0
-}
-
 test comment-on-quoted-names-with-capital-letters {
     CREATE SCHEMA "CommentUp";
     CREATE TABLE "CommentUp"."MixT" ("ColA" int, b int);
@@ -1571,6 +1558,19 @@ expect {
     1|mixed column
     0|mixed schema
     0|mixed table
+}
+
+test comment-on-view-is-stored-and-dropped-with-the-view {
+    CREATE TABLE commented_view_base (a int);
+    CREATE VIEW commented_view AS SELECT a FROM commented_view_base;
+    COMMENT ON VIEW commented_view IS 'a commented view';
+    SELECT objsubid, description FROM pg_description WHERE description = 'a commented view';
+    DROP VIEW commented_view;
+    SELECT count(*) FROM pg_description WHERE description = 'a commented view';
+}
+expect {
+    0|a commented view
+    0
 }
 
 test comment-is-rolled-back-with-its-transaction {
@@ -1613,6 +1613,59 @@ test dropping-a-schema-deletes-its-comment {
     SELECT count(*) FROM pg_description WHERE description = 'dropped schema';
 }
 expect {
+    0
+}
+
+@skip-if postgres "PostgreSQL keeps the number of a column when a column before it is dropped"
+test dropping-a-column-deletes-its-comment-and-keeps-the-others {
+    CREATE TABLE comment_column_dropped (a int, b int, c int);
+    COMMENT ON TABLE comment_column_dropped IS 'the table';
+    COMMENT ON COLUMN comment_column_dropped.a IS 'the a';
+    COMMENT ON COLUMN comment_column_dropped.b IS 'the b';
+    COMMENT ON COLUMN comment_column_dropped.c IS 'the c';
+    ALTER TABLE comment_column_dropped DROP COLUMN b;
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'comment_column_dropped' ORDER BY a.attnum;
+    SELECT obj_description(oid, 'pg_class') FROM pg_class
+    WHERE relname = 'comment_column_dropped';
+    SELECT count(*) FROM pg_description WHERE description = 'the b';
+}
+expect {
+    a|the a
+    c|the c
+    the table
+    0
+}
+
+test dropping-a-column-is-rolled-back-with-its-comments {
+    CREATE TABLE comment_drop_undone (a int, b int);
+    COMMENT ON COLUMN comment_drop_undone.a IS 'undone a';
+    COMMENT ON COLUMN comment_drop_undone.b IS 'undone b';
+    BEGIN;
+    ALTER TABLE comment_drop_undone DROP COLUMN a;
+    ROLLBACK;
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'comment_drop_undone' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    a|undone a
+    b|undone b
+}
+
+test dropping-a-column-of-a-quoted-table-keeps-the-other-comments {
+    CREATE TABLE "MixDrop" ("ColA" int, "ColB" int);
+    COMMENT ON COLUMN "MixDrop"."ColA" IS 'mixdrop a';
+    COMMENT ON COLUMN "MixDrop"."ColB" IS 'mixdrop b';
+    ALTER TABLE "MixDrop" DROP COLUMN "ColA";
+    SELECT a.attname, col_description(a.attrelid, a.attnum)
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'MixDrop' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum;
+    SELECT count(*) FROM pg_description WHERE description = 'mixdrop a';
+}
+expect {
+    ColB|mixdrop b
     0
 }
 

@@ -39,8 +39,8 @@ use turso_core::security::roles::RoleId;
 use turso_core::{
     emit_sqlite_sequence_row_read, emit_sqlite_sequence_row_write, to_u32, AccessStatement,
     Catalog, CatalogApply, CatalogCmd, CmdContext, CmdOrigin, CmpInsFlags, CollationSeq,
-    Connection, CursorType, InsertFlags, Insn, LimboError, NewOwner, Numeric, OwnerColumn,
-    ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
+    Connection, CursorType, DropColumn, InsertFlags, Insn, LimboError, NewOwner, Numeric,
+    OwnerColumn, ProgramBuilder, RegisterOrLiteral, RelationName, SqliteCatalog, Value,
 };
 use turso_parser::ast;
 
@@ -56,7 +56,7 @@ use crate::auth_members::{
     CREATE_AUTH_MEMBERS_TABLE_SQL,
 };
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
-use crate::descriptions::{emit_delete_relation_comments, is_stored_catalog_table};
+use crate::descriptions::{emit_delete_comments, is_stored_catalog_table, Dropped};
 use crate::error::sqlstate_error;
 use crate::policies::{self, TablePolicies};
 use crate::roles::{
@@ -586,7 +586,11 @@ impl Catalog for PostgresCatalog {
             CatalogCmd::AddColumn(_) => {}
             // The statement drops the sequences that the column owns
             // itself, each with its class row.
-            CatalogCmd::DropColumn(_) => {}
+            CatalogCmd::DropColumn(column) => {
+                if ctx.origin != CmdOrigin::Engine && ctx.database_id == MAIN_DB_ID {
+                    emit_dropped_column_comments(program, ctx, column);
+                }
+            }
         }
         Ok(())
     }
@@ -628,6 +632,39 @@ impl Catalog for PostgresCatalog {
             _ => translate_access_statement(program, ctx.schema, ctx.connection, statement),
         }
     }
+}
+
+/// Deletes the comment of the column that `column.table` no longer has, and
+/// moves the comments of the later columns to the numbers those columns now
+/// have.
+fn emit_dropped_column_comments(
+    program: &mut ProgramBuilder,
+    ctx: &CmdContext<'_>,
+    column: &DropColumn<'_>,
+) {
+    // An engine table has no row and no comments.
+    let Some(class) = class_catalog(ctx.schema)
+        .and_then(|catalog| catalog.get_by_name(column.namespace, column.name))
+    else {
+        return;
+    };
+    let Some(table_before) = ctx.schema.get_btree_table(column.namespace, column.name) else {
+        return;
+    };
+    let remaining = column.table.columns();
+    let position = table_before
+        .columns()
+        .iter()
+        .zip(remaining)
+        .position(|(before, after)| before.name != after.name)
+        .unwrap_or(remaining.len());
+    let column_number = position as i64 + 1;
+    emit_delete_comments(
+        program,
+        ctx.schema,
+        class.oid,
+        Dropped::Column(column_number),
+    );
 }
 
 /// Stores the new name of column `old_name` of `table` in the class rows
@@ -715,7 +752,7 @@ impl<'a> ClassRowWriter<'a> {
         else {
             return;
         };
-        emit_delete_relation_comments(program, self.schema, class.oid);
+        emit_delete_comments(program, self.schema, class.oid, Dropped::Relation);
         emit_class_row_delete(program, &self.cursors, namespace, name)
     }
 
