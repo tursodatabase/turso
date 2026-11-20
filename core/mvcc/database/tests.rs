@@ -236,7 +236,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     let index_info = Arc::new(
         IndexInfo::new(
             [crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
+                sort_order: crate::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
@@ -264,8 +264,8 @@ fn index_key_payload_allocation_uses_passed_allocator() {
 /// keys of different lengths.
 #[test]
 fn index_key_order_matches_compare_immutable() {
+    use crate::ast::SortOrder;
     use crate::translate::collate::CollationSeq;
-    use turso_parser::ast::SortOrder;
 
     let integers = [
         0,
@@ -373,8 +373,8 @@ fn index_key_order_matches_compare_immutable() {
 /// the error of the general path, from both sides.
 #[test]
 fn index_key_compare_reports_corrupt_values() {
+    use crate::ast::SortOrder;
     use crate::translate::collate::CollationSeq;
-    use turso_parser::ast::SortOrder;
 
     let info = Arc::new(
         IndexInfo::new(
@@ -1559,7 +1559,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let info = std::sync::Arc::new(
         crate::types::IndexInfo::new(
             crate::alloc::vec![crate::types::KeyInfo {
-                sort_order: turso_parser::ast::SortOrder::Asc,
+                sort_order: crate::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],

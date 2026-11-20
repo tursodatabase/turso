@@ -157,8 +157,8 @@ use super::{
     },
     CommitState,
 };
+use crate::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use crate::sync::RwLock;
-use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
@@ -812,8 +812,8 @@ pub fn op_compare(
         if let Some((a, b)) = integer_operands(state, start_reg_a, start_reg_b) {
             let cmp = a.cmp(&b);
             state.last_compare = Some(match key_info[0].sort_order {
-                turso_parser::ast::SortOrder::Asc => cmp,
-                turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                crate::ast::SortOrder::Asc => cmp,
+                crate::ast::SortOrder::Desc => cmp.reverse(),
             });
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -826,8 +826,8 @@ pub fn op_compare(
             {
                 let cmp = a.as_str().cmp(b.as_str());
                 state.last_compare = Some(match key_info[0].sort_order {
-                    turso_parser::ast::SortOrder::Asc => cmp,
-                    turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                    crate::ast::SortOrder::Asc => cmp,
+                    crate::ast::SortOrder::Desc => cmp.reverse(),
                 });
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);

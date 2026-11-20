@@ -6,8 +6,8 @@ use sql_generation::{
         table::{ColumnType, Table},
     },
 };
+use turso_core::ast;
 use turso_core::{Numeric, Value};
-use turso_parser::ast;
 
 use crate::model::lateral::{
     ColumnRef, Comparison, LateralColumn, LateralForm, LateralJoin, LateralJoinType, LateralSelect,

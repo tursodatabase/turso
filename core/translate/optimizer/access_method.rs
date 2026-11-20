@@ -3,8 +3,8 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::iter;
 
+use crate::ast::{self, SortOrder, TableInternalId};
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;

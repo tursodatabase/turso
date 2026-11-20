@@ -25,6 +25,7 @@ use super::{
     window::WindowMetadata,
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::ast::{self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime};
 use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
@@ -55,9 +56,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
-};
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -515,11 +513,11 @@ impl<'a> Resolver<'a> {
 
     /// Counts one more level of nested query until the returned guard is
     /// dropped. The planner and the code generator recurse one time for each
-    /// level, so the depth is bounded by [turso_parser::MAX_QUERY_DEPTH], as in
+    /// level, so the depth is bounded by [ast::MAX_QUERY_DEPTH], as in
     /// the parser.
     pub(crate) fn enter_nested_query(&self) -> Result<NestedQueryGuard<'_>> {
         let depth = self.query_nesting_depth.get();
-        if depth > turso_parser::MAX_QUERY_DEPTH {
+        if depth > ast::MAX_QUERY_DEPTH {
             return Err(query_nested_too_deeply_error());
         }
         self.query_nesting_depth.set(depth + 1);
@@ -892,7 +890,7 @@ impl Drop for NestedQueryGuard<'_> {
 #[cold]
 #[inline(never)]
 fn query_nested_too_deeply_error() -> LimboError {
-    LimboError::ParseError(turso_parser::query_nested_too_deeply_message())
+    LimboError::ParseError(ast::query_nested_too_deeply_message())
 }
 
 #[derive(Debug, Clone, Copy)]

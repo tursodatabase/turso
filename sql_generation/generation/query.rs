@@ -21,7 +21,7 @@ use indexmap::IndexSet;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 use turso_core::alloc::{TursoSliceExt, ALLOC_ERR_MSG};
-use turso_parser::ast::{ColumnConstraint, Expr, SortOrder};
+use turso_core::ast::{ColumnConstraint, Expr, SortOrder};
 
 use super::{backtrack, pick};
 
@@ -942,7 +942,7 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                 new_name: Name::arbitrary(rng, context).0,
             },
             AlterTableTypeDiscriminants::AddColumn => {
-                use turso_parser::ast::ColumnConstraint;
+                use turso_core::ast::ColumnConstraint;
 
                 let mut column = Column::arbitrary(rng, context);
                 // can't be dropped acc to sqlite
@@ -952,7 +952,7 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                 AlterTableType::AddColumn { column }
             }
             AlterTableTypeDiscriminants::AlterColumn => {
-                use turso_parser::ast::ColumnConstraint;
+                use turso_core::ast::ColumnConstraint;
 
                 let col_diff = get_column_diff(table);
 

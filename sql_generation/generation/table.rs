@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use indexmap::IndexSet;
 use rand::Rng;
-use turso_parser::ast::{ColumnConstraint, GeneratedColumnType};
+use turso_core::ast::{ColumnConstraint, GeneratedColumnType};
 
 use crate::generation::generated_expr::generate_column_expr_with_refs;
 use crate::generation::{pick, readable_name_custom, Arbitrary, GenerationContext};
@@ -183,7 +183,7 @@ impl Arbitrary for Column {
         let column_type = ColumnType::arbitrary(rng, context);
 
         let constraints = if rng.random_bool(0.1) {
-            vec![turso_parser::ast::ColumnConstraint::Unique(None)]
+            vec![turso_core::ast::ColumnConstraint::Unique(None)]
         } else {
             vec![]
         };

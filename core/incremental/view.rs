@@ -1,4 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::ast;
+use crate::ast::{Cmd, Stmt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
 use crate::namespace::NamespaceId;
 use crate::schema::view::{extract_view_columns, ViewColumnSchema};
@@ -8,8 +10,6 @@ use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, Value};
 use crate::{turso_assert, LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use turso_parser::ast;
-use turso_parser::ast::{Cmd, Stmt};
 
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
@@ -736,12 +736,12 @@ impl IncrementalView {
 mod tests {
     use super::*;
     use crate::alloc::vec;
+    use crate::ast;
     use crate::namespace::NamespaceId;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
     use crate::sync::Arc;
-    use turso_parser::ast;
 
     #[test]
     fn hidden_state_ownership_parses_aggregate_suffixes() {

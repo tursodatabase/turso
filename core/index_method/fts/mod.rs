@@ -20,6 +20,7 @@
 #[cfg(not(nightly))]
 use crate::alloc::TursoVecInExt;
 use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
+use crate::ast::{self, Select, SortOrder};
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
@@ -62,7 +63,6 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
     TantivyDocument, Term, TERMINATED,
 };
-use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
@@ -1391,7 +1391,7 @@ impl FtsCursor {
                     // and its base rows must not commit without their index
                     // entries.
                     return Err(LimboError::Raise(
-                        turso_parser::ast::ResolveType::Abort,
+                        crate::ast::ResolveType::Abort,
                         Box::new(LimboError::Constraint(
                             "statement already has an open writer on this FTS index; \
                              a trigger cannot write the FTS-indexed table its firing \
@@ -2607,9 +2607,9 @@ impl FtsCursor {
         Ok(hits)
     }
 
-    fn constant_integer_expression(expr: &turso_parser::ast::Expr) -> Option<i64> {
+    fn constant_integer_expression(expr: &crate::ast::Expr) -> Option<i64> {
         match expr {
-            turso_parser::ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            crate::ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 Self::constant_integer_expression(&expressions[0])
             }
             _ => match crate::util::parse_signed_number(expr).ok()? {

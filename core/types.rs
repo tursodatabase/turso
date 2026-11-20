@@ -1,8 +1,8 @@
+use crate::ast::SortOrder;
 use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
 use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
-use turso_parser::ast::SortOrder;
 
 use crate::alloc::*;
 use crate::error::LimboError;
@@ -2666,7 +2666,7 @@ impl<'a> Ord for ValueRef<'a> {
 pub struct KeyInfo {
     pub sort_order: SortOrder,
     pub collation: CollationSeq,
-    pub nulls_order: Option<turso_parser::ast::NullsOrder>,
+    pub nulls_order: Option<crate::ast::NullsOrder>,
 }
 
 #[cfg(not(nightly))]
@@ -2879,8 +2879,8 @@ pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -
                 // NULLS FIRST: keep that natural order regardless of ASC/DESC.
                 // NULLS LAST: reverse it regardless of ASC/DESC.
                 return match nulls_order {
-                    turso_parser::ast::NullsOrder::First => cmp,
-                    turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                    crate::ast::NullsOrder::First => cmp,
+                    crate::ast::NullsOrder::Last => cmp.reverse(),
                 };
             }
         }

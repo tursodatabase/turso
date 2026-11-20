@@ -1,3 +1,4 @@
+use crate::ast::{self, Expr};
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
@@ -36,7 +37,6 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_macros::turso_assert;
-use turso_parser::ast::{self, Expr};
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_select(

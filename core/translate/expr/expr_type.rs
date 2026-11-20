@@ -5,7 +5,7 @@
 //! wire protocol should report for it asks here instead of matching on expression
 //! shapes itself.
 
-use turso_parser::ast;
+use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
@@ -1411,12 +1411,12 @@ fn builtin_type_of_affinity(affinity: Affinity) -> BuiltinType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Expr, Literal, Name, Operator, UnaryOperator};
     use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::schema::{RangeOffsets, SchemaBuilder, TypeOrigin};
     use crate::translate::emitter::DoubleQuotedDml;
     use crate::{DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
 
     impl PartialEq for ExprType {
         fn eq(&self, other: &Self) -> bool {

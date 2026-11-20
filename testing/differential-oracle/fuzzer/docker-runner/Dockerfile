@@ -12,6 +12,7 @@ WORKDIR /app
 FROM chef AS planner
 # cargo-chef requires all this crap to be present in the workspace
 COPY Cargo.toml Cargo.lock ./
+COPY ast ./ast/
 COPY core ./core/
 COPY bindings ./bindings/
 COPY extensions ./extensions/
@@ -38,6 +39,7 @@ FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin differential_fuzzer --recipe-path recipe.json
+COPY --from=planner /app/ast ./ast/
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/

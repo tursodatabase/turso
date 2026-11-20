@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
-use turso_parser::ast::{
+use turso_core::ast::{
     self,
     fmt::{BlankContext, WriteSql},
 };

@@ -1,3 +1,4 @@
+use crate::ast::{self, SortOrder, TableInternalId};
 use crate::schema::{impl_effective_nulls_order, Column, Table};
 use crate::translate::expr_context::ExprContext;
 use crate::turso_assert_greater_than_or_equal;
@@ -20,7 +21,6 @@ use crate::{
     },
     util::exprs_are_equivalent,
 };
-use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
 
