@@ -5457,3 +5457,29 @@ test fk-drop-deferred-child-after-its-parent {
 expect {
     0
 }
+
+# Once an UPDATE changes a key, SQLite checks every foreign key that references
+# the table itself, also one whose columns the UPDATE does not change. Row 2's
+# old key 7 has no parent, which cancels the violation of row 1's new key 8,
+# so the unchanged dangling q = 9 of row 2 must be counted again.
+@cross-check-integrity
+test fk-update-checks-unchanged-self-reference-of-row-missing-its-parent {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, p INT REFERENCES t(id), q INT REFERENCES t(u));
+    INSERT INTO t VALUES (1, NULL, NULL, NULL), (2, NULL, 7, 9);
+    PRAGMA foreign_keys=ON;
+    UPDATE t SET p = CASE id WHEN 1 THEN 8 ELSE 1 END;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-update-of-parent-key-checks-unchanged-self-reference {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, p INT REFERENCES t(id), q INT REFERENCES t(u));
+    INSERT INTO t VALUES (1, NULL, NULL, NULL), (2, NULL, NULL, 9);
+    PRAGMA foreign_keys=ON;
+    UPDATE t SET id = 3 WHERE id = 2;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

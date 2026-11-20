@@ -1101,8 +1101,8 @@ fn build_parent_key(
     Ok(())
 }
 
-/// Child-side FK maintenance for UPDATE/UPSERT:
-/// If any FK columns of this child row changed:
+/// Child-side FK maintenance for UPDATE/UPSERT, for every FK whose child
+/// columns change and every FK that references the table itself:
 ///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement deferred counter (guarded).
 ///  Pass 2 (NEW tuple): if NEW is non-NULL and parent is missing: immediate error or deferred(+1).
 #[allow(clippy::too_many_arguments)]
@@ -1167,20 +1167,24 @@ pub fn emit_fk_child_update_counters(
         return Ok(());
     }
 
-    // Like SQLite, a reference to the table itself is checked also when only
-    // its parent key changes: the row may reference its own OLD key, or have
-    // been missing its parent before the statement.
-    let mut fk_refs: Vec<ResolvedFkRef> = Vec::new();
-    for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_for_child(namespace.id, child_table_name, Some(updated_cols))
-    })? {
-        if fk_ref.child_key_changed(updated_cols, child_tbl)
-            || (fk_ref.is_self_reference()
-                && fk_ref.parent_key_may_change(updated_cols, child_tbl)?)
-        {
-            fk_refs.push(fk_ref);
-        }
-    }
+    // Like SQLite, once an UPDATE changes a key, every reference to the table
+    // itself is checked, even one whose columns do not change: the row may
+    // reference its own OLD key, or have been missing its parent before the
+    // statement. Without the OLD/NEW pair for such a row, the cancel of its
+    // OLD key violation in pass 1 is not matched by a count of the same
+    // violation in pass 2, so it could cancel a violation that another row
+    // added:
+    //
+    //   (1,NULL,NULL),(2,7,9): UPDATE t SET p = CASE id WHEN 1 THEN 8 ELSE 1 END
+    let fk_refs: Vec<ResolvedFkRef> = resolver
+        .with_schema(database_id, |s| {
+            s.resolved_fks_for_child(namespace.id, child_table_name, Some(updated_cols))
+        })?
+        .into_iter()
+        .filter(|fk_ref| {
+            fk_ref.child_key_changed(updated_cols, child_tbl) || fk_ref.is_self_reference()
+        })
+        .collect();
 
     // Like SQLite, cancel the violations of the OLD keys of every foreign key
     // before counting the violations of the NEW keys. Otherwise an OLD key
