@@ -109,7 +109,6 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     index_method::IndexMethod,
     schema::Trigger,
-    storage::encryption::AtomicCipherMode,
     sync::{atomic::AtomicBool, Arc, RwLock},
     vdbe::metrics::ConnectionMetrics,
 };
@@ -145,10 +144,9 @@ pub use database::{
 pub(crate) use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-#[cfg(test)]
-pub(crate) use dialect::EngineDialect;
 pub use dialect::{
     AccessStatement, CatalogApply, Dialect, NewOwner, OwnerColumn, RelationChange, RelationName,
+    StatementTimes,
 };
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -177,7 +175,9 @@ pub use io::{
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use security::roles::SessionRole;
-pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+pub use statement::{
+    ColumnOrigin, ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter,
+};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

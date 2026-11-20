@@ -2,24 +2,26 @@ use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::{sql_parse_error, sqlstate_error};
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::Utc;
-use std::{fmt, sync::Arc};
+use chrono::{DateTime, NaiveDateTime};
+use std::fmt;
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::security::roles::RoleId;
 use turso_pg_parser::ParseError;
 
 use crate::roles::{connection_roles, RoleCatalog};
+use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
-    array_values_from_any, exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError,
-    Numeric, OpenOptions, Register, Result, Value,
+    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
+    Register, Result, Value, WallClockInstant,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_DATETIME_FORMAT,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -27,13 +29,14 @@ use turso_pg_parser::sqlstate::{
 /// Rust type of the body (see `ScalarReturn`), so it cannot drift from what
 /// the body returns.
 macro_rules! scalar_functions {
-    ($options:expr, |$connection:ident, $args:ident| {
+    ($options:expr, |$context:ident, $connection:ident, $args:ident| {
         $($($name:literal)|+ ($arity:expr, $deterministic:expr) => $body:expr,)*
     }) => {{
         let mut options = $options;
         $($(
             #[allow(unused_variables)]
-            let step = |$connection: &Arc<Connection>, $args: &[Register]| -> Result<_> {
+            let step = |$context: &ScalarFuncContext<'_>, $args: &[Register]| -> Result<_> {
+                let $connection = $context.connection;
                 Ok($body)
             };
             options = options.extension_function(pg_scalar_function(
@@ -61,7 +64,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
 }
 
 fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
-    scalar_functions!(options, |connection, args| {
+    scalar_functions!(options, |context, connection, args| {
         "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
         "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
             oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
@@ -103,7 +106,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "int8_out_of_range"(FunctionArity::Exact(0), false) => Err::<i64, _>(sqlstate_error(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-            "bigint out of range",
+            "bigint out of range", None,
         ))?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
@@ -147,17 +150,34 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
         },
-        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
-            FunctionArity::Variadic, false
-        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
+        // The time the transaction started, or the statement outside a
+        // transaction.
+        "now" | "transaction_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.statement_times().transaction)
+        },
+        "statement_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.statement_times().statement)
+        },
+        // The clock at each call.
+        "clock_timestamp"(FunctionArity::Exact(0), false) => {
+            timestamptz_at(context.current_time())
+        },
     })
+}
+
+/// The timestamptz of `instant`, a reading of the system clock.
+fn timestamptz_at(instant: WallClockInstant) -> Timestamptz {
+    let time: NaiveDateTime = DateTime::from_timestamp(instant.secs, instant.micros * 1_000)
+        .expect("a system clock reading is a valid date and time")
+        .naive_utc();
+    Timestamptz(time.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
 }
 
 pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 ) -> ExternalFunc {
     ExternalFunc::new_native_scalar(
         name.to_string(),
@@ -171,7 +191,7 @@ pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
 /// A PostgreSQL function that computes its result without I/O.
 struct PgScalarFunction<O> {
     name: &'static str,
-    step: fn(&Arc<Connection>, &[Register]) -> Result<O>,
+    step: fn(&ScalarFuncContext<'_>, &[Register]) -> Result<O>,
 }
 
 impl<O> fmt::Debug for PgScalarFunction<O> {
@@ -194,8 +214,8 @@ impl<O: ScalarReturn + 'static> ScalarFunction for PgScalarFunction<O> {
 impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
     type Output = O;
 
-    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
-        Ok(IOResult::Done((self.step)(connection, args)?))
+    fn step(&mut self, context: &ScalarFuncContext<'_>, args: &[Register]) -> IOResultOr<O> {
+        Ok(IOResult::Done((self.step)(context, args)?))
     }
 }
 
@@ -260,6 +280,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         value => match value.as_int() {
@@ -327,6 +348,7 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
             sqlstate_error(
                 SQLSTATE_INTERNAL_ERROR,
                 format!("unrecognized object type abbreviation: {kind_code}"),
+                None,
             )
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
@@ -530,6 +552,7 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<S
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Some(value) => match value.as_int() {
@@ -558,6 +581,7 @@ fn unrecognized_parameter(name: &str) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_OBJECT,
         format!("unrecognized configuration parameter \"{name}\""),
+        None,
     )
 }
 
@@ -580,6 +604,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
                 return Err(sqlstate_error(
                     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
                     "bigint out of range",
+                    None,
                 ));
             }
             rounded as i64
@@ -591,6 +616,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
                     "invalid input syntax for type bigint: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
@@ -605,6 +631,7 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         return Err(sqlstate_error(
             sqlstate,
             format!("{clause} must not be negative"),
+            None,
         ));
     }
     Ok(Some(value))
@@ -622,6 +649,7 @@ pub(crate) fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> 
         None => Err(sqlstate_error(
             SQLSTATE_UNDEFINED_OBJECT,
             format!("invalid role OID: {}", crate::catalog::role_oid(role)),
+            None,
         )),
     }
 }
@@ -690,6 +718,66 @@ fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
     Ok(Some(stripped))
 }
 
+/// Appends the rows of PostgreSQL's json_each(json): the key of each member
+/// unescaped and the text of its value as the input writes it, in the order of
+/// the input and with repeated keys kept. The engine's json_each() is SQLite's,
+/// which turns a number member into a SQL value and writes it again.
+pub(crate) fn exec_json_each(value: &Value, rows: &mut Vec<[Value; 2]>) -> Result<()> {
+    let json = match value {
+        Value::Null => return Ok(()),
+        Value::Text(text) => text.as_str(),
+        other => return Err(undefined_function("json_each", &[pg_type_name(other)])),
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    skip_json_whitespace(bytes, &mut pos);
+    match bytes[pos] {
+        b'{' => pos += 1,
+        b'[' => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct an array as an object",
+                None,
+            ))
+        }
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_PARAMETER_VALUE,
+                "cannot deconstruct a scalar",
+                None,
+            ))
+        }
+    }
+    // The walk decodes every string in a value, so a \u0000 or a lone surrogate
+    // anywhere in it errors as in PostgreSQL. Its copy of the value is not used.
+    let mut walked_value = String::new();
+    loop {
+        skip_json_whitespace(bytes, &mut pos);
+        match bytes[pos] {
+            b'}' => break,
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let key = decode_json_string(json, &mut pos)?;
+        skip_json_whitespace(bytes, &mut pos);
+        pos += 1; // ':'
+        skip_json_whitespace(bytes, &mut pos);
+        let start = pos;
+        walked_value.clear();
+        copy_without_null_fields(json, &mut pos, 1, &mut walked_value)?;
+        rows.push([
+            Value::build_text(key),
+            Value::build_text(json[start..pos].to_string()),
+        ]);
+    }
+    Ok(())
+}
+
 /// `array_to_json(array [, pretty])`: the array as a JSON array, with line
 /// feeds between its elements when `pretty` is true. After the arguments come
 /// their type names, such as `boolean[]`, because an element's stored value
@@ -708,6 +796,7 @@ fn exec_array_to_json(args: &[Register]) -> Result<Option<Json>> {
                     "invalid input syntax for type boolean: \"{}\"",
                     text.as_str()
                 ),
+                None,
             )
         })?,
         Some(pretty) => !matches!(pretty, Value::Numeric(Numeric::Integer(0))),
@@ -873,6 +962,7 @@ pub(crate) fn invalid_json() -> LimboError {
     sqlstate_error(
         SQLSTATE_INVALID_TEXT_REPRESENTATION,
         "invalid input syntax for type json",
+        None,
     )
 }
 
@@ -880,6 +970,7 @@ pub(crate) fn unsupported_unicode_escape() -> LimboError {
     sqlstate_error(
         SQLSTATE_UNTRANSLATABLE_CHARACTER,
         "unsupported Unicode escape sequence",
+        None,
     )
 }
 
@@ -897,6 +988,7 @@ fn copy_without_null_fields(
         return Err(sqlstate_error(
             SQLSTATE_STATEMENT_TOO_COMPLEX,
             "stack depth limit exceeded",
+            None,
         ));
     }
     match bytes[*pos] {
@@ -1046,6 +1138,7 @@ fn like_matches(text: &str, pattern: &str) -> Result<bool> {
         sqlstate_error(
             SQLSTATE_INVALID_ESCAPE_SEQUENCE,
             "LIKE pattern must not end with escape character",
+            None,
         )
     };
     let (text_bytes, pattern_bytes) = (text.as_bytes(), pattern.as_bytes());
@@ -1153,6 +1246,7 @@ fn exec_like_escape(args: &[Register]) -> Result<Option<String>> {
             return Err(sqlstate_error(
                 SQLSTATE_INVALID_ESCAPE_SEQUENCE,
                 "invalid escape string: Escape string must be empty or one character.",
+                None,
             ));
         }
     };
@@ -1175,7 +1269,7 @@ fn exec_similar_to_escape(args: &[Register]) -> Result<Option<String>> {
     match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
         Ok(regex) => Ok(Some(regex)),
         Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
-            Err(sqlstate_error(sqlstate, message))
+            Err(sqlstate_error(sqlstate, message, None))
         }
         Err(error) => Err(LimboError::ParseError(error.to_string())),
     }
@@ -1300,6 +1394,7 @@ fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
     sqlstate_error(
         SQLSTATE_UNDEFINED_FUNCTION,
         format!("function {name}({}) does not exist", arg_types.join(", ")),
+        None,
     )
 }
 

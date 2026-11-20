@@ -31,36 +31,49 @@ with binding-specific lifetime management for the callback context.
 
 ## Rust example
 
+The example also depends on the `turso_core` crate for `Value` and `OpenFlags`.
+
 ```rust
-use turso_sdk_kit::rsapi::{
-    TursoDatabase, TursoDatabaseConfig, TursoStatusCode, Value, ValueRef,
+use turso_core::{OpenFlags, Value};
+use turso_sdk_kit::{
+    rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode},
+    IoBackend,
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), TursoError> {
     // Create the database holder (not opened yet).
-    let db = TursoDatabase::create(TursoDatabaseConfig {
+    let db = TursoDatabase::new(TursoDatabaseConfig {
         path: ":memory:".to_string(),
         experimental_features: None,
-        io: None,
         // When true, step/execute may return Io and you should call run_io() to progress.
         async_io: true,
+        encryption: None,
+        vfs: IoBackend::Default,
+        io: None,
+        db_file: None,
+        page_codec: None,
+        open_flags: OpenFlags::default(),
     });
 
     // Open and connect.
-    db.open()?;
+    while db.open()?.is_io() {
+        db.io()?.step()?;
+    }
     let conn = db.connect()?;
 
     // Prepare, bind, and step a simple query.
     let mut stmt = conn.prepare_single("SELECT :greet || ' Turso'")?;
-    stmt.bind_named("greet", Value::Text("Hello".into()))?;
+    // The parameter name includes its prefix; positions are 1-based.
+    let position = stmt.named_position(":greet")?;
+    stmt.bind_positional(position, Value::from_text("Hello"))?;
 
     loop {
-        match stmt.step()? {
+        match stmt.step(None)? {
             TursoStatusCode::Row => {
-                // Read current row value. Valid until next step/reset/finalize.
+                // Read the current row value.
                 match stmt.row_value(0)? {
-                    ValueRef::Text(t) => println!("{}", t.as_str()),
-                    other => println!("row[0] = {:?}", other),
+                    Value::Text(t) => println!("{}", t.as_str()),
+                    other => println!("row[0] = {other:?}"),
                 }
             }
             TursoStatusCode::Io => {
@@ -68,16 +81,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stmt.run_io()?;
             }
             TursoStatusCode::Done => break,
-            _ => unreachable!("unexpected status"),
         }
     }
 
     // Finalize to complete the statement cleanly (may also return Io).
-    match stmt.finalize()? {
+    match stmt.finalize(None)? {
         TursoStatusCode::Io => {
             // If needed, drive IO and finalize again.
             stmt.run_io()?;
-            let _ = stmt.finalize()?;
+            let _ = stmt.finalize(None)?;
         }
         _ => {}
     }
@@ -94,117 +106,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #include <stdbool.h>
 #include "turso.h"
 
-static void fail_and_cleanup(const char *msg, turso_status_t st) {
-    fprintf(stderr, "%s: %s\n", msg, st.error ? st.error : "(no message)");
-    if (st.error) turso_status_deinit(st);
+// Print the error message returned through an error_opt_out parameter and free it.
+static void report_error(const char *what, turso_status_code_t code, const char *error) {
+    fprintf(stderr, "%s failed (code %d): %s\n", what, (int)code, error ? error : "(no message)");
+    turso_str_deinit(error);
 }
 
 int main(void) {
+    const turso_database_t *db = NULL;
+    turso_connection_t *conn = NULL;
+    turso_statement_t *stmt = NULL;
+    const char *error = NULL;
+    turso_status_code_t rc;
+    int exit_code = 1;
+
     // Optional: initialize logging (stdout example) and/or set log level via environment.
-    // turso_setup((turso_config_t){ .logger = NULL, .log_level = "info" });
+    // turso_setup(&(turso_config_t){ .logger = NULL, .log_level = "info" }, NULL);
 
     // Create database holder (not opened yet). Enable caller-driven async I/O.
-    turso_database_create_result_t db_res = turso_database_create(
-        (turso_database_config_t){
-            .path = ":memory:",
-            .experimental_features = NULL,
-            .async_io = true,
-        }
-    );
-    if (db_res.status.code != TURSO_OK) {
-        fail_and_cleanup("create database failed", db_res.status);
-        return 1;
-    }
+    turso_database_config_t config = {
+        .path = ":memory:",
+        .experimental_features = NULL,
+        .async_io = true,
+    };
+    rc = turso_database_new(&config, &db, &error);
+    if (rc != TURSO_OK) { report_error("turso_database_new", rc, error); return 1; }
 
-    turso_status_t st = turso_database_open(db_res.database);
-    if (st.code != TURSO_OK) {
-        fail_and_cleanup("open failed", st);
-        turso_database_deinit(db_res.database);
-        return 1;
-    }
+    rc = turso_database_open(db, &error);
+    if (rc != TURSO_OK) { report_error("turso_database_open", rc, error); goto cleanup; }
 
-    turso_database_connect_result_t conn_res = turso_database_connect(db_res.database);
-    if (conn_res.status.code != TURSO_OK) {
-        fail_and_cleanup("connect failed", conn_res.status);
-        turso_database_deinit(db_res.database);
-        return 1;
-    }
+    rc = turso_database_connect(db, &conn, &error);
+    if (rc != TURSO_OK) { report_error("turso_database_connect", rc, error); goto cleanup; }
 
-    const char *sql = "SELECT :greet || ' Turso'";
-    turso_connection_prepare_single_t prep =
-        turso_connection_prepare_single(
-            conn_res.connection,
-            (turso_slice_ref_t){ .ptr = (const void*)sql, .len = strlen(sql) });
+    rc = turso_connection_prepare_single(conn, "SELECT :greet || ' Turso'", &stmt, &error);
+    if (rc != TURSO_OK) { report_error("turso_connection_prepare_single", rc, error); goto cleanup; }
 
-    if (prep.status.code != TURSO_OK) {
-        fail_and_cleanup("prepare failed", prep.status);
-        turso_connection_deinit(conn_res.connection);
-        turso_database_deinit(db_res.database);
-        return 1;
-    }
-
-    // Bind named parameter (omit the leading ':' in the name).
-    const char *name = "greet";
-    const char *val  = "Hello";
-    st = turso_statement_bind_named(
-        prep.statement,
-        (turso_slice_ref_t){ .ptr = (const void*)name, .len = strlen(name) },
-        turso_text(val, strlen(val))
-    );
-    if (st.code != TURSO_OK) {
-        fail_and_cleanup("bind failed", st);
-        turso_statement_deinit(prep.statement);
-        turso_connection_deinit(conn_res.connection);
-        turso_database_deinit(db_res.database);
-        return 1;
-    }
+    // Look up the 1-based position of a named parameter (the name includes its prefix),
+    // then bind a value at that position.
+    int64_t position = turso_statement_named_position(stmt, ":greet");
+    if (position < 0) { fprintf(stderr, "parameter :greet not found\n"); goto cleanup; }
+    const char *greet = "Hello";
+    rc = turso_statement_bind_positional_text(stmt, (size_t)position, greet, strlen(greet));
+    if (rc != TURSO_OK) { report_error("turso_statement_bind_positional_text", rc, NULL); goto cleanup; }
 
     // Drive the statement: handle ROW/IO/DONE.
     for (;;) {
-        turso_status_t step = turso_statement_step(prep.statement);
-        if (step.code == TURSO_IO) {
+        rc = turso_statement_step(stmt, &error);
+        if (rc == TURSO_IO) {
             // Run one iteration of the IO backend and continue.
-            turso_status_t io = turso_statement_run_io(prep.statement);
-            if (io.code != TURSO_OK) {
-                fail_and_cleanup("run_io failed", io);
-                break;
-            }
+            rc = turso_statement_run_io(stmt, &error);
+            if (rc != TURSO_OK) { report_error("turso_statement_run_io", rc, error); goto cleanup; }
             continue;
         }
-        if (step.code == TURSO_ROW) {
-            turso_statement_row_value_t rv = turso_statement_row_value(prep.statement, 0);
-            if (rv.status.code == TURSO_OK && rv.value.type == TURSO_TYPE_TEXT) {
-                const turso_slice_ref_t s = rv.value.value.text;
-                fwrite(s.ptr, 1, s.len, stdout);
+        if (rc == TURSO_ROW) {
+            // Row values are valid only until the next operation on the statement.
+            if (turso_statement_row_value_kind(stmt, 0) == TURSO_TYPE_TEXT) {
+                const char *text = turso_statement_row_value_bytes_ptr(stmt, 0);
+                int64_t len = turso_statement_row_value_bytes_count(stmt, 0);
+                fwrite(text, 1, (size_t)len, stdout);
                 fputc('\n', stdout);
             }
             continue;
         }
-        if (step.code == TURSO_DONE) {
-            break;
-        }
-        // Any other status is an error.
-        fail_and_cleanup("step failed", step);
-        break;
+        if (rc == TURSO_DONE) break;
+        report_error("turso_statement_step", rc, error);
+        goto cleanup;
     }
 
-    // Finalize; if it returns TURSO_IO, drive IO until OK.
+    // Finalize returns TURSO_DONE when complete; with async_io it may return TURSO_IO first.
     for (;;) {
-        turso_status_t fin = turso_statement_finalize(prep.statement);
-        if (fin.code == TURSO_OK) break;
-        if (fin.code == TURSO_IO) {
-            turso_status_t io = turso_statement_run_io(prep.statement);
-            if (io.code != TURSO_OK) { fail_and_cleanup("finalize run_io failed", io); break; }
+        rc = turso_statement_finalize(stmt, &error);
+        if (rc == TURSO_DONE) break;
+        if (rc == TURSO_IO) {
+            rc = turso_statement_run_io(stmt, &error);
+            if (rc != TURSO_OK) { report_error("turso_statement_run_io", rc, error); goto cleanup; }
             continue;
         }
-        fail_and_cleanup("finalize failed", fin);
-        break;
+        report_error("turso_statement_finalize", rc, error);
+        goto cleanup;
     }
+    exit_code = 0;
 
+cleanup:
     // Clean up handles.
-    turso_statement_deinit(prep.statement);
-    turso_connection_deinit(conn_res.connection);
-    turso_database_deinit(db_res.database);
-    return 0;
+    turso_statement_deinit(stmt);
+    turso_connection_deinit(conn);
+    turso_database_deinit(db);
+    return exit_code;
 }
 ```

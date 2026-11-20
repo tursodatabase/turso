@@ -68,3 +68,29 @@ test window-sum-all-int-overflow-errors {
 }
 expect error {
 }
+
+# Inf + -Inf is NaN, which sum() and avg() return as NULL. Removing a row
+# from a frame adds its negation, so once an infinite value leaves the
+# frame the total is NaN and the result stays NULL for the rest of the
+# partition. avg() still counts each row added after that, so removing
+# those rows later finds them counted.
+setup infinite_value {
+    CREATE TABLE inf(n INT, x REAL);
+    INSERT INTO inf VALUES (1, 1e999), (2, 1.0), (3, 2.0), (4, 4.0);
+}
+
+@setup infinite_value
+test window-sum-avg-stay-null-after-infinite-value-leaves-frame {
+    SELECT n,
+           avg(x) OVER (ORDER BY n ROWS BETWEEN CURRENT ROW AND CURRENT ROW),
+           avg(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW),
+           sum(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW),
+           total(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    FROM inf;
+}
+expect {
+    1|Inf|Inf|Inf|Inf
+    2||Inf|Inf|Inf
+    3||||
+    4||||
+}

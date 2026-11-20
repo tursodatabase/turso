@@ -348,7 +348,7 @@ fn copy_with_affinity(
 /// Build an unpacked key for opcodes that require adjacent registers; rowid aliases
 /// may resolve outside the compact column block.
 #[inline]
-fn copy_context_columns_with_affinity(
+pub(crate) fn copy_context_columns_with_affinity(
     program: &mut ProgramBuilder,
     dml_ctx: &DmlColumnContext,
     column_positions: &[usize],
@@ -1039,7 +1039,9 @@ fn emit_fk_parent_key_probe(
 
 /// An index on exactly the child key columns that can find the child rows of
 /// a parent key: its key columns must compare with the parent key's
-/// collations, otherwise a seek would miss or wrongly find child rows.
+/// collations, otherwise a seek would miss or wrongly find child rows. A
+/// partial index cannot find them all, because it has no entries for the
+/// child rows that fail its WHERE clause.
 pub(super) fn child_index_for_fk(
     resolver: &Resolver,
     database_id: usize,
@@ -1049,7 +1051,8 @@ pub(super) fn child_index_for_fk(
     resolver.with_schema(database_id, |s| {
         s.get_indices(fk_ref.child_namespace, &fk_ref.child_table.name)
             .find(|ix| {
-                ix.columns.len() == child_cols.len()
+                ix.where_clause.is_none()
+                    && ix.columns.len() == child_cols.len()
                     && ix
                         .columns
                         .iter()

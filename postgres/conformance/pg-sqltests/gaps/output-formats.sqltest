@@ -1,0 +1,512 @@
+# Known tursopg gaps against PostgreSQL: C. Output formats
+#
+# Each test with a `@compat-gap "<kind>:<object>"` label records a known
+# difference: its default `expect` block is PostgreSQL 18's answer and its
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg
+# gives the PostgreSQL answer, the tursopg run fails with "gap fixed": then
+# delete only `@compat-gap` and the `expect @tursopg` block, and keep the
+# test. A test without `@compat-gap` matches PostgreSQL and guards against
+# regressions. The `# X-NN` comments are the IDs from the audit that found
+# each gap.
+
+@database :memory:
+
+setup t_b_n_ts_j_jb_arr_u_with_rows {
+    CREATE TABLE t (b boolean, n numeric(10,2), ts timestamptz, j json, jb jsonb, arr text[], u uuid);
+    INSERT INTO t VALUES (true, 1.5, '2026-10-08T12:00:00Z', '{"x": 1}', '{"y": 2}', '{a}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+}
+
+# C-01: boolean true: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test boolean-true-raw-value-inside-json-build-object {
+    CREATE TABLE t (v boolean);
+    INSERT INTO t VALUES (true);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    t|{"v" : true}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-02: smallint 12: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test smallint-12-raw-value-inside-json-build-object {
+    CREATE TABLE t (v smallint);
+    INSERT INTO t VALUES (12);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    12|{"v" : 12}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-03: integer 123: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test integer-123-raw-value-inside-json-build-object {
+    CREATE TABLE t (v integer);
+    INSERT INTO t VALUES (123);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    123|{"v" : 123}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-04: bigint 9007199254740993: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test bigint-9007199254740993-raw-and-in-json-build-object {
+    CREATE TABLE t (v bigint);
+    INSERT INTO t VALUES (9007199254740993);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    9007199254740993|{"v" : 9007199254740993}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-05: numeric(10,2) 1.005: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test numeric-10-2-1-005-raw-and-in-json-build-object {
+    CREATE TABLE t (v numeric(10,2));
+    INSERT INTO t VALUES (1.005);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    1.01|{"v" : 1.01}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-06: numeric 1.50: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test numeric-1-50-raw-value-inside-json-build-object {
+    CREATE TABLE t (v numeric);
+    INSERT INTO t VALUES (1.50);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    1.50|{"v" : 1.50}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-07: numeric 123456789012345678901234567890.123: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test numeric-with-30-integer-digits-raw-and-in-json-build-object {
+    CREATE TABLE t (v numeric);
+    INSERT INTO t VALUES (123456789012345678901234567890.123);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    123456789012345678901234567890.123|{"v" : 123456789012345678901234567890.123}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-08: real 1.1: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test real-1-1-raw-value-inside-json-build-object {
+    CREATE TABLE t (v real);
+    INSERT INTO t VALUES (1.1);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    1.1|{"v" : 1.1}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-09: double precision 0.1: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test double-precision-0-1-raw-and-in-json-build-object {
+    CREATE TABLE t (v double precision);
+    INSERT INTO t VALUES (0.1);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    0.1|{"v" : 0.1}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-10: text 'héllo "q"': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test text-h-llo-q-raw-value-inside-json-build-object {
+    CREATE TABLE t (v text);
+    INSERT INTO t VALUES ('héllo "q"');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    héllo "q"|{"v" : "héllo \"q\""}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-11: uuid 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test upper-case-uuid-raw-and-in-json-build-object {
+    CREATE TABLE t (v uuid);
+    INSERT INTO t VALUES ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|{"v" : "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-12: date '2026-10-08': raw value, inside json_build_object
+@compat-gap "type:date"
+test date-raw-and-in-json-build-object {
+    CREATE TABLE t (v date);
+    INSERT INTO t VALUES ('2026-10-08');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    2026-10-08|{"v" : "2026-10-08"}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# C-13: time '12:34:56.789': raw value, inside json_build_object
+@compat-gap "type:time"
+test time-with-milliseconds-raw-and-in-json-build-object {
+    CREATE TABLE t (v time);
+    INSERT INTO t VALUES ('12:34:56.789');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    12:34:56.789|{"v" : "12:34:56.789"}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# C-14: timetz '12:34:56+02': raw value, inside json_build_object
+@compat-gap "type:timetz"
+test timetz-raw-and-in-json-build-object {
+    CREATE TABLE t (v timetz);
+    INSERT INTO t VALUES ('12:34:56+02');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    12:34:56+02|{"v" : "12:34:56+02"}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# C-15: timestamp '2026-10-08T12:00:00.5': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test timestamp-with-t-separator-raw-and-in-json-build-object {
+    CREATE TABLE t (v timestamp);
+    INSERT INTO t VALUES ('2026-10-08T12:00:00.5');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    2026-10-08 12:00:00.5|{"v" : "2026-10-08T12:00:00.5"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-16: timestamptz '2026-10-08 14:00:00+02': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test timestamptz-with-offset-raw-and-in-json-build-object {
+    CREATE TABLE t (v timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 14:00:00+02');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    2026-10-08 12:00:00+00|{"v" : "2026-10-08T12:00:00+00:00"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-17: timestamptz '2026-10-08T12:00:00.123456Z': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test timestamptz-with-z-and-microseconds-raw-and-in-json-build-object {
+    CREATE TABLE t (v timestamptz);
+    INSERT INTO t VALUES ('2026-10-08T12:00:00.123456Z');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    2026-10-08 12:00:00.123456+00|{"v" : "2026-10-08T12:00:00.123456+00:00"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-18: interval '1 day 2 hours': raw value, inside json_build_object
+@compat-gap "type:interval"
+test interval-raw-and-in-json-build-object {
+    CREATE TABLE t (v interval);
+    INSERT INTO t VALUES ('1 day 2 hours');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    1 day 02:00:00|{"v" : "1 day 02:00:00"}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# C-19: interval '90 minutes': raw value, inside json_build_object
+@compat-gap "type:interval"
+test interval-90-minutes-raw-value-inside-json-build {
+    CREATE TABLE t (v interval);
+    INSERT INTO t VALUES ('90 minutes');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    01:30:00|{"v" : "01:30:00"}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# C-20: json '{"b": 2,  "a":1}': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test json-b-2-a-1-raw-value-inside-json-build-object {
+    CREATE TABLE t (v json);
+    INSERT INTO t VALUES ('{"b": 2,  "a":1}');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    {"b": 2,  "a":1}|{"v" : {"b": 2,  "a":1}}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-21: jsonb '{"b": 2,  "a":1, "c": {"z": 1.50}}': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test jsonb-object-raw-and-in-json-build-object {
+    CREATE TABLE t (v jsonb);
+    INSERT INTO t VALUES ('{"b": 2,  "a":1, "c": {"z": 1.50}}');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    {"a": 1, "b": 2, "c": {"z": 1.50}}|{"v" : {"a": 1, "b": 2, "c": {"z": 1.50}}}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-22: bytea '\xdeadbeef': raw value, inside json_build_object
+@compat-gap "type:bytea"
+test bytea-raw-and-in-json-build-object {
+    CREATE TABLE t (v bytea);
+    INSERT INTO t VALUES ('\xdeadbeef');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    \\xdeadbeef|{"v" : "\\\\xdeadbeef"}
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# C-23: text[] '{a,"b c",NULL}': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test text-array-with-null-raw-and-in-json-build-object {
+    CREATE TABLE t (v text[]);
+    INSERT INTO t VALUES ('{a,"b c",NULL}');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    {a,"b c",NULL}|{"v" : ["a","b c",null]}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-24: int[] '{1,2,3}': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test int-1-2-3-raw-value-inside-json-build-object {
+    CREATE TABLE t (v int[]);
+    INSERT INTO t VALUES ('{1,2,3}');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    {1,2,3}|{"v" : [1,2,3]}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-25: jsonb[] ARRAY['{"a":1}'::jsonb]: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test jsonb-array-column-raw-and-in-json-build-object {
+    CREATE TABLE t (v jsonb[]);
+    INSERT INTO t VALUES (ARRAY['{"a":1}'::jsonb]);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    {"{\"a\": 1}"}|{"v" : [{"a": 1}]}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-26: mood 'happy': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test mood-happy-raw-value-inside-json-build-object {
+    CREATE TYPE mood AS ENUM ('happy', 'sad');
+    CREATE TABLE t (v mood);
+    INSERT INTO t VALUES ('happy');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    happy|{"v" : "happy"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-27: posint 5: raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test posint-5-raw-value-inside-json-build-object {
+    CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+    CREATE TABLE t (v posint);
+    INSERT INTO t VALUES (5);
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    5|{"v" : 5}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-28: varchar(5) 'ab': raw value, inside json_build_object
+@compat-gap "function:json_build_object"
+test varchar-5-ab-raw-value-inside-json-build-object {
+    CREATE TABLE t (v varchar(5));
+    INSERT INTO t VALUES ('ab');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    ab|{"v" : "ab"}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-29: char(3) 'ab': raw value, inside json_build_object
+@compat-gap "type:bpchar"
+test char-3-ab-raw-value-inside-json-build-object {
+    CREATE TABLE t (v char(3));
+    INSERT INTO t VALUES ('ab');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    ab |{"v" : "ab "}
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
+# C-30: real 'NaN': raw value, inside json_build_object
+@compat-gap "type:float4"
+test real-nan-raw-value-inside-json-build-object {
+    CREATE TABLE t (v real);
+    INSERT INTO t VALUES ('NaN');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    NaN|{"v" : "NaN"}
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# C-31: numeric 'NaN': raw value, inside json_build_object
+@compat-gap "type:numeric"
+test numeric-nan-raw-value-inside-json-build-object {
+    CREATE TABLE t (v numeric);
+    INSERT INTO t VALUES ('NaN');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    NaN|{"v" : "NaN"}
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# C-32: double precision 'Infinity': raw value, inside json_build_object
+@compat-gap "type:float8"
+test double-precision-infinity-raw-value-inside-json {
+    CREATE TABLE t (v double precision);
+    INSERT INTO t VALUES ('Infinity');
+    SELECT v, json_build_object('v', v) FROM t;
+}
+expect {
+    Infinity|{"v" : "Infinity"}
+}
+@sqlstate 23000
+expect @tursopg error {}
+
+# C-40: json_agg of mixed-type row
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+@compat-gap "function:json_build_object"
+test json-agg-of-mixed-type-row {
+    SELECT json_agg(json_build_object('b', b, 'n', n, 'ts', ts, 'j', j, 'jb', jb, 'u', u)) FROM t;
+}
+expect {
+    [{"b" : true, "n" : 1.50, "ts" : "2026-10-08T12:00:00+00:00", "j" : {"x": 1}, "jb" : {"y": 2}, "u" : "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}]
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-41: text[] inside json object
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+@compat-gap "function:json_build_object"
+test text-inside-json-object {
+    SELECT json_build_object('arr', arr) FROM t;
+}
+expect {
+    {"arr" : ["a"]}
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-42: ::text cast of each type
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+@compat-gap "cast:bool -> text"
+test text-cast-of-each-type {
+    SELECT b::text, n::text, ts::text, jb::text, arr::text, u::text FROM t;
+}
+expect {
+    true|1.50|2026-10-08 12:00:00+00|{"y": 2}|{a}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+expect @tursopg {
+    1|1.50|2026-10-08 12:00:00|{"y":2}|a|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+# C-43: result column type of bool comparison via pg_typeof
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+@compat-gap "function:pg_typeof"
+test result-column-types-via-pg-typeof {
+    SELECT pg_typeof(b), pg_typeof(n), pg_typeof(ts), pg_typeof(jb), pg_typeof(arr) FROM t;
+}
+expect {
+    boolean|numeric|timestamp with time zone|jsonb|text[]
+}
+@sqlstate 42883
+expect @tursopg error {}
+
+# C-44: row_to_json of whole row
+@setup t_b_n_ts_j_jb_arr_u_with_rows
+@compat-gap "function:row_to_json"
+test row-to-json-of-whole-row {
+    SELECT row_to_json(t) FROM t;
+}
+expect {
+    {"b":true,"n":1.50,"ts":"2026-10-08T12:00:00+00:00","j":{"x": 1},"jb":{"y": 2},"arr":["a"],"u":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
+}
+@sqlstate 42703
+expect @tursopg error {}
+
+# C-45: text[] output of an element with a newline
+@compat-gap "type:_text"
+test text-output-of-an-element-with-a-newline {
+    CREATE TABLE t (v text[]);
+    INSERT INTO t VALUES ('{"a
+b"}');
+    SELECT v, v[1] = 'a' || chr(10) || 'b' FROM t;
+}
+expect {
+    {"a
+    b"}|t
+}
+expect @tursopg {
+    {"a\nb"}|1
+}

@@ -10,8 +10,8 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "auth.uid",
             FunctionArity::Exact(0),
             false,
-            |connection, _| {
-                claim(connection, "request.jwt.claim.sub", "sub")?
+            |context, _| {
+                claim(context.connection, "request.jwt.claim.sub", "sub")?
                     .map(|sub| canonical_uuid(&sub).map(Uuid))
                     .transpose()
             },
@@ -20,13 +20,13 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             "auth.email",
             FunctionArity::Exact(0),
             false,
-            |connection, _| claim(connection, "request.jwt.claim.email", "email"),
+            |context, _| claim(context.connection, "request.jwt.claim.email", "email"),
         ))
         .extension_function(pg_scalar_function(
             "auth.jwt",
             FunctionArity::Exact(0),
             false,
-            |connection, _| jwt(connection),
+            |context, _| jwt(context.connection),
         ))
 }
 
@@ -51,6 +51,7 @@ fn canonical_uuid(text: &str) -> Result<String> {
             sqlstate_error(
                 SQLSTATE_INVALID_TEXT_REPRESENTATION,
                 format!("invalid input syntax for type uuid: \"{text}\""),
+                None,
             )
         })
 }

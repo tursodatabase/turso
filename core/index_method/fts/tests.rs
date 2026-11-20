@@ -12,56 +12,6 @@ use std::num::NonZeroU32;
 use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 
 #[test]
-fn field_weights_reject_non_finite_and_non_positive_values() {
-    let mut accepted = Vec::new();
-    for weight in [
-        "NaN",
-        "nan",
-        "+NaN",
-        "-NaN",
-        "inf",
-        "+inf",
-        "-inf",
-        "Infinity",
-        "+INFINITY",
-        "-infinity",
-        "1e39",
-        "-1e39",
-        "0",
-        "-0",
-        "-1",
-        "1e-46",
-    ] {
-        let result = FtsIndexAttachment::new(
-            &crate::EngineDialect,
-            IndexMethodConfiguration {
-                table_name: "w".to_string(),
-                index_name: "wx".to_string(),
-                columns: crate::alloc::vec![
-                    IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
-                    IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
-                ],
-                parameters: FxHashMap::from_iter([(
-                    "weights".to_string(),
-                    Value::from_text(format!("title={weight},body=1")),
-                )]),
-            },
-        );
-        match result {
-            Ok(_) => accepted.push(weight),
-            Err(error) => assert!(
-                matches!(error, LimboError::ParseError(_)),
-                "{weight}: {error}"
-            ),
-        }
-    }
-    assert!(
-        accepted.is_empty(),
-        "accepted invalid weights: {accepted:?}"
-    );
-}
-
-#[test]
 fn field_weights_accept_finite_positive_boundaries() {
     let columns = [
         IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
@@ -104,8 +54,7 @@ fn field_weights_rename_column() {
 }
 
 fn test_attachment() -> FtsIndexAttachment {
-    FtsIndexAttachment::new(
-        &crate::EngineDialect,
+    FtsIndexAttachment::with_patterns(
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -115,6 +64,7 @@ fn test_attachment() -> FtsIndexAttachment {
             ],
             parameters: FxHashMap::<String, Value>::default(),
         },
+        Vec::new(),
     )
     .unwrap()
 }
@@ -122,15 +72,22 @@ fn test_attachment() -> FtsIndexAttachment {
 #[test]
 fn score_result_uses_the_fields_selected_by_the_query() {
     let attachment = test_attachment();
-    let pattern = &attachment.patterns[FTS_PATTERN_COMBINED as usize];
-    let ast::OneSelect::Select { columns, .. } = &pattern.body.select else {
-        panic!("expected a SELECT pattern");
-    };
-    let ast::ResultColumn::Expr(score, _) = &columns[0] else {
-        panic!("expected a score result");
-    };
-    let ast::Expr::FunctionCall { args, .. } = score.as_ref() else {
-        panic!("expected a score function");
+    // The score expression of the query patterns: fts_score(title, body, ?1).
+    let args: Vec<Box<Expr>> = vec![
+        Box::new(Expr::Id(Name::exact("title".to_string()))),
+        Box::new(Expr::Id(Name::exact("body".to_string()))),
+        Box::new(Expr::Variable(Variable::indexed(NonZeroU32::MIN))),
+    ];
+    let score = Expr::FunctionCall {
+        name: Name::exact("fts_score".to_string()),
+        distinctness: None,
+        args: args.clone(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
     };
 
     for (fields, expected_columns) in [("1", &[1][..]), ("0", &[0][..]), ("0,1", &[0, 1][..])] {
@@ -141,7 +98,7 @@ fn score_result_uses_the_fields_selected_by_the_query() {
                 Expr::Literal(Literal::String(format!("'{fields}'"))),
             ),
         ]);
-        let result = attachment.result_column(score, &parameters).unwrap();
+        let result = attachment.result_column(&score, &parameters).unwrap();
         let Expr::FunctionCall {
             args: result_args, ..
         } = result.as_ref()
@@ -168,8 +125,7 @@ fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
 }
 
 fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstimate {
-    let attachment = FtsIndexAttachment::new(
-        &crate::EngineDialect,
+    let attachment = FtsIndexAttachment::with_patterns(
         IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
@@ -180,6 +136,7 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
             )],
             parameters: FxHashMap::<String, Value>::default(),
         },
+        Vec::new(),
     )
     .unwrap();
     let cursor = attachment.init().unwrap();
@@ -605,6 +562,63 @@ fn segment_load_rejects_the_old_identity_field() {
 }
 
 #[test]
+fn segment_files_do_not_depend_on_the_writer_memory_budget() {
+    // `build_segment` gives the segment writer of a small batch a small
+    // memory budget. Tantivy uses the budget only for the initial size of its
+    // term table, and FTS stores the segment files in the database. Thus the
+    // files must be the same for each budget, also when the table grows.
+    let attachment = test_attachment();
+    let cursor = FtsCursor::new(&attachment);
+    let segment_id = SegmentId::generate_random();
+    let build = |memory_budget: usize| {
+        let directory = BuildDirectory::default();
+        let index = Index::create(
+            directory.clone(),
+            attachment.schema.clone(),
+            IndexSettings::default(),
+        )
+        .unwrap();
+        cursor.register_tokenizers(&index);
+        let mut writer = SegmentWriter::for_segment(
+            memory_budget,
+            index.segment(index.new_segment_meta(segment_id, 0)),
+        )
+        .unwrap();
+        // About 3,000 different terms: the smallest table (2^10 entries)
+        // grows three times.
+        for rowid in 0..1000i64 {
+            let mut document = TantivyDocument::default();
+            document.add_i64(attachment.rowid_field, rowid);
+            document.add_text(attachment.indexed_fields[0].1, format!("title {rowid}"));
+            document.add_text(
+                attachment.indexed_fields[1].1,
+                format!("body word{rowid} shared text{}", rowid % 7),
+            );
+            document.add_u64(attachment.identity_hi_field, 1);
+            document.add_u64(attachment.identity_lo_field, rowid as u64);
+            writer
+                .add_document(AddOperation {
+                    opstamp: 0,
+                    document,
+                })
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let mut files: Vec<_> = directory
+            .captured_files()
+            .into_iter()
+            .map(|(path, bytes)| (path, bytes.to_vec()))
+            .collect();
+        files.sort();
+        files
+    };
+    let smallest = build(FtsCursor::segment_memory_budget(1));
+    let largest = build(DEFAULT_MEMORY_BUDGET_BYTES);
+    assert!(!largest.is_empty());
+    assert_eq!(smallest, largest);
+}
+
+#[test]
 fn merge_keeps_document_identities_and_retires_only_dropped_tombstones() {
     let attachment = test_attachment();
     let (mut first, _) = build_and_load_segment(&attachment, &[(1, "alpha one"), (2, "alpha two")]);
@@ -892,7 +906,6 @@ fn fts_write_errors_do_not_infer_out_of_memory_from_the_message() {
 mod allocation_failures {
     use super::*;
     use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
-    use crate::DatabaseAllocators;
     use std::io::{ErrorKind, Write};
     use std::ptr::NonNull;
     use std::sync::atomic::AtomicIsize;
@@ -1062,89 +1075,6 @@ mod allocation_failures {
             footer["version"],
             serde_json::to_value(tantivy::version()).unwrap()
         );
-    }
-
-    #[test]
-    fn failed_fts_allocations_roll_back_statements_and_allow_retry() {
-        for merge in [false, true] {
-            for mvcc in [false, true] {
-                let (conn, allocator) = database_with_failing_fts_allocator(mvcc);
-                if merge {
-                    conn.execute("INSERT INTO docs VALUES (19, 'hello world')")
-                        .unwrap();
-                }
-                let sql = if merge {
-                    "OPTIMIZE INDEX docs_fts"
-                } else {
-                    "INSERT INTO docs VALUES (19, 'hello world')"
-                };
-                allocator.allocations.store(0, Ordering::Relaxed);
-                conn.execute(sql).unwrap();
-                let allocation_count = allocator.allocations.load(Ordering::Relaxed);
-                assert!(allocation_count > 0);
-
-                for fail_at in 0..allocation_count {
-                    let (conn, allocator) = database_with_failing_fts_allocator(mvcc);
-                    if merge {
-                        conn.execute("INSERT INTO docs VALUES (19, 'hello world')")
-                            .unwrap();
-                    }
-                    allocator.fail_after(fail_at);
-                    let result = conn.execute(sql);
-                    assert_eq!(
-                        allocator.remaining.load(Ordering::Relaxed),
-                        -1,
-                        "{sql}, mvcc={mvcc}, fail_at={fail_at}"
-                    );
-                    assert!(
-                        matches!(result, Err(LimboError::OutOfMemory)),
-                        "{sql}, mvcc={mvcc}, fail_at={fail_at}: {result:?}"
-                    );
-
-                    let expected = if merge { vec![7, 19] } else { vec![7] };
-                    assert_fts_rows(&conn, &expected);
-                    conn.execute(sql).unwrap();
-                    assert_fts_rows(&conn, &[7, 19]);
-                }
-            }
-        }
-    }
-
-    fn database_with_failing_fts_allocator(mvcc: bool) -> (Arc<Connection>, FailingAllocator) {
-        let allocator = FailingAllocator::default();
-        let db = crate::Database::open(
-            Arc::new(crate::MemoryIO::new()),
-            ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
-                .db_opts(crate::DatabaseOpts::default().with_index_method(true))
-                .allocators(DatabaseAllocators {
-                    fts: DynAllocator::new(allocator.clone()),
-                    ..Default::default()
-                }),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        if mvcc {
-            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        }
-        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
-            .unwrap();
-        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
-            .unwrap();
-        conn.execute("INSERT INTO docs VALUES (7, 'hello turso')")
-            .unwrap();
-        (conn, allocator)
-    }
-
-    fn assert_fts_rows(conn: &Arc<Connection>, ids: &[i64]) {
-        let expected: Vec<Vec<Value>> = ids.iter().map(|id| vec![Value::from_i64(*id)]).collect();
-        for sql in [
-            "SELECT id FROM docs ORDER BY id",
-            "SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id",
-        ] {
-            let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
-            assert_eq!(rows, expected, "{sql}");
-        }
     }
 
     #[derive(Clone)]

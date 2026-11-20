@@ -823,9 +823,14 @@ fn get_subquery_parser<'a>(
                 // never evaluated: an ORDER BY term that would error at
                 // runtime (e.g. an integer overflow) must not fail the query.
                 // LIMIT and OFFSET stay: with DISTINCT gone they count plain
-                // rows, which matches SQLite.
-                plan.order_by.clear();
-                plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                // rows, which matches SQLite. An OFFSET after DISTINCT ON
+                // counts groups, as in PostgreSQL, so that pair stays whole.
+                let offset_counts_distinct_on_groups =
+                    plan.offset.is_some() && plan.distinctness.is_distinct_on();
+                if !offset_counts_distinct_on_groups {
+                    plan.order_by.clear();
+                    plan.distinctness = crate::translate::plan::Distinctness::NonDistinct;
+                }
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {

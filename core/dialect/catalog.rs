@@ -88,6 +88,12 @@ pub enum AccessStatement<'a> {
         name: &'a str,
         options: &'a ast::RoleOptions,
     },
+    /// `DROP ROLE roles`, which also ends the roles' memberships.
+    /// `if_exists` skips a role that does not exist.
+    DropRole {
+        if_exists: bool,
+        roles: &'a [Grantee],
+    },
     /// `GRANT roles TO grantees`, which makes each grantee a member of each
     /// role, or `REVOKE roles FROM grantees` when `revoke` is set.
     GrantRole {
@@ -117,6 +123,7 @@ impl AccessStatement<'_> {
                 "row-level security is not supported".to_string()
             }
             Self::CreateRole { .. } => "CREATE ROLE is not supported".to_string(),
+            Self::DropRole { .. } => "DROP ROLE is not supported".to_string(),
             Self::GrantRole { revoke, .. } => format!(
                 "{} of role membership is not supported",
                 grant_or_revoke(*revoke)

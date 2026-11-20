@@ -136,6 +136,7 @@ expect {
 # A condition that tursopg cannot print as pg_get_expr does is shown as
 # CREATE POLICY wrote it, which PostgreSQL reads back, rather than as the
 # engine's SQL.
+@compat-gap "function:pg_get_expr"
 test pg-policy-shows-conditions-it-cannot-print-as-written {
     CREATE TABLE pp_docs_10 (id INT, owner TEXT, v VARCHAR(10));
     CREATE POLICY p1 ON pp_docs_10 USING (owner LIKE 'a%' AND v IN ('a', 'b'));
@@ -156,6 +157,7 @@ expect @tursopg {
 
 # pg_get_expr prints the columns of the policy's table without the table's
 # name, so a condition stays valid after the table is renamed.
+@compat-gap "function:pg_get_expr"
 test pg-policy-conditions-do-not-name-the-table {
     CREATE TABLE pp_docs_12 (x INT, owner TEXT);
     CREATE POLICY p1 ON pp_docs_12 USING (pp_docs_12.owner ILIKE 'a%');
@@ -177,9 +179,8 @@ expect @tursopg {
 
 # tursopg runs COLLATE "C" as its default comparison, so the condition it
 # compiles has no COLLATE; the condition is shown as written to keep it.
-# pg_query prints this condition as ARRAY[x, 1][1] > 0, which does not
-# parse, so tursopg cannot keep it as text for the catalogs.
-test pg-policy-refuses-a-condition-it-cannot-keep-as-text {
+@compat-gap "function:pg_get_expr"
+test pg-policy-keeps-an-indexed-array-constructor-as-text {
     CREATE TABLE pp_docs_14 (x INT);
     CREATE POLICY p1 ON pp_docs_14 USING ((ARRAY[x, 1])[1] > 0);
     SELECT polname, pg_get_expr(polqual, polrelid)
@@ -189,9 +190,8 @@ test pg-policy-refuses-a-condition-it-cannot-keep-as-text {
 expect {
     p1|((ARRAY[x, 1])[1] > 0)
 }
-@sqlstate 0A000
-expect @tursopg error {
-    this expression in a policy condition is not supported
+expect @tursopg {
+    p1|(ARRAY[x, 1])[1] > 0
 }
 
 test pg-policy-shows-quoted-and-mixed-case-names {

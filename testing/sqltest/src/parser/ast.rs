@@ -321,6 +321,9 @@ pub struct TestCase {
     pub sql: String,
     /// Expected results (with optional backend-specific overrides)
     pub expectations: Expectations,
+    /// The label of a gap test, from `@compat-gap "<kind>:<object>"`. A gap test
+    /// records a known difference between tursopg and PostgreSQL.
+    pub gap: Option<String>,
     /// Common modifiers (setups, skip, backend, requires)
     pub modifiers: CaseModifiers,
 }

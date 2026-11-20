@@ -4304,7 +4304,7 @@ fn apply_one_select_for_column_rename(
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             let visible_target_qualifiers = outer_target_qualifiers.with_from_tables(
                 from_clause_tables(from),
@@ -4348,6 +4348,25 @@ fn apply_one_select_for_column_rename(
                 apply_expr_for_column_rename(
                     mode,
                     where_expr,
+                    ColumnRenameExprTraversal::Normal,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    None,
+                    &visible_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+
+            for expr in distinctness
+                .iter_mut()
+                .flat_map(|distinctness| distinctness.exprs_mut())
+            {
+                apply_expr_for_column_rename(
+                    mode,
+                    expr,
                     ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
@@ -5510,7 +5529,7 @@ fn validate_one_select_column_refs_after_drop(
             where_clause,
             group_by,
             window_clause,
-            ..
+            distinctness,
         } => {
             let local_visible_columns = merge_column_lists(
                 outer_visible_columns,
@@ -5566,6 +5585,25 @@ fn validate_one_select_column_refs_after_drop(
             if let Some(where_clause) = where_clause {
                 if let Some(bad) = validate_expr_column_refs_after_drop(
                     where_clause,
+                    &local_visible_columns,
+                    owning_table_columns,
+                    allow_bare_owning_columns,
+                    altered_table_norm,
+                    post_drop_table,
+                    resolver,
+                    trigger_database_id,
+                    altered_database_id,
+                )? {
+                    return Ok(Some(bad));
+                }
+            }
+
+            for expr in distinctness
+                .iter()
+                .flat_map(|distinctness| distinctness.exprs())
+            {
+                if let Some(bad) = validate_expr_column_refs_after_drop(
+                    expr,
                     &local_visible_columns,
                     owning_table_columns,
                     allow_bare_owning_columns,

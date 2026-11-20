@@ -32,17 +32,21 @@ use turso_core::mvcc::database::MvStore;
 use turso_core::mvcc::database::RowID;
 use turso_core::mvcc::database::*;
 #[cfg(feature = "conn_raw_api")]
-use turso_core::mvcc::persistent_storage::logical_log::StreamingLogicalLogReader;
+use turso_core::mvcc::persistent_storage::logical_log::{
+    LogOpForTesting, StreamingLogicalLogReader,
+};
 use turso_core::mvcc::persistent_storage::logical_log::{
     LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 use turso_core::mvcc::yield_hooks::YieldPointMarker;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};
 use turso_core::namespace::NamespaceId;
+use turso_core::schema::{Schema, Table};
 use turso_core::state_machine::{StateTransition, TransitionResult};
 use turso_core::storage::sqlite3_ondisk::checksum_wal;
 use turso_core::storage::sqlite3_ondisk::read_varint;
 use turso_core::storage::sqlite3_ondisk::write_varint;
+use turso_core::storage::sqlite3_ondisk::DatabaseHeader;
 use turso_core::storage::sqlite3_ondisk::WalHeader;
 use turso_core::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE;
@@ -62,6 +66,7 @@ use turso_core::IOExt;
 use turso_core::MemoryIO;
 use turso_core::Numeric;
 use turso_core::OpenFlags;
+use turso_core::ReparseSchemaState;
 use turso_core::Result;
 use turso_core::Statement;
 use turso_core::StatementStatusCounter;
@@ -1897,6 +1902,158 @@ impl MvccTestDb {
 }
 
 #[test]
+fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let schema = reparse_physical_schema(&db.conn);
+    let table_root = match schema
+        .get_table(NamespaceId::ROOT, "t")
+        .expect("table t")
+        .as_ref()
+    {
+        Table::BTree(btree) => btree.root_page,
+        _ => panic!("expected btree table"),
+    };
+    let index_root = schema
+        .indices_including_backing(NamespaceId::ROOT, "t")
+        .next()
+        .map(|index| index.root_page)
+        .expect("index idx_t_v");
+
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+
+    db.mvcc_store
+        .with_global_header_mut_for_testing(|header| *header = DatabaseHeader::default())
+        .unwrap();
+    db.mvcc_store
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+
+    db.mvcc_store
+        .reset_after_vacuum_for_testing(header, schema.as_ref());
+
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.schema_cookie.get(), None)
+            .unwrap(),
+        77
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&SQLITE_SCHEMA_MVCC_TABLE_ID),
+        Some(1)
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(table_root))),
+        Some(table_root as u64)
+    );
+    assert_eq!(
+        db.mvcc_store
+            .current_root_page(&MVTableId::from(-(index_root))),
+        Some(index_root as u64)
+    );
+    assert!(
+        db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-999_i64))
+            .is_none(),
+        "stale root-page entries must be cleared"
+    );
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    db.conn
+        .execute("UPDATE t SET v = 'z' WHERE id = 1")
+        .unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Checkpoint-time GC removes the buckets it empties (it runs under the
+    // blocking lock), so recreate the condition VACUUM reset must handle:
+    // lazy background GC empties chains but leaves the buckets in the maps.
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+    db.conn.execute("ROLLBACK").unwrap();
+    db.mvcc_store.drop_unused_row_versions();
+
+    let empty_row_ids = db
+        .mvcc_store
+        .rows
+        .iter()
+        .filter(|entry| entry.value().read().is_empty())
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    let empty_index_ids = db
+        .mvcc_store
+        .index_rows
+        .iter()
+        .filter(|entry| {
+            entry
+                .value()
+                .iter()
+                .all(|row_entry| row_entry.value().read().is_empty())
+        })
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    assert!(
+        !empty_row_ids.is_empty(),
+        "lazy GC should leave empty table row buckets before VACUUM reset"
+    );
+    assert!(
+        !empty_index_ids.is_empty(),
+        "lazy GC should leave empty index buckets before VACUUM reset"
+    );
+
+    let schema = reparse_physical_schema(&db.conn);
+
+    db.mvcc_store
+        .reset_after_vacuum_for_testing(DatabaseHeader::default(), schema.as_ref());
+
+    for row_id in empty_row_ids {
+        assert!(
+            db.mvcc_store.rows.get(&row_id).is_none(),
+            "empty table row buckets must be cleared across VACUUM reset"
+        );
+    }
+    for index_id in empty_index_ids {
+        assert!(
+            db.mvcc_store.index_rows.get(&index_id).is_none(),
+            "empty index buckets must be cleared across VACUUM reset"
+        );
+    }
+}
+
+/// Reads the schema from the B-tree image, as VACUUM does after it rewrote it,
+/// instead of from the MVCC store.
+fn reparse_physical_schema(conn: &Arc<Connection>) -> Arc<Schema> {
+    conn.demote_to_mvcc_connection();
+    let mut state = ReparseSchemaState::default();
+    conn.get_pager()
+        .io
+        .block(|| conn.reparse_schema_nonblock(&mut state))
+        .unwrap();
+    let schema = conn.current_schema();
+    conn.promote_to_regular_connection();
+    schema
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
@@ -2798,6 +2955,52 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     assert_eq!(rows.len(), 1, "committed row must survive recovery");
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(rows[0][1].to_string(), "x");
+}
+
+/// A TRUNCATE checkpoint truncates the logical log (step 8) before it truncates the WAL
+/// (step 10). A process killed between the two leaves a committed WAL and a 0-byte log.
+/// Every frame the log held is at or below the boundary committed to the WAL, so recovery
+/// must complete the checkpoint, not fail closed with "logical log header is missing"
+/// (#7480). Passive checkpoints stay OFF here: this is the default-mode crash window.
+#[test]
+fn test_bootstrap_recovers_truncate_checkpoint_killed_before_wal_truncate() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path().to_string();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let mvcc_store = db.get_mvcc_store();
+        // Stop right after the pager commit: the WAL holds the committed frames.
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store.clone(), &conn);
+        // The crash window: logical log already truncated to 0, WAL not yet truncated.
+        let log_file = mvcc_store.get_logical_log_file();
+        let c = log_file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+        conn.db.io.wait_for_completion(c).unwrap();
+    }
+    db.close();
+    let wal_path = wal_path_for_db(&db_path);
+    assert!(wal_path.metadata().map(|m| m.len()).unwrap_or(0) > 0);
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+        .expect("a TRUNCATE checkpoint killed before its WAL truncate must stay openable");
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .expect("connect should complete the checkpoint");
+    let rows = get_rows(&conn, "SELECT count(*), min(id), max(id) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 50);
+    assert_eq!(rows[0][1].as_int().unwrap(), 0);
+    assert_eq!(rows[0][2].as_int().unwrap(), 49);
+    assert_eq!(wal_path.metadata().map(|m| m.len()).unwrap_or(0), 0);
+    assert_integrity_ok(&conn);
+    conn.execute("INSERT INTO t VALUES (100, 'after')").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 51);
 }
 
 /// MVCC supports only Passive and Truncate, so a requested FULL checkpoint maps to
@@ -9235,6 +9438,122 @@ fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
         clients,
         vec!["client-a".to_string(), "client-a".to_string()]
     );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_emit_header_only_commits() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn.execute("PRAGMA user_version = 42").unwrap();
+    db.conn.execute("PRAGMA application_id = 1337").unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let recovery_ops = collect_mvcc_log_ops(&db.conn);
+
+    // Header-only commits touch no user object, but a portable-enabled writer
+    // still emits the extension block so readers can tell an empty change set
+    // apart from pre-portable history. The payload therefore carries the frame
+    // cursor and commit timestamp and nothing else.
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert_eq!(txns.len(), 2);
+    assert!(decoded_object_maps(&txns).is_empty());
+    assert!(txns.iter().all(|txn| txn.metadata.is_empty()));
+    assert_eq!(
+        recovery_ops
+            .iter()
+            .filter(|op| matches!(op, LogOpForTesting::UpdateHeader))
+            .count(),
+        2
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let recovery_ops = collect_mvcc_log_ops(&db.conn);
+
+    let delete_pk_record = recovery_ops.iter().find_map(|op| match op {
+        LogOpForTesting::DeleteTable {
+            rowid,
+            record_bytes,
+            pk_record_bytes,
+            ..
+        } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => {
+            assert!(
+                record_bytes.is_empty(),
+                "data DELETE must not duplicate the full row record"
+            );
+            Some(pk_record_bytes.clone())
+        }
+        _ => None,
+    });
+    let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let delete_pk_record = collect_mvcc_log_ops(&db.conn)
+        .into_iter()
+        .find_map(|op| match op {
+            LogOpForTesting::DeleteTable {
+                rowid,
+                pk_record_bytes,
+                ..
+            } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => Some(pk_record_bytes),
+            _ => None,
+        })
+        .expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
+        .get_values_owned()
+        .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn collect_mvcc_log_ops(conn: &Arc<Connection>) -> Vec<LogOpForTesting> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+    reader.read_ops_for_testing(&io).unwrap()
 }
 
 #[cfg(feature = "conn_raw_api")]

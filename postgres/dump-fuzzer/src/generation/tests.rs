@@ -40,7 +40,7 @@ fn inserts_follow_column_types_and_constraints(tc: TestCase) {
     let mut statements = vec![Statement::CreateTable(table.clone())];
     statements.extend(tc.draw(data::inserts(table.clone())));
     let sql = Workload(statements).to_string();
-    let parsed = pg_query::parse(&sql).unwrap();
+    let parsed = pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT).unwrap();
     let mut keys = std::collections::BTreeSet::new();
     for statement in parsed.protobuf.stmts {
         let Some(N::InsertStmt(insert)) = statement.stmt.and_then(|s| s.node) else {
@@ -87,13 +87,13 @@ fn inserts_follow_column_types_and_constraints(tc: TestCase) {
 #[hegel::test(test_cases = 2000)]
 fn table_workloads_are_valid_postgres_syntax(tc: TestCase) {
     let sql = tc.draw(workload(Profile::Tables, vec![]));
-    pg_query::parse(&sql).unwrap();
+    pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT).unwrap();
 }
 
 #[hegel::test(test_cases = 2000)]
 fn compatible_workloads_are_valid_postgres_syntax(tc: TestCase) {
     let sql = tc.draw(workload(Profile::Compatible, vec![]));
-    pg_query::parse(&sql).unwrap();
+    pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT).unwrap();
 }
 #[hegel::test(test_cases = 2000)]
 fn disabled_features_are_absent_from_compatible_ast(tc: TestCase) {
@@ -102,7 +102,7 @@ fn disabled_features_are_absent_from_compatible_ast(tc: TestCase) {
             .max_size(Feature::value_variants().len()),
     );
     let sql = tc.draw(workload(Profile::Compatible, disabled.clone()));
-    let parsed = pg_query::parse(&sql).unwrap();
+    let parsed = pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT).unwrap();
     for statement in parsed.protobuf.stmts {
         use pg_query::{
             protobuf::{AlterTableType as A, ConstrType},
@@ -197,7 +197,7 @@ fn independent_access_controls_stay_enabled(tc: TestCase) {
     };
     let table = tc.draw(schema::table(0, config.clone()));
     let sql = Workload(tc.draw(access_control(table, config))).to_string();
-    let nodes: Vec<_> = pg_query::parse(&sql)
+    let nodes: Vec<_> = pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT)
         .unwrap()
         .protobuf
         .stmts
@@ -235,7 +235,11 @@ fn workload_orders_steps_and_keeps_access_control_out_of_tables_profile(tc: Test
     let sql = tc.draw(workload(profile, disabled));
     let mut last_phase = 0;
     let mut created = false;
-    for statement in pg_query::parse(&sql).unwrap().protobuf.stmts {
+    for statement in pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT)
+        .unwrap()
+        .protobuf
+        .stmts
+    {
         let phase = match statement.stmt.unwrap().node.unwrap() {
             N::VariableSetStmt(_) => continue,
             N::CreateStmt(_) => {
@@ -288,7 +292,7 @@ fn rendered_values_preserve_their_contents(tc: TestCase) {
         table: Identifier::new("t"),
         row: Row(values.clone()),
     };
-    let parsed = pg_query::parse(&statement.to_string()).unwrap();
+    let parsed = pg_query::parse(&statement.to_string(), pg_query::ParserOptions::DEFAULT).unwrap();
     let pg_query::NodeEnum::InsertStmt(insert) = parsed.protobuf.stmts[0]
         .stmt
         .as_ref()
@@ -342,7 +346,7 @@ fn insert_preserves_quoted_target_identifier(tc: TestCase) {
         table: Identifier::new(target.clone()),
         row: Row(vec![Value::Null]),
     };
-    let parsed = pg_query::parse(&statement.to_string()).unwrap();
+    let parsed = pg_query::parse(&statement.to_string(), pg_query::ParserOptions::DEFAULT).unwrap();
     assert_eq!(parsed.protobuf.stmts.len(), 1);
     let pg_query::NodeEnum::InsertStmt(insert) = parsed.protobuf.stmts[0]
         .stmt
@@ -368,7 +372,7 @@ fn identifier_rejects_names_postgres_cannot_preserve() {
 fn integer_extrema_render_exactly() {
     for value in [i64::MIN, i64::MAX] {
         let sql = format!("INSERT INTO t VALUES ({});", model::Value::Integer(value));
-        let parsed = pg_query::parse(&sql).unwrap();
+        let parsed = pg_query::parse(&sql, pg_query::ParserOptions::DEFAULT).unwrap();
         let pg_query::NodeEnum::InsertStmt(insert) = parsed.protobuf.stmts[0]
             .stmt
             .as_ref()
@@ -431,7 +435,11 @@ fn access_control_rendering_preserves_typed_fields(tc: TestCase) {
     };
     let table = tc.draw(schema::table(0, config.clone()));
     let statements = tc.draw(access_control(table, config));
-    let parsed = pg_query::parse(&Workload(statements.clone()).to_string()).unwrap();
+    let parsed = pg_query::parse(
+        &Workload(statements.clone()).to_string(),
+        pg_query::ParserOptions::DEFAULT,
+    )
+    .unwrap();
     assert_eq!(statements.len(), parsed.protobuf.stmts.len());
     for (expected, actual) in statements.iter().zip(parsed.protobuf.stmts) {
         match (expected, actual.stmt.unwrap().node.unwrap()) {
@@ -507,7 +515,11 @@ fn schema_rendering_preserves_columns_and_constraints(tc: TestCase) {
         },
     };
     let expected = tc.draw(schema::table(0, config));
-    let parsed = pg_query::parse(&Statement::CreateTable(expected.clone()).to_string()).unwrap();
+    let parsed = pg_query::parse(
+        &Statement::CreateTable(expected.clone()).to_string(),
+        pg_query::ParserOptions::DEFAULT,
+    )
+    .unwrap();
     let N::CreateStmt(actual) = parsed.protobuf.stmts[0]
         .stmt
         .as_ref()
@@ -581,7 +593,11 @@ fn indexes_preserve_keys_ordering_and_uniqueness(tc: TestCase) {
     };
     let table = tc.draw(schema::table(0, config.clone()));
     let statements = tc.draw(schema::indexes(table, config));
-    let parsed = pg_query::parse(&Workload(statements.clone()).to_string()).unwrap();
+    let parsed = pg_query::parse(
+        &Workload(statements.clone()).to_string(),
+        pg_query::ParserOptions::DEFAULT,
+    )
+    .unwrap();
     assert_eq!(statements.len(), parsed.protobuf.stmts.len());
     for (statement, actual) in statements.iter().zip(parsed.protobuf.stmts) {
         let Statement::CreateIndex {

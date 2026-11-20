@@ -123,3 +123,61 @@ test without-rowid-add-column-check-rejects-primary-key-value {
 expect error {
     CHECK constraint failed: a = 5
 }
+
+test without-rowid-automatic-index-keeps-rows-sharing-read-columns {
+    CREATE TABLE c(a INTEGER, b INTEGER, w, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k);
+    INSERT INTO c VALUES (1, 1, 0), (1, 2, 0), (1, 3, 0);
+    INSERT INTO p VALUES (1, 1), (2, 9);
+    SELECT count(*) FROM p JOIN c ON c.a = p.k;
+}
+expect {
+    3
+}
+
+test without-rowid-automatic-index-left-join-keeps-rows-sharing-read-columns {
+    CREATE TABLE c(a INTEGER, b INTEGER, w, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k);
+    INSERT INTO c VALUES (1, 1, 0), (1, 2, 0), (1, 3, 0);
+    INSERT INTO p VALUES (1, 1), (2, 9);
+    SELECT p.id, count(c.w) FROM p LEFT JOIN c ON c.a = p.k GROUP BY p.id;
+}
+expect {
+    1|3
+    2|0
+}
+
+test without-rowid-automatic-index-three-column-primary-key {
+    CREATE TABLE c(a INTEGER, b INTEGER, d INTEGER, w, PRIMARY KEY(a, b, d)) WITHOUT ROWID;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k);
+    INSERT INTO c VALUES (1, 1, 1, 0), (1, 1, 2, 0), (1, 2, 1, 0), (2, 1, 1, 0);
+    INSERT INTO p VALUES (1, 1), (2, 9);
+    SELECT count(*) FROM p JOIN c ON c.a = p.k;
+}
+expect {
+    3
+}
+
+test without-rowid-automatic-index-descending-primary-key-column {
+    CREATE TABLE c(a INTEGER, b INTEGER, w, PRIMARY KEY(a DESC, b)) WITHOUT ROWID;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k);
+    INSERT INTO c VALUES (1, 1, 0), (1, 2, 0), (1, 3, 0);
+    INSERT INTO p VALUES (1, 1), (2, 9);
+    SELECT count(*) FROM p JOIN c ON c.a = p.k;
+}
+expect {
+    3
+}
+
+test without-rowid-automatic-index-reading-all-primary-key-columns {
+    CREATE TABLE c(a INTEGER, b INTEGER, w, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k);
+    INSERT INTO c VALUES (1, 1, 0), (1, 2, 0), (1, 3, 0);
+    INSERT INTO p VALUES (1, 1), (2, 9);
+    SELECT p.id, c.a, c.b FROM p JOIN c ON c.a = p.k ORDER BY c.b;
+}
+expect {
+    1|1|1
+    1|1|2
+    1|1|3
+}

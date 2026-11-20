@@ -145,14 +145,14 @@ test('on-disk db', () => {
         db1.exec("CREATE TABLE t(x)");
         db1.exec("INSERT INTO t VALUES (1), (2), (3)");
         const stmt1 = db1.prepare("SELECT * FROM t WHERE x % 2 = ?");
-        expect(stmt1.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt1.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows1 = stmt1.all([1]);
         expect(rows1).toEqual([{ x: 1 }, { x: 3 }]);
         db1.close();
 
         const db2 = new Database(path);
         const stmt2 = db2.prepare("SELECT * FROM t WHERE x % 2 = ?");
-        expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt2.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows2 = stmt2.all([1]);
         expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
         db2.close();
@@ -176,7 +176,7 @@ test('attach', () => {
         db1.exec(`ATTACH '${path2}' as secondary`);
 
         const stmt = db1.prepare("SELECT * FROM t UNION ALL SELECT * FROM secondary.q");
-        expect(stmt.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
+        expect(stmt.columns()).toEqual([{ name: "x", column: "x", database: "main", table: "t", type: null }]);
         const rows = stmt.all([1]);
         expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }]);
     } finally {
@@ -230,4 +230,63 @@ test('encryption', () => {
     } finally {
         unlinkSync(path);
     }
+})
+
+test('a transaction function called inside another runs as a savepoint, as in better-sqlite3', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        if (x === 2) throw new Error('inner failed');
+    });
+    const outer = db.transaction(() => {
+        inner(1);
+        expect(() => inner(2)).toThrow('inner failed');
+        insert.run(3);
+    });
+    outer();
+    expect(db.prepare('SELECT x FROM t ORDER BY x').all()).toEqual([{ x: 1 }, { x: 3 }]);
+})
+
+test('transaction functions nest three deep, each level rolling back only itself', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        throw new Error('inner failed');
+    });
+    const middle = db.transaction(() => {
+        insert.run(2);
+        expect(() => inner(3)).toThrow('inner failed');
+        insert.run(4);
+    });
+    const outer = db.transaction(() => {
+        insert.run(1);
+        middle();
+        insert.run(5);
+    });
+    outer();
+    expect(db.inTransaction).toBe(false);
+    expect(db.prepare('SELECT x FROM t ORDER BY x').all()).toEqual([{ x: 1 }, { x: 2 }, { x: 4 }, { x: 5 }]);
+})
+
+test('an error that leaves every nested transaction function rolls back the whole transaction', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE t (x INTEGER)');
+    const insert = db.prepare('INSERT INTO t VALUES (?)');
+    const inner = db.transaction((x) => {
+        insert.run(x);
+        throw new Error('inner failed');
+    });
+    const outer = db.transaction(() => {
+        insert.run(1);
+        inner(2);
+    });
+    expect(() => outer()).toThrow('inner failed');
+    expect(db.inTransaction).toBe(false);
+    expect(db.prepare('SELECT x FROM t').all()).toEqual([]);
+    db.transaction(() => insert.run(3))();
+    expect(db.prepare('SELECT x FROM t').all()).toEqual([{ x: 3 }]);
 })

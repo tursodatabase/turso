@@ -266,3 +266,59 @@ fn test_alter_table_preserves_catalog_names_after_reopen(db: TempDatabase) {
         ]
     );
 }
+
+/// Opening a database and reading its schema again go through the same
+/// steps, so the catalogs must report the same objects after both.
+#[test]
+fn catalogs_report_the_same_objects_after_open_and_after_the_schema_is_read_again() {
+    let db = TempDatabase::builder().build();
+    {
+        let conn = db.connect_postgres();
+        conn.execute("CREATE SCHEMA app").unwrap();
+        conn.execute("CREATE SEQUENCE app.ids START WITH 5")
+            .unwrap();
+        conn.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+            .unwrap();
+        conn.execute("CREATE ROLE alice").unwrap();
+        conn.execute("CREATE TABLE app.docs (id int PRIMARY KEY, feeling mood)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_feeling ON app.docs (feeling)")
+            .unwrap();
+        conn.execute("ALTER TABLE app.docs OWNER TO alice").unwrap();
+    }
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+
+    let after_open = catalog_rows(&conn);
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+    let after_reading_again = catalog_rows(&conn);
+
+    for name in ["app", "ids", "mood", "alice", "docs", "docs_feeling"] {
+        assert!(
+            after_open
+                .iter()
+                .any(|row| row.contains(&Value::build_text(name))),
+            "{name} is missing from the catalogs: {after_open:?}"
+        );
+    }
+    assert_eq!(after_open, after_reading_again);
+}
+
+/// What the catalogs report about schemas, relations, sequences, types and
+/// roles.
+fn catalog_rows(conn: &turso_pg::Connection) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for sql in [
+        "SELECT oid, nspname, nspowner FROM pg_namespace ORDER BY oid",
+        "SELECT oid, relname, relnamespace, relkind, relowner FROM pg_class ORDER BY oid",
+        "SELECT schemaname, sequencename, start_value, increment_by FROM pg_sequences \
+         ORDER BY schemaname, sequencename",
+        "SELECT oid, typname, typnamespace, typtype FROM pg_type ORDER BY oid",
+        "SELECT oid, rolname, rolsuper FROM pg_roles ORDER BY oid",
+        "SELECT attrelid, attname, atttypid FROM pg_attribute ORDER BY attrelid, attnum",
+    ] {
+        let mut stmt = conn.query(sql).unwrap().unwrap();
+        rows.extend(stmt.run_collect_rows().unwrap());
+    }
+    rows
+}

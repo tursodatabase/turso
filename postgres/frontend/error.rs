@@ -53,12 +53,18 @@ impl From<LimboError> for Error {
 }
 
 /// An engine error with the message `message`, which reports SQLSTATE
-/// `sqlstate` to the client. Use it for errors that the PostgreSQL frontend
-/// raises itself, also in the PostgreSQL functions that the engine runs.
-pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
+/// `sqlstate` to the client, with the DETAIL `detail` if there is one. Use
+/// it for errors that the PostgreSQL frontend raises itself, also in the
+/// PostgreSQL functions that the engine runs.
+pub fn sqlstate_error(
+    sqlstate: &'static str,
+    message: impl Into<String>,
+    detail: Option<String>,
+) -> LimboError {
     LimboError::Dialect(Box::new(DialectError {
         code: sqlstate,
         message: message.into(),
+        detail,
     }))
 }
 
@@ -67,7 +73,7 @@ pub fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> Lim
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
         turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
-            sqlstate_error(sqlstate, message)
+            sqlstate_error(sqlstate, message, None)
         }
         other => LimboError::ParseError(other.to_string()),
     }
@@ -80,6 +86,7 @@ pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
     sqlstate_error(
         turso_pg_parser::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
         "current transaction is aborted, commands ignored until end of transaction block",
+        None,
     )
 }
 
@@ -119,6 +126,10 @@ impl From<&LimboError> for ErrorReport {
         }
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
+            report.detail = permission_denied_detail(denial);
+        }
+        if let LimboError::Dialect(error) = error {
+            report.detail.clone_from(&error.detail);
         }
         report
     }
@@ -328,7 +339,7 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
-    } else if msg.starts_with("ambiguous column name") {
+    } else if msg.starts_with("ambiguous column name") || msg.ends_with("\" is ambiguous") {
         SQLSTATE_AMBIGUOUS_COLUMN
     } else if msg.starts_with("misuse of aggregate")
         || msg.starts_with("aggregate functions are not allowed")
@@ -338,7 +349,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("window functions are not allowed")
     {
         SQLSTATE_WINDOWING_ERROR
-    } else if msg.starts_with("invalid reference to FROM-clause entry") {
+    } else if msg.starts_with("invalid reference to FROM-clause entry")
+        || msg == "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        || msg == "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        || msg.contains(" term out of range - should be between ")
+    {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
@@ -362,7 +377,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.starts_with("there is no parameter $") {
         SQLSTATE_UNDEFINED_PARAMETER
-    } else if msg == "subqueries in policies are not supported" {
+    } else if msg == "subqueries in policies are not supported"
+        || (msg.contains("DISTINCT ON") && msg.ends_with(" is not supported"))
+    {
         SQLSTATE_FEATURE_NOT_SUPPORTED
     } else if msg == "sequence must have same owner as table it is linked to" {
         SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE
@@ -440,10 +457,7 @@ fn raise_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE
     } else if msg == "value too long for varchar" {
         SQLSTATE_STRING_DATA_RIGHT_TRUNCATION
-    } else if msg.starts_with("cannot call ")
-        || msg.starts_with("cannot deconstruct ")
-        || msg.ends_with(" must be an array of objects")
-    {
+    } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else {
         SQLSTATE_RAISE_EXCEPTION
@@ -485,6 +499,7 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
     match (denial.action, &denial.object) {
         (Action::CreateTemporary, _) => "permission denied to create temporary objects".into(),
         (Action::Create, Object::Role(_)) => "permission denied to create role".into(),
+        (Action::Drop, Object::Role(_)) => "permission denied to drop role".into(),
         (Action::Write, Object::Setting(name)) => {
             format!("permission denied to set parameter \"{name}\"")
         }
@@ -500,6 +515,21 @@ fn permission_denied_message(denial: &PermissionDenied) -> String {
         }
         (_, Object::File(_)) => "permission denied to COPY from a file".into(),
         (_, object) => format!("permission denied for {}", object_name(object)),
+    }
+}
+
+/// The DETAIL PostgreSQL gives with a denial, for the denials that have one.
+fn permission_denied_detail(denial: &PermissionDenied) -> Option<String> {
+    match (&denial.reason, denial.action, &denial.object) {
+        (Reason::Privilege, Action::Create, Object::Role(_)) => {
+            Some("Only roles with the CREATEROLE attribute may create roles.".to_string())
+        }
+        (Reason::Privilege, Action::Drop, Object::Role(_)) => Some(
+            "Only roles with the CREATEROLE attribute and the ADMIN option on the target roles \
+             may drop roles."
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -585,6 +615,39 @@ mod tests {
             (
                 "role \"no such table\" already exists",
                 SQLSTATE_DUPLICATE_OBJECT,
+            ),
+            (
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "1st DISTINCT ON term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            (
+                "1st ORDER BY term out of range - should be between 1 and 2",
+                SQLSTATE_INVALID_COLUMN_REFERENCE,
+            ),
+            ("ORDER BY \"a\" is ambiguous", SQLSTATE_AMBIGUOUS_COLUMN),
+            (
+                "SELECT DISTINCT ON with a volatile function in the select list is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "a DISTINCT ON expression that is neither a GROUP BY expression nor an aggregate is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
+            (
+                "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
             ),
             ("\"t\" is not a sequence", SQLSTATE_WRONG_OBJECT_TYPE),
             ("\"t\" is not an index", SQLSTATE_WRONG_OBJECT_TYPE),
