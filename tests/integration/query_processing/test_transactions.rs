@@ -2665,3 +2665,36 @@ fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempData
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
     assert_eq!(rows, vec![(1,)]);
 }
+
+// https://github.com/tursodatabase/turso/issues/11276
+// A driver that keeps prepared statements around (better-sqlite3 style `all()`)
+// finishes a `pragma_table_info` scan without resetting or dropping it. The
+// pragma cursor owns a nested helper statement, and inside BEGIN nothing ended
+// it at Halt, so the next statement on the connection believed it was nested,
+// never upgraded the transaction to a write and panicked in SetCookie.
+#[turso_macros::test]
+fn test_ddl_after_finished_pragma_table_valued_statement_in_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a)").unwrap();
+    conn.execute("BEGIN").unwrap();
+
+    let mut table_info = conn
+        .prepare("SELECT name FROM pragma_table_info('t')")
+        .unwrap();
+    let rows = table_info.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    // `table_info` is finished but still alive: neither reset nor dropped.
+
+    conn.execute("CREATE TABLE u (b)").unwrap();
+    conn.execute("ALTER TABLE u ADD COLUMN c").unwrap();
+    conn.execute("INSERT INTO u VALUES (1, 2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT b, c FROM u");
+    assert_eq!(rows, vec![(1, 2)]);
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('t', 'u') ORDER BY name",
+    );
+    assert_eq!(rows, vec![("t".to_string(),), ("u".to_string(),)]);
+    drop(table_info);
+}
