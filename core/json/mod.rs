@@ -13,14 +13,17 @@ pub use crate::json::ops::{
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};
-use crate::types::{validate_utf8, AsValueRef, Text, TextSubtype, Value, ValueBlob, ValueType};
+use crate::types::{
+    validate_utf8, value_blob_from_slice, AsValueRef, Text, TextSubtype, Value, ValueBlob,
+    ValueType,
+};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
 use crate::{LimboError, ValueRef};
 use cache::CachedJsonPath;
 pub use cache::JsonCacheCell;
 use jsonb::{
-    jsonb_error_position, unescape_string, utf8_lossy, validate_jsonb, ElementType, Jsonb,
-    JsonbHeader, ParseInfo, PathOperationMode, SearchOperation, SetOperation,
+    find_path_element, jsonb_error_position, unescape_string, utf8_lossy, validate_jsonb,
+    ElementType, Jsonb, JsonbHeader, ParseInfo, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -37,6 +40,7 @@ pub enum Conv {
 }
 
 #[cfg(feature = "json")]
+#[derive(Clone, Copy)]
 pub enum OutputVariant {
     ElementType,
     ElementTypePlain,
@@ -354,7 +358,7 @@ pub fn json_array_length(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
 
     if path.is_none() {
         let len = json.array_len()?;
@@ -364,10 +368,11 @@ pub fn json_array_length(
     let path = cached_json_path(json_cache, path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
-        let mut op = SearchOperation::new();
-        let _ = json.operate_on_path(&path, &mut op);
-        if let Ok(len) = op.into_element(json).array_len() {
-            return Ok(Value::from_i64(len as i64));
+        if let Ok(Some(target)) = find_path_element(json.as_bytes(), &path) {
+            let element = &json.as_bytes()[target.start..target.end];
+            if let Ok(len) = jsonb::array_len(element) {
+                return Ok(Value::from_i64(len as i64));
+            }
         }
     }
     Ok(Value::Null)
@@ -471,18 +476,13 @@ pub fn json_arrow_extract(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    if let Some(path) = cached_json_path(json_cache, &path, false)? {
-        let mut op = SearchOperation::new();
-        let res = json.operate_on_path(&path, &mut op);
-        let extracted = op.into_element(json);
-        if res.is_ok() {
-            Ok(Value::Text(Text::json(extracted.to_string()?)))
-        } else {
-            Ok(Value::Null)
-        }
-    } else {
-        Ok(Value::Null)
+    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    let Some(path) = cached_json_path(json_cache, &path, false)? else {
+        return Ok(Value::Null);
+    };
+    match find_path_element(json.as_bytes(), &path) {
+        Ok(Some(target)) => Ok(Value::Text(Text::json(json.element_to_string(target)?))),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -498,27 +498,16 @@ pub fn json_arrow_shift_extract(
         return Ok(Value::Null);
     }
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    if let Some(path) = cached_json_path(json_cache, &path, false)? {
-        let mut op = SearchOperation::new();
-        let res = json.operate_on_path(&path, &mut op);
-        let extracted = op.into_element(json);
-        let element_type = match extracted.element_type() {
-            Err(_) => return Ok(Value::Null),
-            Ok(el) => el,
-        };
-
-        if res.is_ok() {
-            Ok(json_string_to_db_type(
-                extracted,
-                element_type,
-                OutputVariant::ElementTypePlain,
-            )?)
-        } else {
-            Ok(Value::Null)
-        }
-    } else {
-        Ok(Value::Null)
+    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    let Some(path) = cached_json_path(json_cache, &path, false)? else {
+        return Ok(Value::Null);
+    };
+    match find_path_element(json.as_bytes(), &path) {
+        Ok(Some(target)) => element_to_db_type(
+            &json.as_bytes()[target.start..target.end],
+            OutputVariant::ElementTypePlain,
+        ),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -546,13 +535,12 @@ where
     }
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-    // The result is an SQL value or JSON text, which does not keep the
-    // buffer of the element.
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths, json_cache)?;
-
-    let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
-
-    Ok(result)
+    extract_paths(
+        jsonb.as_bytes(),
+        paths,
+        json_cache,
+        OutputVariant::ElementType,
+    )
 }
 
 pub fn jsonb_extract<I, E, V>(
@@ -575,75 +563,56 @@ where
     }
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths, json_cache)?;
-    if let ElementType::ARRAY | ElementType::OBJECT = element_type {
-        // The result is in a buffer with the capacity of the document, and a
-        // BLOB keeps the buffer that it gets. Thus the BLOB gets a copy.
-        return json_ref_to_db_type(&json, element_type, OutputVariant::Binary);
-    }
-    json_string_to_db_type(json, element_type, OutputVariant::ElementType)
+    extract_paths(jsonb.as_bytes(), paths, json_cache, OutputVariant::Binary)
 }
 
-/// Extracts the elements of `value` at `paths`. With one path, the result is
-/// the element; with more, an array of the elements. The element of a single
-/// path is given in the buffer of `value`, which is larger than the element,
-/// as [SearchOperation::into_element] gives it.
-fn jsonb_extract_internal<E, V>(
-    value: Jsonb,
+/// The result of json_extract and jsonb_extract for the JSONB document `json`:
+/// with one path, the element at the path, and with more, an array of the
+/// elements at the paths. A path that selects no element gives NULL, or a null
+/// element in the array. An array or object result is converted with
+/// `container_output`, and a string, number or boolean becomes its SQL value.
+fn extract_paths<E, V>(
+    json: &[u8],
     mut paths: E,
     json_cache: &JsonCacheCell,
-) -> crate::Result<(Jsonb, ElementType)>
+    container_output: OutputVariant,
+) -> crate::Result<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    // The NULL result is only made when it is returned.
-    let null = || Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
         })?;
-        if let Some(path) = cached_json_path(json_cache, &first_path, true)? {
-            let mut json = value;
-
-            let mut op = SearchOperation::new();
-            let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.into_element(json);
-            let element_type = match extracted.element_type() {
-                Err(_) => return Ok((null()?, ElementType::NULL)),
-                Ok(el) => el,
-            };
-            if res.is_ok() {
-                return Ok((extracted, element_type));
-            } else {
-                return Ok((null()?, ElementType::NULL));
-            }
-        } else {
-            return Ok((null()?, ElementType::NULL));
-        }
+        let Some(path) = cached_json_path(json_cache, &first_path, true)? else {
+            return Ok(Value::Null);
+        };
+        let Ok(Some(target)) = find_path_element(json, &path) else {
+            return Ok(Value::Null);
+        };
+        let element = &json[target.start..target.end];
+        let output = match JsonbHeader::from_slice(0, element)?.0.element_type() {
+            ElementType::ARRAY | ElementType::OBJECT => container_output,
+            _ => OutputVariant::ElementType,
+        };
+        return element_to_db_type(element, output);
     }
 
-    let mut json = value;
     let mut result = Jsonb::make_empty_array(json.len())?;
-
-    // TODO: make an op to avoid creating new json for every path element
     for path in paths {
-        let path = cached_json_path(json_cache, &path, true);
-        if let Some(path) = path? {
-            let mut op = SearchOperation::new();
-            let res = json.operate_on_path(&path, &mut op);
-            if res.is_ok() {
-                result.append_to_array_unsafe(op.element_in(&json));
-            } else {
-                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
-            }
-        } else {
-            return Ok((null()?, ElementType::NULL));
+        let Some(path) = cached_json_path(json_cache, &path, true)? else {
+            return Ok(Value::Null);
+        };
+        match find_path_element(json, &path) {
+            Ok(Some(target)) => result.append_to_array_unsafe(&json[target.start..target.end]),
+            _ => result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes()),
         }
     }
     result.finalize_unsafe(ElementType::ARRAY)?;
-    Ok((result, ElementType::ARRAY))
+    // The array has the capacity of the document, so a BLOB result gets a
+    // copy of it, as json_ref_to_db_type makes.
+    json_ref_to_db_type(&result, ElementType::ARRAY, container_output)
 }
 
 /// converts a `Jsonb` value to a db Value
@@ -684,45 +653,8 @@ pub(crate) fn json_ref_to_db_type(
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.try_clone()?.data()));
     }
-    // SQL values of TEXT5 strings are decoded from the payload, not from the
-    // JSON rendering, because escapes that cannot be rendered as JSON text
-    // still extract, as in SQLite.
-    if element_type == ElementType::TEXT5
-        && matches!(
-            flag,
-            OutputVariant::ElementType | OutputVariant::ElementTypePlain
-        )
-    {
-        return Ok(Value::Text(Text::new(json.scalar_string_value()?)));
-    }
-    // A string with no byte that its JSON text escapes, a number with a UTF-8
-    // payload and a boolean give the same SQL value without the JSON text: the
-    // steps below would remove the quotes and the escapes that the text adds
-    // again, and read a number from its payload text.
-    if matches!(
-        flag,
-        OutputVariant::ElementType | OutputVariant::ElementTypePlain
-    ) {
-        if let Some(payload) = json.plain_string_payload() {
-            return Ok(Value::Text(Text::new(utf8_lossy(payload).into_owned())));
-        }
-        if let Some(payload) = json.scalar_payload() {
-            match element_type {
-                ElementType::INT => {
-                    if let Some(text) = validate_utf8(payload) {
-                        return int_text_to_db_type(text, text);
-                    }
-                }
-                ElementType::FLOAT => {
-                    if let Some(text) = validate_utf8(payload) {
-                        return float_text_to_db_type(text);
-                    }
-                }
-                ElementType::TRUE => return Ok(Value::from_i64(1)),
-                ElementType::FALSE => return Ok(Value::from_i64(0)),
-                _ => {}
-            }
-        }
+    if let Some(value) = scalar_to_db_type(json.as_bytes(), element_type, flag) {
+        return value;
     }
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::String) {
@@ -755,6 +687,65 @@ pub(crate) fn json_ref_to_db_type(
         ElementType::TRUE => Ok(Value::from_i64(1)),
         ElementType::FALSE => Ok(Value::from_i64(0)),
         _ => unreachable!(),
+    }
+}
+
+/// Converts `element`, an element of a JSONB document, to an SQL value, as
+/// [json_string_to_db_type] converts a document. A string, a number or a
+/// boolean is read from its bytes. Other elements are copied into a document
+/// of their own first.
+fn element_to_db_type(element: &[u8], flag: OutputVariant) -> crate::Result<Value> {
+    let element_type = JsonbHeader::from_slice(0, element)?.0.element_type();
+    if element_type == ElementType::NULL {
+        return Ok(Value::Null);
+    }
+    if matches!(flag, OutputVariant::Binary) {
+        return Ok(Value::Blob(value_blob_from_slice(element)?));
+    }
+    if let Some(value) = scalar_to_db_type(element, element_type, flag) {
+        return value;
+    }
+    json_ref_to_db_type(&Jsonb::from_raw_data(element)?, element_type, flag)
+}
+
+/// The SQL value of the string, number or boolean element at the start of
+/// `element`, when it is the same without the JSON text of the element:
+/// [json_ref_to_db_type] would remove the quotes and the escapes that the text
+/// adds, and read a number from its payload text. Returns None for the other
+/// elements and for `OutputVariant::Binary` and `OutputVariant::String`.
+#[inline]
+fn scalar_to_db_type(
+    element: &[u8],
+    element_type: ElementType,
+    flag: OutputVariant,
+) -> Option<crate::Result<Value>> {
+    if !matches!(
+        flag,
+        OutputVariant::ElementType | OutputVariant::ElementTypePlain
+    ) {
+        return None;
+    }
+    // SQL values of TEXT5 strings are decoded from the payload, not from the
+    // JSON rendering, because escapes that cannot be rendered as JSON text
+    // still extract, as in SQLite. For example, the JSON text has \u0009 for
+    // the JSON5 escape \v, as in SQLite, but the SQL value has the byte 0x0B.
+    if element_type == ElementType::TEXT5 {
+        return Some(
+            jsonb::scalar_payload(element)
+                .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))
+                .map(|payload| Value::Text(Text::new(unescape_string(&utf8_lossy(payload))))),
+        );
+    }
+    if let Some(payload) = jsonb::plain_string_payload(element) {
+        return Some(Ok(Value::Text(Text::new(utf8_lossy(payload).into_owned()))));
+    }
+    let payload = jsonb::scalar_payload(element)?;
+    match element_type {
+        ElementType::INT => validate_utf8(payload).map(|text| int_text_to_db_type(text, text)),
+        ElementType::FLOAT => validate_utf8(payload).map(float_text_to_db_type),
+        ElementType::TRUE => Some(Ok(Value::from_i64(1))),
+        ElementType::FALSE => Some(Ok(Value::from_i64(0))),
+        _ => None,
     }
 }
 
@@ -834,15 +825,10 @@ pub fn json_type(
         crate::LimboError::InternalError("path should be Some after is_none check".to_string())
     })?;
     if let Some(path) = cached_json_path(json_cache, &path_value, true)? {
-        let mut json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
+        let json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
-        if let Ok(mut path) = json.navigate_path(&path, PathOperationMode::ReplaceExisting) {
-            let target = path.pop().expect("Should exist");
-            let element_type = if let Some(el_index) = target.get_array_index() {
-                json.element_type_at(el_index)
-            } else {
-                json.element_type_at(target.field_value_index)
-            }?;
+        if let Ok(Some(target)) = find_path_element(json.as_bytes(), &path) {
+            let element_type = json.element_type_at(target.start)?;
             Ok(Value::Text(Text::new(String::from(element_type))))
         } else {
             Ok(Value::Null)

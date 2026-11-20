@@ -728,87 +728,6 @@ impl PathOperation for InsertOperation {
     }
 }
 
-/// A search for the element at a path. The search does not copy the element:
-/// the caller gets it with [Self::element_in] or [Self::into_element].
-pub struct SearchOperation {
-    mode: PathOperationMode,
-    value_offset: usize,
-    /// The offset after the element that the search found, or 0.
-    value_end: usize,
-    label_offset: Option<usize>,
-}
-
-impl SearchOperation {
-    pub fn new() -> Self {
-        Self {
-            mode: PathOperationMode::ReplaceExisting,
-            value_offset: 0,
-            value_end: 0,
-            label_offset: None,
-        }
-    }
-
-    /// Returns the element that the search found in `json`, in the buffer of
-    /// `json`: the element moves to the start of the buffer, and the bytes
-    /// after it are cut off. Returns an empty document if the search found
-    /// nothing.
-    ///
-    /// The buffer keeps its capacity, so this is for a caller that converts
-    /// the element and then drops it.
-    pub fn into_element(self, mut json: Jsonb) -> Jsonb {
-        if self.value_end == 0 {
-            return Jsonb::empty();
-        }
-        json.data.copy_within(self.value_offset..self.value_end, 0);
-        json.data.truncate(self.value_end - self.value_offset);
-        json
-    }
-
-    /// Returns the bytes of the element that the search found in `json`, or
-    /// no bytes if the search found nothing.
-    pub fn element_in<'a>(&self, json: &'a Jsonb) -> &'a [u8] {
-        &json.data[self.value_offset..self.value_end]
-    }
-
-    pub fn value_offset(&self) -> usize {
-        self.value_offset
-    }
-
-    pub fn label_offset(&self) -> Option<usize> {
-        self.label_offset
-    }
-}
-
-impl PathOperation for SearchOperation {
-    fn operation_mode(&self) -> PathOperationMode {
-        self.mode
-    }
-
-    fn execute(&mut self, json: &mut Jsonb, mut stack: TraversalStack) -> Result<()> {
-        let target = stack.pop().ok_or_else(|| {
-            LimboError::InternalError("stack should not be empty after check".to_string())
-        })?;
-        let (idx, label_idx) = match (target.get_array_index(), target.field_key_index) {
-            (Some(idx), _) => (idx, None),
-            (None, JsonLocationKind::ObjectProperty(key_idx)) => {
-                (target.field_value_index, Some(key_idx))
-            }
-            (None, _) => (target.field_value_index, None),
-        };
-        let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
-        let end = json.element_end(idx, &[header_size, size])?;
-        self.value_offset = idx;
-        self.value_end = end;
-        self.label_offset = label_idx;
-
-        Ok(())
-    }
-
-    fn changes_document(&self) -> bool {
-        false
-    }
-}
-
 impl JsonTraversalResult {
     pub fn new(field_value_index: usize, field_key_index: JsonLocationKind, delta: isize) -> Self {
         Self {
@@ -1172,13 +1091,25 @@ impl Jsonb {
         Ok(result)
     }
 
-    /// Returns the decoded text of the single string element this
-    /// document holds, unescaping straight from the stored payload.
-    /// This cannot go through [Jsonb::to_string], because JSON text
-    /// rendering translates the JSON5 \v escape to \u0009 for SQLite
-    /// bug-compatibility, while extraction must yield the real 0x0B.
-    pub fn scalar_string_value(&self) -> Result<String> {
-        Ok(unescape_string(&self.scalar_payload_text()?))
+    /// Returns the JSON text of `element`, an element of this document.
+    pub(crate) fn element_to_string(&self, element: PathTarget) -> Result<String> {
+        let mut result = String::with_capacity((element.end - element.start) * 2);
+        self.serialize_value(&mut result, element.start, 0, &JsonIndentation::None)?;
+        Ok(result)
+    }
+
+    /// The bytes of the document.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Makes `element`, an element of this document, the whole document: the
+    /// element moves to the start of the buffer, and the bytes after it are
+    /// cut off. The buffer keeps its capacity, so this is for a caller that
+    /// reads the element and then drops it.
+    pub(crate) fn keep_only_element(&mut self, element: PathTarget) {
+        self.data.copy_within(element.start..element.end, 0);
+        self.data.truncate(element.end - element.start);
     }
 
     pub fn scalar_payload_text(&self) -> Result<Cow<'_, str>> {
@@ -1198,18 +1129,7 @@ impl Jsonb {
     /// Returns the payload of the element at the start of the document, or
     /// None when its header is malformed or the payload runs past the end.
     pub fn scalar_payload(&self) -> Option<&[u8]> {
-        let (JsonbHeader(_, len), header_size) = self.read_header(0).ok()?;
-        let payload_end = header_size.checked_add(len)?;
-        self.data.get(header_size..payload_end)
-    }
-
-    /// Returns the payload of the string element at the start of the document
-    /// when its JSON text has no escape: the element is TEXT, TEXTJ or TEXTRAW,
-    /// and the payload has no `"`, `\` or control character. The JSON text of
-    /// the string is then the payload in quotes, and its decoded text is the
-    /// payload.
-    pub fn plain_string_payload(&self) -> Option<&[u8]> {
-        plain_string_payload(&self.data)
+        scalar_payload(&self.data)
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -2851,22 +2771,7 @@ impl Jsonb {
     }
 
     pub fn array_len(&self) -> Result<usize> {
-        let (header, header_skip) = self.read_header(0)?;
-        if header.0 != ElementType::ARRAY {
-            return Ok(0);
-        }
-
-        let end = header_skip
-            .checked_add(header.1)
-            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        let mut count = 0;
-        let mut pos = header_skip;
-        while pos < end {
-            pos = self.skip_element(pos)?;
-            count += 1;
-        }
-
-        Ok(count)
+        array_len(&self.data)
     }
 
     pub fn navigate_path(
@@ -3898,7 +3803,179 @@ fn is_json_float(text: &[u8]) -> bool {
     has_fraction_or_exponent && rest.is_empty()
 }
 
-/// [Jsonb::plain_string_payload] for the element at the start of `element`.
+/// The element that a JSON path selects in a JSONB document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PathTarget {
+    /// The offset of the header of the element.
+    pub start: usize,
+    /// The offset after the element.
+    pub end: usize,
+    /// The offset of the object key of the element, when the last step of the
+    /// path is a key.
+    pub key: Option<usize>,
+}
+
+/// Finds the element that `path` selects in the JSONB document `data`, as the
+/// search of [Jsonb::operate_on_path] does, but with no change to the document
+/// and no copy of it. Returns None when the path selects no element: a key
+/// that the object does not have, an index that the array does not have, a
+/// step into an element of a different type, an append locator (`[#]`) or a
+/// bracket-quoted key.
+///
+/// Each header is read with checked bounds, and an element that does not fit
+/// in its container is an error. Thus a document that was not validated gives
+/// an error and not a panic. The elements that the search does not go into are
+/// not examined.
+pub(crate) fn find_path_element(data: &[u8], path: &JsonPath) -> Result<Option<PathTarget>> {
+    let mut target = PathTarget {
+        start: 0,
+        end: element_end_within(data, 0, data.len())?,
+        key: None,
+    };
+    for element in &path.elements {
+        let found = match element {
+            PathElement::Root() => Some(target),
+            PathElement::Key(key, quoted) => {
+                find_object_member(data, target, key.as_bytes(), *quoted)?
+            }
+            PathElement::ArrayLocator(Some(index)) => find_array_element(data, target, *index)?,
+            PathElement::ArrayLocator(None) | PathElement::BracketQuotedKey(_) => None,
+        };
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        target = found;
+    }
+    Ok(Some(target))
+}
+
+/// Finds the value of the first member of the object `object` whose key is
+/// `path_key`. Returns None when `object` is not an object or has no such key.
+fn find_object_member(
+    data: &[u8],
+    object: PathTarget,
+    path_key: &[u8],
+    quoted: bool,
+) -> Result<Option<PathTarget>> {
+    let (JsonbHeader(element_type, _), header_size) = JsonbHeader::from_slice(object.start, data)?;
+    if element_type != ElementType::OBJECT {
+        return Ok(None);
+    }
+    let mut pos = object.start + header_size;
+    while pos < object.end {
+        let (JsonbHeader(key_type, key_len), key_header_size) = JsonbHeader::from_slice(pos, data)?;
+        if !key_type.is_valid_key() {
+            bail_parse_error!("malformed JSON");
+        }
+        let key_start = pos + key_header_size;
+        let value = match key_start.checked_add(key_len) {
+            Some(value) if value < object.end => value,
+            _ => bail_parse_error!("malformed JSON"),
+        };
+        let value_end = element_end_within(data, value, object.end)?;
+        if compare((&data[key_start..value], key_type), (path_key, quoted)) {
+            return Ok(Some(PathTarget {
+                start: value,
+                end: value_end,
+                key: Some(pos),
+            }));
+        }
+        pos = value_end;
+    }
+    Ok(None)
+}
+
+/// Finds the element of the array `array` at `index`, which counts from the end
+/// when it is negative (`-1` is the last element). Returns None when `array` is
+/// not an array or has no element at `index`.
+fn find_array_element(data: &[u8], array: PathTarget, index: i32) -> Result<Option<PathTarget>> {
+    let (JsonbHeader(element_type, _), header_size) = JsonbHeader::from_slice(array.start, data)?;
+    if element_type != ElementType::ARRAY {
+        return Ok(None);
+    }
+    let first = array.start + header_size;
+    let index = match usize::try_from(index) {
+        Ok(index) => index,
+        Err(_) => {
+            let mut count = 0usize;
+            let mut pos = first;
+            while pos < array.end {
+                pos = element_end_within(data, pos, array.end)?;
+                count += 1;
+            }
+            match count.checked_sub(index.unsigned_abs() as usize) {
+                Some(index) => index,
+                None => return Ok(None),
+            }
+        }
+    };
+    let mut pos = first;
+    let mut position = 0;
+    while pos < array.end {
+        let end = element_end_within(data, pos, array.end)?;
+        if position == index {
+            return Ok(Some(PathTarget {
+                start: pos,
+                end,
+                key: None,
+            }));
+        }
+        pos = end;
+        position += 1;
+    }
+    Ok(None)
+}
+
+/// The offset after the element at `pos`, which must end at or before `limit`.
+#[inline]
+fn element_end_within(data: &[u8], pos: usize, limit: usize) -> Result<usize> {
+    if pos < limit {
+        let (JsonbHeader(_, payload_size), header_size) = JsonbHeader::from_slice(pos, data)?;
+        if let Some(end) = (pos + header_size).checked_add(payload_size) {
+            if end <= limit {
+                return Ok(end);
+            }
+        }
+    }
+    bail_parse_error!("malformed JSON")
+}
+
+/// The number of elements of the array at the start of `element`, or 0 when
+/// the element is not an array.
+pub(crate) fn array_len(element: &[u8]) -> Result<usize> {
+    let (header, header_skip) = JsonbHeader::from_slice(0, element)?;
+    if header.0 != ElementType::ARRAY {
+        return Ok(0);
+    }
+
+    let end = header_skip
+        .checked_add(header.1)
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+    let mut count = 0;
+    let mut pos = header_skip;
+    while pos < end {
+        let (header, header_size) = JsonbHeader::from_slice(pos, element)?;
+        pos = pos
+            .checked_add(header_size)
+            .and_then(|pos| pos.checked_add(header.1))
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// [Jsonb::scalar_payload] for the element at the start of `element`.
+pub(crate) fn scalar_payload(element: &[u8]) -> Option<&[u8]> {
+    let (JsonbHeader(_, len), header_size) = JsonbHeader::from_slice(0, element).ok()?;
+    let payload_end = header_size.checked_add(len)?;
+    element.get(header_size..payload_end)
+}
+
+/// Returns the payload of the string element at the start of `element` when
+/// its JSON text has no escape: the element is TEXT, TEXTJ or TEXTRAW, and the
+/// payload has no `"`, `\` or control character. The JSON text of the string
+/// is then the payload in quotes, and its decoded text is the payload.
 pub(crate) fn plain_string_payload(element: &[u8]) -> Option<&[u8]> {
     let (JsonbHeader(element_type, len), header_size) = JsonbHeader::from_slice(0, element).ok()?;
     if !matches!(
@@ -5104,14 +5181,13 @@ mod tests {
     }
 
     #[test]
-    fn scalar_string_value_rejects_overflowing_payload_length() {
+    fn scalar_payload_rejects_overflowing_payload_length() {
         // TEXT5 header in the 8-byte size format declaring a payload
         // length near usize::MAX: the payload end computation must not
         // overflow (SQL paths validate blobs first, but this decoder is
         // public API).
         let blob = [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7];
-        let jsonb = Jsonb::from_raw_data(&blob).unwrap();
-        assert!(jsonb.scalar_string_value().is_err());
+        assert!(scalar_payload(&blob).is_none());
     }
 
     #[test]
@@ -6190,12 +6266,9 @@ mod path_operations_tests {
     }
 
     #[test]
-    fn test_search_operation() {
+    fn test_find_path_element() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
-        let mut jsonb = Jsonb::from_str(json_str).unwrap();
-
-        // Create a search operation
-        let mut operation = SearchOperation::new();
+        let jsonb = Jsonb::from_str(json_str).unwrap();
 
         // Create a path to the "person" property
         let path = create_path(vec![
@@ -6203,13 +6276,8 @@ mod path_operations_tests {
             PathElement::Key(Cow::Borrowed("person"), false),
         ]);
 
-        // Execute the operation
-        let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
-
-        // Get the search result
-        let search_result = operation.into_element(jsonb);
-        let result_str = search_result.to_string().unwrap();
+        let target = find_path_element(jsonb.as_bytes(), &path).unwrap().unwrap();
+        let result_str = jsonb.element_to_string(target).unwrap();
 
         // Verify the search found the correct value
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
@@ -6390,22 +6458,55 @@ mod path_operations_tests {
         ];
         for (elements, expected) in cases {
             let path = create_path(elements);
-            let mut json = doc.clone();
-            let mut search = SearchOperation::new();
-            let found = json.operate_on_path(&path, &mut search);
-            assert_eq!(found.is_ok(), expected.is_some(), "{path:?}");
-            let element = search.element_in(&json).to_vec();
-            let moved = search.into_element(json);
+            let found = find_path_element(doc.as_bytes(), &path).unwrap();
+            assert_eq!(found.is_some(), expected.is_some(), "{path:?}");
+            let Some(target) = found else {
+                continue;
+            };
+            let element = doc.as_bytes()[target.start..target.end].to_vec();
+            let mut moved = doc.clone();
+            moved.keep_only_element(target);
             assert_eq!(moved.data.as_slice(), element.as_slice(), "{path:?}");
-            match expected {
-                Some(expected) => assert_eq!(moved.to_string().unwrap(), expected, "{path:?}"),
-                None => assert!(element.is_empty(), "{path:?}"),
-            }
+            assert_eq!(moved.to_string().unwrap(), expected.unwrap(), "{path:?}");
         }
     }
 
+    /// The search gives the offset of the key of an object member, which
+    /// json_each() uses as the id of the member, and no key for an array
+    /// element.
+    #[test]
+    fn search_gives_the_key_of_an_object_member() {
+        let doc = Jsonb::from_str(r#"{"a":[1,{"b":2}]}"#).unwrap();
+        let key = |key| PathElement::Key(Cow::Borrowed(key), false);
+        let path = create_path(vec![PathElement::Root(), key("a")]);
+        let target = find_path_element(doc.as_bytes(), &path).unwrap().unwrap();
+        // The key "a" follows the 1-byte header of the object.
+        assert_eq!(target.key, Some(1));
+        let path = create_path(vec![
+            PathElement::Root(),
+            key("a"),
+            PathElement::ArrayLocator(Some(-1)),
+            key("b"),
+        ]);
+        let target = find_path_element(doc.as_bytes(), &path).unwrap().unwrap();
+        assert_eq!(doc.element_to_string(target).unwrap(), "2");
+        let path = create_path(vec![
+            PathElement::Root(),
+            key("a"),
+            PathElement::ArrayLocator(Some(0)),
+        ]);
+        let target = find_path_element(doc.as_bytes(), &path).unwrap().unwrap();
+        assert_eq!(target.key, None);
+        let path = create_path(vec![
+            PathElement::Root(),
+            key("a"),
+            PathElement::ArrayLocator(Some(-3)),
+        ]);
+        assert_eq!(find_path_element(doc.as_bytes(), &path).unwrap(), None);
+    }
+
     /// A child element whose declared size runs past the buffer must not reach
-    /// the slice in `SearchOperation` or the `drain` in `DeleteOperation`.
+    /// the slice of a path search or the `drain` in `DeleteOperation`.
     ///
     /// Blob-sourced documents are validated on the way in, so no SQL input
     /// reaches these ranges today. The checks exist because the sizes are
@@ -6422,12 +6523,9 @@ mod path_operations_tests {
             PathElement::ArrayLocator(Some(0)),
         ]);
 
-        let mut jsonb = Jsonb {
-            data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        };
-        let mut search = SearchOperation::new();
+        let data = [0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert!(
-            jsonb.operate_on_path(&path, &mut search).is_err(),
+            find_path_element(&data, &path).is_err(),
             "oversized child size must not be sliced out of bounds"
         );
 

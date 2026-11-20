@@ -8,7 +8,7 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 use crate::{
     json::{
         convert_dbtype_to_jsonb, json_path_text,
-        jsonb::{IteratorState, Jsonb, SearchOperation},
+        jsonb::{find_path_element, IteratorState, Jsonb},
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
         Conv,
@@ -522,22 +522,13 @@ fn navigate_to_path(
     mut jsonb: Jsonb,
     json_path: &JsonPath,
 ) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
-    let mut search_operation = SearchOperation::new();
-    if jsonb
-        .operate_on_path(json_path, &mut search_operation)
-        .is_err()
-    {
+    let Ok(Some(target)) = find_path_element(jsonb.as_bytes(), json_path) else {
         return Ok(None);
-    }
-    let value_offset = search_operation.value_offset() as i64;
-    let root_id = search_operation
-        .label_offset()
-        .map_or(value_offset, |offset| offset as i64);
-    Ok(Some((
-        search_operation.into_element(jsonb),
-        value_offset,
-        root_id,
-    )))
+    };
+    let value_offset = target.start as i64;
+    let root_id = target.key.map_or(value_offset, |offset| offset as i64);
+    jsonb.keep_only_element(target);
+    Ok(Some((jsonb, value_offset, root_id)))
 }
 
 mod columns {
