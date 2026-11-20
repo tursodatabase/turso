@@ -2274,6 +2274,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut processed = 0;
         let drop_current_if_in_btree = true;
         let total = self.index_write_set.len() + self.unwritten_index_rows.len();
+        // See gc_checkpointed_table_versions: the write set has the keys of
+        // each index in key order, so a cursor that walks the keys of the
+        // index gets to each key in a few steps. Another index starts a new
+        // cursor.
+        let mvstore = self.mvstore.clone();
+        let guard = epoch::pin();
+        let mut current_index: Option<(
+            MVTableId,
+            IndexRowsEntry<'_, A>,
+            IndexKeyCursor<'_, '_, A>,
+        )> = None;
         while index < total {
             let current = index;
             index += 1;
@@ -2293,16 +2304,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         &self.unwritten_index_rows[current - self.index_write_set.len()];
                     (*index_id, sortable_key, true)
                 };
-                let outer_entry = self
-                    .mvstore
-                    .index_rows
-                    .get(&index_id)
-                    .expect("index_id from write set must exist in index_rows");
-                let inner_map = outer_entry.value();
-                let inner_entry = inner_map
-                    .get(sortable_key)
-                    .expect("index row from write set must exist in inner map");
-                let mut versions = inner_entry.value().write();
+                if current_index
+                    .as_ref()
+                    .is_none_or(|(id, _, _)| *id != index_id)
+                {
+                    current_index = Some(new_index_key_cursor(&mvstore, index_id, &guard));
+                }
+                let (_, _, keys) = current_index
+                    .as_mut()
+                    .expect("the cursor of the index was set above");
+                let chain = match keys.advance_to(sortable_key) {
+                    Some(chain) => chain,
+                    // The cursor only walks forward: a key below the previous
+                    // key takes a new cursor.
+                    None => {
+                        let (_, _, keys) =
+                            current_index.insert(new_index_key_cursor(&mvstore, index_id, &guard));
+                        keys.advance_to(sortable_key)
+                            .expect("index row from write set must exist in inner map")
+                    }
+                };
+                let mut versions = chain.write();
                 if stamp {
                     self.mvstore.stamp_chain_materialized(
                         &mut versions,
@@ -3645,6 +3667,21 @@ impl<'a, 'g, K, V, C: Comparator<K>, A: SkiplistAllocator> CollectEntry<'a, 'g, 
 }
 
 type IndexKeyCursor<'a, 'g, A> = LockstepCursor<'a, 'g, Arc<SortableIndexKey>, RowVersions<A>, A>;
+
+/// A cursor at the start of the keys of the index `index_id`, with the
+/// entry of the index in the index map, which the cursor walks.
+fn new_index_key_cursor<'a, 'g, Clock: LogicalClock, A: ConcurrentAllocator>(
+    mvstore: &'a MvStore<Clock, A>,
+    index_id: MVTableId,
+    guard: &'g epoch::Guard,
+) -> (MVTableId, IndexRowsEntry<'a, A>, IndexKeyCursor<'a, 'g, A>) {
+    let index = mvstore
+        .index_rows
+        .get(&index_id)
+        .expect("index_id from write set must exist in index_rows");
+    let keys = LockstepCursor::new(index.value(), guard);
+    (index_id, index, keys)
+}
 
 struct LockstepCursor<'a, 'g, K, V, A: SkiplistAllocator> {
     map: &'a SkipMap<K, V, BasicComparator, A>,
