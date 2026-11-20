@@ -153,6 +153,12 @@ public sealed class TursoSyncDatabaseOptions
         return builder.Uri;
     }
 
+    internal static void ValidateConnectionStringKey(string keyword, object? value)
+    {
+        if ((keyword is "Local Encryption Key" or "Remote Encryption Key") && value is string key)
+            ArgumentException.ThrowIfNullOrWhiteSpace(key, keyword);
+    }
+
     internal void Validate()
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(Path);
