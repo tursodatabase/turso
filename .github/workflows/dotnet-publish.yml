@@ -782,9 +782,24 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install dotnet SDK
+        id: setup-dotnet
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
+
+      # The macos-26 runner image also ships a .NET 11 SDK, and without a
+      # global.json `dotnet` picks the newest SDK. The iOS workload install then
+      # mixes .NET 11 and .NET 10 workload manifests and fails. This global.json
+      # sits in the job's working directory, so the workload install, restore
+      # and build below all use the .NET 10 SDK that setup-dotnet installed.
+      - name: Pin .NET 10 SDK
+        env:
+          DOTNET_SDK_VERSION: ${{ steps.setup-dotnet.outputs.dotnet-version }}
+        run: |
+          dotnet new globaljson --sdk-version "$DOTNET_SDK_VERSION" --roll-forward latestFeature --force
+          cat global.json
+          dotnet --version
+          dotnet --list-sdks
 
       # Workload set 10.0.401.1 moved the iOS SDK to 27.0, which requires
       # Xcode 27. The macos-26 runner image only ships Xcode 26.x, so stay on
