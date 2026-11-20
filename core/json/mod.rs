@@ -551,7 +551,10 @@ fn read_path_element<R>(
                 return Ok(None);
             };
             match find_in_blob(blob, &json_path) {
-                InBlob::Element(element) => return read(FoundElement::InBlob(element)).map(Some),
+                InBlob::Element(target) => {
+                    let element = &blob[target.start..target.end];
+                    return read(FoundElement::InBlob(element)).map(Some);
+                }
                 InBlob::Nothing => return Ok(None),
                 InBlob::Malformed => {}
             }
@@ -597,10 +600,10 @@ impl FoundElement<'_> {
 }
 
 /// What a path search finds in a JSONB blob that is read where it is.
-enum InBlob<'a> {
+enum InBlob {
     /// The element at the path, which passed the check that [validate_jsonb]
     /// makes of a whole document.
-    Element(&'a [u8]),
+    Element(PathTarget),
     /// The path selects no element.
     Nothing,
     /// The search found malformed data, or the element at the path is
@@ -610,11 +613,9 @@ enum InBlob<'a> {
 
 /// Finds the element at `path` in `blob`, a blob that passes
 /// [looks_like_jsonb_blob] and that is not checked otherwise.
-fn find_in_blob<'a>(blob: &'a [u8], path: &JsonPath) -> InBlob<'a> {
+fn find_in_blob(blob: &[u8], path: &JsonPath) -> InBlob {
     match find_path_element(blob, path) {
-        Ok(Some(target)) if jsonb::is_valid_element(blob, target) => {
-            InBlob::Element(&blob[target.start..target.end])
-        }
+        Ok(Some(target)) if jsonb::is_valid_element(blob, target) => InBlob::Element(target),
         Ok(None) => InBlob::Nothing,
         Ok(Some(_)) | Err(_) => InBlob::Malformed,
     }
@@ -741,7 +742,7 @@ where
         };
         let element = if in_blob {
             match find_in_blob(json, &path) {
-                InBlob::Element(element) => Some(element),
+                InBlob::Element(target) => Some(&json[target.start..target.end]),
                 InBlob::Nothing => None,
                 InBlob::Malformed => return Ok(None),
             }

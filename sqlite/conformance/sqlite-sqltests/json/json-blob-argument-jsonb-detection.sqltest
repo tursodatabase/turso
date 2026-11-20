@@ -351,3 +351,46 @@ test jsonb_malformed_value_at_one_of_several_paths {
 expect error {
     malformed JSON
 }
+
+# json_each and json_tree with a root path read a JSONB argument as the
+# functions above do: only the element at the root path is checked.
+test jsonb_json_each_at_a_path_outside_a_malformed_value {
+    SELECT key, value, type, atom, id, parent, fullkey, path FROM json_each(X'8C1761133117621BFF', '$.a');
+}
+expect {
+    |1|integer|1|1||$.a|$.a
+}
+
+test jsonb_json_each_of_a_container_outside_a_malformed_value {
+    SELECT key, value, id, fullkey, path FROM json_each(X'BC17614B1331133217621BFF', '$.a');
+}
+expect {
+    0|1|4|$.a[0]|$.a
+    1|2|6|$.a[1]|$.a
+}
+
+test jsonb_json_tree_of_a_container_outside_a_malformed_value {
+    SELECT key, value, id, parent, fullkey, path FROM json_tree(X'BC17614B1331133217621BFF', '$.a');
+}
+expect {
+    a|[1,2]|1||$.a|$
+    0|1|4|1|$.a[0]|$.a
+    1|2|6|1|$.a[1]|$.a
+}
+
+test jsonb_json_each_of_a_missing_key_skips_malformed_values {
+    SELECT count(*) FROM json_each(X'8C1761133117621BFF', '$.c');
+}
+expect {
+    0
+}
+
+# SQLite 3.50.2 does not finish this query: its json_each loops on the
+# malformed element. Thus the test does not run on SQLite.
+@skip-if sqlite "SQLite 3.50.2 does not finish json_each of this malformed element"
+test jsonb_json_each_of_a_malformed_value_at_the_path {
+    SELECT count(*) FROM json_each(X'8C1761133117621BFF', '$.b');
+}
+expect error {
+    malformed JSON
+}

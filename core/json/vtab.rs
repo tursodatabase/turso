@@ -7,15 +7,16 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_text,
+        convert_dbtype_to_jsonb, convert_ref_dbtype_into_jsonb, find_in_blob, json_path_text,
         jsonb::{find_path_element, IteratorState, Jsonb},
+        looks_like_jsonb_blob,
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
-        Conv,
+        Conv, InBlob,
     },
     types::{AsValueRef, Text, TextSubtype},
     vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
-    Connection, LimboError, Value,
+    Connection, LimboError, Value, ValueRef,
 };
 use turso_parser::ast;
 
@@ -294,7 +295,19 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             ));
         }
 
-        let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        // The document is converted into the buffer that the cursor keeps,
+        // so that a filter for each row of an outer loop does not allocate.
+        // A JSONB blob with a root path is searched where it is, as
+        // read_path_element searches it, and only the element at the path is
+        // copied.
+        let document = args[0].as_value_ref();
+        let blob = match document {
+            ValueRef::Blob(blob) if args.len() > 1 && looks_like_jsonb_blob(blob) => Some(blob),
+            _ => None,
+        };
+        if blob.is_none() {
+            convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?;
+        }
         // The path is parsed after the document, so that a bad document
         // gives its error first. The parsed path is for the search and for
         // the path of the cursor.
@@ -310,15 +323,41 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             unreachable!("the root path is set above");
         };
 
-        let (root_json, root_offset, root_id) = if args.len() == 1 {
-            (jsonb, 0, 0)
-        } else if let Some(found) = navigate_to_path(jsonb, root_json_path)? {
-            found
+        let (root_offset, root_id) = if args.len() == 1 {
+            (0, 0)
         } else {
-            return Ok(false);
+            let found = match blob.map(|blob| (blob, find_in_blob(blob, root_json_path))) {
+                Some((blob, InBlob::Element(target))) => {
+                    self.json.set_data(&blob[target.start..target.end])?;
+                    Some(target)
+                }
+                Some((_, InBlob::Nothing)) => None,
+                // A blob with malformed data on the path is converted like
+                // other values, which checks the whole blob, and reads a blob
+                // that is not JSONB as JSON text.
+                Some((_, InBlob::Malformed)) | None => {
+                    if blob.is_some() {
+                        convert_ref_dbtype_into_jsonb(document, Conv::Strict, &mut self.json)?;
+                    }
+                    let target = find_path_element(self.json.as_bytes(), root_json_path)
+                        .ok()
+                        .flatten();
+                    if let Some(target) = target {
+                        self.json.keep_only_element(target);
+                    }
+                    target
+                }
+            };
+            let Some(target) = found else {
+                return Ok(false);
+            };
+            let value_offset = target.start as i64;
+            (
+                value_offset,
+                target.key.map_or(value_offset, |offset| offset as i64),
+            )
         };
 
-        self.json = root_json;
         self.root_offset = root_offset;
         self.id = root_id;
         self.path_to_current_value.set(&root_path, root_json_path);
@@ -567,21 +606,6 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
-/// Returns the element of `jsonb` at `json_path`, in the buffer of `jsonb`,
-/// with its offset and its id.
-fn navigate_to_path(
-    mut jsonb: Jsonb,
-    json_path: &JsonPath,
-) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
-    let Ok(Some(target)) = find_path_element(jsonb.as_bytes(), json_path) else {
-        return Ok(None);
-    };
-    let value_offset = target.start as i64;
-    let root_id = target.key.map_or(value_offset, |offset| offset as i64);
-    jsonb.keep_only_element(target);
-    Ok(Some((jsonb, value_offset, root_id)))
-}
-
 mod columns {
     use crate::{
         json::{
