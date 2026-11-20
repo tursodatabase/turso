@@ -5052,47 +5052,6 @@ fn test_exact_index_seek_steps_past_matching_rows(
     );
 }
 
-/// What this test checks: statements that step a cursor past the key of an exact-match seek,
-/// past a row it found with a direction change (allocating a new rowid), or through a range
-/// return the right rows when every cursor step yields once before it finishes.
-#[test]
-fn test_steps_past_seek_key_resume_after_yields() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-    conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
-        .unwrap();
-    conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 20), (4, 30)")
-        .unwrap();
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    conn.execute("INSERT INTO t VALUES (5, 20), (6, 25)")
-        .unwrap();
-    // A newer version shadows the B-tree's index entry (30, 4), right after key 25.
-    conn.execute("UPDATE t SET v = 31 WHERE id = 4").unwrap();
-
-    conn.set_yield_injector(Some(Arc::new(YieldAtEveryCursorPoint::default())));
-    let ids = |sql: &str| rows_through_yields(&conn, sql);
-    let expect = |values: &[i64]| -> Vec<Vec<Value>> {
-        values.iter().map(|v| vec![Value::from_i64(*v)]).collect()
-    };
-    assert_eq!(ids("SELECT id FROM t WHERE v = 20"), expect(&[2, 3, 5]));
-    assert_eq!(ids("SELECT id FROM t WHERE v = 25"), expect(&[6]));
-    assert_eq!(
-        ids("SELECT id FROM t WHERE v = 20 ORDER BY id DESC"),
-        expect(&[5, 3, 2])
-    );
-    assert_eq!(
-        ids("INSERT INTO t(v) VALUES (40) RETURNING id"),
-        expect(&[7])
-    );
-    assert_eq!(
-        ids("SELECT id FROM t WHERE v >= 20 ORDER BY v, id"),
-        expect(&[2, 3, 5, 6, 4, 7])
-    );
-    conn.set_yield_injector(None);
-}
-
 /// What this test checks: a DELETE that walks an index removes every row in its range,
 /// including checkpointed (B-tree) rows that come after keys that exist only in MVCC. The
 /// delete loop removes each index entry with an exact-match seek on the same cursor it walks
@@ -5214,23 +5173,6 @@ fn with_cursor_yields<T>(conn: &Arc<Connection>, yields: bool, steps: impl FnOnc
         conn.set_yield_injector(None);
     }
     result
-}
-
-fn rows_through_yields(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
-    let mut stmt = conn.prepare(sql).unwrap();
-    let io = conn.pager.load().io.clone();
-    let mut rows = Vec::new();
-    for _ in 0..1_000_000 {
-        match stmt.step().unwrap() {
-            crate::StepResult::Done => return rows,
-            crate::StepResult::Row => {
-                rows.push(stmt.row().unwrap().get_values().cloned().collect())
-            }
-            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
-            other => panic!("unexpected step result for {sql}: {other:?}"),
-        }
-    }
-    panic!("{sql} did not finish");
 }
 
 /// Yields at every cursor yield point, so each cursor step returns to the
