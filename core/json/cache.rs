@@ -86,7 +86,7 @@ impl JsonCache {
         let key = key.as_value_ref();
         for i in (0..self.used).rev() {
             if let Some((stored_key, value)) = &self.entries[i] {
-                if key.value_type() == stored_key.value_type() && key == *stored_key {
+                if key_matches(key, stored_key) {
                     let json = value.try_clone()?;
                     self.age[i] = self.counter;
                     self.counter += 1;
@@ -101,6 +101,19 @@ impl JsonCache {
     pub fn clear(&mut self) {
         self.counter = 0;
         self.used = 0;
+    }
+}
+
+/// Whether `key` is `stored`: the same type and the same value. A text or a
+/// blob, the usual keys, is compared as bytes directly.
+#[inline]
+fn key_matches(key: ValueRef, stored: &Value) -> bool {
+    match (key, stored) {
+        (ValueRef::Text(key), Value::Text(stored)) => {
+            key.value.as_bytes() == stored.value.as_bytes()
+        }
+        (ValueRef::Blob(key), Value::Blob(stored)) => key == stored.as_slice(),
+        _ => key.value_type() == stored.value_type() && key == *stored,
     }
 }
 
