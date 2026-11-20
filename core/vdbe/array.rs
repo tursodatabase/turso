@@ -826,7 +826,7 @@ mod tests {
             Value::from_i64(1),
             Value::build_text("hello"),
             Value::Null,
-            Value::Blob(b"ab".to_vec()),
+            Value::Blob(crate::alloc::vec![b'a', b'b']),
         ])
         .unwrap();
         let Value::Blob(blob) = &arr else {
