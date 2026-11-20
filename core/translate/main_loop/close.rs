@@ -689,7 +689,39 @@ pub(super) fn emit_table_read_advance(
             // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a Next instruction.
             match search {
                 Search::RowidEq { .. } => {}
-                Search::Seek { seek_def, .. } => {
+                Search::Seek { index, seek_def } => {
+                    let single_match_end = if temp_cursor_id.is_none()
+                        && index.as_ref().is_some_and(|index| {
+                            index.unique
+                                && seek_def.prefix.len() == index.columns.len()
+                                && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+                                && matches!(seek_def.end.last_component, SeekKeyComponent::None)
+                        }) {
+                        // Stepping after the only match is unnecessary, and in
+                        // MVCC it can scan unrelated deleted index entries.
+                        // `IS` can match many NULL keys, so decide from the saved
+                        // seek values rather than assuming a UNIQUE index always
+                        // returns one row.
+                        if !(0..seek_def.prefix.len())
+                            .any(|i| seek_def.is_null_matching_key_component(i))
+                        {
+                            return;
+                        }
+                        let start_reg = t_ctx.seek_key_registers[&iteration_cursor_id];
+                        let advance = program.allocate_label();
+                        let end = program.allocate_label();
+                        for i in 0..seek_def.prefix.len() {
+                            program.emit_insn(Insn::IsNull {
+                                reg: start_reg + i,
+                                target_pc: advance,
+                            });
+                        }
+                        program.emit_insn(Insn::Goto { target_pc: end });
+                        program.preassign_label_to_next_insn(advance);
+                        Some(end)
+                    } else {
+                        None
+                    };
                     if seek_def.iter_dir == IterationDirection::Backwards {
                         program.emit_insn(Insn::Prev {
                             cursor_id: iteration_cursor_id,
@@ -704,6 +736,9 @@ pub(super) fn emit_table_read_advance(
                             fullscan: false,
                             is_index: false,
                         });
+                    }
+                    if let Some(end) = single_match_end {
+                        program.preassign_label_to_next_insn(end);
                     }
                 }
                 Search::InSeek { index, .. } => {
