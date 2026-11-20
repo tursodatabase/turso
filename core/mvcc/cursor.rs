@@ -577,12 +577,13 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     index_shadow_scan: IndexShadowScan<A>,
     /// [`MvStore::table_rows_epoch`] or [`MvStore::index_rows_epoch`], by cursor
     /// type, read before the MVCC peek was taken.
-    /// See [`Self::reseek_mvcc_if_rows_changed`].
+    /// See [`Self::reseek_mvcc_if_needed`].
     mvcc_peek_epoch: u64,
-    /// The direction in which `next()` or `prev()` can reuse the two peeks.
-    /// `None` after an exact seek, an existence probe, or insertion at another
-    /// key. The next step then seeks both sources past the complete current key.
+    /// The direction in which a step can reuse the B-tree peek.
+    /// `None` means the next step seeks both sources past the complete current key.
     peeks_valid_for: Option<IterationDirection>,
+    /// A retained B-tree peek can still have a bounded MVCC iterator from an exact seek.
+    mvcc_peek_needs_reseek: bool,
     /// The seek past the current row that a step started, so that a step that
     /// returned IO resumes it.
     seek_past_current: Option<SeekOp>,
@@ -656,6 +657,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
             peeks_valid_for: None,
+            mvcc_peek_needs_reseek: false,
             seek_past_current: None,
         })
     }
@@ -901,8 +903,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.dual_peek.mvcc_peek = new_peek_state;
     }
 
-    /// Seeks the MVCC iterator again, just past the current key, if table or
-    /// index versions were inserted or deleted since the MVCC peek was taken.
+    /// Seeks the MVCC iterator again, just past the current key, if the old
+    /// iterator was bounded by an exact seek or if versions changed.
     /// The iterator sees a key added ahead of its position, but not one added
     /// between the current key and the peek, nor any key once it is exhausted.
     /// And the peek itself may have been deleted since. Either can be a write
@@ -910,15 +912,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     ///
     /// Returns true if it seeked: the MVCC peek is then already past the
     /// current key and must not be advanced again.
-    fn reseek_mvcc_if_rows_changed(&mut self, dir: IterationDirection) -> Result<bool> {
+    fn reseek_mvcc_if_needed(&mut self, dir: IterationDirection) -> Result<bool> {
         let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
             return Ok(false);
         };
         let epoch = self.mvcc_rows_epoch();
-        if epoch == self.mvcc_peek_epoch {
+        if epoch == self.mvcc_peek_epoch && !self.mvcc_peek_needs_reseek {
             return Ok(false);
         }
-        self.mvcc_peek_epoch = epoch;
         let found = match &row_id.row_id {
             RowKey::Int(_) => self
                 .db
@@ -949,6 +950,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             },
             None => CursorPeek::Exhausted,
         };
+        self.mvcc_peek_epoch = epoch;
+        self.mvcc_peek_needs_reseek = false;
         Ok(true)
     }
 
@@ -1229,6 +1232,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Invalidate candidates and visibility scans before repositioning.
     fn reset_dual_peek(&mut self) {
         self.peeks_valid_for = None;
+        self.mvcc_peek_needs_reseek = false;
         self.dual_peek = DualCursorPeek::default();
         self.mvcc_peek_epoch = self.mvcc_rows_epoch();
         self.eq_seek_row = None;
@@ -1586,7 +1590,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             };
 
             // Advance cursors as needed and update peek state
-            let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Forwards)?;
+            let reseeked = self.reseek_mvcc_if_needed(IterationDirection::Forwards)?;
             if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
                 self.advance_mvcc_iterator();
             }
@@ -1684,7 +1688,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             };
 
             // Advance cursors as needed and update peek state
-            let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Backwards)?;
+            let reseeked = self.reseek_mvcc_if_needed(IterationDirection::Backwards)?;
             if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
                 self.advance_mvcc_iterator();
             }
@@ -1923,8 +1927,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // Now pick the winner based on direction
                     let winner_pos = self.position_from_peeks(direction);
                     self.state = None;
-                    // Exact lookups prepare matches for their key, not neighbors.
-                    // A later step must seek both sources past the complete current key.
+                    // Exact lookups default to seeking both sources again on movement.
                     self.peeks_valid_for = if op.eq_only() { None } else { Some(direction) };
                     if let CursorPosition::Loaded {
                         row_id,
@@ -1962,6 +1965,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 }
                             };
                             if found {
+                                // A peek ahead of the winner can skip a row restored by rollback.
+                                if let (
+                                    true,
+                                    SeekKey::IndexKey(index_key),
+                                    MvccCursorType::Index(index_info),
+                                ) = (in_btree, &seek_key, &self.mv_cursor_type)
+                                {
+                                    if !index_key_matches_at_most_one_row(index_key, index_info)? {
+                                        self.peeks_valid_for = Some(direction);
+                                        self.mvcc_peek_needs_reseek = true;
+                                    }
+                                }
                                 return Ok(IOResult::Done(SeekResult::Found));
                             } else {
                                 // The cursor stands past the key, where the two
@@ -2057,6 +2072,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         };
         if !at_current_row {
             self.peeks_valid_for = None;
+            self.mvcc_peek_needs_reseek = false;
         }
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
@@ -2440,6 +2456,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn seek_end(&mut self) -> IOResultOr<()> {
         self.peeks_valid_for = None;
+        self.mvcc_peek_needs_reseek = false;
         if self.is_btree_allocated() {
             // Defer to btree cursor's seek_end implementation
             self.btree_cursor.seek_end()
