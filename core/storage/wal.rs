@@ -2777,12 +2777,17 @@ impl OngoingCheckpoint {
 
     #[inline]
     /// Remove any completed write operations from `inflight_writes`,
-    /// returns whether any progress was made.
-    fn process_inflight_writes(&mut self) -> bool {
+    /// returns whether any progress was made. If a write batch failed, returns its
+    /// error and removes nothing, because the checkpoint must not count the pages
+    /// of a failed batch as backfilled.
+    fn process_inflight_writes(&mut self) -> std::result::Result<bool, CompletionError> {
+        if let Some(e) = self.inflight_writes.iter().find_map(|w| w.err.get()) {
+            return Err(*e);
+        }
         let before_len = self.inflight_writes.len();
         self.inflight_writes
             .retain(|w| !w.done.load(Ordering::Acquire));
-        before_len > self.inflight_writes.len()
+        Ok(before_len > self.inflight_writes.len())
     }
 
     #[inline]
@@ -2816,15 +2821,6 @@ impl OngoingCheckpoint {
             return Err(LimboError::CompletionError(e));
         }
         Ok(moved)
-    }
-
-    fn first_write_error(&self) -> Option<CompletionError>
-    where
-        CompletionError: Clone,
-    {
-        self.inflight_writes
-            .iter()
-            .find_map(|w| w.err.get().cloned())
     }
 }
 
@@ -5132,25 +5128,26 @@ impl WalFile {
                     let mut group = CompletionGroup::new(|_| {});
                     let mut ongoing_chkpt = self.ongoing_checkpoint.write();
 
-                    // Check and clean any completed writes from pending flush
-                    if ongoing_chkpt.process_inflight_writes() {
-                        tracing::trace!("Completed a write batch");
-                    }
                     // Process completed reads into current batch
                     if ongoing_chkpt.process_pending_reads()? {
                         tracing::trace!("Drained reads into batch");
                     }
-                    if let Some(e) = ongoing_chkpt.first_write_error() {
-                        mark_unlikely();
-                        // cancel everything still in-flight to avoid leaks
-                        let to_cancel: Vec<Completion> = ongoing_chkpt
-                            .inflight_reads
-                            .iter()
-                            .map(|r| r.completion.clone())
-                            .collect();
-                        pager.io.cancel(&to_cancel)?;
-                        pager.io.drain_completions(&to_cancel)?;
-                        return Err(LimboError::CompletionError(e).into());
+                    // Check and clean any completed writes from pending flush
+                    match ongoing_chkpt.process_inflight_writes() {
+                        Ok(true) => tracing::trace!("Completed a write batch"),
+                        Ok(false) => {}
+                        Err(e) => {
+                            mark_unlikely();
+                            // cancel everything still in-flight to avoid leaks
+                            let to_cancel: Vec<Completion> = ongoing_chkpt
+                                .inflight_reads
+                                .iter()
+                                .map(|r| r.completion.clone())
+                                .collect();
+                            pager.io.cancel(&to_cancel)?;
+                            pager.io.drain_completions(&to_cancel)?;
+                            return Err(LimboError::CompletionError(e).into());
+                        }
                     }
                     let epoch = self.coordination.checkpoint_epoch();
                     // Issue reads until we hit limits

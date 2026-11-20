@@ -170,6 +170,7 @@ pub trait File: Send + Sync {
         let mut pos = pos;
         let outstanding = Arc::new(AtomicUsize::new(buffers.len()));
         let total_written = Arc::new(AtomicUsize::new(0));
+        let first_error = Arc::new(crate::sync::OnceLock::new());
 
         for buf in buffers {
             let len = buf.len();
@@ -177,13 +178,24 @@ pub trait File: Send + Sync {
                 let c_main = c.clone();
                 let outstanding = outstanding.clone();
                 let total_written = total_written.clone();
+                let first_error = first_error.clone();
                 Completion::new_write(move |n| {
-                    if let Ok(n) = n {
+                    match n {
                         // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::SeqCst);
-                        if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            // last one finished
-                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
+                        Ok(n) => {
+                            total_written.fetch_add(n as usize, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            let _ = first_error.set(e);
+                        }
+                    }
+                    // Resolve the parent only after the last child: the caller may
+                    // reuse the file range once the parent finishes, so no child
+                    // write may still be in flight then.
+                    if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        match first_error.get() {
+                            Some(e) => c_main.error(*e),
+                            None => c_main.complete(total_written.load(Ordering::Acquire) as i32),
                         }
                     }
                 })
