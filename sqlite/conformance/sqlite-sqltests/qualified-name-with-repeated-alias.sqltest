@@ -153,6 +153,29 @@ expect error {
     ambiguous column name
 }
 
+# SQLite expands x.* to <schema>.x.<column>, so with a subquery or a table
+# of another database named x, each column binds to its own FROM item. Turso
+# expands x.* this way only when all FROM items named x are tables of one
+# database, and reports the error otherwise.
+@skip-if sqlite "SQLite expands x.* by schema; Turso reports the error"
+test table-star-with-repeated-alias-in-other-schema-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TEMP TABLE u(a TEXT, d INT);
+    SELECT x.* FROM t AS x FULL JOIN u AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
+@skip-if sqlite "SQLite expands x.* by schema; Turso reports the error"
+test table-star-with-repeated-alias-of-subquery-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    SELECT x.* FROM (SELECT 2 AS a) AS x FULL JOIN t AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
 # A declared column named rowid wins over the implicit rowid of the other
 # FROM item with the same alias, in either order.
 @cross-check-integrity

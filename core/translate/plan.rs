@@ -1416,10 +1416,14 @@ pub(super) fn expand_table_star(
     let normalized_name = crate::util::normalize_ident(table_name);
     let tables = table_references.joined_tables();
 
-    let mut direct_matches = tables.iter().enumerate().filter(|(_, table)| {
+    let is_direct_match = |table: &JoinedTable| {
         table.table.parenthesized_join_columns().is_none()
             && alias_or_stored_name(table) == normalized_name
-    });
+    };
+    let mut direct_matches = tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| is_direct_match(table));
     let first_direct_match = direct_matches.next();
     if let (Some((_, first_table)), Some(_)) = (first_direct_match, direct_matches.next()) {
         let names_parenthesized_table = tables.iter().any(|table| {
@@ -1432,7 +1436,20 @@ pub(super) fn expand_table_star(
                         .any(|column| column.source.matches_table(None, &normalized_name))
                 })
         });
-        if names_parenthesized_table {
+        // SQLite expands `x.*` to `<schema>.x.<column>` for each FROM item
+        // named x, and the schema of a subquery matches only other
+        // subqueries. Binding `x.<column>` reaches the same FROM items only
+        // when all of them are tables of one database, so a view or a
+        // subquery named x keeps the error.
+        let all_tables_of_one_database =
+            tables
+                .iter()
+                .filter(|table| is_direct_match(table))
+                .all(|table| {
+                    matches!(&table.table, Table::BTree(_) | Table::Virtual(_))
+                        && table.namespace.database_id == first_table.namespace.database_id
+                });
+        if names_parenthesized_table || !all_tables_of_one_database {
             let column_name = first_table
                 .columns()
                 .iter()
