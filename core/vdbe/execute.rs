@@ -10392,9 +10392,11 @@ pub fn op_function(
                         path_value.map(|x| x.get_value()),
                         &state.json_cache,
                     ),
-                    JsonFunc::JsonType => {
-                        json_type(json_value.get_value(), path_value.map(|x| x.get_value()))
-                    }
+                    JsonFunc::JsonType => json_type(
+                        json_value.get_value(),
+                        path_value.map(|x| x.get_value()),
+                        &state.json_cache,
+                    ),
                     _ => unreachable!(),
                 };
 

@@ -823,7 +823,11 @@ fn json5_hex_literal_to_i64(payload: &str) -> crate::Result<Option<i64>> {
     }))
 }
 
-pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate::Result<Value> {
+pub fn json_type(
+    value: impl AsValueRef,
+    path: Option<impl AsValueRef>,
+    json_cache: &JsonCacheCell,
+) -> crate::Result<Value> {
     let value = value.as_value_ref();
     if let ValueRef::Null = value {
         return Ok(Value::Null);
@@ -839,7 +843,7 @@ pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate
     let path_value = path.ok_or_else(|| {
         crate::LimboError::InternalError("path should be Some after is_none check".to_string())
     })?;
-    if let Some(path) = json_path_from_db_value(&path_value, true)? {
+    if let Some(path) = cached_json_path(json_cache, &path_value, true)? {
         let mut json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
         if let Ok(mut path) = json.navigate_path(&path, PathOperationMode::ReplaceExisting) {
