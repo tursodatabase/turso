@@ -264,10 +264,6 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        false
-    }
-
     fn supports_capture_data_changes(&self) -> bool {
         false
     }
@@ -284,39 +280,8 @@ impl Dialect for PostgresDialect {
         crate::schema_state::build_schema_state(schema, results)
     }
 
-    fn translate_relation_changes(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[turso_core::RelationChange<'_>],
-    ) -> turso_core::Result<()> {
-        crate::classes::translate_relation_changes(program, schema, connection, changes)
-    }
-
-    fn translate_access_statement(
-        &self,
-        program: &mut turso_core::ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &turso_core::AccessStatement<'_>,
-    ) -> turso_core::Result<()> {
-        match statement {
-            turso_core::AccessStatement::CreateRole { name, options } => {
-                crate::roles::translate_create_role(program, schema, name, options)
-            }
-            turso_core::AccessStatement::DropRole { if_exists, roles } => {
-                crate::roles::translate_drop_role(program, schema, connection, *if_exists, roles)
-            }
-            turso_core::AccessStatement::GrantRole {
-                revoke,
-                roles,
-                grantees,
-            } => crate::auth_members::translate_grant_role(
-                program, schema, connection, *revoke, roles, grantees,
-            ),
-            _ => crate::classes::translate_access_statement(program, schema, connection, statement),
-        }
+    fn catalog(&self) -> &dyn turso_core::Catalog {
+        &crate::classes::PostgresCatalog
     }
 
     /// The built-in superuser is found by its name, `postgres`, too.
@@ -5127,6 +5092,202 @@ mod tests {
                 .run_collect_rows()
                 .unwrap(),
             vec![vec![Value::from_i64(3)]]
+        );
+    }
+
+    #[test]
+    fn indexes_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let opts = crate::DatabaseOpts::new().with_attach(true);
+        // A file of the PostgreSQL dialect keeps its tables in schemas, which
+        // a statement cannot name through an attached database. A file of
+        // the SQLite dialect keeps them where `aux.other` finds them.
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                opts,
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+            conn.execute("CREATE TABLE other (v INT, w INT)").unwrap();
+            conn.execute("CREATE INDEX other_v ON other (v)").unwrap();
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            opts,
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        // The relation catalog covers only the main database.
+        for sql in [
+            "CREATE INDEX other_w ON aux.other (w)",
+            "DROP INDEX aux.other_v",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequences_and_tables_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        // `aux.name` finds only objects that are in no schema, which a file
+        // made with the SQLite dialect has.
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_mvcc(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            conn.execute("CREATE SEQUENCE s").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "CREATE SEQUENCE aux.other",
+            "DROP SEQUENCE aux.s",
+            "DROP TABLE aux.t",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_column_of_a_sequence_of_an_attached_database_cannot_be_changed() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            let attached = Database::open_file_with_flags(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new().with_mvcc(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .unwrap();
+            conn.execute("CREATE SEQUENCE s").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "ALTER SEQUENCE aux.s OWNED BY aux.t.v",
+            "ALTER SEQUENCE aux.s OWNED BY NONE",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn views_of_an_attached_database_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let attached_path = dir.path().join("attached.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            let attached = Database::open(
+                io.clone(),
+                attached_path.to_str().unwrap(),
+                turso_core::OpenOptions::new(Arc::new(turso_sqlite::SqliteDialect))
+                    .db_opts(crate::DatabaseOpts::new().with_mvcc(true)),
+            )
+            .unwrap();
+            let conn = attached
+                .connect(ConnectOpts::new(SessionRole::Superuser))
+                .unwrap();
+            conn.execute("CREATE VIEW existing AS SELECT 1 AS one")
+                .unwrap();
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_attach(true),
+        )
+        .unwrap();
+        let conn = connect_with_public(&db);
+        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
+            .unwrap();
+        for sql in [
+            "CREATE VIEW aux.added AS SELECT 2 AS two",
+            "DROP VIEW aux.existing",
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("relations in an attached database is not supported"),
+                "{sql}: {err}"
+            );
+        }
+        assert_eq!(
+            conn.prepare("SELECT name FROM aux.sqlite_schema WHERE type = 'view'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::build_text("existing")]]
         );
     }
 

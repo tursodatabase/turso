@@ -108,7 +108,6 @@ pub fn emit_program_for_update(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
     program
@@ -492,7 +491,6 @@ pub fn emit_program_for_update(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(write_phase_tables);

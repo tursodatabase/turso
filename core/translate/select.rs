@@ -120,7 +120,7 @@ pub fn emit_select_plan(
     };
 
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan, |_| {})?;
+    emit_program(connection, resolver, program, plan)?;
     Ok(num_result_cols)
 }
 

@@ -17,7 +17,7 @@ use turso_parser::ast;
 
 use crate::{
     bail_parse_error,
-    dialect::AccessStatement,
+    dialect::{AccessStatement, CmdContext},
     function::Func,
     namespace::{NamespaceId, NamespaceRef},
     schema::{collect_column_dependencies_of_expr, BTreeTable, Column, Schema, Table},
@@ -760,8 +760,9 @@ fn row_security_table(
     }
 }
 
-/// Has the dialect translate `statement`, in a write transaction that bumps
-/// the schema cookie so that other connections load what it stored.
+/// Has the dialect's catalog store what `statement` changes, in a write
+/// transaction that bumps the schema cookie so that other connections load
+/// what it stored.
 pub(crate) fn translate_access_statement(
     statement: &AccessStatement<'_>,
     resolver: &Resolver,
@@ -770,10 +771,12 @@ pub(crate) fn translate_access_statement(
 ) -> Result<()> {
     let schema = resolver.schema();
     program.begin_write_on_database(MAIN_DB_ID, schema.schema_version)?;
+    let cmd_context = CmdContext::new(connection, resolver, MAIN_DB_ID);
     resolver
         .catalog
         .dialect
-        .translate_access_statement(program, schema, connection, statement)?;
+        .catalog()
+        .emit_access(program, &cmd_context, statement)?;
     emit_schema_cookie(resolver, program);
     Ok(())
 }

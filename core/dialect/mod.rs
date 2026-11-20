@@ -24,8 +24,13 @@ pub mod catalog;
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
+pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
-    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
+    CreateView, DropColumn, DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn,
+    RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable,
 };
 
 use crate::{
@@ -33,7 +38,7 @@ use crate::{
     namespace::NamespaceId,
     schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
-    vdbe::{builder::ProgramBuilder, Register},
+    vdbe::Register,
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
     WallClockInstant, IO,
 };
@@ -384,45 +389,10 @@ pub trait Dialect: Send + Sync + 'static {
         ))
     }
 
-    /// Translates `changes`, which the statement being compiled makes to
-    /// relations, into the bytecode that records them in the dialect's own
-    /// schema state, in the same transaction as the statement's
-    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
-    /// call. Does nothing for a dialect without schema state of its own.
-    fn translate_relation_changes(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[RelationChange<'_>],
-    ) -> Result<()> {
-        let _ = (program, schema, connection, changes);
-        Ok(())
-    }
-
-    /// Translates `statement` into the bytecode that changes the roles,
-    /// owners, privileges or policies the dialect stores. A dialect that
-    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
-    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
-    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_access_statement(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &AccessStatement<'_>,
-    ) -> Result<()> {
-        let _ = (program, schema, connection);
-        Err(statement.not_supported())
-    }
-
-    /// Whether relations can be created, renamed or dropped in an attached
-    /// database. The PostgreSQL frontend refuses it: its relation catalog
-    /// covers only the main database, so a database file with relations
-    /// made while it was attached could not be opened later.
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        true
+    /// Where the dialect stores the objects of a database. The default
+    /// stores them as rows of `sqlite_schema`.
+    fn catalog(&self) -> &dyn Catalog {
+        &SqliteCatalog
     }
 
     /// The id of the role named `name`, case-sensitively, when the dialect
