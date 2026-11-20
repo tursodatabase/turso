@@ -14,9 +14,14 @@ use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
-    schema::Trigger,
+    schema::{Table, Trigger},
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
-    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    translate::{
+        self,
+        display::PlanContext,
+        emitter::TransactionMode,
+        plan::{BitSet, Plan, TableReferences},
+    },
     turso_assert, turso_soft_unreachable,
     vdbe::{
         self,
@@ -134,7 +139,7 @@ impl StatementOrigin {
 pub struct ColumnTypeInfo {
     /// The declared type name as written in CREATE TABLE — e.g. `"INTEGER"`,
     /// `"VARCHAR"`, or the name of a `CREATE TYPE` / `CREATE DOMAIN` such as
-    /// `"cents"`. This is the same string `get_column_decltype` returns.
+    /// `"cents"`. `get_column_decltype` returns it with the type's parameters.
     pub declared_name: String,
     /// Array dimensionality: `0` for scalar columns, `1` for `INTEGER[]`,
     /// `2` for `TEXT[][]`, etc.
@@ -190,6 +195,20 @@ pub enum ColumnTypeKind {
     /// Values are stored as BLOBs containing a tag and a payload; the
     /// declared name carries the variant schema.
     Union,
+}
+
+/// The table column that a result column reads.
+///
+/// Returned by [`Statement::get_column_origin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnOrigin {
+    /// `main`, `temp`, or the name an attached database was given.
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    /// The declared type with its parameters, e.g. `VARCHAR(40)`. `None` for
+    /// a column declared without a type.
+    pub declared_type: Option<String>,
 }
 
 pub struct Statement {
@@ -1213,30 +1232,15 @@ impl Statement {
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
-        if matches!(
-            self.query_mode,
-            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
-        ) {
-            return None;
-        }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column { table, .. } => self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
-            _ => None,
-        }
+        self.get_column_origin(idx)
+            .map(|origin| Cow::Owned(origin.table))
     }
 
     /// Returns the declared type of a result column.
     ///
-    /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:
-    /// If the Nth column of the returned result set of a SELECT is a table column
-    /// (not an expression or subquery) then the declared type of the table column
-    /// is returned. If the Nth column of the result set is an expression or subquery,
-    /// then None is returned. The returned string is always UTF-8 encoded.
+    /// This behaves like SQLite's `sqlite3_column_decltype()`: the declared type,
+    /// with its parameters, of the table column that the result column reads (see
+    /// [Self::get_column_origin]), or None for an expression.
     ///
     /// See: <https://sqlite.org/c3ref/column_decltype.html>
     pub fn get_column_decltype(&self, idx: usize) -> Option<String> {
@@ -1255,27 +1259,85 @@ impl Statement {
             };
             return Some(column_types.get(idx).expect("No column").to_string());
         }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                let ty_str = &table_column.ty_str;
-                if ty_str.is_empty() {
-                    None
-                } else {
-                    Some(ty_str.clone())
-                }
-            }
-            _ => None,
+        self.get_column_origin(idx)?.declared_type
+    }
+
+    /// Returns the table column that a result column reads.
+    ///
+    /// This behaves like SQLite's `sqlite3_column_database_name()`,
+    /// `sqlite3_column_table_name()`, `sqlite3_column_origin_name()` and
+    /// `sqlite3_column_decltype()` together: a column of a FROM-clause
+    /// subquery, view or CTE is followed to the table column it reads, and an
+    /// expression has no origin. A compound subquery is followed through its
+    /// last SELECT, as in SQLite. Unlike SQLite, a scalar subquery such as
+    /// `(SELECT name FROM users)` has no origin.
+    ///
+    /// See: <https://sqlite.org/c3ref/column_database_name.html>
+    pub fn get_column_origin(&self, idx: usize) -> Option<ColumnOrigin> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
         }
+        let column = self.program.result_columns.get(idx).expect("No column");
+        self.column_origin(&column.expr, &self.program.table_references)
+    }
+
+    fn column_origin(
+        &self,
+        expr: &turso_parser::ast::Expr,
+        tables: &TableReferences,
+    ) -> Option<ColumnOrigin> {
+        let (table_id, column_idx) = match expr {
+            turso_parser::ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
+            turso_parser::ast::Expr::RowId { table, .. } => (*table, None),
+            turso_parser::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                return self.column_origin(&exprs[0], tables);
+            }
+            _ => return None,
+        };
+        let (namespace, table) = tables
+            .find_joined_table_by_internal_id(table_id)
+            .map(|joined| (joined.namespace, &joined.table))
+            .or_else(|| {
+                tables
+                    .find_outer_query_ref_by_internal_id(table_id)
+                    .map(|outer| (outer.namespace, &outer.table))
+            })?;
+        let table_column = match (table, column_idx) {
+            (Table::FromClauseSubquery(subquery), Some(column_idx)) => {
+                let select = match subquery.plan.as_ref() {
+                    Plan::Select(select) => select,
+                    Plan::CompoundSelect { right_most, .. } => right_most,
+                    _ => return None,
+                };
+                let result_column = select.result_columns.get(column_idx)?;
+                return self.column_origin(&result_column.expr, &select.table_references);
+            }
+            (Table::BTree(_) | Table::Virtual(_), Some(column_idx)) => {
+                Some(table.get_column_at(column_idx)?)
+            }
+            (Table::BTree(btree), None) => btree.get_rowid_alias_column().map(|(_, c)| c),
+            _ => return None,
+        };
+        let (column, declared_type) = match table_column {
+            Some(table_column) => (
+                table_column.name.clone()?,
+                Some(table_column.declared_type()).filter(|ty| !ty.is_empty()),
+            ),
+            None => ("rowid".to_string(), Some("INTEGER".to_string())),
+        };
+        let database_id = match table {
+            // SQLite keeps table-valued functions such as json_each() in main.
+            Table::Virtual(vtab) if vtab.kind == turso_ext::VTabKind::TableValuedFunction => {
+                crate::MAIN_DB_ID
+            }
+            _ => namespace.database_id,
+        };
+        Some(ColumnOrigin {
+            database: self.connection.namespace_name(database_id)?,
+            table: table.get_name().to_string(),
+            column,
+            declared_type,
+        })
     }
 
     /// Returns rich type information for a result column.
