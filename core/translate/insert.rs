@@ -1110,6 +1110,34 @@ pub fn translate_insert(
         )?;
     }
 
+    // RETURNING reads the row before the AFTER triggers run, as in SQLite, so
+    // a subquery in it does not see what a trigger writes.
+    if !returning_subqueries.is_empty() {
+        emit_returning_subqueries(
+            program,
+            resolver,
+            &table_references,
+            &mut returning_subqueries,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            &btree_table.column_layout()?,
+        )?;
+    }
+
+    // Emit RETURNING results if specified
+    if !result_columns.is_empty() {
+        emit_returning_results(
+            program,
+            &table_references,
+            &result_columns,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            resolver,
+            ctx.returning_buffer.as_ref(),
+            &btree_table.column_layout()?,
+        )?;
+    }
+
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
         resolver,
@@ -1152,7 +1180,7 @@ pub fn translate_insert(
             None => trigger_ctx_after,
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-        // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
+        // not skip post-row work (FK counters, autoincrement, CDC).
         // Use a label that falls through to the next instruction after the trigger loop.
         let after_trigger_done = program.allocate_label();
         for trigger in relevant_after_triggers {
@@ -1183,31 +1211,6 @@ pub fn translate_insert(
         )?;
     }
 
-    if !returning_subqueries.is_empty() {
-        emit_returning_subqueries(
-            program,
-            resolver,
-            &table_references,
-            &mut returning_subqueries,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            &btree_table.column_layout()?,
-        )?;
-    }
-
-    // Emit RETURNING results if specified
-    if !result_columns.is_empty() {
-        emit_returning_results(
-            program,
-            &table_references,
-            &result_columns,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout()?,
-        )?;
-    }
     program.emit_insn(Insn::Goto {
         target_pc: ctx.loop_labels.row_done,
     });

@@ -208,6 +208,23 @@ expect {
 }
 
 @cross-check-integrity
+test upsert-returning-subqueries-before-after-triggers {
+    CREATE TABLE r6 (id INTEGER PRIMARY KEY, name);
+    CREATE TABLE r6log (x);
+    CREATE TRIGGER r6i AFTER INSERT ON r6 BEGIN INSERT INTO r6log VALUES ('i'); END;
+    CREATE TRIGGER r6u AFTER UPDATE ON r6 BEGIN INSERT INTO r6log VALUES ('u'); END;
+    INSERT INTO r6 VALUES (1, 'a');
+    DELETE FROM r6log;
+    INSERT INTO r6 VALUES (1, 'b'), (2, 'c')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, (SELECT count(*) FROM r6log);
+}
+expect {
+    1|0
+    2|1
+}
+
+@cross-check-integrity
 test upsert-rowid-in-set {
     CREATE TABLE rid (id INTEGER PRIMARY KEY, name);
     INSERT INTO rid VALUES (5,'foo');

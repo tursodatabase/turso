@@ -1674,54 +1674,9 @@ pub fn emit_upsert(
         }
     }
 
-    // Fire AFTER UPDATE triggers
-    if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let relevant_triggers = get_triggers_including_temp(
-            resolver,
-            upsert_namespace,
-            TriggerEvent::Update,
-            TriggerTime::After,
-            Some(set_column_names),
-            &btree_table,
-            connection,
-        );
-        if !relevant_triggers.is_empty() {
-            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-            let new_registers_after: Vec<usize> = (0..num_cols)
-                .map(|i| layout.to_register(new_start, i))
-                .chain(std::iter::once(new_rowid_for_trigger))
-                .collect();
-
-            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
-            // clauses should not suppress errors. Override conflict resolution to Abort.
-            // NEW values are encoded at this point; fire_trigger will decode them.
-            let trigger_ctx_after = TriggerContext::new(
-                btree_table,
-                Some(new_registers_after),
-                DmlRowForm::Stored,
-                Some(old_regs),
-            )
-            .with_override_conflict(ast::ResolveType::Abort);
-
-            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-            // not skip post-row work (RETURNING).
-            let after_trigger_done = program.allocate_label();
-            for trigger in relevant_triggers {
-                fire_trigger(
-                    program,
-                    resolver,
-                    trigger,
-                    &trigger_ctx_after,
-                    connection,
-                    upsert_namespace,
-                    after_trigger_done,
-                )?;
-            }
-            program.preassign_label_to_next_insn(after_trigger_done);
-        }
-    }
-
-    // RETURNING from NEW image + final rowid
+    // RETURNING from NEW image + final rowid. It reads the row before the
+    // AFTER triggers run, as in SQLite, so a subquery in it does not see what
+    // a trigger writes.
     if !returning.is_empty() {
         let final_rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let upsert_returning_columns;
@@ -1762,6 +1717,52 @@ pub fn emit_upsert(
             ctx.returning_buffer.as_ref(),
             &layout,
         )?;
+    }
+
+    // Fire AFTER UPDATE triggers
+    if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
+        let relevant_triggers = get_triggers_including_temp(
+            resolver,
+            upsert_namespace,
+            TriggerEvent::Update,
+            TriggerTime::After,
+            Some(set_column_names),
+            &btree_table,
+            connection,
+        );
+        if !relevant_triggers.is_empty() {
+            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            let new_registers_after: Vec<usize> = (0..num_cols)
+                .map(|i| layout.to_register(new_start, i))
+                .chain(std::iter::once(new_rowid_for_trigger))
+                .collect();
+
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            // NEW values are encoded at this point; fire_trigger will decode them.
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table,
+                Some(new_registers_after),
+                DmlRowForm::Stored,
+                Some(old_regs),
+            )
+            .with_override_conflict(ast::ResolveType::Abort);
+
+            // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body.
+            let after_trigger_done = program.allocate_label();
+            for trigger in relevant_triggers {
+                fire_trigger(
+                    program,
+                    resolver,
+                    trigger,
+                    &trigger_ctx_after,
+                    connection,
+                    upsert_namespace,
+                    after_trigger_done,
+                )?;
+            }
+            program.preassign_label_to_next_insn(after_trigger_done);
+        }
     }
 
     program.emit_insn(Insn::Goto {
