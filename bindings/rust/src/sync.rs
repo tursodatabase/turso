@@ -1204,6 +1204,21 @@ mod tests {
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
 
+    #[tokio::test]
+    async fn local_encryption_requires_a_shared_cipher_before_io() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing-cipher.db");
+        let result = super::Builder::new_remote(path.to_str().unwrap())
+            .experimental_sync_encryption(true)
+            .with_local_encryption_key("16".repeat(32))
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(crate::Error::Error(message)) if message.contains("requires a shared cipher"))
+        );
+        assert!(!path.exists());
+    }
+
     #[test]
     fn missing_native_roots_returns_build_error() {
         const CHILD: &str = "TURSO_TEST_MISSING_NATIVE_ROOTS";

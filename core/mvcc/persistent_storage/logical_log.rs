@@ -6322,19 +6322,19 @@ mod tests {
                 }
                 "extra record" => {
                     header[32..36].copy_from_slice(&2u32.to_le_bytes());
-                    "truncated logical log extension header"
+                    "extension record header is truncated"
                 }
                 "record flags" => {
                     body[2] = 1;
-                    "unsupported logical log extension flags"
+                    "unsupported extension flags for type"
                 }
                 "record length" => {
                     body[4..8].copy_from_slice(&(extension_size as u32).to_le_bytes());
-                    "truncated logical log extension body"
+                    "extension record payload is truncated"
                 }
                 "trailing bytes" => {
                     body[4..8].fill(0);
-                    "extension count does not match its size"
+                    "extension block has trailing bytes"
                 }
                 _ => unreachable!(),
             };
