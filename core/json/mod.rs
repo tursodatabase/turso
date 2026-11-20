@@ -358,24 +358,22 @@ pub fn json_array_length(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    json_cache.with_jsonb(value, make_jsonb_fn, |json| {
+        let Some(path) = path else {
+            let len = json.array_len()?;
+            return Ok(Value::from_i64(len as i64));
+        };
 
-    if path.is_none() {
-        let len = json.array_len()?;
-        return Ok(Value::from_i64(len as i64));
-    }
-
-    let path = cached_json_path(json_cache, path.expect("We already checked none"), true)?;
-
-    if let Some(path) = path {
-        if let Ok(Some(target)) = find_path_element(json.as_bytes(), &path) {
-            let element = &json.as_bytes()[target.start..target.end];
-            if let Ok(len) = jsonb::array_len(element) {
-                return Ok(Value::from_i64(len as i64));
+        if let Some(path) = cached_json_path(json_cache, path, true)? {
+            if let Ok(Some(target)) = find_path_element(json.as_bytes(), &path) {
+                let element = &json.as_bytes()[target.start..target.end];
+                if let Ok(len) = jsonb::array_len(element) {
+                    return Ok(Value::from_i64(len as i64));
+                }
             }
         }
-    }
-    Ok(Value::Null)
+        Ok(Value::Null)
+    })
 }
 
 pub fn json_set<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -476,14 +474,15 @@ pub fn json_arrow_extract(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    let Some(path) = cached_json_path(json_cache, &path, false)? else {
-        return Ok(Value::Null);
-    };
-    match find_path_element(json.as_bytes(), &path) {
-        Ok(Some(target)) => Ok(Value::Text(Text::json(json.element_to_string(target)?))),
-        _ => Ok(Value::Null),
-    }
+    json_cache.with_jsonb(value, make_jsonb_fn, |json| {
+        let Some(path) = cached_json_path(json_cache, &path, false)? else {
+            return Ok(Value::Null);
+        };
+        match find_path_element(json.as_bytes(), &path) {
+            Ok(Some(target)) => Ok(Value::Text(Text::json(json.element_to_string(target)?))),
+            _ => Ok(Value::Null),
+        }
+    })
 }
 
 /// Implements the ->> operator. Always returns a SQL representation of the JSON subcomponent.
@@ -498,17 +497,18 @@ pub fn json_arrow_shift_extract(
         return Ok(Value::Null);
     }
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    let Some(path) = cached_json_path(json_cache, &path, false)? else {
-        return Ok(Value::Null);
-    };
-    match find_path_element(json.as_bytes(), &path) {
-        Ok(Some(target)) => element_to_db_type(
-            &json.as_bytes()[target.start..target.end],
-            OutputVariant::ElementTypePlain,
-        ),
-        _ => Ok(Value::Null),
-    }
+    json_cache.with_jsonb(value, make_jsonb_fn, |json| {
+        let Some(path) = cached_json_path(json_cache, &path, false)? else {
+            return Ok(Value::Null);
+        };
+        match find_path_element(json.as_bytes(), &path) {
+            Ok(Some(target)) => element_to_db_type(
+                &json.as_bytes()[target.start..target.end],
+                OutputVariant::ElementTypePlain,
+            ),
+            _ => Ok(Value::Null),
+        }
+    })
 }
 
 /// Extracts a JSON value from a JSON object or array.
@@ -534,13 +534,14 @@ where
         return Ok(Value::Null);
     }
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-    extract_paths(
-        jsonb.as_bytes(),
-        paths,
-        json_cache,
-        OutputVariant::ElementType,
-    )
+    json_cache.with_jsonb(value, convert_to_jsonb, |jsonb| {
+        extract_paths(
+            jsonb.as_bytes(),
+            paths,
+            json_cache,
+            OutputVariant::ElementType,
+        )
+    })
 }
 
 pub fn jsonb_extract<I, E, V>(
@@ -562,8 +563,9 @@ where
         return Ok(Value::Null);
     }
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-    extract_paths(jsonb.as_bytes(), paths, json_cache, OutputVariant::Binary)
+    json_cache.with_jsonb(value, convert_to_jsonb, |jsonb| {
+        extract_paths(jsonb.as_bytes(), paths, json_cache, OutputVariant::Binary)
+    })
 }
 
 /// The result of json_extract and jsonb_extract for the JSONB document `json`:

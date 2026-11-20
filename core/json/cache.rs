@@ -50,11 +50,7 @@ impl JsonCache {
         value: &Jsonb,
     ) -> std::result::Result<(), TryReserveError> {
         let key = key.as_value_ref();
-        let id = if self.used < JSON_CACHE_SIZE {
-            self.used
-        } else {
-            self.find_oldest_entry()
-        };
+        let id = self.new_entry_slot();
         let entry = &mut self.entries[id];
         match entry {
             // The entry that the new entry evicts, or an entry from before a
@@ -72,31 +68,86 @@ impl JsonCache {
             }
             None => *entry = Some((key.to_owned()?, value.try_clone()?)),
         }
+        self.add_entry(id);
+        Ok(())
+    }
+
+    /// Like [Self::insert], but the cache takes `value`, and the document of
+    /// the evicted entry is dropped. Returns the slot of the new entry.
+    fn insert_owned(
+        &mut self,
+        key: ValueRef,
+        value: Jsonb,
+    ) -> std::result::Result<usize, TryReserveError> {
+        let id = self.new_entry_slot();
+        let entry = &mut self.entries[id];
+        match entry {
+            Some((stored_key, stored_value)) => {
+                *stored_value = value;
+                if let Err(err) = copy_key(stored_key, key) {
+                    // Half of a new entry must not match a lookup.
+                    *entry = None;
+                    return Err(err);
+                }
+            }
+            None => *entry = Some((key.to_owned()?, value)),
+        }
+        self.add_entry(id);
+        Ok(id)
+    }
+
+    /// The slot for a new entry: the next unused slot, or the slot of the
+    /// oldest entry when the cache is full.
+    fn new_entry_slot(&self) -> usize {
+        if self.used < JSON_CACHE_SIZE {
+            self.used
+        } else {
+            self.find_oldest_entry()
+        }
+    }
+
+    /// Makes the entry in `id`, a slot from [Self::new_entry_slot], the newest
+    /// entry.
+    fn add_entry(&mut self, id: usize) {
         if self.used < JSON_CACHE_SIZE {
             self.used += 1;
         }
         self.age[id] = self.counter;
         self.counter += 1;
-        Ok(())
     }
 
     pub fn lookup(
         &mut self,
         key: impl AsValueRef,
     ) -> std::result::Result<Option<Jsonb>, TryReserveError> {
-        let key = key.as_value_ref();
+        match self.find(key.as_value_ref()) {
+            Some(id) => Ok(Some(self.entry(id).try_clone()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the slot of the entry for `key` and makes it the newest entry,
+    /// or returns None when the cache has no entry for `key`.
+    fn find(&mut self, key: ValueRef) -> Option<usize> {
         for i in (0..self.used).rev() {
-            if let Some((stored_key, value)) = &self.entries[i] {
+            if let Some((stored_key, _)) = &self.entries[i] {
                 if key_matches(key, stored_key) {
-                    let json = value.try_clone()?;
                     self.age[i] = self.counter;
                     self.counter += 1;
-
-                    return Ok(Some(json));
+                    return Some(i);
                 }
             }
         }
-        Ok(None)
+        None
+    }
+
+    /// The document of the entry in `id`, a slot that [Self::find] or
+    /// [Self::insert_owned] returned.
+    fn entry(&self, id: usize) -> &Jsonb {
+        let (_, json) = self.entries[id]
+            .as_ref()
+            .expect("a slot from find or insert_owned holds an entry");
+        json
     }
 
     pub fn clear(&mut self) {
@@ -276,6 +327,28 @@ impl JsonCacheCell {
                 None
             }
         }
+    }
+
+    /// Calls `read` with the document for `key`: the document in the cache, or
+    /// the document that `value` makes for `key`, which then enters the cache.
+    /// The document is not copied, so this is for a caller that only reads it.
+    #[inline]
+    pub fn with_jsonb<R>(
+        &self,
+        key: impl AsValueRef,
+        value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
+        read: impl FnOnce(&Jsonb) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        let key = key.as_value_ref();
+        let _guard = self.access_guard();
+        // SAFETY: the access guard makes a second access to the cache panic
+        // while this reference lives, also from `value` or `read`.
+        let cache = unsafe { (*self.inner.get()).get_or_insert_with(JsonCache::new) };
+        let id = match cache.find(key) {
+            Some(id) => id,
+            None => cache.insert_owned(key, value(key)?)?,
+        };
+        read(cache.entry(id))
     }
 
     pub fn get_or_insert_with(
@@ -685,6 +758,46 @@ mod tests {
 
         // Should return the original value
         assert_eq!(result.unwrap(), value);
+    }
+
+    #[test]
+    fn with_jsonb_reads_the_cached_document() {
+        let cache_cell = JsonCacheCell::new();
+        let (key, value) = create_test_pair("{\"test\": \"value\"}");
+        let text = cache_cell
+            .with_jsonb(&key, |_| Ok(value.clone()), |json| json.to_string())
+            .unwrap();
+        assert_eq!(text, "{\"test\":\"value\"}");
+
+        // The second call reads the cached document, without a new conversion.
+        let converted = Cell::new(false);
+        let text = cache_cell
+            .with_jsonb(
+                &key,
+                |_| {
+                    converted.set(true);
+                    Ok(Jsonb::from_str("1").unwrap())
+                },
+                |json| json.to_string(),
+            )
+            .unwrap();
+        assert!(!converted.get());
+        assert_eq!(text, "{\"test\":\"value\"}");
+        assert!(!cache_cell.accessed.get());
+    }
+
+    #[test]
+    fn with_jsonb_does_not_cache_a_failed_conversion() {
+        let cache_cell = JsonCacheCell::new();
+        let (key, _) = create_test_pair("{\"test\": \"value\"}");
+        let result = cache_cell.with_jsonb(
+            &key,
+            |_| Err(crate::LimboError::ParseError("malformed JSON".to_string())),
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!cache_cell.accessed.get());
+        assert!(cache_cell.lookup(&key).is_none());
     }
 
     #[test]
