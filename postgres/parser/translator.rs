@@ -3722,12 +3722,24 @@ impl PostgreSQLTranslator {
                         check_type_is_supported("time", 0)?;
                         Ok(ast::Expr::Literal(ast::Literal::CurrentTime))
                     }
+                    // CURRENT_TIMESTAMP is now(), the time the transaction
+                    // started, and LOCALTIMESTAMP is that time as a timestamp
+                    // in the session's time zone, which is always UTC.
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(function_call("now", vec![])),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(ast::Expr::Cast {
+                        expr: Box::new(function_call("now", vec![])),
+                        type_name: Some(ast::Type {
+                            name: "timestamp".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
                     // Each role keyword is stored as a call to the function
                     // of the same name, so that the catalogs can show the
                     // keyword that was written.
@@ -11815,7 +11827,7 @@ mod tests {
             panic!("Expected SELECT body");
         };
 
-        let expected = [ast::Expr::Literal(ast::Literal::CurrentTimestamp)];
+        let expected = [function_call("now", vec![])];
 
         assert_eq!(columns.len(), expected.len());
 
