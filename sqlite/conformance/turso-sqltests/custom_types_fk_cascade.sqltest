@@ -331,3 +331,22 @@ test set-default-encodes-default-value {
 expect {
     8
 }
+
+# A timestamptz key matches the same instant written with another offset, as
+# in PostgreSQL, because both are stored as the same integer.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test foreign-key-on-timestamptz-matches-the-same-instant {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(k timestamptz PRIMARY KEY) STRICT;
+    CREATE TABLE child(k timestamptz REFERENCES parent(k) ON DELETE CASCADE) STRICT;
+    INSERT INTO parent VALUES ('2024-01-05 10:00:00+00');
+    INSERT INTO child VALUES ('2024-01-05 12:00:00+02');
+    SELECT k FROM child;
+    DELETE FROM parent;
+    SELECT count(*) FROM child;
+}
+expect {
+    2024-01-05 10:00:00+00
+    0
+}

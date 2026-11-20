@@ -2690,6 +2690,8 @@ expect @tursopg error {
 # now() is the time the transaction started, so every row a transaction
 # inserts gets the same DEFAULT now(). The generate_series between the
 # INSERTs lets the clock move.
+# The stored rows equal now() whatever the digits of its fraction of a
+# second.
 test default-now-is-the-same-for-every-insert-of-a-transaction {
     CREATE TABLE created (id int, created_at timestamptz NOT NULL DEFAULT now());
     BEGIN;
@@ -2697,11 +2699,13 @@ test default-now-is-the-same-for-every-insert-of-a-transaction {
     SELECT count(*) FROM generate_series(1, 100000);
     INSERT INTO created (id) VALUES (2);
     SELECT count(DISTINCT created_at) FROM created;
+    SELECT count(*) FROM created WHERE created_at = now();
     COMMIT;
 }
 expect {
     100000
     1
+    2
 }
 
 # Outside a transaction, now() and statement_timestamp() are the time the

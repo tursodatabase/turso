@@ -1049,6 +1049,10 @@ pub enum ScalarFunc {
     IntToBoolean,
     ValidateIpAddr,
     TemporalEncode,
+    TimestampEncode,
+    TimestampDecode,
+    TimestamptzEncode,
+    TimestamptzDecode,
     // Numeric type functions
     NumericEncode,
     NumericFit,
@@ -1179,6 +1183,10 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::TemporalEncode
+            | ScalarFunc::TimestampEncode
+            | ScalarFunc::TimestampDecode
+            | ScalarFunc::TimestamptzEncode
+            | ScalarFunc::TimestamptzDecode
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
@@ -1267,6 +1275,8 @@ impl ScalarFunc {
             | Self::Gcd
             | Self::Lcm
             | Self::BooleanToInt
+            | Self::TimestampEncode
+            | Self::TimestamptzEncode
             | Self::DateDiff
             | Self::ArrayLength
             | Self::ArrayContains
@@ -1310,6 +1320,8 @@ impl ScalarFunc {
             | Self::Lpad
             | Self::Rpad
             | Self::TemporalEncode
+            | Self::TimestampDecode
+            | Self::TimestamptzDecode
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode
@@ -1445,6 +1457,10 @@ impl Display for ScalarFunc {
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::TemporalEncode => "temporal_encode",
+            Self::TimestampEncode => "timestamp_encode",
+            Self::TimestampDecode => "timestamp_decode",
+            Self::TimestamptzEncode => "timestamptz_encode",
+            Self::TimestamptzDecode => "timestamptz_decode",
             Self::NumericEncode => "numeric_encode",
             Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
@@ -1595,6 +1611,10 @@ impl ScalarFunc {
             | Self::ValidateIpAddr
             | Self::NumericEncode
             | Self::NumericDecode
+            | Self::TimestampEncode
+            | Self::TimestampDecode
+            | Self::TimestamptzEncode
+            | Self::TimestamptzDecode
             | Self::NumericNeg => &[1],
             Self::TemporalEncode
             | Self::NumericAdd

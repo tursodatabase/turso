@@ -2168,6 +2168,10 @@ fn translate_function_call_expr(
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
                 | ScalarFunc::TemporalEncode
+                | ScalarFunc::TimestampEncode
+                | ScalarFunc::TimestampDecode
+                | ScalarFunc::TimestamptzEncode
+                | ScalarFunc::TimestamptzDecode
                 | ScalarFunc::NumericEncode
                 | ScalarFunc::NumericFit
                 | ScalarFunc::NumericDecode

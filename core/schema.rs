@@ -561,7 +561,8 @@ pub struct TypeDef {
     /// values, so an index on a column of the type can serve a range or ORDER
     /// BY even though the type has no ordering of its own. True only for the
     /// built-in date and time types, which store one text form with a 4-digit
-    /// year. False for a domain, whose index then serves only `=`.
+    /// year or, for timestamp and timestamptz, an integer. False for a domain,
+    /// whose index then serves only `=`.
     pub stored_form_sorts_in_value_order: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,

@@ -1,8 +1,10 @@
 @database :memory:
 
 # The built-in date, time, timestamp and timestamptz types read the input
-# forms PostgreSQL reads and store one text form with a 4-digit year.
-# Expected values are PostgreSQL 17's, with the session time zone UTC.
+# forms PostgreSQL reads. date and time store one text form with a 4-digit
+# year; timestamp and timestamptz store the microseconds since 2000-01-01, in
+# UTC for timestamptz. Expected values are PostgreSQL 18's, with the session
+# time zone UTC.
 
 @requires strict "uses STRICT tables"
 test datetime-input-postgresql-forms {
@@ -14,10 +16,10 @@ test datetime-input-postgresql-forms {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00
-    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
-    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00
-    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00
+    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00+00
+    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
+    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00+00
+    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00+00
 }
 
 @requires custom_types "date and time types are custom types"
@@ -37,9 +39,9 @@ test datetime-input-keeps-microseconds {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456
-    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5
-    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00
+    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456+00
+    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5+00
+    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -63,8 +65,8 @@ test datetime-input-offsets {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
-    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00
+    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
+    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -124,7 +126,7 @@ test datetime-input-accepts-second-60-as-next-day {
     SELECT * FROM t;
 }
 expect {
-    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00
+    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -194,7 +196,7 @@ test datetime-time-input-rejects-date-form-1 {
     INSERT INTO t VALUES ('Jan 5 2024 10:00');
 }
 expect error {
-    invalid input syntax for type time: "Jan 5 2024 10:00"
+    invalid or unsupported input for type time: "Jan 5 2024 10:00"
 }
 
 @requires strict "uses STRICT tables"
@@ -203,7 +205,7 @@ test datetime-time-input-rejects-date-form-2 {
     INSERT INTO t VALUES ('10:00 Jan 5 2024');
 }
 expect error {
-    invalid input syntax for type time: "10:00 Jan 5 2024"
+    invalid or unsupported input for type time: "10:00 Jan 5 2024"
 }
 
 @requires strict "uses STRICT tables"
@@ -230,7 +232,7 @@ test datetime-time-input-rejects-date-form-5 {
     INSERT INTO t VALUES ('20240105 10:00');
 }
 expect error {
-    invalid input syntax for type time: "20240105 10:00"
+    invalid or unsupported input for type time: "20240105 10:00"
 }
 
 # PostgreSQL accepts the values below, but their stored text would not sort in
@@ -323,7 +325,7 @@ expect {
     1|2024-01-05|2024-01-05 10:00:00
 }
 
-# The stored text sorts in time order, so a range on the column can use an
+# The stored form sorts in time order, so a range on the column can use an
 # index.
 
 @requires strict "uses STRICT tables"
@@ -383,28 +385,30 @@ expect {
     3
 }
 
-# timestamptz is stored as the UTC instant with no offset, so it equals the
-# same timestamp and SQLite's date functions can read it.
+# The row's record ends with two serial types 6, 8-byte integers, each holding
+# 0x0002B12D00EB8120: 757756800500000 microseconds since 2000-01-01, in UTC
+# for the timestamptz.
 @requires strict "uses STRICT tables"
-test datetime-timestamp-equals-timestamptz {
-    CREATE TABLE t(id INTEGER, ts timestamp, tz timestamptz) STRICT;
-    INSERT INTO t VALUES (1, '2024-01-05 10:00:00', '2024-01-05 10:00:00');
-    INSERT INTO t VALUES (2, '2024-01-05 10:00:00', '2024-01-05 10:00:00+02');
-    SELECT id FROM t WHERE ts = tz;
+@skip-if mvcc "in MVCC mode the row is not written to the page until a checkpoint"
+test datetime-timestamps-stored-as-microseconds-since-2000 {
+    CREATE TABLE t(ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES ('2024-01-05 08:00:00.5', '2024-01-05 10:00:00.5+02');
+    SELECT substr(hex(data), -36) FROM sqlite_dbpage WHERE pgno = (SELECT rootpage FROM sqlite_schema WHERE name = 't');
 }
 expect {
-    1
+    06060002B12D00EB81200002B12D00EB8120
 }
 
 @requires strict "uses STRICT tables"
-test datetime-timestamptz-in-sqlite-date-functions {
+test datetime-timestamptz-in-recursive-union-all {
     CREATE TABLE t(tz timestamptz) STRICT;
-    INSERT INTO t VALUES ('2024-01-05 10:00:00'), ('2024-01-05 12:00:00+02');
-    SELECT datetime(tz), date(tz), unixepoch(tz) FROM t;
+    INSERT INTO t VALUES ('2024-01-05');
+    WITH RECURSIVE r(x, n) AS (SELECT tz, 1 FROM t UNION ALL SELECT x, n + 1 FROM r WHERE n < 2)
+    SELECT x, n FROM r;
 }
 expect {
-    2024-01-05 10:00:00|2024-01-05|1704448800
-    2024-01-05 10:00:00|2024-01-05|1704448800
+    2024-01-05 00:00:00+00|1
+    2024-01-05 00:00:00+00|2
 }
 
 # The order of the fields matters, as in PostgreSQL: `T` needs a date before
@@ -512,7 +516,7 @@ test datetime-input-rejects-order-5-2024-jan {
     INSERT INTO t VALUES ('5 2024 Jan');
 }
 expect error {
-    invalid input syntax for type timestamp: "5 2024 Jan"
+    invalid or unsupported input for type timestamp: "5 2024 Jan"
 }
 
 @requires strict "uses STRICT tables"

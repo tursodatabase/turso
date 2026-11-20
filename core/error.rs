@@ -123,6 +123,10 @@ pub enum LimboError {
     /// A date or time field is out of range, such as `2024-02-30`.
     #[error("Parse error: {0}")]
     DatetimeFieldOverflow(String),
+    /// A use of a date or time type that is not supported, such as a
+    /// conversion from a number or comparing a timestamp with text.
+    #[error("Parse error: {0}")]
+    DatetimeNotSupported(String),
     #[error("Parse error: {0}")]
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]

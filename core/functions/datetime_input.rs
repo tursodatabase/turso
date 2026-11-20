@@ -1,18 +1,26 @@
 //! Reads date and time input as PostgreSQL's `date_in`, `time_in`,
 //! `timestamp_in` and `timestamptz_in` do, for the ENCODE of the built-in
-//! types of the same names. Each value is written in one fixed text form, with
-//! a 4-digit year, so the stored texts sort in time order:
-//! `2024-01-05`, `10:00:00.5`, `2024-01-05 10:00:00.5`. A timestamptz is
-//! written as the same form in UTC, without an offset.
+//! types of the same names. A date or time is written in one fixed text form,
+//! with a 4-digit year, so the stored texts sort in time order: `2024-01-05`,
+//! `10:00:00.5`. A timestamp and a timestamptz are stored as PostgreSQL stores
+//! them: the microseconds since 2000-01-01 00:00:00 as an integer, in UTC for a
+//! timestamptz. PostgreSQL keeps the largest and smallest integer for
+//! `infinity` and `-infinity`.
 //!
 //! The input is split into fields as PostgreSQL's `ParseDateTime` does and the
 //! fields are read as its `DecodeDateTime` does, for a subset of its forms.
-//! Values whose text would not sort in time order are rejected: BC, years past
-//! 9999, years not written with 4 digits and `infinity`.
+//! BC, years past 9999, years not written with 4 digits and `infinity` are
+//! rejected: the text form of a date would not sort in time order, and the
+//! timestamp types read the same input as date.
+//!
+//! Input that PostgreSQL may read but this parser does not, such as those
+//! years, `infinity` or a time zone name, is an error with SQLSTATE 0A000.
+//! Only input PostgreSQL rejects too gets PostgreSQL's 22007 or 22008.
 
+use crate::numeric::Numeric;
 use crate::types::Value;
 use crate::{LimboError, Result};
-use chrono::{Datelike, Duration, Month, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{DateTime, Datelike, Duration, Month, NaiveDate, NaiveDateTime, Timelike};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TemporalType {
@@ -36,44 +44,136 @@ impl TemporalType {
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
-/// `temporal_encode(value, type)`, the ENCODE of the built-in type `type`:
-/// NULL stays NULL, text is read as `type`, anything else is an error, as
-/// PostgreSQL has no conversion from numbers or bytes to dates.
+/// Microseconds from 1970-01-01, where Unix time starts, to 2000-01-01, where
+/// PostgreSQL's time starts.
+pub const POSTGRES_EPOCH_IN_UNIX_MICROS: i64 = 946_684_800_000_000;
+
+/// `temporal_encode(value, type)`, the ENCODE of the built-in type `type`,
+/// date or time.
 pub fn exec_temporal_encode(value: &Value, type_name: &Value) -> Result<Value> {
     let ty = match type_name.to_text() {
         Some("date") => TemporalType::Date,
         Some("time") => TemporalType::Time,
-        Some("timestamp") => TemporalType::Timestamp,
-        Some("timestamptz") => TemporalType::Timestamptz,
         _ => {
             return Err(LimboError::InvalidArgument(format!(
                 "temporal_encode: unknown type {type_name}"
             )))
         }
     };
+    encode(value, ty)
+}
+
+/// `timestamp_encode(value)`, the ENCODE of timestamp. As in PostgreSQL, a
+/// UTC offset in the input is ignored.
+pub fn exec_timestamp_encode(value: &Value) -> Result<Value> {
+    encode(value, TemporalType::Timestamp)
+}
+
+/// `timestamptz_encode(value)`, the ENCODE of timestamptz.
+pub fn exec_timestamptz_encode(value: &Value) -> Result<Value> {
+    encode(value, TemporalType::Timestamptz)
+}
+
+/// NULL stays NULL, text is read as `ty`, anything else is an error, as
+/// PostgreSQL has no conversion from numbers or bytes to dates.
+fn encode(value: &Value, ty: TemporalType) -> Result<Value> {
     let input = match value {
         Value::Null => return Ok(Value::Null),
         Value::Text(text) => text.as_str(),
-        Value::Numeric(_) | Value::Blob(_) => {
-            return Err(error(format!(
-                "only text can be converted to {}",
+        // PostgreSQL reads only text as a date or time, so `20240105` is not
+        // 2024-01-05.
+        Value::Numeric(_) => {
+            return Err(not_supported(format!(
+                "converting a number to {} is not supported",
+                ty.name()
+            )))
+        }
+        Value::Blob(_) => {
+            return Err(not_supported(format!(
+                "converting a blob to {} is not supported",
                 ty.name()
             )))
         }
     };
-    let fields = Fields::read(input, ty)?;
-    Ok(Value::build_text(fields.format(input, ty)?))
+    Fields::read(input, ty)?.encode(input, ty)
 }
 
-/// PostgreSQL's frontend reports these as `invalid_datetime_format`. Values
-/// out of range are `DatetimeFieldOverflow` instead.
-fn error(message: String) -> LimboError {
-    LimboError::InvalidDate(message)
+fn not_supported(message: String) -> LimboError {
+    LimboError::DatetimeNotSupported(message)
 }
 
+/// `timestamp_decode(value)`, the DECODE of timestamp: the stored
+/// microseconds as PostgreSQL prints a timestamp, such as
+/// `2024-01-05 10:00:00.5`.
+pub fn exec_timestamp_decode(value: &Value) -> Result<Value> {
+    Ok(match decode(value, TemporalType::Timestamp)? {
+        Some(timestamp) => Value::build_text(format_timestamp(timestamp)),
+        None => Value::Null,
+    })
+}
+
+/// `timestamptz_decode(value)`, the DECODE of timestamptz: the stored
+/// microseconds as PostgreSQL prints a timestamptz in the time zone UTC, such
+/// as `2024-01-05 10:00:00.5+00`.
+pub fn exec_timestamptz_decode(value: &Value) -> Result<Value> {
+    Ok(match decode(value, TemporalType::Timestamptz)? {
+        Some(timestamp) => Value::build_text(format_timestamptz(timestamp)),
+        None => Value::Null,
+    })
+}
+
+/// The timestamp of stored microseconds, or `None` for NULL. A value the
+/// ENCODE does not write, such as `infinity`, is an error.
+fn decode(value: &Value, ty: TemporalType) -> Result<Option<NaiveDateTime>> {
+    let micros = match value {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Integer(micros)) => *micros,
+        Value::Numeric(Numeric::Float(_)) | Value::Text(_) | Value::Blob(_) => {
+            return Err(LimboError::Corrupt(format!(
+                "a {} must be stored as an integer, got {}",
+                ty.name(),
+                value.value_type()
+            )))
+        }
+    };
+    timestamp_of_micros(micros)
+        .map(Some)
+        .ok_or_else(|| LimboError::DatetimeFieldOverflow("timestamp out of range".to_string()))
+}
+
+/// The timestamp `micros` microseconds after 2000-01-01 00:00:00, the form
+/// PostgreSQL stores, or None outside the years 0001 to 9999, which Turso
+/// neither reads nor prints.
+pub fn timestamp_of_micros(micros: i64) -> Option<NaiveDateTime> {
+    micros
+        .checked_add(POSTGRES_EPOCH_IN_UNIX_MICROS)
+        .and_then(DateTime::from_timestamp_micros)
+        .map(|timestamp| timestamp.naive_utc())
+        .filter(|timestamp| (1..=9999).contains(&timestamp.year()))
+}
+
+/// How PostgreSQL prints a timestamptz in the time zone UTC, such as
+/// `2024-01-05 10:00:00.5+00`. Digits below a microsecond are dropped.
+pub fn format_timestamptz(timestamp: NaiveDateTime) -> String {
+    format!("{}+00", format_timestamp(timestamp))
+}
+
+/// Input that PostgreSQL rejects too. PostgreSQL's frontend reports it as
+/// `invalid_datetime_format`. Values out of range are `DatetimeFieldOverflow`
+/// instead.
 fn syntax_error(input: &str, ty: TemporalType) -> LimboError {
-    error(format!(
+    LimboError::InvalidDate(format!(
         "invalid input syntax for type {}: \"{input}\"",
+        ty.name()
+    ))
+}
+
+/// Input that PostgreSQL may read but this parser does not, such as a time
+/// zone name or a date in the order day, month, year. It is an error with
+/// SQLSTATE 0A000, not 22007, because PostgreSQL may return a value for it.
+fn unsupported_form(input: &str, ty: TemporalType) -> LimboError {
+    not_supported(format!(
+        "invalid or unsupported input for type {}: \"{input}\"",
         ty.name()
     ))
 }
@@ -182,14 +282,14 @@ impl Fields {
             }
             word @ ("infinity" | "-infinity" | "epoch" | "now" | "today" | "tomorrow"
             | "yesterday" | "allballs") => {
-                return Err(error(format!(
+                return Err(not_supported(format!(
                     "the {} value \"{word}\" is not supported",
                     ty.name()
                 )))
             }
             _ => {}
         }
-        let fields = split_fields(input).ok_or_else(|| syntax_error(input, ty))?;
+        let fields = split_fields(input).ok_or_else(|| unsupported_form(input, ty))?;
         let mut reader = Reader {
             input,
             ty,
@@ -212,8 +312,8 @@ impl Fields {
         reader.finish()
     }
 
-    /// The value in `ty`'s fixed text form.
-    fn format(self, input: &str, ty: TemporalType) -> Result<String> {
+    /// The value in `ty`'s stored form.
+    fn encode(self, input: &str, ty: TemporalType) -> Result<Value> {
         let date = match self.date {
             Some((year, month, day)) => {
                 Some(NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| range_error(input))?)
@@ -227,27 +327,37 @@ impl Fields {
             (None, TemporalType::Time) => return Err(syntax_error(input, ty)),
             (None, _) => 0,
         };
-        let (date, ty) = match (date, ty) {
+        let date = match (date, ty) {
             (_, TemporalType::Time) => {
                 let mut out = String::new();
                 push_time(&mut out, time);
-                return Ok(out);
+                return Ok(Value::build_text(out));
             }
             (None, _) => return Err(syntax_error(input, ty)),
-            (Some(date), TemporalType::Date) => return Ok(date.format("%Y-%m-%d").to_string()),
-            (Some(date), ty) => (date, ty),
+            (Some(date), TemporalType::Date) => {
+                return Ok(Value::build_text(date.format("%Y-%m-%d").to_string()))
+            }
+            (Some(date), TemporalType::Timestamp | TemporalType::Timestamptz) => date,
         };
         let mut timestamp = NaiveDateTime::from(date) + Duration::microseconds(time);
         if let (TemporalType::Timestamptz, Some(offset)) = (ty, self.offset) {
             timestamp -= Duration::seconds(offset);
         }
         check_year(timestamp.year(), input, ty)?;
-        let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
-            + i64::from(timestamp.nanosecond() / 1000);
-        let mut out = timestamp.format("%Y-%m-%d ").to_string();
-        push_time(&mut out, time);
-        Ok(out)
+        Ok(Value::from_i64(
+            timestamp.and_utc().timestamp_micros() - POSTGRES_EPOCH_IN_UNIX_MICROS,
+        ))
     }
+}
+
+/// How PostgreSQL prints a timestamp, such as `2024-01-05 10:00:00.5`.
+/// Digits below a microsecond are dropped.
+pub fn format_timestamp(timestamp: NaiveDateTime) -> String {
+    let time = i64::from(timestamp.num_seconds_from_midnight()) * 1_000_000
+        + i64::from(timestamp.nanosecond() / 1000);
+    let mut out = timestamp.format("%Y-%m-%d ").to_string();
+    push_time(&mut out, time);
+    out
 }
 
 /// What a field of the input says about the date and time. A field can be
@@ -315,10 +425,10 @@ impl Reader<'_> {
         // A first number of 1 or 2 digits is a month or a day, in an order
         // that depends on PostgreSQL's DateStyle, which is not supported.
         let [year_text, month, day] = parts[..] else {
-            return Err(syntax_error(input, ty));
+            return Err(unsupported_form(input, ty));
         };
         if year_text.len() <= 2 {
-            return Err(syntax_error(input, ty));
+            return Err(unsupported_form(input, ty));
         }
         self.year = Some(year(year_text, input, ty)?);
         self.month = Some(two_digits(month, input, ty)?);
@@ -332,12 +442,12 @@ impl Reader<'_> {
         // `time` takes no number. After a `T`, PostgreSQL reads a number as a
         // time written as `hhmm`, which is not supported.
         if ty == TemporalType::Time || self.iso_time_pending {
-            return Err(syntax_error(input, ty));
+            return Err(unsupported_form(input, ty));
         }
         // 6 digits or more, with no date yet, are a date: `20240105`.
         if digits.len() >= 6 && self.seen & DATE == 0 {
             if digits.len() != 8 {
-                return Err(syntax_error(input, ty));
+                return Err(unsupported_form(input, ty));
             }
             self.year = Some(year(&digits[..4], input, ty)?);
             self.month = Some(two_digits(&digits[4..6], input, ty)?);
@@ -358,7 +468,7 @@ impl Reader<'_> {
                 Ok(MONTH)
             }
             // PostgreSQL reads 3 digits after the year as a day of the year.
-            (true, false, false) if is_long => Err(syntax_error(input, ty)),
+            (true, false, false) if is_long => Err(unsupported_form(input, ty)),
             (true, false, false) => {
                 self.month = Some(two_digits(digits, input, ty)?);
                 Ok(MONTH)
@@ -379,7 +489,7 @@ impl Reader<'_> {
             // A day first needs DateStyle `DMY`. A number after a whole date
             // would be a time written as `hhmm`, which is not supported.
             (false, false, true) | (true, false, true) | (true, true, true) => {
-                Err(syntax_error(input, ty))
+                Err(unsupported_form(input, ty))
             }
         }
     }
@@ -411,16 +521,19 @@ impl Reader<'_> {
                 self.offset = Some(0);
                 Ok(TIME_ZONE)
             }
-            "bc" => Err(error(format!(
+            "bc" => Err(not_supported(format!(
                 "BC dates are not supported for type {}: \"{input}\"",
                 ty.name()
             ))),
-            // `time` does not take a month name.
-            _ if ty == TemporalType::Time => Err(syntax_error(input, ty)),
+            // Any other word may be a time zone name or abbreviation, a day
+            // name or another word PostgreSQL reads, such as `EST`, `Fri` or
+            // `ago`. Telling those from a word PostgreSQL rejects, such as
+            // `hello`, needs PostgreSQL's tables of time zone names.
+            _ if ty == TemporalType::Time => Err(unsupported_form(input, ty)),
             other => {
                 let month = other
                     .parse::<Month>()
-                    .map_err(|_| syntax_error(input, ty))?
+                    .map_err(|_| unsupported_form(input, ty))?
                     .number_from_month();
                 let mut mask = MONTH;
                 // A number before the name is the day, not the month:
@@ -505,33 +618,41 @@ fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit())
 }
 
-/// A field of 1 or 2 digits, such as a month, a day or an hour.
+/// A field of 1 or 2 digits, such as a month, a day or an hour. PostgreSQL
+/// reads more digits, such as the `005` of `2024-01-005`.
 fn two_digits<T: std::str::FromStr>(text: &str, input: &str, ty: TemporalType) -> Result<T> {
-    if !is_digits(text) || text.len() > 2 {
+    if !is_digits(text) {
         return Err(syntax_error(input, ty));
+    }
+    if text.len() > 2 {
+        return Err(unsupported_form(input, ty));
     }
     text.parse().map_err(|_| syntax_error(input, ty))
 }
 
 /// A year must have 4 digits, so that its text sorts in time order.
+/// PostgreSQL reads other years, such as `24` or `10000`, and rejects year 0.
 fn year(text: &str, input: &str, ty: TemporalType) -> Result<i32> {
     if !is_digits(text) {
         return Err(syntax_error(input, ty));
     }
     if text.len() != 4 {
-        return Err(error(format!(
+        return Err(not_supported(format!(
             "years must be written with 4 digits, from 0001 to 9999: \"{input}\""
         )));
     }
     let year = text.parse().map_err(|_| syntax_error(input, ty))?;
-    check_year(year, input, ty)?;
+    if year == 0 {
+        return Err(range_error(input));
+    }
     Ok(year)
 }
 
+/// PostgreSQL reads years before 0001, as BC, and after 9999.
 fn check_year(year: i32, input: &str, ty: TemporalType) -> Result<()> {
     match year {
         1..=9999 => Ok(()),
-        _ => Err(LimboError::DatetimeFieldOverflow(format!(
+        _ => Err(not_supported(format!(
             "{} values must be between years 0001 and 9999: \"{input}\"",
             ty.name()
         ))),
@@ -543,12 +664,14 @@ fn check_year(year: i32, input: &str, ty: TemporalType) -> Result<()> {
 fn read_time(text: &str, input: &str, ty: TemporalType) -> Result<(i64, i64, i64, i64)> {
     let (clock, fraction) = match text.split_once('.') {
         Some((clock, fraction)) if is_digits(fraction) => (clock, fraction),
-        Some(_) => return Err(syntax_error(input, ty)),
+        Some(_) => return Err(unsupported_form(input, ty)),
         None => (text, ""),
     };
     let parts: Vec<&str> = clock.split(':').collect();
     let (hour, minute, second) = match parts[..] {
         [hour, minute] if fraction.is_empty() => (hour, minute, "0"),
+        // PostgreSQL reads `10:00.5` as minutes and seconds.
+        [_, _] => return Err(unsupported_form(input, ty)),
         [hour, minute, second] => (hour, minute, second),
         _ => return Err(syntax_error(input, ty)),
     };
@@ -592,9 +715,20 @@ fn read_offset(text: &str, input: &str, ty: TemporalType) -> Result<i64> {
 mod tests {
     use super::*;
 
+    /// The value as it is stored, or as the DECODE prints it for a timestamp
+    /// or a timestamptz.
     fn encode(input: &str, ty: &str) -> std::result::Result<String, String> {
         let value = Value::build_text(input.to_string());
-        match exec_temporal_encode(&value, &Value::build_text(ty.to_string())) {
+        let encoded = match ty {
+            "timestamp" => {
+                exec_timestamp_encode(&value).and_then(|stored| exec_timestamp_decode(&stored))
+            }
+            "timestamptz" => {
+                exec_timestamptz_encode(&value).and_then(|stored| exec_timestamptz_decode(&stored))
+            }
+            _ => exec_temporal_encode(&value, &Value::build_text(ty.to_string())),
+        };
+        match encoded {
             Ok(Value::Text(text)) => Ok(text.as_str().to_string()),
             Ok(other) => Err(format!("not text: {other:?}")),
             Err(err) => Err(err.to_string()),
@@ -615,7 +749,7 @@ mod tests {
             ("2024-01-05 10:00", "time", "10:00:00"),
             ("9:5", "time", "09:05:00"),
             ("12:30 PM", "time", "12:30:00"),
-            ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00"),
+            ("2024-01-05 10:00", "timestamptz", "2024-01-05 10:00:00+00"),
             ("+02 2024-01-05 10:00", "timestamp", "2024-01-05 10:00:00"),
             ("Z 2024-01-05", "timestamp", "2024-01-05 00:00:00"),
         ];
@@ -660,6 +794,92 @@ mod tests {
                 "{input} as {ty}: {:?}",
                 encode(input, ty)
             );
+        }
+    }
+
+    /// The stored values are the ones PostgreSQL 18's `timestamp_send` and
+    /// `timestamptz_send` write for the same timestamps.
+    #[test]
+    fn timestamps_are_stored_as_postgresql_stores_them() {
+        let cases = [
+            ("2000-01-01 00:00:00", 0),
+            ("0001-01-01 00:00:00", 0xff1f_e2ff_c59c_6000_u64 as i64),
+            ("9999-12-31 23:59:59.999999", 0x0380_e70b_913b_7fff),
+        ];
+        for (text, stored) in cases {
+            let timestamp = Value::build_text(text.to_string());
+            let timestamptz = Value::build_text(format!("{text}+00"));
+            let stored = Value::from_i64(stored);
+            assert_eq!(exec_timestamp_encode(&timestamp).unwrap(), stored);
+            assert_eq!(exec_timestamp_decode(&stored).unwrap(), timestamp);
+            assert_eq!(exec_timestamptz_encode(&timestamptz).unwrap(), stored);
+            assert_eq!(exec_timestamptz_decode(&stored).unwrap(), timestamptz);
+        }
+        for stored in [i64::MIN, i64::MAX, 0x0380_e70b_913b_8000] {
+            let stored = Value::from_i64(stored);
+            assert!(exec_timestamp_decode(&stored).is_err());
+            assert!(exec_timestamptz_decode(&stored).is_err());
+        }
+    }
+
+    /// An index orders the stored integers, while an expression compares the
+    /// DECODE's text, so both must give the same order for every stored value.
+    ///
+    /// A stored value is a day, a second of that day and a microsecond of that
+    /// second. The DECODE's text is the day in 10 characters, a space, the
+    /// second in 8 characters, then a suffix that depends only on the
+    /// microsecond. Because the day and the second have a fixed width, the
+    /// text compares the day first, then the second, then the suffix, as the
+    /// integer does. So the text sorts as the integer if each part sorts as
+    /// its number. The test checks every day from 0001-01-01 to 9999-12-31,
+    /// every second of a day and every microsecond of a second.
+    #[test]
+    fn decoded_text_sorts_as_the_stored_integer() {
+        const SECOND: i64 = 1_000_000;
+        const DAY: i64 = 86_400 * SECOND;
+        let first_day = 0xff1f_e2ff_c59c_6000_u64 as i64; // 0001-01-01 00:00:00
+        let last_day = 0x0380_e70b_913b_7fff - (DAY - 1); // 9999-12-31 00:00:00
+        for (decode, offset) in [
+            (exec_timestamp_decode as fn(&Value) -> Result<Value>, ""),
+            (exec_timestamptz_decode, "+00"),
+        ] {
+            let text = |stored: i64| {
+                decode(&Value::from_i64(stored))
+                    .unwrap()
+                    .to_text()
+                    .unwrap()
+                    .to_string()
+            };
+            assert!(decode(&Value::from_i64(first_day - 1)).is_err());
+            assert!(decode(&Value::from_i64(last_day + DAY)).is_err());
+
+            let mut previous = String::new();
+            for stored in (first_day..=last_day).step_by(DAY as usize) {
+                let text = text(stored);
+                assert_eq!(&text[10..], format!(" 00:00:00{offset}"), "{text}");
+                assert!(previous.as_str() < &text[..10], "{previous} then {text}");
+                previous = text[..10].to_string();
+            }
+
+            let mut previous = String::new();
+            for stored in (0..DAY).step_by(SECOND as usize) {
+                let text = text(stored);
+                assert_eq!(&text[..11], "2000-01-01 ", "{text}");
+                assert_eq!(&text[19..], offset, "{text}");
+                assert!(previous.as_str() < &text[11..19], "{previous} then {text}");
+                previous = text[11..19].to_string();
+            }
+
+            let mut previous = String::new();
+            for stored in 0..SECOND {
+                let text = text(stored);
+                assert_eq!(&text[..19], "2000-01-01 00:00:00", "{text}");
+                assert!(
+                    stored == 0 || previous.as_str() < &text[19..],
+                    "{previous} then {text}"
+                );
+                previous = text[19..].to_string();
+            }
         }
     }
 }

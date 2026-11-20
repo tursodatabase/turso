@@ -97,9 +97,11 @@ pub mod vtab;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 pub use function::{ExternalFunc, Func, ScalarFunc};
-/// The ENCODE of the built-in date and time types, also used by the PostgreSQL
-/// frontend to check input in `pg_input_is_valid`.
-pub use functions::datetime_input::exec_temporal_encode;
+/// The ENCODEs of the built-in date and time types, also used by the
+/// PostgreSQL frontend to check input in `pg_input_is_valid`.
+pub use functions::datetime_input::{
+    exec_temporal_encode, exec_timestamp_encode, exec_timestamptz_encode, format_timestamptz,
+};
 /// The printf engine backing the SQL printf()/format() functions, also used
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.
