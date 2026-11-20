@@ -113,3 +113,57 @@ expect {
 expect @tursopg error {
     > ANY/SOME \(subquery\) is not supported
 }
+
+# GREATEST and LEAST skip NULL arguments in PostgreSQL and return NULL when
+# every argument is NULL. tursopg returns NULL when any argument is NULL. The
+# default `expect` is PostgreSQL 18's answer, `expect @tursopg` is tursopg's
+# current answer.
+@setup tsmix
+test ts-tz-greatest-null {
+    SELECT id, GREATEST(ts, tz) FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|2024-01-05 10:00:00+00
+    5|9999-12-31 23:59:59.999999+00
+}
+expect @tursopg {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 11:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|
+    5|9999-12-31 23:59:59.999999+00
+}
+
+@setup tsmix
+test ts-tz-least-null {
+    SELECT id, LEAST(ts, tz) FROM t ORDER BY id;
+}
+expect {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 10:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|2024-01-05 10:00:00+00
+    5|0001-01-01 00:00:00+00
+}
+expect @tursopg {
+    1|2024-01-05 10:00:00+00
+    2|2024-01-05 10:00:00+00
+    3|2024-01-05 09:00:00.5+00
+    4|
+    5|0001-01-01 00:00:00+00
+}
+
+# The same gap with integers, so it is not specific to timestamps.
+@database :memory:
+test greatest-least-int-null {
+    SELECT GREATEST(1, NULL), LEAST(1, NULL), GREATEST(NULL, NULL);
+}
+expect {
+    1|1|
+}
+expect @tursopg {
+    ||
+}

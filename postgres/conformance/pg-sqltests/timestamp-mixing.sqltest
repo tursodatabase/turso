@@ -174,28 +174,6 @@ expect {
 }
 
 @setup tsmix
-test ts-tz-mix-16 {
-    SELECT id, GREATEST(ts, tz) FROM t WHERE ts IS NOT NULL ORDER BY id;
-}
-expect {
-    1|2024-01-05 10:00:00+00
-    2|2024-01-05 11:00:00+00
-    3|2024-01-05 09:00:00.5+00
-    5|9999-12-31 23:59:59.999999+00
-}
-
-@setup tsmix
-test ts-tz-mix-17 {
-    SELECT id, LEAST(ts, tz) FROM t WHERE ts IS NOT NULL ORDER BY id;
-}
-expect {
-    1|2024-01-05 10:00:00+00
-    2|2024-01-05 10:00:00+00
-    3|2024-01-05 09:00:00.5+00
-    5|0001-01-01 00:00:00+00
-}
-
-@setup tsmix
 test ts-tz-mix-18 {
     SELECT id, COALESCE(ts, tz) FROM t ORDER BY id;
 }
@@ -978,17 +956,6 @@ test ts-tz-order-89 {
 }
 expect {
     0001-01-01 00:00:00+00|9999-12-31 23:59:59.999999+00
-}
-
-@setup tsmix
-test ts-tz-order-90 {
-    SELECT id, GREATEST(ts, tz), LEAST(ts, tz) FROM t WHERE ts IS NOT NULL ORDER BY id;
-}
-expect {
-    1|2024-01-05 10:00:00+00|2024-01-05 10:00:00+00
-    2|2024-01-05 11:00:00+00|2024-01-05 10:00:00+00
-    3|2024-01-05 09:00:00.5+00|2024-01-05 09:00:00.5+00
-    5|9999-12-31 23:59:59.999999+00|0001-01-01 00:00:00+00
 }
 
 setup tsmix_two_tables {
