@@ -60,6 +60,20 @@ const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
 static ENDS_DOUBLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'"');
 static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'\'');
 
+/// The 1-byte headers of TEXT elements with a payload of 0 to 11 bytes. The
+/// string parser reads the header from this table after its scan. When it
+/// computed the header from the length, the compiler computed it in each
+/// step of the scan.
+static TEXT_HEADERS: [u8; 12] = {
+    let mut headers = [0u8; 12];
+    let mut len = 0;
+    while len < headers.len() {
+        headers[len] = ElementType::TEXT as u8 | (len as u8) << 4;
+        len += 1;
+    }
+    headers
+};
+
 /// For each byte, whether the JSON text of a string escapes it: a control
 /// character, and for TEXT and TEXTRAW also `"` and `\`. A TEXTJ payload
 /// holds its quotes and backslashes as escapes already.
@@ -1983,9 +1997,8 @@ impl Jsonb {
                 let header_pos = self.data.len();
 
                 // Write header and content
-                if len <= 11 {
-                    self.data
-                        .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                if let Some(&header) = TEXT_HEADERS.get(len) {
+                    self.data.push(header);
                 } else {
                     self.write_element_header(header_pos, ElementType::TEXT, len, false)
                         .map_err(|_| PError::Message {
