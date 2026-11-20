@@ -157,6 +157,11 @@ To repeat a run, use the same seed and the same flags:
 cargo run -p limbo_sim -- --swarm --seed 1
 ```
 
+CI runs a swarm profile.
+On pull requests, iteration N uses seed N, so each pull request tests the same settings.
+On pushes to main, each iteration uses a new random seed.
+If an iteration fails, the log ends with the command that repeats the run.
+
 ## Run simulator using the Miri interpreter
 
 Miri is a deterministic Rust interpreter designed to identify undefined behavior. To run the simulator under Miri, use
