@@ -138,3 +138,72 @@ expect {
     2|3
     2|4
 }
+
+@setup schema
+test unique-is-delete-keeps-null-duplicates {
+    DELETE FROM t WHERE k IS lower('A') AND part IS nullif(1,1);
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    7
+    8
+    9
+}
+
+@setup schema
+test unique-is-delete-nonnull-key {
+    DELETE FROM t WHERE k IS lower('A') AND part IS abs(-1);
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+@setup schema
+test unique-is-update-keeps-null-duplicates {
+    UPDATE t SET v='changed' WHERE k IS nullif('x','x') AND part IS abs(-1);
+    SELECT id FROM t WHERE v='changed' ORDER BY id;
+}
+expect {
+    3
+    4
+}
+
+@setup schema
+test unique-is-prefix-delete-keeps-all-matches {
+    DELETE FROM t WHERE k IS lower('A');
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    3
+    4
+    7
+    8
+    9
+}
+
+@setup schema
+test unique-expression-is-keeps-null-duplicates {
+    CREATE TABLE expressions(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE UNIQUE INDEX expressions_key ON expressions(lower(k));
+    INSERT INTO expressions VALUES(1,'a'),(2,NULL),(3,NULL),(4,'b');
+    SELECT id FROM expressions WHERE lower(k) IS lower('A');
+    DELETE FROM expressions WHERE lower(k) IS nullif('x','x');
+    SELECT id FROM expressions ORDER BY id;
+}
+expect {
+    1
+    1
+    4
+}
