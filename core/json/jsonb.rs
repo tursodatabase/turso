@@ -739,43 +739,30 @@ impl PathOperation for InsertOperation {
     }
 }
 
+/// A search for the element at a path. The search does not copy the element:
+/// the caller gets it with [Self::element_in] or [Self::into_element].
 pub struct SearchOperation {
-    value: Jsonb,
     mode: PathOperationMode,
     value_offset: usize,
     /// The offset after the element that the search found, or 0.
     value_end: usize,
     label_offset: Option<usize>,
-    /// Whether the search copies the element that it finds, for
-    /// [Self::result].
-    copies_value: bool,
 }
 
 impl SearchOperation {
     pub fn new() -> Self {
         Self {
             mode: PathOperationMode::ReplaceExisting,
-            value: Jsonb::empty(),
             value_offset: 0,
             value_end: 0,
             label_offset: None,
-            copies_value: true,
-        }
-    }
-
-    /// A search that does not copy the element that it finds. The caller
-    /// gets the element with [Self::into_element].
-    pub fn locate() -> Self {
-        Self {
-            copies_value: false,
-            ..Self::new()
         }
     }
 
     /// Returns the element that the search found in `json`, in the buffer of
     /// `json`: the element moves to the start of the buffer, and the bytes
-    /// after it are cut off. Returns an empty document, as [Self::result]
-    /// does, if the search found nothing.
+    /// after it are cut off. Returns an empty document if the search found
+    /// nothing.
     ///
     /// The buffer keeps its capacity, so this is for a caller that converts
     /// the element and then drops it.
@@ -801,10 +788,6 @@ impl SearchOperation {
     pub fn label_offset(&self) -> Option<usize> {
         self.label_offset
     }
-
-    pub fn result(self) -> Jsonb {
-        self.value
-    }
 }
 
 impl PathOperation for SearchOperation {
@@ -825,9 +808,6 @@ impl PathOperation for SearchOperation {
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         let end = json.element_end(idx, &[header_size, size])?;
-        if self.copies_value {
-            self.value = Jsonb::from_raw_data(&json.data[idx..end])?;
-        }
         self.value_offset = idx;
         self.value_end = end;
         self.label_offset = label_idx;
@@ -6262,7 +6242,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Get the search result
-        let search_result = operation.result();
+        let search_result = operation.into_element(jsonb);
         let result_str = search_result.to_string().unwrap();
 
         // Verify the search found the correct value
@@ -6414,53 +6394,47 @@ mod path_operations_tests {
     }
 
     #[test]
-    fn located_element_is_the_element_that_a_search_copies() {
-        let doc = Jsonb::from_str(r#"{"a":1,"b":[2,"three"],"c":{"d":null}}"#).unwrap();
-        let paths = [
-            vec![PathElement::Root()],
-            vec![
-                PathElement::Root(),
-                PathElement::Key(Cow::Borrowed("a"), false),
-            ],
-            vec![
-                PathElement::Root(),
-                PathElement::Key(Cow::Borrowed("b"), false),
-            ],
-            vec![
-                PathElement::Root(),
-                PathElement::Key(Cow::Borrowed("b"), false),
-                PathElement::ArrayLocator(Some(1)),
-            ],
-            vec![
-                PathElement::Root(),
-                PathElement::Key(Cow::Borrowed("c"), false),
-                PathElement::Key(Cow::Borrowed("d"), false),
-            ],
+    fn search_gives_the_element_in_the_document() {
+        let text = r#"{"a":1,"b":[2,"three"],"c":{"d":null}}"#;
+        let doc = Jsonb::from_str(text).unwrap();
+        let key = |key| PathElement::Key(Cow::Borrowed(key), false);
+        let cases = [
+            (vec![PathElement::Root()], Some(text)),
+            (vec![PathElement::Root(), key("a")], Some("1")),
+            (vec![PathElement::Root(), key("b")], Some(r#"[2,"three"]"#)),
+            (
+                vec![
+                    PathElement::Root(),
+                    key("b"),
+                    PathElement::ArrayLocator(Some(1)),
+                ],
+                Some(r#""three""#),
+            ),
+            (vec![PathElement::Root(), key("c"), key("d")], Some("null")),
             // Paths that find nothing.
-            vec![
-                PathElement::Root(),
-                PathElement::Key(Cow::Borrowed("e"), false),
-            ],
-            vec![
-                PathElement::Root(),
-                PathElement::Key(Cow::Borrowed("b"), false),
-                PathElement::ArrayLocator(Some(5)),
-            ],
+            (vec![PathElement::Root(), key("e")], None),
+            (
+                vec![
+                    PathElement::Root(),
+                    key("b"),
+                    PathElement::ArrayLocator(Some(5)),
+                ],
+                None,
+            ),
         ];
-        for elements in paths {
+        for (elements, expected) in cases {
             let path = create_path(elements);
-            let mut copy = doc.clone();
+            let mut json = doc.clone();
             let mut search = SearchOperation::new();
-            let copied = copy.operate_on_path(&path, &mut search);
-            let mut located = doc.clone();
-            let mut locate = SearchOperation::locate();
-            let found = located.operate_on_path(&path, &mut locate);
-            assert_eq!(copied.is_ok(), found.is_ok(), "{path:?}");
-            assert_eq!(
-                locate.into_element(located).data,
-                search.result().data,
-                "{path:?}"
-            );
+            let found = json.operate_on_path(&path, &mut search);
+            assert_eq!(found.is_ok(), expected.is_some(), "{path:?}");
+            let element = search.element_in(&json).to_vec();
+            let moved = search.into_element(json);
+            assert_eq!(moved.data.as_slice(), element.as_slice(), "{path:?}");
+            match expected {
+                Some(expected) => assert_eq!(moved.to_string().unwrap(), expected, "{path:?}"),
+                None => assert!(element.is_empty(), "{path:?}"),
+            }
         }
     }
 

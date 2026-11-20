@@ -850,7 +850,8 @@ pub fn call_builtin_scalar(
                     };
 
                     columns_json_array.operate_on_path(&path, &mut op)?;
-                    let column_name = op.result();
+                    let column_name =
+                        json::jsonb::Jsonb::from_raw_data(op.element_in(&columns_json_array))?;
                     json.append_jsonb_to_end(column_name.data());
 
                     let val = match payload_iterator.next() {

@@ -522,7 +522,7 @@ fn navigate_to_path(
     mut jsonb: Jsonb,
     json_path: &JsonPath,
 ) -> Result<Option<(Jsonb, i64, i64)>, LimboError> {
-    let mut search_operation = SearchOperation::locate();
+    let mut search_operation = SearchOperation::new();
     if jsonb
         .operate_on_path(json_path, &mut search_operation)
         .is_err()

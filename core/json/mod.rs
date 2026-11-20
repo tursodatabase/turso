@@ -364,7 +364,7 @@ pub fn json_array_length(
     let path = cached_json_path(json_cache, path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
-        let mut op = SearchOperation::locate();
+        let mut op = SearchOperation::new();
         let _ = json.operate_on_path(&path, &mut op);
         if let Ok(len) = op.into_element(json).array_len() {
             return Ok(Value::from_i64(len as i64));
@@ -473,7 +473,7 @@ pub fn json_arrow_extract(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = cached_json_path(json_cache, &path, false)? {
-        let mut op = SearchOperation::locate();
+        let mut op = SearchOperation::new();
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.into_element(json);
         if res.is_ok() {
@@ -500,7 +500,7 @@ pub fn json_arrow_shift_extract(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = cached_json_path(json_cache, &path, false)? {
-        let mut op = SearchOperation::locate();
+        let mut op = SearchOperation::new();
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.into_element(json);
         let element_type = match extracted.element_type() {
@@ -548,7 +548,7 @@ where
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
     // The result is an SQL value or JSON text, which does not keep the
     // buffer of the element.
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths, true, json_cache)?;
+    let (json, element_type) = jsonb_extract_internal(jsonb, paths, json_cache)?;
 
     let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
 
@@ -576,24 +576,22 @@ where
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
 
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths, false, json_cache)?;
-    let output_variant = match element_type {
-        ElementType::ARRAY | ElementType::OBJECT => OutputVariant::Binary,
-        _ => OutputVariant::ElementType,
-    };
-    let result = json_string_to_db_type(json, element_type, output_variant)?;
-
-    Ok(result)
+    let (json, element_type) = jsonb_extract_internal(jsonb, paths, json_cache)?;
+    if let ElementType::ARRAY | ElementType::OBJECT = element_type {
+        // The result is in a buffer with the capacity of the document, and a
+        // BLOB keeps the buffer that it gets. Thus the BLOB gets a copy.
+        return json_ref_to_db_type(&json, element_type, OutputVariant::Binary);
+    }
+    json_string_to_db_type(json, element_type, OutputVariant::ElementType)
 }
 
 /// Extracts the elements of `value` at `paths`. With one path, the result is
-/// the element; with more, an array of the elements. If `in_place` is set,
-/// the element of a single path is given in the buffer of `value`, which is
-/// larger than the element, as [SearchOperation::into_element] gives it.
+/// the element; with more, an array of the elements. The element of a single
+/// path is given in the buffer of `value`, which is larger than the element,
+/// as [SearchOperation::into_element] gives it.
 fn jsonb_extract_internal<E, V>(
     value: Jsonb,
     mut paths: E,
-    in_place: bool,
     json_cache: &JsonCacheCell,
 ) -> crate::Result<(Jsonb, ElementType)>
 where
@@ -609,17 +607,9 @@ where
         if let Some(path) = cached_json_path(json_cache, &first_path, true)? {
             let mut json = value;
 
-            let mut op = if in_place {
-                SearchOperation::locate()
-            } else {
-                SearchOperation::new()
-            };
+            let mut op = SearchOperation::new();
             let res = json.operate_on_path(&path, &mut op);
-            let extracted = if in_place {
-                op.into_element(json)
-            } else {
-                op.result()
-            };
+            let extracted = op.into_element(json);
             let element_type = match extracted.element_type() {
                 Err(_) => return Ok((null()?, ElementType::NULL)),
                 Ok(el) => el,
@@ -641,7 +631,7 @@ where
     for path in paths {
         let path = cached_json_path(json_cache, &path, true);
         if let Some(path) = path? {
-            let mut op = SearchOperation::locate();
+            let mut op = SearchOperation::new();
             let res = json.operate_on_path(&path, &mut op);
             if res.is_ok() {
                 result.append_to_array_unsafe(op.element_in(&json));
