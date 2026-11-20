@@ -219,6 +219,10 @@ pub struct JsonEachCursor {
     /// The key of the current object member. It is a field so that each
     /// member uses the same buffer.
     key_element: Jsonb,
+    /// The text of the last root path and the path that it parses to. The
+    /// calls of a statement usually have the same root path, which is then
+    /// parsed once.
+    root_path: Option<(String, JsonPath<'static>)>,
 }
 
 struct TraversalState {
@@ -240,6 +244,7 @@ impl JsonEachCursor {
             traversal_mode,
             pop_path_before_advance: false,
             key_element: Jsonb::empty(),
+            root_path: None,
         }
     }
 
@@ -295,13 +300,24 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         }
 
         let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
-        // The path is parsed once, after the document, for the search and
-        // for the path of the cursor.
-        let root_json_path = json_path(&root_path)?;
+        // The path is parsed after the document, so that a bad document
+        // gives its error first. The parsed path is for the search and for
+        // the path of the cursor.
+        if self
+            .root_path
+            .as_ref()
+            .is_none_or(|(text, _)| *text != *root_path)
+        {
+            let parsed = json_path(&root_path)?.into_owned();
+            self.root_path = Some((root_path.to_string(), parsed));
+        }
+        let Some((_, root_json_path)) = &self.root_path else {
+            unreachable!("the root path is set above");
+        };
 
         let (root_json, root_offset, root_id) = if args.len() == 1 {
             (jsonb, 0, 0)
-        } else if let Some(found) = navigate_to_path(jsonb, &root_json_path)? {
+        } else if let Some(found) = navigate_to_path(jsonb, root_json_path)? {
             found
         } else {
             return Ok(false);
@@ -310,7 +326,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.json = root_json;
         self.root_offset = root_offset;
         self.id = root_id;
-        self.path_to_current_value.set(&root_path, &root_json_path);
+        self.path_to_current_value.set(&root_path, root_json_path);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
