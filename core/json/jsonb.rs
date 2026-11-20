@@ -344,22 +344,10 @@ impl TryFrom<u8> for ElementType {
     type Error = LimboError;
 
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::NULL),
-            1 => Ok(Self::TRUE),
-            2 => Ok(Self::FALSE),
-            3 => Ok(Self::INT),
-            4 => Ok(Self::INT5),
-            5 => Ok(Self::FLOAT),
-            6 => Ok(Self::FLOAT5),
-            7 => Ok(Self::TEXT),
-            8 => Ok(Self::TEXTJ),
-            9 => Ok(Self::TEXT5),
-            10 => Ok(Self::TEXTRAW),
-            11 => Ok(Self::ARRAY),
-            12 => Ok(Self::OBJECT),
-            13..=15 => bail_parse_error!("Invalid element type: {}", value),
-            _ => bail_parse_error!("Failed to recognize jsonvalue type"),
+        match ELEMENT_TYPE_BY_CODE.get(value as usize) {
+            Some(Some(element_type)) => Ok(*element_type),
+            Some(None) => bail_parse_error!("Invalid element type: {}", value),
+            None => bail_parse_error!("Failed to recognize jsonvalue type"),
         }
     }
 }
