@@ -443,26 +443,20 @@ expect @tursopg error {}
 
 # B-43: jsonb @> filter
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb @> jsonb"
 test jsonb-filter {
     SELECT id FROM t WHERE j @> '{"n":1}' ORDER BY id;
 }
 expect {
     1
 }
-expect @tursopg {
-}
 
 # B-45: jsonb <@
 @setup t_id_s_n_arr_ia_j_ok_with_rows
-@compat-gap "operator:jsonb <@ jsonb"
 test jsonb-is-contained-by {
     SELECT id FROM t WHERE j <@ '{"a":2,"n":2,"z":0}' ORDER BY id;
 }
 expect {
     2
-}
-expect @tursopg {
 }
 
 # B-46: jsonb ? key

@@ -641,6 +641,18 @@ pub trait Dialect: Send + Sync + 'static {
         crate::vdbe::value::push_hex_upper(out, blob);
         out.push_str("'\"");
     }
+
+    /// The name of the function that runs `a @> b` when neither operand is
+    /// an array, or None when the array function runs it too.
+    ///
+    /// PostgreSQL's `@>` also compares jsonb values: the frontend gives a
+    /// function that it registers. SQLite has no `@>`, and Turso's `@>`
+    /// compares arrays.
+    ///
+    /// FIXME(pg-catalog): This hand-codes the pg_operator entry `jsonb @> jsonb`, whose function is jsonb_contains, beside the entry `anyarray @> anyarray`, whose function is arraycontains. A lookup in pg_operator by the types of the operands replaces this.
+    fn json_contains_function(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

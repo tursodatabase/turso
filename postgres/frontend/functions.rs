@@ -11,8 +11,8 @@ use crate::roles::{connection_roles, RoleCatalog};
 use turso_core::dialect::ScalarFuncContext;
 use turso_core::types::IOResultOr;
 use turso_core::{
-    exec_temporal_encode, Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions,
-    Register, Result, Value, WallClockInstant,
+    exec_temporal_encode, Connection, Decimal, ExternalFunc, IOResult, LimboError, Numeric,
+    OpenOptions, Register, Result, Value, WallClockInstant,
 };
 use turso_pg_parser::sqlstate::{
     SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INTERNAL_ERROR,
@@ -270,6 +270,9 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         },
         "jsonb_field_text"(FunctionArity::Exact(2), true) => {
             exec_jsonb_field_text(args[0].get_value(), args[1].get_value())?
+        },
+        "jsonb_contains"(FunctionArity::Exact(2), true) => {
+            exec_jsonb_contains(args[0].get_value(), args[1].get_value())?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| format_type(type_oid, int_arg(args, 1, -1))),
@@ -1099,6 +1102,234 @@ fn walk_json_members<'a>(
         visit(key, &json[start..pos]);
     }
     Ok(())
+}
+
+/// PostgreSQL's `jsonb @> jsonb`, which is also its function jsonb_contains():
+/// whether `json` contains `template`. Core runs this function for `a @> b`
+/// when neither operand has an array type, and the translator turns `a <@ b`
+/// into `b @> a`.
+///
+/// Core does not know the type of each array: a column of a VALUES list has
+/// no array type, and CREATE TABLE AS stores an array as text. Thus two
+/// arrays that are not JSON documents are compared with the array function of
+/// core, as `@>` compared them before it compared jsonb values.
+///
+/// FIXME(pg-catalog): This chooses between arraycontains and jsonb_contains from the values, because the type of a VALUES column or of a column that CREATE TABLE AS made does not say that it is an array. PostgreSQL chooses from the types, so it fails with 22P02 for `'{}'::jsonb @> '{a}'`, where this gives false. An expression tree that carries PostgreSQL types replaces this.
+fn exec_jsonb_contains(json: &Value, template: &Value) -> Result<Option<bool>> {
+    match (json, template) {
+        (Value::Null, _) | (_, Value::Null) => Ok(None),
+        // A json or jsonb column reads as text.
+        (Value::Text(json_text), Value::Text(template_text)) => {
+            let documents = read_json_document(json_text.as_str())
+                .and_then(|json| Ok((json, read_json_document(template_text.as_str())?)));
+            match documents {
+                Ok((json, template)) => Ok(Some(json_document_contains(&json, &template))),
+                // `{a}` is an array, not JSON. A JSON object such as `{"a":1}`
+                // is not an array, so a jsonb value keeps the JSON error.
+                Err(error) => turso_core::array_contains_all(json, template)
+                    .map(Some)
+                    .ok_or(error),
+            }
+        }
+        _ if holds_array(json) || holds_array(template) => {
+            Ok(turso_core::array_contains_all(json, template))
+        }
+        // A number or a bytea has no @> for jsonb in PostgreSQL.
+        _ => Err(undefined_operator(
+            pg_type_name(json),
+            "@>",
+            pg_type_name(template),
+        )),
+    }
+}
+
+/// Whether `value` is a blob that holds an array. An array is stored as a
+/// blob, and a bytea is a blob too.
+fn holds_array(value: &Value) -> bool {
+    matches!(value, Value::Blob(_)) && turso_core::array_values_from_any(value).is_some()
+}
+
+/// A JSON value as jsonb compares it. A number is its exact decimal value, so
+/// `1.5` and `1.50` are equal. An object has one field for each name, sorted
+/// by name.
+enum JsonNode {
+    Null,
+    Bool(bool),
+    Number(Decimal),
+    String(String),
+    Array(Vec<JsonNode>),
+    Object(Vec<(String, JsonNode)>),
+}
+
+/// Reads the JSON document `json` into a tree, with the errors of PostgreSQL's
+/// jsonb input.
+///
+/// A loop with its own list of open objects and arrays reads the document,
+/// not a function that calls itself for each level: the server runs
+/// statements on threads with small stacks, and 1000 levels of such calls
+/// do not fit in them.
+fn read_json_document(json: &str) -> Result<JsonNode> {
+    // Validate first, so the reading below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let bytes = json.as_bytes();
+    let mut pos = 0;
+    // The objects and arrays that are open, innermost last, each with the
+    // name of the field that it is the value of, if it is in an object.
+    let mut open: Vec<(Option<String>, OpenJsonContainer)> = Vec::new();
+    // The name of the field whose value comes next.
+    let mut name: Option<String> = None;
+    loop {
+        skip_json_whitespace(bytes, &mut pos);
+        let value = match bytes[pos] {
+            b',' => {
+                pos += 1;
+                continue;
+            }
+            b'{' | b'[' => {
+                if open.len() == MAX_JSON_DEPTH {
+                    return Err(sqlstate_error(
+                        SQLSTATE_STATEMENT_TOO_COMPLEX,
+                        "stack depth limit exceeded",
+                        None,
+                    ));
+                }
+                let container = if bytes[pos] == b'{' {
+                    OpenJsonContainer::Object(Vec::new())
+                } else {
+                    OpenJsonContainer::Array(Vec::new())
+                };
+                pos += 1;
+                open.push((name.take(), container));
+                continue;
+            }
+            b'}' | b']' => {
+                pos += 1;
+                let (field_name, container) =
+                    open.pop().expect("a closing bracket has its opening one");
+                name = field_name;
+                container.into_node()
+            }
+            b'"' if name.is_none()
+                && matches!(open.last(), Some((_, OpenJsonContainer::Object(_)))) =>
+            {
+                name = Some(decode_json_string(json, &mut pos)?);
+                skip_json_whitespace(bytes, &mut pos);
+                pos += 1; // ':'
+                continue;
+            }
+            b'"' => JsonNode::String(decode_json_string(json, &mut pos)?),
+            b't' => {
+                pos += 4;
+                JsonNode::Bool(true)
+            }
+            b'f' => {
+                pos += 5;
+                JsonNode::Bool(false)
+            }
+            b'n' => {
+                pos += 4;
+                JsonNode::Null
+            }
+            // The arms above match every other value, so this is a number.
+            _ => {
+                let start = pos;
+                while matches!(
+                    bytes.get(pos),
+                    Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                ) {
+                    pos += 1;
+                }
+                // A JSON number is also valid numeric text, so the only error
+                // is a number with more digits than numeric allows. jsonb
+                // stores its numbers as numeric, so PostgreSQL fails then too.
+                let number = json[start..pos].parse::<Decimal>().map_err(|_| {
+                    sqlstate_error(
+                        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                        "value overflows numeric format",
+                        None,
+                    )
+                })?;
+                JsonNode::Number(number)
+            }
+        };
+        match open.last_mut() {
+            None => return Ok(value),
+            Some((_, OpenJsonContainer::Array(elements))) => elements.push(value),
+            Some((_, OpenJsonContainer::Object(fields))) => {
+                fields.push((name.take().expect("a field value has a name"), value))
+            }
+        }
+    }
+}
+
+/// An object or array that read_json_document has not read to its end yet.
+enum OpenJsonContainer {
+    Array(Vec<JsonNode>),
+    Object(Vec<(String, JsonNode)>),
+}
+
+impl OpenJsonContainer {
+    fn into_node(self) -> JsonNode {
+        match self {
+            Self::Array(elements) => JsonNode::Array(elements),
+            Self::Object(mut fields) => {
+                // Of two fields with the same name, the last one counts, as in
+                // jsonb. The sort is stable, so such fields keep their order.
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut unique: Vec<(String, JsonNode)> = Vec::with_capacity(fields.len());
+                for field in fields {
+                    match unique.last_mut() {
+                        Some(last) if last.0 == field.0 => *last = field,
+                        _ => unique.push(field),
+                    }
+                }
+                JsonNode::Object(unique)
+            }
+        }
+    }
+}
+
+/// Whether the document `json` contains the document `template`. Only at this
+/// level does an array also contain a scalar that is one of its elements:
+/// jsonb stores a scalar document as an array with one element.
+fn json_document_contains(json: &JsonNode, template: &JsonNode) -> bool {
+    match (json, template) {
+        (
+            JsonNode::Array(elements),
+            JsonNode::Null | JsonNode::Bool(_) | JsonNode::Number(_) | JsonNode::String(_),
+        ) => elements
+            .iter()
+            .any(|element| json_contains(element, template)),
+        _ => json_contains(json, template),
+    }
+}
+
+/// Whether `json` contains `template`: each field of an object in `template`
+/// is in `json` with a value that contains it, and each element of an array
+/// in `template` is contained by an element of the array in `json`, in any
+/// order. Scalars must be equal.
+fn json_contains(json: &JsonNode, template: &JsonNode) -> bool {
+    match (json, template) {
+        (JsonNode::Object(fields), JsonNode::Object(wanted)) => {
+            wanted.iter().all(|(name, wanted_value)| {
+                fields
+                    .binary_search_by(|(field_name, _)| field_name.cmp(name))
+                    .is_ok_and(|index| json_contains(&fields[index].1, wanted_value))
+            })
+        }
+        (JsonNode::Array(elements), JsonNode::Array(wanted)) => {
+            wanted.iter().all(|wanted_element| {
+                elements
+                    .iter()
+                    .any(|element| json_contains(element, wanted_element))
+            })
+        }
+        (JsonNode::Null, JsonNode::Null) => true,
+        (JsonNode::Bool(a), JsonNode::Bool(b)) => a == b,
+        (JsonNode::Number(a), JsonNode::Number(b)) => a == b,
+        (JsonNode::String(a), JsonNode::String(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// `array_to_json(array [, pretty])`: the array as a JSON array, with line
