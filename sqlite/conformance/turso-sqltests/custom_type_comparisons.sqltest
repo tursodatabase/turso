@@ -1796,3 +1796,90 @@ test cmp-coalesce-with-text-and-two-custom-types-is-an-error {
 expect error {
     cannot tell which type to read a string literal or parameter as
 }
+
+@requires strict "uses STRICT tables"
+test cmp-date-time-types-read-the-earlier-as-the-later {
+    -- Of a date, a timestamp and a timestamptz, the value of the earlier type
+    -- is read as the later type, as in PostgreSQL: a date is midnight, so it
+    -- equals a timestamp at midnight. BETWEEN, IN, CASE and joins compare the
+    -- same way, before and after the indexes exist.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT;
+    INSERT INTO t VALUES (1, '2026-11-20', '2026-11-20 00:00:00', '2026-11-20 00:00:00'),
+        (2, '2026-11-21', '2026-11-20 12:00:00', '2026-11-20 12:00:00');
+    SELECT 'cmp', id, d = ts, d < ts, d = tz, ts = tz, d >= tz FROM t ORDER BY id;
+    SELECT 'between', id FROM t WHERE d BETWEEN ts AND tz ORDER BY id;
+    SELECT 'in', id FROM t WHERE d IN (ts, CAST('2026-11-21 00:00' AS timestamp)) ORDER BY id;
+    SELECT 'in-ts', id FROM t WHERE ts IN (d, CAST('2026-11-20 12:00' AS timestamp)) ORDER BY id;
+    SELECT 'case', id, CASE d WHEN ts THEN 'eq' ELSE 'ne' END, CASE ts WHEN d THEN 'eq' ELSE 'ne' END FROM t ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.d = b.ts ORDER BY 2, 3;
+    SELECT 'join-lt', a.id, b.id FROM t a JOIN t b ON b.tz < a.d ORDER BY 2, 3;
+    CREATE INDEX t_d ON t(d);
+    CREATE INDEX t_ts ON t(ts);
+    CREATE INDEX t_tz ON t(tz);
+    SELECT 'between', id FROM t WHERE d BETWEEN ts AND tz ORDER BY id;
+    SELECT 'in', id FROM t WHERE d IN (ts, CAST('2026-11-21 00:00' AS timestamp)) ORDER BY id;
+    SELECT 'in-ts', id FROM t WHERE ts IN (d, CAST('2026-11-20 12:00' AS timestamp)) ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.d = b.ts ORDER BY 2, 3;
+    SELECT 'join-lt', a.id, b.id FROM t a JOIN t b ON b.tz < a.d ORDER BY 2, 3;
+}
+expect {
+    cmp|1|1|0|1|1|1
+    cmp|2|0|0|0|1|1
+    between|1
+    in|1
+    in|2
+    in-ts|1
+    in-ts|2
+    case|1|eq|eq
+    case|2|ne|ne
+    join|1|1
+    join-lt|2|1
+    join-lt|2|2
+    between|1
+    in|1
+    in|2
+    in-ts|1
+    in-ts|2
+    join|1|1
+    join-lt|2|1
+    join-lt|2|2
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-time-is-an-error {
+    -- PostgreSQL has no operator that compares a date with a time.
+    CREATE TABLE t(d date, tm time) STRICT;
+    SELECT d = tm FROM t;
+}
+expect error {
+    cannot compare type date with type time
+}
+
+@requires strict "uses STRICT tables"
+test cmp-timestamptz-with-json-is-an-error {
+    CREATE TABLE t(tz timestamptz, j json) STRICT;
+    SELECT 1 FROM t WHERE 0 AND tz = j;
+}
+expect error {
+    cannot compare type timestamptz with type json
+}
+
+@requires strict "uses STRICT tables"
+test cmp-timestamp-in-list-of-varchar-is-an-error {
+    CREATE TABLE t(ts timestamp, v varchar(20)) STRICT;
+    SELECT 1 FROM t WHERE ts IN (v);
+}
+expect error {
+    cannot compare type timestamp with type varchar
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-time-types-in-subquery-is-an-error {
+    -- The subquery's values are not converted, so two different date/time
+    -- types are not compared by IN (SELECT ...).
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT 1 FROM t WHERE ts IN (SELECT d FROM t);
+}
+expect error {
+    cannot compare type timestamp with type date in IN \(SELECT \.\.\.\)
+}

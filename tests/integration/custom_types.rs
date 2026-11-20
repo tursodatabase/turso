@@ -3055,6 +3055,190 @@ mod tests {
         ("SELECT t.n FROM t, u WHERE t.n = u.m AND u.m > 1", 0),
     ];
 
+    /// Of two values of different types among date, timestamp and timestamptz,
+    /// the one of the earlier type is read as the later type, as PostgreSQL
+    /// reads it: a date is midnight, a timestamp is in UTC. Each comparison runs
+    /// for each pair of types and each operator, with the typed value as a
+    /// literal, as a parameter and as a column of a joined table, on either
+    /// side, before and after indexes exist. All runs must return the rows that
+    /// comparing the values as times gives.
+    #[test]
+    fn date_time_comparisons_read_the_earlier_type_as_the_later_with_and_without_index() {
+        let types = ["date", "timestamp", "timestamptz"];
+        let column = |ty: &str| match ty {
+            "date" => "d",
+            "timestamp" => "ts",
+            "timestamptz" => "tz",
+            _ => unreachable!(),
+        };
+        // (id, d, ts and tz). ts and tz hold the same time.
+        let rows: [(i64, Option<&'static str>, Option<&'static str>); 6] = [
+            (1, Some("2026-11-19"), Some("2026-11-19 23:59:59")),
+            (2, Some("2026-11-20"), Some("2026-11-20 00:00:00")),
+            (3, Some("2026-11-21"), Some("2026-11-20 00:00:00.5")),
+            (4, None, Some("2026-11-20 12:00:00")),
+            (5, Some("2026-11-22"), Some("2026-11-21 00:00:00")),
+            (6, Some("2026-11-20"), None),
+        ];
+        let values = |ty: &str| -> &'static [&'static str] {
+            match ty {
+                "date" => &["2026-11-20", "2026-11-21"],
+                "timestamp" => &["2026-11-20 00:00:00", "2026-11-20 12:00:00"],
+                "timestamptz" => &["2026-11-20 00:00:00+00", "2026-11-20 00:00:00.5+00"],
+                _ => unreachable!(),
+            }
+        };
+        // The time a value stands for, as text that sorts in time order.
+        let as_time = |ty: &str, text: &str| -> String {
+            match ty {
+                "date" => format!("{text} 00:00:00"),
+                _ => text.trim_end_matches("+00").to_string(),
+            }
+        };
+        fn column_value(
+            row: &(i64, Option<&'static str>, Option<&'static str>),
+            ty: &str,
+        ) -> Option<&'static str> {
+            match ty {
+                "date" => row.1,
+                _ => row.2,
+            }
+        }
+        type Cmp = fn(&std::cmp::Ordering) -> bool;
+        let operators: [(&str, &str, Cmp); 6] = [
+            ("=", "=", |o| o.is_eq()),
+            ("<>", "<>", |o| o.is_ne()),
+            ("<", ">", |o| o.is_lt()),
+            ("<=", ">=", |o| o.is_le()),
+            (">", "<", |o| o.is_gt()),
+            (">=", "<=", |o| o.is_ge()),
+        ];
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, d date, ts timestamp, tz timestamptz) STRICT",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE v(d date, ts timestamp, tz timestamptz) STRICT")
+            .unwrap();
+        for (id, d, ts) in rows {
+            let sql_text = |v: Option<&str>| v.map_or("NULL".to_string(), |v| format!("'{v}'"));
+            conn.execute(format!(
+                "INSERT INTO t VALUES ({id}, {}, {}, {})",
+                sql_text(d),
+                sql_text(ts),
+                sql_text(ts)
+            ))
+            .unwrap();
+        }
+        let ids = |sql: &str, param: Option<&str>| -> Vec<i64> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            if let Some(param) = param {
+                stmt.bind_at(
+                    1.try_into().unwrap(),
+                    turso_core::Value::build_text(param.to_string()),
+                )
+                .unwrap();
+            }
+            let mut ids = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                ids.push(row.get::<i64>(0)?);
+                Ok(())
+            })
+            .unwrap();
+            ids
+        };
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let mut plan = String::new();
+            stmt.run_with_row_callback(|row| {
+                plan.push_str(&row.get::<String>(3)?);
+                plan.push('\n');
+                Ok(())
+            })
+            .unwrap();
+            plan
+        };
+
+        let mut checked = 0;
+        for indexed in [false, true] {
+            if indexed {
+                conn.execute("CREATE INDEX t_d ON t(d)").unwrap();
+                conn.execute("CREATE INDEX t_ts ON t(ts)").unwrap();
+                conn.execute("CREATE INDEX t_tz ON t(tz)").unwrap();
+            }
+            for column_type in types {
+                for value_type in types {
+                    if column_type == value_type {
+                        continue;
+                    }
+                    let col = column(column_type);
+                    for value in values(value_type) {
+                        conn.execute("DELETE FROM v").unwrap();
+                        conn.execute(format!(
+                            "INSERT INTO v({}) VALUES ('{value}')",
+                            column(value_type)
+                        ))
+                        .unwrap();
+                        let value_time = as_time(value_type, value);
+                        for (op, swapped_op, holds) in operators {
+                            let expected: Vec<i64> = rows
+                                .iter()
+                                .filter(|row| {
+                                    column_value(row, column_type).is_some_and(|c| {
+                                        holds(&as_time(column_type, c).cmp(&value_time))
+                                    })
+                                })
+                                .map(|row| row.0)
+                                .collect();
+                            let literal = format!("CAST('{value}' AS {value_type})");
+                            let parameter = format!("CAST(? AS {value_type})");
+                            let joined = format!("v.{}", column(value_type));
+                            for (operand, param) in [
+                                (literal.as_str(), None),
+                                (parameter.as_str(), Some(*value)),
+                                (joined.as_str(), None),
+                            ] {
+                                for sql in [
+                                    format!("SELECT t.id FROM v, t WHERE t.{col} {op} {operand} ORDER BY t.id"),
+                                    format!("SELECT t.id FROM v, t WHERE {operand} {swapped_op} t.{col} ORDER BY t.id"),
+                                ] {
+                                    assert_eq!(
+                                        ids(&sql, param),
+                                        expected,
+                                        "{sql} with {value_type} {value}, indexed: {indexed}"
+                                    );
+                                    checked += 1;
+                                }
+                            }
+                            // The index on the column of the later type serves the
+                            // join; the index on the column of the earlier type
+                            // holds values the comparison does not compare.
+                            if indexed && op != "<>" {
+                                let sql = format!(
+                                    "SELECT t.id FROM v, t WHERE t.{col} {op} v.{}",
+                                    column(value_type)
+                                );
+                                let plan = plan(&sql);
+                                let column_is_later = types.iter().position(|t| *t == column_type)
+                                    > types.iter().position(|t| *t == value_type);
+                                assert_eq!(
+                                    plan.contains(&format!("USING COVERING INDEX t_{col}"))
+                                        && plan.contains("SEARCH t"),
+                                    column_is_later,
+                                    "{sql}:\n{plan}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 6 * 2 * 6 * 3 * 2);
+    }
+
     fn connection_with_typed_tables() -> Arc<turso_core::Connection> {
         let db = turso_core::Database::open_file_with_flags(
             Arc::new(turso_core::MemoryIO::new()),
