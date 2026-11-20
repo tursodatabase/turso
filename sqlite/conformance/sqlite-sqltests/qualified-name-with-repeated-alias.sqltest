@@ -63,6 +63,26 @@ expect {
     2|1
 }
 
+# A subquery or CTE names a merged FULL JOIN column `x.a` as `a`.
+test subquery-names-full-join-column-with-repeated-alias-by-column-name {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    INSERT INTO t VALUES(1, 'x'), (3, 'z');
+    INSERT INTO u VALUES('2', 'y'), ('3', 'q');
+    SELECT s.a FROM (SELECT x.a FROM t AS x FULL JOIN u AS x USING(a)) AS s ORDER BY s.a;
+    WITH c AS (SELECT x.a FROM t AS x FULL JOIN u AS x USING(a)) SELECT c.a FROM c ORDER BY c.a;
+    SELECT * FROM (SELECT x.a, t.a FROM t AS x FULL JOIN u AS x USING(a) JOIN t USING(a)) AS s WHERE "a:1" = 1;
+}
+expect {
+    1
+    3
+    2
+    1
+    3
+    2
+    1|1
+}
+
 @cross-check-integrity
 test left-join-using-with-repeated-alias-reads-left-copy {
     CREATE TABLE t(a INTEGER, b TEXT);
@@ -99,6 +119,40 @@ expect error {
     ambiguous column name: x.b
 }
 
+# x.* adds the columns of every FROM item with the alias x, and each column
+# binds like x.<column>.
+@cross-check-integrity
+test table-star-with-repeated-alias-expands-every-item {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'y');
+    INSERT INTO u VALUES('2', 5), ('3', 6);
+    SELECT x.* FROM t AS x RIGHT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x FULL JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x LEFT JOIN u AS x USING(a) ORDER BY 1;
+    SELECT x.* FROM t AS x NATURAL JOIN t AS x ORDER BY 1;
+}
+expect {
+    2|y|2|5
+    3||3|6
+    1|x|1|
+    2|y|2|5
+    3||3|6
+    1|x|1|
+    2|y|2|5
+    1|x|1|x
+    2|y|2|y
+}
+
+test table-star-with-repeated-alias-and-unmerged-column-is-ambiguous {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE w(a TEXT, b INT);
+    SELECT x.* FROM t AS x JOIN w AS x USING(a);
+}
+expect error {
+    ambiguous column name
+}
+
 # A declared column named rowid wins over the implicit rowid of the other
 # FROM item with the same alias, in either order.
 @cross-check-integrity
@@ -131,4 +185,44 @@ expect {
     a|TEXT
     d|INT
     a|
+}
+
+# An unqualified FULL JOIN USING column in a subquery, CTE or view keeps the
+# name written in the query. CREATE TABLE AS shows the name.
+test subquery-names-unqualified-full-join-column-as-written {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, b INT);
+    CREATE VIEW v AS SELECT A FROM t FULL JOIN u USING(a);
+    CREATE TABLE from_view AS SELECT * FROM v;
+    CREATE TABLE from_subquery AS SELECT * FROM (SELECT A FROM t FULL JOIN u USING(a));
+    CREATE TABLE from_cte AS WITH c AS (SELECT A FROM t FULL JOIN u USING(a)) SELECT * FROM c;
+    SELECT name FROM pragma_table_info('from_view');
+    SELECT name FROM pragma_table_info('from_subquery');
+    SELECT name FROM pragma_table_info('from_cte');
+}
+expect {
+    A
+    A
+    A
+}
+
+# A view's `x.*` columns come from every FROM item named x, and each column
+# takes its type the way `x.<column>` does.
+test view-table-star-with-repeated-alias-lists-every-item {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE TABLE u(a TEXT, d INT);
+    CREATE VIEW v_right AS SELECT x.* FROM t AS x RIGHT JOIN u AS x USING(a);
+    CREATE VIEW v_full AS SELECT x.* FROM t AS x FULL JOIN u AS x USING(a);
+    SELECT name, type FROM pragma_table_info('v_right');
+    SELECT name, type FROM pragma_table_info('v_full');
+}
+expect {
+    a|TEXT
+    b|TEXT
+    a:1|TEXT
+    d|INT
+    a|
+    b|TEXT
+    a:1|
+    d|INT
 }
