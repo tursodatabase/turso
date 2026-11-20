@@ -616,7 +616,6 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
             Value::build_text("x + 7"),
         ),
         ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
-        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
     ] {
         assert_eq!(
             conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
@@ -647,7 +646,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         [
             ("format_type", 1, 2048),
             ("format_type", 2, 2048),
-            ("now", -1, 0),
+            ("now", 0, 0),
             ("pg_get_constraintdef", 1, 0),
             ("pg_get_constraintdef", 2, 0),
             ("quote_ident", 1, 2048),
@@ -673,7 +672,7 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
         [
             ("format_type", 1, "i"),
             ("format_type", 2, "i"),
-            ("now", -1, "v"),
+            ("now", 0, "v"),
             ("pg_get_constraintdef", 1, "v"),
             ("pg_get_constraintdef", 2, "v"),
             ("quote_ident", 1, "i"),
@@ -700,7 +699,7 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         assert!(conn.get_syms_functions().iter().any(
             |(registered, is_agg, argc, deterministic)| registered == name
                 && !is_agg
-                && *argc == -1
+                && *argc == 0
                 && !deterministic
         ));
         let rows = conn

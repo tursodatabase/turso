@@ -37,13 +37,15 @@ test error-zero-parameter {
 expect error {}
 
 # tursopg does not have LISTEN.
+@compat-gap "syntax:unsupported-statement"
 test error-unsupported-statement {
     LISTEN channel;
 }
 expect {
 }
 @sqlstate 0A000
-expect @tursopg error {}
+expect @tursopg error {
+}
 
 test error-values-lists-have-different-lengths {
     VALUES (1), (2, 3), (4);
@@ -207,6 +209,7 @@ expect error {}
 
 # PostgreSQL skips it; tursopg refuses it, as it refuses every array type,
 # rather than drop a custom type named "void[]".
+@compat-gap "syntax:drop-type"
 test drop-if-exists-bracketed-array-of-type-without-arrays {
     DROP TYPE IF EXISTS void[];
 }

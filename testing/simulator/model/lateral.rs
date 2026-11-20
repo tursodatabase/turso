@@ -376,7 +376,7 @@ fn select_ast(
         with: None,
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
-                distinctness: distinct.then_some(ast::Distinctness::Distinct),
+                distinctness: distinct.then_some(ast::SelectDistinctness::Distinct),
                 columns,
                 from: Some(from),
                 where_clause: where_clause.map(Box::new),

@@ -4,7 +4,9 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, PlatformIO, SessionRole};
+use turso_core::{
+    ConnectOpts, Connection, Database, MemoryIO, PlatformIO, SessionRole, Statement, StepResult,
+};
 use turso_sqlite::SqliteDialect;
 
 // Title: JSONB Function Benchmarking
@@ -953,10 +955,195 @@ fn bench_json_patch(criterion: &mut Criterion) {
     }
 }
 
+/// Number of rows in the `docs` table that `bench_json_functions` reads.
+const JSON_DOC_ROWS: i64 = 1_000;
+
+/// Queries that apply a JSON function, operator or table-valued function to every
+/// row of `docs`. `doc` holds a document as JSON text and `docb` holds the same
+/// document as JSONB, so a query parses a different document for each row.
+const JSON_FUNCTION_QUERIES: &[(&str, &str)] = &[
+    (
+        "json_extract",
+        "SELECT json_extract(doc, '$.address.city') FROM docs",
+    ),
+    (
+        "json_extract_three_paths",
+        "SELECT json_extract(doc, '$.id', '$.name', '$.tags[0]') FROM docs",
+    ),
+    ("arrow_object", "SELECT doc -> '$.address' FROM docs"),
+    ("arrow_shift_text", "SELECT doc ->> '$.name' FROM docs"),
+    ("arrow_shift_label", "SELECT doc ->> 'email' FROM docs"),
+    (
+        "arrow_shift_nested_path",
+        "SELECT doc ->> '$.history[1].event' FROM docs",
+    ),
+    (
+        "arrow_shift_negative_index",
+        "SELECT doc ->> '$.tags[#-1]' FROM docs",
+    ),
+    (
+        "arrow_shift_jsonb",
+        "SELECT docb ->> '$.address.city' FROM docs",
+    ),
+    (
+        "where_arrow_shift",
+        "SELECT count(*) FROM docs WHERE doc ->> '$.active'",
+    ),
+    ("json_type", "SELECT json_type(doc, '$.score') FROM docs"),
+    (
+        "json_array_length",
+        "SELECT json_array_length(doc, '$.tags') FROM docs",
+    ),
+    ("json_valid", "SELECT json_valid(doc) FROM docs"),
+    ("json_text", "SELECT json(doc) FROM docs"),
+    ("json_from_jsonb", "SELECT json(docb) FROM docs"),
+    ("jsonb_from_text", "SELECT jsonb(doc) FROM docs"),
+    ("json_pretty", "SELECT json_pretty(doc) FROM docs"),
+    (
+        "json_set",
+        "SELECT json_set(doc, '$.name', 'renamed', '$.address.zip', 12345) FROM docs",
+    ),
+    (
+        "json_insert",
+        "SELECT json_insert(doc, '$.created', 1700000000) FROM docs",
+    ),
+    (
+        "json_replace",
+        "SELECT json_replace(doc, '$.score', 0.5) FROM docs",
+    ),
+    (
+        "json_remove",
+        "SELECT json_remove(doc, '$.history') FROM docs",
+    ),
+    (
+        "jsonb_set",
+        "SELECT jsonb_set(docb, '$.active', json('false')) FROM docs",
+    ),
+    (
+        "json_patch_rows",
+        r#"SELECT json_patch(doc, '{"active":false,"address":{"zip":null}}') FROM docs"#,
+    ),
+    (
+        "json_object",
+        "SELECT json_object('id', id, 'name', name, 'score', score) FROM docs",
+    ),
+    ("json_array", "SELECT json_array(id, name, score) FROM docs"),
+    ("json_quote", "SELECT json_quote(name) FROM docs"),
+    (
+        "json_group_array",
+        "SELECT json_group_array(name) FROM docs",
+    ),
+    (
+        "json_group_object",
+        "SELECT json_group_object(name, score) FROM docs",
+    ),
+    (
+        "json_each",
+        "SELECT key, value FROM docs, json_each(docs.doc)",
+    ),
+    (
+        "json_each_path",
+        "SELECT value FROM docs, json_each(docs.doc, '$.tags')",
+    ),
+    (
+        "json_tree",
+        "SELECT fullkey, atom FROM docs, json_tree(docs.doc)",
+    ),
+];
+
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_json_functions(criterion: &mut Criterion) {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    seed_json_docs(&conn);
+
+    let elements: Vec<String> = (0..JSON_DOC_ROWS).map(|i| i.to_string()).collect();
+    let literal_array_query = format!(
+        "SELECT sum(value) FROM json_each('[{}]')",
+        elements.join(",")
+    );
+    let queries = JSON_FUNCTION_QUERIES
+        .iter()
+        .map(|(label, sql)| (*label, (*sql).to_string()))
+        .chain(std::iter::once((
+            "json_each_literal_array",
+            literal_array_query,
+        )));
+
+    let mut group = criterion.benchmark_group("JSON functions");
+    for (label, sql) in queries {
+        group.bench_function(label, |b| {
+            let mut stmt = conn.prepare(&sql).unwrap();
+            assert!(
+                run_to_completion(&db, &mut stmt) > 0,
+                "{label} should give back rows"
+            );
+            b.iter(|| run_to_completion(&db, &mut stmt));
+        });
+    }
+    group.finish();
+}
+
+fn seed_json_docs(conn: &Arc<Connection>) {
+    conn.execute(
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, name TEXT, score REAL, doc TEXT, docb BLOB)",
+    )
+    .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..JSON_DOC_ROWS {
+        let score = i as f64 * 1.5;
+        let doc = format!(
+            concat!(
+                r#"{{"id":{i},"name":"user_{i}","email":"user_{i}@example.com","active":{active},"#,
+                r#""score":{score:.2},"tags":["tag{a}","tag{b}","tag{c}"],"#,
+                r#""address":{{"street":"{i} Main St","city":"city_{city}","zip":"{zip}"}},"#,
+                r#""history":[{{"ts":{i},"event":"login"}},{{"ts":{next},"event":"logout"}}]}}"#,
+            ),
+            i = i,
+            active = i % 2 == 0,
+            score = score,
+            a = i % 10,
+            b = i % 7,
+            c = i % 3,
+            city = i % 50,
+            zip = 10_000 + i,
+            next = i + 1,
+        );
+        conn.execute(format!(
+            "INSERT INTO docs VALUES ({i}, 'user_{i}', {score:.2}, '{doc}', jsonb('{doc}'))"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+/// Steps `stmt` until it is done, resets it and returns the number of rows.
+fn run_to_completion(db: &Database, stmt: &mut Statement) -> usize {
+    let mut rows = 0;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                black_box(stmt.row());
+                rows += 1;
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                db.io.step().unwrap();
+            }
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => unreachable!(),
+        }
+    }
+    stmt.reset().unwrap();
+    rows
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench, bench_sequential_jsonb, bench_json_patch
+    targets = bench, bench_sequential_jsonb, bench_json_patch, bench_json_functions
 }
 
 criterion_main!(benches);

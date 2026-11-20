@@ -341,6 +341,7 @@ fn apply_tx_access_mode(
             return Err(sqlstate_error(
                 SQLSTATE_ACTIVE_SQL_TRANSACTION,
                 "cannot set transaction read-write mode inside a read-only transaction",
+                None,
             )
             .into());
         }
@@ -348,6 +349,7 @@ fn apply_tx_access_mode(
             return Err(sqlstate_error(
                 SQLSTATE_ACTIVE_SQL_TRANSACTION,
                 "transaction read-write mode must be set before any query",
+                None,
             )
             .into());
         }
@@ -576,6 +578,7 @@ fn translate_statement<'a>(
                     "positional INSERT into table \"{table}\" with generated columns \
                      requires an explicit column list"
                 ),
+                None,
             ));
         }
     }
@@ -1570,6 +1573,7 @@ fn create_table_schema_from_search_path(
         sqlstate_error(
             SQLSTATE_INVALID_SCHEMA_NAME,
             "no schema has been selected to create in",
+            None,
         )
     })?;
     Ok(Some((location, schema)))
@@ -1650,6 +1654,7 @@ fn stored_sequence_name(conn: &Arc<Connection>, schema: &str, name: &str) -> Res
             sqlstate_error(
                 SQLSTATE_INVALID_SCHEMA_NAME,
                 format!("schema \"{schema}\" does not exist"),
+                None,
             )
         })?;
     Ok(if namespace.is_database() {
@@ -1695,6 +1700,7 @@ fn reject_drop_of_other_view_kind(
             return Err(sqlstate_error(
                 SQLSTATE_WRONG_OBJECT_TYPE,
                 format!("\"{}\" is not a {expected_kind}", view_name.name.as_str()),
+                None,
             ));
         }
         return Ok(());
@@ -1786,11 +1792,13 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
         return Err(sqlstate_error(
             SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE,
             format!("cannot {verb} view \"{table_name}\""),
+            None,
         ));
     }
     Err(sqlstate_error(
         SQLSTATE_INSUFFICIENT_PRIVILEGE,
         format!("cannot {verb} pg_catalog table \"{table_name}\""),
+        None,
     ))
 }
 
@@ -1846,11 +1854,11 @@ fn try_prepare_special(
 fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
     match error {
         ParseError::ParseError(message) => LimboError::ParseError(message),
-        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message),
+        ParseError::Sqlstate { sqlstate, message } => sqlstate_error(sqlstate, message, None),
         ParseError::SchemaQualifiedName { ref schema, .. } => {
             match check_schema_exists(conn, schema) {
                 Err(missing_schema) => missing_schema,
-                Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string()),
+                Ok(()) => sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string(), None),
             }
         }
         ParseError::UnresolvedFunctionType {
@@ -1865,11 +1873,12 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
                 }
             }
             if type_exists(conn, schema.as_deref(), name) {
-                sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
+                sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string(), None)
             } else {
                 sqlstate_error(
                     SQLSTATE_UNDEFINED_OBJECT,
                     used_as.missing_message(full_name),
+                    None,
                 )
             }
         }
@@ -1931,6 +1940,7 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
             return Err(sqlstate_error(
                 SQLSTATE_INSUFFICIENT_PRIVILEGE,
                 format!("permission denied for materialized view {}", stmt.name),
+                None,
             ));
         }
         FrontendStmt::CommentOn(stmt) => {
@@ -1938,7 +1948,11 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
                 PgCommentTarget::Owned(object) => format!("must be owner of {object}"),
                 PgCommentTarget::Role | PgCommentTarget::Other => "permission denied".to_string(),
             };
-            return Err(sqlstate_error(SQLSTATE_INSUFFICIENT_PRIVILEGE, message));
+            return Err(sqlstate_error(
+                SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                message,
+                None,
+            ));
         }
     };
     Err(LimboError::PermissionDenied(Box::new(denial)))
@@ -1970,6 +1984,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
                         format!(
                             "REVOKE on the system catalogs of schema {schema} is not supported"
                         ),
+                        None,
                     ));
                 }
                 relations.extend(
@@ -2002,6 +2017,7 @@ fn grant_commands(conn: &Arc<Connection>, stmt: &PgGrantStmt) -> Result<Vec<Defe
                     return Err(sqlstate_error(
                         SQLSTATE_UNDEFINED_OBJECT,
                         format!("role \"{name}\" does not exist"),
+                        None,
                     ));
                 }
             }
@@ -2029,6 +2045,7 @@ fn check_schema_exists(conn: &Connection, schema: &str) -> Result<()> {
     Err(sqlstate_error(
         SQLSTATE_INVALID_SCHEMA_NAME,
         format!("schema \"{schema}\" does not exist"),
+        None,
     ))
 }
 
@@ -2064,6 +2081,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 return Err(sqlstate_error(
                     SQLSTATE_INVALID_PARAMETER_VALUE,
                     format!("SET {name} takes only one argument"),
+                    None,
                 ))
             }
         },
@@ -2072,6 +2090,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 return Err(sqlstate_error(
                     SQLSTATE_INVALID_PARAMETER_VALUE,
                     format!("SET {name} takes only one argument"),
+                    None,
                 ));
             }
             let values = values
@@ -2095,6 +2114,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!("{command} {name} is not supported"),
+                None,
             ));
         }
     };
@@ -2120,6 +2140,7 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
             return Err(sqlstate_error(
                 SQLSTATE_FEATURE_NOT_SUPPORTED,
                 format!("SHOW {name} is not supported"),
+                None,
             ))
         }
     };
@@ -2146,6 +2167,7 @@ fn discard_all(conn: &Connection) -> Result<()> {
         return Err(sqlstate_error(
             SQLSTATE_ACTIVE_SQL_TRANSACTION,
             "DISCARD ALL cannot run inside a transaction block",
+            None,
         ));
     }
     reset_all_settings(conn)?;
@@ -2192,6 +2214,7 @@ pub(crate) fn set_role(
                 return Err(sqlstate_error(
                     SQLSTATE_UNDEFINED_OBJECT,
                     format!("role \"{name}\" does not exist"),
+                    None,
                 ));
             };
             if !roles.can_set_role(conn.session_role(), role.id) {
@@ -2228,6 +2251,7 @@ pub(crate) fn set_custom_parameter(
         return Err(sqlstate_error(
             SQLSTATE_INVALID_NAME,
             format!("invalid configuration parameter name \"{name}\""),
+            None,
         ));
     }
     session_state(conn)?.mutate(conn, |settings| {
@@ -2316,7 +2340,7 @@ fn create_schema_commands(
             SQLSTATE_RESERVED_NAME,
             format!(
                 "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
-            ),
+            ), None,
         ));
     }
 
@@ -2360,6 +2384,7 @@ fn drop_schema_commands(
         return Err(sqlstate_error(
             SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
             format!("cannot drop schema \"{name}\" because other objects depend on it"),
+            None,
         ));
     }
 
@@ -2421,6 +2446,7 @@ fn unsupported_cascade_to_other_schemas(schema: &str, error: LimboError) -> Limb
             "DROP SCHEMA \"{schema}\" CASCADE is not supported when an object of another schema \
              depends on an object of the schema: {error}"
         ),
+        None,
     )
 }
 

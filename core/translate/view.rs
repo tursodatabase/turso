@@ -1,4 +1,4 @@
-use crate::dialect::RelationChange;
+use crate::dialect::{CatalogCmd, CmdContext, CreateMaterializedView, CreateView, DropView};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::view::extract_view_columns;
@@ -8,9 +8,7 @@ use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::{
     emitter::Resolver,
-    schema::{
-        self, emit_drop_view_row, emit_schema_entry, open_sqlite_schema_for_write, SchemaEntryType,
-    },
+    schema::{self, emit_schema_entry, SchemaEntryType},
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
@@ -151,14 +149,6 @@ pub fn translate_create_materialized_view(
         .cloned()
         .collect::<Vec<_>>();
 
-    // Reconstruct the SQL string for storage
-    let sql = create_view_to_str(
-        "MATERIALIZED VIEW",
-        &view_name.name.as_ident(),
-        columns,
-        select_stmt,
-    );
-
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
     let view_root_reg = program.alloc_register();
@@ -222,40 +212,26 @@ pub fn translate_create_materialized_view(
 
     program.preassign_label_to_next_insn(clear_done_label);
 
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    // Add the materialized view entry to sqlite_schema
-    emit_schema_entry(
+    let cmd_context = CmdContext::new(&connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for views
-        SchemaEntryType::View,
-        &view_key,
-        &view_key,
-        view_root_reg, // btree root for materialized view data
-        Some(sql),
+        &cmd_context,
+        &CatalogCmd::CreateMaterializedView(CreateMaterializedView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+            written_name: &view_name.name,
+            columns,
+            select: select_stmt,
+            root_reg: view_root_reg,
+        }),
     )?;
-
-    // The view is a relation of the dialect's; its hidden state tables are
-    // engine objects and are not.
-    if schema::dialect_relation_hooks_apply(&connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            &connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-                kind: crate::schema::RelationKind::MaterializedView,
-                table: None,
-            }],
-        )?;
-    }
 
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
-    // codegen; the marker only persists compatibility metadata.
+    // codegen; the marker only persists compatibility metadata. They are
+    // engine tables, so their sqlite_schema rows are written here and not by
+    // the catalog.
+    let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
     let mut parse_schema_names = vec![escape_sql_string_literal(&view_key)];
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();
@@ -436,45 +412,22 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
-    let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
-    let sql = create_view_to_str(
-        "VIEW",
-        &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
-        columns,
-        select_stmt,
-    );
-
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    // Add the view entry to sqlite_schema
-    emit_schema_entry(
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for views
-        SchemaEntryType::View,
-        &stored_view_name,
-        &stored_view_name,
-        0, // Regular views don't have a btree
-        Some(sql),
+        &cmd_context,
+        &CatalogCmd::CreateView(CreateView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+            written_name: &view_name.name,
+            columns,
+            select: select_stmt,
+        }),
     )?;
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Created {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-                kind: crate::schema::RelationKind::View,
-                table: None,
-            }],
-        )?;
-    }
-
     // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&stored_view_name);
+    let escaped_view_name =
+        escape_sql_string_literal(&resolver.mangle_name(namespace, &normalized_view_name));
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
@@ -490,23 +443,6 @@ pub fn translate_create_view(
     });
 
     Ok(())
-}
-
-fn create_view_to_str(
-    view_kind: &str,
-    view_name: &str,
-    columns: &[ast::IndexedColumn],
-    select_stmt: &ast::Select,
-) -> String {
-    let columns_str = columns
-        .iter()
-        .map(|col| col.col_name.as_ident())
-        .collect::<Vec<String>>()
-        .join(", ");
-    if !columns_str.is_empty() {
-        return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
-    }
-    format!("CREATE {view_kind} {view_name} AS {select_stmt}")
 }
 
 pub fn translate_drop_view(
@@ -648,32 +584,24 @@ pub fn translate_drop_view(
         }
     }
 
-    if schema::dialect_relation_hooks_apply(connection, database_id)? {
-        resolver.catalog.dialect.translate_relation_changes(
-            program,
-            resolver.schema(),
-            connection,
-            &[RelationChange::Dropped {
-                namespace: namespace.id,
-                name: &normalized_view_name,
-            }],
-        )?;
-    }
-
-    let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-
-    let rowid_reg = emit_drop_view_row(
+    let cmd_context = CmdContext::new(connection, resolver, database_id);
+    resolver.catalog.dialect.catalog().emit(
         program,
-        resolver,
-        namespace,
-        &normalized_view_name,
-        sqlite_schema_cursor_id,
+        &cmd_context,
+        &CatalogCmd::DropView(DropView {
+            namespace: namespace.id,
+            name: &normalized_view_name,
+        }),
     )?;
 
-    // If this is a materialized view, delete internal table and index
-    // entries in a second pass, one loop per internal table. We do this in
-    // separate loops to ensure we catch all entries even if they come in
-    // different orders in sqlite_schema.
+    // The tables with the state of a materialized view are engine tables,
+    // so their sqlite_schema rows are deleted here and not by the catalog.
+    let sqlite_schema_cursor_id = cmd_context.sqlite_schema_cursor(program);
+    let rowid_reg = cmd_context.sqlite_schema_rowid_reg(program);
+
+    // Delete internal table and index entries, one loop per internal table.
+    // We do this in separate loops to ensure we catch all entries even if
+    // they come in different orders in sqlite_schema.
     for dbsp_table_name in &internal_table_names {
         // Set up registers for the table name and types (outside the loop for efficiency)
         let dbsp_table_name_reg_2 = program.alloc_register();

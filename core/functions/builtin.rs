@@ -841,7 +841,7 @@ pub fn call_builtin_scalar(
 
                 let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                 for i in 0..columns_len {
-                    let mut op = json::jsonb::SearchOperation::new(0)?;
+                    let mut op = json::jsonb::SearchOperation::new();
                     let path = json::path::JsonPath {
                         elements: vec![
                             json::path::PathElement::Root(),
@@ -850,7 +850,8 @@ pub fn call_builtin_scalar(
                     };
 
                     columns_json_array.operate_on_path(&path, &mut op)?;
-                    let column_name = op.result();
+                    let column_name =
+                        json::jsonb::Jsonb::from_raw_data(op.element_in(&columns_json_array))?;
                     json.append_jsonb_to_end(column_name.data());
 
                     let val = match payload_iterator.next() {

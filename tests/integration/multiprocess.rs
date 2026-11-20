@@ -31,6 +31,8 @@ const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess::multiprocess_shm_count_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess::multiprocess_shm_schema_child_process";
+const MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST: &str =
+    "multiprocess::multiprocess_shm_db_file_reader_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "win_iocp"))]
@@ -1734,6 +1736,426 @@ fn write_after_full_checkpoint_restarts_wal() {
     assert_eq!(count_test_rows(&conn), 21);
 }
 
+#[test]
+fn test_rollback_releases_shared_read_lock_slot() {
+    let (db, _dir) = open_rollback_test_db();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+    let locked_slots_before = db.wal_read_slots_with_readers();
+    assert_eq!(
+        locked_slots_before.len(),
+        1,
+        "expected exactly one shared read-lock slot while transaction is active"
+    );
+
+    conn.execute("ROLLBACK").unwrap();
+
+    let locked_slots_after = db.wal_read_slots_with_readers();
+    assert!(
+        locked_slots_after.is_empty(),
+        "ROLLBACK must release the shared read-lock slot"
+    );
+}
+
+#[test]
+fn test_rollback_releases_slot_zero_read_lock() {
+    let (db, _dir) = open_rollback_test_db();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn.execute("CREATE TABLE test(id integer primary key, value text)")
+        .unwrap();
+    bulk_inserts(&conn, 3, 3);
+    {
+        let result = run_checkpoint(&conn, CheckpointMode::Restart);
+        assert!(
+            result.everything_backfilled(),
+            "restart checkpoint setup must fully backfill WAL"
+        );
+    }
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO test(value) VALUES('slot0')")
+        .unwrap();
+
+    let locked_slots_before = db.wal_read_slots_with_readers();
+    assert_eq!(
+        locked_slots_before,
+        vec![0],
+        "writer should use slot 0 when WAL is fully checkpointed"
+    );
+
+    conn.execute("ROLLBACK").unwrap();
+
+    let locked_slots_after = db.wal_read_slots_with_readers();
+    assert!(
+        locked_slots_after.is_empty(),
+        "ROLLBACK must release slot 0 shared read-lock as well"
+    );
+}
+
+#[test]
+fn test_savepoint_then_tx_rollback_allows_restart_checkpoint_from_other_connection() {
+    let (db, _dir) = open_rollback_test_db();
+    let conn1 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    conn1
+        .execute("CREATE TABLE test(id integer primary key, value text)")
+        .unwrap();
+    bulk_inserts(&conn1, 2, 2);
+    let count_before = count_test_rows(&conn1);
+
+    conn1.execute("BEGIN").unwrap();
+    conn1
+        .execute("INSERT INTO test(id, value) VALUES(1000, 'first')")
+        .unwrap();
+    let duplicate = conn1.execute("INSERT INTO test(id, value) VALUES(1000, 'dup')");
+    assert!(duplicate.is_err(), "duplicate PK insert must fail");
+
+    {
+        let pager = conn1.get_pager();
+        assert!(
+            pager.holds_read_lock(),
+            "read lock must still be held after savepoint rollback"
+        );
+        assert!(
+            pager.holds_write_lock(),
+            "write lock must still be held after savepoint rollback"
+        );
+    }
+
+    conn1.execute("ROLLBACK").unwrap();
+
+    {
+        let pager = conn1.get_pager();
+        assert!(
+            !pager.holds_read_lock(),
+            "read lock must be released after transaction rollback"
+        );
+        assert!(
+            !pager.holds_write_lock(),
+            "write lock must be released after transaction rollback"
+        );
+    }
+
+    let locked_slots_after_rollback = db.wal_read_slots_with_readers();
+    assert!(
+        locked_slots_after_rollback.is_empty(),
+        "transaction rollback after savepoint failure must not leak shared read locks"
+    );
+    assert_eq!(
+        count_test_rows(&conn1),
+        count_before,
+        "transaction rollback should remove writes made before savepoint failure"
+    );
+
+    let result = run_checkpoint(&conn2, CheckpointMode::Restart);
+    assert!(
+        result.everything_backfilled(),
+        "restart checkpoint from another connection must succeed after full rollback"
+    );
+}
+
+/// Opens a read transaction while the WAL is fully backfilled, so the
+/// snapshot reads the database file directly, then reports what it sees in
+/// a table it has not touched yet after the parent has changed and
+/// checkpointed that table.
+#[test]
+fn multiprocess_shm_db_file_reader_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let result_file = std::env::var_os("TURSO_MULTIPROCESS_RESULT_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    let Value::Text(seen) = &rows[0][0] else {
+        panic!("unexpected row: {rows:?}");
+    };
+    std::fs::write(&result_file, seen.as_str()).unwrap();
+    conn.execute("commit").unwrap();
+}
+
+#[test]
+fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(
+        checkpoint.everything_backfilled(),
+        "the child must start its snapshot with nothing left in the WAL"
+    );
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+    assert!(backfilled_frame > 0);
+    assert_eq!(db.shared_wal_min_active_reader_frame(), None);
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    assert!(
+        db.shared_wal_has_active_db_file_reader(),
+        "a reader that bypasses the WAL must still be visible to other processes"
+    );
+    assert_eq!(db.shared_wal_min_active_reader_frame(), None);
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    assert!(wal_max_frame(&conn) > backfilled_frame);
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame past the child's snapshot may reach the database file while it reads"
+    );
+    assert_eq!(checkpoint.wal_total_backfilled, backfilled_frame);
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!db.shared_wal_has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+}
+
+#[test]
+fn subprocess_db_file_reader_allows_wal_restart_but_stops_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader-restart.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    assert!(db.shared_wal_has_active_db_file_reader());
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a database file reader in another process must not stop the WAL restart, \
+         but the write appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame of the restarted WAL may reach the database file while the child reads"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!db.shared_wal_has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    assert_eq!(rows[0][0].to_string(), "new");
+}
+
+#[test]
+fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = multiprocess_test_io();
+    let db = open_multiprocess_db(io, dir.path().join("late-reader.db").to_str().unwrap()).unwrap();
+    let readers = [
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap(),
+        db.connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap(),
+    ];
+    let writer = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    writer.execute("PRAGMA synchronous = NORMAL").unwrap();
+    writer
+        .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, k BLOB UNIQUE, v BLOB)")
+        .unwrap();
+    let insert = "INSERT INTO test(k, v) VALUES(randomblob(16), randomblob(200))";
+
+    readers[0].execute("BEGIN").unwrap();
+    count_test_rows(&readers[0]);
+    let mut open_reader = 0;
+    let mut rows = 0;
+    while wal_max_frame(&writer) < 9000 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+        if rows % 50 == 0 {
+            let next = 1 - open_reader;
+            readers[next].execute("BEGIN").unwrap();
+            assert_eq!(count_test_rows(&readers[next]), rows);
+            readers[open_reader].execute("COMMIT").unwrap();
+            open_reader = next;
+        }
+    }
+
+    let held_reader = &readers[1 - open_reader];
+    held_reader.execute("BEGIN").unwrap();
+    let held_rows = count_test_rows(held_reader);
+    assert_eq!(held_rows, rows);
+    readers[open_reader].execute("COMMIT").unwrap();
+    let held_frame = wal_max_frame(&writer);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+
+    for _ in 0..1500 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+    }
+    assert!(wal_max_frame(&writer) > held_frame + 1000);
+    assert_eq!(count_test_rows(held_reader), held_rows);
+    assert_eq!(count_test_rows(&writer), rows);
+    db.take_shared_wal_frame_index_blocks_scanned();
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+    assert_eq!(checkpoint.wal_checkpoint_backfilled, 0);
+    assert_eq!(db.take_shared_wal_frame_index_blocks_scanned(), 0);
+
+    held_reader.execute("COMMIT").unwrap();
+    let checkpoint = run_checkpoint(
+        &writer,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    assert_eq!(wal_max_frame(&writer), 0);
+    let fresh = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(count_test_rows(&fresh), rows);
+    assert_eq!(
+        get_rows(&fresh, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+}
+
 fn coordination_open_mode(db: &Database) -> Option<SharedWalCoordinationOpenTelemetryMode> {
     db.shared_wal_open_telemetry()
         .unwrap()
@@ -1763,4 +2185,35 @@ fn wal_max_frame(conn: &Arc<Connection>) -> u64 {
     conn.get_pager()
         .wal_max_frame()
         .expect("wal should be present")
+}
+
+/// Opens a new database with a multiprocess WAL. The returned `TempDir`
+/// deletes the database directory when it drops.
+fn open_rollback_test_db() -> (Arc<Database>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), db_path.to_str().unwrap()).unwrap();
+    (db, dir)
+}
+
+fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
+    for _ in 0..n_txns {
+        conn.execute("begin transaction").unwrap();
+        for i in 0..rows_per_txn {
+            conn.execute(format!("insert into test(value) values ('v{i}')"))
+                .unwrap();
+        }
+        conn.execute("commit").unwrap();
+    }
+}
+
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
 }

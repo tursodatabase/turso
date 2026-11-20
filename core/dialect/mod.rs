@@ -17,13 +17,20 @@
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
 //! [`Dialect::parse_internal`] of the database's dialect.
 
+#[cfg(test)]
+pub(crate) mod cannot_parse;
 pub mod catalog;
 
 pub use crate::functions::builtin::{
     call_builtin_scalar, resolve_builtin_function, SQLITE_VERSION, SQLITE_VERSION_NUMBER,
 };
+pub use crate::translate::schema::SqliteCatalog;
 pub use catalog::{
-    AccessStatement, CatalogApply, NewOwner, OwnerColumn, RelationChange, RelationName,
+    AccessStatement, AddColumn, AlterColumn, AutomaticIndex, Catalog, CatalogApply, CatalogCmd,
+    CmdContext, CmdOrigin, CreateIndex, CreateMaterializedView, CreateSequence, CreateTable,
+    CreateView, DropColumn, DropIndex, DropSequence, DropTable, DropView, NewOwner, OwnerColumn,
+    RelationName, RenameColumn, RenameTable, RewrittenTrigger, RewrittenView, TableText,
+    TempTriggerOfRenamedTable,
 };
 
 use crate::{
@@ -31,24 +38,75 @@ use crate::{
     namespace::NamespaceId,
     schema::{BTreeTable, Schema, SchemaBuilder},
     security::{policy::RowPolicy, roles::RoleId},
-    vdbe::{builder::ProgramBuilder, Register},
-    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
+    vdbe::Register,
+    Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value,
+    WallClockInstant, IO,
 };
-use std::{any::Any, sync::Arc};
+use std::{any::Any, cell::Cell, ops::Range, sync::Arc};
 use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
-/// What a built-in scalar function may read besides its arguments.
+/// What a scalar function may read besides its arguments.
 pub struct ScalarFuncContext<'a> {
-    pub connection: &'a Connection,
+    pub connection: &'a Arc<Connection>,
     pub io: &'a dyn IO,
     /// The statement's clock: every function of one step sees the same time.
     pub clock: &'a dyn Clock,
+    /// Set by the first call of `statement_times` in the statement.
+    pub statement_times: &'a Cell<Option<StatementTimes>>,
     /// The collation of the call site, for functions that compare arguments.
     pub collation: CollationSeq,
+}
+
+impl ScalarFuncContext<'_> {
+    /// The same times for every call until the statement ends, triggers
+    /// included.
+    pub fn statement_times(&self) -> StatementTimes {
+        if let Some(times) = self.statement_times.get() {
+            return times;
+        }
+        let times = StatementTimes::new(self.io.current_time_wall_clock(), self.connection);
+        self.statement_times.set(Some(times));
+        times
+    }
+
+    /// The wall clock now. The statement start is read first, so no time
+    /// read during a statement is earlier than its `statement_times`.
+    pub fn current_time(&self) -> WallClockInstant {
+        self.statement_times();
+        self.io.current_time_wall_clock()
+    }
+}
+
+/// When a statement and its transaction started, as PostgreSQL's
+/// `statement_timestamp()` and `now()` report them. A client command with
+/// several statements, or an extended-protocol batch that ends at Sync, is
+/// one transaction in autocommit mode, so its statements share these times.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementTimes {
+    pub statement: WallClockInstant,
+    pub transaction: WallClockInstant,
+}
+
+impl StatementTimes {
+    /// Times for a statement that starts at `now`. In autocommit mode the
+    /// statement is its own transaction, unless a command set the times.
+    pub(crate) fn new(now: WallClockInstant, connection: &Connection) -> Self {
+        let command = connection.command_times();
+        let statement = command.map_or(now, |times| times.statement);
+        let transaction = if connection.get_auto_commit() {
+            command.map_or(now, |times| times.transaction)
+        } else {
+            connection.explicit_transaction_start()
+        };
+        Self {
+            statement,
+            transaction,
+        }
+    }
 }
 
 /// Start of the comment in stored table SQL that lists the positions and kinds
@@ -112,6 +170,11 @@ pub trait Dialect: Send + Sync + 'static {
     /// Parse the column definition that core keeps for `ALTER TABLE`, such
     /// as `b INTEGER DEFAULT 0`. The text is SQLite syntax in every dialect.
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition>;
+
+    /// The byte ranges of the parameter markers in a statement that
+    /// [`Dialect::parse`] accepted, in the order they appear. Markers inside
+    /// string literals, quoted identifiers and comments are not parameters.
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<Range<usize>>>;
 
     /// The dialect for the statements that core and the frontend run for
     /// themselves. Those statements are SQLite syntax and expect SQLite
@@ -326,45 +389,10 @@ pub trait Dialect: Send + Sync + 'static {
         ))
     }
 
-    /// Translates `changes`, which the statement being compiled makes to
-    /// relations, into the bytecode that records them in the dialect's own
-    /// schema state, in the same transaction as the statement's
-    /// `sqlite_schema` rows. A table comes with its automatic indexes in one
-    /// call. Does nothing for a dialect without schema state of its own.
-    fn translate_relation_changes(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        changes: &[RelationChange<'_>],
-    ) -> Result<()> {
-        let _ = (program, schema, connection, changes);
-        Ok(())
-    }
-
-    /// Translates `statement` into the bytecode that changes the roles,
-    /// owners, privileges or policies the dialect stores. A dialect that
-    /// stores none refuses `CREATE ROLE`, `GRANT role TO role`,
-    /// `ALTER ... OWNER TO`, `ALTER SEQUENCE ... OWNED BY`, `GRANT`,
-    /// `REVOKE`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`,
-    /// `CREATE POLICY` and `DROP POLICY`.
-    fn translate_access_statement(
-        &self,
-        program: &mut ProgramBuilder,
-        schema: &Schema,
-        connection: &Arc<Connection>,
-        statement: &AccessStatement<'_>,
-    ) -> Result<()> {
-        let _ = (program, schema, connection);
-        Err(statement.not_supported())
-    }
-
-    /// Whether relations can be created, renamed or dropped in an attached
-    /// database. The PostgreSQL frontend refuses it: its relation catalog
-    /// covers only the main database, so a database file with relations
-    /// made while it was attached could not be opened later.
-    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
-        true
+    /// Where the dialect stores the objects of a database. The default
+    /// stores them as rows of `sqlite_schema`.
+    fn catalog(&self) -> &dyn Catalog {
+        &SqliteCatalog
     }
 
     /// The id of the role named `name`, case-sensitively, when the dialect
@@ -504,6 +532,11 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
+    fn sort_term_matching(&self) -> SortTermMatching {
+        SortTermMatching::Sqlite
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
@@ -574,6 +607,18 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+}
+
+/// How an ORDER BY or DISTINCT ON term is matched to the output columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortTermMatching {
+    /// A name anywhere in the term can be an output column name, and the first output
+    /// column with that name is used.
+    Sqlite,
+    /// Only a term that is a bare name can be an output column name, and it is an error
+    /// when output columns with different expressions share that name. Every ORDER BY
+    /// term of a SELECT DISTINCT must be an output column.
+    Sql92,
 }
 
 /// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that

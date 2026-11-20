@@ -1099,13 +1099,10 @@ fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header(
     assert!(page_count > 2, "t should span multiple pages");
 
     db.get_mvcc_store()
-        .with_header_mut(
-            |header| {
-                header.freelist_trunk_page = (page_count as u32).into();
-                header.freelist_pages = 1.into();
-            },
-            None,
-        )
+        .with_global_header_mut_for_testing(|header| {
+            header.freelist_trunk_page = (page_count as u32).into();
+            header.freelist_pages = 1.into();
+        })
         .unwrap();
 
     let rows = get_rows(&conn, "PRAGMA integrity_check");

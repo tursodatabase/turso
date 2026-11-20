@@ -704,6 +704,15 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::DropRole { if_exists, roles } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.comma(roles, context)
+            }
             Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
@@ -1460,6 +1469,27 @@ impl ToTokens for FromClause {
         }
 
         Ok(())
+    }
+}
+
+impl_display_for_to_tokens!(SelectDistinctness);
+impl ToTokens for SelectDistinctness {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        match self {
+            Self::Distinct => s.append(TK_DISTINCT, None),
+            Self::All => s.append(TK_ALL, None),
+            Self::DistinctOn(exprs) => {
+                s.append(TK_DISTINCT, None)?;
+                s.append(TK_ON, None)?;
+                s.append(TK_LP, None)?;
+                comma(exprs, s, context)?;
+                s.append(TK_RP, None)
+            }
+        }
     }
 }
 

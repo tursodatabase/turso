@@ -2,11 +2,13 @@
 #
 # tursopg refuses date, time, timetz and interval, arrays of every date and
 # time type, and the keywords and functions that return a refused type. Each
-# test shows PostgreSQL's answer; remove a test's `expect @tursopg error`
-# block once tursopg supports that type.
+# gap test has a `@compat-gap` label and shows PostgreSQL's answer in `expect`. When
+# tursopg gives the PostgreSQL answer the tursopg run fails with "gap fixed";
+# then delete `@compat-gap` and the `expect @tursopg` block.
 
 @database :memory:
 
+@compat-gap "type:date"
 test date-column {
     CREATE TABLE t (a date);
     INSERT INTO t VALUES ('2024-01-01');
@@ -20,6 +22,7 @@ expect @tursopg error {
     type "date" is not supported
 }
 
+@compat-gap "type:interval"
 test interval-cast {
     SELECT '1 day 2 hours'::interval;
 }
@@ -31,6 +34,7 @@ expect @tursopg error {
     type "interval" is not supported
 }
 
+@compat-gap "type:timetz"
 test timetz-typed-literal {
     SELECT time with time zone '10:00:00+05';
 }
@@ -42,6 +46,7 @@ expect @tursopg error {
     type "timetz" is not supported
 }
 
+@compat-gap "type:date"
 test domain-over-date {
     CREATE DOMAIN d AS date;
     SELECT '2024-01-01'::d;
@@ -54,6 +59,7 @@ expect @tursopg error {
     type "date" is not supported
 }
 
+@compat-gap "type:time"
 test localtime-returns-time {
     SELECT localtime IS NOT NULL;
 }
@@ -65,6 +71,7 @@ expect @tursopg error {
     type "time" is not supported
 }
 
+@compat-gap "type:timetz"
 test current-time-returns-timetz {
     SELECT current_time IS NOT NULL;
 }
@@ -90,6 +97,7 @@ expect {
     ok
 }
 
+@compat-gap "type:date"
 test make-date-returns-date {
     SELECT make_date(2024, 1, 1);
 }
@@ -101,6 +109,7 @@ expect @tursopg error {
     type "date" is not supported
 }
 
+@compat-gap "type:_timestamp"
 test timestamp-array-column {
     CREATE TABLE t (a timestamp[]);
     INSERT INTO t VALUES ('{"2024-01-01 08:00:00"}');
@@ -114,6 +123,7 @@ expect @tursopg error {
     type "timestamp\[\]" is not supported
 }
 
+@compat-gap "type:_timestamptz"
 test timestamptz-array-cast {
     SELECT '{"2024-01-01 08:00:00+00"}'::timestamptz[];
 }
@@ -125,6 +135,7 @@ expect @tursopg error {
     type "timestamptz\[\]" is not supported
 }
 
+@compat-gap "type:_timestamptz"
 test timestamptz-array-column-by-internal-name {
     CREATE TABLE t (a _timestamptz);
     INSERT INTO t VALUES ('{"2024-01-01 08:00:00+00"}');

@@ -447,6 +447,7 @@ impl FixedParameter {
                     "invalid value for parameter \"{}\": \"{value}\"; supported value is \"{}\"",
                     self.name, self.value
                 ),
+                None,
             ))
         }
     }

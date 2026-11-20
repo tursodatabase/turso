@@ -374,8 +374,8 @@ impl SelfTableScope {
 
 #[cfg(test)]
 impl Resolver<'static> {
-    /// A resolver over an empty main schema with the SQLite dialect. Its state is leaked so
-    /// that unit tests can create one in a single call.
+    /// A resolver over an empty main schema with a dialect that cannot parse.
+    /// Its state is leaked so that unit tests can create one in a single call.
     pub(crate) fn empty_for_tests() -> Self {
         Self::new(
             Box::leak(Box::new(Schema::default())),
@@ -386,7 +386,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::SqliteDialect),
+            Arc::new(crate::dialect::cannot_parse::DialectThatCannotParse),
             None,
             RoleId::SUPERUSER,
         )
@@ -1157,12 +1157,11 @@ pub fn emit_program(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
-    after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan),
         mut plan @ Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, &mut plan).map(|_| ())
         }

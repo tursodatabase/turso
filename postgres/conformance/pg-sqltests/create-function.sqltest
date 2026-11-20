@@ -2,13 +2,15 @@
 #
 # tursopg does not support functions yet. When PostgreSQL rejects a
 # statement, tursopg gives the same error. Otherwise tursopg names the first
-# feature it does not support. Each test shows what PostgreSQL does, so a
-# feature is supported once its `expect @tursopg error` block is removed.
+# feature it does not support. Each gap test has a `@compat-gap` label; when tursopg
+# gives the PostgreSQL answer the tursopg run fails with "gap fixed", and then
+# you delete `@compat-gap` and the `expect @tursopg` block.
 
 @database :memory:
 
 # A plain SQL function, which is the first kind of function tursopg will
 # support.
+@compat-gap "syntax:create-function"
 test sql-function {
     CREATE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
@@ -21,6 +23,7 @@ expect @tursopg error {
     CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test sql-function-with-parameter {
     CREATE FUNCTION add_one(int) RETURNS int AS $$ SELECT $1 + 1 $$ LANGUAGE sql;
     SELECT add_one(41);
@@ -33,6 +36,7 @@ expect @tursopg error {
     CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test sql-function-in-public-schema {
     CREATE FUNCTION public.one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT public.one();
@@ -45,6 +49,7 @@ expect @tursopg error {
     CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test sql-function-in-other-schema {
     CREATE SCHEMA app;
     CREATE FUNCTION app.one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
@@ -66,6 +71,7 @@ expect error {
     schema "nosuch" does not exist
 }
 
+@compat-gap "syntax:create-function"
 test create-or-replace-function {
     CREATE OR REPLACE FUNCTION one() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
@@ -78,6 +84,7 @@ expect @tursopg error {
     CREATE OR REPLACE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-procedure"
 test create-procedure {
     CREATE PROCEDURE noop() AS $$ SELECT 1 $$ LANGUAGE sql;
     CALL noop();
@@ -91,6 +98,7 @@ expect @tursopg error {
 
 # Languages
 
+@compat-gap "syntax:create-function"
 test plpgsql-function {
     CREATE FUNCTION one() RETURNS int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql;
     SELECT one();
@@ -103,6 +111,7 @@ expect @tursopg error {
     LANGUAGE plpgsql is not supported
 }
 
+@compat-gap "syntax:create-function"
 test internal-function {
     CREATE FUNCTION my_abs(int) RETURNS int AS 'int4abs' LANGUAGE internal;
     SELECT my_abs(-3);
@@ -133,6 +142,7 @@ expect error {
 
 # Function bodies
 
+@compat-gap "syntax:create-function"
 test single-quoted-function-body {
     CREATE FUNCTION one() RETURNS int AS 'SELECT 1' LANGUAGE sql;
     SELECT one();
@@ -145,6 +155,7 @@ expect @tursopg error {
     a function body that is not dollar-quoted is not supported
 }
 
+@compat-gap "syntax:create-function"
 test return-function-body {
     CREATE FUNCTION one() RETURNS int RETURN 1;
     SELECT one();
@@ -157,6 +168,7 @@ expect @tursopg error {
     a RETURN function body is not supported
 }
 
+@compat-gap "syntax:create-function"
 test begin-atomic-function-body {
     CREATE FUNCTION one() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;
     SELECT one();
@@ -201,6 +213,7 @@ expect error {
     syntax error at or near "SELEC"
 }
 
+@compat-gap "syntax:create-function"
 test multi-statement-function {
     CREATE FUNCTION two() RETURNS int AS $$ SELECT 1; SELECT 2 $$ LANGUAGE sql;
     SELECT two();
@@ -213,6 +226,7 @@ expect @tursopg error {
     a function body with several statements is not supported
 }
 
+@compat-gap "syntax:create-function"
 test ddl-in-function {
     CREATE FUNCTION make_table() RETURNS void AS $$ CREATE TABLE made (a int) $$ LANGUAGE sql;
     SELECT make_table();
@@ -227,6 +241,7 @@ expect @tursopg error {
     CREATE TABLE in a function body is not supported
 }
 
+@compat-gap "syntax:create-function"
 test select-into-in-function {
     CREATE FUNCTION make_table() RETURNS void AS $$ SELECT 1 AS a INTO made $$ LANGUAGE sql;
     SELECT make_table();
@@ -241,6 +256,7 @@ expect @tursopg error {
     SELECT INTO in a function body is not supported
 }
 
+@compat-gap "syntax:create-function"
 test utility-statement-in-function {
     CREATE FUNCTION notify() RETURNS void AS $$ NOTIFY channel $$ LANGUAGE sql;
     SELECT notify();
@@ -253,6 +269,7 @@ expect @tursopg error {
     a utility statement in a function body is not supported
 }
 
+@compat-gap "syntax:create-function"
 test data-modifying-function {
     CREATE TABLE t (a int);
     INSERT INTO t VALUES (1);
@@ -271,6 +288,7 @@ expect @tursopg error {
 
 # Parameters
 
+@compat-gap "syntax:create-function"
 test polymorphic-function {
     CREATE FUNCTION same(anyelement) RETURNS anyelement AS $$ SELECT $1 $$ LANGUAGE sql;
     SELECT same(1), same('a'::text);
@@ -291,6 +309,7 @@ expect error {
     cannot determine result data type
 }
 
+@compat-gap "syntax:create-function"
 test named-parameter {
     CREATE FUNCTION add_one(x int) RETURNS int AS $$ SELECT x + 1 $$ LANGUAGE sql;
     SELECT add_one(41);
@@ -303,6 +322,7 @@ expect @tursopg error {
     a named function parameter is not supported
 }
 
+@compat-gap "syntax:create-function"
 test parameter-default {
     CREATE FUNCTION add(int, int DEFAULT 1) RETURNS int AS $$ SELECT $1 + $2 $$ LANGUAGE sql;
     SELECT add(41);
@@ -315,6 +335,7 @@ expect @tursopg error {
     a function parameter with a DEFAULT is not supported
 }
 
+@compat-gap "syntax:create-function"
 test out-parameter {
     CREATE FUNCTION one(OUT int) AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT one();
@@ -327,6 +348,7 @@ expect @tursopg error {
     an OUT parameter is not supported
 }
 
+@compat-gap "syntax:create-function"
 test inout-parameter {
     CREATE FUNCTION add_one(INOUT int) AS $$ SELECT $1 + 1 $$ LANGUAGE sql;
     SELECT add_one(41);
@@ -339,6 +361,7 @@ expect @tursopg error {
     an INOUT parameter is not supported
 }
 
+@compat-gap "syntax:create-function"
 test variadic-parameter {
     CREATE FUNCTION first(VARIADIC int[]) RETURNS int AS $$ SELECT $1[1] $$ LANGUAGE sql;
     SELECT first(4, 5);
@@ -351,6 +374,7 @@ expect @tursopg error {
     a VARIADIC parameter is not supported
 }
 
+@compat-gap "syntax:create-function"
 test array-parameter {
     CREATE FUNCTION first(int[]) RETURNS int AS $$ SELECT $1[1] $$ LANGUAGE sql;
     SELECT first(ARRAY[4, 5]);
@@ -364,6 +388,7 @@ expect @tursopg error {
 }
 
 # `_int4` is the catalog's name of int4[].
+@compat-gap "syntax:create-function"
 test array-parameter-by-catalog-name {
     CREATE FUNCTION first_of(_int4) RETURNS int AS $$ SELECT $1[1] $$ LANGUAGE sql;
     SELECT first_of(ARRAY[4, 5]);
@@ -376,6 +401,7 @@ expect @tursopg error {
     a function parameter of array type _int4 is not supported
 }
 
+@compat-gap "syntax:create-function"
 test column-type-parameter {
     CREATE TABLE t (a int);
     CREATE FUNCTION add_one(t.a%TYPE) RETURNS int AS $$ SELECT $1 + 1 $$ LANGUAGE sql;
@@ -389,6 +415,7 @@ expect @tursopg error {
     %TYPE in a function parameter type is not supported
 }
 
+@compat-gap "syntax:create-function"
 test table-row-parameter {
     CREATE TABLE emp (name text);
     CREATE FUNCTION name_of(emp) RETURNS text AS $$ SELECT $1.name $$ LANGUAGE sql;
@@ -403,6 +430,7 @@ expect @tursopg error {
     a function parameter of type emp is not supported
 }
 
+@compat-gap "syntax:create-function"
 test enum-parameter {
     CREATE TYPE mood AS ENUM ('sad', 'happy');
     CREATE FUNCTION is_happy(mood) RETURNS bool AS $$ SELECT $1 = 'happy' $$ LANGUAGE sql;
@@ -424,6 +452,7 @@ expect error {
     type nosuch does not exist
 }
 
+@compat-gap "syntax:create-function"
 test range-parameter {
     CREATE FUNCTION f(int4range) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
@@ -434,6 +463,7 @@ expect @tursopg error {
     CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test pg-lsn-result {
     CREATE FUNCTION f() RETURNS pg_lsn AS $$ SELECT '0/0'::pg_lsn $$ LANGUAGE sql;
 }
@@ -494,6 +524,7 @@ expect error {
 }
 
 # cstring[] is an ordinary array type, not a pseudo-type like record[].
+@compat-gap "syntax:create-function"
 test cstring-array-parameter {
     CREATE FUNCTION cstring_array_parameter(_cstring) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
@@ -524,6 +555,7 @@ expect error {
 
 # A function that returns a set returns several rows when called in the
 # select list. Rejecting RETURNS SETOF and RETURNS TABLE rejects these calls.
+@compat-gap "syntax:create-function"
 test returns-setof-base-type {
     CREATE FUNCTION two_rows() RETURNS SETOF int AS $$ VALUES (1), (2) $$ LANGUAGE sql;
     SELECT two_rows();
@@ -537,6 +569,7 @@ expect @tursopg error {
     RETURNS SETOF is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-setof-table {
     CREATE TABLE emp (name text);
     INSERT INTO emp VALUES ('ann');
@@ -551,6 +584,7 @@ expect @tursopg error {
     a function result of type SETOF emp is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-table-row {
     CREATE TABLE emp (name text);
     INSERT INTO emp VALUES ('ann');
@@ -565,6 +599,7 @@ expect @tursopg error {
     a function result of type emp is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-record {
     CREATE FUNCTION pair() RETURNS record AS $$ SELECT 1, 2 $$ LANGUAGE sql;
     SELECT * FROM pair() AS p(a int, b int);
@@ -577,6 +612,7 @@ expect @tursopg error {
     RETURNS record is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-table {
     CREATE FUNCTION two_rows() RETURNS TABLE (a int) AS $$ VALUES (1), (2) $$ LANGUAGE sql;
     SELECT a FROM two_rows();
@@ -590,6 +626,7 @@ expect @tursopg error {
     RETURNS TABLE is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-void {
     CREATE FUNCTION nothing() RETURNS void AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT nothing() IS NULL;
@@ -602,6 +639,7 @@ expect @tursopg error {
     RETURNS void is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-array {
     CREATE FUNCTION pair() RETURNS int[] AS $$ SELECT ARRAY[1, 2] $$ LANGUAGE sql;
     SELECT pair();
@@ -614,6 +652,7 @@ expect @tursopg error {
     a function result of array type pg_catalog\.int4\[\] is not supported
 }
 
+@compat-gap "syntax:create-function"
 test returns-column-type {
     CREATE TABLE t (a int);
     CREATE FUNCTION one() RETURNS t.a%TYPE AS $$ SELECT 1 $$ LANGUAGE sql;
@@ -653,6 +692,7 @@ expect error {
 
 # Options
 
+@compat-gap "syntax:create-function"
 test immutable-function {
     CREATE FUNCTION one() RETURNS int IMMUTABLE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT provolatile FROM pg_proc WHERE proname = 'one';
@@ -665,6 +705,7 @@ expect @tursopg error {
     IMMUTABLE in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test stable-function {
     CREATE FUNCTION one() RETURNS int STABLE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT provolatile FROM pg_proc WHERE proname = 'one';
@@ -677,6 +718,7 @@ expect @tursopg error {
     STABLE in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test volatile-function {
     CREATE FUNCTION one() RETURNS int VOLATILE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT provolatile FROM pg_proc WHERE proname = 'one';
@@ -689,6 +731,7 @@ expect @tursopg error {
     VOLATILE in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test window-function {
     CREATE FUNCTION w(int) RETURNS int WINDOW AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT prokind FROM pg_proc WHERE proname = 'w';
@@ -701,6 +744,7 @@ expect @tursopg error {
     WINDOW in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test leakproof-function {
     CREATE FUNCTION one() RETURNS int LEAKPROOF AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proleakproof FROM pg_proc WHERE proname = 'one';
@@ -713,6 +757,7 @@ expect @tursopg error {
     LEAKPROOF in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test not-leakproof-function {
     CREATE FUNCTION one() RETURNS int NOT LEAKPROOF AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proleakproof FROM pg_proc WHERE proname = 'one';
@@ -725,6 +770,7 @@ expect @tursopg error {
     NOT LEAKPROOF in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test security-definer-function {
     CREATE FUNCTION one() RETURNS int SECURITY DEFINER AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT prosecdef FROM pg_proc WHERE proname = 'one';
@@ -737,6 +783,7 @@ expect @tursopg error {
     SECURITY DEFINER in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test security-invoker-function {
     CREATE FUNCTION one() RETURNS int EXTERNAL SECURITY INVOKER AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT prosecdef FROM pg_proc WHERE proname = 'one';
@@ -749,6 +796,7 @@ expect @tursopg error {
     SECURITY INVOKER in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test called-on-null-input-function {
     CREATE FUNCTION one() RETURNS int CALLED ON NULL INPUT AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proisstrict FROM pg_proc WHERE proname = 'one';
@@ -762,6 +810,7 @@ expect @tursopg error {
 }
 
 # RETURNS NULL ON NULL INPUT is another spelling of STRICT.
+@compat-gap "syntax:create-function"
 test returns-null-on-null-input-function {
     CREATE FUNCTION one() RETURNS int RETURNS NULL ON NULL INPUT AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proisstrict FROM pg_proc WHERE proname = 'one';
@@ -774,6 +823,7 @@ expect @tursopg error {
     STRICT in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test parallel-function {
     CREATE FUNCTION one() RETURNS int PARALLEL SAFE AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proparallel FROM pg_proc WHERE proname = 'one';
@@ -786,6 +836,7 @@ expect @tursopg error {
     PARALLEL SAFE in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test cost-function {
     CREATE FUNCTION one() RETURNS int COST 10 AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT procost FROM pg_proc WHERE proname = 'one';
@@ -807,6 +858,7 @@ expect error {
 }
 
 # ROWS needs RETURNS SETOF, which tursopg does not support.
+@compat-gap "syntax:create-function"
 test rows-function {
     CREATE FUNCTION two_rows() RETURNS SETOF int ROWS 2 AS $$ VALUES (1), (2) $$ LANGUAGE sql;
     SELECT prorows FROM pg_proc WHERE proname = 'two_rows';
@@ -835,6 +887,7 @@ expect error {
     ROWS is not applicable when function does not return a set
 }
 
+@compat-gap "syntax:create-function"
 test support-function {
     CREATE FUNCTION one() RETURNS int SUPPORT textlike_support AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT prosupport FROM pg_proc WHERE proname = 'one';
@@ -847,6 +900,7 @@ expect @tursopg error {
     SUPPORT in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test set-function {
     CREATE FUNCTION one() RETURNS int SET search_path = public AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT proconfig FROM pg_proc WHERE proname = 'one';
@@ -859,6 +913,7 @@ expect @tursopg error {
     SET in CREATE FUNCTION is not supported
 }
 
+@compat-gap "syntax:create-function"
 test set-from-current-function {
     CREATE FUNCTION one() RETURNS int SET search_path FROM CURRENT AS $$ SELECT 1 $$ LANGUAGE sql;
     SELECT count(*) FROM pg_proc WHERE proname = 'one';
@@ -882,6 +937,7 @@ expect error {
 # PostgreSQL has no transform for SQL functions, so it rejects every
 # TRANSFORM clause. To give PostgreSQL's error, tursopg would have to write
 # the type as PostgreSQL does, `integer` for `int`.
+@compat-gap "syntax:create-function"
 test transform-function {
     CREATE FUNCTION one(int) RETURNS int TRANSFORM FOR TYPE int AS $$ SELECT 1 $$ LANGUAGE sql;
 }
@@ -896,6 +952,7 @@ expect @tursopg error {
 
 # Calls
 
+@compat-gap "syntax:create-function"
 test variadic-argument {
     SELECT concat(VARIADIC ARRAY['a', 'b']);
 }
@@ -907,6 +964,7 @@ expect @tursopg error {
     a VARIADIC function argument is not supported
 }
 
+@compat-gap "syntax:create-function"
 test named-argument {
     SELECT jsonb_path_exists('{"a": 1}', '$.a', silent => true);
 }
@@ -922,6 +980,7 @@ expect @tursopg error {
 # PostgreSQL rejects them too. To give PostgreSQL's errors, tursopg would have
 # to look the functions and triggers up.
 
+@compat-gap "syntax:drop-function"
 test drop-function {
     DROP FUNCTION nosuch;
 }
@@ -934,6 +993,7 @@ expect @tursopg error {
     DROP FUNCTION is not supported
 }
 
+@compat-gap "syntax:drop-function"
 test drop-procedure {
     DROP PROCEDURE nosuch;
 }
@@ -946,6 +1006,7 @@ expect @tursopg error {
     DROP PROCEDURE is not supported
 }
 
+@compat-gap "syntax:drop-function"
 test drop-routine {
     DROP ROUTINE nosuch;
 }
@@ -958,6 +1019,7 @@ expect @tursopg error {
     DROP ROUTINE is not supported
 }
 
+@compat-gap "syntax:create-trigger"
 test create-trigger {
     CREATE TABLE t (a int);
     CREATE TRIGGER t_insert BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION nosuch();
@@ -973,6 +1035,7 @@ expect @tursopg error {
 
 # Added coverage for the type and body checks.
 
+@compat-gap "syntax:create-function"
 test empty-function-body {
     CREATE FUNCTION nothing() RETURNS void AS $$ $$ LANGUAGE sql;
     SELECT nothing() IS NULL;
@@ -986,6 +1049,7 @@ expect @tursopg error {
 }
 
 # To give PostgreSQL's error, tursopg would have to load the library.
+@compat-gap "syntax:create-function"
 test c-function {
     CREATE FUNCTION f() RETURNS int AS 'nosuch', 'f' LANGUAGE c;
 }
@@ -1030,6 +1094,7 @@ expect error {
     type t_a does not exist
 }
 
+@compat-gap "syntax:create-function"
 test table-row-parameter-in-other-schema {
     CREATE SCHEMA app;
     CREATE TABLE app.emp (name text);

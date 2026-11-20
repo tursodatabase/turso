@@ -1221,6 +1221,7 @@ expect {
     kept_seq
 }
 
+@compat-gap "syntax:catalog"
 test pg-primary-key-dump-catalogs {
     CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
     CREATE SEQUENCE after_indexes;
@@ -1262,6 +1263,7 @@ expect {
     u|1|0|UNIQUE (a)
 }
 
+@compat-gap "syntax:catalog"
 test pg-primary-key-named-and-quoted {
     CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
     SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
@@ -1294,6 +1296,7 @@ expect {
     t|t_pkey|p|PRIMARY KEY (a)|1
 }
 
+@compat-gap "syntax:catalog"
 test pg-primary-key-index-name-collisions {
     CREATE TABLE t_pkey(x INTEGER);
     CREATE INDEX t_pkey1 ON t_pkey(x);
@@ -1483,6 +1486,7 @@ expect {
 
 # tursopg compiles COLLATE "default" to nothing, as it leaves the collation
 # as it is, so the condition is shown without it.
+@compat-gap "function:pg_get_constraintdef"
 test pg-get-constraintdef-check-constraint-with-collate {
     CREATE TABLE checked (
         owner text, code varchar(10),
@@ -1516,6 +1520,7 @@ expect {
 
 # tursopg does not print the casts of the || operator and shows the condition
 # as the engine stores it.
+@compat-gap "function:pg_get_constraintdef"
 test pg-get-constraintdef-check-constraint-with-concatenation {
     CREATE TABLE checked (owner text CHECK (owner || 'x' <> 'ax'));
     SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0;

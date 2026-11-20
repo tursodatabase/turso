@@ -4,6 +4,8 @@ pub mod unordered;
 
 use crate::backends::QueryResult;
 use crate::parser::ast::Expectation;
+use regex::RegexBuilder;
+use std::collections::HashSet;
 
 /// Result of comparing actual vs expected output
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +109,68 @@ fn compare_error(
             pattern::compare_error(&normalized_err, &normalized_pattern)
         }
     }
+}
+
+/// Whether one query result can match both expectations under the rules of
+/// [`compare`]. It assumes that no output value holds a line break. Where
+/// it cannot decide, it answers true: for an `expect pattern` block against
+/// an `expect unordered` or another `expect pattern` block, and for two error
+/// messages, because two regexes can match the same message.
+pub fn may_match_same_output(a: &Expectation, b: &Expectation) -> bool {
+    match (a, b) {
+        (Expectation::Error { sqlstate: a, .. }, Expectation::Error { sqlstate: b, .. }) => {
+            // compare_error checks a SQLSTATE only when the block names one.
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+        (Expectation::Error { .. }, _) | (_, Expectation::Error { .. }) => false,
+        (Expectation::Exact(a), Expectation::Exact(b)) => exact_text(a) == exact_text(b),
+        (Expectation::Unordered(a), Expectation::Unordered(b)) => {
+            unordered_set(a) == unordered_set(b)
+        }
+        (Expectation::Exact(exact), Expectation::Unordered(unordered))
+        | (Expectation::Unordered(unordered), Expectation::Exact(exact)) => {
+            exact_matches_unordered(exact, unordered)
+        }
+        (Expectation::Pattern(pattern), Expectation::Exact(exact))
+        | (Expectation::Exact(exact), Expectation::Pattern(pattern)) => {
+            // exact::compare accepts only output whose text is exact_text, and
+            // pattern::compare matches the regex against that same text.
+            RegexBuilder::new(pattern)
+                .build()
+                .is_ok_and(|re| re.is_match(&exact_text(exact)))
+        }
+        (Expectation::Pattern(_), _) | (_, Expectation::Pattern(_)) => true,
+    }
+}
+
+/// The only output text that exact::compare accepts for these lines.
+fn exact_text(lines: &[String]) -> String {
+    format_rows(&parse_expected_rows(lines))
+}
+
+/// The set of rows that unordered::compare accepts for these lines.
+fn unordered_set(lines: &[String]) -> HashSet<String> {
+    parse_expected_rows(lines)
+        .iter()
+        .map(|row| row.join("|"))
+        .collect()
+}
+
+/// Whether some output has the text of the exact block and the row set of
+/// the unordered block. Without line breaks in values, the rows of an output
+/// are the lines of its text. The empty text is also the text of an output
+/// with no rows.
+fn exact_matches_unordered(exact: &[String], unordered: &[String]) -> bool {
+    let text = exact_text(exact);
+    let expected = unordered_set(unordered);
+    if text.is_empty() && expected.is_empty() {
+        return true;
+    }
+    let rows: HashSet<String> = text.split('\n').map(str::to_string).collect();
+    rows == expected
 }
 
 /// Format rows for display (pipe-separated)
@@ -278,5 +342,84 @@ mod tests {
             compare(&actual, &sqlstate_expectation("42P01", None)),
             ComparisonResult::mismatch("expected error but query succeeded")
         );
+    }
+
+    fn lines(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|r| r.to_string()).collect()
+    }
+
+    #[test]
+    fn unordered_blocks_with_repeated_rows_match_the_same_output() {
+        // unordered::compare compares row sets, so the output `1` matches both.
+        let a = Expectation::Unordered(lines(&["1", "1"]));
+        let b = Expectation::Unordered(lines(&["1"]));
+        let output = QueryResult::success(vec![vec!["1".to_string()]]);
+        assert!(compare(&output, &a).is_match() && compare(&output, &b).is_match());
+        assert!(may_match_same_output(&a, &b));
+    }
+
+    #[test]
+    fn a_null_row_makes_exact_blocks_differ() {
+        // An empty line is a row with one NULL value.
+        let a = Expectation::Exact(lines(&["1", ""]));
+        let b = Expectation::Exact(lines(&["1"]));
+        assert!(!may_match_same_output(&a, &b));
+        let with_null = QueryResult::success(vec![vec!["1".to_string()], vec!["".to_string()]]);
+        assert!(compare(&with_null, &a).is_match() && !compare(&with_null, &b).is_match());
+    }
+
+    #[test]
+    fn exact_text_is_not_trimmed_inside_rows() {
+        let a = Expectation::Exact(lines(&["a "]));
+        let b = Expectation::Exact(lines(&["a"]));
+        assert!(!may_match_same_output(&a, &b));
+    }
+
+    #[test]
+    fn exact_and_unordered_blocks() {
+        let exact = Expectation::Exact(lines(&["2", "1", "2"]));
+        assert!(may_match_same_output(
+            &exact,
+            &Expectation::Unordered(lines(&["1", "2"]))
+        ));
+        assert!(!may_match_same_output(
+            &exact,
+            &Expectation::Unordered(lines(&["1"]))
+        ));
+        assert!(may_match_same_output(
+            &Expectation::Exact(vec![]),
+            &Expectation::Unordered(vec![])
+        ));
+    }
+
+    #[test]
+    fn patterns_and_errors() {
+        let exact = Expectation::Exact(lines(&["12"]));
+        assert!(may_match_same_output(
+            &Expectation::Pattern("^1".to_string()),
+            &exact
+        ));
+        assert!(!may_match_same_output(
+            &Expectation::Pattern("^2".to_string()),
+            &exact
+        ));
+        assert!(may_match_same_output(
+            &Expectation::Pattern("x".to_string()),
+            &Expectation::Unordered(lines(&["1"]))
+        ));
+        let error = |s: Option<&str>| Expectation::Error {
+            sqlstate: s.map(str::to_string),
+            pattern: None,
+        };
+        assert!(may_match_same_output(
+            &error(Some("22P02")),
+            &error(Some("22P02"))
+        ));
+        assert!(!may_match_same_output(
+            &error(Some("22P02")),
+            &error(Some("42883"))
+        ));
+        assert!(may_match_same_output(&error(None), &error(Some("42883"))));
+        assert!(!may_match_same_output(&error(None), &exact));
     }
 }
