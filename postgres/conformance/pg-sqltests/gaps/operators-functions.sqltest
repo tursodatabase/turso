@@ -969,6 +969,18 @@ expect {
 @sqlstate 0A000
 expect @tursopg error {}
 
+# date_trunc(text, timestamp) returns a timestamp. tursopg supports only
+# timestamptz arguments.
+@compat-gap "function:date_trunc"
+test date-trunc-timestamp {
+    SELECT date_trunc('hour', '2026-10-08 12:34:56'::timestamp)::text;
+}
+expect {
+    2026-10-08 12:00:00
+}
+@sqlstate 0A000
+expect @tursopg error {}
+
 # B-93: nullif / greatest / least
 test nullif-greatest-least {
     SELECT nullif(1, 1), greatest(1, 3, 2), least('b', 'a');
