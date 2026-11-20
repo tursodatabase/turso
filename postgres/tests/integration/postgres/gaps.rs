@@ -117,7 +117,7 @@ fn gap_a_33_timestamptz_n_param_with_offset(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2026-10-08 12:00:00");
+    assert_eq!(out, "2026-10-08 12:00:00+00");
 }
 
 // A-41 (S2): date $n param
@@ -259,7 +259,7 @@ fn gap_a_69_untyped_1_2026_10_08_14_00_02_into_timestamptz_c(db: TempDatabase) {
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "2026-10-08 12:00:00");
+    assert_eq!(out, "2026-10-08 12:00:00+00");
 }
 
 // A-70 (S1): insert jsonb text param into jsonb column

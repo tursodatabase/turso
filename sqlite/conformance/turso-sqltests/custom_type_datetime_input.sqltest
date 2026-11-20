@@ -14,10 +14,10 @@ test datetime-input-postgresql-forms {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00
-    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
-    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00
-    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00
+    1|2024-01-05|09:30:00|2024-01-05 10:00:00|2024-01-05 10:00:00+00
+    2|2024-01-05|22:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
+    3|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 04:30:00+00
+    4|2024-01-05|00:00:00|2024-01-05 10:00:00|2024-01-05 15:00:00+00
 }
 
 @requires custom_types "date and time types are custom types"
@@ -37,9 +37,9 @@ test datetime-input-keeps-microseconds {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456
-    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5
-    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00
+    1|10:00:00.123456|2024-01-05 10:00:00.123456|2024-01-05 10:00:00.123456+00
+    2|10:00:00.0005|2024-01-05 10:00:00.0005|2024-01-05 10:00:00.5+00
+    3|10:00:00.000002|2024-01-05 10:00:00.123458|2024-01-06 00:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -63,8 +63,8 @@ test datetime-input-offsets {
     SELECT * FROM t ORDER BY id;
 }
 expect {
-    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00
-    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00
+    1|10:00:00|2024-01-05 10:00:00|2024-01-05 08:00:00+00
+    2|10:00:00|2024-01-05 01:00:00|2024-01-04 23:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -124,7 +124,7 @@ test datetime-input-accepts-second-60-as-next-day {
     SELECT * FROM t;
 }
 expect {
-    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00
+    1|2024-01-05|2024-01-06 00:00:00|2024-01-06 00:00:00+00
 }
 
 @requires strict "uses STRICT tables"
@@ -396,6 +396,8 @@ expect {
     1
 }
 
+# SQLite's date functions read a time zone only as `+HH:MM`, so they return
+# NULL for the `+00` that ends a timestamptz.
 @requires strict "uses STRICT tables"
 test datetime-timestamptz-in-sqlite-date-functions {
     CREATE TABLE t(tz timestamptz) STRICT;
@@ -403,8 +405,8 @@ test datetime-timestamptz-in-sqlite-date-functions {
     SELECT datetime(tz), date(tz), unixepoch(tz) FROM t;
 }
 expect {
-    2024-01-05 10:00:00|2024-01-05|1704448800
-    2024-01-05 10:00:00|2024-01-05|1704448800
+    ||
+    ||
 }
 
 # The order of the fields matters, as in PostgreSQL: `T` needs a date before

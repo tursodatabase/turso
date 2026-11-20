@@ -715,8 +715,12 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
+        let utc = timestamp
+            .as_str()
+            .strip_suffix("+00")
+            .unwrap_or_else(|| panic!("{name} returned {} with no +00", timestamp.as_str()));
         assert!(
-            is_timestamp_text(timestamp.as_str()),
+            is_timestamp_text(utc),
             "{name} returned {}",
             timestamp.as_str()
         );

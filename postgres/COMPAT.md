@@ -190,6 +190,9 @@ statements of one query string;
 `clock_timestamp()` reads the clock at each call. All of them have microsecond
 precision.
 
+A timestamptz prints in UTC with the offset `+00`, such as
+`2024-01-05 08:00:00+00`.
+
 A timestamp compared with a timestamptz is read as a timestamptz, as in
 PostgreSQL, with the session time zone UTC. Comparing a timestamp or
 timestamptz with a value of another custom type, such as `timestamptz` with
