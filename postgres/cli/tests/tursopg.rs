@@ -1880,6 +1880,30 @@ fn wire_error_drop_table_that_views_read() {
     });
 }
 
+#[test]
+fn wire_error_drop_column_that_a_view_reads() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE depcol_t (a INT, b INT)");
+        c.query_command_tags("CREATE VIEW depcol_v AS SELECT b FROM depcol_t");
+        let fields = c.query_error_fields("ALTER TABLE depcol_t DROP COLUMN b");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("2BP01"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("cannot drop column b of table depcol_t because other objects depend on it"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'D').map(String::as_str),
+            Some("view depcol_v depends on column b of table depcol_t"),
+            "{fields:?}"
+        );
+    });
+}
+
 /// Named UNIQUE constraint: duplicate value in a column with an explicit
 /// CONSTRAINT name.
 ///

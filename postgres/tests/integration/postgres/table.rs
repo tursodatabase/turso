@@ -388,6 +388,47 @@ fn refused_drop_names_the_view_that_reads_the_relation() {
 }
 
 #[test]
+fn refused_drop_quotes_names_and_names_the_schema_the_search_path_lacks() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute(r#"CREATE TABLE "T" (a int)"#).unwrap();
+    conn.execute(r#"CREATE VIEW "my view" AS SELECT a FROM "T""#)
+        .unwrap();
+    let error = conn.execute(r#"DROP TABLE "T""#).unwrap_err();
+    assert_eq!(
+        error.message,
+        r#"cannot drop table "T" because other objects depend on it"#
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(r#"view "my view" depends on table "T""#)
+    );
+
+    conn.execute("CREATE SCHEMA o").unwrap();
+    conn.execute("CREATE TABLE o.f (a int, b int)").unwrap();
+    conn.execute("CREATE VIEW o.fv AS SELECT b FROM o.f")
+        .unwrap();
+    let error = conn.execute("ALTER TABLE o.f DROP COLUMN b").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop column b of table o.f because other objects depend on it"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("view o.fv depends on column b of table o.f")
+    );
+
+    conn.execute("CREATE SEQUENCE o.s").unwrap();
+    conn.execute("CREATE TABLE u (n bigint DEFAULT nextval('o.s'))")
+        .unwrap();
+    let error = conn.execute("DROP SEQUENCE o.s").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop sequence o.s because other objects depend on it"
+    );
+}
+
+#[test]
 fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

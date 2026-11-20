@@ -2630,7 +2630,7 @@ pub(crate) fn find_object_using_sequence(
             walk_schema_expressions(schema, dialect, &mut |owner_namespace, owner, expr| {
                 if usage.is_none() && !is_dropped(database_id, owner_namespace, &owner) {
                     usage = checked_sequence_called_by(expr)
-                        .map(|sequence| format!("{owner} depends on sequence {sequence}"));
+                        .map(|sequence| (owner.to_string(), sequence));
                 }
                 Ok(if usage.is_some() {
                     WalkControl::SkipChildren
@@ -2640,7 +2640,12 @@ pub(crate) fn find_object_using_sequence(
             })
         })?;
     }
-    Ok(usage)
+    Ok(usage.map(|(owner, sequence)| {
+        let sequence = resolver.with_schema(namespace.database_id, |schema| {
+            dialect.relation_name_in_messages(connection, schema, namespace.id, &sequence)
+        });
+        format!("{owner} depends on sequence {sequence}")
+    }))
 }
 
 /// Validate an encode or decode expression for safety.
