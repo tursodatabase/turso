@@ -2848,11 +2848,17 @@ pub fn determine_where_to_eval_term(
                 || referenced_tables
                     .iter()
                     .any(|table_index| table_index < right_table_index);
-            if reads_left_table {
-                let loop_index = join_order
-                    .iter()
-                    .position(|table| table.table_id == right_table.internal_id)
-                    .expect("right join table must be in the join order");
+            if !reads_left_table {
+                continue;
+            }
+            // A materialized hash input removes its join prefix from this plan.
+            // When that prefix holds the RIGHT JOIN, the input's own plan already
+            // added the unmatched right rows, and every row reaches this plan
+            // through the probe loop. The term then runs where its tables are ready.
+            if let Some(loop_index) = join_order
+                .iter()
+                .position(|table| table.table_id == right_table.internal_id)
+            {
                 eval_at = eval_at.max(EvalAt::Loop(loop_index));
             }
         }
