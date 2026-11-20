@@ -1063,6 +1063,42 @@ func TestSyncEncryptionRedirectOrigins(t *testing.T) {
 	}
 }
 
+func TestSyncEncryptionCipherAliasesReserveNativeMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		cipher string
+		bytes  int
+	}{
+		{"aes-256-gcm", 28},
+		{"AES_128_GCM", 28},
+		{"aegis-128x2", 32},
+		{"AEGIS_256X4", 48},
+	} {
+		t.Run(tc.cipher, func(t *testing.T) {
+			require.Equal(t, tc.bytes, syncEncryptionReservedBytes(tc.cipher))
+
+			file := filepath.Join(t.TempDir(), "replica.db")
+			noBootstrap := false
+			ctx := context.Background()
+			replica, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+				Path: file, BootstrapIfEmpty: &noBootstrap,
+				RemoteEncryptionCipher: tc.cipher,
+			})
+			require.NoError(t, err)
+			defer turso_sync_database_deinit(replica.db)
+			conn, err := replica.Connect(ctx)
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = conn.Exec("CREATE TABLE reserved(value INTEGER)")
+			require.NoError(t, err)
+			require.NoError(t, replica.Checkpoint(ctx))
+			header, err := os.ReadFile(file)
+			require.NoError(t, err)
+			require.Greater(t, len(header), 20)
+			require.Equal(t, byte(tc.bytes), header[20])
+		})
+	}
+}
+
 func TestSyncEncryptionBootstrapOfflineReopen(t *testing.T) {
 	ctx := context.Background()
 	cloudKey := "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws="
