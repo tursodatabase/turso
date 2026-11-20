@@ -190,3 +190,68 @@ expect {
     {"rowid":"my-rowid","data":999}
 }
 
+
+# json_object(*) takes the same columns as SELECT *, so a USING or NATURAL
+# column appears once
+test json_object_star_join_using {
+    CREATE TABLE js_left (a, b);
+    INSERT INTO js_left VALUES (1, 2);
+    SELECT json_object(*) FROM (SELECT a FROM js_left) x JOIN js_left USING (a);
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json_object_star_natural_join {
+    CREATE TABLE js_left (a, b);
+    INSERT INTO js_left VALUES (1, 2);
+    SELECT json_object(*) FROM js_left NATURAL JOIN (SELECT a FROM js_left) x;
+}
+expect {
+    {"a":1,"b":2}
+}
+
+# The USING column of a RIGHT or FULL JOIN comes from whichever side matched
+test json_object_star_right_join_using {
+    CREATE TABLE js_left (a, b);
+    CREATE TABLE js_right (a, c);
+    INSERT INTO js_left VALUES (1, 2);
+    INSERT INTO js_right VALUES (3, 4);
+    SELECT json_object(*) FROM js_left RIGHT JOIN js_right USING (a);
+}
+expect {
+    {"a":3,"b":null,"c":4}
+}
+
+test json_object_star_full_join_using {
+    CREATE TABLE js_left (a, b);
+    CREATE TABLE js_right (a, c);
+    INSERT INTO js_left VALUES (1, 2);
+    INSERT INTO js_right VALUES (3, 4);
+    SELECT json_object(*) FROM js_left FULL JOIN js_right USING (a) ORDER BY a;
+}
+expect {
+    {"a":1,"b":2,"c":null}
+    {"a":3,"b":null,"c":4}
+}
+
+test json_object_star_parenthesized_join_using {
+    CREATE TABLE js_left (a, b);
+    CREATE TABLE js_right (a, c);
+    INSERT INTO js_left VALUES (1, 2);
+    INSERT INTO js_right VALUES (1, 4);
+    SELECT json_object(*) FROM (js_left JOIN js_right USING (a));
+}
+expect {
+    {"a":1,"b":2,"c":4}
+}
+
+# A table that appears twice without aliases is ambiguous, as for SELECT *
+test json_object_star_same_table_twice {
+    CREATE TABLE js_left (a, b);
+    INSERT INTO js_left VALUES (1, 2);
+    SELECT json_object(*) FROM js_left, js_left;
+}
+expect error {
+    ambiguous column name
+}
