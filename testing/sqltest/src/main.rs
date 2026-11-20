@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
 use owo_colors::OwoColorize;
+use sqltest::gap::GapReport;
 use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
     OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
@@ -109,6 +110,14 @@ enum Commands {
         compat_gaps: bool,
     },
 
+    /// Print the gap-test counts of test files as Markdown tables, without
+    /// running the tests. The gap lints are on.
+    Gaps {
+        /// Test files or directories
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+
     /// Validate test file syntax and check for pending snapshots
     Check {
         /// Test files or directories
@@ -206,6 +215,7 @@ async fn main() -> ExitCode {
             .await
         }
         Commands::Check { paths, compat_gaps } => check_files(paths, compat_gaps).await,
+        Commands::Gaps { paths } => print_gaps(paths).await,
         Commands::Convert {
             paths,
             output_dir,
@@ -323,6 +333,17 @@ async fn run_tests(
             eprintln!("Error loading test files: {e}");
             return ExitCode::from(1);
         }
+    };
+
+    let gap_report = if compat_gaps {
+        GapReport::from_files(
+            loaded
+                .files
+                .iter()
+                .map(|(path, file)| (path.as_path(), file)),
+        )
+    } else {
+        GapReport::default()
     };
 
     let integrity_fixtures = collect_integrity_fixtures(loaded.test_files());
@@ -553,12 +574,47 @@ async fn run_tests(
     output.write_summary(&summary);
     output.flush();
 
+    if output_format == "pretty" && !gap_report.is_empty() {
+        println!();
+        println!("{}", gap_report.to_markdown());
+    }
     // Return appropriate exit code
     if summary.is_success() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
+}
+
+/// Prints the gap report of the test files as Markdown, for the `gaps`
+/// command. The tests are parsed but not run.
+async fn print_gaps(paths: Vec<PathBuf>) -> ExitCode {
+    let loaded = match load_test_files(&paths, &sqltest::gap::lint(true)).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // A file that does not parse would be left out of the counts, so the
+    // command fails instead of printing counts that are too low.
+    if !loaded.errors.is_empty() {
+        for error in &loaded.errors {
+            eprintln!(
+                "Error: {} does not parse; run `sqltest check` on it",
+                error.file.display()
+            );
+        }
+        return ExitCode::from(1);
+    }
+    let report = GapReport::from_files(
+        loaded
+            .files
+            .iter()
+            .map(|(path, file)| (path.as_path(), file)),
+    );
+    println!("{}", report.to_markdown());
+    ExitCode::SUCCESS
 }
 
 /// Simple resolver that holds the paths directly

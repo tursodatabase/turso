@@ -8,11 +8,14 @@
 //! passes when tursopg still gives the recorded answer and fails when tursopg
 //! gives the PostgreSQL answer, so that a fixed gap cannot stay recorded.
 //!
-//! This module validates gap tests.
+//! This module validates gap tests, derives their class from the two
+//! expectations and counts them per label.
 
 use crate::backends::QueryResult;
 use crate::parser::ast::{Backend, Expectation, Skip, SkipCondition, TestCase, TestFile};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// What a gap label names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -146,6 +149,54 @@ fn label_kind(label: &str) -> Result<GapKind, String> {
     Ok(kind)
 }
 
+/// How tursopg differs from PostgreSQL in a gap test. The runner derives it
+/// from the two expectations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GapClass {
+    /// tursopg fails with any SQLSTATE and PostgreSQL returns rows. The user
+    /// sees an error, not a wrong value.
+    Refused,
+    /// Both fail, with different SQLSTATEs.
+    ErrorMismatch,
+    /// PostgreSQL fails and tursopg returns rows.
+    AcceptsInvalid,
+    /// Any other difference, for example different rows.
+    Wrong,
+}
+
+impl GapClass {
+    pub const ALL: &'static [GapClass] = &[
+        GapClass::Refused,
+        GapClass::ErrorMismatch,
+        GapClass::AcceptsInvalid,
+        GapClass::Wrong,
+    ];
+
+    pub fn of(postgres: &Expectation, tursopg: &Expectation) -> GapClass {
+        match (postgres, tursopg) {
+            (Expectation::Error { .. }, Expectation::Error { .. }) => GapClass::ErrorMismatch,
+            (Expectation::Error { .. }, _) => GapClass::AcceptsInvalid,
+            (_, Expectation::Error { .. }) => GapClass::Refused,
+            _ => GapClass::Wrong,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GapClass::Refused => "refused",
+            GapClass::ErrorMismatch => "error-mismatch",
+            GapClass::AcceptsInvalid => "accepts-invalid",
+            GapClass::Wrong => "wrong",
+        }
+    }
+}
+
+impl fmt::Display for GapClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Checks the rules for a test with a `@compat-gap` decorator. `global_skip` are the
 /// `@skip-file` and `@skip-file-if` directives of its file.
 fn check_gap_test(test: &TestCase, label: &str, global_skip: &[Skip]) -> Result<(), String> {
@@ -246,6 +297,131 @@ pub(crate) fn check_tursopg_override(test: &TestCase) -> Result<(), String> {
                 .to_string(),
         ),
     }
+}
+
+/// One gap test in a report.
+#[derive(Debug, Clone)]
+pub struct GapEntry {
+    pub file: PathBuf,
+    pub test: String,
+    pub label: String,
+    pub kind: GapKind,
+    pub class: GapClass,
+    /// The answer PostgreSQL gives, from the default `expect` block.
+    pub postgres: String,
+    /// The answer tursopg gives, from the `expect @tursopg` block.
+    pub tursopg: String,
+}
+
+/// The gap tests of a set of test files. Each test counts
+/// once, however many databases its file runs it on.
+#[derive(Debug, Default)]
+pub struct GapReport {
+    pub gaps: Vec<GapEntry>,
+}
+
+impl GapReport {
+    /// The report of files that the gap lints accepted.
+    pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a Path, &'a TestFile)>) -> Self {
+        let mut report = GapReport::default();
+        for (path, file) in files {
+            for test in &file.tests {
+                if let Some(label) = &test.gap {
+                    let tursopg = test.expectations.overrides.get(&Backend::Tursopg).expect(
+                        "the gap lints reject a @compat-gap test without an `expect @tursopg` block",
+                    );
+                    report.gaps.push(GapEntry {
+                        file: path.to_path_buf(),
+                        test: test.name.clone(),
+                        label: label.clone(),
+                        kind: label_kind(label).expect("the gap lints check gap labels"),
+                        class: GapClass::of(&test.expectations.default, tursopg),
+                        postgres: describe_expectation(&test.expectations.default),
+                        tursopg: describe_expectation(tursopg),
+                    });
+                }
+            }
+        }
+        report
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.gaps.is_empty()
+    }
+
+    /// The counts as Markdown tables: by kind, by class, by label (with the
+    /// count of each class).
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::new();
+        let total = self.gaps.len();
+        out.push_str(&format!(
+            "### Compatibility gaps: {total} known differences from PostgreSQL\n\n"
+        ));
+
+        let mut by_kind: BTreeMap<GapKind, usize> = BTreeMap::new();
+        let mut by_class: BTreeMap<GapClass, usize> = BTreeMap::new();
+        let mut by_label: BTreeMap<&str, BTreeMap<GapClass, usize>> = BTreeMap::new();
+        for gap in &self.gaps {
+            *by_kind.entry(gap.kind).or_default() += 1;
+            *by_class.entry(gap.class).or_default() += 1;
+            *by_label
+                .entry(gap.label.as_str())
+                .or_default()
+                .entry(gap.class)
+                .or_default() += 1;
+        }
+
+        out.push_str("| kind | gaps |\n|---|---:|\n");
+        for (kind, n) in &by_kind {
+            out.push_str(&format!("| {kind} | {n} |\n"));
+        }
+        out.push_str("\n| class | gaps |\n|---|---:|\n");
+        for (class, n) in &by_class {
+            out.push_str(&format!("| {class} | {n} |\n"));
+        }
+        out.push_str("\n| label | gaps |");
+        for class in GapClass::ALL {
+            out.push_str(&format!(" {class} |"));
+        }
+        out.push_str("\n|---|---:|");
+        for _ in GapClass::ALL {
+            out.push_str("---:|");
+        }
+        out.push('\n');
+        for (label, classes) in &by_label {
+            let n: usize = classes.values().sum();
+            out.push_str(&format!("| `{label}` | {n} |"));
+            for class in GapClass::ALL {
+                out.push_str(&format!(" {} |", classes.get(class).copied().unwrap_or(0)));
+            }
+            out.push('\n');
+        }
+
+        out.push_str(&format!(
+            "\n<details><summary>All {total} gaps with both answers</summary>\n\n\
+             | label | test | tursopg returns | PostgreSQL returns |\n|---|---|---|---|\n"
+        ));
+        let mut gaps: Vec<&GapEntry> = self.gaps.iter().collect();
+        gaps.sort_by(|a, b| (&a.label, &a.file, &a.test).cmp(&(&b.label, &b.file, &b.test)));
+        for gap in gaps {
+            out.push_str(&format!(
+                "| `{}` | {} `{}` | {} | {} |\n",
+                gap.label,
+                gap.file.display(),
+                gap.test,
+                markdown_cell(&gap.tursopg),
+                markdown_cell(&gap.postgres),
+            ));
+        }
+        out.push_str("\n</details>\n");
+
+        out
+    }
+}
+
+/// Escapes text for one cell of a markdown table.
+fn markdown_cell(text: &str) -> String {
+    text.replace('|', "\\|")
 }
 
 /// The gap lints for one test of a file: the rules of a `@compat-gap` test
@@ -430,4 +606,100 @@ expect @tursopg {
         );
     }
 
+    fn rows(lines: &[&str]) -> Expectation {
+        Expectation::Exact(lines.iter().map(|l| l.to_string()).collect())
+    }
+
+    fn error(sqlstate: &str) -> Expectation {
+        Expectation::Error {
+            sqlstate: Some(sqlstate.to_string()),
+            pattern: None,
+        }
+    }
+
+    #[test]
+    fn classes() {
+        assert_eq!(
+            GapClass::of(&rows(&["1"]), &error("0A000")),
+            GapClass::Refused
+        );
+        assert_eq!(
+            GapClass::of(&error("22003"), &error("0A000")),
+            GapClass::ErrorMismatch
+        );
+        assert_eq!(
+            GapClass::of(&error("22003"), &error("22P02")),
+            GapClass::ErrorMismatch
+        );
+        assert_eq!(
+            GapClass::of(&error("22003"), &rows(&["1"])),
+            GapClass::AcceptsInvalid
+        );
+        assert_eq!(GapClass::of(&rows(&["t"]), &rows(&["1"])), GapClass::Wrong);
+        assert_eq!(
+            GapClass::of(&rows(&["1"]), &error("42883")),
+            GapClass::Refused
+        );
+    }
+
+    const REPORT_FILE: &str = r#"
+@compat-gap "type:bool"
+test wrong {
+    SELECT true;
+}
+expect {
+    t
+}
+expect @tursopg {
+    1
+}
+
+@compat-gap "type:int4"
+test accepts-invalid {
+    SELECT '2147483648'::int4;
+}
+@sqlstate 22003
+expect error {
+}
+expect @tursopg {
+    2147483648
+}
+
+@compat-gap "syntax:unsupported-statement"
+test refused {
+    LISTEN c;
+}
+expect {
+}
+@sqlstate 0A000
+expect @tursopg error {
+}
+
+"#;
+
+    fn report() -> GapReport {
+        // Two databases: each test still counts once.
+        let file = parse_with_gap_lints(&format!(
+            "@database :memory:\n@database :temp:\n{REPORT_FILE}"
+        ))
+        .unwrap();
+        GapReport::from_files([(Path::new("f.sqltest"), &file)])
+    }
+
+    #[test]
+    fn report_counts_each_test_once() {
+        let report = report();
+        let classes: Vec<_> = report.gaps.iter().map(|g| g.class).collect();
+        assert_eq!(
+            classes,
+            [GapClass::Wrong, GapClass::AcceptsInvalid, GapClass::Refused]
+        );
+        let md = report.to_markdown();
+        assert!(
+            md.contains("### Compatibility gaps: 3 known differences"),
+            "{md}"
+        );
+        assert!(md.contains("| type | 2 |"), "{md}");
+        assert!(md.contains("| `type:int4` | 1 | 0 | 0 | 1 | 0 |"), "{md}");
+    }
 }
