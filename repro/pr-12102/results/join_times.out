@@ -1,0 +1,32 @@
+# Raw join times, measured before run_join.sh existed. Rounds 1-5 ran base first and
+# printed '<variant> <result> <ms> ms'. Rounds 6-15 ran pr first and printed '<variant> <ms> ms'.
+base 400000 497 ms
+pr 400000 638 ms
+base 400000 464 ms
+pr 400000 605 ms
+base 400000 426 ms
+pr 400000 642 ms
+base 400000 476 ms
+pr 400000 535 ms
+base 400000 395 ms
+pr 400000 553 ms
+pr 579 ms
+base 462 ms
+pr 561 ms
+base 495 ms
+pr 553 ms
+base 393 ms
+pr 560 ms
+base 430 ms
+pr 566 ms
+base 420 ms
+pr 531 ms
+base 454 ms
+pr 572 ms
+base 433 ms
+pr 573 ms
+base 374 ms
+pr 495 ms
+base 417 ms
+pr 492 ms
+base 378 ms

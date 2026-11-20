@@ -1,0 +1,43 @@
+== base
+  35 tests of the four claims:         5 ok, 30 FAILED
+  89 new unit-test cases of the PR:    13 ok, 76 FAILED
+  6 new integration tests of the PR:   0 ok, 6 FAILED
+== pr
+  35 tests of the four claims:         35 ok, 0 FAILED
+  89 new unit-test cases of the PR:    89 ok, 0 FAILED
+  6 new integration tests of the PR:   6 ok, 0 FAILED
+
+Row sequences of the 35 tests that each variant gets wrong:
+== base
+  REPRO1 index=false backwards=false target=10 actual=[10, 30, 50] expected=[10, 20, 30, 40, 50]
+  REPRO1 index=false backwards=false target=20 actual=[20] expected=[20, 30, 40, 50]
+  REPRO1 index=false backwards=false target=30 actual=[30, 50] expected=[30, 40, 50]
+  REPRO1 index=false backwards=false target=40 actual=[40] expected=[40, 50]
+  REPRO1 index=false backwards=true target=20 actual=[20] expected=[20, 10]
+  REPRO1 index=false backwards=true target=30 actual=[30, 10] expected=[30, 20, 10]
+  REPRO1 index=false backwards=true target=40 actual=[40] expected=[40, 30, 20, 10]
+  REPRO1 index=false backwards=true target=50 actual=[50, 30, 10] expected=[50, 40, 30, 20, 10]
+  REPRO1 index=true backwards=false target=10 actual=[10, 30, 50] expected=[10, 20, 30, 40, 50]
+  REPRO1 index=true backwards=false target=20 actual=[20] expected=[20, 30, 40, 50]
+  REPRO1 index=true backwards=false target=30 actual=[30, 50] expected=[30, 40, 50]
+  REPRO1 index=true backwards=false target=40 actual=[40] expected=[40, 50]
+  REPRO1 index=true backwards=true target=20 actual=[20] expected=[20, 10]
+  REPRO1 index=true backwards=true target=30 actual=[30, 10] expected=[30, 20, 10]
+  REPRO1 index=true backwards=true target=40 actual=[40] expected=[40, 30, 20, 10]
+  REPRO1 index=true backwards=true target=50 actual=[50, 30, 10] expected=[50, 40, 30, 20, 10]
+  REPRO2 target=10 actual=[10, 30, 50] expected=[10, 20, 30, 40, 50]
+  REPRO2 target=20 actual=[20] expected=[20, 30, 40, 50]
+  REPRO2 target=30 actual=[30, 50] expected=[30, 40, 50]
+  REPRO2 target=40 actual=[40] expected=[40, 50]
+  REPRO3 index=false actual=[35, 10, 30, 40, 50] expected=[35, 40, 50]
+  REPRO3 index=true actual=[35, 10, 30, 40, 50] expected=[35, 40, 50]
+  REPRO4 index=false target=10 actual=(next Some(20), prev Some(40)) expected=(next Some(20), prev Some(10))
+  REPRO4 index=false target=20 actual=(next Some(30), prev Some(40)) expected=(next Some(30), prev Some(20))
+  REPRO4 index=false target=30 actual=(next Some(40), prev Some(50)) expected=(next Some(40), prev Some(30))
+  REPRO4 index=false target=40 actual=(next Some(50), prev Some(30)) expected=(next Some(50), prev Some(40))
+  REPRO4 index=true target=10 actual=(next Some(20), prev Some(40)) expected=(next Some(20), prev Some(10))
+  REPRO4 index=true target=20 actual=(next Some(30), prev Some(40)) expected=(next Some(30), prev Some(20))
+  REPRO4 index=true target=30 actual=(next Some(40), prev Some(50)) expected=(next Some(40), prev Some(30))
+  REPRO4 index=true target=40 actual=(next Some(50), prev Some(30)) expected=(next Some(50), prev Some(40))
+== pr
+  none

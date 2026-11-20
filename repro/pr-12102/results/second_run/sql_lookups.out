@@ -1,0 +1,2 @@
+base: 2000 lookups, total 1.034 s, mean 0.52 ms, results other than 1: 0
+pr: 2000 lookups, total 1.952 s, mean 0.98 ms, results other than 1: 0

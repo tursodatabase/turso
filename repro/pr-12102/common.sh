@@ -5,6 +5,8 @@
 PR_COMMIT=a4c5e653b8b01f0d87690929291334119418e15d
 # The merge base of PR_COMMIT with main. The "base" variant uses its cursor.rs.
 BASE_COMMIT=91d399c41142057539681a49f58b9d30049179e2
+# The repository that has both commits.
+UPSTREAM=${UPSTREAM:-https://github.com/tursodatabase/turso.git}
 
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=${REPO:-$(git -C "$KIT" rev-parse --show-toplevel)}

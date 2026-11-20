@@ -29,9 +29,9 @@ for n in $SQL_SIZES; do
     out=$("$BIN/tursodb_$v" -m list "$D/t.db" < "$D/delete_insert_$n.sql" 2>&1)
     echo "$out" > "$D/delete_insert_$n.$v.out"
     # Timed statements: BEGIN, DELETE, INSERT, COMMIT, SELECT, integrity_check, checkpoint.
-    t=($(echo "$out" | timer_seconds))
-    result=$(echo "$out" | grep -E '^[0-9]+\|[0-9]+\|[0-9]+$' | head -1)
-    check=$(echo "$out" | grep -E '^ok$' | head -1)
+    t=($(echo "$out" | timer_seconds || true))
+    result=$(echo "$out" | grep -E '^[0-9]+\|[0-9]+\|[0-9]+$' | head -1 || true)
+    check=$(echo "$out" | grep -E '^ok$' | head -1 || true)
     echo "$n,$v,${t[1]},${t[2]},${t[5]},${t[6]},$result,${check:-NOT OK}"
   done
 done | tee "$D/delete_insert.csv"
@@ -49,4 +49,4 @@ for v in base pr; do
   echo "$out" | timer_seconds | awk -v v=$v -v wrong="$wrong" '{s += $1; n++} END {
     printf "%s: %d lookups, total %.3f s, mean %.2f ms, results other than 1: %d\n", v, n, s, 1000 * s / n, wrong
   }'
-done | tee "$D/lookups.txt"
+done | tee "$D/lookups.out"

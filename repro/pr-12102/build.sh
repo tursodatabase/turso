@@ -16,7 +16,8 @@ source "$(dirname "$0")/common.sh"
 
 mkdir -p "$WORK" "$BIN"
 echo "Work directory: $WORK"
-git -C "$REPO" fetch --quiet origin "$PR_COMMIT" "$BASE_COMMIT"
+# Fetch from the upstream URL: the remote "origin" of a clone can be a fork.
+git -C "$REPO" fetch --quiet "$UPSTREAM" "$PR_COMMIT" "$BASE_COMMIT"
 if [ ! -d "$TREE" ]; then
   git -C "$REPO" worktree add --detach "$TREE" "$PR_COMMIT"
   cat "$KIT/cursor_repro_tests.rs" >> "$TREE/core/mvcc/database/tests.rs"

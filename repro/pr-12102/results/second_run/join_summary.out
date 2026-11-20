@@ -1,0 +1,2 @@
+base: runs=15 median=422 ms fastest=342 ms result=400000
+pr: runs=15 median=555 ms fastest=478 ms result=400000

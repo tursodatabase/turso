@@ -1,0 +1,4 @@
+# Part 2 of run_sql_perf.sh, measured before the script existed. My SQL file had
+# one more timed statement (SELECT 'end') after the 2,000 lookups.
+base: 2001 statements, total 1.090 s, mean 0.54 ms
+pr: 2001 statements, total 1.708 s, mean 0.85 ms

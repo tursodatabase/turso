@@ -41,7 +41,9 @@ summary() {
 
 for v in base pr; do
   echo "== $v"
-  "$BIN/unit_$v" mvcc::database::tests::repro_claim --test-threads=4 --nocapture \
+  # Without --nocapture, the result lines stay complete. The REPRO line of each
+  # failed test is in the failure section of the log.
+  "$BIN/unit_$v" mvcc::database::tests::repro_claim --test-threads=4 \
     > "$D/repro_claims.$v.log" 2>&1 || true
   echo "  35 tests of the four claims:         $(summary "$D/repro_claims.$v.log")"
   : > "$D/pr_unit_tests.$v.log"
@@ -60,10 +62,10 @@ for v in base pr; do
 done
 
 echo
-echo "Row sequences that each variant gets wrong (actual differs from expected):"
+echo "Row sequences of the 35 tests that each variant gets wrong:"
 for v in base pr; do
   echo "== $v"
-  grep -h '^REPRO' "$D/repro_claims.$v.log" | sort | awk '{
+  { grep -h '^REPRO' "$D/repro_claims.$v.log" || true; } | sort | awk '{
     a = $0; sub(/.*actual=/, "", a); sub(/ expected=.*/, "", a)
     e = $0; sub(/.*expected=/, "", e)
     if (a != e) { print "  " $0; n++ }

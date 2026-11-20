@@ -21,13 +21,13 @@ for i in $(seq 1 "$JOIN_RUNS"); do
     out=$("$BIN/tursodb_$v" -m list "$D/join.db" < "$KIT/sql/join_query.sql" 2>&1)
     echo "$v $(echo "$out" | grep -E '^[0-9]+$') $(echo "$out" | timer_seconds)"
   done
-done > "$D/join_times.txt"
+done > "$D/join_times.out"
 
 for v in base pr; do
-  grep "^$v " "$D/join_times.txt" | awk '{print $2, $3}' | sort -k2 -n | awk -v v=$v '
+  grep "^$v " "$D/join_times.out" | awk '{print $2, $3}' | sort -k2 -n | awk -v v=$v '
     { rows[NR] = $1; t[NR] = $2 }
     END {
       m = (NR % 2) ? t[(NR + 1) / 2] : (t[NR / 2] + t[NR / 2 + 1]) / 2
       printf "%s: runs=%d median=%.0f ms fastest=%.0f ms result=%s\n", v, NR, m * 1000, t[1] * 1000, rows[1]
     }'
-done | tee "$D/join_summary.txt"
+done | tee "$D/join_summary.out"

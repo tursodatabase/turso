@@ -1,0 +1,17 @@
+case,rows,policy,runs,base_pull_s,pr_pull_s,speedup
+indexed,1000,automatic,1,0.511,0.061,8.4
+indexed,1000,after_pull,1,0.597,0.071,8.4
+indexed,2000,automatic,1,3.662,0.227,16.1
+indexed,2000,after_pull,1,2.678,0.135,19.8
+generated_indexed,1000,automatic,1,0.634,0.071,8.9
+generated_indexed,1000,after_pull,1,0.646,0.071,9.1
+generated_indexed,2000,automatic,1,4.120,0.245,16.8
+generated_indexed,2000,after_pull,1,3.067,0.155,19.8
+plain,1000,automatic,1,0.025,0.023,1.1
+plain,1000,after_pull,1,0.026,0.024,1.1
+plain,2000,automatic,1,0.096,0.080,1.2
+plain,2000,after_pull,1,0.046,0.045,1.0
+generated,1000,automatic,1,0.023,0.026,0.9
+generated,1000,after_pull,1,0.025,0.026,0.9
+generated,2000,automatic,1,0.080,0.080,1.0
+generated,2000,after_pull,1,0.050,0.053,0.9

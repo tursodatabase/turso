@@ -35,6 +35,16 @@ The PR description uses the same method: the two variants differ only in
    cd turso && git checkout claude/wizardly-sagan-y9mner
    ```
 
+   If you have a clone already, fetch the branch from the upstream repository:
+
+   ```bash
+   git fetch https://github.com/tursodatabase/turso.git claude/wizardly-sagan-y9mner
+   ```
+
+   ```bash
+   git checkout FETCH_HEAD
+   ```
+
 2. Build the two variants. On a 4-core VM, this takes about 20 minutes:
 
    ```bash
@@ -114,9 +124,9 @@ Examples of what base returns:
 | Insert 35, then `next()` | 35, 10, 30, 40, 50 | 35, 40, 50 |
 | Range seek 30, `next()`, then `prev()` | 40, then 50 | 40, then 30 |
 
-No plain SQL statement shows these bugs. `run_mixed_sql.sh` runs 15 queries and
+I found no plain SQL statement that shows these bugs. `run_mixed_sql.sh` runs 15 queries and
 writes on the same kind of mixed state. Both variants give the same output, and
-I examined each row of it by hand (`results/mixed_sql_expected.txt`). The built-in
+I examined each row of it by hand (`results/mixed_sql_expected.out`). The built-in
 FTS and vector index methods do not use these cursor sequences.
 
 ### Delete, then insert again, in one transaction
@@ -130,7 +140,7 @@ FTS and vector index methods do not use these cursor sequences.
 | 4,000 | 8.856 | 0.084 | 9.812 | 0.564 |
 | 8,000 | 35.508 | 0.192 | 37.152 | 0.612 |
 
-On base, the INSERT time increases 4 times when N doubles.
+On base, the INSERT takes 4 times longer each time N doubles.
 
 ### Slowdown that the PR adds
 
@@ -162,6 +172,20 @@ With 23 generated columns added, the PR is 60 to 100 times faster at 10,000 to
 Without indexes, the two variants have the same speed. For 40,000 rows, the medians
 of 3 runs differ by less than 3% (`results/pull_bench_unindexed/comparison.csv`).
 
+### Second run with these scripts
+
+After I wrote the scripts, I ran them again on the same machine, from a new
+`build.sh` build. The outputs are in `results/second_run/` and `results/cursor_tests/`.
+
+| Test | base | pr |
+|---|---:|---:|
+| Join, median of 15 runs | 422 ms | 555 ms |
+| INSERT of 8,000 rows after their delete | 36.3 s | 0.15 s |
+| One lookup among hidden entries | 0.52 ms | 0.98 ms |
+| Pull of 2,000 rows, five indexes, automatic policy | 3.66 s | 0.23 s |
+
+The cursor test counts are the same as in the first run.
+
 ## Notes
 
 - A parallel build changes the benchmark times very much. In one of my runs, a
@@ -170,5 +194,7 @@ of 3 runs differ by less than 3% (`results/pull_bench_unindexed/comparison.csv`)
   each size was always slower, in both variants. Thus the run order, not the checkpoint
   policy, causes most of the difference between the two checkpoint columns. The PR
   description shows the same effect at 20,000 rows (43.7 s, then 70.6 s).
-- I measured the times in `results/` before I wrote these scripts. The scripts run the
-  same SQL and the same commands.
+- I measured the files at the top of `results/` and in `results/pull_bench*/` before I
+  wrote these scripts. The scripts run the same SQL and the same commands.
+- `build.sh` took 21 minutes on my VM. Later runs of `build.sh` use the same tree and
+  build only what changed.
