@@ -19,7 +19,7 @@ public class TursoConnectionOptions
     public string? this[string keyword]
     {
         get => _builder.GetOption(keyword);
-        set => _builder[keyword] = value ?? string.Empty;
+        set => _builder[keyword] = value;
     }
 
     public int DefaultTimeout => _builder.DefaultTimeout;

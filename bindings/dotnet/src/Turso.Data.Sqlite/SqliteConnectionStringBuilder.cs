@@ -8,9 +8,6 @@ namespace Turso.Data.Sqlite;
 
 public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 {
-    private bool _parsingConnectionString;
-    private bool _parsedEmptyCloudKey;
-
     private static readonly string[] CanonicalKeywords =
     [
         "Data Source",
@@ -262,27 +259,6 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ConnectionString = connectionString ?? string.Empty;
     }
 
-    [AllowNull]
-    public new string ConnectionString
-    {
-        get => base.ConnectionString;
-        set
-        {
-            _parsingConnectionString = true;
-            _parsedEmptyCloudKey = false;
-            try
-            {
-                base.ConnectionString = value;
-                if (_parsedEmptyCloudKey && !base.ContainsKey("Local Encryption Key"))
-                    base.Remove("Remote Encryption Key");
-            }
-            finally
-            {
-                _parsingConnectionString = false;
-            }
-        }
-    }
-
     public bool IsLocal => !IsDirectRemote && !IsReplica;
 
     public bool IsDirectRemote
@@ -413,8 +389,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set
         {
             var normalizedKeyword = NormalizeKeyword(keyword);
-            if (normalizedKeyword == "Remote Encryption Key")
-                _parsedEmptyCloudKey = false;
+            TursoSyncDatabaseOptions.ValidateConnectionStringKey(normalizedKeyword, value);
             if (value is null)
             {
                 base.Remove(normalizedKeyword);
@@ -432,17 +407,6 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         if (!KeywordMap.TryGetValue(keyword, out var normalizedKeyword))
             return false;
 
-        if (!_parsingConnectionString && normalizedKeyword == "Local Encryption Key")
-            throw new InvalidOperationException(
-                "Local Encryption Key cannot be removed with Remove. Assign null through the builder indexer to omit it.");
-        // Preserve explicit empty credentials when the base parser calls Remove.
-        if (_parsingConnectionString && normalizedKeyword is "Local Encryption Key" or "Remote Encryption Key")
-        {
-            if (normalizedKeyword == "Remote Encryption Key")
-                _parsedEmptyCloudKey = true;
-            base[normalizedKeyword] = string.Empty;
-            return true;
-        }
         return base.Remove(normalizedKeyword);
     }
 
