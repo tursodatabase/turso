@@ -5175,10 +5175,10 @@ impl TryClone for Index {
 }
 
 impl TryClone for Schema {
-    /// Copying a `Schema` requires deep cloning of all internal tables and indexes, even though they are wrapped in `Arc`.
-    /// Simply copying the `Arc` pointers would result in multiple `Schema` instances sharing the same underlying tables and indexes,
-    /// which could lead to panics or data races if any instance attempts to modify them.
-    /// To ensure each `Schema` is independent and safe to modify, we clone the underlying data for all tables and indexes.
+    /// The copy shares the tables, indexes, views and triggers with `self`,
+    /// because they are behind an `Arc`. Code that changes one of them in a
+    /// schema must copy it first with `Arc::make_mut`, so the change does not
+    /// reach the other schemas.
     type Error = TryReserveError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
@@ -5212,18 +5212,16 @@ impl TryClone for NamespaceSchema {
         let tables = self
             .tables
             .iter()
-            .map(|(name, table)| {
-                Ok::<_, TryReserveError>((name.clone(), Arc::new(table.as_ref().try_clone()?)))
-            })
-            .try_collect::<Result<_, TryReserveError>>()??;
+            .map(|(name, table)| (name.clone(), Arc::clone(table)))
+            .try_collect()?;
         let indexes = self
             .indexes
             .iter()
             .map(|(name, indexes)| {
                 let indexes = indexes
                     .iter()
-                    .map(|index| index.as_ref().try_clone().map(Arc::new))
-                    .try_collect::<Result<VecDeque<_>, TryReserveError>>()??;
+                    .map(Arc::clone)
+                    .try_collect::<VecDeque<_>>()?;
                 Ok::<_, TryReserveError>((name.clone(), indexes))
             })
             .try_collect::<Result<_, TryReserveError>>()??;
@@ -5237,20 +5235,15 @@ impl TryClone for NamespaceSchema {
         let views = self
             .views
             .iter()
-            .map(|(name, view)| {
-                Ok::<_, TryReserveError>((name.clone(), Arc::new(view.as_ref().try_clone()?)))
-            })
-            .try_collect::<Result<_, TryReserveError>>()??;
+            .map(|(name, view)| (name.clone(), Arc::clone(view)))
+            .try_collect()?;
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
                 Ok::<_, TryReserveError>((
                     table_name.clone(),
-                    triggers
-                        .iter()
-                        .map(|t| Arc::new((**t).clone()))
-                        .try_collect()?,
+                    triggers.iter().map(Arc::clone).try_collect()?,
                 ))
             })
             .try_collect::<Result<_, TryReserveError>>()??;
@@ -9965,6 +9958,31 @@ mod tests {
 
         assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
         assert!(t.peek_column_dependencies().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_copy_shares_a_table_until_the_copy_changes_it() -> Result<()> {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_stored_sql(&SqliteDialect, "CREATE TABLE t(a, b)", 2, false)?;
+        schema.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
+
+        let mut copy = schema.try_clone()?;
+        assert!(Arc::ptr_eq(
+            &schema.get_table(NamespaceId::ROOT, "t").unwrap(),
+            &copy.get_table(NamespaceId::ROOT, "t").unwrap()
+        ));
+
+        let table = Arc::make_mut(copy.table_mut(NamespaceId::ROOT, "t").unwrap());
+        Arc::make_mut(table.btree_mut().unwrap()).root_page = 3;
+        let root_page = |schema: &Schema| {
+            schema
+                .get_btree_table(NamespaceId::ROOT, "t")
+                .unwrap()
+                .root_page
+        };
+        assert_eq!(root_page(&schema), 2);
+        assert_eq!(root_page(&copy), 3);
         Ok(())
     }
 

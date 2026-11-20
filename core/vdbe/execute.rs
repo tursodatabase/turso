@@ -23,7 +23,8 @@ use crate::schema::alter_table::{
     RewrittenView,
 };
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, ForeignKey, Schema, Table, EXPR_INDEX_SENTINEL,
+    SCHEMA_TABLE_NAME,
 };
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::state_machine::StateMachine;
@@ -16833,17 +16834,25 @@ pub fn op_rename_table(
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.insert_table(*namespace, normalized_to.to_owned(), table);
 
+        let references_renamed_table = |fk: &ForeignKey| {
+            fk.parent_namespace == *namespace
+                && normalize_ident(&fk.parent_table) == normalized_from
+        };
         for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             // skip the table we just renamed
             if child_namespace == *namespace && normalize_ident(tname) == normalized_to {
                 continue;
             }
+            // Copy only the tables that change, because other schemas share them.
+            if !matches!(t_arc.as_ref(), Table::BTree(child_btree)
+                if child_btree.foreign_keys.iter().any(|fk| references_renamed_table(fk)))
+            {
+                continue;
+            }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if fk_arc.parent_namespace == *namespace
-                        && normalize_ident(&fk_arc.parent_table) == normalized_from
-                    {
+                    if references_renamed_table(fk_arc) {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(&normalized_to);
                     }
@@ -17103,7 +17112,7 @@ pub fn op_drop_column(
             .table_mut(*namespace, &normalized_table_name)
             .expect("table being renamed should be in schema");
 
-        let table = Arc::get_mut(table).expect("this should be the only strong reference");
+        let table = Arc::make_mut(table);
 
         let Table::BTree(btree) = table else {
             panic!("only btree tables can be renamed");
@@ -17500,16 +17509,24 @@ pub fn op_alter_column(
         }
 
         // fix OTHER tables, of any namespace, that reference this table as parent
+        let references_altered_table = |fk: &ForeignKey| {
+            fk.parent_namespace == *namespace
+                && normalize_ident(&fk.parent_table) == normalized_table_name
+        };
         for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             if child_namespace == *namespace && normalize_ident(tname) == normalized_table_name {
+                continue;
+            }
+            // Copy only the tables that change, because other schemas share them.
+            if !matches!(t_arc.as_ref(), Table::BTree(child_btree)
+                if child_btree.foreign_keys.iter().any(|fk| references_altered_table(fk)))
+            {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if fk_arc.parent_namespace != *namespace
-                        || normalize_ident(&fk_arc.parent_table) != normalized_table_name
-                    {
+                    if !references_altered_table(fk_arc) {
                         continue;
                     }
                     let fk = Arc::make_mut(fk_arc);
