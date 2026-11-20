@@ -695,25 +695,29 @@ fn s08_an_earlier_connection_and_earlier_schema_statement() {
 }
 
 #[test]
-fn s11_failed_page_one_authentication_read_and_retry() {
+fn s11_failed_page_one_read_and_retry() {
     let cipher = CipherMode::Aegis256;
     let env = Env::new("s11");
     let db = env.open(env.encrypted(cipher, KEY_A));
     let owner = connect(&db, cipher, Some(KEY_A)).unwrap();
     populate(&owner, "protected value");
-    for (byte, valid) in [(KEY_A, true), (KEY_B, false)] {
-        env.io.fail_next_request(QueuedIoOpKind::Pread);
-        let error = connect(&db, cipher, Some(byte))
-            .err()
-            .expect("injected read must fail");
-        assert_eq!(classify(&error), Category::InjectedIo);
-        let retry = connect(&db, cipher, Some(byte));
-        if valid {
-            assert_eq!(marker(&retry.unwrap()), ["protected value"]);
-        } else {
-            assert_refused(retry, "wrong key after I/O failure");
-        }
-    }
+    env.io.fail_next_request(QueuedIoOpKind::Pread);
+    assert_eq!(
+        assert_refused(connect(&db, cipher, Some(KEY_B)), "wrong key before I/O"),
+        Category::CredentialWrong
+    );
+    let error = connect(&db, cipher, Some(KEY_A))
+        .err()
+        .expect("the pending injected read must fail for the valid key");
+    assert_eq!(classify(&error), Category::InjectedIo);
+    assert_eq!(
+        marker(&connect(&db, cipher, Some(KEY_A)).unwrap()),
+        ["protected value"]
+    );
+    assert_refused(
+        connect(&db, cipher, Some(KEY_B)),
+        "wrong key after I/O failure",
+    );
     owner.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     assert_eq!(env.size(&format!("{}-wal", env.path)), 0);
 }
@@ -744,7 +748,7 @@ fn s12_encrypted_page_size_is_fixed_before_first_write() {
 }
 
 #[test]
-fn s14_uncached_validation_from_wal_and_main_file() {
+fn s14_cached_credentials_are_checked_before_wal_and_main_file_reads() {
     let mut coverage = Coverage::default();
     let cipher = CipherMode::Aegis256;
     let page_size = 4096;
@@ -789,14 +793,12 @@ fn s14_uncached_validation_from_wal_and_main_file() {
         env.io.set_owner(format!("s14.{source}.right"));
         let peer = connect(&db, cipher, Some(KEY_A)).unwrap();
         env.io.set_owner(format!("s14.{source}.wrong"));
-        // A header-only read could not tell the keys apart: the refusal is an
-        // authentication failure of the full page.
         assert_eq!(
             assert_refused(connect(&db, cipher, Some(KEY_B)), "wrong key"),
             Category::CredentialWrong
         );
         assert!(full_page_one_reads(&format!("s14.{source}.right")) > 0);
-        assert!(full_page_one_reads(&format!("s14.{source}.wrong")) > 0);
+        assert_eq!(full_page_one_reads(&format!("s14.{source}.wrong")), 0);
         assert_eq!(marker(&peer), ["protected value"]);
         coverage.see(format!("validated_from_{source}"));
     }

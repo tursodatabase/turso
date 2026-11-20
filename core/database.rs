@@ -4183,17 +4183,15 @@ mod database_tests {
         .unwrap();
         for (byte, accepted) in [(None, false), (Some(1), true), (Some(2), false)] {
             let key = byte.map(|byte| EncryptionKey::new_256([byte; 32]));
-            let mut state = super::DbHeaderReadState::default();
-            let pager = crate::util::IOExt::block(io.as_ref(), || {
-                db.init_pager(None, &mut state, key.as_ref(), None)
-            })
+            let pager = crate::Pager::new(
+                db.db_file.clone(),
+                None,
+                io.clone(),
+                crate::storage::page_cache::PageCache::default(),
+                db.buffer_pool.clone(),
+                db.pager_state.clone(),
+            )
             .unwrap();
-            if let Some(key) = &key {
-                pager.enable_encryption(true);
-                pager
-                    .set_encryption_context(crate::CipherMode::Aegis256, key)
-                    .unwrap();
-            }
             assert!(!pager.is_authenticated());
             assert!(db
                 .new_connection(
@@ -4225,22 +4223,97 @@ mod database_tests {
     }
 
     #[test]
-    fn pager_cannot_change_the_database_encryption_identity() {
-        let db = Database::open(
-            Arc::new(crate::MemoryIO::new()),
-            ":memory:immutable",
+    fn authenticated_header_is_bound_to_its_database() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let options = |byte| {
             OpenOptions::new(Arc::new(EngineDialect))
-                .db_opts(DatabaseOpts::new().with_encryption(true)),
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(crate::EncryptionOpts {
+                    cipher: "aegis256".into(),
+                    hexkey: format!("{byte:02x}").repeat(32),
+                })
+        };
+        let source = Database::open(io.clone(), ":memory:header-source", options(1)).unwrap();
+        for target_options in [OpenOptions::new(Arc::new(EngineDialect)), options(2)] {
+            let target =
+                Database::open(io.clone(), ":memory:header-target", target_options).unwrap();
+            let mut state = super::HeaderAuthenticationState::default();
+            let header = crate::util::IOExt::block(io.as_ref(), || {
+                source.read_authenticated_header(
+                    &mut state,
+                    Some(&EncryptionKey::new_256([1; 32])),
+                    None,
+                )
+            })
+            .unwrap();
+            let original_size = target.pager_state.page_size();
+            let original_cipher = target.encryption_cipher();
+            let error = target.init_pager(header).err().unwrap();
+            assert!(error.to_string().contains("belongs to another database"));
+            assert_eq!(target.pager_state.page_size(), original_size);
+            assert_eq!(target.encryption_cipher(), original_cipher);
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn cold_encrypted_init_authenticates_before_configuring_shared_buffers() {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let path = ":memory:authenticated-cold-header";
+        let size = crate::storage::sqlite3_ondisk::PageSize::new(8192).unwrap();
+        let opts = DatabaseOpts::new().with_encryption(true);
+        let encryption = crate::EncryptionOpts {
+            cipher: "aegis256".into(),
+            hexkey: "01".repeat(32),
+        };
+        let warm = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(EngineDialect))
+                .db_opts(opts)
+                .encryption(encryption.clone())
+                .page_size(size),
         )
         .unwrap();
-        let pager = db._init(None, None).unwrap();
-        assert!(pager
-            .set_encryption_context(
-                crate::CipherMode::Aegis256,
-                &EncryptionKey::new_256([1; 32])
+        let owner = warm
+            .connect(
+                ConnectOpts::new(SessionRole::Superuser)
+                    .with_encryption_key(Some(EncryptionKey::new_256([1; 32]))),
             )
+            .unwrap();
+        owner.execute("CREATE TABLE data(value)").unwrap();
+        let file = Arc::new(DatabaseFile::new(
+            io.open_file(path, OpenFlags::Create, false).unwrap(),
+        ));
+        let cold = Database::new(
+            opts,
+            OpenFlags::Create,
+            path,
+            format!("{path}-wal"),
+            &io,
+            file,
+            Some(encryption),
+            size,
+            super::DatabaseAllocators::default(),
+            None,
+            Arc::new(EngineDialect),
+            &crate::native_ext::NativeExtensions::default(),
+        )
+        .unwrap();
+        assert_eq!(cold.pager_state.page_size(), None);
+        assert_eq!(cold.buffer_pool.get_page().len(), 4096);
+        assert!(cold
+            ._init(Some(&EncryptionKey::new_256([2; 32])), None)
             .is_err());
-        assert_eq!(db.encryption_cipher(), crate::CipherMode::None);
+        assert_eq!(cold.pager_state.page_size(), None);
+        assert_eq!(cold.buffer_pool.get_page().len(), 4096);
+        let pager = cold
+            ._init(Some(&EncryptionKey::new_256([1; 32])), None)
+            .unwrap();
+        assert!(pager.is_authenticated());
+        assert!(Arc::ptr_eq(&pager.buffer_pool, &cold.buffer_pool));
+        assert_eq!(cold.pager_state.page_size(), Some(size));
+        assert_eq!(cold.buffer_pool.get_page().len(), 8192);
     }
 
     #[cfg(feature = "fs")]

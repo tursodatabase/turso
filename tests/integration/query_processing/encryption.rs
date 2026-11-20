@@ -2661,7 +2661,11 @@ fn connect_async_yields_and_cancellation_releases_read_transactions() -> anyhow:
                 break;
             }
         }
-        assert!(cancelled > 0, "page-1 authentication must yield");
+        if wrong {
+            assert_eq!(cancelled, 0, "a cached wrong key must fail before page I/O");
+        } else {
+            assert!(cancelled > 0, "reading page 1 must yield");
+        }
     }
     Ok(())
 }
