@@ -1,6 +1,6 @@
 use turso_core::EncryptionContext;
 
-use crate::{errors::Error, Result};
+use crate::{database_sync_operations::WAL_FRAME_SIZE, errors::Error, Result};
 
 const INFO_HEADER: &[u8; 10] = b"TSYNMETA\x01\x00";
 const INFO_AAD: &[u8] = b"turso-sync/info/v1\0TSYNMETA\x01\x00";
@@ -46,7 +46,7 @@ impl ChangeIdentity {
     }
 
     pub(crate) fn validate_record_length(&self, length: u64) -> Result<()> {
-        if length == 0 || (self.kind == ChangeKind::Pages && length != 4120) {
+        if length == 0 || (self.kind == ChangeKind::Pages && length != WAL_FRAME_SIZE as u64) {
             return Err(invalid("invalid change record length"));
         }
         Ok(())

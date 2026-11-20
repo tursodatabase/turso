@@ -3782,7 +3782,10 @@ pub async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) 
     wait_file_completion(coro, &c).await
 }
 
-async fn wait_file_completion<Ctx>(coro: &Coro<Ctx>, completion: &Completion) -> Result<()> {
+pub(crate) async fn wait_file_completion<Ctx>(
+    coro: &Coro<Ctx>,
+    completion: &Completion,
+) -> Result<()> {
     while !completion.finished() {
         coro.yield_(SyncEngineIoResult::IO).await?;
     }

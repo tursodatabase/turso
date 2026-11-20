@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex};
 use turso_core::{Buffer, Completion, EncryptionContext, File};
 
 use crate::{
+    database_sync_operations::{wait_file_completion, WAL_FRAME_SIZE},
     errors::Error,
     sync_cipher::{ChangeCounts, ChangeIdentity, ChangeKind, CHUNK_SIZE},
-    types::{Coro, SyncEngineIoResult},
+    types::Coro,
     Result,
 };
 
@@ -341,15 +342,12 @@ impl ChangesFile {
         let Some(completion) = self.pending.as_ref() else {
             return Ok(());
         };
-        while !completion.finished() {
-            coro.yield_(SyncEngineIoResult::IO).await?;
+        // Keep the completion attached so reset can drain a cancelled wait.
+        let result = wait_file_completion(coro, completion).await;
+        if completion.finished() {
+            self.pending = None;
         }
-        let error = completion.get_error();
-        self.pending = None;
-        if let Some(error) = error {
-            return Err(Error::IoError(error.to_string()));
-        }
-        Ok(())
+        result
     }
 }
 
@@ -397,7 +395,7 @@ impl ChangesReader<'_> {
             return Ok(None);
         }
         let length = match self.sealed.kind() {
-            ChangeKind::Pages => 4120,
+            ChangeKind::Pages => WAL_FRAME_SIZE as u64,
             ChangeKind::Logical => self.read_length(coro).await?,
         };
         self.sealed.identity.validate_record_length(length)?;
@@ -865,6 +863,20 @@ mod tests {
             self.truncates.fetch_add(1, Ordering::SeqCst);
             self.inner.truncate(size, c)
         }
+    }
+
+    #[test]
+    fn sync_file_propagates_failed_completion() {
+        let file = Arc::new(ControlledFile::new());
+        file.fail_sync.store(true, Ordering::SeqCst);
+        let file: Arc<dyn File> = file;
+        let error = run(|coro| async move {
+            crate::database_sync_operations::sync_file(&coro, &file).await
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::IoError(message) if message.contains("injected sync failure"))
+        );
     }
 
     #[test]
