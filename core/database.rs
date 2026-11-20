@@ -4152,9 +4152,9 @@ mod database_tests {
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{PageCodec, PageCodecContext, PageCodecId};
     use crate::{
-        storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
-        DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
-        OpenFlags, OpenOptions, PlatformIO, IO,
+        storage::database::DatabaseFile, ConnectOpts, DatabaseOpts, DatabaseStorage,
+        EncryptionOpts, IOResult, OpenDbAsyncState, OpenFlags, OpenOptions, PlatformIO,
+        SessionRole, IO,
     };
 
     #[test]
@@ -4173,7 +4173,7 @@ mod database_tests {
         let db = Database::open(
             io.clone(),
             ":memory:publication-key",
-            OpenOptions::new(Arc::new(EngineDialect))
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
                 .db_opts(DatabaseOpts::new().with_encryption(true))
                 .encryption(EncryptionOpts {
                     cipher: "aegis256".into(),
@@ -4226,7 +4226,7 @@ mod database_tests {
     fn authenticated_header_is_bound_to_its_database() {
         let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
         let options = |byte| {
-            OpenOptions::new(Arc::new(EngineDialect))
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
                 .db_opts(DatabaseOpts::new().with_encryption(true))
                 .encryption(crate::EncryptionOpts {
                     cipher: "aegis256".into(),
@@ -4234,7 +4234,10 @@ mod database_tests {
                 })
         };
         let source = Database::open(io.clone(), ":memory:header-source", options(1)).unwrap();
-        for target_options in [OpenOptions::new(Arc::new(EngineDialect)), options(2)] {
+        for target_options in [
+            OpenOptions::new(Arc::new(DialectThatCannotParse)),
+            options(2),
+        ] {
             let target =
                 Database::open(io.clone(), ":memory:header-target", target_options).unwrap();
             let mut state = super::HeaderAuthenticationState::default();
@@ -4269,7 +4272,7 @@ mod database_tests {
         let warm = Database::open(
             io.clone(),
             path,
-            OpenOptions::new(Arc::new(EngineDialect))
+            OpenOptions::new(Arc::new(DialectThatCannotParse))
                 .db_opts(opts)
                 .encryption(encryption.clone())
                 .page_size(size),
@@ -4281,7 +4284,8 @@ mod database_tests {
                     .with_encryption_key(Some(EncryptionKey::new_256([1; 32]))),
             )
             .unwrap();
-        owner.execute("CREATE TABLE data(value)").unwrap();
+        let pager = owner.get_pager();
+        crate::util::IOExt::block(io.as_ref(), || pager.maybe_allocate_page1()).unwrap();
         let file = Arc::new(DatabaseFile::new(
             io.open_file(path, OpenFlags::Create, false).unwrap(),
         ));
@@ -4296,7 +4300,7 @@ mod database_tests {
             size,
             super::DatabaseAllocators::default(),
             None,
-            Arc::new(EngineDialect),
+            Arc::new(DialectThatCannotParse),
             &crate::native_ext::NativeExtensions::default(),
         )
         .unwrap();

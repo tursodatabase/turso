@@ -5394,7 +5394,15 @@ mod shuttle_encryption_tests {
             let observer = db.clone();
             assert_eq!(
                 race(
-                    move || writer.execute("CREATE TABLE secrets(value TEXT)").is_ok(),
+                    move || {
+                        let pager = writer.get_pager();
+                        writer.db.io.block(|| pager.maybe_allocate_page1()).unwrap();
+                        writer
+                            .with_schema_mut(|schema| schema.schema_version += 1)
+                            .unwrap();
+                        writer.publish_schema_if_newer();
+                        true
+                    },
                     move || observer
                         .connect(
                             ConnectOpts::new(crate::SessionRole::Superuser)
@@ -5404,6 +5412,7 @@ mod shuttle_encryption_tests {
                 ),
                 [true, false]
             );
+            assert_eq!(db.clone_schema().schema_version, 1);
             assert_single_binding(&db, CipherMode::Aegis256, 1);
         });
     }
@@ -5412,12 +5421,14 @@ mod shuttle_encryption_tests {
         let db = Database::open(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
-                .db_opts(DatabaseOpts::new().with_encryption(true))
-                .encryption(crate::EncryptionOpts {
-                    cipher: "aegis256".into(),
-                    hexkey: "01".repeat(32),
-                }),
+            crate::OpenOptions::new(Arc::new(
+                crate::dialect::cannot_parse::DialectThatCannotParse,
+            ))
+            .db_opts(DatabaseOpts::new().with_encryption(true))
+            .encryption(crate::EncryptionOpts {
+                cipher: "aegis256".into(),
+                hexkey: "01".repeat(32),
+            }),
         )
         .unwrap();
         let first = db
