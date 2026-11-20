@@ -429,6 +429,47 @@ fn refused_drop_quotes_names_and_names_the_schema_the_search_path_lacks() {
 }
 
 #[test]
+fn failed_drop_of_several_relations_drops_none() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE kept (a int)").unwrap();
+    conn.execute("INSERT INTO kept VALUES (6)").unwrap();
+    conn.execute("CREATE VIEW kept_view AS SELECT a FROM kept")
+        .unwrap();
+    conn.execute("CREATE TABLE owner (id serial)").unwrap();
+    conn.execute("CREATE TABLE borrower (n bigint DEFAULT nextval('owner_id_seq'))")
+        .unwrap();
+
+    let error = conn.execute("DROP TABLE kept, missing").unwrap_err();
+    assert_eq!(error.sqlstate, "42P01", "{error}");
+    let error = conn.execute("DROP VIEW kept_view, missing").unwrap_err();
+    assert_eq!(error.message, "no such view: missing");
+    let error = conn.execute("DROP TABLE borrower, kept").unwrap_err();
+    assert_eq!(
+        error.message,
+        "cannot drop desired object(s) because other objects depend on them"
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("view kept_view depends on table kept")
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Use DROP ... CASCADE to drop the dependent objects too.")
+    );
+    let error = conn.execute("DROP TABLE kept, owner CASCADE").unwrap_err();
+    assert_eq!(error.sqlstate, "0A000", "{error}");
+
+    let rows = conn
+        .query("SELECT a FROM kept_view")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows[0][0].to_string(), "6");
+}
+
+#[test]
 fn refused_drop_leaves_the_sequence_and_the_other_default_working() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

@@ -1339,3 +1339,179 @@ test drop-schema-cascade-drops-views-that-read-each-other {
 expect {
     0
 }
+
+test drop-table-cascade-drops-the-views-that-read-it {
+    CREATE SCHEMA IF NOT EXISTS dc_other;
+    DROP VIEW IF EXISTS dc_other.far;
+    CREATE TABLE dc_t (a int);
+    CREATE VIEW dc_v AS SELECT a FROM dc_t;
+    CREATE VIEW dc_w AS SELECT a FROM dc_v;
+    CREATE VIEW dc_other.far AS SELECT a FROM public.dc_w;
+    DROP TABLE dc_t CASCADE;
+    CREATE VIEW dc_v AS SELECT 1 AS a;
+    CREATE VIEW dc_w AS SELECT 2 AS a;
+    CREATE VIEW dc_other.far AS SELECT 3 AS a;
+    SELECT count(*) FROM pg_class WHERE relname = 'dc_t';
+    SELECT a FROM dc_v UNION ALL SELECT a FROM dc_w UNION ALL SELECT a FROM dc_other.far ORDER BY 1;
+}
+expect {
+    0
+    1
+    2
+    3
+}
+
+test drop-view-cascade-keeps-the-table {
+    CREATE TABLE dc_keep (a int);
+    INSERT INTO dc_keep VALUES (3);
+    CREATE VIEW dc_keep_v AS SELECT a FROM dc_keep;
+    CREATE VIEW dc_keep_w AS SELECT a FROM dc_keep_v;
+    DROP VIEW dc_keep_v CASCADE;
+    CREATE VIEW dc_keep_v AS SELECT 1 AS a;
+    CREATE VIEW dc_keep_w AS SELECT 2 AS a;
+    SELECT a FROM dc_keep_v UNION ALL SELECT a FROM dc_keep_w UNION ALL SELECT a FROM dc_keep ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test drop-table-cascade-without-dependent-objects {
+    CREATE TABLE dc_alone (a int);
+    DROP TABLE dc_alone CASCADE;
+    SELECT count(*) FROM pg_class WHERE relname = 'dc_alone';
+}
+expect {
+    0
+}
+
+test drop-table-cascade-rolls-back-with-its-transaction {
+    CREATE TABLE dc_tx (a int);
+    INSERT INTO dc_tx VALUES (8);
+    CREATE VIEW dc_tx_v AS SELECT a FROM dc_tx;
+    BEGIN;
+    DROP TABLE dc_tx CASCADE;
+    ROLLBACK;
+    SELECT a FROM dc_tx_v;
+}
+expect {
+    8
+}
+
+# PostgreSQL drops the default of dc_seq_user.n with the table.
+@compat-gap "syntax:drop-table"
+test drop-table-cascade-when-a-default-uses-its-sequence {
+    CREATE TABLE dc_seq_owner (id serial);
+    CREATE TABLE dc_seq_user (n bigint DEFAULT nextval('dc_seq_owner_id_seq'));
+    DROP TABLE dc_seq_owner CASCADE;
+    SELECT count(*) FROM pg_class WHERE relname = 'dc_seq_owner';
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP ... CASCADE is not supported when an object that is not a view depends on what it drops
+}
+
+# PostgreSQL drops the foreign key of dc_fk_child with the table.
+@compat-gap "syntax:drop-table"
+test drop-table-cascade-when-a-foreign-key-references-it {
+    CREATE TABLE dc_fk_parent (id int PRIMARY KEY);
+    CREATE TABLE dc_fk_child (pid int REFERENCES dc_fk_parent (id));
+    DROP TABLE dc_fk_parent CASCADE;
+    SELECT count(*) FROM pg_constraint WHERE conname = 'dc_fk_child_pid_fkey';
+}
+expect {
+    0
+}
+@sqlstate 0A000
+expect @tursopg error {
+    DROP ... CASCADE is not supported when a foreign key of a table that is not dropped references a dropped table
+}
+
+test drop-table-cascade-of-a-table-and-the-table-whose-foreign-key-references-it {
+    CREATE TABLE dc_fk_both_parent (id int PRIMARY KEY);
+    CREATE TABLE dc_fk_both_child (pid int REFERENCES dc_fk_both_parent (id));
+    DROP TABLE dc_fk_both_parent, dc_fk_both_child CASCADE;
+    SELECT count(*) FROM pg_class WHERE relname IN ('dc_fk_both_parent', 'dc_fk_both_child');
+}
+expect {
+    0
+}
+
+test drop-table-cascade-of-a-table-whose-foreign-key-references-itself {
+    CREATE TABLE dc_fk_self (id int PRIMARY KEY, parent int REFERENCES dc_fk_self (id));
+    DROP TABLE dc_fk_self CASCADE;
+    SELECT count(*) FROM pg_class WHERE relname = 'dc_fk_self';
+}
+expect {
+    0
+}
+
+test drop-several-tables {
+    CREATE TABLE dm_a (a int);
+    CREATE TABLE dm_b (a int);
+    DROP TABLE dm_a, dm_b;
+    SELECT count(*) FROM pg_class WHERE relname IN ('dm_a', 'dm_b');
+}
+expect {
+    0
+}
+
+test drop-several-views-that-read-each-other {
+    CREATE TABLE dm_base (a int);
+    CREATE VIEW dm_inner AS SELECT a FROM dm_base;
+    CREATE VIEW dm_outer AS SELECT a FROM dm_inner;
+    DROP VIEW dm_inner, dm_outer;
+    CREATE VIEW dm_inner AS SELECT 1 AS a;
+    CREATE VIEW dm_outer AS SELECT 2 AS a;
+    SELECT a FROM dm_inner UNION ALL SELECT a FROM dm_outer ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test drop-several-tables-drops-none-when-one-is-missing {
+    CREATE TABLE dm_kept (a int);
+    INSERT INTO dm_kept VALUES (6);
+    DROP TABLE dm_kept, dm_missing;
+}
+@sqlstate 42P01
+expect error {}
+
+test drop-several-tables-if-exists-skips-the-missing-one {
+    CREATE TABLE dm_there (a int);
+    DROP TABLE IF EXISTS dm_there, dm_not_there;
+    SELECT count(*) FROM pg_class WHERE relname = 'dm_there';
+}
+expect {
+    0
+}
+
+test drop-several-tables-refuses-when-a-view-outside-them-reads-one {
+    CREATE TABLE dm_read (a int);
+    CREATE TABLE dm_unread (a int);
+    CREATE VIEW dm_reader AS SELECT a FROM dm_read;
+    DROP TABLE dm_unread, dm_read;
+}
+@sqlstate 2BP01
+expect error {
+    because other objects depend on them
+}
+
+test drop-several-tables-with-quoted-names-cascade {
+    CREATE TABLE "Dm Mixed" (a int);
+    CREATE VIEW "Dm View" AS SELECT a FROM "Dm Mixed";
+    CREATE TABLE dm_plain (a int);
+    DROP TABLE "Dm Mixed", dm_plain CASCADE;
+    CREATE VIEW "Dm View" AS SELECT 1 AS a;
+    SELECT count(*) FROM pg_class WHERE relname IN ('Dm Mixed', 'dm_plain');
+    SELECT a FROM "Dm View";
+}
+expect {
+    0
+    1
+}

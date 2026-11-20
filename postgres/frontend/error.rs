@@ -65,6 +65,23 @@ pub fn sqlstate_error(
         code: sqlstate,
         message: message.into(),
         detail,
+        hint: None,
+    }))
+}
+
+const DROP_CASCADE_HINT: &str = "Use DROP ... CASCADE to drop the dependent objects too.";
+
+/// The error of a DROP of several objects that `error` refused because other
+/// objects depend on one of them. PostgreSQL does not say which one.
+pub fn several_dropped_objects_have_dependents(error: LimboError) -> LimboError {
+    let LimboError::DependentObjects(refusal) = error else {
+        return error;
+    };
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+        message: "cannot drop desired object(s) because other objects depend on them".into(),
+        detail: Some(refusal.dependents.join("\n")),
+        hint: Some(DROP_CASCADE_HINT.into()),
     }))
 }
 
@@ -132,7 +149,7 @@ impl From<&LimboError> for ErrorReport {
                 refusal.dropped
             );
             report.detail = Some(refusal.dependents.join("\n"));
-            report.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+            report.hint = Some(DROP_CASCADE_HINT.into());
         }
         if let LimboError::PermissionDenied(denial) = error {
             report.message = permission_denied_message(denial);
@@ -140,6 +157,7 @@ impl From<&LimboError> for ErrorReport {
         }
         if let LimboError::Dialect(error) = error {
             report.detail.clone_from(&error.detail);
+            report.hint.clone_from(&error.hint);
         }
         report
     }

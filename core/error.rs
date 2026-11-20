@@ -69,6 +69,9 @@ pub struct DialectError {
     /// More about the error, which a dialect may report apart from the
     /// message, such as the objects that keep it from dropping something.
     pub detail: Option<String>,
+    /// What the user can do about the error, which a dialect may report
+    /// apart from the message.
+    pub hint: Option<String>,
 }
 
 /// A DROP that was refused because other objects depend on what it drops.
