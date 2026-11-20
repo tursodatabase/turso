@@ -737,7 +737,12 @@ pub struct SearchOperation {
     value: Jsonb,
     mode: PathOperationMode,
     value_offset: usize,
+    /// The offset after the element that the search found, or 0.
+    value_end: usize,
     label_offset: Option<usize>,
+    /// Whether the search copies the element that it finds, for
+    /// [Self::result].
+    copies_value: bool,
 }
 
 impl SearchOperation {
@@ -746,8 +751,35 @@ impl SearchOperation {
             mode: PathOperationMode::ReplaceExisting,
             value: Jsonb::empty(),
             value_offset: 0,
+            value_end: 0,
             label_offset: None,
+            copies_value: true,
         }
+    }
+
+    /// A search that does not copy the element that it finds. The caller
+    /// gets the element with [Self::into_element].
+    pub fn locate() -> Self {
+        Self {
+            copies_value: false,
+            ..Self::new()
+        }
+    }
+
+    /// Returns the element that the search found in `json`, in the buffer of
+    /// `json`: the element moves to the start of the buffer, and the bytes
+    /// after it are cut off. Returns an empty document, as [Self::result]
+    /// does, if the search found nothing.
+    ///
+    /// The buffer keeps its capacity, so this is for a caller that converts
+    /// the element and then drops it.
+    pub fn into_element(self, mut json: Jsonb) -> Jsonb {
+        if self.value_end == 0 {
+            return Jsonb::empty();
+        }
+        json.data.copy_within(self.value_offset..self.value_end, 0);
+        json.data.truncate(self.value_end - self.value_offset);
+        json
     }
 
     pub fn value_offset(&self) -> usize {
@@ -781,8 +813,11 @@ impl PathOperation for SearchOperation {
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         let end = json.element_end(idx, &[header_size, size])?;
-        self.value = Jsonb::from_raw_data(&json.data[idx..end])?;
+        if self.copies_value {
+            self.value = Jsonb::from_raw_data(&json.data[idx..end])?;
+        }
         self.value_offset = idx;
+        self.value_end = end;
         self.label_offset = label_idx;
 
         Ok(())
@@ -6277,6 +6312,57 @@ mod path_operations_tests {
         // Should return an error instead of panicking with overflow
         let result = jsonb.array_len();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn located_element_is_the_element_that_a_search_copies() {
+        let doc = Jsonb::from_str(r#"{"a":1,"b":[2,"three"],"c":{"d":null}}"#).unwrap();
+        let paths = [
+            vec![PathElement::Root()],
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("a"), false),
+            ],
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("b"), false),
+            ],
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("b"), false),
+                PathElement::ArrayLocator(Some(1)),
+            ],
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("c"), false),
+                PathElement::Key(Cow::Borrowed("d"), false),
+            ],
+            // Paths that find nothing.
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("e"), false),
+            ],
+            vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed("b"), false),
+                PathElement::ArrayLocator(Some(5)),
+            ],
+        ];
+        for elements in paths {
+            let path = create_path(elements);
+            let mut copy = doc.clone();
+            let mut search = SearchOperation::new();
+            let copied = copy.operate_on_path(&path, &mut search);
+            let mut located = doc.clone();
+            let mut locate = SearchOperation::locate();
+            let found = located.operate_on_path(&path, &mut locate);
+            assert_eq!(copied.is_ok(), found.is_ok(), "{path:?}");
+            assert_eq!(
+                locate.into_element(located).data,
+                search.result().data,
+                "{path:?}"
+            );
+        }
     }
 
     /// A child element whose declared size runs past the buffer must not reach
