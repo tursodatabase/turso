@@ -478,17 +478,12 @@ expect error {
     invalid input value for enum "it's ""x""": "b"
 }
 
-@compat-gap "type:date"
 test select-cast-to-domain {
     CREATE DOMAIN dd AS date;
     SELECT '2024-01-01'::dd;
 }
 expect {
     2024-01-01
-}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
 }
 
 test select-cast-to-domain-checks-constraint {
@@ -518,7 +513,7 @@ test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
 }
 expect error {}
 
-@compat-gap "type:date"
+@compat-gap "type:time"
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
@@ -527,7 +522,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    type "time" is not supported
 }
 
 test select-cast-text-to-timestamp {
@@ -537,16 +532,11 @@ expect {
     2024-01-15 10:30:00
 }
 
-@compat-gap "type:date"
 test select-cast-invalid-text-to-date {
     SELECT 'hello'::date;
 }
 @sqlstate 22007
 expect error {}
-@sqlstate 0A000
-expect @tursopg error {
-    type "date" is not supported
-}
 
 test select-cast-invalid-text-to-timestamp {
     SELECT 'hello'::timestamp;
@@ -872,7 +862,7 @@ test exists-subquery-with-empty-select-list-rejects-group-by-position {
 expect error {
 }
 
-@compat-gap "type:date"
+@compat-gap "function:current_date"
 test select-current-data-and-time {
     SELECT 'ok'
     WHERE CURRENT_DATE IS NOT NULL
@@ -884,7 +874,7 @@ expect {
 }
 @sqlstate 0A000
 expect @tursopg error {
-    type "date" is not supported
+    CURRENT_DATE is not supported
 }
 
 setup comma_and_join {
@@ -2352,6 +2342,7 @@ expect {
     4.00|1
 }
 
+@compat-gap "syntax:window-range-offset"
 test window-range-offset-over-date-is-an-error {
     CREATE TABLE range_dates(d date);
     SELECT count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_dates;
@@ -2360,9 +2351,9 @@ test window-range-offset-over-date-is-an-error {
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
 }
-@sqlstate 0A000
+@sqlstate 42601
 expect @tursopg error {
-    type "date" is not supported
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
 }
 
 test window-range-decimal-offset-over-bigint-is-an-error {

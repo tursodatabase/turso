@@ -172,18 +172,19 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence named
 `<table>_<column>_seq`, or, when a relation of the schema has that name,
 the first of `<table>_<column>_seq1`, `..._seq2`, ... that none has. boolean,
-smallint, bigint, uuid, timestamp[tz], bytea, json, jsonb, inet,
+smallint, bigint, uuid, date, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n) and
 numeric(p,s) keep their type modifiers; type modifiers on any other type,
 including char(n), timestamp(p) and bit(n), are rejected. xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
-date, time, timetz and interval, and arrays of every date and time type
-(`timestamp[]` and `timestamptz[]` included), are rejected as not supported
-(0A000) in column types, casts, typed literals and domains. So are
+time, timetz and interval, and arrays of every date and time type
+(`date[]`, `timestamp[]` and `timestamptz[]` included), are rejected as not
+supported (0A000) in column types, casts, typed literals and domains. So are
 `CURRENT_DATE`, `CURRENT_TIME`, `LOCALTIME` and the built-in functions that
-return date, time, timetz or interval, such as `age` and `make_date`.
+return date, time, timetz or interval, such as `age`, `make_date`, `to_date`
+and `date()`.
 
 `now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are the time the
 transaction started, and `LOCALTIMESTAMP` is that time as a timestamp in UTC;
@@ -196,12 +197,14 @@ Comparing values of two different custom types fails when either type changes
 the values it stores (a STRUCT or UNION, a type with ENCODE or a DECODE other
 than `value`), unless the two already have one order in common, as `numeric`
 and `bigint` do. A domain compares as the type it is declared on, so two
-domains over one type compare as that type. So a `timestamp` with a
-`timestamptz`, and a `timestamptz` with a `varchar(n)`, fail. PostgreSQL refuses
-the second pair too, with 42883.
+domains over one type compare as that type. So a `date`, a `timestamp` and a
+`timestamptz` fail with one another, and so does a `timestamptz` with a
+`varchar(n)`. PostgreSQL refuses the `timestamptz` with `varchar(n)` pair too,
+with 42883.
 The error is `cannot compare type x with type y` with SQLSTATE 0A000. Turso
 refuses comparisons that PostgreSQL may run and does not know which ones, so
-the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It covers `=`, `<`,
+the code differs from PostgreSQL's 42883 where PostgreSQL also refuses. It
+covers `=`, `<`,
 `IS DISTINCT FROM`, BETWEEN, IN and `IN (SELECT ...)`, `CASE x WHEN`, `NULLIF`,
 `min` and `max`, and joins, with or without an index. The same two types in
 one result column fail the same way: in UNION, UNION ALL, INTERSECT, EXCEPT, a
