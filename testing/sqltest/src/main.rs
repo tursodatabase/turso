@@ -118,6 +118,19 @@ enum Commands {
         paths: Vec<PathBuf>,
     },
 
+    /// Fail when a gap test of the base tree is gone from the head tree: deleted,
+    /// renamed, or converted into a plain test with other SQL, setups or
+    /// PostgreSQL answer
+    GapRemovals {
+        /// Test directory in the base tree, for example the target branch
+        #[arg(long)]
+        base: PathBuf,
+
+        /// The same test directory in the head tree
+        #[arg(long)]
+        head: PathBuf,
+    },
+
     /// Validate test file syntax and check for pending snapshots
     Check {
         /// Test files or directories
@@ -216,6 +229,7 @@ async fn main() -> ExitCode {
         }
         Commands::Check { paths, compat_gaps } => check_files(paths, compat_gaps).await,
         Commands::Gaps { paths } => print_gaps(paths).await,
+        Commands::GapRemovals { base, head } => check_gap_removals(base, head).await,
         Commands::Convert {
             paths,
             output_dir,
@@ -615,6 +629,30 @@ async fn print_gaps(paths: Vec<PathBuf>) -> ExitCode {
     );
     println!("{}", report.to_markdown());
     ExitCode::SUCCESS
+}
+
+/// Checks that the head tree keeps every gap test of the base tree, for the
+/// `gap-removals` command.
+async fn check_gap_removals(base: PathBuf, head: PathBuf) -> ExitCode {
+    let mut trees = Vec::new();
+    for (root, is_base) in [(&base, true), (&head, false)] {
+        match sqltest::gap_removals::load_tree(root, is_base).await {
+            Ok(files) => trees.push(files),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let errors = sqltest::gap_removals::removed_gaps(&trees[0], &trees[1]);
+    for error in &errors {
+        eprintln!("{} {error}", "Removed gap:".red().bold());
+    }
+    if errors.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 /// Simple resolver that holds the paths directly
