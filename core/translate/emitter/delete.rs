@@ -376,9 +376,15 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
-        if !fk_ref.fk.deferred {
+        if !fk_ref.fk.deferred && !fk_ref.is_self_referencing() {
             continue;
         }
+        let deferred = fk_ref.fk.deferred;
+        let null_skip = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred,
+            target_pc: null_skip,
+        });
         let child_positions: Vec<usize> = fk_ref
             .fk
             .child_columns
@@ -395,7 +401,6 @@ pub fn emit_fk_child_decrement_on_delete(
         )?;
 
         // Fast path: if any FK column is NULL can't be a violation
-        let null_skip = program.allocate_label();
         for &pos in &child_positions {
             program.emit_insn(Insn::IsNull {
                 reg: child_key.to_column_reg(pos),
@@ -440,7 +445,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done, true);
+            emit_guarded_fk_decrement(program, done, deferred);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -476,7 +481,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok, true);
+            emit_guarded_fk_decrement(program, ok, deferred);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
@@ -680,23 +685,6 @@ fn emit_delete_row_common(
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_namespace = unsafe { (*table_reference).namespace };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_namespace.database_id, |s| {
-                    s.any_resolved_fks_referencing(delete_namespace.id, table_name)
-                }) {
-                ForeignKeyActions::prepare_fk_delete_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    main_table_cursor_id,
-                    rowid_reg,
-                    None,
-                    delete_namespace,
-                )?
-            } else {
-                ForeignKeyActions::default()
-            };
             if t_ctx
                 .resolver
                 .with_schema(delete_namespace.database_id, |s| {
@@ -713,7 +701,24 @@ fn emit_delete_row_common(
                     &t_ctx.resolver,
                 )?;
             }
-            prepared
+            if t_ctx
+                .resolver
+                .with_schema(delete_namespace.database_id, |s| {
+                    s.any_resolved_fks_referencing(delete_namespace.id, table_name)
+                })
+            {
+                ForeignKeyActions::prepare_fk_delete_actions(
+                    program,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    main_table_cursor_id,
+                    rowid_reg,
+                    None,
+                    delete_namespace,
+                )?
+            } else {
+                ForeignKeyActions::default()
+            }
         } else {
             ForeignKeyActions::default()
         }

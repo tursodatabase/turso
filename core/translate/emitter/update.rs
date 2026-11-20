@@ -682,21 +682,6 @@ fn emit_replace_delete<'a>(
     let table_name = target_table.table.get_name();
     let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(update_namespace.id, table_name)
-        }) {
-            ForeignKeyActions::prepare_fk_delete_actions(
-                program,
-                &mut t_ctx.resolver,
-                table_name,
-                target_table_cursor_id,
-                conflicting_rowid_reg,
-                new_row_registers,
-                update_namespace,
-            )?
-        } else {
-            ForeignKeyActions::default()
-        };
         if t_ctx.resolver.with_schema(update_database_id, |s| {
             s.has_child_fks(update_namespace.id, table_name)
         }) {
@@ -713,7 +698,21 @@ fn emit_replace_delete<'a>(
                 &t_ctx.resolver,
             )?;
         }
-        prepared
+        if t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.any_resolved_fks_referencing(update_namespace.id, table_name)
+        }) {
+            ForeignKeyActions::prepare_fk_delete_actions(
+                program,
+                &mut t_ctx.resolver,
+                table_name,
+                target_table_cursor_id,
+                conflicting_rowid_reg,
+                new_row_registers,
+                update_namespace,
+            )?
+        } else {
+            ForeignKeyActions::default()
+        }
     } else {
         ForeignKeyActions::default()
     };

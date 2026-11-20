@@ -8064,6 +8064,15 @@ pub enum FkCheckParent {
 }
 
 impl ResolvedFkRef {
+    /// Returns true when the child and the parent are the same table.
+    pub fn is_self_referencing(&self) -> bool {
+        self.child_namespace == self.fk.parent_namespace
+            && self
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&self.fk.parent_table)
+    }
+
     /// Returns if any referenced parent column can change when these column positions are updated.
     pub fn parent_key_may_change(
         &self,
