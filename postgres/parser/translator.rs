@@ -14131,7 +14131,10 @@ mod tests {
     fn fail_closed_current_timestamp_precision() {
         assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
         assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
-        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+        // Precision 0 is refused too: PostgreSQL rounds to it and tursopg cannot.
+        assert_not_supported("SELECT CURRENT_TIMESTAMP(0)", "fractional-second precision");
+        assert_not_supported("SELECT LOCALTIMESTAMP(0)", "fractional-second precision");
+        assert_translates("SELECT CURRENT_TIMESTAMP, LOCALTIMESTAMP");
     }
 
     #[test]
