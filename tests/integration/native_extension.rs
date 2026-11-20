@@ -1418,9 +1418,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                     let table = result.unwrap();
                     let mut cursor = table.open(conn.clone()).unwrap();
                     assert!(matches!(
-                        cursor
-                            .filter(0, None, 0, turso_core::alloc::vec![])
-                            .unwrap(),
+                        cursor.filter(0, None, &mut []).unwrap(),
                         IOResult::Done(true)
                     ));
                     let IOResult::Done(value) = cursor.column(0).unwrap() else {

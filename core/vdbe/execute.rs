@@ -1534,20 +1534,20 @@ pub fn op_vfilter(
         insn
     );
     let has_rows = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_virtual_mut();
-
-        let args = (0..*arg_count)
-            .map(|i| state.registers[args_reg + i].get_value().try_clone())
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
             None
         };
+        let cursor = get_cursor!(state, *cursor_id);
+        let cursor = cursor.as_virtual_mut();
         return_if_io!(
             state,
-            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+            cursor.filter(
+                *idx_num as i32,
+                idx_str,
+                &mut state.registers[*args_reg..*args_reg + *arg_count],
+            )
         )
     };
     // Increment filter_operations metric for virtual table filter
