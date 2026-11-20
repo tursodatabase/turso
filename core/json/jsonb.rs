@@ -70,11 +70,6 @@ static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(
 /// The length of the part of `rest` that a string quoted with `quote` copies as
 /// it is: the offset of the first `quote`, backslash or control character in
 /// `rest`, or the length of `rest`. `quote` is `"` or `'`.
-///
-/// `rest` is the input after a position in a string, so it usually has 16 bytes
-/// or more also for a short string. On x86_64, each step tests 16 bytes with
-/// SSE2, which is part of the x86_64 baseline. The other bytes, and the bytes
-/// on other targets, are tested one at a time with a byte table.
 #[inline(always)]
 fn plain_part_len(rest: &[u8], quote: u8) -> usize {
     let ends_plain_part = if quote == b'"' {
@@ -82,6 +77,106 @@ fn plain_part_len(rest: &[u8], quote: u8) -> usize {
     } else {
         &ENDS_SINGLE_QUOTED_PLAIN_PART
     };
+    first_marked_byte::<true, false>(rest, rest.len(), quote, ends_plain_part)
+}
+
+/// The length of the start of the first `len` bytes of `rest` that the JSON
+/// text of a string copies as it is: the offset of the first byte to escape,
+/// or `len`. The bytes to escape are the control characters, and with
+/// `escape_quote_and_backslash` also `"` and the backslash. `len` is at most
+/// the length of `rest`.
+#[inline(always)]
+fn escape_free_len(rest: &[u8], len: usize, escape_quote_and_backslash: bool) -> usize {
+    if escape_quote_and_backslash {
+        first_marked_byte::<true, true>(rest, len, b'"', &ESCAPED_IN_TEXT)
+    } else {
+        first_marked_byte::<false, true>(rest, len, 0, &ESCAPED_IN_TEXTJ)
+    }
+}
+
+/// Appends the JSON text of the string `text`, without the quotes, to
+/// `string`. The control characters are escaped, and with
+/// `escape_quote_and_backslash` also `"` and the backslash. `scanned` starts
+/// with the bytes of `text` and can have more bytes after them, which the scan
+/// for the bytes to escape can read and ignore.
+#[inline(always)]
+fn push_escaped_text(
+    string: &mut String,
+    text: &str,
+    scanned: &[u8],
+    escape_quote_and_backslash: bool,
+) {
+    let len = escape_free_len(scanned, text.len(), escape_quote_and_backslash);
+    // Usually there is no byte to escape, and the JSON text of the string is
+    // the string itself.
+    if len == text.len() {
+        string.push_str(text);
+        return;
+    }
+    push_text_with_escapes(string, text, scanned, len, escape_quote_and_backslash);
+}
+
+/// [push_escaped_text] for a string with a byte to escape at `first_escape`.
+/// The bytes to escape are ASCII, so each part between them is UTF-8.
+#[inline(never)]
+fn push_text_with_escapes(
+    string: &mut String,
+    text: &str,
+    scanned: &[u8],
+    first_escape: usize,
+    escape_quote_and_backslash: bool,
+) {
+    let mut pos = 0;
+    let mut len = first_escape;
+    loop {
+        string.push_str(&text[pos..pos + len]);
+        pos += len;
+        let Some(&b) = text.as_bytes().get(pos) else {
+            return;
+        };
+        pos += 1;
+        match b {
+            b'"' => string.push_str("\\\""),
+            b'\\' => string.push_str("\\\\"),
+            0x08 => string.push_str("\\b"),
+            0x0C => string.push_str("\\f"),
+            b'\n' => string.push_str("\\n"),
+            b'\r' => string.push_str("\\r"),
+            b'\t' => string.push_str("\\t"),
+            c => {
+                let _ = write!(string, "\\u{c:04x}");
+            }
+        }
+        len = escape_free_len(
+            &scanned[pos..],
+            text.len() - pos,
+            escape_quote_and_backslash,
+        );
+    }
+}
+
+/// The offset of the first of the first `limit` bytes of `rest` that `table`
+/// marks, or `limit`. `table` marks the control characters, and with
+/// `QUOTE_AND_BACKSLASH` also `quote` and the backslash. `limit` is at most
+/// the length of `rest`, and without `BOUNDED` it is the length of `rest`.
+///
+/// On x86_64, each step tests 16 bytes with SSE2, which is part of the x86_64
+/// baseline. With `BOUNDED`, a step can read bytes of `rest` after `limit`, and
+/// ignores them, so a short string followed by more of the document is tested
+/// in one step. The last bytes, and the bytes on other targets, are tested one
+/// at a time with `table`.
+///
+/// The parser scans to the end of `rest`, and stops at the closing quote. The
+/// checks of `limit` cost the parser about 4% with Rust 1.88, so its copy of
+/// this function has no limit.
+#[inline(always)]
+fn first_marked_byte<const QUOTE_AND_BACKSLASH: bool, const BOUNDED: bool>(
+    rest: &[u8],
+    limit: usize,
+    quote: u8,
+    table: &[bool; 256],
+) -> usize {
+    debug_assert!(limit <= rest.len());
     #[cfg(target_arch = "x86_64")]
     let start = {
         use std::arch::x86_64::{
@@ -96,17 +191,25 @@ fn plain_part_len(rest: &[u8], quote: u8) -> usize {
             let quotes = _mm_set1_epi8(quote as i8);
             let backslashes = _mm_set1_epi8(b'\\' as i8);
             let last_control = _mm_set1_epi8(0x1F);
-            while offset + 16 <= rest.len() {
+            while (!BOUNDED || offset < limit) && offset + 16 <= rest.len() {
                 let chunk = _mm_loadu_si128(rest.as_ptr().add(offset).cast());
-                let is_quote = _mm_cmpeq_epi8(chunk, quotes);
-                let is_backslash = _mm_cmpeq_epi8(chunk, backslashes);
                 // A byte is a control character when it is at most 0x1F, that
                 // is, when the unsigned minimum with 0x1F is the byte.
-                let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
-                let mask = _mm_movemask_epi8(_mm_or_si128(
-                    _mm_or_si128(is_quote, is_backslash),
-                    is_control,
-                ));
+                let mut marked = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+                if QUOTE_AND_BACKSLASH {
+                    marked = _mm_or_si128(
+                        marked,
+                        _mm_or_si128(
+                            _mm_cmpeq_epi8(chunk, quotes),
+                            _mm_cmpeq_epi8(chunk, backslashes),
+                        ),
+                    );
+                }
+                let mut mask = _mm_movemask_epi8(marked) as u32;
+                if BOUNDED && limit - offset < 16 {
+                    // The bytes after `limit` are not part of the scan.
+                    mask &= (1 << (limit - offset)) - 1;
+                }
                 if mask != 0 {
                     return offset + mask.trailing_zeros() as usize;
                 }
@@ -117,11 +220,18 @@ fn plain_part_len(rest: &[u8], quote: u8) -> usize {
     };
     #[cfg(not(target_arch = "x86_64"))]
     let start = 0;
-    let tail = &rest[start..];
+    if BOUNDED && start >= limit {
+        return limit;
+    }
+    let tail = if BOUNDED {
+        &rest[start..limit]
+    } else {
+        &rest[start..]
+    };
     start
         + tail
             .iter()
-            .position(|&c| ends_plain_part[c as usize])
+            .position(|&c| table[c as usize])
             .unwrap_or(tail.len())
 }
 
@@ -1405,46 +1515,28 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let escaped = if *kind == ElementType::TEXTJ {
-                    &ESCAPED_IN_TEXTJ
-                } else {
-                    &ESCAPED_IN_TEXT
-                };
-                // Usually the payload is UTF-8 with no byte to escape, and
-                // its JSON text is the payload itself.
-                if let Some(text) = validate_utf8(word_slice)
-                    .filter(|text| !text.bytes().any(|b| escaped[b as usize]))
-                {
-                    string.push_str(text);
-                    if quote {
-                        string.push('"');
-                    }
-                    return Ok(end_cursor);
-                }
-                let word = utf8_lossy(word_slice);
-
-                let mut last_end = 0;
-                let bytes = word.as_bytes();
-                for i in 0..bytes.len() {
-                    let b = bytes[i];
-                    if escaped[b as usize] {
-                        string.push_str(&word[last_end..i]);
-                        match b {
-                            b'"' => string.push_str("\\\""),
-                            b'\\' => string.push_str("\\\\"),
-                            0x08 => string.push_str("\\b"),
-                            0x0C => string.push_str("\\f"),
-                            b'\n' => string.push_str("\\n"),
-                            b'\r' => string.push_str("\\r"),
-                            b'\t' => string.push_str("\\t"),
-                            c => {
-                                let _ = write!(string, "\\u{c:04x}");
-                            }
-                        }
-                        last_end = i + 1;
+                // A TEXTJ payload holds its quotes and backslashes as escapes
+                // already, so only its control characters are escaped.
+                let escape_quote_and_backslash = *kind != ElementType::TEXTJ;
+                match validate_utf8(word_slice) {
+                    // The bytes after the payload in the document let the scan
+                    // test 16 bytes at a time also for a short string.
+                    Some(text) => push_escaped_text(
+                        string,
+                        text,
+                        &self.data[cursor..],
+                        escape_quote_and_backslash,
+                    ),
+                    None => {
+                        let text = String::from_utf8_lossy(word_slice);
+                        push_escaped_text(
+                            string,
+                            &text,
+                            text.as_bytes(),
+                            escape_quote_and_backslash,
+                        );
                     }
                 }
-                string.push_str(&word[last_end..]);
             }
 
             // We have to escape some JSON5 escape sequences
@@ -5472,7 +5564,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_part_len_is_the_offset_of_the_first_special_byte() {
+    fn byte_scans_give_the_offset_of_the_first_special_byte() {
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
         let mut next = move || {
             state ^= state << 13;
@@ -5497,6 +5589,26 @@ mod tests {
                             .position(|&c| c == quote || c == b'\\' || c < 0x20)
                             .unwrap_or(rest.len());
                         assert_eq!(plain_part_len(rest, quote), expected, "{rest:?} {quote}");
+                    }
+                }
+                for start in 0..=len {
+                    let rest = &input[start..];
+                    for limit in [0, rest.len() / 2, rest.len().saturating_sub(1), rest.len()] {
+                        let part = &rest[..limit];
+                        let control = part.iter().position(|&c| c < 0x20);
+                        let escaped = part
+                            .iter()
+                            .position(|&c| c < 0x20 || c == b'"' || c == b'\\');
+                        assert_eq!(
+                            escape_free_len(rest, limit, false),
+                            control.unwrap_or(limit),
+                            "{rest:?} {limit}"
+                        );
+                        assert_eq!(
+                            escape_free_len(rest, limit, true),
+                            escaped.unwrap_or(limit),
+                            "{rest:?} {limit}"
+                        );
                     }
                 }
             }
