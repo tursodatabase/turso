@@ -195,7 +195,7 @@ pub fn prepare_select_plan(
 #[turso_macros::trace_stack]
 pub(crate) fn prepare_select_plan_from_arms(
     first_arm: ast::OneSelect,
-    compound_arms: impl IntoIterator<Item = CompoundSelect, IntoIter: ExactSizeIterator>,
+    compound_arms: impl IntoIterator<Item = CompoundSelect>,
     with: Option<ast::With>,
     order_by: Vec<ast::SortedColumn>,
     limit: Option<ast::Limit>,
@@ -207,12 +207,6 @@ pub(crate) fn prepare_select_plan_from_arms(
 ) -> Result<Plan> {
     let _nested_query = resolver.enter_nested_query()?;
     let mut compound_arms = compound_arms.into_iter().peekable();
-    // The first arm and the compound arms. The parser does not apply this limit
-    // to the SQL that the schema stores, and the code generator recurses one
-    // time for each term.
-    if compound_arms.len() + 1 > turso_parser::MAX_COMPOUND_SELECT {
-        return Err(too_many_compound_terms_error());
-    }
     if compound_arms.peek().is_none() {
         return Ok(Plan::Select(Box::new(prepare_one_select_plan(
             first_arm,
@@ -301,16 +295,6 @@ pub(crate) fn prepare_select_plan_from_arms(
         offset,
         order_by,
     })
-}
-
-/// The error for a compound SELECT with more than
-/// [turso_parser::MAX_COMPOUND_SELECT] terms. It is out of line, so that the
-/// frame of [prepare_select_plan_from_arms], which recurses one time for each
-/// level of nested queries, does not hold the temporaries of the error.
-#[cold]
-#[inline(never)]
-fn too_many_compound_terms_error() -> crate::LimboError {
-    crate::LimboError::ParseError(turso_parser::TOO_MANY_COMPOUND_TERMS_MESSAGE.to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -109,8 +109,7 @@ fn expression_tree_too_large_error() -> Error {
 }
 
 /// The message of the error for a compound SELECT with more terms than
-/// [`MAX_COMPOUND_SELECT`]. The planner gives the same error for the stored SQL
-/// that [`Parser::new_for_stored_sql`] parses.
+/// [`MAX_COMPOUND_SELECT`].
 pub const TOO_MANY_COMPOUND_TERMS_MESSAGE: &str = "too many terms in compound SELECT";
 
 #[cold]
@@ -221,9 +220,6 @@ pub struct Parser<'a> {
     /// Number of queries and parenthesized FROM terms that enclose the current
     /// position, without the query of the statement, bounded by [`MAX_QUERY_DEPTH`]
     query_nesting_depth: u32,
-    /// Whether the parser applies [`MAX_QUERY_DEPTH`] and [`MAX_COMPOUND_SELECT`].
-    /// False for SQL that the schema or the engine stores.
-    applies_statement_limits: bool,
     /// Height of the most recently parsed expression (`1 + max(child heights)`,
     /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
     last_expr_height: usize,
@@ -242,15 +238,12 @@ pub const MAX_EXPR_DEPTH: usize = 100;
 /// Maximum number of terms in a compound SELECT, the same as SQLite's
 /// `SQLITE_MAX_COMPOUND_SELECT` (default 500). The code generator recurses one
 /// time for each term, so this limit bounds its stack use.
-/// [`Parser::new_for_stored_sql`] does not apply it, but the planner applies it
-/// to all SQL.
 pub const MAX_COMPOUND_SELECT: usize = 500;
 
 /// Maximum nesting depth of queries: subqueries in a FROM clause or in an
 /// expression, CTE bodies, and parenthesized FROM terms. SQLite has no such
 /// limit. The parser, the planner and the code generator recurse one time for
-/// each level, so this limit bounds their stack use. [`Parser::new_for_stored_sql`]
-/// does not apply it.
+/// each level, so this limit bounds their stack use.
 pub const MAX_QUERY_DEPTH: usize = 500;
 
 impl<'a> Iterator for Parser<'a> {
@@ -278,21 +271,9 @@ impl<'a> Parser<'a> {
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
             query_nesting_depth: 0,
-            applies_statement_limits: true,
             last_expr_height: 0,
             domain_default_ends_at_not_null: false,
         }
-    }
-
-    /// Makes a parser for SQL that the schema or the engine stores. SQLite and
-    /// older versions of Turso can have written this SQL without the limits
-    /// [`MAX_QUERY_DEPTH`] and [`MAX_COMPOUND_SELECT`], so this parser does not
-    /// apply them. The planner still applies both limits when a statement uses
-    /// this SQL.
-    pub fn new_for_stored_sql(input: &'a [u8]) -> Self {
-        let mut parser = Self::new(input);
-        parser.applies_statement_limits = false;
-        parser
     }
 
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
@@ -3227,7 +3208,7 @@ impl<'a> Parser<'a> {
     /// Parses a query or a parenthesized FROM term that is nested in another
     /// one, bounding the nesting depth by [`MAX_QUERY_DEPTH`].
     fn parse_nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        if self.applies_statement_limits && self.query_nesting_depth as usize >= MAX_QUERY_DEPTH {
+        if self.query_nesting_depth as usize >= MAX_QUERY_DEPTH {
             return Err(query_nested_too_deeply_error());
         }
         self.query_nesting_depth += 1;
@@ -3408,7 +3389,7 @@ impl<'a> Parser<'a> {
             // The first term and the terms in `compounds`, plus the one to parse.
             // SQLite does not count a compound whose last term is VALUES. Turso
             // counts it, because the code generator recurses for its terms too.
-            if self.applies_statement_limits && compounds.len() + 2 > MAX_COMPOUND_SELECT {
+            if compounds.len() + 2 > MAX_COMPOUND_SELECT {
                 return Err(too_many_compound_terms_error());
             }
             compounds.push(CompoundSelect {

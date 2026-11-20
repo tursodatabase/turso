@@ -55,12 +55,12 @@ programs that execute one inside the other, for example a chain of triggers or
 an `ON DELETE CASCADE` through a chain of rows. As in SQLite, the error occurs
 only when a statement gets to level 1001, and the statement rolls back.
 
-The limits on compound terms and on nested queries do not apply when Turso
-reads the views and triggers that a database stores, because SQLite and older
-versions of Turso can have written them without these limits. Thus such a
-database opens. A statement that uses a stored view or trigger with more than
-500 levels of nested queries, or with a compound `SELECT` of more than 500
-terms, gets the error of that limit.
+The limits on compound terms and on nested queries also apply when Turso reads
+the views and triggers that a database stores. SQLite and older versions of
+Turso can have written them without these limits, but SQL this deep can
+overflow the stack of Turso. Thus Turso does not load such a view: a statement
+that reads it gets an error, `ALTER TABLE` gets the error of the limit, and
+`DROP VIEW` removes the view. A database with such a trigger does not open.
 
 ## PostgreSQL schema metadata
 

@@ -491,21 +491,29 @@ fn run_then_count(
 
 /// SQLite has no limit on the nesting of queries, and it does not count the
 /// terms of a compound whose last term is VALUES. So a database that it wrote
-/// can store views and triggers that go past the parse limits of Turso. Turso
-/// opens such a database. The statements that use a view or trigger past a
-/// limit get the error of that limit from the planner.
+/// can store views past the limits of Turso. Turso reads the SQL of these views
+/// with the same limits as the SQL of statements, so such a view is
+/// unavailable, and `ALTER TABLE` stops with the error of the limit. The other
+/// views and tables stay available, and `DROP VIEW` removes such a view.
 #[test]
-fn stored_sql_over_the_parse_limits_still_loads() {
+fn stored_views_past_the_limits_are_unavailable() {
     on_worker_thread(|| {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("deep.db");
-        write_database_over_the_parse_limits(&path);
+        let nested = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 100);
+        let compound_at_the_limit = compound_ending_in_values(MAX_COMPOUND_SELECT);
+        let compound_over_the_limit = compound_ending_in_values(MAX_COMPOUND_SELECT + 1);
+        write_database_with_sqlite(
+            &path,
+            &format!(
+                "CREATE TABLE t(x); CREATE VIEW v AS {nested}; \
+                 CREATE VIEW w AS {compound_at_the_limit}; \
+                 CREATE VIEW x AS {compound_over_the_limit};"
+            ),
+        );
 
         let db = crate::common::TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
-        let names =
-            crate::common::limbo_exec_rows(&conn, "SELECT name FROM sqlite_schema ORDER BY name");
-        assert_eq!(names.len(), 6, "{names:?}");
         let rows = crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM w");
         assert_eq!(
             rows,
@@ -513,75 +521,68 @@ fn stored_sql_over_the_parse_limits_still_loads() {
                 MAX_COMPOUND_SELECT as i64
             )]]
         );
-        for (sql, error) in [
-            ("SELECT * FROM v", query_nested_too_deeply()),
-            ("INSERT INTO u VALUES (1)", query_nested_too_deeply()),
-            (
-                "SELECT count(*) FROM x",
-                TOO_MANY_COMPOUND_TERMS_MESSAGE.to_string(),
-            ),
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            assert_eq!(err.to_string(), error, "{sql}");
+        for view in ["v", "x"] {
+            let err = conn.execute(format!("SELECT * FROM {view}")).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("view '{view}' could not be loaded")),
+                "{view}: {err}"
+            );
         }
-        let rows = crate::common::limbo_exec_rows(&conn, "SELECT count(*) FROM u");
-        assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(0)]]);
+        let err = conn.execute("ALTER TABLE t RENAME TO t2").unwrap_err();
+        assert!(
+            err.to_string().contains(&query_nested_too_deeply()),
+            "{err}"
+        );
+        conn.execute("DROP VIEW v").unwrap();
+        let err = conn.execute("ALTER TABLE t RENAME TO t2").unwrap_err();
+        assert!(
+            err.to_string().contains(TOO_MANY_COMPOUND_TERMS_MESSAGE),
+            "{err}"
+        );
+        conn.execute("DROP VIEW x").unwrap();
+        conn.execute("ALTER TABLE t RENAME TO t2").unwrap();
     });
 }
 
-/// ALTER TABLE rewrites the stored SQL that names the renamed table or column.
-/// It parses all stored SQL, also the SQL past the parse limits, as the schema
-/// loader does.
+/// A trigger past a limit stops the open of the database, as other trigger SQL
+/// that does not parse does.
 #[test]
-fn alter_table_rewrites_stored_sql_over_the_parse_limits() {
+fn stored_trigger_past_the_nesting_limit_stops_the_open() {
     on_worker_thread(|| {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("deep.db");
-        write_database_over_the_parse_limits(&path);
-
-        let db = crate::common::TempDatabase::new_with_existent(&path);
-        let conn = db.connect_limbo();
-        for sql in [
-            "ALTER TABLE t RENAME TO t2",
-            "ALTER TABLE t2 RENAME COLUMN x TO y",
-            "ALTER TABLE u RENAME TO u2",
-        ] {
-            conn.execute(sql)
-                .unwrap_or_else(|err| panic!("{sql}: {err}"));
-        }
-        let names = crate::common::limbo_exec_rows(
-            &conn,
-            "SELECT name FROM sqlite_schema WHERE sql LIKE '%t2%' ORDER BY name",
+        let nested = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 100);
+        write_database_with_sqlite(
+            &path,
+            &format!(
+                "CREATE TABLE t(x); CREATE TABLE u(x); \
+                 CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t {nested}; END;"
+            ),
         );
-        let text = |name: &str| vec![rusqlite::types::Value::Text(name.to_string())];
-        assert_eq!(names, vec![text("t2"), text("tr"), text("v")]);
+
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let Err(err) = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))
+        else {
+            panic!("the open must fail");
+        };
+        assert!(err.to_string().starts_with("invalid trigger sql"), "{err}");
     });
 }
 
-/// Writes a database with SQLite. Its view `v` and the body of its trigger `tr`
-/// on table `u` are nested `MAX_QUERY_DEPTH + 100` levels deep, and they read
-/// table `t`. Its views `w` and `x` are compounds of `MAX_COMPOUND_SELECT` and
-/// `MAX_COMPOUND_SELECT + 1` terms whose last term is VALUES.
-fn write_database_over_the_parse_limits(path: &std::path::Path) {
-    let select = (NESTED_QUERIES[0].build)(MAX_QUERY_DEPTH + 100);
-    let compound = |terms: usize| {
-        format!(
-            "{} UNION ALL VALUES (2)",
-            vec!["SELECT 1"; terms - 1].join(" UNION ALL ")
-        )
-    };
-    let compound_at_the_limit = compound(MAX_COMPOUND_SELECT);
-    let compound_over_the_limit = compound(MAX_COMPOUND_SELECT + 1);
+/// A compound SELECT of `terms` terms whose last term is VALUES.
+fn compound_ending_in_values(terms: usize) -> String {
+    format!(
+        "{} UNION ALL VALUES (2)",
+        vec!["SELECT 1"; terms - 1].join(" UNION ALL ")
+    )
+}
+
+/// Writes a database in WAL mode with SQLite, and runs `sql` in it.
+fn write_database_with_sqlite(path: &std::path::Path, sql: &str) {
     let sqlite = rusqlite::Connection::open(path).unwrap();
     sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
-    sqlite
-        .execute_batch(&format!(
-            "CREATE TABLE t(x); CREATE TABLE u(x); CREATE VIEW v AS {select}; \
-             CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO t {select}; END; \
-             CREATE VIEW w AS {compound_at_the_limit}; \
-             CREATE VIEW x AS {compound_over_the_limit};"
-        ))
-        .unwrap();
+    sqlite.execute_batch(sql).unwrap();
 }
 
 /// Runs `f` on a thread with [WORKER_STACK] bytes of stack.
