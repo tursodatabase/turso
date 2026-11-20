@@ -7,6 +7,7 @@ use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::select::check_values_has_no_order_by_or_limit;
 use crate::translate::update::bind_set_expr;
 use crate::translate::{roles, row_security};
 use crate::turso_debug_assert;
@@ -3702,13 +3703,10 @@ fn translate_virtual_table_insert(
             crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT")
         }
         InsertBody::Select(select, None) => match &mut select.body.select {
-            OneSelect::Values(_) if !select.order_by.is_empty() => {
-                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause")
+            OneSelect::Values(values) => {
+                check_values_has_no_order_by_or_limit(&select.order_by, select.limit.as_ref())?;
+                (values[0].len(), std::mem::take(values))
             }
-            OneSelect::Values(_) if select.limit.is_some() => {
-                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause")
-            }
-            OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
         InsertBody::DefaultValues => (0, vec![vec![]]),
