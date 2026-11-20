@@ -255,6 +255,9 @@ fn emit_visibility_fold(
                     dest,
                 });
             }
+            ast::CompoundOperator::ExceptAll | ast::CompoundOperator::IntersectAll => {
+                unreachable!("build_plan_dag_node rejects EXCEPT ALL and INTERSECT ALL")
+            }
             ast::CompoundOperator::Except => {
                 program.emit_insn(Insn::Not {
                     reg: scratch_reg,
