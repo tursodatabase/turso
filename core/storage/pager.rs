@@ -2014,6 +2014,17 @@ impl Pager {
         self.record_pool.lock().pop()
     }
 
+    /// Capacities of the record buffers that later cursors on this pager can
+    /// reuse.
+    #[cfg(feature = "test_helper")]
+    pub fn record_pool_capacities(&self) -> Vec<usize> {
+        self.record_pool
+            .lock()
+            .iter()
+            .map(|buf| buf.capacity())
+            .collect()
+    }
+
     /// Keep a retired record buffer for the next cursor on this pager. Extra
     /// buffers beyond the pool size or larger than the largest page are freed.
     pub(crate) fn recycle_record_buf(&self, buf: crate::types::RecordBuf) {
@@ -3215,8 +3226,10 @@ impl Pager {
         self.wal.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
+    /// The address of the shared WAL state of the pager's WAL file, or None
+    /// when the pager has no WAL file.
+    #[cfg(feature = "test_helper")]
+    pub fn wal_shared_ptr(&self) -> Option<usize> {
         self.wal
             .as_ref()
             .and_then(|wal| wal.as_any().downcast_ref::<crate::storage::wal::WalFile>())
@@ -6587,7 +6600,6 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use crate::security::roles::SessionRole;
     use crate::sync::Arc;
 
     use crate::sync::RwLock;
@@ -6603,34 +6615,6 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
-
-    #[test]
-    fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
-        let io = Arc::new(MemoryIO::new());
-        let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (2, CAST(zeroblob(5000) AS TEXT), 'small')")
-            .unwrap();
-        conn.execute("SELECT body FROM t WHERE id = 1").unwrap();
-        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 1")
-            .unwrap();
-        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 2")
-            .unwrap();
-
-        let pager = conn.get_pager();
-        let pool = pager.record_pool.lock();
-        assert!(!pool.is_empty());
-        for buf in pool.iter() {
-            assert!(buf.capacity() <= super::PageSize::MAX as usize);
-        }
-    }
 
     #[test]
     fn checkpoint_reset_does_not_reuse_failed_header_read() {
@@ -7279,15 +7263,16 @@ mod ptrmap_tests {
 #[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::io::{PlatformIO, IO};
     use crate::security::roles::SessionRole;
+    use crate::storage::pager::test_writes::commit_new_pages;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::SqliteDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -7322,7 +7307,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         (db, dir)
@@ -7344,14 +7329,7 @@ mod checkpoint_phase_tests {
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
         conn.wal_auto_actions_disable();
-        conn.execute("create table test(id integer primary key, value blob)")
-            .unwrap();
-        conn.execute("begin immediate").unwrap();
-        for _ in 0..32 {
-            conn.execute("insert into test(value) values (randomblob(2048))")
-                .unwrap();
-        }
-        conn.execute("commit").unwrap();
+        commit_new_pages(&conn, 32);
         assert!(
             db.shared_wal
                 .read()
@@ -7426,5 +7404,49 @@ mod checkpoint_phase_tests {
             ),
             "resuming after the post-sync gap must install a valid durable backfill proof"
         );
+    }
+}
+
+/// Write transactions for unit tests that need WAL frames but cannot run SQL.
+#[cfg(test)]
+pub(crate) mod test_writes {
+    use crate::util::IOExt;
+    use crate::{Connection, Pager, SyncMode};
+
+    /// Grows the database by `count` pages in one committed write transaction
+    /// of `conn`. The transaction writes the new pages and page 1.
+    pub(crate) fn commit_new_pages(conn: &Connection, count: usize) {
+        commit_write_tx(conn, |pager| {
+            for _ in 0..count {
+                pager.io.block(|| pager.allocate_page()).unwrap();
+            }
+        });
+    }
+
+    /// Sets the user version in the database header in one committed write
+    /// transaction of `conn`. The transaction writes only page 1.
+    pub(crate) fn commit_user_version(conn: &Connection, user_version: i32) {
+        commit_write_tx(conn, |pager| {
+            pager
+                .io
+                .block(|| pager.with_header_mut(|header| header.user_version = user_version.into()))
+                .unwrap();
+        });
+    }
+
+    /// Commits one write transaction of `conn` in which `write` changes pages
+    /// through the pager.
+    pub(crate) fn commit_write_tx(conn: &Connection, write: impl FnOnce(&Pager)) {
+        let pager = conn.pager.load();
+        pager.begin_read_tx().unwrap();
+        pager
+            .io
+            .block(|| pager.begin_write_tx(conn.wal_auto_actions()))
+            .unwrap();
+        write(&pager);
+        pager
+            .io
+            .block(|| pager.commit_tx(conn, SyncMode::Full, true))
+            .unwrap();
     }
 }

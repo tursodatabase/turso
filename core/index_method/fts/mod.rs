@@ -693,6 +693,17 @@ impl FtsIndexAttachment {
         dialect: &dyn crate::dialect::Dialect,
         cfg: IndexMethodConfiguration,
     ) -> Result<Self> {
+        let pattern_sql = query_pattern_sql(&cfg);
+        let patterns = parse_patterns(dialect, &pattern_sql.each_ref().map(String::as_str))?;
+        Self::with_patterns(cfg, patterns)
+    }
+
+    /// Build the attachment with already parsed query patterns, in the
+    /// order of [`query_pattern_sql`].
+    pub(crate) fn with_patterns(
+        cfg: IndexMethodConfiguration,
+        patterns: Vec<Select>,
+    ) -> Result<Self> {
         // Validate WITH clause keys the same way bad values are validated:
         // a typo like `tokenzier` must be an error, not a silently different
         // index. Keys are matched case-insensitively.
@@ -867,52 +878,6 @@ impl FtsIndexAttachment {
 
         let schema = schema_builder.build();
 
-        // Build query patterns for FTS
-        // Order matters: more specific patterns should come first
-        let cols = cfg
-            .columns
-            .iter()
-            .map(|c| crate::util::quote_identifier(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let table = crate::util::quote_identifier(&cfg.table_name);
-
-        // Pattern 0: score with ORDER BY DESC LIMIT
-        let score_pattern = format!(
-            "SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
-        let combined_ordered_limit = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC LIMIT ?"
-        );
-        // Pattern 2: combined + ORDER BY DESC (no LIMIT)
-        let combined_ordered = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC"
-        );
-        // Pattern 3: combined + LIMIT (no ORDER BY)
-        let combined_limit = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) LIMIT ?"
-        );
-        // Pattern 4: combined (no ORDER BY, no LIMIT)
-        let combined = format!(
-            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1)"
-        );
-        // Pattern 5: match + LIMIT
-        let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
-        // Pattern 6: match (no LIMIT)
-        let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
-        let patterns = parse_patterns(
-            dialect,
-            &[
-                &score_pattern,          // 0
-                &combined_ordered_limit, // 1
-                &combined_ordered,       // 2
-                &combined_limit,         // 3
-                &combined,               // 4
-                &match_limit,            // 5
-                &match_pattern,          // 6
-            ],
-        )?;
         Ok(Self {
             cfg,
             schema,
@@ -926,6 +891,36 @@ impl FtsIndexAttachment {
             shared: Arc::new(FtsShared::default()),
         })
     }
+}
+
+/// The SQL of the query patterns of an FTS index on `cfg`, more specific
+/// patterns first.
+fn query_pattern_sql(cfg: &IndexMethodConfiguration) -> [String; 7] {
+    let cols = cfg
+        .columns
+        .iter()
+        .map(|c| crate::util::quote_identifier(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = crate::util::quote_identifier(&cfg.table_name);
+    let score = format!("fts_score({cols}, ?1) as score FROM {table}");
+    let fts_match = format!("WHERE fts_match({cols}, ?1)");
+    [
+        // 0: score with ORDER BY DESC LIMIT
+        format!("SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"),
+        // 1: combined + ORDER BY DESC + LIMIT (most specific)
+        format!("SELECT {score} {fts_match} ORDER BY score DESC LIMIT ?"),
+        // 2: combined + ORDER BY DESC (no LIMIT)
+        format!("SELECT {score} {fts_match} ORDER BY score DESC"),
+        // 3: combined + LIMIT (no ORDER BY)
+        format!("SELECT {score} {fts_match} LIMIT ?"),
+        // 4: combined (no ORDER BY, no LIMIT)
+        format!("SELECT {score} {fts_match}"),
+        // 5: match + LIMIT
+        format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?"),
+        // 6: match (no LIMIT)
+        format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)"),
+    ]
 }
 
 fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<HashSet<String>> {

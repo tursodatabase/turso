@@ -41,16 +41,22 @@ pub(crate) trait LoadStep: Send {
 }
 
 /// A statement of a [`LoadStep`].
-pub(crate) struct LoadQuery {
-    sql: String,
-    origin: StatementOrigin,
+pub(crate) enum LoadQuery {
+    /// `SELECT * FROM sqlite_schema`, as
+    /// [`Connection::prepare_schema_table_read`] prepares it without parsing
+    /// SQL.
+    SchemaTableRead,
+    Sql {
+        sql: String,
+        origin: StatementOrigin,
+    },
 }
 
 impl LoadQuery {
     /// A read of an engine table, as
     /// [`Connection::prepare_engine_metadata_read`] prepares it.
     pub(crate) fn engine_metadata_read(sql: impl Into<String>) -> Self {
-        Self {
+        Self::Sql {
             sql: sql.into(),
             origin: StatementOrigin::EngineMetadataRead,
         }
@@ -58,7 +64,7 @@ impl LoadQuery {
 
     /// A helper statement, as [`Connection::prepare_internal`] prepares it.
     pub(crate) fn internal_helper(sql: impl Into<String>) -> Self {
-        Self {
+        Self::Sql {
             sql: sql.into(),
             origin: StatementOrigin::InternalHelper,
         }
@@ -183,9 +189,11 @@ impl SchemaLoader {
                 conn.install_schema_keeping_dialect_schema(&self.load.schema)?;
                 self.current_step_schema_installed = true;
             }
-            let statement = conn
-                .prepare_with_origin(&query.sql, query.origin)
-                .map_err(|err| step.query_failed(QueryFailure::Prepare, err))?;
+            let statement = match query {
+                LoadQuery::SchemaTableRead => conn.prepare_schema_table_read(),
+                LoadQuery::Sql { sql, origin } => conn.prepare_with_origin(&sql, origin),
+            }
+            .map_err(|err| step.query_failed(QueryFailure::Prepare, err))?;
             self.statement = Some(Box::new(statement));
             return Ok(true);
         }
@@ -218,9 +226,7 @@ impl LoadStep for SchemaRows {
             return Ok(None);
         }
         self.queried = true;
-        Ok(Some(LoadQuery::engine_metadata_read(
-            "SELECT * FROM sqlite_schema",
-        )))
+        Ok(Some(LoadQuery::SchemaTableRead))
     }
 
     fn row(&mut self, load: &mut SchemaLoad, row: &Row) -> Result<()> {

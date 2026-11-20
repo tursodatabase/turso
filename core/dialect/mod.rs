@@ -17,6 +17,8 @@
 //! `sqlite_schema`, is SQLite syntax in every database. Core parses it with
 //! [`Dialect::parse_internal`] of the database's dialect.
 
+#[cfg(test)]
+pub(crate) mod cannot_parse;
 pub mod catalog;
 
 pub use crate::functions::builtin::{
@@ -34,7 +36,7 @@ use crate::{
     vdbe::{builder::ProgramBuilder, Register},
     Clock, CollationSeq, Connection, Func, LimboError, OpenOptions, Result, Value, IO,
 };
-use std::{any::Any, sync::Arc};
+use std::{any::Any, ops::Range, sync::Arc};
 use turso_parser::ast::{self, Cmd, CreateTableBody, IdentityKind, Privilege, QualifiedName, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
@@ -112,6 +114,11 @@ pub trait Dialect: Send + Sync + 'static {
     /// Parse the column definition that core keeps for `ALTER TABLE`, such
     /// as `b INTEGER DEFAULT 0`. The text is SQLite syntax in every dialect.
     fn parse_internal_column_definition(&self, sql: &str) -> Result<ast::ColumnDefinition>;
+
+    /// The byte ranges of the parameter markers in a statement that
+    /// [`Dialect::parse`] accepted, in the order they appear. Markers inside
+    /// string literals, quoted identifiers and comments are not parameters.
+    fn parameter_marker_ranges(&self, sql: &str) -> Result<Vec<Range<usize>>>;
 
     /// The dialect for the statements that core and the frontend run for
     /// themselves. Those statements are SQLite syntax and expect SQLite

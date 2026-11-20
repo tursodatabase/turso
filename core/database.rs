@@ -70,6 +70,7 @@ use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use tracing::{instrument, Level};
+use turso_parser::ast;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1779,7 +1780,7 @@ impl Database {
                                 .as_ref()
                                 .expect("conn must be initialized in Init phase");
                             state.mvcc_convert_stmt =
-                                Some(conn.prepare("PRAGMA journal_mode = 'mvcc'")?);
+                                Some(conn.prepare_ast_stmt(journal_mode_mvcc_pragma())?);
                         }
                         let stmt = state.mvcc_convert_stmt.as_mut().expect("created above");
                         return_if_io!(stmt.run_ignore_rows_nonblock());
@@ -3253,6 +3254,50 @@ impl Database {
         })
     }
 
+    /// The address of the WAL state that the connections of this database
+    /// share, to compare with [Pager::wal_shared_ptr].
+    #[cfg(feature = "test_helper")]
+    pub fn shared_wal_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared_wal) as usize
+    }
+
+    /// Indexes of the WAL read-lock slots that a connection of this database
+    /// holds.
+    #[cfg(feature = "test_helper")]
+    pub fn wal_read_slots_with_readers(&self) -> Vec<usize> {
+        self.shared_wal.read().read_slots_with_readers()
+    }
+
+    /// The oldest WAL frame that a reader in any process holds, or `None` if
+    /// no reader holds a WAL frame.
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    pub fn shared_wal_min_active_reader_frame(&self) -> Option<u64> {
+        self.shared_wal_coordination_for_tests()
+            .min_active_reader_frame()
+    }
+
+    /// Whether a reader in any process reads only the database file.
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    pub fn shared_wal_has_active_db_file_reader(&self) -> bool {
+        self.shared_wal_coordination_for_tests()
+            .has_active_db_file_reader()
+    }
+
+    /// The number of shared WAL frame index blocks that page lookups scanned
+    /// since the previous call.
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    pub fn take_shared_wal_frame_index_blocks_scanned(&self) -> u64 {
+        self.shared_wal_coordination_for_tests()
+            .take_frame_index_blocks_scanned_for_tests()
+    }
+
+    #[cfg(all(feature = "test_helper", host_shared_wal))]
+    fn shared_wal_coordination_for_tests(&self) -> Arc<MappedSharedWalCoordination> {
+        self.shared_wal_coordination()
+            .unwrap()
+            .expect("the database must use shared WAL coordination")
+    }
+
     #[cfg(feature = "simulator")]
     pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
         #[cfg(host_shared_wal)]
@@ -3703,6 +3748,17 @@ impl Database {
     }
 }
 
+/// `PRAGMA journal_mode = 'mvcc'`, which converts a database to MVCC. It is
+/// built as a statement so that opening a database parses no SQL.
+fn journal_mode_mvcc_pragma() -> ast::Stmt {
+    ast::Stmt::Pragma {
+        name: ast::QualifiedName::single(ast::Name::exact("journal_mode".to_string())),
+        body: Some(ast::PragmaBody::Equals(Box::new(ast::Expr::Name(
+            ast::Name::from_string("'mvcc'"),
+        )))),
+    }
+}
+
 pub(crate) struct AttachedDatabase {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
@@ -3799,11 +3855,12 @@ mod database_tests {
     use std::sync::Arc;
 
     use super::{is_memory_like, Database, DatabaseKey, InitState, DATABASE_MANAGER};
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{PageCodec, PageCodecContext, PageCodecId};
     use crate::{
         storage::database::DatabaseFile, DatabaseStorage, IOResult, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, SqliteDialect, IO,
+        OpenOptions, PlatformIO, IO,
     };
 
     #[test]
@@ -3869,9 +3926,9 @@ mod database_tests {
         let path = path.to_str().unwrap();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), path, Arc::new(DialectThatCannotParse)).unwrap();
         let file_key = DatabaseKey::File(crate::io::get_file_id(path).unwrap());
-        let reopened = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
+        let reopened = Database::open_file(io, path, Arc::new(DialectThatCannotParse)).unwrap();
         assert!(Arc::ptr_eq(&db, &reopened));
         drop(reopened);
         assert!(DATABASE_MANAGER.lock().contains_key(&file_key));
@@ -3880,7 +3937,7 @@ mod database_tests {
 
         let name = "registry-entry-is-removed-when-last-database-reference-drops";
         let memory_key = DatabaseKey::SharedMemory(name.to_string());
-        let db = Database::open_shared_memory(name, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_shared_memory(name, Arc::new(DialectThatCannotParse)).unwrap();
         assert!(DATABASE_MANAGER.lock().contains_key(&memory_key));
         drop(db);
         assert!(!DATABASE_MANAGER.lock().contains_key(&memory_key));
@@ -3916,7 +3973,7 @@ mod database_tests {
         let file = io.open_file(path, OpenFlags::Create, true).unwrap();
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(DialectThatCannotParse))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .page_codec(codec);

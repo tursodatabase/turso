@@ -214,9 +214,23 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialect::cannot_parse::DialectThatCannotParse;
     use crate::security::roles::SessionRole;
-    use crate::SqliteDialect;
     use crate::{ConnectOpts, Database};
+
+    #[test]
+    fn reparsing_an_empty_schema_parses_no_sql() {
+        let db = Database::open_file(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            Arc::new(DialectThatCannotParse),
+        )
+        .unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.reparse_schema().unwrap();
+    }
 
     /// The reparse of the schema installs a fresh schema before the
     /// dialect's schema state is read, and a statement compiled meanwhile
@@ -226,7 +240,7 @@ mod tests {
         let db = Database::open_file(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            Arc::new(SqliteDialect),
+            Arc::new(DialectThatCannotParse),
         )
         .unwrap();
         let conn = db
@@ -236,7 +250,7 @@ mod tests {
             schema.dialect_schema = Some(Arc::new(()));
         })
         .unwrap();
-        let fresh = crate::schema::builtin::schema_builder(&SqliteDialect, false)
+        let fresh = crate::schema::builtin::schema_builder(&DialectThatCannotParse, false)
             .unwrap()
             .build();
         assert!(fresh.dialect_schema.is_none());

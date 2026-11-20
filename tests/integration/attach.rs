@@ -406,6 +406,93 @@ fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> 
     Ok(())
 }
 
+/// A fresh database attached to an MVCC database is an MVCC database, and
+/// its pager has a WAL before the database is first written.
+#[test]
+fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_wal.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    let (attached_db, pager) = conn.attached_database("aux").unwrap();
+    assert!(attached_db.get_mv_store().is_some());
+    assert!(
+        pager.wal_shared_ptr().is_some(),
+        "the attached pager has no WAL"
+    );
+
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO aux.t VALUES(1)")?;
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+#[test]
+fn test_fresh_mvcc_attach_reuses_database_shared_wal() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_shared_wal.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO aux.t VALUES(1)")?;
+
+    let (attached_db, pager) = conn.attached_database("aux").unwrap();
+    let pager_shared_ptr = pager
+        .wal_shared_ptr()
+        .expect("the attached pager has no WAL");
+    assert_eq!(pager_shared_ptr, attached_db.shared_wal_ptr());
+    Ok(())
+}
+
+#[test]
+fn test_ddl_in_one_transaction_changes_the_schema_in_place() -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attach_ddl_in_place.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    for name in ["main", "temp", "aux"] {
+        conn.execute("BEGIN")?;
+        // The first DDL copies the schema, which the committed schema still shares.
+        conn.execute(format!("CREATE TABLE {name}.a(x)"))?;
+        let private_schema = conn.schema_address(name);
+        conn.execute(format!("CREATE TABLE {name}.b(x UNIQUE)"))?;
+        conn.execute(format!("CREATE INDEX {name}.b_x ON b(x)"))?;
+        conn.execute(format!(
+            "CREATE TRIGGER {name}.b_insert AFTER INSERT ON b BEGIN SELECT 1; END"
+        ))?;
+        assert_eq!(
+            conn.schema_address(name),
+            private_schema,
+            "DDL on {name} copied a schema that only this transaction uses"
+        );
+        conn.execute(format!("INSERT INTO {name}.b VALUES (1)"))?;
+
+        conn.execute("SAVEPOINT sp")?;
+        conn.execute(format!("CREATE TABLE {name}.c(x)"))?;
+        conn.execute(format!("CREATE TABLE {name}.d(x)"))?;
+        conn.execute("ROLLBACK TO sp")?;
+        assert!(conn.execute(format!("SELECT * FROM {name}.c")).is_err());
+        assert!(conn.execute(format!("SELECT * FROM {name}.d")).is_err());
+        conn.execute(format!("SELECT * FROM {name}.b"))?;
+
+        conn.execute("ROLLBACK")?;
+        for object in ["a", "b"] {
+            assert!(
+                conn.execute(format!("SELECT * FROM {name}.{object}"))
+                    .is_err(),
+                "{name}.{object} survived ROLLBACK"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[turso_macros::test]
 fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = attach_enabled_db(DatabaseOpts::new());

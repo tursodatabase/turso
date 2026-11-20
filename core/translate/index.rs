@@ -1638,35 +1638,28 @@ mod tests {
 
     #[test]
     fn canonical_create_index_sql_drops_schema_qualifier_from_index_name_only() {
-        let stmt = match crate::dialect::parse_statement(
-            &crate::SqliteDialect,
-            "CREATE INDEX aux.idx1 ON t1(name);",
-        )
-        .unwrap()
-        .unwrap()
-        {
-            ast::Cmd::Stmt(stmt) => stmt,
-            other => panic!("expected statement, got {other:?}"),
+        let name = |name: &str| ast::Name::exact(name.to_string());
+        // CREATE INDEX aux.idx1 ON t1(name)
+        let stmt = ast::Stmt::CreateIndex {
+            unique: false,
+            if_not_exists: false,
+            idx_name: ast::QualifiedName {
+                namespace: Some(name("aux")),
+                name: name("idx1"),
+                alias: None,
+            },
+            tbl_name: name("t1"),
+            using: None,
+            columns: vec![ast::SortedColumn {
+                expr: Box::new(ast::Expr::Id(name("name"))),
+                order: None,
+                nulls: None,
+            }],
+            with_clause: vec![],
+            where_clause: None,
         };
 
-        // let's confirm that the stmt does carry `aux`
-        let ast::Stmt::CreateIndex { idx_name, .. } = &stmt else {
-            panic!("expected CREATE INDEX statement");
-        };
-        assert_eq!(
-            idx_name
-                .namespace
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("aux")
-        );
-
-        let ast::Stmt::CreateIndex { tbl_name, .. } = &stmt else {
-            panic!("expected CREATE INDEX statement");
-        };
-        let canonical_sql =
-            canonical_create_index_sql(&stmt, idx_name.name.clone(), tbl_name.clone());
+        let canonical_sql = canonical_create_index_sql(&stmt, name("idx1"), name("t1"));
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
         let stored_sql = canonical_create_index_sql(
             &stmt,
