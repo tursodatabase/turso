@@ -1281,10 +1281,11 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
     Ok(decoded)
 }
 
+/// Validate every record, collecting payload bytes only when a type is requested.
 fn find_extension_payload(
     extension_block: &[u8],
     extension_record_count: u32,
-    wanted_type: u16,
+    wanted_type: Option<u16>,
 ) -> Result<Vec<u8>> {
     let mut offset = 0usize;
     let mut payload = Vec::new();
@@ -1324,7 +1325,7 @@ fn find_extension_payload(
                 "extension record payload is truncated".to_string(),
             ));
         }
-        if extension_type == wanted_type {
+        if Some(extension_type) == wanted_type {
             payload.extend_from_slice(&extension_block[payload_start..payload_end]);
         }
         offset = payload_end;
@@ -2817,7 +2818,7 @@ impl StreamingLogicalLogReader {
                     let portable_changes = match find_extension_payload(
                         &bytes,
                         extension_record_count,
-                        EXTENSION_TYPE_PORTABLE_CHANGES,
+                        Some(EXTENSION_TYPE_PORTABLE_CHANGES),
                     ) {
                         Ok(payload) => payload,
                         Err(LimboError::Corrupt(msg)) => {
@@ -2966,13 +2967,7 @@ impl StreamingLogicalLogReader {
                 header_bytes[38],
                 header_bytes[39],
             ]);
-            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-            }
-            if extension_size == 0 && extension_record_count != 0 {
-                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
-            }
-            if extension_size > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            if !valid_extension_header(extension_size as u64, extension_record_count, frame_flags) {
                 return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
             }
             (extension_size, extension_record_count, frame_flags)
@@ -3048,7 +3043,7 @@ impl StreamingLogicalLogReader {
             let portable_changes = find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
-                EXTENSION_TYPE_PORTABLE_CHANGES,
+                Some(EXTENSION_TYPE_PORTABLE_CHANGES),
             )?;
             let parsed_ops = parse_ops_from_plaintext(
                 &plaintext[recovery_start..recovery_end],
@@ -3255,15 +3250,7 @@ impl StreamingLogicalLogReader {
                 header_bytes[38],
                 header_bytes[39],
             ]);
-            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(IOResult::Done(ParseResult::InvalidFrame));
-            }
-            if extension_size_u64 == 0 && extension_record_count != 0 {
-                self.last_valid_offset = frame_start;
-                return Ok(IOResult::Done(ParseResult::InvalidFrame));
-            }
-            if extension_size_u64 > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            if !valid_extension_header(extension_size_u64, extension_record_count, frame_flags) {
                 self.last_valid_offset = frame_start;
                 return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
@@ -3329,7 +3316,7 @@ impl StreamingLogicalLogReader {
             let portable_changes = match find_extension_payload(
                 &plaintext[..extension_size],
                 extension_record_count,
-                EXTENSION_TYPE_PORTABLE_CHANGES,
+                Some(EXTENSION_TYPE_PORTABLE_CHANGES),
             ) {
                 Ok(payload) => payload,
                 Err(LimboError::Corrupt(msg)) => {
@@ -3348,7 +3335,7 @@ impl StreamingLogicalLogReader {
                         let portable_changes = match find_extension_payload(
                             &bytes,
                             extension_record_count,
-                            EXTENSION_TYPE_PORTABLE_CHANGES,
+                            Some(EXTENSION_TYPE_PORTABLE_CHANGES),
                         ) {
                             Ok(payload) => payload,
                             Err(LimboError::Corrupt(msg)) => {
@@ -3821,6 +3808,12 @@ enum PayloadParseResult {
     Ok(Vec<ParsedOp>, u32),
     /// Not enough bytes to complete the payload.
     Eof,
+}
+
+fn valid_extension_header(size: u64, count: u32, flags: u32) -> bool {
+    flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0
+        && (size != 0 || count == 0)
+        && (size == 0 || flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0)
 }
 
 /// Result of reading and decrypting one encrypted chunk into `decrypt_scratch`.
@@ -5974,6 +5967,49 @@ mod tests {
             Ok(ParseResult::InvalidFrame) => {}
             other => {
                 panic!("spliced frame from a different log should NOT validate, got {other:?}")
+            }
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_matches_reader_for_empty_extension_blocks() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        for version in [LOG_VERSION_V2, LOG_VERSION] {
+            for flags in [0, super::TX_FRAME_FLAG_HAS_EXTENSION_BLOCK] {
+                let bytes = LogHeader::new_with_version(&io, version).encode();
+                let header = validate_log_header(&bytes).unwrap();
+                let mut frame = vec![0; TX_EXT_HEADER_SIZE];
+                frame[..4].copy_from_slice(&EXT_FRAME_MAGIC.to_le_bytes());
+                frame[16..24].copy_from_slice(&1u64.to_le_bytes());
+                frame[36..40].copy_from_slice(&flags.to_le_bytes());
+                let crc = crc32c::crc32c_append(header.initial_crc(), &frame);
+                frame.extend(crc.to_le_bytes());
+                frame.extend(END_MAGIC.to_le_bytes());
+                let file = open_test_file(&io, &format!("empty-extension-{version}-{flags}"));
+                let mut stored = bytes.to_vec();
+                stored.extend(&frame);
+                overwrite_file_bytes(file.clone(), &io, &stored);
+                let mut reader = StreamingLogicalLogReader::new(file, None);
+                reader.read_header(&io).unwrap();
+                let native = io.block(|| reader.parse_next_transaction()).unwrap();
+                let accepted = version != LOG_VERSION_V2;
+                assert_eq!(matches!(native, ParseResult::Frame(_)), accepted);
+                let mut output = Vec::new();
+                assert_eq!(
+                    validate_frame_into(
+                        &header,
+                        LOG_HDR_SIZE as u64,
+                        &frame,
+                        header.initial_crc(),
+                        None,
+                        &mut output,
+                    )
+                    .is_ok(),
+                    accepted,
+                    "version={version}, flags={flags}"
+                );
             }
         }
     }
