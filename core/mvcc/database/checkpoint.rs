@@ -2187,13 +2187,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let total = self.write_set.len() + self.unwritten_table_rows.len();
         // The write set has the rows of each table in key order, so a cursor
         // that walks the rows map gets to each row in a few steps, where a
-        // lookup searches from the head of the map. A key below the previous
-        // key, as at the start of the next table, starts a new cursor,
-        // because the cursor only walks forward.
+        // lookup searches from the head of the map.
         let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
         let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
-        let mut previous_row_id: Option<&RowID> = None;
         while index < total {
             let current = index;
             index += 1;
@@ -2213,11 +2210,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     true,
                 )
             };
-            if previous_row_id.is_some_and(|previous| row_id < previous) {
-                rows = LockstepCursor::new(&mvstore.rows, &guard);
-            }
-            previous_row_id = Some(row_id);
-            if let Some(chain) = rows.advance_to(row_id) {
+            let chain = match rows.advance_to(row_id) {
+                Some(chain) => Some(chain),
+                // The cursor only walks forward, so it also gives None for a
+                // row that it has passed, as at the start of the next table.
+                // A new cursor searches from the head of the map, as a lookup
+                // does.
+                None => {
+                    rows = LockstepCursor::new(&mvstore.rows, &guard);
+                    rows.advance_to(row_id)
+                }
+            };
+            if let Some(chain) = chain {
                 let mut versions = chain.write();
                 if stamp {
                     self.mvstore.stamp_chain_materialized(
