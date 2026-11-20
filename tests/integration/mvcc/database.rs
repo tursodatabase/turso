@@ -5,6 +5,10 @@
 //! through read-only methods of `MvStore` such as `tx_snapshot()`, `watermarks()` and
 //! `debug_gc_snapshot()`.
 
+#[path = "../../../core/io/cursor_steps_test.rs"]
+mod cursor_steps_test;
+
+use self::cursor_steps_test::SeekBtreeSteps;
 use super::checkpoint::{
     assert_integrity_ok, get_rows, wal_path_for_db, FixedFailureInjector, FixedYieldInjector,
 };
@@ -5025,21 +5029,6 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     (rng, seed as u64)
 }
 
-/// Counts the B-tree steps MVCC cursors take to seek and to advance forward, and never yields.
-#[derive(Debug, Default)]
-struct SeekBtreeSteps(AtomicU64);
-
-impl YieldInjector for SeekBtreeSteps {
-    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
-        if point == CursorYieldPoint::SeekBtreeProgress.point()
-            || point == CursorYieldPoint::AdvanceBtreeForwardProgress.point()
-        {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-        false
-    }
-}
-
 /// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow
 /// returns each row's newest version, or nothing for a deleted or missing row, in a few B-tree
 /// steps however many shadowed rows follow its target.
@@ -5080,6 +5069,76 @@ fn test_exact_rowid_seek_over_shadowed_btree_rows() {
         );
         let taken = steps.0.load(Ordering::Relaxed);
         assert!(taken <= 2, "the seek for id {i} took {taken} B-tree steps");
+    }
+}
+
+/// What this test checks: a DELETE that walks an index removes every row in its range,
+/// including checkpointed (B-tree) rows that come after keys that exist only in MVCC. The
+/// delete loop removes each index entry with an exact-match seek on the same cursor it walks
+/// with, then steps that cursor to the next entry.
+mod test_index_delete_reaches_btree_rows_after_mvcc_only_keys {
+    use super::{get_rows, MvccTestDbNoConn, Value};
+
+    #[test]
+    fn case_1_non_unique_mvcc_keys_first() {
+        run(false, &[(1, 10), (2, 20)], &[(3, 30), (4, 40), (5, 50)]);
+    }
+
+    #[test]
+    fn case_2_non_unique_mvcc_keys_between() {
+        run(false, &[(2, 20), (4, 40)], &[(1, 10), (3, 30), (5, 50)]);
+    }
+
+    #[test]
+    fn case_3_unique_mvcc_keys_first() {
+        run(true, &[(1, 10), (2, 20)], &[(3, 30), (4, 40), (5, 50)]);
+    }
+
+    #[test]
+    fn case_4_unique_mvcc_keys_between() {
+        run(true, &[(2, 20), (4, 40)], &[(1, 10), (3, 30), (5, 50)]);
+    }
+
+    fn run(unique: bool, mvcc_rows: &[(i64, i64)], btree_rows: &[(i64, i64)]) {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        let unique_sql = if unique { "UNIQUE" } else { "" };
+        conn.execute(format!("CREATE {unique_sql} INDEX t_v ON t(v)"))
+            .unwrap();
+        let values = |rows: &[(i64, i64)]| {
+            rows.iter()
+                .map(|(id, v)| format!("({id},{v})"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        conn.execute(format!("INSERT INTO t VALUES {}", values(btree_rows)))
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("INSERT INTO t VALUES {}", values(mvcc_rows)))
+            .unwrap();
+
+        let plan = get_rows(&conn, "EXPLAIN DELETE FROM t WHERE v >= 0");
+        assert!(
+            plan.iter()
+                .any(|row| row.iter().any(|value| value.to_string() == "IdxDelete")),
+            "the DELETE must remove index entries with IdxDelete: {plan:?}"
+        );
+
+        conn.execute("DELETE FROM t WHERE v >= 0").unwrap();
+
+        assert_eq!(
+            get_rows(&conn, "SELECT id FROM t ORDER BY id"),
+            Vec::<Vec<Value>>::new(),
+            "the index-driven DELETE must remove every row in its range"
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT v FROM t WHERE v >= 0 ORDER BY v"),
+            Vec::<Vec<Value>>::new(),
+            "the index must not keep entries for deleted rows"
+        );
     }
 }
 
