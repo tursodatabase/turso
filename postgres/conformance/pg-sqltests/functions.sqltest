@@ -2967,3 +2967,13 @@ test star-argument-of-aggregate-and-window-functions {
 expect {
     1|1
 }
+
+# The clock functions keep microseconds. Of 200 clock readings at least one
+# has more than three fraction digits (PostgreSQL leaves out trailing zeros).
+test clock-timestamp-has-microseconds {
+    SELECT min(1) FROM (SELECT clock_timestamp()::text AS c FROM generate_series(1, 200)) s
+    WHERE c LIKE '%.____%';
+}
+expect {
+    1
+}
