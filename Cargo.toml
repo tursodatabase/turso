@@ -154,6 +154,10 @@ futures = "0.3"
 clap = "4.5.47"
 thiserror = "2.0.16"
 tempfile = "3.20.0"
+# aristo SDK from crates.io. It also has the aristo::instrument surface behind
+# the `aristo_instrument` feature. The conformance harness resolves aristo and
+# aristo-macros from crates.io, so no vendored copy or path rewrite is needed.
+aristo = "0.4"
 indexmap = "2.11.1"
 indicatif = "0.17"
 miette = "7.6.0"
