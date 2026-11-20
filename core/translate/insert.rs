@@ -415,6 +415,20 @@ pub fn translate_insert(
         connection,
     )?;
 
+    let updates_on_conflict = upsert_actions
+        .iter()
+        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
+    // Emitting a subquery consumes its plan, so each DO UPDATE arm plans the
+    // RETURNING subqueries again from the clause as written.
+    let upsert_returning = if updates_on_conflict
+        && returning.iter().any(
+            |column| matches!(column, ResultColumn::Expr(expr, _) if expr_contains_subquery(expr)),
+        ) {
+        Some(returning.clone())
+    } else {
+        None
+    };
+
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
@@ -430,9 +444,6 @@ pub fn translate_insert(
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
-    let updates_on_conflict = upsert_actions
-        .iter()
-        .any(|(_, _, upsert)| matches!(upsert.do_clause, ast::UpsertDo::Set { .. }));
     let reads_columns = updates_on_conflict
         || upsert_actions
             .iter()
@@ -1210,6 +1221,7 @@ pub fn translate_insert(
             &insertion,
             &table,
             &mut result_columns,
+            upsert_returning.as_deref(),
             connection,
             &mut table_references,
             tbl_name.alias.as_ref().map(|alias| alias.as_str()),
@@ -1753,6 +1765,7 @@ fn resolve_upserts(
     insertion: &Insertion,
     table: &Table,
     result_columns: &mut [ResultSetColumn],
+    returning_with_subqueries: Option<&[ResultColumn]>,
     connection: &Arc<crate::Connection>,
     table_references: &mut TableReferences,
     table_alias: Option<&str>,
@@ -1797,6 +1810,7 @@ fn resolve_upserts(
                 where_clause,
                 resolver,
                 result_columns,
+                returning_with_subqueries,
                 connection,
                 table_references,
                 table_alias,
