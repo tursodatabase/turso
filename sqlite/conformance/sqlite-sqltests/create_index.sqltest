@@ -302,3 +302,21 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+# A qualified column in an indexed term: one naming the table is refused with
+# SQLite's "." error, and one naming another database is no such column.
+test create-index-expression-qualified-with-own-database {
+    CREATE TABLE tq (a, b);
+    CREATE INDEX tq_b ON tq ((main.tq.b + 1));
+}
+expect error {
+    the "\." operator prohibited in index expressions
+}
+
+test create-index-expression-qualified-with-other-database {
+    CREATE TABLE tz (a, b);
+    CREATE INDEX tz_b ON tz ((zz.tz.b + 1));
+}
+expect error {
+    no such column: zz\.tz\.b
+}

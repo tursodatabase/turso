@@ -208,21 +208,26 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
+    // A schema or database name in a qualified column must name the index's own
+    // namespace, resolved as the binder resolves `db.table.column`.
+    let names_index_namespace =
+        |name: &str| resolver.catalog.namespace_named(&normalize_ident(name)) == Some(namespace);
     // Not checked when the schema loads or when a nested statement such as VACUUM
     // replays the stored schema, so databases that already have such an index keep
     // working.
-    let reject_qualified_columns_in_db = (!resolver
-        .catalog
-        .dialect
-        .allows_qualified_columns_in_index_terms()
-        && !connection.is_nested_stmt())
-    .then_some(db_name.as_str());
+    let qualified_columns = (!connection.is_nested_stmt()).then_some(QualifiedColumns {
+        names_index_namespace: &names_index_namespace,
+        rejected: !resolver
+            .catalog
+            .dialect
+            .allows_qualified_columns_in_index_terms(),
+    });
     let columns = resolver.with_schema(database_id, |schema| {
         resolve_sorted_columns_with_catalog(
             &tbl,
             &columns,
             Some(&resolver.catalog),
-            reject_qualified_columns_in_db,
+            qualified_columns,
             schema,
             resolver.catalog.symbol_table,
         )
@@ -1059,18 +1064,30 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     Ok(())
 }
 
+/// How CREATE INDEX checks the qualified column names in its indexed terms.
+#[derive(Clone, Copy)]
+struct QualifiedColumns<'a> {
+    /// Whether a schema or database name names the index's own namespace.
+    names_index_namespace: &'a dyn Fn(&str) -> bool,
+    /// Whether a qualified column name is an error even when it names a column
+    /// of the table, as in SQLite.
+    rejected: bool,
+}
+
 /// The index columns of `cols`. A column, or an expression, whose type has an
 /// order is kept in that order, so the index is in the order comparisons on
 /// it use; an explicit COLLATE on it is an error.
 ///
-/// When `reject_qualified_columns_in_db` names the index's database, a qualified
-/// column name in an indexed term is an error, as in SQLite. The WHERE clause of a
-/// partial index is not checked: SQLite allows qualified names there.
+/// With `qualified_columns`, a qualified column name in an indexed term must
+/// name a column of the table, and of the index's own namespace when it gives
+/// one; a stored expression is written without the qualifiers, so this is
+/// where they are checked. The WHERE clause of a partial index is not checked
+/// here: it is bound like any other condition.
 fn resolve_sorted_columns_with_catalog(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&CatalogContext>,
-    reject_qualified_columns_in_db: Option<&str>,
+    qualified_columns: Option<QualifiedColumns<'_>>,
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
@@ -1079,8 +1096,10 @@ fn resolve_sorted_columns_with_catalog(
             cols.len(),
         )?;
     for sc in cols {
-        let has_qualified_column = match reject_qualified_columns_in_db {
-            Some(db_name) => has_qualified_columns(&sc.expr, table, db_name)?,
+        let rejected_qualified_column = match qualified_columns {
+            Some(q) => {
+                has_qualified_columns(&sc.expr, table, q.names_index_namespace)? && q.rejected
+            }
             None => false,
         };
         let order = sc.order.unwrap_or(SortOrder::Asc);
@@ -1127,7 +1146,7 @@ fn resolve_sorted_columns_with_catalog(
             }
         };
         // SQLite reports any other error in the same term instead of this one.
-        if has_qualified_column {
+        if rejected_qualified_column {
             crate::bail_parse_error!("the \".\" operator prohibited in index expressions");
         }
         resolved
@@ -1158,9 +1177,14 @@ fn without_table_qualifiers(expr: &Expr) -> crate::Result<Box<Expr>> {
 }
 
 /// Returns whether `expr` contains a qualified column name. A qualified name that
-/// does not name a column of `table` is reported as `no such column`, which SQLite
-/// reports before any other error in the term.
-fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crate::Result<bool> {
+/// does not name a column of `table`, in the index's own namespace when it names
+/// one, is reported as `no such column`, which SQLite reports before any other
+/// error in the term.
+fn has_qualified_columns(
+    expr: &Expr,
+    table: &BTreeTable,
+    names_index_namespace: &dyn Fn(&str) -> bool,
+) -> crate::Result<bool> {
     let mut has_qualified_column = false;
     walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
         let (db_qualifier, table_qualifier, column) = match e {
@@ -1170,7 +1194,7 @@ fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crat
             }
             _ => return Ok(WalkControl::Continue),
         };
-        let resolves = db_qualifier.is_none_or(|db| db.as_str().eq_ignore_ascii_case(db_name))
+        let resolves = db_qualifier.is_none_or(|db| names_index_namespace(db.as_str()))
             && table_qualifier.as_str().eq_ignore_ascii_case(&table.name)
             && table.get_column(column.as_str()).is_some();
         if !resolves {

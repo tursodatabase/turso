@@ -340,6 +340,32 @@ expect {
     2|5
 }
 
+test table-index-expression-with-schema-qualified-column-and-table-alias {
+    CREATE TABLE t_schema_index (a int, b int);
+    INSERT INTO t_schema_index VALUES (1, 1), (2, 2);
+    CREATE INDEX t_schema_index_b ON t_schema_index ((public.t_schema_index.b * 2));
+    UPDATE t_schema_index AS t SET b = 5 WHERE a = 2;
+    DELETE FROM t_schema_index t WHERE a = 1;
+    SELECT a, b FROM t_schema_index WHERE b * 2 = 10;
+}
+expect {
+    2|5
+}
+
+# A column qualified with another schema is not the indexed table's column.
+# PostgreSQL reports the table reference (42P01); tursopg reports the column,
+# as it does on main.
+test table-index-expression-with-other-schema-rejected {
+    CREATE TABLE t_other_schema (a int, b int);
+    CREATE INDEX t_other_schema_b ON t_other_schema ((zz.t_other_schema.b + 3));
+}
+@sqlstate 42P01
+expect error {}
+@sqlstate 42703
+expect @tursopg error {
+    no such column: zz.t_other_schema.b
+}
+
 test table-numeric-column-compared-with-expression {
     CREATE TABLE nm (v numeric(10,2));
     INSERT INTO nm VALUES (1.50);
