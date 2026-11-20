@@ -1945,42 +1945,42 @@ impl Jsonb {
         }
         pos += 1; // consume quote
 
-        let quoted = quote == b'"' || quote == b'\'';
-
-        if quoted {
-            // A string with no escape and no control character ends at the
-            // first quote, and its payload is the bytes before the quote.
-            let ends_plain_part = if quote == b'"' {
-                &ESCAPED_IN_TEXT
-            } else {
-                &ENDS_SINGLE_QUOTED_PLAIN_PART
-            };
-            let rest = &input[pos..];
-            let len = rest
-                .iter()
-                .position(|&c| ends_plain_part[c as usize])
-                .unwrap_or(rest.len());
-            if rest.get(len) == Some(&quote) {
-                let end_pos = pos + len;
-                let header_pos = self.data.len();
-
-                // Write header and content
-                if let Some(&header) = TEXT_HEADERS.get(len) {
-                    self.data.push(header);
-                } else {
-                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                        .map_err(|_| PError::Message {
-                            msg: "Failed to write header".to_string(),
-                            location: Some(pos),
-                        })?;
-                }
-
-                self.data.extend_from_slice(&rest[..len]);
-                return Ok(end_pos + 1); // Skip past closing quote
-            }
+        if quote != b'"' && quote != b'\'' {
+            return self.deserialize_unquoted_key(input, pos, string_start, quote);
         }
 
-        self.deserialize_string_with_escapes(input, pos, string_start, quote, info)
+        // A string with no escape and no control character ends at the first
+        // quote, and its payload is the bytes before the quote.
+        let ends_plain_part = if quote == b'"' {
+            &ESCAPED_IN_TEXT
+        } else {
+            &ENDS_SINGLE_QUOTED_PLAIN_PART
+        };
+        let rest = &input[pos..];
+        let len = rest
+            .iter()
+            .position(|&c| ends_plain_part[c as usize])
+            .unwrap_or(rest.len());
+        if rest.get(len) == Some(&quote) {
+            let end_pos = pos + len;
+            let header_pos = self.data.len();
+
+            // Write header and content
+            if let Some(&header) = TEXT_HEADERS.get(len) {
+                self.data.push(header);
+            } else {
+                self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                    .map_err(|_| PError::Message {
+                        msg: "Failed to write header".to_string(),
+                        location: Some(pos),
+                    })?;
+            }
+
+            self.data.extend_from_slice(&rest[..len]);
+            return Ok(end_pos + 1); // Skip past closing quote
+        }
+
+        self.deserialize_string_with_escapes(input, pos, pos + len, string_start, quote, info)
     }
 
     /// Parses the double-quoted object key at `pos`, as
@@ -2008,11 +2008,16 @@ impl Jsonb {
         self.deserialize_string(input, pos, info)
     }
 
-    /// Parses the rest of a string that [Self::deserialize_string] cannot copy
-    /// as it is: a string with an escape or a control character, an unclosed
-    /// string, or an unquoted JSON5 key. `pos` is the offset after `quote`,
-    /// the first byte of the string, and `string_start` is the offset of the
-    /// element in the document.
+    /// Parses the rest of a quoted string that [Self::deserialize_string]
+    /// cannot copy as it is: a string with an escape or a control character,
+    /// or an unclosed string. `start` is the offset after `quote`, `special` is
+    /// the offset of the first byte that ends the plain part of the string, and
+    /// `string_start` is the offset of the element in the document.
+    ///
+    /// The payload of the element is the input between the quotes, because
+    /// JSONB keeps the escapes as they are. Thus the function checks the
+    /// escapes and finds the end of the string first, and then writes the
+    /// header and copies the payload once.
     ///
     /// This is a separate function so that the loop of the plain case in
     /// [Self::deserialize_string] has few live values.
@@ -2020,271 +2025,167 @@ impl Jsonb {
     fn deserialize_string_with_escapes(
         &mut self,
         input: &[u8],
-        mut pos: usize,
+        start: usize,
+        special: usize,
         string_start: usize,
         quote: u8,
         info: &mut ParseInfo,
     ) -> PResult<usize> {
-        let quoted = quote == b'"' || quote == b'\'';
-        let mut len = 0;
-
-        // Write placeholder header to be updated later
-        self.write_element_header(string_start, ElementType::TEXT, 0, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
-
+        let ends_plain_part = if quote == b'"' {
+            &ESCAPED_IN_TEXT
+        } else {
+            &ENDS_SINGLE_QUOTED_PLAIN_PART
+        };
         let mut element_type = ElementType::TEXT;
-
-        // Special case for unquoted JSON5 keys (identifiers)
-        if !quoted {
-            if quote == b'\\' && input.get(pos) == Some(&b'u') {
-                // The key starts with a \uXXXX escape, which SQLite
-                // accepts no matter what it decodes to. Rewind one byte
-                // so the escape handling below consumes it.
-                pos -= 1;
-            } else if !is_json5_id_char(quote, true) {
-                return Err(PError::Message {
-                    msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos - 1),
-                });
-            } else {
-                self.data.push(quote);
-                len += 1;
-            }
-
-            if len > 0 && pos < input.len() && input[pos] == b':' {
-                self.write_element_header(string_start, element_type, len, false)
-                    .map_err(|_| PError::Message {
-                        msg: "Failed to write header".to_string(),
-                        location: Some(pos),
-                    })?;
-                return Ok(pos);
-            }
-        }
-
-        if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
-        }
-
-        let mut escape_buffer = [0u8; 6]; // Buffer for escape sequences
-        let mut closed = false;
-
-        while pos < input.len() {
-            let c = input[pos];
-            pos += 1;
-
-            if quoted && c == quote {
-                closed = true;
-                break; // End of string
-            } else if !quoted && !is_unquoted_key_char(input, pos - 1) {
-                pos -= 1;
+        let mut pos = special;
+        loop {
+            let Some(&c) = input.get(pos) else {
+                return Err(parse_error("Unexpected end of input", input.len()));
+            };
+            if c == quote {
                 break;
-            } else if c == b'\\' {
-                // Handle escape sequences
-                if pos >= input.len() {
-                    return Err(PError::Message {
-                        msg: "Unexpected end of input".to_string(),
-                        location: Some(pos),
-                    });
-                }
-
-                let esc_pos = pos;
-                let esc = input[pos];
-                pos += 1;
-
-                // A standard escape upgrades plain TEXT to TEXTJ but
-                // never demotes TEXT5: earlier JSON5 syntax keeps the
-                // string JSON5.
+            }
+            if c == b'\\' {
+                let esc_pos = pos + 1;
+                let Some(&esc) = input.get(esc_pos) else {
+                    return Err(parse_error("Unexpected end of input", esc_pos));
+                };
+                pos = esc_pos + 1;
+                // A standard escape upgrades plain TEXT to TEXTJ but never
+                // demotes TEXT5: earlier JSON5 syntax keeps the string JSON5.
                 match esc {
-                    b'b' => {
-                        self.data.extend_from_slice(b"\\b");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'f' => {
-                        self.data.extend_from_slice(b"\\f");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'n' => {
-                        self.data.extend_from_slice(b"\\n");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'r' => {
-                        self.data.extend_from_slice(b"\\r");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b't' => {
-                        self.data.extend_from_slice(b"\\t");
-                        len += 2;
-                        if element_type == ElementType::TEXT {
-                            element_type = ElementType::TEXTJ;
-                        }
-                    }
-                    b'\\' | b'"' | b'/' => {
-                        self.data.push(b'\\');
-                        self.data.push(esc);
-                        len += 2;
+                    b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
                         if element_type == ElementType::TEXT {
                             element_type = ElementType::TEXTJ;
                         }
                     }
                     b'u' => {
-                        // Unicode escape sequence
-                        if pos + 4 > input.len() {
-                            return Err(PError::Message {
-                                msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(esc_pos),
-                            });
+                        let Some(digits) = input.get(pos..pos + 4) else {
+                            return Err(parse_error("Incomplete unicode escape sequence", esc_pos));
+                        };
+                        if !digits.iter().all(|&h| is_hex_digit(h)) {
+                            return Err(parse_error("Invalid unicode escape sequence", esc_pos));
                         }
-
-                        escape_buffer[0] = b'\\';
-                        escape_buffer[1] = b'u';
-
-                        for i in 0..4 {
-                            let h = input[pos + i];
-                            if !is_hex_digit(h) {
-                                return Err(PError::Message {
-                                    msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(esc_pos),
-                                });
-                            }
-                            escape_buffer[2 + i] = h;
-                        }
-
-                        self.data.extend_from_slice(&escape_buffer[0..6]);
-                        len += 6;
                         pos += 4;
                         if element_type == ElementType::TEXT {
                             element_type = ElementType::TEXTJ;
                         }
                     }
                     // JSON5 extensions
-                    b'\n' => {
-                        self.data.extend_from_slice(b"\\\n");
-                        len += 2;
-                        element_type = ElementType::TEXT5;
-                    }
+                    b'\n' | b'\'' | b'v' => element_type = ElementType::TEXT5,
                     b'\r' => {
-                        // Line continuation; swallows a following LF so
+                        // Line continuation; a following LF is part of it, so
                         // \<CR><LF> counts as one line terminator.
-                        self.data.extend_from_slice(b"\\\r");
-                        len += 2;
-                        if pos < input.len() && input[pos] == b'\n' {
-                            self.data.push(b'\n');
-                            len += 1;
+                        if input.get(pos) == Some(&b'\n') {
                             pos += 1;
                         }
                         element_type = ElementType::TEXT5;
                     }
-                    0xe2 if pos + 1 < input.len()
-                        && input[pos] == 0x80
-                        && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+                    // Line continuation with U+2028 or U+2029
+                    0xe2 if input.get(pos) == Some(&0x80)
+                        && matches!(input.get(pos + 1), Some(0xa8 | 0xa9)) =>
                     {
-                        // Line continuation with U+2028 or U+2029
-                        self.data.push(b'\\');
-                        self.data.extend_from_slice(&input[pos - 1..pos + 2]);
-                        len += 4;
                         pos += 2;
-                        element_type = ElementType::TEXT5;
-                    }
-                    b'\'' => {
-                        self.data.extend_from_slice(b"\\\'");
-                        len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'0' if !input.get(pos).is_some_and(u8::is_ascii_digit) => {
-                        self.data.extend_from_slice(b"\\0");
-                        len += 2;
-                        element_type = ElementType::TEXT5;
-                    }
-                    b'v' => {
-                        self.data.extend_from_slice(b"\\v");
-                        len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'x' => {
-                        // Hex escape sequence (JSON5)
-                        if pos + 2 > input.len() {
-                            return Err(PError::Message {
-                                msg: "Incopmlete hex escape sequence".to_string(),
-                                location: Some(esc_pos),
-                            });
+                        let Some(digits) = input.get(pos..pos + 2) else {
+                            return Err(parse_error("Incomplete hex escape sequence", esc_pos));
+                        };
+                        if !digits.iter().all(|&h| is_hex_digit(h)) {
+                            return Err(parse_error("Invalid hex escape sequence", esc_pos));
                         }
-
-                        escape_buffer[0] = b'\\';
-                        escape_buffer[1] = b'x';
-
-                        for i in 0..2 {
-                            let h = input[pos + i];
-                            if !is_hex_digit(h) {
-                                return Err(PError::Message {
-                                    msg: "Invalid hex escape sequence".to_string(),
-                                    location: Some(esc_pos),
-                                });
-                            }
-                            escape_buffer[2 + i] = h;
-                        }
-
-                        self.data.extend_from_slice(&escape_buffer[0..4]);
-                        len += 4;
                         pos += 2;
                         element_type = ElementType::TEXT5;
                     }
-
-                    _ => {
-                        return Err(PError::Message {
-                            msg: "Invalid escape sequence".to_string(),
-                            location: Some(esc_pos),
-                        });
-                    }
+                    _ => return Err(parse_error("Invalid escape sequence", esc_pos)),
                 }
-            } else if c <= 0x1F {
-                // Control character
-                element_type = ElementType::TEXT5;
-                self.data.push(c);
-                len += 1;
             } else {
-                // Normal character
-                self.data.push(c);
-                len += 1;
+                // A control character, which JSON5 allows in a string.
+                element_type = ElementType::TEXT5;
+                pos += 1;
             }
-        }
-
-        // A quoted string must end with its closing quote before the
-        // input runs out.
-        if quoted && !closed {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
+            let rest = &input[pos..];
+            pos += rest
+                .iter()
+                .position(|&c| ends_plain_part[c as usize])
+                .unwrap_or(rest.len());
         }
 
         if matches!(element_type, ElementType::TEXT5) {
             info.has_json5 = true;
         }
+        self.write_element_header(string_start, element_type, pos - start, false)
+            .map_err(|_| parse_error("Failed to write header", pos))?;
+        self.data.extend_from_slice(&input[start..pos]);
+        Ok(pos + 1) // Skip past closing quote
+    }
+
+    /// Parses an unquoted JSON5 object key, whose first byte is `first`. `pos`
+    /// is the offset after `first`, and `string_start` is the offset of the
+    /// element in the document.
+    #[inline(never)]
+    fn deserialize_unquoted_key(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        string_start: usize,
+        first: u8,
+    ) -> PResult<usize> {
+        let mut len = 0;
+
+        // Write placeholder header to be updated later
+        self.write_element_header(string_start, ElementType::TEXT, 0, false)
+            .map_err(|_| parse_error("Failed to write header", pos))?;
+
+        let mut element_type = ElementType::TEXT;
+
+        if first == b'\\' && input.get(pos) == Some(&b'u') {
+            // The key starts with a \uXXXX escape, which SQLite accepts no
+            // matter what it decodes to. Rewind one byte so the loop below
+            // reads it.
+            pos -= 1;
+        } else if !is_json5_id_char(first, true) {
+            return Err(parse_error(
+                "Invalid character in unquoted object key",
+                pos - 1,
+            ));
+        } else {
+            self.data.push(first);
+            len += 1;
+        }
+
+        if len > 0 && pos < input.len() && input[pos] == b':' {
+            self.write_element_header(string_start, element_type, len, false)
+                .map_err(|_| parse_error("Failed to write header", pos))?;
+            return Ok(pos);
+        }
+
+        if pos >= input.len() {
+            return Err(parse_error("Unexpected end of input", pos));
+        }
+
+        while pos < input.len() && is_unquoted_key_char(input, pos) {
+            if input[pos] == b'\\' {
+                // is_unquoted_key_char accepts a backslash only before u and
+                // four hex digits.
+                self.data.extend_from_slice(&input[pos..pos + 6]);
+                len += 6;
+                pos += 6;
+                element_type = ElementType::TEXTJ;
+            } else {
+                self.data.push(input[pos]);
+                len += 1;
+                pos += 1;
+            }
+        }
 
         // Write final header with correct type and size
         self.write_element_header(string_start, element_type, len, false)
-            .map_err(|_| PError::Message {
-                msg: "Failed to write header".to_string(),
-                location: Some(pos),
-            })?;
+            .map_err(|_| parse_error("Failed to write header", pos))?;
 
         Ok(pos)
     }
@@ -5530,6 +5431,95 @@ mod tests {
     #[test]
     fn escaped_bytes_end_the_plain_part_of_a_double_quoted_string() {
         assert_eq!(make_plain_string_end_table(b'"'), ESCAPED_IN_TEXT);
+    }
+
+    /// The payload of a string with escapes is the input between the quotes,
+    /// and the element type tells which escapes the payload holds.
+    #[test]
+    fn escaped_strings_keep_their_input_bytes_as_the_payload() {
+        let long = "x".repeat(300);
+        let longer = "y".repeat(70_000);
+        let cases = [
+            (
+                r#""a\nb""#.to_string(),
+                ElementType::TEXTJ,
+                r#"a\nb"#.to_string(),
+            ),
+            (
+                r#""\u00e9x""#.to_string(),
+                ElementType::TEXTJ,
+                r#"\u00e9x"#.to_string(),
+            ),
+            (
+                r#""a\"b\\c\/""#.to_string(),
+                ElementType::TEXTJ,
+                r#"a\"b\\c\/"#.to_string(),
+            ),
+            (
+                "\"a\\\r\nb\"".to_string(),
+                ElementType::TEXT5,
+                "a\\\r\nb".to_string(),
+            ),
+            // A JSON5 escape before a standard escape keeps the string TEXT5.
+            (
+                r#""\x41\n""#.to_string(),
+                ElementType::TEXT5,
+                r#"\x41\n"#.to_string(),
+            ),
+            (
+                r#""\n\v""#.to_string(),
+                ElementType::TEXT5,
+                r#"\n\v"#.to_string(),
+            ),
+            (
+                r#"'it\'s'"#.to_string(),
+                ElementType::TEXT5,
+                r#"it\'s"#.to_string(),
+            ),
+            (
+                "\"a\u{1}b\"".to_string(),
+                ElementType::TEXT5,
+                "a\u{1}b".to_string(),
+            ),
+            (
+                "\"\\u2028\u{2028}\"".to_string(),
+                ElementType::TEXTJ,
+                "\\u2028\u{2028}".to_string(),
+            ),
+            (
+                format!("\"\\t{long}\""),
+                ElementType::TEXTJ,
+                format!("\\t{long}"),
+            ),
+            (
+                format!("[\"{long}\\\"\"]"),
+                ElementType::ARRAY,
+                String::new(),
+            ),
+            (
+                format!("\"{longer}\\n\""),
+                ElementType::TEXTJ,
+                format!("{longer}\\n"),
+            ),
+        ];
+        for (input, element_type, payload) in cases {
+            let json = Jsonb::from_str(&input).unwrap();
+            let (header, header_size) = JsonbHeader::from_slice(0, json.as_bytes()).unwrap();
+            assert_eq!(header.element_type(), element_type, "{input:?}");
+            assert_eq!(header_size + header.payload_size(), json.len(), "{input:?}");
+            if element_type != ElementType::ARRAY {
+                assert_eq!(
+                    &json.as_bytes()[header_size..],
+                    payload.as_bytes(),
+                    "{input:?}"
+                );
+            }
+            // The JSON text of a string with standard escapes is the input.
+            // The JSON text of a TEXT5 string has other escapes.
+            if element_type == ElementType::TEXTJ {
+                assert_eq!(json.to_string().unwrap(), input, "{input:?}");
+            }
+        }
     }
 
     #[test]
