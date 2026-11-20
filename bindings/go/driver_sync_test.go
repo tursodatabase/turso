@@ -947,6 +947,36 @@ func TestSyncPullAfterCanceledPull(t *testing.T) {
 	}
 }
 
+func TestSyncCipherRejectsNULBeforeOpening(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	for _, cipher := range []string{"aes256gcm\x00suffix", "AES-256-GCM\x00", "aegis_256x4\x00suffix"} {
+		t.Run(cipher, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			path := filepath.Join(t.TempDir(), "replica.db")
+			noBootstrap := false
+			replica, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+				Path: path, RemoteUrl: server.URL, BootstrapIfEmpty: &noBootstrap,
+				ExperimentalFeatures:   "encryption,sync_encryption",
+				RemoteEncryptionCipher: cipher,
+				RemoteEncryptionKey:    base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{11}, 32)),
+			})
+			if replica != nil {
+				turso_sync_database_deinit(replica.db)
+				replica.client.CloseIdleConnections()
+			}
+			require.ErrorContains(t, err, "NUL")
+			require.NoFileExists(t, path)
+			require.Zero(t, requests.Load())
+		})
+	}
+}
+
 func TestSyncEncryptionRedirects(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -1059,6 +1089,42 @@ func TestSyncEncryptionRedirectOrigins(t *testing.T) {
 			} else {
 				require.ErrorContains(t, err, "refusing encrypted sync redirect to a different origin")
 			}
+		})
+	}
+}
+
+func TestSyncEncryptionCipherAliasesReserveNativeMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		cipher string
+		bytes  int
+	}{
+		{"aes-256-gcm", 28},
+		{"AES_128_GCM", 28},
+		{"aegis-128x2", 32},
+		{"AEGIS_256X4", 48},
+	} {
+		t.Run(tc.cipher, func(t *testing.T) {
+			require.Equal(t, tc.bytes, syncEncryptionReservedBytes(tc.cipher))
+
+			file := filepath.Join(t.TempDir(), "replica.db")
+			noBootstrap := false
+			ctx := context.Background()
+			replica, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+				Path: file, BootstrapIfEmpty: &noBootstrap,
+				RemoteEncryptionCipher: tc.cipher,
+			})
+			require.NoError(t, err)
+			defer turso_sync_database_deinit(replica.db)
+			conn, err := replica.Connect(ctx)
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = conn.Exec("CREATE TABLE reserved(value INTEGER)")
+			require.NoError(t, err)
+			require.NoError(t, replica.Checkpoint(ctx))
+			header, err := os.ReadFile(file)
+			require.NoError(t, err)
+			require.Greater(t, len(header), 20)
+			require.Equal(t, byte(tc.bytes), header[20])
 		})
 	}
 }

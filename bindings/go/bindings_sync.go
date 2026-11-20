@@ -2,6 +2,7 @@ package turso // import "github.com/tursodatabase/turso/go"
 
 import (
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -397,6 +398,9 @@ func sliceRefToStringCopy(s turso_slice_ref_t) string {
 
 // turso_sync_database_new creates the database sync holder but does not open it.
 func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncDatabaseConfig) (TursoSyncDatabase, error) {
+	if strings.IndexByte(syncConfig.RemoteEncryptionCipher, 0) >= 0 {
+		return nil, statusToError(TURSO_MISUSE, "remote encryption cipher contains NUL")
+	}
 	// Build C database config
 	var cdb turso_database_config_t
 	var pathBytes, expBytes, localCipherBytes, localKeyBytes []byte

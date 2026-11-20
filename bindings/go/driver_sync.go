@@ -714,6 +714,7 @@ func parseSyncDSN(dsn string) (string, syncDSNOptions) {
 }
 
 func syncEncryptionReservedBytes(cipher string) int {
+	cipher = strings.NewReplacer("-", "", "_", "").Replace(strings.ToLower(cipher))
 	switch cipher {
 	case "aes128gcm", "aes256gcm", "chacha20poly1305":
 		return 28
