@@ -9134,6 +9134,14 @@ fn relation_privilege(name: &str, on_sequences: bool) -> Result<ast::Privilege, 
     })
 }
 
+/// PostgreSQL's oid of `pg_class`, the `classoid` of a comment on a relation
+/// or on a column.
+pub const PG_CLASS_OID: i64 = 1259;
+
+/// PostgreSQL's oid of `pg_namespace`, the `classoid` of a comment on a
+/// schema.
+pub const PG_NAMESPACE_OID: i64 = 2615;
+
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
 /// compatibility but are not stored.
 #[derive(Debug, Clone)]

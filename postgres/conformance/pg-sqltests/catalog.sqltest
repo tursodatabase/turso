@@ -1384,6 +1384,14 @@ expect {
     2200|2615|0|standard public schema
 }
 
+@skip-if postgres "a PostgreSQL superuser may write pg_description"
+test pg-description-rejects-writes {
+    INSERT INTO pg_description VALUES (1, 1, 0, 'x');
+}
+@sqlstate 42501
+expect error {
+}
+
 test pg-attribute-default-storage {
     CREATE TABLE storage_types (
         id INTEGER PRIMARY KEY, body TEXT, label VARCHAR(40), data BYTEA,

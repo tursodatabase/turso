@@ -27,6 +27,7 @@ use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
+use turso_pg_parser::translator::{PG_CLASS_OID, PG_NAMESPACE_OID};
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -476,7 +477,7 @@ fn schema_name_of(schema: &Schema, namespace: NamespaceId) -> &str {
 }
 
 /// OID of the public schema, which initdb gives it.
-const PUBLIC_NAMESPACE_OID: i64 = 2200;
+pub(crate) const PUBLIC_NAMESPACE_OID: i64 = 2200;
 
 /// What is added to the id of a namespace to get the OID of its
 /// schema.
@@ -664,7 +665,7 @@ impl SnapshotRows for PgClassTable {
         )";
     /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(1259);
+    const TABLE_OID: Option<i64> = Some(PG_CLASS_OID);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -823,7 +824,7 @@ impl SnapshotRows for PgNamespaceTable {
         )";
     /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
     /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
-    const TABLE_OID: Option<i64> = Some(2615);
+    const TABLE_OID: Option<i64> = Some(PG_NAMESPACE_OID);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
@@ -865,25 +866,6 @@ impl SnapshotRows for PgNamespaceTable {
             ]);
         }
         rows
-    }
-}
-
-#[derive(Debug)]
-struct PgDescriptionTable;
-
-impl SnapshotRows for PgDescriptionTable {
-    const SCHEMA: &'static str = "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
-    const TABLE_OID: Option<i64> = None;
-    const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 1;
-
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(2200),
-            Value::from_i64(PgNamespaceTable::TABLE_OID.unwrap()),
-            Value::from_i64(0),
-            Value::build_text("standard public schema"),
-        ]]
     }
 }
 
@@ -3033,11 +3015,6 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         },
     );
     options = options.native_module(
-        "pg_description",
-        VTabKind::TableValuedFunction,
-        SnapshotCatalog::<PgDescriptionTable>(PhantomData),
-    );
-    options = options.native_module(
         "pg_seclabels",
         VTabKind::TableValuedFunction,
         EmptyPgCatalogTable {
@@ -4789,7 +4766,6 @@ mod tests {
             "pg_foreign_table",
             "pg_partitioned_table",
             "pg_collation",
-            "pg_description",
             "pg_publication",
             "pg_publication_namespace",
             "pg_publication_rel",

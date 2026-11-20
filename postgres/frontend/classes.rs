@@ -56,6 +56,7 @@ use crate::auth_members::{
     CREATE_AUTH_MEMBERS_TABLE_SQL,
 };
 use crate::catalog::{engine_role_by_name, role_oid, role_oid_by_name};
+use crate::descriptions::is_stored_catalog_table;
 use crate::error::sqlstate_error;
 use crate::policies::{self, TablePolicies};
 use crate::roles::{
@@ -171,6 +172,9 @@ impl ClassCatalog {
     pub(crate) fn build(schema: &Schema, rows: &[Vec<Value>]) -> turso_core::Result<Self> {
         let catalog = Self::new(rows)?;
         for (namespace, name, _) in schema.user_relations() {
+            if is_stored_catalog_table(namespace, &name) {
+                continue;
+            }
             if catalog.get_by_name(namespace, &name).is_none() {
                 return Err(LimboError::Corrupt(format!(
                     "relation \"{name}\" of namespace {} has no row in {CLASSES_TABLE_NAME}",
@@ -390,6 +394,9 @@ pub(crate) fn role_has_privilege(
     role: RoleId,
     privilege: ast::Privilege,
 ) -> bool {
+    if is_stored_catalog_table(namespace, name) {
+        return privilege == ast::Privilege::Select;
+    }
     let Some(class) =
         class_catalog(schema).and_then(|catalog| catalog.get_by_name(namespace, name))
     else {
@@ -2308,6 +2315,7 @@ pub(crate) fn initialize_schema(
         statements.push(CREATE_AUTH_MEMBERS_TABLE_SQL.to_string());
         statements.push(CREATE_AUTH_MEMBERS_ROLE_MEMBER_INDEX_SQL.to_string());
     }
+    statements.extend(crate::descriptions::initialize_statements(schema));
     Ok(statements)
 }
 
