@@ -325,6 +325,7 @@ pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
     match type_name {
         "numeric" => Some(TypeOrdering::Numeric),
+        "timestamp" | "timestamptz" => Some(TypeOrdering::Timestamp),
         _ => None,
     }
 }
@@ -2201,7 +2202,7 @@ impl Schema {
                 ),
             };
         };
-        if self.type_ordering(type_def).is_some() {
+        if self.type_ordering(type_def).is_some() && !type_def.stored_form_sorts_in_value_order {
             crate::bail_parse_error!(
                 "arrays of type {} are not supported, because their elements would not compare in the order of {}",
                 type_def.name,
@@ -8657,6 +8658,9 @@ impl Column {
                 self.override_affinity(stored_affinity);
                 self.type_ordering = resolved.ordering();
                 self.value_affinity = Some(match self.type_ordering {
+                    // Timestamps compare by the text or integer they hold, which
+                    // the type's ordering reads.
+                    Some(TypeOrdering::Timestamp) => resolved.leaf().value_type().affinity(),
                     // Its values compare in the type's own order, by how
                     // they are stored.
                     Some(_) => stored_affinity,

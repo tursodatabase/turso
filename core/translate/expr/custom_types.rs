@@ -529,14 +529,18 @@ fn is_untyped_operand(expr: &ast::Expr) -> Result<bool> {
 /// Whether a string literal or parameter compared with a value of `resolved`
 /// is converted to the type. A type with its own order, such as numeric,
 /// converts the other operand when it compares instead, and a type without
-/// ENCODE or DECODE reads a value as it is written.
+/// ENCODE or DECODE reads a value as it is written. The order of a timestamp
+/// reads only the text its DECODE gives, so a literal in another form, such as
+/// '2024-01-05T09:31', is converted like one for a type without an order.
 fn converts_untyped_operands(resolved: &ResolvedType) -> bool {
-    resolved.ordering().is_none()
-        && (resolved
-            .chain
-            .iter()
-            .any(|type_def| type_def.encode().is_some())
-            || !resolved.decode_returns_value_unchanged())
+    matches!(
+        resolved.ordering(),
+        None | Some(crate::type_ordering::TypeOrdering::Timestamp)
+    ) && (resolved
+        .chain
+        .iter()
+        .any(|type_def| type_def.encode().is_some())
+        || !resolved.decode_returns_value_unchanged())
 }
 
 /// Stores the string literal or parameter in `reg` as a value of `resolved`,
