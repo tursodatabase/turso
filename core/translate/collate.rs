@@ -17,6 +17,7 @@ use crate::{
             row_value_component_expr, row_value_len,
         },
         expr_context::{ExprContext, ExprProperties},
+        optimizer::Optimizable,
         plan::{Plan, SelectPlan, TableReferences},
     },
     type_ordering::TypeOrdering,
@@ -553,15 +554,23 @@ pub fn in_subquery_collation(
     comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
 }
 
-/// The collation that `x IN (y1, ..., yN)` compares with. When x or any item
-/// has a type with an order, every comparison uses that order, so
-/// `'10.0' IN (n)` agrees with `'10.0' = n`. Otherwise the text collation is
-/// the one of x alone, as in SQLite.
+/// The collation that `x IN (y1, ..., yN)` compares with. SQLite turns
+/// `x IN (c)` with one constant item into `x = +c`, so that comparison's rule
+/// applies: an explicit COLLATE on either side, the left first. Otherwise,
+/// when x or any item has a type with an order, every comparison uses that
+/// order, so `'10.0' IN (n)` agrees with `'10.0' = n`, and the text collation
+/// is the one of x alone, as in SQLite.
 pub fn in_list_collation(
     lhs: &Expr,
     rhs: &[Box<Expr>],
     context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    let lhs_is_row_value = matches!(lhs, Expr::Parenthesized(items) if items.len() > 1);
+    if let [item] = rhs {
+        if !lhs_is_row_value && item.is_constant(context.resolver()) {
+            return comparison_collation(lhs, item, context);
+        }
+    }
     let operands = std::iter::once(lhs)
         .chain(rhs.iter().map(|item| item.as_ref()))
         .map(|expr| (expr, context));
