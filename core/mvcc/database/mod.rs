@@ -4177,19 +4177,48 @@ pub enum ReadPersistentTxTsMaxState {
     },
 }
 
-/// Sub state machine for `MvStore::initialize_mvcc_metadata_table_nonblock`.
-/// Sequences the CREATE TABLE then INSERT statements, holding each prepared
-/// statement across IO yields.
 #[derive(Default)]
-pub enum InitMetadataTableState {
+pub struct InitMetadataTableState {
+    phase: InitMetadataTablePhase,
+    stmt: Option<Box<crate::Statement>>,
+    connection: Option<Arc<Connection>>,
+}
+
+#[derive(Default)]
+enum InitMetadataTablePhase {
     #[default]
-    Start,
-    CreateTable {
-        stmt: Box<crate::Statement>,
-    },
-    Insert {
-        stmt: Box<crate::Statement>,
-    },
+    Begin,
+    CreateTable,
+    Insert,
+    Commit,
+}
+
+impl InitMetadataTableState {
+    fn cancel(&mut self) {
+        self.stmt = None;
+        if let Some(connection) = self
+            .connection
+            .take()
+            .filter(|connection| !connection.get_auto_commit())
+        {
+            let pager = connection.pager.load();
+            pager.rollback_tx(&connection);
+            connection.auto_commit.store(true, Ordering::SeqCst);
+            connection.set_tx_state(crate::TransactionState::None);
+            connection.clear_tx_poison();
+        }
+        self.phase = InitMetadataTablePhase::Begin;
+    }
+}
+
+impl BootstrapState {
+    /// Cancel an unfinished bootstrap before reusing its connection.
+    pub fn cancel(&mut self) {
+        if let Self::FinishInit { init_st } = self {
+            init_st.cancel();
+        }
+        *self = Self::default();
+    }
 }
 
 /// Sub state machine for [`MvStore::maybe_recover_logical_log`]. The
@@ -5024,44 +5053,45 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.global_header.write().replace(header);
     }
 
-    /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
-    /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
-    /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`
-    /// are replayed. Called once during first MVCC bootstrap.
-    /// Creates and seeds the MVCC metadata table, driving the CREATE TABLE then
-    /// INSERT statements cooperatively via the supplied [`InitMetadataTableState`]
-    /// so bootstrap does not block on backends without a synchronous IO pump.
     fn initialize_mvcc_metadata_table_nonblock(
         &self,
         connection: &Arc<Connection>,
         st: &mut InitMetadataTableState,
     ) -> IOResultOr<()> {
-        loop {
-            match st {
-                InitMetadataTableState::Start => {
-                    let stmt = connection.prepare(format!(
+        let result = (|| loop {
+            if st.stmt.is_none() {
+                let sql = match st.phase {
+                    InitMetadataTablePhase::Begin => {
+                        assert!(connection.get_auto_commit());
+                        st.connection = Some(connection.clone());
+                        "BEGIN IMMEDIATE".to_string()
+                    }
+                    InitMetadataTablePhase::CreateTable => format!(
                         "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
-                    ))?;
-                    *st = InitMetadataTableState::CreateTable {
-                        stmt: Box::new(stmt),
-                    };
-                }
-                InitMetadataTableState::CreateTable { stmt } => {
-                    return_if_io!(stmt.run_ignore_rows_nonblock());
-                    let stmt = connection.prepare(format!(
+                    ),
+                    InitMetadataTablePhase::Insert => format!(
                         "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
-                    ))?;
-                    *st = InitMetadataTableState::Insert {
-                        stmt: Box::new(stmt),
-                    };
-                }
-                InitMetadataTableState::Insert { stmt } => {
-                    return_if_io!(stmt.run_ignore_rows_nonblock());
-                    *st = InitMetadataTableState::Start;
+                    ),
+                    InitMetadataTablePhase::Commit => "COMMIT".to_string(),
+                };
+                st.stmt = Some(Box::new(connection.prepare(sql)?));
+            }
+            return_if_io!(st.stmt.as_mut().unwrap().run_ignore_rows_nonblock());
+            st.stmt = None;
+            st.phase = match st.phase {
+                InitMetadataTablePhase::Begin => InitMetadataTablePhase::CreateTable,
+                InitMetadataTablePhase::CreateTable => InitMetadataTablePhase::Insert,
+                InitMetadataTablePhase::Insert => InitMetadataTablePhase::Commit,
+                InitMetadataTablePhase::Commit => {
+                    st.connection = None;
                     return Ok(IOResult::Done(()));
                 }
-            }
+            };
+        })();
+        if result.is_err() {
+            st.cancel();
         }
+        result
     }
 
     /// Shared validation/normalization for the persistent-tx-ts-max metadata
@@ -5154,7 +5184,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
         let mut st = BootstrapState::default();
         let io = bootstrap_conn.db.io.clone();
-        io.block(|| self.bootstrap_nonblock(&bootstrap_conn, &mut st))
+        let result = io.block(|| self.bootstrap_nonblock(&bootstrap_conn, &mut st));
+        if result.is_err() {
+            st.cancel();
+        }
+        result
     }
 
     #[doc(hidden)]

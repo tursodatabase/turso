@@ -416,6 +416,15 @@ pub(crate) enum InitState {
     ReadPage1 { pager: Box<Pager> },
 }
 
+impl InitState {
+    pub(crate) fn cancel(&mut self) {
+        if let Self::ReadPage1 { pager } = self {
+            pager.end_read_tx();
+        }
+        *self = Self::default();
+    }
+}
+
 /// Sub state machine for [`Database::header_validation`], driven from
 /// [`OpenDbAsyncPhase::ValidatingHeader`]. Keeps WAL recovery on open
 /// non-blocking by yielding through its IO instead of `io.block`.
@@ -553,7 +562,6 @@ pub struct OpenDbAsyncState {
     phase: OpenDbAsyncPhase,
     db: Option<Arc<Database>>,
     pager: Option<Arc<Pager>>,
-    conn: Option<Arc<Connection>>,
     encryption_key: Option<EncryptionKey>,
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
@@ -581,6 +589,7 @@ pub struct OpenDbAsyncState {
     dialect_schema_stmt: Option<Box<Statement>>,
     dialect_schema_rows: Vec<Vec<Value>>,
     dialect_schema_results: Vec<Vec<Vec<Value>>>,
+    conn: Option<Arc<Connection>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -615,10 +624,32 @@ impl OpenDbAsyncState {
 
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
+        if let HeaderValidationState::Start { init, .. } = &mut self.header_validation_state {
+            init.cancel();
+        }
         if let Some(registry_key) = self.registry_key.take() {
             let mut registry = DATABASE_MANAGER.lock();
             registry.remove(&registry_key);
         }
+    }
+}
+
+impl OpenDbAsyncState {
+    fn clear_open_resources(&mut self) {
+        self.schema_guard = None;
+        self.make_from_btree_state = schema::MakeFromBtreeState::new();
+        self.mvcc_convert_stmt = None;
+        self.mvcc_bootstrap_state.cancel();
+        self.dialect_schema_stmt = None;
+        self.mvcc_bootstrap_conn = None;
+        self.conn = None;
+        self.pager = None;
+        self.db = None;
+        self.building_db = None;
+        if let HeaderValidationState::Start { init, .. } = &mut self.header_validation_state {
+            init.cancel();
+        }
+        self.header_validation_state = HeaderValidationState::default();
     }
 }
 
@@ -1562,7 +1593,7 @@ impl Database {
             native_extensions,
         );
         if result.is_err() {
-            let _ = state.schema_guard.take();
+            state.clear_open_resources();
         }
         result
     }

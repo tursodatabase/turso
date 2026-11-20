@@ -30,7 +30,7 @@ PRAGMA database_list;
 
 ### page_count
 
-Returns the total number of pages in the database file.
+Returns the total number of pages in the database file. A main-file header with a zero stored page count uses the count calculated from the file size.
 
 ```sql
 PRAGMA page_count;
