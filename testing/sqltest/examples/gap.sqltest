@@ -1,0 +1,60 @@
+# Gap tests: known differences between tursopg and PostgreSQL 18
+#
+# Gap tests run only on the tursopg, tursopg-embedded and postgres backends:
+#   sqltest run examples/gap.sqltest --backend tursopg --binary <path to tursopg> --compat-gaps
+#   sqltest run examples/gap.sqltest --backend postgres --postgres-dsn <url> --compat-gaps
+#   sqltest gaps examples/gap.sqltest
+#
+# Without --compat-gaps, a @compat-gap test does not parse.
+#
+# The default `expect` block is PostgreSQL 18's answer, and the
+# `expect @tursopg` block is tursopg's current wrong answer. When tursopg gives
+# the PostgreSQL answer, the tursopg run fails with "gap fixed": then delete
+# `@compat-gap` and the `expect @tursopg` block.
+
+@database :memory:
+
+# Class `wrong`: both return rows, and the rows differ.
+@compat-gap "type:bool"
+test like-returns-bool {
+    SELECT 'ABC' LIKE 'abc', 'abc' LIKE 'a%';
+}
+# PostgreSQL 18's answer
+expect {
+    f|t
+}
+# tursopg's current answer (wrong)
+expect @tursopg {
+    0|1
+}
+
+# Class `accepts-invalid`: PostgreSQL returns an error, tursopg returns rows.
+# The default error block may give the PostgreSQL message, which the postgres
+# backend checks. On tursopg, an error matches the default block when it has
+# the default block's SQLSTATE, whatever its message.
+@compat-gap "type:int4"
+test int4-literal-out-of-range {
+    SELECT '2147483648'::int4;
+}
+# PostgreSQL 18's answer
+@sqlstate 22003
+expect error {
+    value "2147483648" is out of range for type integer
+}
+# tursopg's current answer (wrong)
+expect @tursopg {
+    2147483648
+}
+
+# Class `refused`: PostgreSQL runs the statement, tursopg returns an error.
+@compat-gap "syntax:unsupported-statement"
+test listen {
+    LISTEN channel;
+}
+# PostgreSQL 18's answer
+expect {
+}
+# tursopg's current answer (wrong)
+@sqlstate 0A000
+expect @tursopg error {
+}

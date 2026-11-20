@@ -252,6 +252,7 @@ test table-select-into-nested-rejected {
 @sqlstate 42601
 expect error {}
 
+@compat-gap "type:date"
 test table-date-arithmetic {
     CREATE TABLE dates (a date, b date);
     INSERT INTO dates VALUES ('2025-01-05', '2025-01-01');
@@ -265,6 +266,7 @@ expect @tursopg error {
     type "date" is not supported
 }
 
+@compat-gap "type:date"
 test table-indexed-date-column-with-default {
     CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
     INSERT INTO dates VALUES (1, 2, '2024-05-06');
@@ -281,6 +283,7 @@ expect @tursopg error {
     type "date" is not supported
 }
 
+@compat-gap "type:date"
 test table-cast-timestamp-column-to-date-and-time {
     CREATE TABLE events (ts timestamp);
     INSERT INTO events VALUES ('2024-01-15 10:30:00');
@@ -870,6 +873,7 @@ expect {
     2|public
 }
 
+@compat-gap "type:date"
 test array-columns-hold-element-values {
     -- tursopg prints a boolean result as 1, PostgreSQL as t, so every
     -- boolean is cast to int.
@@ -1120,6 +1124,7 @@ expect {
     2|c
 }
 
+@compat-gap "syntax:returning"
 test returning-with-new-alias {
     CREATE TABLE returning_alias (a int);
     INSERT INTO returning_alias VALUES (1) RETURNING WITH (NEW AS n) n.a;
@@ -1132,6 +1137,7 @@ expect @tursopg error {
     RETURNING with OLD or NEW aliases is not supported
 }
 
+@compat-gap "syntax:returning"
 test returning-old-from-aliased-update {
     CREATE TABLE returning_old (a int);
     INSERT INTO returning_old VALUES (11);
@@ -1145,6 +1151,7 @@ expect @tursopg error {
     old or new as a row name in RETURNING is not supported
 }
 
+@compat-gap "syntax:returning"
 test returning-old-from-update {
     CREATE TABLE returning_old_plain (a int);
     INSERT INTO returning_old_plain VALUES (11);
@@ -1167,6 +1174,7 @@ expect {
     21
 }
 
+@compat-gap "syntax:foreign-key"
 test foreign-key-not-enforced {
     CREATE TABLE fk_parent (a int PRIMARY KEY);
     CREATE TABLE fk_child (a int, FOREIGN KEY (a) REFERENCES fk_parent (a) NOT ENFORCED);

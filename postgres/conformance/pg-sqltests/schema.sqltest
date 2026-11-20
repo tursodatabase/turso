@@ -510,6 +510,7 @@ expect {
 }
 
 # PostgreSQL drops the default of public.dc_outside_user.n with the schema.
+@compat-gap "syntax:drop-schema"
 test drop-schema-cascade-when-a-table-of-another-schema-uses-its-sequence {
     CREATE SCHEMA dc_outside;
     CREATE TABLE dc_outside.a (id serial);

@@ -51,6 +51,7 @@ Example test files are available in the `examples/` directory:
 
 - `examples/basic.sqltest` - Basic DSL syntax examples
 - `examples/joins.sqltest` - Setup composition and join tests
+- `examples/gap.sqltest` - Gap tests: known differences between tursopg and PostgreSQL
 
 ## Crate Structure
 

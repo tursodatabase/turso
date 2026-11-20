@@ -723,6 +723,7 @@ expect {
 
 # tursopg does not print GREATEST as PostgreSQL does and shows the
 # expression as the engine stores it.
+@compat-gap "function:pg_get_expr"
 test stored-generated-column-pg-get-expr-returns-pg-syntax {
     CREATE TABLE t (a int, b int GENERATED ALWAYS AS (greatest(a, 2)) STORED);
     SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef pa JOIN pg_class pc ON pa.adrelid = pc.oid WHERE pc.relname = 't';
@@ -759,6 +760,7 @@ expect {
     (z * 2)
 }
 
+@compat-gap "syntax:generated-column"
 test virtual-generated-column {
     CREATE TABLE virt (a int, b int GENERATED ALWAYS AS (a * 2));
     INSERT INTO virt VALUES (3);
