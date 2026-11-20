@@ -270,37 +270,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         // sync engine opens internally (e.g. the revert connection), so they
         // match the main database opened via TursoDatabase below.
         let db_opts = db_config.database_opts();
-        let local_encryption = db_config
-            .encryption
-            .as_ref()
-            .map(turso_sync_engine::sync_encryption::SyncEncryption::from_local_options)
-            .transpose()
-            .map_err(|error| TursoError::Misuse(error.to_string()))?;
-        let cipher = sync_config
-            .cipher
-            .as_deref()
-            // ChaCha is supported by legacy remote encryption, but not native core.
-            .filter(|cipher| {
-                local_encryption.is_some()
-                    || !matches!(*cipher, "chacha20poly1305" | "chacha20-poly1305")
-            })
-            .map(turso_core::CipherMode::try_from)
-            .transpose()
-            .map_err(|error| TursoError::Misuse(error.to_string()))?;
-        if let (Some(local), Some(cipher)) = (&local_encryption, cipher) {
-            if local.cipher() != cipher {
-                return Err(TursoError::Misuse(
-                    "sync uses a single cipher for both local and cloud encryption".into(),
-                ));
-            }
-        }
-        let encryption = match local_encryption {
-            Some(config) => Some(config),
-            None => cipher
-                .map(|cipher| turso_sync_engine::sync_encryption::SyncEncryption::new(cipher, None))
-                .transpose()
-                .map_err(|error| TursoError::Misuse(error.to_string()))?,
-        };
+        let encryption = turso_sync_engine::sync_encryption::SyncEncryption::from_options(
+            sync_config.cipher.as_deref(),
+            db_config.encryption.as_ref(),
+        )
+        .map_err(|error| TursoError::Misuse(error.to_string()))?;
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
             encryption,
             remote_url: sync_config.remote_url.clone(),
@@ -706,9 +680,18 @@ mod tests {
         legacy_database.encryption = None;
         let mut legacy_sync = sync_config.clone();
         legacy_sync.cipher = Some("chacha20poly1305".into());
-        let legacy =
-            TursoDatabaseSync::<Vec<u8>>::new(legacy_database, legacy_sync.clone()).unwrap();
-        assert!(legacy.sync_engine_opts.encryption.is_none());
+        for cipher in [
+            "chacha20poly1305",
+            "chacha20-poly1305",
+            "ChaCha20Poly1305",
+            "future-cloud-cipher",
+        ] {
+            legacy_sync.cipher = Some(cipher.into());
+            let legacy =
+                TursoDatabaseSync::<Vec<u8>>::new(legacy_database.clone(), legacy_sync.clone())
+                    .unwrap();
+            assert!(legacy.sync_engine_opts.encryption.is_none());
+        }
         assert!(TursoDatabaseSync::<Vec<u8>>::new(config.clone(), legacy_sync).is_err());
         let mut mismatched = sync_config.clone();
         mismatched.cipher = Some("aes128gcm".into());
