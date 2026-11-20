@@ -4650,7 +4650,7 @@ fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
                 .expect("index probe must encode");
             for op in [SeekOp::GE { eq_only: true }, SeekOp::LE { eq_only: true }] {
                 let mut cursor = fixture.cursor();
-                steps.0.store(0, Ordering::Relaxed);
+                steps.total.store(0, Ordering::Relaxed);
                 let result = conn
                     .db
                     .io
@@ -4678,7 +4678,7 @@ fn test_exact_index_seek_with_duplicate_and_null_prefixes() {
                     );
                 }
                 if single_row {
-                    let taken = steps.0.load(Ordering::Relaxed);
+                    let taken = steps.total.load(Ordering::Relaxed);
                     assert!(
                         taken <= 2,
                         "unique={unique}, values={values:?}, op={op:?}: {taken} B-tree steps"
@@ -4853,6 +4853,8 @@ fn test_index_cursor_steps_forward_after_stepping_back_past_deleted_row(
 #[rstest::rstest]
 #[case::nonunique_forward(false, false, false)]
 #[case::nonunique_backward(false, false, true)]
+#[case::nonunique_prefix_forward(false, true, false)]
+#[case::nonunique_prefix_backward(false, true, true)]
 #[case::unique_forward(true, false, false)]
 #[case::unique_backward(true, false, true)]
 #[case::unique_prefix_forward(true, true, false)]
@@ -4897,6 +4899,150 @@ fn test_exact_index_seek_steps_past_matching_rows(
         actual, expected,
         "unique={unique}, prefix_only={prefix_only}, key_in_btree={key_in_btree}, op={op:?}"
     );
+}
+
+#[rstest::rstest]
+#[case::nonunique(false, Value::from_i64(20))]
+#[case::nullable_unique(true, Value::Null)]
+fn test_duplicate_prefix_seek_continues_after_writes(
+    #[case] unique: bool,
+    #[case] probe: Value,
+    #[values(false, true)] backwards: bool,
+    #[values(false, true)] reverse: bool,
+    #[values(false, true)] yields: bool,
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let index = cursor_test_index(
+        unique,
+        [
+            IndexColumn::new("k", 1, CollationSeq::BINARY),
+            IndexColumn::new("v", 2, CollationSeq::BINARY),
+        ],
+    );
+    let index_record = |id, k, v| {
+        ImmutableRecord::from_values(&[Value::from_i64(k), v, Value::from_i64(id)], 3).unwrap()
+    };
+    let fixture = CursorTestFixture::new(
+        Some(index),
+        [
+            (10, index_record(10, 0, Value::from_i64(10))),
+            (30, index_record(30, 1, probe.clone())),
+            (50, index_record(50, 1, probe.clone())),
+            (70, index_record(70, 2, Value::from_i64(50))),
+        ],
+    );
+    let conn = &fixture.db.conn;
+    let io = &conn.db.io;
+    let mut writer = fixture.cursor();
+    for (id, k, v) in [
+        (20, 0, Value::from_i64(20)),
+        (25, 1, probe.clone()),
+        (40, 1, probe.clone()),
+        (55, 1, probe.clone()),
+        (60, 2, Value::from_i64(40)),
+    ] {
+        let record = index_record(id, k, v);
+        let key = CursorTestFixture::btree_key(true, id, &record);
+        io.block(|| writer.insert(&key)).unwrap();
+    }
+
+    let (op, current, inserted, deleted) = if backwards {
+        (SeekOp::LE { eq_only: true }, 55, 53, 50)
+    } else {
+        (SeekOp::GE { eq_only: true }, 25, 27, 30)
+    };
+    let prefix = ImmutableRecord::from_values(&[Value::from_i64(1), probe.clone()], 2).unwrap();
+    let full = index_record(current, 1, probe.clone());
+    let mut cursor = fixture.cursor();
+    let actual = with_cursor_yields(conn, yields, || {
+        for record in [&prefix, &full] {
+            let result = io
+                .block(|| cursor.seek(SeekKey::IndexKey(record.as_record_ref()), op))
+                .unwrap();
+            assert!(matches!(result, SeekResult::Found));
+            assert_eq!(io.block(|| cursor.rowid()).unwrap(), Some(current));
+        }
+
+        let record = index_record(inserted, 1, probe.clone());
+        let key = CursorTestFixture::btree_key(true, inserted, &record);
+        io.block(|| writer.insert(&key)).unwrap();
+        fixture.delete_index_row(&index_record(deleted, 1, probe));
+
+        rowids_from_current_row(conn, &mut cursor, backwards ^ reverse)
+    });
+    assert_eq!(
+        actual,
+        match (backwards, reverse) {
+            (false, false) => vec![25, 27, 40, 50, 55, 60, 70],
+            (false, true) => vec![25, 20, 10],
+            (true, false) => vec![55, 53, 40, 30, 25, 20, 10],
+            (true, true) => vec![55, 60, 70],
+        }
+    );
+    drop(cursor);
+    drop(writer);
+    fixture.rollback();
+}
+
+#[rstest::rstest]
+#[case::mvcc_forward(false, false, [10, 20, 40, 60, 70])]
+#[case::mvcc_backward(true, false, [70, 60, 40, 20, 10])]
+#[case::btree_forward(false, true, [10, 20, 40, 60, 70])]
+#[case::btree_backward(true, true, [70, 60, 40, 20, 10])]
+fn test_exact_index_cursor_returns_rows_restored_by_savepoint_rollback(
+    #[case] backwards: bool,
+    #[case] first_in_btree: bool,
+    #[case] expected: [i64; 5],
+) {
+    use crate::types::{SeekKey, SeekOp};
+
+    let mut physical_rows = vec![(20, 1), (40, 1), (60, 1)];
+    let endpoints = [(10, 1), (70, 1)];
+    if first_in_btree {
+        physical_rows.extend(endpoints);
+    }
+    let fixture = CursorTestFixture::integer_rows(Some(false), physical_rows);
+    if !first_in_btree {
+        fixture.insert_integer_rows(endpoints);
+    }
+
+    let store = &fixture.db.mvcc_store;
+    store.begin_named_savepoint(fixture.tx_id, "s".to_owned(), false, 0);
+    fixture.delete_integer_index_row(20, 1);
+    fixture.delete_integer_index_row(60, 1);
+
+    let op = if backwards {
+        SeekOp::LE { eq_only: true }
+    } else {
+        SeekOp::GE { eq_only: true }
+    };
+    let conn = &fixture.db.conn;
+    let key = ImmutableRecord::from_values(&[Value::from_i64(1)], 1).unwrap();
+    let mut cursor = fixture.cursor();
+    let result = conn
+        .db
+        .io
+        .block(|| cursor.seek(SeekKey::IndexKey(key.as_record_ref()), op))
+        .unwrap();
+    assert!(matches!(result, SeekResult::Found));
+    assert_eq!(
+        conn.db.io.block(|| cursor.rowid()).unwrap(),
+        Some(expected[0])
+    );
+
+    assert_eq!(
+        store
+            .rollback_to_named_savepoint(fixture.tx_id, "s")
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        rowids_from_current_row(conn, &mut cursor, backwards),
+        expected
+    );
+    drop(cursor);
+    fixture.rollback();
 }
 
 struct CursorTestFixture {

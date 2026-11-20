@@ -5029,6 +5029,44 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     (rng, seed as u64)
 }
 
+#[test]
+fn test_nonunique_index_join_reuses_btree_position() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX b_v ON b(v)").unwrap();
+    conn.execute("INSERT INTO b VALUES (1,1),(2,0),(3,1),(4,0)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x<12) \
+         INSERT INTO a SELECT x,x%2 FROM s",
+    )
+    .unwrap();
+
+    let sql = "SELECT count(*),sum(b.id) FROM a CROSS JOIN b INDEXED BY b_v WHERE b.v=a.v";
+    let plan = get_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+    assert!(
+        plan.iter()
+            .flatten()
+            .any(|value| { value.to_string() == "SEARCH b USING COVERING INDEX b_v (v=?)" }),
+        "{plan:?}"
+    );
+    let steps = Arc::new(SeekBtreeSteps::default());
+    conn.set_yield_injector(Some(steps.clone()));
+    let result = get_rows(&conn, sql);
+    conn.set_yield_injector(None);
+    assert_eq!(result, vec![vec![Value::from_i64(24), Value::from_i64(60)]]);
+    let seek_progress = steps.seek_progress.load(Ordering::Relaxed);
+    assert!(
+        seek_progress <= 24,
+        "12 index probes should take at most 24 B-tree seek progress events, got {seek_progress}"
+    );
+}
+
 /// What this test checks: An exact rowid seek over checkpointed rows that newer versions shadow
 /// returns each row's newest version, or nothing for a deleted or missing row, in a few B-tree
 /// steps however many shadowed rows follow its target.
@@ -5053,7 +5091,7 @@ fn test_exact_rowid_seek_over_shadowed_btree_rows() {
     let steps = Arc::new(SeekBtreeSteps::default());
     conn.set_yield_injector(Some(steps.clone()));
     for i in 1..=201 {
-        steps.0.store(0, Ordering::Relaxed);
+        steps.total.store(0, Ordering::Relaxed);
         let rows = get_rows(&conn, &format!("SELECT v FROM t WHERE id = {i}"));
         let expected = if i > 200 || i % 3 == 0 {
             None
@@ -5067,7 +5105,7 @@ fn test_exact_rowid_seek_over_shadowed_btree_rows() {
             expected,
             "id {i}"
         );
-        let taken = steps.0.load(Ordering::Relaxed);
+        let taken = steps.total.load(Ordering::Relaxed);
         assert!(taken <= 2, "the seek for id {i} took {taken} B-tree steps");
     }
 }
@@ -5169,10 +5207,10 @@ fn test_exact_index_seek_over_shadowed_btree_rows() {
             let steps = Arc::new(SeekBtreeSteps::default());
             conn.set_yield_injector(Some(steps.clone()));
             for id in 1..=changed_rows {
-                steps.0.store(0, Ordering::Relaxed);
+                steps.total.store(0, Ordering::Relaxed);
                 conn.execute(format!("INSERT INTO t VALUES ({id},{id})"))
                     .expect("deleted row must be reinserted");
-                let taken = steps.0.load(Ordering::Relaxed);
+                let taken = steps.total.load(Ordering::Relaxed);
                 assert!(
                     taken <= 8,
                     "reinserting id {id} of {changed_rows} with unique={unique} took {taken} B-tree steps"
@@ -5224,13 +5262,13 @@ fn test_index_insert_over_shadowed_btree_entries() {
     let steps = Arc::new(SeekBtreeSteps::default());
     conn.set_yield_injector(Some(steps.clone()));
     for i in 1..=150 {
-        steps.0.store(0, Ordering::Relaxed);
+        steps.total.store(0, Ordering::Relaxed);
         conn.execute(format!(
             "INSERT INTO t VALUES ({i}, '{}')",
             wide_index_key(i)
         ))
         .unwrap();
-        let taken = steps.0.load(Ordering::Relaxed);
+        let taken = steps.total.load(Ordering::Relaxed);
         assert!(
             taken <= 6,
             "inserting id {i} back took {taken} B-tree steps"
@@ -5283,7 +5321,7 @@ fn test_exact_unique_index_seek_over_shadowed_btree_rows() {
             (old_key, (151..=200).contains(&i) && exists),
             (new_key, i <= 150 && exists),
         ] {
-            steps.0.store(0, Ordering::Relaxed);
+            steps.total.store(0, Ordering::Relaxed);
             // LIMIT 1 stops the scan after a match, so only the lookup itself is counted.
             let rows = get_rows(
                 &conn,
@@ -5295,7 +5333,7 @@ fn test_exact_unique_index_seek_over_shadowed_btree_rows() {
                 "key {}...",
                 &key[..8]
             );
-            let taken = steps.0.load(Ordering::Relaxed);
+            let taken = steps.total.load(Ordering::Relaxed);
             assert!(
                 taken <= 3,
                 "the lookup of key {}... took {taken} B-tree steps",
@@ -6992,6 +7030,28 @@ fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
             }
         }
     }
+}
+
+#[test]
+fn test_exact_index_scan_returns_rows_restored_by_savepoint_rollback() {
+    let actual = ["ASC", "DESC"].map(|order| {
+        let db = MvccTestDb::new();
+        let conn = &db.conn;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+        conn.execute("INSERT INTO t VALUES (20,1),(40,1),(60,1)")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.execute("INSERT INTO t VALUES (10,1),(70,1)").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("DELETE FROM t WHERE id IN (20,60)").unwrap();
+
+        let sql = format!("SELECT id FROM t INDEXED BY t_k WHERE k=1 ORDER BY id {order}");
+        scan_with_write_after_rows(conn, &sql, 1, conn, "ROLLBACK TO s")
+    });
+    assert_eq!(actual, ["10,20,40,60,70", "70,60,40,20,10"]);
 }
 
 /// Steps `scan_sql` on `conn` and runs `write_sql` on `writer` once the scan has
