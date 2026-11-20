@@ -53,12 +53,15 @@ pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
 const MVCC_LOG_MAGIC: u32 = 0x4C4D4C32;
 const MVCC_LOG_VERSION: u8 = 3;
 const MVCC_LOG_HEADER_SIZE: usize = 56;
-const MVCC_TX_FRAME_MAGIC: u32 = 0x5854564D;
+#[cfg(test)]
 const MVCC_TX_EXT_FRAME_MAGIC: u32 = 0x5845564D;
 const MVCC_TX_END_MAGIC: u32 = 0x4554564D;
+#[cfg(test)]
 const MVCC_TX_HEADER_SIZE: usize = 24;
+#[cfg(test)]
 const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
+#[cfg(test)]
 const MVCC_TX_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 const MVCC_EXTENSION_RECORD_HEADER_SIZE: usize = 8;
 const MVCC_EXTENSION_TYPE_PORTABLE_CHANGES: u16 = 1;
@@ -943,13 +946,6 @@ fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
-    let bytes = buf.get(offset..offset + 8).ok_or_else(|| {
-        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
-    })?;
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-}
-
 fn find_mvcc_extension_payload(
     extension_block: &[u8],
     extension_record_count: u32,
@@ -1714,109 +1710,30 @@ pub(crate) async fn decode_raw_mvcc_logical_log_to_staging<Ctx>(
             pos < range_body.len()
         } {
             let frame_start = pos;
-            let (header_size, payload_size, extension_size, extension_record_count) =
-                match source_cipher {
-                    Some(cipher) => {
-                        use turso_core::mvcc::persistent_storage::logical_log::frame_codec::inspect_frame_prefix_with_overhead;
-                        let layout = inspect_frame_prefix_with_overhead(
-                            &range_body[pos..],
-                            Some((cipher.tag_size(), cipher.nonce_size())),
-                        )?
-                        .ok_or_else(|| {
-                            Error::DatabaseSyncEngineError(
-                                "truncated MVCC source frame header".into(),
-                            )
-                        })?;
-                        source_offset = source_offset
-                            .checked_add(layout.stored_size() as u64)
-                            .filter(|&end| end <= range.end_offset)
-                            .ok_or_else(|| {
-                                Error::DatabaseSyncEngineError(
-                                    "MVCC source frame exceeds range boundary".into(),
-                                )
-                            })?;
-                        (
-                            layout.header_size(),
-                            layout.recovery_size(),
-                            layout.extension_size(),
-                            layout.extension_records(),
+            use turso_core::mvcc::persistent_storage::logical_log::frame_codec::inspect_frame_prefix_with_overhead;
+            let layout = inspect_frame_prefix_with_overhead(
+                &range_body[pos..],
+                source_cipher.map(|cipher| (cipher.tag_size(), cipher.nonce_size())),
+            )?
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError("truncated MVCC source frame header".into())
+            })?;
+            if source_cipher.is_some() {
+                source_offset = source_offset
+                    .checked_add(layout.stored_size() as u64)
+                    .filter(|&end| end <= range.end_offset)
+                    .ok_or_else(|| {
+                        Error::DatabaseSyncEngineError(
+                            "MVCC source frame exceeds range boundary".into(),
                         )
-                    }
-                    None => {
-                        if range_body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
-                            return Err(Error::DatabaseSyncEngineError(
-                                "truncated MVCC logical-log transaction frame".to_string(),
-                            ));
-                        }
-                        let frame_magic = read_u32_le(range_body, pos)?;
-                        let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
-                        if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
-                            return Err(Error::DatabaseSyncEngineError(format!(
-                            "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
-                        )));
-                        }
-                        let header_size = if has_extension_header {
-                            if range_body.len() - pos
-                                < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE
-                            {
-                                return Err(Error::DatabaseSyncEngineError(
-                                    "truncated MVCC logical-log transaction frame".to_string(),
-                                ));
-                            }
-                            MVCC_TX_EXT_HEADER_SIZE
-                        } else {
-                            MVCC_TX_HEADER_SIZE
-                        };
-                        let payload_size = usize::try_from(read_u64_le(range_body, pos + 4)?)
-                            .map_err(|_| {
-                                Error::DatabaseSyncEngineError(
-                                    "MVCC logical-log recovery payload size overflows usize"
-                                        .to_string(),
-                                )
-                            })?;
-                        let (extension_size, extension_record_count) = if has_extension_header {
-                            let extension_size = usize::try_from(read_u64_le(
-                                range_body,
-                                pos + 24,
-                            )?)
-                            .map_err(|_| {
-                                Error::DatabaseSyncEngineError(
-                                    "MVCC logical-log extension size overflows usize".to_string(),
-                                )
-                            })?;
-                            let extension_record_count = read_u32_le(range_body, pos + 32)?;
-                            let frame_flags = read_u32_le(range_body, pos + 36)?;
-                            if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                                return Err(Error::DatabaseSyncEngineError(format!(
-                                "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
-                            )));
-                            }
-                            if extension_size == 0 && extension_record_count != 0 {
-                                return Err(Error::DatabaseSyncEngineError(
-                                "MVCC logical-log frame has extension record count without extension block"
-                                    .to_string(),
-                            ));
-                            }
-                            if extension_size > 0
-                                && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0
-                            {
-                                return Err(Error::DatabaseSyncEngineError(
-                                "MVCC logical-log frame has extension block without extension flag"
-                                    .to_string(),
-                            ));
-                            }
-                            (extension_size, extension_record_count)
-                        } else {
-                            (0, 0)
-                        };
-                        (
-                            header_size,
-                            payload_size,
-                            extension_size,
-                            extension_record_count,
-                        )
-                    }
-                };
+                    })?;
+            }
+            let (header_size, payload_size, extension_size, extension_record_count) = (
+                layout.header_size(),
+                layout.recovery_size(),
+                layout.extension_size(),
+                layout.extension_records(),
+            );
             let op_count = read_u32_le(range_body, pos + 12)?;
 
             let extension_start = pos.checked_add(header_size).ok_or_else(|| {
@@ -3647,9 +3564,7 @@ async fn write_bootstrap_page<Ctx>(
         page_data.page_id
     );
     if local_crypto.is_some() && page_data.page_id >= header.db_size {
-        return Err(Error::DatabaseSyncEngineError(
-            "bootstrap page exceeds database size".into(),
-        ));
+        return Ok(());
     }
     let page_id = page_data.page_id;
     let offset = page_id
@@ -5062,7 +4977,7 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_mvcc_rejects_empty_extension_flag_and_validates_frame() {
+    fn mvcc_empty_extension_flag_uses_the_same_layout_for_all_sources() {
         let seed = 1234u32;
         let mut frame = vec![0u8; super::MVCC_TX_EXT_HEADER_SIZE];
         frame[..4].copy_from_slice(&super::MVCC_TX_EXT_FRAME_MAGIC.to_le_bytes());
@@ -5109,11 +5024,9 @@ mod tests {
             frame,
             Some(turso_core::CipherMode::Aes256Gcm),
         )
-        .expect_err("encrypted source must still use frame layout validation");
+        .expect_err("encrypted logical sync also requires portable changes");
         assert!(
-            error
-                .to_string()
-                .contains("invalid logical log extension flags or count"),
+            error.to_string().contains("has no portable changes"),
             "{error}"
         );
     }
@@ -6873,7 +6786,7 @@ mod tests {
                 assert!(result
                     .unwrap_err()
                     .to_string()
-                    .contains("bootstrap page exceeds database size"));
+                    .contains("bootstrap page header is incompatible with local encryption"));
             } else {
                 result.unwrap();
                 let db = turso_core::Database::open_file_with_flags(
@@ -6906,7 +6819,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_encrypts_pages_with_the_local_key_before_writing() {
+    fn bootstrap_encrypts_current_pages_and_ignores_stale_wal_pages() {
         use turso_core::{CipherMode, EncryptionContext, EncryptionKey, OpenFlags};
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.db");
@@ -6946,6 +6859,15 @@ mod tests {
         );
         header.db_size = (stored.len() / super::PAGE_SIZE) as u64;
         let mut response = header.encode_length_delimited_to_vec();
+        for page_id in [header.db_size, header.db_size + 3] {
+            response.extend(
+                PageData {
+                    page_id,
+                    encoded_page: vec![0xab; super::PAGE_SIZE].into(),
+                }
+                .encode_length_delimited_to_vec(),
+            );
+        }
         for (index, page) in stored.chunks_exact(super::PAGE_SIZE).enumerate() {
             let plaintext = source_crypto.decrypt_page(page, index + 1).unwrap();
             let page = PageData {
