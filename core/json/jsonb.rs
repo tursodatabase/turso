@@ -52,7 +52,9 @@ const fn make_whitespace_table() -> [u8; 256] {
 static WS_TABLE: [u8; 256] = make_whitespace_table();
 
 /// For each byte, whether it ends the part of a string that the parser copies
-/// as it is: the quote of the string, a backslash or a control character.
+/// as it is: the quote of the string, a backslash or a control character. For
+/// a double-quoted string, these are the bytes of [ESCAPED_IN_TEXT], so the
+/// parser uses that table.
 const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
     let mut table = [false; 256];
     let mut byte = 0;
@@ -63,7 +65,6 @@ const fn make_plain_string_end_table(quote: u8) -> [bool; 256] {
     table
 }
 
-static ENDS_DOUBLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'"');
 static ENDS_SINGLE_QUOTED_PLAIN_PART: [bool; 256] = make_plain_string_end_table(b'\'');
 
 /// The 1-byte headers of TEXT elements with a payload of 0 to 11 bytes. The
@@ -2034,7 +2035,7 @@ impl Jsonb {
             // A string with no escape and no control character ends at the
             // first quote, and its payload is the bytes before the quote.
             let ends_plain_part = if quote == b'"' {
-                &ENDS_DOUBLE_QUOTED_PLAIN_PART
+                &ESCAPED_IN_TEXT
             } else {
                 &ENDS_SINGLE_QUOTED_PLAIN_PART
             };
@@ -2080,7 +2081,7 @@ impl Jsonb {
         if let Some(rest) = input.get(pos + 1..) {
             let len = rest
                 .iter()
-                .position(|&c| ENDS_DOUBLE_QUOTED_PLAIN_PART[c as usize])
+                .position(|&c| ESCAPED_IN_TEXT[c as usize])
                 .unwrap_or(rest.len());
             if let (Some(b'"'), Some(&header)) = (rest.get(len), TEXT_HEADERS.get(len)) {
                 self.data.push(header);
@@ -5426,6 +5427,11 @@ mod tests {
         .expect(crate::alloc::ALLOC_ERR_MSG);
         let err = minus_only_int5.to_string().unwrap_err();
         assert!(err.to_string().contains("malformed JSON"));
+    }
+
+    #[test]
+    fn escaped_bytes_end_the_plain_part_of_a_double_quoted_string() {
+        assert_eq!(make_plain_string_end_table(b'"'), ESCAPED_IN_TEXT);
     }
 
     #[test]
