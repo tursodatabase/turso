@@ -2771,26 +2771,37 @@ expect {
 
 # PostgreSQL rounds to the given precision. tursopg cannot yet, so it refuses
 # every explicit precision, including 0.
-test current-timestamp-with-precision-is-not-supported {
-    SELECT current_timestamp(0);
+test current-timestamp-with-precision-0-has-no-fraction {
+    SELECT current_timestamp(0) = date_trunc('second', current_timestamp(0));
+}
+expect {
+    t
 }
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
     a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
 }
 
-test localtimestamp-with-precision-is-not-supported {
-    SELECT localtimestamp(0);
+test localtimestamp-with-precision-0-has-no-fraction {
+    SELECT localtimestamp(0) = date_trunc('second', localtimestamp(0));
+}
+expect {
+    t
 }
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
     a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
 }
 
-test default-current-timestamp-with-precision-is-not-supported {
-    CREATE TABLE ts_precision (t timestamptz DEFAULT current_timestamp(0));
+test default-current-timestamp-with-precision-0-has-no-fraction {
+    CREATE TABLE ts_precision (id int, t timestamptz DEFAULT current_timestamp(0));
+    INSERT INTO ts_precision (id) VALUES (1);
+    SELECT t = date_trunc('second', t) FROM ts_precision;
+}
+expect {
+    t
 }
 @sqlstate 0A000
-expect error {
+expect @tursopg error {
     a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP is not supported
 }
